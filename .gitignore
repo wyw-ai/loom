@@ -1,0 +1,6 @@
+/target
+/data/journal.jsonl
+/data/artifacts/
+/data/agents/
+.DS_Store
+/.claude/

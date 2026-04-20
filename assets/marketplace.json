@@ -1,0 +1,140 @@
+{
+  "version": "1.0.0",
+  "agents": [
+    {
+      "id": "claude-acp",
+      "name": "Claude Agent",
+      "version": "0.24.2",
+      "description": "ACP wrapper for Anthropic's Claude",
+      "repository": "https://github.com/agentclientprotocol/claude-agent-acp",
+      "authors": ["Anthropic", "Zed Industries", "JetBrains"],
+      "distribution": {
+        "npx": {
+          "package": "@agentclientprotocol/claude-agent-acp@0.24.2"
+        }
+      }
+    },
+    {
+      "id": "codex-acp",
+      "name": "Codex CLI",
+      "version": "0.10.0",
+      "description": "ACP adapter for OpenAI's coding assistant",
+      "repository": "https://github.com/zed-industries/codex-acp",
+      "authors": ["OpenAI", "Zed Industries"],
+      "distribution": {
+        "npx": {
+          "package": "@zed-industries/codex-acp@0.10.0"
+        },
+        "binary": {
+          "darwin-aarch64": {
+            "archive": "https://github.com/zed-industries/codex-acp/releases/download/v0.10.0/codex-acp-0.10.0-aarch64-apple-darwin.tar.gz",
+            "cmd": "./codex-acp"
+          },
+          "darwin-x86_64": {
+            "archive": "https://github.com/zed-industries/codex-acp/releases/download/v0.10.0/codex-acp-0.10.0-x86_64-apple-darwin.tar.gz",
+            "cmd": "./codex-acp"
+          },
+          "linux-aarch64": {
+            "archive": "https://github.com/zed-industries/codex-acp/releases/download/v0.10.0/codex-acp-0.10.0-aarch64-unknown-linux-gnu.tar.gz",
+            "cmd": "./codex-acp"
+          },
+          "linux-x86_64": {
+            "archive": "https://github.com/zed-industries/codex-acp/releases/download/v0.10.0/codex-acp-0.10.0-x86_64-unknown-linux-gnu.tar.gz",
+            "cmd": "./codex-acp"
+          }
+        }
+      }
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "version": "2026.03.30",
+      "description": "Cursor's coding agent",
+      "authors": ["Cursor"],
+      "distribution": {
+        "binary": {
+          "darwin-aarch64": {
+            "archive": "https://downloads.cursor.com/lab/2026.03.30-a5d3e17/darwin/arm64/agent-cli-package.tar.gz",
+            "cmd": "cursor-agent",
+            "args": ["acp"]
+          },
+          "darwin-x86_64": {
+            "archive": "https://downloads.cursor.com/lab/2026.03.30-a5d3e17/darwin/x64/agent-cli-package.tar.gz",
+            "cmd": "cursor-agent",
+            "args": ["acp"]
+          },
+          "linux-aarch64": {
+            "archive": "https://downloads.cursor.com/lab/2026.03.30-a5d3e17/linux/arm64/agent-cli-package.tar.gz",
+            "cmd": "cursor-agent",
+            "args": ["acp"]
+          },
+          "linux-x86_64": {
+            "archive": "https://downloads.cursor.com/lab/2026.03.30-a5d3e17/linux/x64/agent-cli-package.tar.gz",
+            "cmd": "cursor-agent",
+            "args": ["acp"]
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI",
+      "version": "0.35.3",
+      "description": "Google's official CLI for Gemini",
+      "repository": "https://github.com/google-gemini/gemini-cli",
+      "authors": ["Google"],
+      "distribution": {
+        "npx": {
+          "package": "@google/gemini-cli@0.35.3",
+          "args": ["--acp"]
+        }
+      }
+    },
+    {
+      "id": "qwen-code",
+      "name": "Qwen Code",
+      "version": "0.13.2",
+      "description": "Alibaba's Qwen coding assistant",
+      "repository": "https://github.com/QwenLM/qwen-code",
+      "authors": ["Alibaba Qwen Team"],
+      "distribution": {
+        "npx": {
+          "package": "@qwen-code/qwen-code@0.13.2",
+          "args": ["--acp", "--experimental-skills"]
+        }
+      }
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "version": "1.3.9",
+      "description": "The open source coding agent",
+      "repository": "https://github.com/anomalyco/opencode",
+      "authors": ["Anomaly"],
+      "distribution": {
+        "binary": {
+          "darwin-aarch64": {
+            "archive": "https://github.com/anomalyco/opencode/releases/download/v1.3.9/opencode-darwin-arm64.zip",
+            "cmd": "./opencode",
+            "args": ["acp"]
+          },
+          "darwin-x86_64": {
+            "archive": "https://github.com/anomalyco/opencode/releases/download/v1.3.9/opencode-darwin-x64.zip",
+            "cmd": "./opencode",
+            "args": ["acp"]
+          },
+          "linux-aarch64": {
+            "archive": "https://github.com/anomalyco/opencode/releases/download/v1.3.9/opencode-linux-arm64.tar.gz",
+            "cmd": "./opencode",
+            "args": ["acp"]
+          },
+          "linux-x86_64": {
+            "archive": "https://github.com/anomalyco/opencode/releases/download/v1.3.9/opencode-linux-x64.tar.gz",
+            "cmd": "./opencode",
+            "args": ["acp"]
+          }
+        }
+      }
+    }
+  ]
+}

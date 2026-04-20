@@ -78,7 +78,16 @@ async fn wake_agent(
         .map_err(|e| e.to_string())?;
     manager.set_active_turn(&actor_id, Some(turn.id.clone()));
 
-    let prompt_text = render_prompt(&trigger);
+    let user_text = render_prompt(&trigger);
+    let prompt_text = if manager.take_seed_slot(&actor_id) {
+        format!(
+            "{}\n\n=== User message ===\n{}",
+            seed_manifest(&actor_id, &trigger.scope),
+            user_text
+        )
+    } else {
+        user_text
+    };
     if let Err(e) = adapter.send_prompt(prompt_text).await {
         let _ = store.close_turn(&turn.id, TurnStatus::Failed);
         manager.set_active_turn(&actor_id, None);
@@ -96,6 +105,46 @@ fn render_prompt(trigger: &Event) -> String {
         return text.to_string();
     }
     serde_json::to_string(&trigger.payload).unwrap_or_default()
+}
+
+/// One-time bootstrap shown to the agent on its very first prompt of a session.
+/// It tells the model who it is, what scope it is in, and which `joi` commands
+/// are available for reading server state. Environment variables JOI_SERVER and
+/// JOI_ACTOR are already injected into the child process.
+fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
+    let scope_kind = match scope.kind {
+        ScopeKind::Conversation => "conversation",
+        ScopeKind::Space => "space",
+    };
+    let scope_flag = if matches!(scope.kind, ScopeKind::Space) {
+        " --space"
+    } else {
+        ""
+    };
+    format!(
+        "=== System: Joi multi-actor context (auto-injected on session start) ===\n\
+         You are an ACP agent running inside the Joi multi-actor server.\n\
+         Identity:\n\
+           actor id      = {actor_id}\n\
+           current scope = {scope_kind}:{scope_id}\n\
+         \n\
+         You can shell out to the `joi` CLI to read server state. The env vars\n\
+         JOI_SERVER and JOI_ACTOR are already set, so commands like:\n\
+           joi --json event list --in {scope_id}{scope_flag}\n\
+           joi --json event list --in {scope_id}{scope_flag} --before <event_id>\n\
+           joi --json conv list\n\
+           joi --json space list\n\
+           joi --json actor list\n\
+           joi --json agent list\n\
+         will work without flags. Use `--json` for machine-readable output.\n\
+         Use `joi --help` and `joi <subcommand> --help` for the full surface.\n\
+         Only the message after the marker line is the new user input.\n\
+         ",
+        actor_id = actor_id,
+        scope_kind = scope_kind,
+        scope_id = scope.id,
+        scope_flag = scope_flag,
+    )
 }
 
 /// Spawned per agent process when it starts; consumes `AgentEvent`s and turns

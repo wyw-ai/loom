@@ -113,9 +113,16 @@ joi --json event list --in <conv_id> --before <event_id>  # paginate older
 joi --json agent list
 ```
 
-ACP children launched by the server inherit the parent's environment, so set
-`JOI_SERVER` (and optionally `JOI_ACTOR=<actor-id>`) on the server process and
-the agent can shell out to `joi` to backfill conversation history when it wakes.
+When the server spawns an ACP child it injects two environment variables (only
+if the agent's spec doesn't already set them):
+
+- `JOI_SERVER` → the WebSocket URL the server is bound to (e.g. `ws://127.0.0.1:7878/rpc`)
+- `JOI_ACTOR`  → the agent's own actor id
+
+so the child can run `joi --json event list --in <conv_id>` etc. without any
+extra flags. The very first prompt of each session is also prefixed with a
+short auto-generated manifest telling the model who it is, what scope it is in,
+and which read-only commands are available; subsequent prompts are clean.
 
 ## What's not in v0
 

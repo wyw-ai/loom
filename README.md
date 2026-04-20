@@ -97,6 +97,26 @@ Template variables in `cwd` / `env` values:
 - `{agent.logs}`      → `data/agents/<actor-id>/logs`
 - `{agent.root}`      → `data/agents/<actor-id>`
 
+## Reading state from the CLI (for humans and agents)
+
+Read-only RPCs are wrapped as subcommands so an ACP child process (or any shell)
+can introspect the server. Add `--json` (or `JOI_JSON=1`) to any output-producing
+command to get a single-line JSON document instead of the human-friendly text.
+
+```sh
+joi --json space list
+joi --json conv list --space <space_id>
+joi --json actor list
+joi --json event list --in <conv_id> --limit 200          # scope/read on a conversation
+joi --json event list --in <space_id> --space             # scope/read on a space
+joi --json event list --in <conv_id> --before <event_id>  # paginate older
+joi --json agent list
+```
+
+ACP children launched by the server inherit the parent's environment, so set
+`JOI_SERVER` (and optionally `JOI_ACTOR=<actor-id>`) on the server process and
+the agent can shell out to `joi` to backfill conversation history when it wakes.
+
 ## What's not in v0
 
 - no auth, no RBAC

@@ -8,9 +8,14 @@ use proto::methods::*;
 use serde_json::json;
 
 use crate::client::Client;
+use crate::render;
 
 pub async fn list(client: Arc<Client>) -> Result<()> {
     let res: AgentListResult = client.call(method::AGENT_LIST, json!({})).await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
     if res.agents.is_empty() {
         println!("(no registered agents)");
     }
@@ -27,6 +32,10 @@ pub async fn marketplace(client: Arc<Client>) -> Result<()> {
     let res: AgentMarketplaceListResult = client
         .call(method::AGENT_LIST_MARKETPLACE, json!({}))
         .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
     if res.entries.is_empty() {
         println!("(empty marketplace)");
         return Ok(());
@@ -187,6 +196,10 @@ pub async fn log(client: Arc<Client>, actor_id: String, tail: u32) -> Result<()>
             json!({ "actorId": actor_id, "tail": tail }),
         )
         .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
     if res.lines.is_empty() {
         println!("(no log lines)");
     }

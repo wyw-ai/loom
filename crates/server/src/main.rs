@@ -52,10 +52,12 @@ async fn main() -> Result<()> {
     let store = Store::open(journal)?;
     let subscriptions = Subscriptions::new();
     let artifacts = Arc::new(ArtifactStore::new(args.data_dir.join("artifacts"))?);
+    let server_url = format!("ws://{}/rpc", args.bind);
     let runtime = RuntimeManager::new(
         args.data_dir.clone(),
         args.agents_dir.clone(),
         store.clone(),
+        server_url,
     )?;
 
     let state = AppState {

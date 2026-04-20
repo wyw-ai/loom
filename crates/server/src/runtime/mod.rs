@@ -2,7 +2,7 @@ pub mod acp;
 pub mod registry;
 pub mod wakeup;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -47,6 +47,8 @@ pub struct RegisteredAgent {
     pub action_map: HashMap<String, (Arc<AcpAdapter>, String)>,
     /// Currently active turn for this agent (only one in-flight prompt at a time in v0)
     pub active_turn_id: Option<String>,
+    /// True after the agent's session has received its first manifest-bearing prompt.
+    pub seeded: bool,
 }
 
 impl RegisteredAgent {
@@ -60,6 +62,7 @@ impl RegisteredAgent {
             log: VecDeque::new(),
             action_map: HashMap::new(),
             active_turn_id: None,
+            seeded: false,
         }
     }
 
@@ -76,6 +79,8 @@ impl RegisteredAgent {
 pub struct RuntimeManager {
     pub data_dir: PathBuf,
     pub agents_dir: PathBuf,
+    /// WebSocket URL agents should hit when they shell out to `joi` (JOI_SERVER).
+    pub server_url: String,
     agents: Mutex<HashMap<String, RegisteredAgent>>,
     store: Arc<Store>,
 }
@@ -85,12 +90,14 @@ impl RuntimeManager {
         data_dir: PathBuf,
         agents_dir: PathBuf,
         store: Arc<Store>,
+        server_url: String,
     ) -> RuntimeResult<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&agents_dir)?;
         let mgr = Arc::new(Self {
             data_dir,
             agents_dir,
+            server_url,
             agents: Mutex::new(HashMap::new()),
             store,
         });
@@ -253,6 +260,21 @@ impl RuntimeManager {
             a.session_id = None;
             a.status = "stopped".into();
             a.active_turn_id = None;
+            a.seeded = false;
+        }
+    }
+
+    /// Returns `true` exactly once per session — flips the agent's `seeded` flag
+    /// from false to true so callers can prepend a one-time bootstrap manifest
+    /// to the very first prompt of a freshly-started ACP child.
+    pub fn take_seed_slot(&self, actor_id: &str) -> bool {
+        let mut agents = self.agents.lock();
+        match agents.get_mut(actor_id) {
+            Some(a) if !a.seeded => {
+                a.seeded = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -324,12 +346,16 @@ impl RuntimeManager {
             PathBuf::from(self.expand_path_vars(&spec.transport.cwd, actor_id))
         };
 
-        let env = spec
+        let mut env: BTreeMap<String, String> = spec
             .transport
             .env
             .iter()
             .map(|(k, v)| (k.clone(), self.expand_path_vars(v, actor_id)))
             .collect();
+        env.entry("JOI_SERVER".into())
+            .or_insert_with(|| self.server_url.clone());
+        env.entry("JOI_ACTOR".into())
+            .or_insert_with(|| actor_id.to_string());
         let args = spec
             .transport
             .args

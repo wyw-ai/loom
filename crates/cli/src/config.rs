@@ -57,6 +57,7 @@ pub fn load_or_init() -> Result<Config> {
 pub fn resolve(
     server_url: Option<String>,
     actor_id: Option<String>,
+    display_name: Option<String>,
 ) -> Result<Config> {
     let mut cfg = load_or_init()?;
     if let Some(s) = server_url.or_else(|| std::env::var("JOI_SERVER").ok()) {
@@ -64,6 +65,9 @@ pub fn resolve(
     }
     if let Some(a) = actor_id.or_else(|| std::env::var("JOI_ACTOR").ok()) {
         cfg.actor_id = a;
+    }
+    if let Some(d) = display_name.or_else(|| std::env::var("JOI_DISPLAY").ok()) {
+        cfg.display_name = d;
     }
     Ok(cfg)
 }

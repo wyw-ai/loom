@@ -19,6 +19,9 @@ struct Args {
     /// Override the configured local actor id.
     #[arg(long = "as", global = true, env = "JOI_ACTOR")]
     actor: Option<String>,
+    /// Override the configured local display name.
+    #[arg(long = "display", global = true, env = "JOI_DISPLAY")]
+    display: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -154,7 +157,7 @@ enum AgentCmd {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
-    let cfg = config::resolve(args.server.clone(), args.actor.clone())?;
+    let cfg = config::resolve(args.server.clone(), args.actor.clone(), args.display.clone())?;
 
     if let Cmd::Who = args.cmd {
         println!("server   = {}", cfg.server_url);

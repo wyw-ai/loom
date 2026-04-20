@@ -10,7 +10,7 @@ use proto::types::*;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::acp::{AcpAdapter, AgentEvent};
+use super::acp::AgentEvent;
 use super::RuntimeManager;
 use crate::store::{Store, StoreEvent};
 

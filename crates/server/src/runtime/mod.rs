@@ -81,6 +81,11 @@ pub struct RuntimeManager {
     pub agents_dir: PathBuf,
     /// WebSocket URL agents should hit when they shell out to `joi` (JOI_SERVER).
     pub server_url: String,
+    /// Directory containing the `joi` CLI binary (typically the same dir as the
+    /// running `joi-server` binary). Prepended to ACP child PATH on spawn so the
+    /// agent can run `joi --json ...` without prior installation. `None` if not
+    /// detected — the server logs a warning at boot in that case.
+    pub cli_dir: Option<PathBuf>,
     agents: Mutex<HashMap<String, RegisteredAgent>>,
     store: Arc<Store>,
 }
@@ -94,10 +99,18 @@ impl RuntimeManager {
     ) -> RuntimeResult<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&agents_dir)?;
+        let cli_dir = detect_cli_dir();
+        if cli_dir.is_none() {
+            tracing::warn!(
+                "joi CLI not found next to joi-server; ACP children will not have `joi` on \
+                 PATH unless the operator installs it (e.g. `cargo install --path crates/cli`).",
+            );
+        }
         let mgr = Arc::new(Self {
             data_dir,
             agents_dir,
             server_url,
+            cli_dir,
             agents: Mutex::new(HashMap::new()),
             store,
         });
@@ -356,6 +369,10 @@ impl RuntimeManager {
             .or_insert_with(|| self.server_url.clone());
         env.entry("JOI_ACTOR".into())
             .or_insert_with(|| actor_id.to_string());
+        if let Some(dir) = self.cli_dir.as_ref() {
+            env.entry("PATH".into())
+                .or_insert_with(|| prepend_path(dir));
+        }
         let args = spec
             .transport
             .args
@@ -412,3 +429,31 @@ impl RuntimeManager {
 
 #[allow(dead_code)]
 pub(crate) fn _silence_event_unused(_e: &AgentEvent) {}
+
+fn cli_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "joi.exe"
+    } else {
+        "joi"
+    }
+}
+
+fn detect_cli_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if dir.join(cli_binary_name()).is_file() {
+        Some(dir.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn prepend_path(dir: &Path) -> String {
+    let mut paths: Vec<PathBuf> = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths)
+        .map(|os| os.to_string_lossy().to_string())
+        .unwrap_or_else(|_| dir.display().to_string())
+}

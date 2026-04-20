@@ -9,6 +9,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::client::Client;
+use crate::render::OutputMode;
 
 #[derive(Parser, Debug)]
 #[command(name = "joi", about = "Joi multi-actor collaboration CLI")]
@@ -22,6 +23,9 @@ struct Args {
     /// Override the configured local display name.
     #[arg(long = "display", global = true, env = "JOI_DISPLAY")]
     display: Option<String>,
+    /// Emit machine-readable JSON instead of human-friendly text.
+    #[arg(long, global = true, env = "JOI_JSON")]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -68,6 +72,16 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentCmd,
     },
+    /// Read events / history from a scope.
+    Event {
+        #[command(subcommand)]
+        sub: EventCmd,
+    },
+    /// Inspect actors known to the server.
+    Actor {
+        #[command(subcommand)]
+        sub: ActorCmd,
+    },
     /// Interactive chat REPL inside a conversation.
     Chat {
         #[arg(long)]
@@ -96,6 +110,30 @@ enum ConvCmd {
         #[arg(long)]
         space: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum EventCmd {
+    /// List events in a conversation (default) or space scope.
+    List {
+        /// Scope id (conversation id by default; pass --space to read a space scope).
+        #[arg(long)]
+        r#in: String,
+        /// Read a space scope instead of a conversation scope.
+        #[arg(long)]
+        space: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Cursor: only return events older than this event id.
+        #[arg(long)]
+        before: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ActorCmd {
+    /// List every actor the server knows about.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -157,13 +195,27 @@ enum AgentCmd {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    render::set_output_mode(if args.json {
+        OutputMode::Json
+    } else {
+        OutputMode::Pretty
+    });
     let cfg = config::resolve(args.server.clone(), args.actor.clone(), args.display.clone())?;
 
     if let Cmd::Who = args.cmd {
-        println!("server   = {}", cfg.server_url);
-        println!("actor    = {}", cfg.actor_id);
-        println!("display  = {}", cfg.display_name);
-        println!("config   = {}", config::config_path().display());
+        if render::is_json() {
+            render::print_json(&serde_json::json!({
+                "server": cfg.server_url,
+                "actor": cfg.actor_id,
+                "display": cfg.display_name,
+                "config": config::config_path().display().to_string(),
+            }));
+        } else {
+            println!("server   = {}", cfg.server_url);
+            println!("actor    = {}", cfg.actor_id);
+            println!("display  = {}", cfg.display_name);
+            println!("config   = {}", config::config_path().display());
+        }
         return Ok(());
     }
 
@@ -217,6 +269,17 @@ async fn main() -> Result<()> {
             AgentCmd::Start { actor_id } => cmd::agent::start(client, actor_id).await?,
             AgentCmd::Stop { actor_id } => cmd::agent::stop(client, actor_id).await?,
             AgentCmd::Log { actor_id, tail } => cmd::agent::log(client, actor_id, tail).await?,
+        },
+        Cmd::Event { sub } => match sub {
+            EventCmd::List {
+                r#in,
+                space,
+                limit,
+                before,
+            } => cmd::event::list(client, r#in, space, limit, before).await?,
+        },
+        Cmd::Actor { sub } => match sub {
+            ActorCmd::List => cmd::actor::list(client).await?,
         },
         Cmd::Chat { r#in } => cmd::chat::run(client, cfg.actor_id, r#in).await?,
     }

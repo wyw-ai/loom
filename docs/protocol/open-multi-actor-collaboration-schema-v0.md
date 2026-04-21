@@ -73,7 +73,7 @@
 - 人类用户不需要看到 raw schema。
 - Agent 可以通过 CLI、MCP 或 SDK 间接调用 schema。
 - 不同 binding 的交互手感可以不同，但提交给 server 的动作必须映射到同一套 schema 方法。
-- 文本里的 `@handle` 属于 binding 层输入语法；除非 binding 显式映射为 `targets`、`hands_off_to` 或 `handoff/create`，schema 不为其赋予机器语义。
+- 文本里的 `@handle` 属于 binding 层输入语法；除非 binding 显式映射为 `hands_off_to`，schema 不为其赋予机器语义。
 
 ## 4. 默认绑定约定
 
@@ -356,7 +356,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 ```json
 {
-  "kind": "replies_to | targets | hands_off_to | responds_to | attaches_artifact | references",
+  "kind": "replies_to | hands_off_to | responds_to | attaches_artifact",
   "target": {
     "kind": "event",
     "id": "evt_001"
@@ -404,7 +404,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 {
   "id": "art_123",
   "uri": "artifact://authority/art_123",
-  "kind": "file | directory | bundle | blob",
+  "kind": "file | directory",
   "name": "report.md",
   "mediaType": "text/markdown",
   "size": 1024,
@@ -474,7 +474,6 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 | `content.add` | 追加可展示内容 |
 | `action.request` | 请求审批、输入或选择 |
 | `action.response` | 对 action request 的响应 |
-| `handoff.offer` | 显式 handoff |
 | `artifact.publish` | 记录一次 artifact 发布 |
 | `turn.close` | 标记 turn 结束 |
 
@@ -876,8 +875,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 - 发布共享 artifact，返回稳定的 artifact 对象。
 
-`artifact/publish` 只负责发布共享对象，不负责替代 `event/append`。  
-把 artifact 挂到某个对话动作上，仍应通过 `event/append + attaches_artifact relation` 完成。
+artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻址的共享对象。  
+把 artifact 挂到某个对话动作上，应通过 `event/append` 携带一条 `content.add` 加上 `attaches_artifact` relation 完成。
 
 请求：
 
@@ -887,10 +886,6 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "id": "req_art_publish_1",
   "method": "artifact/publish",
   "params": {
-    "scope": {
-      "kind": "thread",
-      "id": "thread_123"
-    },
     "ingress": {
       "kind": "inline_text",
       "name": "report.md",
@@ -999,67 +994,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 }
 ```
 
-### 9.13 `handoff/create`
-
-用途：
-
-- 创建显式 handoff。
-- handoff 本身仍然应被表示为事件与关系，但 `handoff/create` 允许实现方用明确接口提交。
-- 服务端应为 handoff 目标创建或刷新对应 scope 的 `Membership`，以便它稍后通过 `scope/read` 补看中间历史。
-
-请求：
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "req_handoff_1",
-  "method": "handoff/create",
-  "params": {
-    "sourceActorId": "actor_agent_1",
-    "targetActorId": "actor_agent_2",
-    "scope": {
-      "kind": "thread",
-      "id": "thread_123"
-    },
-    "message": "请继续处理补丁验证。",
-    "_meta": {}
-  }
-}
-```
-
-响应：
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "req_handoff_1",
-  "result": {
-    "event": {
-      "id": "evt_handoff_1",
-      "type": "handoff.offer",
-      "actorId": "actor_agent_1",
-      "scope": {
-        "kind": "thread",
-        "id": "thread_123"
-      },
-      "payload": {
-        "message": "请继续处理补丁验证。"
-      },
-      "relations": [
-        {
-          "kind": "hands_off_to",
-          "target": {
-            "kind": "actor",
-            "id": "actor_agent_2"
-          }
-        }
-      ]
-    }
-  }
-}
-```
-
-### 9.14 `receipt/record`
+### 9.13 `receipt/record`
 
 用途：
 
@@ -1247,7 +1182,6 @@ v0 定义两类 notification：
 - `artifact.published`
 - `delivery.updated`
 - `receipt.recorded`
-- `handoff.created`
 
 ### 11.2 `event.created`
 
@@ -1329,7 +1263,7 @@ v0 定义两类 notification：
 约束：
 
 - 服务端不得把 trace 帧广播给除 owner 之外的任何 connection。
-- 服务端不得把 trace 帧记录为可寻址的 `Event`（不分配 `eventId`，不能被 `replies_to` / `responds_to` / `references` 指向）。
+- 服务端不得把 trace 帧记录为可寻址的 `Event`（不分配 `eventId`，不能被 `replies_to` / `responds_to` 指向）。
 - 重连后 owner 仍可通过 `turn/trace.read` 拉历史。
 
 ## 12. 校验规则
@@ -1351,7 +1285,7 @@ v0 定义两类 notification：
 
 ### 12.3 Relation 校验
 
-- `targets`、`hands_off_to` 的目标必须是 `Actor`。
+- `hands_off_to` 的目标必须是 `Actor`。
 - `attaches_artifact` 的目标必须是 `Artifact`。
 - `responds_to` 的目标必须是 `Event`。
 
@@ -1372,7 +1306,7 @@ human UI 不需要向用户暴露 raw schema。
 | UI 动作 | Schema 方法 |
 | --- | --- |
 | 发送消息 | `event/append` |
-| 选择 agent 作为下一步处理者 | `handoff/create` |
+| 选择 agent 作为下一步处理者 | `event/append (content.add + hands_off_to)` |
 | 新开 thread / 局部讨论 | `thread/create` |
 | 拖拽上传附件 | `artifact/publish` |
 | 在消息里附加附件卡片 | `event/append` + `attaches_artifact` |
@@ -1399,7 +1333,6 @@ CLI 可以直接暴露接近 schema 的动作。
 | `artifact publish --source-path ...` | `artifact/publish` |
 | `artifact get ...` | `artifact/get` |
 | `artifact read ...` | `artifact/read` |
-| `handoff create ...` | `handoff/create` |
 | `receipt record ...` | `receipt/record` |
 
 ### 13.3 Agent MCP Binding
@@ -1415,7 +1348,6 @@ MCP tool 名可以与 schema 方法一一映射。
 | `artifact_publish` | `artifact/publish` |
 | `artifact_get` | `artifact/get` |
 | `artifact_read` | `artifact/read` |
-| `handoff_create` | `handoff/create` |
 | `receipt_record` | `receipt/record` |
 
 约束：
@@ -1458,7 +1390,6 @@ MCP tool 名可以与 schema 方法一一映射。
 - `artifact/publish`
 - `artifact/get`
 - `artifact/read`
-- `handoff/create`
 - `receipt/record`
 - `stream/update`
 - `turn/trace.read`

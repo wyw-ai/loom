@@ -136,13 +136,12 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 - `thread.create`
 - `turn.open`
 - `event.append`
-- `handoff.create`
 - `turn.close`
 - `artifact.publish`
 - `receipt.record`
 
-当前实现里，RPC 方法名使用 dot 形式，例如 `scope.read`、`handoff.create`。
-协议文档里的 canonical 名称仍使用 slash 形式，例如 `scope/read`、`handoff/create`。
+当前实现里，RPC 方法名使用 dot 形式，例如 `scope.read`、`event.append`。
+协议文档里的 canonical 名称仍使用 slash 形式，例如 `scope/read`、`event/append`。
 
 扩展方法：
 
@@ -171,7 +170,7 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 
 接收者来源只有一类：
 
-1. relation 中被 `targets` / `hands_off_to` 显式指向的 actor
+1. relation 中被 `hands_off_to` 显式指向的 actor
 
 另外有两条与投递并行但独立的机制：
 
@@ -238,7 +237,6 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 
 当前 runtime 会因为以下 relation 被自动唤起或入队：
 
-- `targets`
 - `hands_off_to`
 
 纯文本里的 `@agent` 不会触发 runtime。只有显式定向关系才会触发真实运行闭环。
@@ -347,14 +345,13 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 ### 10.1 人发起协作
 
 1. 人在 room 里发一条 `content.add`
-2. 如果用户显式选择了 handoff 目标，前端会调用 `handoff.create`
-3. 如果只是普通 room update，则前端调用 `event.append`
-4. server 只会为 `targets` / `hands_off_to` 写 directed `deliveries`
-5. server 会为发言者或被定向到的 actor 维护 `memberships`
-6. runtime manager 发现相关 directed relation
-7. 如果 agent 未启动且允许按需启动，则自动启动 runtime
-8. 事件入队
-9. runtime 打开 turn 并向 ACP prompt
+2. 不论是否显式选择 handoff 目标，前端都调用 `event.append`；handoff 仅是 `content.add` 携带 `hands_off_to` relation 的特例
+3. server 只会为 `hands_off_to` 写 directed `deliveries`
+4. server 会为发言者或被定向到的 actor 维护 `memberships`
+5. runtime manager 发现相关 directed relation
+6. 如果 agent 未启动且允许按需启动，则自动启动 runtime
+7. 事件入队
+8. runtime 打开 turn 并向 ACP prompt
 
 ### 10.2 agent 反向请求审批
 

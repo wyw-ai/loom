@@ -43,10 +43,15 @@ pub struct History {
 impl History {
     pub fn push_event(&mut self, ev: &Event) {
         match ev.kind.as_str() {
+            // content.add carrying a HandsOffTo relation is a handoff; the
+            // text body is the handoff message. Render it statically rather
+            // than streaming so it stands apart from regular chat.
+            "content.add" if hands_off_target(ev).is_some() => {
+                self.push_static(ev, format_handoff(ev))
+            }
             "content.add" => self.append_stream(ev),
             "action.request" => self.push_static(ev, format_action_request(ev)),
             "action.response" => self.push_static(ev, format_action_response(ev)),
-            "handoff.offer" => self.push_static(ev, format_handoff(ev)),
             // turn.close is intentionally suppressed; delivery state on the
             // outgoing bubble already conveys "the server saw it", and the
             // closing chunk arrives as a normal content.add event.
@@ -301,18 +306,23 @@ fn format_action_response(ev: &Event) -> String {
     format!("✓ action.response → {}", opt)
 }
 
-fn format_handoff(ev: &Event) -> String {
-    let msg = ev
-        .payload
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let to = ev
-        .relations
+fn hands_off_target(ev: &Event) -> Option<String> {
+    ev.relations
         .iter()
         .find(|r| matches!(r.kind, RelationKind::HandsOffTo))
         .map(|r| r.target.id.clone())
-        .unwrap_or_default();
+}
+
+fn format_handoff(ev: &Event) -> String {
+    // Body lives in `text` for content.add+HandsOffTo; legacy `handoff.offer`
+    // events used `message` — keep the fallback so old journals render.
+    let msg = ev
+        .payload
+        .get("text")
+        .and_then(|v| v.as_str())
+        .or_else(|| ev.payload.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let to = hands_off_target(ev).unwrap_or_default();
     format!("↪ handoff → {}: {}", to, msg)
 }
 

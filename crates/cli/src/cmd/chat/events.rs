@@ -190,9 +190,6 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     match kind.as_str() {
-        // Server emits HANDOFF_CREATED in addition to EVENT_CREATED for the
-        // same handoff.offer event (see store.rs ~389-391). Ingest only the
-        // generic stream to avoid duplicate bubbles.
         stream_kind::EVENT_CREATED => {
             if let Some(ev_value) = data.get("event").cloned() {
                 if let Ok(ev) = serde_json::from_value::<Event>(ev_value) {
@@ -525,18 +522,19 @@ async fn do_handoff_with_message(
     message: String,
     scope: &ScopeRef,
 ) {
-    use proto::methods::HandoffCreateResult;
-    let res: Result<HandoffCreateResult, _> = client
-        .call(
-            method::HANDOFF_CREATE,
-            json!({
-                "sourceActorId": app.actor_id,
-                "targetActorId": target,
-                "scope": scope,
-                "message": message,
-            }),
-        )
-        .await;
+    use proto::methods::EventAppendResult;
+    let payload = json!({
+        "event": {
+            "type": "content.add",
+            "actorId": app.actor_id,
+            "scope": scope,
+            "payload": { "contentType": "text/markdown", "text": message },
+            "relations": [
+                { "kind": "hands_off_to", "target": { "kind": "actor", "id": target.clone() } }
+            ],
+        }
+    });
+    let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
     match res {
         Ok(_) => app.set_status(format!("handoff → {}", target)),
         Err(e) => app.set_status(format!("handoff failed: {}", e)),
@@ -638,7 +636,7 @@ fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
         if let Some(target_actor_id) = app.history.actor_for_event(reply_to) {
             if target_actor_id != app.actor_id && target_actor_id != "system" {
                 relations.push(json!({
-                    "kind": "targets",
+                    "kind": "hands_off_to",
                     "target": { "kind": "actor", "id": target_actor_id }
                 }));
             }
@@ -713,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_to_other_actor_adds_targets_relation() {
+    fn reply_to_other_actor_adds_hands_off_to_relation() {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
@@ -738,13 +736,13 @@ mod tests {
         assert_eq!(relations[0]["kind"], "replies_to");
         assert_eq!(relations[0]["target"]["kind"], "event");
         assert_eq!(relations[0]["target"]["id"], "evt_123");
-        assert_eq!(relations[1]["kind"], "targets");
+        assert_eq!(relations[1]["kind"], "hands_off_to");
         assert_eq!(relations[1]["target"]["kind"], "actor");
         assert_eq!(relations[1]["target"]["id"], "actor_agent_opencode");
     }
 
     #[test]
-    fn reply_to_self_does_not_add_targets_relation() {
+    fn reply_to_self_does_not_add_hands_off_to_relation() {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),

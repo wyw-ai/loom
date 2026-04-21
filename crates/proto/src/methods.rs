@@ -21,7 +21,6 @@ pub mod method {
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const EVENT_APPEND: &str = "event/append";
-    pub const HANDOFF_CREATE: &str = "handoff/create";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
     pub const ARTIFACT_READ: &str = "artifact/read";
@@ -299,23 +298,6 @@ pub struct EventAppendResult {
     pub event: Event,
 }
 
-// ---- handoff/create ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HandoffCreateParams {
-    pub source_actor_id: String,
-    pub target_actor_id: String,
-    pub scope: ScopeRef,
-    #[serde(default)]
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandoffCreateResult {
-    pub event: Event,
-}
-
 // ---- artifact/publish / get / read ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,7 +322,6 @@ fn default_text_media_type() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactPublishParams {
-    pub scope: ScopeRef,
     pub ingress: ArtifactIngress,
     pub created_by: String,
 }
@@ -536,5 +517,4 @@ pub mod stream_kind {
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     pub const DELIVERY_UPDATED: &str = "delivery.updated";
     pub const RECEIPT_RECORDED: &str = "receipt.recorded";
-    pub const HANDOFF_CREATED: &str = "handoff.created";
 }

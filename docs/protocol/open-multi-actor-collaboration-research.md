@@ -200,7 +200,7 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 于是：
 
 - `reply` 是 `replies_to` 关系。
-- 面向机器的显式定向是 `targets` 或 `hands_off_to` 关系。
+- 面向机器的显式定向是 `hands_off_to` 关系。
 - 文本里的 `@handle` 属于 binding 层输入语法，不是核心协议关系。
 - handoff 是 `hands_off_to` 关系。
 - artifact 关联是 `attaches_artifact` 关系。
@@ -269,7 +269,7 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 | 顶层共享时间线 | `Channel + Event` |
 | 局部子讨论 | `Thread` |
 | `reply` 关系 | `Relation(replies_to)` |
-| actor 定向投递 | `Relation(targets or hands_off_to) + Delivery` |
+| actor 定向投递 | `Relation(hands_off_to) + Delivery` |
 | 显式 handoff | `Event + Relation(hands_off_to)` |
 | 流式输出 | `Turn + ordered Event` |
 | 工具轨迹 | turn 私有 trace 通道（owner-only），不进事件流 |

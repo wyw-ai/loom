@@ -114,11 +114,16 @@ pub struct Turn {
 #[serde(rename_all = "snake_case")]
 pub enum RelationKind {
     RepliesTo,
-    Targets,
+    /// "X is meant for actor Y." Used for both explicit handoffs (`/handoff`,
+    /// `@mention`) and reply-induced targeting. The legacy distinction
+    /// between `targets` (soft @ mention) and `hands_off_to` (must respond)
+    /// collapsed once the policy became "@ always implies handoff" — old
+    /// journals using the `"targets"` discriminator still load via the
+    /// serde alias.
+    #[serde(alias = "targets")]
     HandsOffTo,
     RespondsTo,
     AttachesArtifact,
-    References,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +139,9 @@ pub struct Relation {
 pub struct Event {
     pub id: String,
     /// Event type, e.g. "content.add", "action.request", "action.response",
-    /// "handoff.offer", "artifact.publish", "turn.close". Vendor extensions
+    /// "artifact.publish", "turn.close". Handoff is expressed as a
+    /// `content.add` carrying a `HandsOffTo` relation rather than a
+    /// dedicated event kind. Vendor extensions
     /// allowed. Agent tool calls and internal status changes are NOT events;
     /// they are turn-private trace frames carried by `turn/trace.update`
     /// (see `proto::types::trace`).
@@ -159,8 +166,6 @@ pub struct Event {
 pub enum ArtifactKind {
     File,
     Directory,
-    Bundle,
-    Blob,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,14 +321,6 @@ pub mod payload {
 
     fn default_kind() -> String {
         "accepted".into()
-    }
-
-    /// Payload for `handoff.offer`.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct HandoffOffer {
-        #[serde(default)]
-        pub message: String,
     }
 
     /// Payload for `turn.close`.

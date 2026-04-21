@@ -1,0 +1,842 @@
+//! Command transport adapter (per docs/command-transport-v0.md).
+//!
+//! Unlike [`AcpAdapter`](super::acp::AcpAdapter) — which keeps a single long-lived
+//! child process and streams every prompt through one ACP session — this adapter
+//! spawns a fresh subprocess for each prompt. State persists across prompts by
+//! delegating to the underlying CLI's own session/resume mechanism (`claude
+//! --resume <id>`, `codex resume`, etc.); joi only bookkeeps the
+//! `(actor_id, scope_id) -> session_id` mapping in
+//! `~/.local/share/joi/agent-client/sessions/<actor>/<scope_id>.json`.
+//!
+//! E2 scope (initial implementation):
+//!   * `output_format`: `Text`, `NdjsonLines`, `ClaudeStreamJson`. CodexStreamJson
+//!     is wired through but its translation table is a placeholder per the doc.
+//!   * `prompt_via`: `Args`, `Stdin`, `Env`.
+//!   * `first_run_capture`: `stdout_json:<path>`, `file:<path>`. The
+//!     `stderr_regex:` form is recognised but returns an unimplemented error so
+//!     it is obvious in logs (rather than silently swallowed).
+//!   * Session bookkeeping: written to disk, read back on next prompt; signature
+//!     mismatch invalidates and forces a first-run path.
+//!
+//! Per the trait, `Adapter::start` only sets the adapter up — it does NOT spawn
+//! anything, because a command-transport agent is not "running" between prompts.
+//! All work happens in `send_prompt`, which spawns a child, drains it, and emits
+//! `AdapterEvent`s synchronously.
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use proto::methods::{CommandOutputFormat, PromptVia};
+use proto::types::ScopeRef;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+
+use super::adapter::{Adapter, AdapterEvent, AdapterStartInfo};
+
+/// Snapshot of the bits of `AgentTransport` the command adapter cares about,
+/// pre-expanded with template variables that don't depend on the per-prompt
+/// scope (env / cwd / static args). Per-prompt expansion (scope.id, session_id,
+/// prompt) happens later in `send_prompt`.
+#[derive(Debug, Clone)]
+pub struct CommandConfig {
+    pub actor_id: String,
+    pub command: String,
+    /// First-run argv (template — `{prompt}` may appear when `prompt_via=args`).
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    pub first_run_capture: Option<String>,
+    pub resume_args: Option<Vec<String>>,
+    pub output_format: CommandOutputFormat,
+    pub prompt_via: PromptVia,
+    /// Where to keep `<actor>/<scope_id>.json` session bookkeeping files. The
+    /// adapter creates subdirs lazily on first write.
+    pub sessions_dir: PathBuf,
+    /// Hash of `command` + `args` template (pre-expansion) — when the spec
+    /// changes the saved sessions are invalidated.
+    pub command_signature: String,
+}
+
+impl CommandConfig {
+    pub fn from_transport(
+        actor_id: String,
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+        spec: &proto::methods::AgentTransport,
+        sessions_dir: PathBuf,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(command.as_bytes());
+        for a in &args {
+            hasher.update(b"\x00");
+            hasher.update(a.as_bytes());
+        }
+        let command_signature = format!("sha256:{}", hex::encode(hasher.finalize()));
+        let session = spec.session.clone();
+        Self {
+            actor_id,
+            command,
+            args,
+            env,
+            cwd,
+            first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
+            resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
+            output_format: spec.output_format.unwrap_or_default(),
+            prompt_via: spec.prompt_via,
+            sessions_dir,
+            command_signature,
+        }
+    }
+}
+
+pub struct CommandAdapter {
+    cfg: CommandConfig,
+    inner: Mutex<CommandInner>,
+}
+
+struct CommandInner {
+    event_sender: Option<mpsc::UnboundedSender<AdapterEvent>>,
+}
+
+impl CommandAdapter {
+    pub fn new(cfg: CommandConfig) -> Self {
+        Self {
+            cfg,
+            inner: Mutex::new(CommandInner { event_sender: None }),
+        }
+    }
+
+    fn sender(&self) -> Result<mpsc::UnboundedSender<AdapterEvent>, String> {
+        self.inner
+            .lock()
+            .event_sender
+            .clone()
+            .ok_or_else(|| "command adapter not started".to_string())
+    }
+}
+
+#[async_trait]
+impl Adapter for CommandAdapter {
+    /// "Start" for command transport just stashes the event sender — there is
+    /// no long-lived child to spawn yet. The first `send_prompt` call does the
+    /// actual work.
+    async fn start(
+        &self,
+        events: mpsc::UnboundedSender<AdapterEvent>,
+    ) -> Result<AdapterStartInfo, String> {
+        self.inner.lock().event_sender = Some(events);
+        Ok(AdapterStartInfo {
+            pid: None,
+            session_id: format!("cmd:{}", self.cfg.actor_id),
+        })
+    }
+
+    async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String> {
+        if prompt.is_empty() {
+            let _ = self.sender()?.send(AdapterEvent::Error {
+                message: "empty prompt".into(),
+            });
+            return Ok(());
+        }
+        let sender = self.sender()?;
+        let cfg = self.cfg.clone();
+        tokio::task::spawn_blocking(move || run_prompt(cfg, scope, prompt, sender))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    async fn respond_action(
+        &self,
+        _request_id: String,
+        _option_id: String,
+    ) -> Result<(), String> {
+        // Command transport does not surface permission prompts (no reverse
+        // channel from the one-shot subprocess back into joi). Anyone calling
+        // this for a command adapter has a bug elsewhere; report it loudly.
+        Err("command transport does not support action requests".into())
+    }
+
+    async fn stop(&self) -> Result<(), String> {
+        // Nothing to stop — each prompt's subprocess exits on its own. Drop the
+        // sender so the runtime's event consumer can close cleanly.
+        self.inner.lock().event_sender = None;
+        Ok(())
+    }
+}
+
+fn run_prompt(
+    cfg: CommandConfig,
+    scope: ScopeRef,
+    prompt: String,
+    sender: mpsc::UnboundedSender<AdapterEvent>,
+) -> Result<(), String> {
+    let session = load_session(&cfg, &scope.id);
+    let resume_session_id = session
+        .as_ref()
+        .filter(|s| s.command_signature == cfg.command_signature)
+        .map(|s| s.session_id.clone());
+
+    // First-run vs resume: if a usable session is on disk AND the spec supports
+    // resume, build the argv from `resume_args`; otherwise build the first-run
+    // argv from `args`.
+    let (argv, is_first_run) = match (resume_session_id.as_deref(), cfg.resume_args.as_ref()) {
+        (Some(sid), Some(template)) => (
+            expand_argv(template, &cfg, &scope, Some(sid), &prompt),
+            false,
+        ),
+        _ => (
+            expand_first_run_argv(&cfg, &scope, &prompt),
+            true,
+        ),
+    };
+
+    let result = spawn_and_collect(&cfg, &scope, &prompt, &argv, &sender);
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = sender.send(AdapterEvent::Error {
+                message: format!("command adapter spawn error: {e}"),
+            });
+            let _ = sender.send(AdapterEvent::Finished {
+                success: false,
+                summary: e.clone(),
+            });
+            return Err(e);
+        }
+    };
+
+    // First-run capture: try once, save to disk on success.
+    if is_first_run {
+        if let Some(rule) = cfg.first_run_capture.as_ref() {
+            match capture_session_id(rule, &outcome, &cfg, &scope) {
+                Ok(Some(sid)) => {
+                    if let Err(e) = save_session(&cfg, &scope.id, &sid) {
+                        tracing::warn!(actor = %cfg.actor_id, %e, "failed to save command session");
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(actor = %cfg.actor_id, rule = %rule,
+                        "command transport: first_run_capture matched no session id");
+                }
+                Err(e) => {
+                    tracing::warn!(actor = %cfg.actor_id, %e,
+                        "command transport: first_run_capture failed");
+                }
+            }
+        }
+    } else if outcome.exit_code != 0 && looks_like_session_lost(&outcome.stderr) {
+        // Resume failed in a way that suggests the underlying session is gone.
+        // Drop the bookkeeping so the next call retries as a first run. We do
+        // NOT auto-retry inside this call — the user's prompt has already been
+        // reported as failed; re-running it silently could double-charge LLM
+        // calls.
+        let _ = delete_session(&cfg, &scope.id);
+        tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
+            "command transport: dropped stale session after resume failure");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SpawnOutcome {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn spawn_and_collect(
+    cfg: &CommandConfig,
+    _scope: &ScopeRef,
+    prompt: &str,
+    argv: &[String],
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> Result<SpawnOutcome, String> {
+    std::fs::create_dir_all(&cfg.cwd).map_err(|e| {
+        format!("failed to create command cwd `{}`: {}", cfg.cwd.display(), e)
+    })?;
+    let mut cmd = Command::new(&cfg.command);
+    cmd.args(argv)
+        .current_dir(&cfg.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in &cfg.env {
+        cmd.env(k, v);
+    }
+    if matches!(cfg.prompt_via, PromptVia::Env) {
+        cmd.env("JOI_PROMPT", prompt);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))?;
+
+    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(prompt.as_bytes())
+                .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
+        }
+    }
+    // Drop unused stdin so the child doesn't block on read.
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
+    let stderr = child.stderr.take().ok_or("failed to open child stderr")?;
+
+    // Stream stdout in a foreground loop so we can translate it live; collect
+    // stderr on a thread purely so it doesn't fill its pipe and deadlock.
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut r = BufReader::new(stderr);
+        let _ = r.read_to_string(&mut buf);
+        buf
+    });
+
+    let mut collected_stdout = String::new();
+    match cfg.output_format {
+        CommandOutputFormat::Text => {
+            let mut r = BufReader::new(stdout);
+            let _ = r.read_to_string(&mut collected_stdout);
+        }
+        CommandOutputFormat::NdjsonLines => {
+            let r = BufReader::new(stdout);
+            for line in r.lines().map_while(Result::ok) {
+                collected_stdout.push_str(&line);
+                collected_stdout.push('\n');
+                translate_ndjson_line(&line, sender);
+            }
+        }
+        CommandOutputFormat::ClaudeStreamJson => {
+            let r = BufReader::new(stdout);
+            for line in r.lines().map_while(Result::ok) {
+                collected_stdout.push_str(&line);
+                collected_stdout.push('\n');
+                translate_claude_stream_line(&line, sender);
+            }
+        }
+        CommandOutputFormat::CodexStreamJson => {
+            let r = BufReader::new(stdout);
+            for line in r.lines().map_while(Result::ok) {
+                collected_stdout.push_str(&line);
+                collected_stdout.push('\n');
+                translate_codex_stream_line(&line, sender);
+            }
+        }
+    }
+
+    let exit = child
+        .wait()
+        .map_err(|e| format!("failed to wait on child: {e}"))?;
+    let collected_stderr = stderr_handle.join().unwrap_or_default();
+    let exit_code = exit.code().unwrap_or(-1);
+
+    // Emit the closing events appropriate to the chosen format. Stream formats
+    // already pushed partial Text frames inline; we only need the final flush
+    // + Finished here. The Text format never pushed anything, so we emit the
+    // whole stdout as a single Text and then Finished.
+    let success = exit_code == 0;
+    let summary = if success {
+        String::new()
+    } else if !collected_stderr.is_empty() {
+        truncate_for_summary(&collected_stderr)
+    } else {
+        format!("exited with code {exit_code}")
+    };
+
+    match cfg.output_format {
+        CommandOutputFormat::Text => {
+            if !collected_stdout.is_empty() {
+                let _ = sender.send(AdapterEvent::Text {
+                    content: collected_stdout.clone(),
+                    is_partial: false,
+                });
+            }
+        }
+        _ => {
+            // Force a buffer flush downstream by emitting an empty
+            // is_partial=false Text frame; the runtime's `take_text_buffer`
+            // will turn whatever was accumulated into a single content.add.
+            let _ = sender.send(AdapterEvent::Text {
+                content: String::new(),
+                is_partial: false,
+            });
+        }
+    }
+    let _ = sender.send(AdapterEvent::Finished { success, summary });
+
+    Ok(SpawnOutcome {
+        exit_code,
+        stdout: collected_stdout,
+        stderr: collected_stderr,
+    })
+}
+
+fn truncate_for_summary(s: &str) -> String {
+    const MAX: usize = 500;
+    if s.len() <= MAX {
+        s.trim().to_string()
+    } else {
+        let mut t = s[..MAX].trim().to_string();
+        t.push_str("…");
+        t
+    }
+}
+
+// ---------------- output_format translators ----------------
+
+fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match kind {
+        "text" => {
+            if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                let _ = sender.send(AdapterEvent::Text {
+                    content: t.to_string(),
+                    is_partial: true,
+                });
+            }
+        }
+        "tool" => {
+            let name = v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input = v.get("input").cloned().unwrap_or(Value::Null);
+            let _ = sender.send(AdapterEvent::ToolUse {
+                tool_name: name,
+                input,
+            });
+        }
+        "status" => {
+            if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
+                let _ = sender.send(AdapterEvent::StatusChange {
+                    status: s.to_string(),
+                });
+            }
+        }
+        "error" => {
+            let msg = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("ndjson error frame")
+                .to_string();
+            let _ = sender.send(AdapterEvent::Error { message: msg });
+        }
+        // "done" and unknown kinds: caller handles the final flush + Finished
+        // outside the per-line loop, so nothing to do here.
+        _ => {}
+    }
+}
+
+fn translate_claude_stream_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let outer = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match outer {
+        "assistant" => {
+            let blocks = v
+                .pointer("/message/content")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for b in blocks {
+                let kind = b.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                match kind {
+                    "text" => {
+                        if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                            let _ = sender.send(AdapterEvent::Text {
+                                content: t.to_string(),
+                                is_partial: true,
+                            });
+                        }
+                    }
+                    "tool_use" => {
+                        let name = b
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = b.get("input").cloned().unwrap_or(Value::Null);
+                        let _ = sender.send(AdapterEvent::ToolUse {
+                            tool_name: name,
+                            input,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // tool_result frames are internal to claude — the user already has
+        // text turn output; don't surface them as their own events.
+        "user" | "system" | "result" => {}
+        _ => {}
+    }
+}
+
+fn translate_codex_stream_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+    // Placeholder per docs/command-transport-v0.md §6.3. The schema is not
+    // pinned yet; treat any `output_text.delta` we see as text and leave the
+    // rest for the next iteration.
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+        match t {
+            "output_text.delta" => {
+                if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        content: d.to_string(),
+                        is_partial: true,
+                    });
+                }
+            }
+            "tool_call" => {
+                let name = v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input = v.get("arguments").cloned().unwrap_or(Value::Null);
+                let _ = sender.send(AdapterEvent::ToolUse {
+                    tool_name: name,
+                    input,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------- session bookkeeping ----------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionRecord {
+    actor_id: String,
+    scope: ScopeRef,
+    session_id: String,
+    created_at: String,
+    last_used_at: String,
+    command_signature: String,
+}
+
+fn session_path(cfg: &CommandConfig, scope_id: &str) -> PathBuf {
+    cfg.sessions_dir
+        .join(&cfg.actor_id)
+        .join(format!("{scope_id}.json"))
+}
+
+fn load_session(cfg: &CommandConfig, scope_id: &str) -> Option<SessionRecord> {
+    let path = session_path(cfg, scope_id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_session(cfg: &CommandConfig, scope_id: &str, session_id: &str) -> std::io::Result<()> {
+    let path = session_path(cfg, scope_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let existing = load_session(cfg, scope_id);
+    let record = SessionRecord {
+        actor_id: cfg.actor_id.clone(),
+        scope: ScopeRef {
+            kind: existing
+                .as_ref()
+                .map(|e| e.scope.kind)
+                .unwrap_or(proto::types::ScopeKind::Thread),
+            id: scope_id.to_string(),
+        },
+        session_id: session_id.to_string(),
+        created_at: existing.map(|e| e.created_at).unwrap_or_else(|| now.clone()),
+        last_used_at: now,
+        command_signature: cfg.command_signature.clone(),
+    };
+    let json = serde_json::to_string_pretty(&record)?;
+    std::fs::write(path, json)
+}
+
+fn delete_session(cfg: &CommandConfig, scope_id: &str) -> std::io::Result<()> {
+    let path = session_path(cfg, scope_id);
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn looks_like_session_lost(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("session not found")
+        || s.contains("unknown session")
+        || s.contains("no such session")
+}
+
+// ---------------- first_run_capture ----------------
+
+fn capture_session_id(
+    rule: &str,
+    outcome: &SpawnOutcome,
+    cfg: &CommandConfig,
+    scope: &ScopeRef,
+) -> Result<Option<String>, String> {
+    if let Some(path) = rule.strip_prefix("stdout_json:") {
+        return Ok(extract_json_path(&outcome.stdout, path));
+    }
+    if let Some(_re) = rule.strip_prefix("stderr_regex:") {
+        return Err("stderr_regex first_run_capture not yet implemented".into());
+    }
+    if let Some(path) = rule.strip_prefix("file:") {
+        let expanded = expand_template(path, cfg, scope, None, "");
+        let text = std::fs::read_to_string(&expanded)
+            .map_err(|e| format!("failed to read capture file `{expanded}`: {e}"))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(trimmed.to_string()));
+    }
+    Err(format!("unknown first_run_capture rule: {rule}"))
+}
+
+fn extract_json_path(stdout: &str, path: &str) -> Option<String> {
+    // Try the whole stdout as one JSON document first; fall back to
+    // line-by-line so we handle ndjson-style streams too.
+    if let Ok(v) = serde_json::from_str::<Value>(stdout) {
+        if let Some(s) = json_path_lookup(&v, path) {
+            return Some(s);
+        }
+    }
+    let mut found: Option<String> = None;
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if let Some(s) = json_path_lookup(&v, path) {
+                // Per the doc: "find the last line that matches" — keep
+                // overwriting so the loop ends with the most recent value.
+                found = Some(s);
+            }
+        }
+    }
+    found
+}
+
+/// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`. No filters,
+/// pipes, or functions.
+fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
+    let path = path.strip_prefix('.').unwrap_or(path);
+    let mut cur = root;
+    for raw in path.split('.') {
+        if raw.is_empty() {
+            continue;
+        }
+        // Parse `name[3]` → key + indices.
+        let (key, indices) = parse_segment(raw);
+        if !key.is_empty() {
+            cur = cur.get(key)?;
+        }
+        for idx in indices {
+            cur = cur.get(idx)?;
+        }
+    }
+    match cur {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
+    let mut indices = Vec::new();
+    let key_end = seg.find('[').unwrap_or(seg.len());
+    let key = &seg[..key_end];
+    let mut rest = &seg[key_end..];
+    while let Some(open) = rest.find('[') {
+        let close = match rest.find(']') {
+            Some(c) if c > open => c,
+            _ => break,
+        };
+        if let Ok(n) = rest[open + 1..close].parse::<usize>() {
+            indices.push(n);
+        }
+        rest = &rest[close + 1..];
+    }
+    (key, indices)
+}
+
+// ---------------- argv & template expansion ----------------
+
+fn expand_first_run_argv(cfg: &CommandConfig, scope: &ScopeRef, prompt: &str) -> Vec<String> {
+    let mut argv: Vec<String> = cfg
+        .args
+        .iter()
+        .map(|a| expand_template(a, cfg, scope, None, prompt))
+        .collect();
+    if matches!(cfg.prompt_via, PromptVia::Args) {
+        // Only append when the template didn't already place {prompt} itself.
+        let already = argv.iter().any(|a| a == prompt);
+        if !already {
+            argv.push(prompt.to_string());
+        }
+    }
+    argv
+}
+
+fn expand_argv(
+    template: &[String],
+    cfg: &CommandConfig,
+    scope: &ScopeRef,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = template
+        .iter()
+        .map(|a| expand_template(a, cfg, scope, session_id, prompt))
+        .collect();
+    if matches!(cfg.prompt_via, PromptVia::Args) {
+        let already = template.iter().any(|a| a.contains("{prompt}"));
+        if !already {
+            argv.push(prompt.to_string());
+        }
+    }
+    argv
+}
+
+fn expand_template(
+    input: &str,
+    cfg: &CommandConfig,
+    scope: &ScopeRef,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> String {
+    let scope_kind = match scope.kind {
+        proto::types::ScopeKind::Thread => "thread",
+        proto::types::ScopeKind::Channel => "channel",
+    };
+    let mut out = input
+        .replace("{actor.id}", &cfg.actor_id)
+        .replace("{scope.id}", &scope.id)
+        .replace("{scope.kind}", scope_kind)
+        .replace("{prompt}", prompt);
+    if let Some(sid) = session_id {
+        out = out.replace("{session_id}", sid);
+    }
+    out
+}
+
+// Silences the `Arc` import in modules that wrap CommandAdapter behind
+// `Arc<dyn Adapter>` without using anything else from this module yet.
+#[allow(dead_code)]
+fn _arc_keepalive(_: Arc<CommandAdapter>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::types::ScopeKind;
+
+    fn cfg() -> CommandConfig {
+        CommandConfig {
+            actor_id: "actor_demo".into(),
+            command: "echo".into(),
+            args: vec!["-n".into()],
+            env: BTreeMap::new(),
+            cwd: PathBuf::from("/tmp"),
+            first_run_capture: None,
+            resume_args: None,
+            output_format: CommandOutputFormat::Text,
+            prompt_via: PromptVia::Args,
+            sessions_dir: PathBuf::from("/tmp/joi-test-sessions"),
+            command_signature: "sha256:test".into(),
+        }
+    }
+
+    fn scope() -> ScopeRef {
+        ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thr_xyz".into(),
+        }
+    }
+
+    #[test]
+    fn json_path_top_level_string() {
+        let v: Value = serde_json::from_str(r#"{"session_id":"abc"}"#).unwrap();
+        assert_eq!(json_path_lookup(&v, ".session_id"), Some("abc".into()));
+    }
+
+    #[test]
+    fn json_path_nested_with_index() {
+        let v: Value = serde_json::from_str(r#"{"items":[{"id":"first"},{"id":"second"}]}"#)
+            .unwrap();
+        assert_eq!(
+            json_path_lookup(&v, ".items[1].id"),
+            Some("second".into())
+        );
+    }
+
+    #[test]
+    fn json_path_missing_returns_none() {
+        let v: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
+        assert!(json_path_lookup(&v, ".b").is_none());
+    }
+
+    #[test]
+    fn extract_session_id_picks_last_matching_line() {
+        let stdout = "{\"type\":\"system\",\"session_id\":\"first\"}\n\
+                      {\"type\":\"result\",\"session_id\":\"second\"}\n";
+        assert_eq!(
+            extract_json_path(stdout, ".session_id"),
+            Some("second".into())
+        );
+    }
+
+    #[test]
+    fn template_expands_scope_and_session_and_prompt() {
+        let cfg = cfg();
+        let scope = scope();
+        let out = expand_template(
+            "--resume {session_id} --scope {scope.id} -- {prompt}",
+            &cfg,
+            &scope,
+            Some("sid_42"),
+            "hello world",
+        );
+        assert_eq!(out, "--resume sid_42 --scope thr_xyz -- hello world");
+    }
+
+    #[test]
+    fn first_run_argv_appends_prompt_when_args_mode() {
+        let cfg = cfg();
+        let scope = scope();
+        let argv = expand_first_run_argv(&cfg, &scope, "what time is it");
+        assert_eq!(argv, vec!["-n", "what time is it"]);
+    }
+
+    #[test]
+    fn first_run_argv_does_not_double_append_when_template_has_prompt() {
+        let mut cfg = cfg();
+        cfg.args = vec!["--input".into(), "{prompt}".into()];
+        let argv = expand_first_run_argv(&cfg, &scope(), "hi");
+        assert_eq!(argv, vec!["--input", "hi"]);
+    }
+
+    #[test]
+    fn looks_like_session_lost_matches_common_phrases() {
+        assert!(looks_like_session_lost("error: Session not found"));
+        assert!(looks_like_session_lost("UNKNOWN session abc"));
+        assert!(!looks_like_session_lost("everything is fine"));
+    }
+}

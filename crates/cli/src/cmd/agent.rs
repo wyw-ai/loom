@@ -141,6 +141,9 @@ pub async fn add(client: Arc<Client>) -> Result<()> {
             env,
             cwd,
             auth_method: None,
+            session: None,
+            output_format: None,
+            prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
     };

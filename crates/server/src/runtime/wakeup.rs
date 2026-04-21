@@ -89,7 +89,7 @@ async fn wake_agent(
     } else {
         user_text
     };
-    if let Err(e) = adapter.send_prompt(prompt_text).await {
+    if let Err(e) = adapter.send_prompt(trigger.scope.clone(), prompt_text).await {
         let _ = store.close_turn(&turn.id, TurnStatus::Failed);
         manager.set_active_turn(&actor_id, None);
         return Err(e);

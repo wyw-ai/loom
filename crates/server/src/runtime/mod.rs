@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod adapter;
+pub mod command;
 pub mod registry;
 pub mod wakeup;
 
@@ -17,6 +18,7 @@ use crate::store::{Store, StoreError};
 
 use self::acp::AcpAdapter;
 use self::adapter::{Adapter, AdapterEvent};
+use self::command::{CommandAdapter, CommandConfig};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -246,6 +248,13 @@ impl RuntimeManager {
         self.data_dir.join("agents").join(actor_id)
     }
 
+    /// Where the command transport keeps its `(actor, scope) -> session_id`
+    /// bookkeeping. Sits inside the runtime data dir so a wipe of one agent's
+    /// state also clears its resume tokens.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("agent-client").join("sessions")
+    }
+
     pub fn append_log(&self, actor_id: &str, line: String) {
         let mut agents = self.agents.lock();
         if let Some(a) = agents.get_mut(actor_id) {
@@ -426,14 +435,38 @@ impl RuntimeManager {
             .collect::<Vec<_>>();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let cfg = acp::AcpConfig {
-            command: spec.transport.command.clone(),
-            args,
-            env,
-            cwd: workdir,
-            auth_method: spec.transport.auth_method.clone(),
+        let adapter: Arc<dyn Adapter> = match spec.transport.kind.as_str() {
+            // "acp_stdio" is the default and the only kind v0 understood. Empty
+            // string is also tolerated for legacy specs that predate the field.
+            "acp_stdio" | "" => {
+                let cfg = acp::AcpConfig {
+                    command: spec.transport.command.clone(),
+                    args,
+                    env,
+                    cwd: workdir,
+                    auth_method: spec.transport.auth_method.clone(),
+                };
+                Arc::new(AcpAdapter::new(cfg))
+            }
+            "command" => {
+                let sessions_dir = self.sessions_dir();
+                let cfg = CommandConfig::from_transport(
+                    actor_id.to_string(),
+                    spec.transport.command.clone(),
+                    args,
+                    env,
+                    workdir,
+                    &spec.transport,
+                    sessions_dir,
+                );
+                Arc::new(CommandAdapter::new(cfg))
+            }
+            other => {
+                return Err(RuntimeError::Acp(format!(
+                    "unknown transport kind `{other}` for agent {actor_id}"
+                )))
+            }
         };
-        let adapter: Arc<dyn Adapter> = Arc::new(AcpAdapter::new(cfg));
         let info = adapter
             .start(event_tx)
             .await

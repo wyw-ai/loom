@@ -10,6 +10,7 @@
 //! pure refactor.
 
 use async_trait::async_trait;
+use proto::types::ScopeRef;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -23,10 +24,11 @@ pub trait Adapter: Send + Sync {
         events: mpsc::UnboundedSender<AdapterEvent>,
     ) -> Result<AdapterStartInfo, String>;
 
-    /// Forward a single prompt to the agent. For long-lived transports (ACP) this
-    /// is a `session/prompt`; for command-style transports each call corresponds
-    /// to a fresh subprocess.
-    async fn send_prompt(&self, prompt: String) -> Result<(), String>;
+    /// Forward a single prompt to the agent in the given scope. For long-lived
+    /// transports (ACP) `scope` is informational — one child handles every
+    /// scope. For command-style transports the scope keys per-thread session
+    /// bookkeeping at `~/.local/share/joi/agent-client/sessions/<actor>/<scope>.json`.
+    async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String>;
 
     /// Reply to an `AdapterEvent::ActionRequest` previously emitted by the agent.
     /// Transports without permission prompts (e.g. command/v0) may treat this as

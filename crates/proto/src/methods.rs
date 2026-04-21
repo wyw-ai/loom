@@ -392,6 +392,7 @@ pub struct ActorListResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTransport {
+    /// `"acp_stdio"` (default) or `"command"` (see docs/command-transport-v0.md).
     pub kind: String,
     pub command: String,
     #[serde(default)]
@@ -403,6 +404,76 @@ pub struct AgentTransport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "authMethod")]
     pub auth_method: Option<String>,
+
+    // ---- command transport only; ignored when kind != "command" ----
+    /// How to capture and re-use the underlying CLI's session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<CommandSession>,
+    /// Tells the adapter how to translate subprocess output into AdapterEvent.
+    /// Defaults to `text` (whole stdout → one content.add at finish).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "outputFormat"
+    )]
+    pub output_format: Option<CommandOutputFormat>,
+    /// How the prompt text is delivered to the subprocess. Defaults to `args`
+    /// (appended after `args` as the final argv token).
+    #[serde(default, rename = "promptVia")]
+    pub prompt_via: PromptVia,
+}
+
+/// Bookkeeping rules for `transport.kind = "command"`. Both fields together let
+/// the adapter resume an existing session (`first_run_capture` extracts a
+/// session id from the very first invocation; `resume_args` is the argv
+/// template used on subsequent calls).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandSession {
+    /// DSL: `stdout_json:<jq-style-path>`, `stderr_regex:<re>`, `file:<path>`.
+    /// `None` means this CLI does not expose a resumable session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_run_capture: Option<String>,
+    /// Argv template substituted with `{session_id}` and (when `prompt_via=args`)
+    /// `{prompt}`. `None` means resume is not supported (each call is a first run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutputFormat {
+    /// Whole stdout collected → single `content.add` event at process exit.
+    Text,
+    /// Anthropic Claude Code `--output-format stream-json` framing.
+    ClaudeStreamJson,
+    /// OpenAI codex CLI `--output-format stream-json` framing (placeholder).
+    CodexStreamJson,
+    /// Generic line-delimited JSON (each line carries `{"type": "...", ...}`).
+    NdjsonLines,
+}
+
+impl Default for CommandOutputFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptVia {
+    /// Append prompt as the final argv token (default). Safe — no shell parse.
+    Args,
+    /// Write prompt to subprocess stdin, then close stdin.
+    Stdin,
+    /// Inject prompt as the env var `JOI_PROMPT`.
+    Env,
+}
+
+impl Default for PromptVia {
+    fn default() -> Self {
+        Self::Args
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

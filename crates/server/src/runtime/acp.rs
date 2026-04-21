@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use proto::types::ScopeRef;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -219,7 +220,9 @@ impl Adapter for AcpAdapter {
         })
     }
 
-    async fn send_prompt(&self, prompt: String) -> Result<(), String> {
+    async fn send_prompt(&self, _scope: ScopeRef, prompt: String) -> Result<(), String> {
+        // ACP is long-lived per actor; the underlying child handles every scope
+        // through the same session, so `scope` is informational only here.
         self.send_prompt_internal(prompt).await
     }
 

@@ -498,6 +498,9 @@ fn agent_install(state: &AppState, params: Option<Value>) -> HandlerResult {
             env: resolved.env.clone(),
             cwd: "{agent.workspace}".into(),
             auth_method: None,
+            session: None,
+            output_format: None,
+            prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
     };

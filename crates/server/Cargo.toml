@@ -26,3 +26,4 @@ hex = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 futures-util = { workspace = true }
+async-trait = { workspace = true }

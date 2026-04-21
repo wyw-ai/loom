@@ -53,6 +53,7 @@ pub async fn dispatch(
         method::TURN_OPEN => turn_open(state, params),
         method::TURN_CLOSE => turn_close(state, params),
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
+        method::TURN_TRACE_APPEND => turn_trace_append(state, connection_id, params),
         method::EVENT_APPEND => event_append(state, params).await,
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
         method::ARTIFACT_GET => artifact_get(state, params),
@@ -302,6 +303,37 @@ fn turn_trace_read(
             _meta: None,
         },
     })
+}
+
+fn turn_trace_append(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TurnTraceAppendParams = parse_params(params)?;
+    let turn = state
+        .store
+        .get_turn(&p.turn_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "turn"))?;
+    let caller_actor = state
+        .subscriptions
+        .actor_for_connection(connection_id)
+        .ok_or_else(|| {
+            ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor")
+        })?;
+    // Same owner-only constraint as turn_trace_read: only the actor that owns
+    // the turn (the agent for which it was opened) may write its own trace.
+    if caller_actor != turn.actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "trace is private to the turn owner",
+        ));
+    }
+    let frame = state
+        .store
+        .append_trace_frame(&p.turn_id, p.kind, p.payload)
+        .map_err(map_store_err)?;
+    ok(TurnTraceAppendResult { frame })
 }
 
 // ---- event/append ----

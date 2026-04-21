@@ -20,6 +20,7 @@ pub mod method {
     pub const TURN_CLOSE: &str = "turn/close";
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
+    pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
     pub const EVENT_APPEND: &str = "event/append";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
@@ -258,6 +259,27 @@ fn default_trace_limit() -> u32 {
 pub struct TurnTraceReadResult {
     pub frames: Vec<crate::types::trace::TraceFrame>,
     pub page_info: PageInfo,
+}
+
+// ---- turn/trace.append (external client → server) ----
+
+/// Append a turn-private trace frame from an external agent client. v0 wrote
+/// trace frames directly through the in-server runtime; v1 lets `joi agent
+/// serve` push them via this RPC instead. Server fans the new frame out as a
+/// `turn/trace.update` notification to the turn owner just like the embedded
+/// path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnTraceAppendParams {
+    pub turn_id: String,
+    pub kind: crate::types::trace::TraceKind,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnTraceAppendResult {
+    pub frame: crate::types::trace::TraceFrame,
 }
 
 // ---- turn/trace.update notification ----

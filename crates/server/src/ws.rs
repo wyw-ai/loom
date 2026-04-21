@@ -158,5 +158,35 @@ fn fanout(state: &AppState, ev: StoreEvent) {
     let payload = json!({ "kind": kind, "scope": scope, "data": data });
     state
         .subscriptions
-        .broadcast_to_scope(&scope, method::STREAM_UPDATE, payload);
+        .broadcast_to_scope(&scope, method::STREAM_UPDATE, payload.clone());
+
+    // Actor-inbox delivery: when an EventCreated event hands off to an actor,
+    // also push the same stream/update directly to that actor's connection
+    // (if any). This lets an external `joi agent serve` process learn about
+    // its work without having to subscribe to every channel/thread it might
+    // care about. For non-event store events (turn open/close, threads, ...)
+    // there's no hands_off_to to follow, so they only ride the scope fan-out.
+    if let StoreEvent::EventCreated(e) = &ev {
+        use proto::types::{RefKind, RelationKind};
+        let mut already_sent: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        // Don't double-send to an actor whose own connection is also a scope
+        // subscriber — that's a minor optimization but more importantly avoids
+        // self-loops when the agent emits its own events on the same scope.
+        already_sent.insert(e.actor_id.as_str());
+        for r in &e.relations {
+            if !matches!(r.kind, RelationKind::HandsOffTo) {
+                continue;
+            }
+            if r.target.kind != RefKind::Actor {
+                continue;
+            }
+            if !already_sent.insert(r.target.id.as_str()) {
+                continue;
+            }
+            state
+                .subscriptions
+                .send_to_actor(&r.target.id, method::STREAM_UPDATE, payload.clone());
+        }
+    }
 }

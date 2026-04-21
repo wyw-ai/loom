@@ -69,8 +69,20 @@ async fn main() -> Result<()> {
 
     // Stream broadcaster (store events -> stream/update notifications).
     ws::spawn_stream_broadcaster(state.clone());
-    // Runtime supervisor (store events -> ACP child wakeup).
-    runtime::wakeup::spawn_supervisor(runtime.clone(), store.clone());
+    // Runtime supervisor (store events -> ACP child wakeup). Set
+    // `JOI_DISABLE_EMBEDDED_RUNTIME=1` to opt into the v1 model where an
+    // external `joi agent serve` process drives agents instead.
+    let disable_embedded = std::env::var("JOI_DISABLE_EMBEDDED_RUNTIME")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if disable_embedded {
+        tracing::info!(
+            "embedded agent runtime disabled (JOI_DISABLE_EMBEDDED_RUNTIME); \
+             run `joi agent serve` to drive registered agents."
+        );
+    } else {
+        runtime::wakeup::spawn_supervisor(runtime.clone(), store.clone());
+    }
 
     let app = Router::new()
         .route("/rpc", get(ws::ws_upgrade))

@@ -1,5 +1,16 @@
 # 当前 App 实现技术总览
 
+> **架构演进说明**
+>
+> 本文档描述 **v0 实现现状**：agent runtime 由 `joi-server` 内嵌托管。
+>
+> **v1 目标**是把 agent runtime 剥成独立的 `joi agent serve` 进程，并通过
+> adapter 抽象支持 ACP 与 command 两类 transport。设计文档见
+> [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md) 与
+> [docs/command-transport-v0.md](command-transport-v0.md)。
+>
+> v0 内容不再修改——它准确描述当前代码。
+
 ## 1. 文档目的
 
 这份文档描述 `joi-apps` 当前这版实现到底已经落到了什么程度，以及它和协议设计文档之间的对应关系。

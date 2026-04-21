@@ -1,5 +1,16 @@
 # 架构说明
 
+> **架构演进说明**
+>
+> 本文档描述当前已实现的 **v0 拓扑**：`joi-server` 内嵌 agent runtime，`joi-cli`
+> 仅服务人。
+>
+> **v1 目标拓扑**（agent runtime 拆为独立 client、adapter 抽象支持 ACP +
+> command transport）见 [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md)。
+>
+> Command transport 的详细 schema 与 worked example 见
+> [docs/command-transport-v0.md](command-transport-v0.md)。
+
 ## 1. 当前结论
 
 这套东西已经不是“能不能做”的问题了，而是已经落成了一版可联调的 runtime + server + GUI。

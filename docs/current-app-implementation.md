@@ -2,14 +2,17 @@
 
 > **架构演进说明**
 >
-> 本文档描述 **v0 实现现状**：agent runtime 由 `joi-server` 内嵌托管。
+> 本文档描述 **v0 实现现状**：agent runtime 由 `joi-server` 内嵌托管。该路径
+> 仍是默认部署。
 >
-> **v1 目标**是把 agent runtime 剥成独立的 `joi agent serve` 进程，并通过
-> adapter 抽象支持 ACP 与 command 两类 transport。设计文档见
+> **v1 拓扑**（agent runtime 剥成独立 `joi agent serve` 进程、adapter 抽象
+> 支持 ACP 与 command 两类 transport）的代码已落 phase E1–E3：在 server 端
+> 设置 `JOI_DISABLE_EMBEDDED_RUNTIME=1` 即切到 v1 部署，由 `joi agent serve`
+> 接管 supervisor。设计文档见
 > [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md) 与
 > [docs/command-transport-v0.md](command-transport-v0.md)。
 >
-> v0 内容不再修改——它准确描述当前代码。
+> v0 内容不再修改——它准确描述当前默认拓扑下的代码。
 
 ## 1. 文档目的
 

@@ -1,9 +1,35 @@
 # 架构 v1：Agent Client 拆分 + Adapter 模型
 
-> **状态**：设计文档（draft），尚未落代码。配套规范见
-> [docs/command-transport-v0.md](command-transport-v0.md)。
+> **状态**：phase E1–E3 已落代码（`refactor: extract trait Adapter`、
+> `feat(server): add CommandAdapter`、`refactor: extract agent-runtime crate`、
+> `feat(server): hooks for external agent client`、
+> `feat(cli): joi agent serve external runtime client`）。E4（删除 server 内嵌
+> runtime）延后——v0 嵌入路径与 v1 外置路径目前并存，由
+> `JOI_DISABLE_EMBEDDED_RUNTIME=1` 环境变量在 server 端切换。
+> 配套规范见 [docs/command-transport-v0.md](command-transport-v0.md)。
 > v0 当前实现见 [docs/architecture.md](architecture.md) 与
 > [docs/current-app-implementation.md](current-app-implementation.md)。
+
+## TL;DR — v1 部署快速上手
+
+```bash
+# 终端 1：启动 server，关掉嵌入 supervisor
+JOI_DISABLE_EMBEDDED_RUNTIME=1 cargo run -p joi-server
+
+# 终端 2：把 v0 的 agent spec 拷到 client 配置目录
+mkdir -p ~/.config/joi/agents
+cp data/agents/*.json ~/.config/joi/agents/
+
+# 终端 3：跑 agent client；它会为每个 spec 起一条 ws 连接
+cargo run -p joi-cli -- agent serve
+
+# 终端 4：照常使用 chat
+cargo run -p joi-cli -- chat --in <thread_id>
+```
+
+不设 `JOI_DISABLE_EMBEDDED_RUNTIME` 时 server 仍然内嵌 supervisor，跟 v0 行为一
+致；同时跑 `joi agent serve` 会和内嵌 supervisor 竞争 `turn/open`，所以两者只能
+二选一。
 
 ---
 
@@ -163,14 +189,16 @@ id 与 `actor.kind = "agent"`）。这样 server 端 `subscribe::bind_actor` 的
 
 ### 3.3 配置位置
 
-| 内容 | v0 位置 | v1 位置 |
+| 内容 | v0 位置 | v1 位置（已实现） |
 | --- | --- | --- |
-| Agent spec（`*.json`） | `<server-data>/agents/` 由 server 扫描 | `~/.config/joi/agents/` 由 agent client 扫描 |
-| Marketplace catalog | server `assets/marketplace.json`（编译进二进制） | 同上，但搬到 cli crate 下；`joi agent install` 在 client 本地写文件 |
-| Agent workspace（`{agent.workspace}` 等模板变量） | `<server-data>/agents/<id>/{workspace,cache,logs}` | `~/.local/share/joi/agents/<id>/{workspace,cache,logs}` |
+| Agent spec（`*.json`） | `<server-data>/agents/` 由 server 扫描 | `~/.config/joi/agents/` 由 agent client 扫描；`--specs <dir>` 可覆盖 |
+| Marketplace catalog | server `assets/marketplace.json`（编译进二进制） | 暂未搬迁；仍由 server 暴露 `agent/marketplace`，`joi agent install` 走 server RPC（E4 之后再搬） |
+| Agent workspace（`{agent.workspace}` 等模板变量） | `<server-data>/agents/<id>/{workspace,cache,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,cache,logs}` |
+| Command session 簿记 | （v0 没有 command transport） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
 
-> **迁移工具**：phase E3 落地时提供 `joi agent migrate-from-server <server-data-dir>`
-> 一次性把 agent spec / workspace 拷到 client 本地。
+> **迁移工具**：尚未提供专门的 `migrate-from-server` 命令；当前用法是手工
+> `cp <server-data>/agents/*.json ~/.config/joi/agents/`，因为 spec 文件结构本身没变。
+> phase E4 清理 server 时再考虑是否需要正式迁移工具。
 
 ---
 
@@ -440,40 +468,58 @@ sequenceDiagram
 
 四个 phase，每个都可以独立验证、独立合并。
 
-### Phase E1：抽 trait（同进程内重构）
+### Phase E1：抽 trait（同进程内重构） ✅ 已合
 
-- 在 `crates/server/src/runtime/` 下新增 `adapter.rs`，定义 `trait Adapter` 与
-  `AdapterEvent`（即 v0 `AgentEvent` 改名）。
-- 把现有 `AcpAdapter` 套上 trait（实现层不动，只加 `impl Adapter for AcpAdapter`
-  + 把 `start` 签名对齐）。
-- `RuntimeManager` 从 `Option<Arc<AcpAdapter>>` 改成 `Option<Arc<dyn Adapter>>`。
-- 验证：现有 `actor_opencode` 启动 + handoff 流程不变。
+提交：`refactor: extract trait Adapter`。
 
-### Phase E2：实现 `CommandAdapter`（仍在 server 进程内）
+- ~~在 `crates/server/src/runtime/` 下新增 `adapter.rs`，定义 `trait Adapter` 与
+  `AdapterEvent`（即 v0 `AgentEvent` 改名）。~~
+- ~~把现有 `AcpAdapter` 套上 trait。~~
+- ~~`RuntimeManager` 从 `Option<Arc<AcpAdapter>>` 改成 `Option<Arc<dyn Adapter>>`。~~
 
-- 新增 `CommandAdapter`：实现见 [docs/command-transport-v0.md](command-transport-v0.md)
-  §6 与 §7。
-- `AgentTransport::kind` 增加 `"command"` 分支；`RuntimeManager::ensure_started`
-  按 kind 选 adapter。
-- 验证：写一份 `claude -p` 的 spec，端到端跑通"人发 hand-off → adapter spawn 子
-  进程 → 输出 → 写回 content.add"。
+实际落点：trait 与 `AdapterEvent` 现在在 `crates/agent-runtime` crate 中，
+`AcpAdapter` 实现了它；server 端 `RuntimeManager` 通过 `Arc<dyn Adapter>` 持有。
 
-### Phase E3：搬出去（新增 `joi agent serve` 子命令）
+### Phase E2：实现 `CommandAdapter` ✅ 已合
 
-- 新增 crate `crates/agent-client/`，把 `runtime/{adapter,acp,command,wakeup}.rs`
-  的核心逻辑搬过来。`crates/cli/` 增加 `cmd::agent::serve` 子命令。
-- 之前 `wakeup.rs` 直接调 `store` 的地方，全部改成走 `crates/cli/src/client.rs`
-  的 RPC client。
-- Server 端 `runtime/` 模块**仍然保留**——为了向后兼容（旧部署仍然在 server 里
-  跑 ACP），但加 feature flag `legacy-runtime`，默认 off。
-- 文档与示例改成"`joi-server`、`joi agent serve` 两个进程并行启动"。
+提交：`feat(server): add CommandAdapter`。
 
-### Phase E4：清理 server
+- `AgentTransport::kind` 增加 `"command"` 分支；
+- 新增 [`CommandAdapter`](../crates/agent-runtime/src/adapter/command.rs)，
+  实现 spec 见 [docs/command-transport-v0.md](command-transport-v0.md)。
+- 端到端跑通"人发 hand-off → adapter spawn 子进程 → 输出 → 写回 content.add"。
 
-- 默认部署不再启用 `legacy-runtime`，删除 `crates/server/src/runtime/`。
+### Phase E3：搬出去 ✅ 已合（分三步）
+
+- **E3a**（`refactor: extract agent-runtime crate`）：把
+  `runtime/{adapter,acp,command}` 整体提取到独立 crate `crates/agent-runtime/`，
+  让 server 与 cli 都能依赖。
+- **E3b**（`feat(server): hooks for external agent client`）：server 端加
+  `JOI_DISABLE_EMBEDDED_RUNTIME` 环境变量（`true|1|yes` 时跳过 supervisor 启动），
+  允许外部 client 接管 actor 上线。
+- **E3c**（`feat(cli): joi agent serve external runtime client`）：新增
+  [`crates/cli/src/cmd/agent_serve.rs`](../crates/cli/src/cmd/agent_serve.rs)
+  实现 `joi agent serve [--specs <dir>]`：扫 `~/.config/joi/agents/`，每个 spec 起
+  一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
+  `hands_off_to` 翻译成 `turn/open` + `send_prompt` + 流式 trace + `turn/close`。
+
+### Phase E4：清理 server ⏳ 延后
+
+提交：尚未落地，**v0 嵌入路径与 v1 外置路径目前并存**。切换方式：在 server 端
+设置 `JOI_DISABLE_EMBEDDED_RUNTIME=1` 即让 server 退化为纯消息枢纽，由
+`joi agent serve` 接管 supervisor。两者**不能同时运行**——会在 `turn/open`
+上抢占。
+
+后续 E4 真正落地时要做：
+
+- 默认部署不再启用嵌入 supervisor，删除 `crates/server/src/runtime/`（或缩成
+  feature flag `legacy-runtime` 并默认 off）。
 - `agent/*` RPC 退化为只读（基于 connection 视图），或彻底移除。
-- `crates/proto/src/methods.rs` 中 `AgentSpec` / `AgentTransport` 留下（因为
-  agent client 仍然要用），但移到独立 mod 表明它们不属于 server 协议。
+- `crates/proto/src/methods.rs` 中 `AgentSpec` / `AgentTransport` 移到独立 mod
+  表明它们不属于 server 协议。
+
+延后理由：当前 GUI / 旧 CLI 仍然有路径走 `agent/list` `agent/install` 等 RPC，
+彻底删除会断掉 marketplace 流程；先让两路并存，等 v1 deploy 跑稳再清理。
 
 每个 phase 都满足"可灰度"：E1/E2 没有协议变更；E3 让 server 同时能跑两种部署模
 式；E4 才是 breaking change。

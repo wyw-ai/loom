@@ -3,6 +3,23 @@
 version = 4
 
 [[package]]
+name = "agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "parking_lot",
+ "proto",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -937,6 +954,7 @@ dependencies = [
 name = "joi-server"
 version = "0.1.0"
 dependencies = [
+ "agent-runtime",
  "anyhow",
  "async-trait",
  "axum",

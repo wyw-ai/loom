@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/server", "crates/cli"]
+members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ authors = ["bojun.cbj"]
 
 [workspace.dependencies]
 proto = { path = "crates/proto" }
+agent-runtime = { path = "crates/agent-runtime" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -136,6 +136,14 @@ async fn refresh_actor_directory(client: &Client, app: &mut App) {
                 proto::types::ActorKind::Agent => "agent",
                 proto::types::ActorKind::Service => "service",
             };
+            // In v1 mode the server's `agent/list` is empty (the registry lives
+            // in the external `joi agent serve` process). Promote any
+            // kind=Agent actor we see in `actor/list` so handoff/@-mention
+            // pickers still find them. v0 mode stays correct because
+            // `agent/list` below re-inserts the same ids idempotently.
+            if matches!(a.kind, proto::types::ActorKind::Agent) {
+                app.agent_ids.insert(a.id.clone());
+            }
             app.actor_kinds.insert(a.id.clone(), kind.to_string());
             app.display_for.insert(a.id, name);
         }
@@ -581,28 +589,47 @@ async fn do_action_response(
 }
 
 async fn list_agents(client: &Arc<Client>, app: &mut App) {
-    use proto::methods::AgentListResult;
-    match client
+    use proto::methods::{ActorListResult, AgentListResult};
+    use std::collections::BTreeMap;
+
+    // (id, display, status). v0 path fills status from agent/list; v1 path
+    // (where the registry lives in `joi agent serve`) leaves status empty.
+    let mut rows: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    if let Ok(list) = client
         .call::<_, AgentListResult>(method::AGENT_LIST, json!({}))
         .await
     {
-        Ok(list) => {
-            if list.agents.is_empty() {
-                app.history.push_system("(no agents registered)");
-            } else {
-                let header = "Registered agents:".to_string();
-                app.history.push_system(header);
-                for ai in list.agents {
-                    // Width-padded so columns line up without tab characters.
-                    let line = format!(
-                        "  • {:<24} {:<20} ({})",
-                        ai.spec.actor.id, ai.spec.actor.display_name, ai.status
-                    );
-                    app.history.push_system(line);
-                }
-            }
+        for ai in list.agents {
+            let actor = ai.spec.actor;
+            rows.insert(actor.id.clone(), (actor.display_name, ai.status));
         }
-        Err(e) => app.set_status(format!("agent/list failed: {}", e)),
+    }
+    if let Ok(list) = client
+        .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
+        .await
+    {
+        for a in list.actors {
+            if !matches!(a.kind, proto::types::ActorKind::Agent) {
+                continue;
+            }
+            rows.entry(a.id)
+                .or_insert((a.display_name, String::new()));
+        }
+    }
+
+    if rows.is_empty() {
+        app.history.push_system("(no agents registered)");
+        return;
+    }
+    app.history.push_system("Registered agents:".to_string());
+    for (id, (display, status)) in rows {
+        let line = if status.is_empty() {
+            format!("  • {:<24} {}", id, display)
+        } else {
+            format!("  • {:<24} {:<20} ({})", id, display, status)
+        };
+        app.history.push_system(line);
     }
 }
 

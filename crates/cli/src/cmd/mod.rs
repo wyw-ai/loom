@@ -1,6 +1,7 @@
 pub mod action;
 pub mod actor;
 pub mod agent;
+pub mod agent_serve;
 pub mod artifact;
 pub mod channel;
 pub mod chat;

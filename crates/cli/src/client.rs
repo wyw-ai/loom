@@ -143,11 +143,24 @@ impl Client {
         actor_id: &str,
         display_name: Option<&str>,
     ) -> Result<Value> {
+        self.open_connection_as(actor_id, "human", display_name).await
+    }
+
+    /// Open a connection bound to `actor_id` with an explicit `actor_kind`
+    /// (`"human"` or `"agent"`). The v1 `joi agent serve` worker uses this to
+    /// register one connection per managed agent so the server's actor-inbox
+    /// delivery routes hands_off_to events to the right WS.
+    pub async fn open_connection_as(
+        &self,
+        actor_id: &str,
+        actor_kind: &str,
+        display_name: Option<&str>,
+    ) -> Result<Value> {
         self.call_raw(
             method::CONNECTION_OPEN,
             Some(json!({
                 "actorId": actor_id,
-                "actorKind": "human",
+                "actorKind": actor_kind,
                 "displayName": display_name.unwrap_or(actor_id),
             })),
         )

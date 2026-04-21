@@ -224,6 +224,15 @@ enum AgentCmd {
         #[arg(long, default_value_t = 50)]
         tail: u32,
     },
+    /// Run as the v1 external agent client: load every AgentSpec under
+    /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
+    /// over its own server connection. Pair with `JOI_DISABLE_EMBEDDED_RUNTIME=1`
+    /// on the server to disable in-process supervision.
+    Serve {
+        /// Override the directory of AgentSpec JSON files.
+        #[arg(long)]
+        specs: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -252,6 +261,16 @@ async fn main() -> Result<()> {
             println!("config   = {}", config::config_path().display());
         }
         return Ok(());
+    }
+
+    // `agent serve` opens its own per-agent connections and never acts as the
+    // local human actor — bypass the up-front connection_open below so we
+    // don't pollute the server's actor table with an unused row.
+    if let Cmd::Agent {
+        sub: AgentCmd::Serve { specs },
+    } = args.cmd
+    {
+        return cmd::agent_serve::run(specs, cfg.server_url).await;
     }
 
     let client = Client::connect(&cfg.server_url).await?;
@@ -306,6 +325,7 @@ async fn main() -> Result<()> {
             AgentCmd::Start { actor_id } => cmd::agent::start(client, actor_id).await?,
             AgentCmd::Stop { actor_id } => cmd::agent::stop(client, actor_id).await?,
             AgentCmd::Log { actor_id, tail } => cmd::agent::log(client, actor_id, tail).await?,
+            AgentCmd::Serve { .. } => unreachable!("handled before client setup"),
         },
         Cmd::Event { sub } => match sub {
             EventCmd::List {

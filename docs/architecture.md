@@ -2,11 +2,13 @@
 
 > **架构演进说明**
 >
-> 本文档描述当前已实现的 **v0 拓扑**：`joi-server` 内嵌 agent runtime，`joi-cli`
-> 仅服务人。
+> 本文档描述 **v0 拓扑**：`joi-server` 内嵌 agent runtime，`joi-cli` 仅服务人。
+> 该形态目前**仍是默认部署**——不设环境变量启动 server 即此拓扑。
 >
-> **v1 目标拓扑**（agent runtime 拆为独立 client、adapter 抽象支持 ACP +
-> command transport）见 [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md)。
+> **v1 拓扑**（agent runtime 拆为独立 `joi agent serve` 进程、adapter 抽象支持
+> ACP + command transport）的代码已落（phase E1–E3），通过
+> `JOI_DISABLE_EMBEDDED_RUNTIME=1` 在 server 端打开。设计与部署指南见
+> [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md)。
 >
 > Command transport 的详细 schema 与 worked example 见
 > [docs/command-transport-v0.md](command-transport-v0.md)。

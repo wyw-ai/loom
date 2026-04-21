@@ -14,10 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterStartInfo};
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
@@ -28,47 +31,17 @@ pub struct AcpConfig {
     pub auth_method: Option<String>,
 }
 
+/// Internal start info — adds ACP-specific fields the adapter helper happens to
+/// surface from `initialize`. Not exposed outside this module; the public
+/// `Adapter::start` implementation downcasts to `AdapterStartInfo`.
 #[derive(Debug, Clone)]
-pub struct AcpStartInfo {
-    pub pid: Option<u32>,
-    pub session_id: String,
-    pub agent_info: Option<Value>,
-    pub agent_capabilities: Option<Value>,
-}
-
-#[derive(Debug, Clone)]
-pub enum AgentEvent {
-    Text {
-        content: String,
-        is_partial: bool,
-    },
-    ToolUse {
-        tool_name: String,
-        input: Value,
-    },
-    ActionRequest {
-        id: String,
-        request_type: String,
-        title: String,
-        description: String,
-        choices: Vec<ActionChoice>,
-    },
-    StatusChange {
-        status: String,
-    },
-    Finished {
-        success: bool,
-        summary: String,
-    },
-    Error {
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct ActionChoice {
-    pub id: String,
-    pub label: String,
+struct AcpStartInfo {
+    pid: Option<u32>,
+    session_id: String,
+    #[allow(dead_code)]
+    agent_info: Option<Value>,
+    #[allow(dead_code)]
+    agent_capabilities: Option<Value>,
 }
 
 struct PendingPermission {
@@ -83,7 +56,7 @@ struct AcpShared {
     in_flight_prompts: Mutex<HashSet<String>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
     action_namespace: String,
-    event_sender: mpsc::UnboundedSender<AgentEvent>,
+    event_sender: mpsc::UnboundedSender<AdapterEvent>,
 }
 
 pub struct AcpAdapter {
@@ -109,9 +82,9 @@ impl AcpAdapter {
         }
     }
 
-    pub async fn start(
+    async fn start_internal(
         &self,
-        event_sender: mpsc::UnboundedSender<AgentEvent>,
+        event_sender: mpsc::UnboundedSender<AdapterEvent>,
     ) -> Result<AcpStartInfo, String> {
         let cfg = self.config.clone();
         tokio::task::spawn_blocking(move || start_blocking(cfg, event_sender))
@@ -127,7 +100,7 @@ impl AcpAdapter {
             })
     }
 
-    pub async fn send_prompt(&self, content: String) -> Result<(), String> {
+    async fn send_prompt_internal(&self, content: String) -> Result<(), String> {
         let (shared, session_id) = {
             let inner = self.inner.lock();
             let shared = inner.shared.clone().ok_or("ACP agent not running")?;
@@ -161,7 +134,7 @@ impl AcpAdapter {
         .map_err(|e| e.to_string())?
     }
 
-    pub async fn respond_permission(
+    async fn respond_permission_internal(
         &self,
         action_id: String,
         option_id: String,
@@ -197,7 +170,7 @@ impl AcpAdapter {
         .map_err(|e| e.to_string())?
     }
 
-    pub async fn stop(&self) -> Result<(), String> {
+    async fn stop_internal(&self) -> Result<(), String> {
         let (shared, session_id, mut child) = {
             let mut inner = self.inner.lock();
             (
@@ -233,9 +206,40 @@ impl AcpAdapter {
     }
 }
 
+#[async_trait]
+impl Adapter for AcpAdapter {
+    async fn start(
+        &self,
+        events: mpsc::UnboundedSender<AdapterEvent>,
+    ) -> Result<AdapterStartInfo, String> {
+        let info = self.start_internal(events).await?;
+        Ok(AdapterStartInfo {
+            pid: info.pid,
+            session_id: info.session_id,
+        })
+    }
+
+    async fn send_prompt(&self, prompt: String) -> Result<(), String> {
+        self.send_prompt_internal(prompt).await
+    }
+
+    async fn respond_action(
+        &self,
+        request_id: String,
+        option_id: String,
+    ) -> Result<(), String> {
+        self.respond_permission_internal(request_id, option_id)
+            .await
+    }
+
+    async fn stop(&self) -> Result<(), String> {
+        self.stop_internal().await
+    }
+}
+
 fn start_blocking(
     cfg: AcpConfig,
-    event_sender: mpsc::UnboundedSender<AgentEvent>,
+    event_sender: mpsc::UnboundedSender<AdapterEvent>,
 ) -> Result<(AcpStartInfo, Child, Arc<AcpShared>, String), String> {
     let workdir = if cfg.cwd.is_absolute() {
         cfg.cwd.clone()
@@ -328,7 +332,7 @@ fn start_blocking(
         .ok_or("ACP agent did not return sessionId")?
         .to_string();
 
-    let _ = event_sender.send(AgentEvent::StatusChange {
+    let _ = event_sender.send(AdapterEvent::StatusChange {
         status: "idle".into(),
     });
 
@@ -390,7 +394,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
             let line = match line {
                 Ok(l) => l,
                 Err(err) => {
-                    let _ = shared.event_sender.send(AgentEvent::Error {
+                    let _ = shared.event_sender.send(AdapterEvent::Error {
                         message: format!("Failed to read ACP output: {}", err),
                     });
                     break;
@@ -403,7 +407,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
             let message: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(err) => {
-                    let _ = shared.event_sender.send(AgentEvent::Error {
+                    let _ = shared.event_sender.send(AdapterEvent::Error {
                         message: format!("Invalid ACP JSON: {}", err),
                     });
                     continue;
@@ -414,7 +418,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
         fail_pending_waiters(&shared, "ACP agent disconnected".into());
         shared.in_flight_prompts.lock().clear();
         shared.pending_permissions.lock().clear();
-        let _ = shared.event_sender.send(AgentEvent::StatusChange {
+        let _ = shared.event_sender.send(AdapterEvent::StatusChange {
             status: "stopped".into(),
         });
     });
@@ -461,7 +465,7 @@ fn handle_agent_request(shared: &Arc<AcpShared>, method: &str, id: Value, messag
                     option_ids: allowed_ids,
                 },
             );
-            let _ = shared.event_sender.send(AgentEvent::ActionRequest {
+            let _ = shared.event_sender.send(AdapterEvent::ActionRequest {
                 id: action_id,
                 request_type: "permission".into(),
                 title,
@@ -494,7 +498,7 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
         Some("agent_message_chunk") => {
             if let Some(text) = extract_text_chunk(&update) {
-                let _ = shared.event_sender.send(AgentEvent::Text {
+                let _ = shared.event_sender.send(AdapterEvent::Text {
                     content: text,
                     is_partial: true,
                 });
@@ -508,7 +512,7 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
                 .or_else(|| update.get("toolCallId").and_then(|v| v.as_str()))
                 .unwrap_or("tool_call")
                 .to_string();
-            let _ = shared.event_sender.send(AgentEvent::ToolUse {
+            let _ = shared.event_sender.send(AdapterEvent::ToolUse {
                 tool_name,
                 input: update,
             });
@@ -533,10 +537,10 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
     }
     if shared.in_flight_prompts.lock().remove(&id_key) {
         if let Some(error) = message.get("error") {
-            let _ = shared.event_sender.send(AgentEvent::Error {
+            let _ = shared.event_sender.send(AdapterEvent::Error {
                 message: json_value_to_string(error),
             });
-            let _ = shared.event_sender.send(AgentEvent::Finished {
+            let _ = shared.event_sender.send(AdapterEvent::Finished {
                 success: false,
                 summary: json_value_to_string(error),
             });
@@ -548,7 +552,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("completed")
             .to_string();
-        let _ = shared.event_sender.send(AgentEvent::Finished {
+        let _ = shared.event_sender.send(AdapterEvent::Finished {
             success: stop_reason != "cancelled",
             summary: stop_reason,
         });

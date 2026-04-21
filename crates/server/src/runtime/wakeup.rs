@@ -2,7 +2,7 @@
 //!   - watches the store's broadcast for newly appended events,
 //!   - when an event targets/handsoff to a registered agent, ensure the agent is
 //!     started, open a Turn for it, and forward the trigger text via session/prompt,
-//!   - translates incoming `AgentEvent`s back into store events.
+//!   - translates incoming `AdapterEvent`s back into store events.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use proto::types::*;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::acp::AgentEvent;
+use super::adapter::AdapterEvent;
 use super::RuntimeManager;
 use crate::store::{Store, StoreEvent};
 
@@ -155,13 +155,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
     )
 }
 
-/// Spawned per agent process when it starts; consumes `AgentEvent`s and turns
+/// Spawned per agent process when it starts; consumes `AdapterEvent`s and turns
 /// them into store events under the currently-active turn for that agent.
 pub fn spawn_event_consumer(
     manager: Arc<RuntimeManager>,
     store: Arc<Store>,
     actor_id: String,
-    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    mut rx: mpsc::UnboundedReceiver<AdapterEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -175,7 +175,7 @@ async fn translate_event(
     manager: &Arc<RuntimeManager>,
     store: &Arc<Store>,
     actor_id: &str,
-    ev: AgentEvent,
+    ev: AdapterEvent,
 ) {
     let turn_id = manager.active_turn(actor_id);
     let scope = match turn_id
@@ -193,7 +193,7 @@ async fn translate_event(
         // they do NOT produce events. A non-partial chunk gets appended to
         // the buffer and flushed immediately as a single `content.add`. The
         // common path (Finished) flushes whatever is left.
-        AgentEvent::Text {
+        AdapterEvent::Text {
             content,
             is_partial,
         } => {
@@ -216,7 +216,7 @@ async fn translate_event(
         }
         // Agent tool invocations are private: never an event, only a trace
         // frame to the turn owner.
-        AgentEvent::ToolUse { tool_name, input } => {
+        AdapterEvent::ToolUse { tool_name, input } => {
             if let Some(tid) = turn_id.as_deref() {
                 emit_trace(
                     manager,
@@ -230,7 +230,7 @@ async fn translate_event(
                 );
             }
         }
-        AgentEvent::ActionRequest {
+        AdapterEvent::ActionRequest {
             id,
             request_type,
             title,
@@ -283,7 +283,7 @@ async fn translate_event(
         // Runtime status changes are private agent state; reflect them on the
         // manager so other server code can observe them, AND emit a `status`
         // trace frame so the owner sees the transition. No event.
-        AgentEvent::StatusChange { status } => {
+        AdapterEvent::StatusChange { status } => {
             manager.set_status(&actor, &status);
             if let Some(tid) = turn_id.as_deref() {
                 emit_trace(
@@ -298,7 +298,7 @@ async fn translate_event(
         // Turn finished: flush any buffered streaming text into a single
         // `content.add` event (this is what other actors see), then write the
         // `turn.close` event and close the turn.
-        AgentEvent::Finished { success, summary } => {
+        AdapterEvent::Finished { success, summary } => {
             if let Some(tid) = turn_id {
                 if let Some(text) = manager.take_text_buffer(&actor, &tid) {
                     flush_text_as_event(store, &actor, &scope, &tid, text);
@@ -324,7 +324,7 @@ async fn translate_event(
         // Runtime errors are private execution detail. The agent itself can
         // decide whether to surface a user-visible message via `content.add`;
         // the raw error becomes an `error` trace frame to the owner.
-        AgentEvent::Error { message } => {
+        AdapterEvent::Error { message } => {
             if let Some(tid) = turn_id.as_deref() {
                 emit_trace(
                     manager,
@@ -405,7 +405,7 @@ pub async fn forward_action_response(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if let Err(e) = adapter.respond_permission(request_id, option_id).await {
+    if let Err(e) = adapter.respond_action(request_id, option_id).await {
         tracing::warn!(%e, "failed to forward action response");
     }
 }

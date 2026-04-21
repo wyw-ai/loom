@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod adapter;
 pub mod registry;
 pub mod wakeup;
 
@@ -14,7 +15,8 @@ use tokio::sync::mpsc;
 
 use crate::store::{Store, StoreError};
 
-use self::acp::{AcpAdapter, AgentEvent};
+use self::acp::AcpAdapter;
+use self::adapter::{Adapter, AdapterEvent};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -38,13 +40,15 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 pub struct RegisteredAgent {
     pub spec: AgentSpec,
-    pub adapter: Option<Arc<AcpAdapter>>,
+    pub adapter: Option<Arc<dyn Adapter>>,
     pub status: String,
     pub pid: Option<u32>,
     pub session_id: Option<String>,
     pub log: VecDeque<String>,
-    /// Pending action.request -> ACP request id mapping (key = event id)
-    pub action_map: HashMap<String, (Arc<AcpAdapter>, String)>,
+    /// Pending action.request -> adapter request id mapping (key = event id).
+    /// The adapter handle is held so the action response can be routed even if
+    /// the agent is unregistered/re-registered between request and response.
+    pub action_map: HashMap<String, (Arc<dyn Adapter>, String)>,
     /// Currently active turn for this agent (only one in-flight prompt at a time in v0)
     pub active_turn_id: Option<String>,
     /// True after the agent's session has received its first manifest-bearing prompt.
@@ -262,7 +266,7 @@ impl RuntimeManager {
     pub fn set_runtime_handle(
         &self,
         actor_id: &str,
-        adapter: Arc<AcpAdapter>,
+        adapter: Arc<dyn Adapter>,
         pid: Option<u32>,
         session_id: Option<String>,
     ) {
@@ -332,7 +336,7 @@ impl RuntimeManager {
         }
     }
 
-    pub fn adapter_for(&self, actor_id: &str) -> Option<Arc<AcpAdapter>> {
+    pub fn adapter_for(&self, actor_id: &str) -> Option<Arc<dyn Adapter>> {
         self.agents
             .lock()
             .get(actor_id)
@@ -343,7 +347,7 @@ impl RuntimeManager {
         &self,
         actor_id: &str,
         event_id: String,
-        adapter: Arc<AcpAdapter>,
+        adapter: Arc<dyn Adapter>,
         request_id: String,
     ) {
         let mut agents = self.agents.lock();
@@ -356,7 +360,7 @@ impl RuntimeManager {
         &self,
         actor_id: &str,
         event_id: &str,
-    ) -> Option<(Arc<AcpAdapter>, String)> {
+    ) -> Option<(Arc<dyn Adapter>, String)> {
         let mut agents = self.agents.lock();
         agents.get_mut(actor_id)?.action_map.remove(event_id)
     }
@@ -383,7 +387,7 @@ impl RuntimeManager {
     pub async fn ensure_started(
         self: &Arc<Self>,
         actor_id: &str,
-    ) -> RuntimeResult<Arc<AcpAdapter>> {
+    ) -> RuntimeResult<Arc<dyn Adapter>> {
         if let Some(adapter) = self.adapter_for(actor_id) {
             return Ok(adapter);
         }
@@ -429,7 +433,7 @@ impl RuntimeManager {
             cwd: workdir,
             auth_method: spec.transport.auth_method.clone(),
         };
-        let adapter = Arc::new(AcpAdapter::new(cfg));
+        let adapter: Arc<dyn Adapter> = Arc::new(AcpAdapter::new(cfg));
         let info = adapter
             .start(event_tx)
             .await
@@ -469,7 +473,7 @@ impl RuntimeManager {
 }
 
 #[allow(dead_code)]
-pub(crate) fn _silence_event_unused(_e: &AgentEvent) {}
+pub(crate) fn _silence_event_unused(_e: &AdapterEvent) {}
 
 fn cli_binary_name() -> &'static str {
     if cfg!(windows) {

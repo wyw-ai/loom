@@ -41,7 +41,7 @@ async fn handle_store_event(manager: &Arc<RuntimeManager>, _store: &Arc<Store>, 
     // The event's own actor may be an agent; ignore self-loops.
     let mut targets: Vec<String> = Vec::new();
     for r in &event.relations {
-        if matches!(r.kind, RelationKind::Targets | RelationKind::HandsOffTo)
+        if matches!(r.kind, RelationKind::HandsOffTo)
             && r.target.kind == RefKind::Actor
             && manager.spec_for(&r.target.id).is_some()
             && r.target.id != event.actor_id
@@ -98,7 +98,9 @@ async fn wake_agent(
 }
 
 fn render_prompt(trigger: &Event) -> String {
-    // Prefer explicit content; otherwise fall back to handoff.offer.message.
+    // content.add carries the prompt under `text`. Old `handoff.offer` events
+    // (now removed) used `message`; keep the fallback so journals replayed
+    // before the rename still wake agents with the right body.
     if let Some(text) = trigger.payload.get("text").and_then(|v| v.as_str()) {
         return text.to_string();
     }
@@ -255,7 +257,7 @@ async fn translate_event(
             let mut relations = vec![];
             if let Some(human) = trigger_actor {
                 relations.push(Relation {
-                    kind: RelationKind::Targets,
+                    kind: RelationKind::HandsOffTo,
                     target: Ref {
                         kind: RefKind::Actor,
                         id: human,

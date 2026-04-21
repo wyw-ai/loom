@@ -34,7 +34,6 @@ pub enum StoreEvent {
     ArtifactPublished(Artifact),
     ReceiptRecorded(Receipt),
     DeliveryUpdated(Delivery),
-    HandoffCreated(Event),
     /// Turn-private trace frame. Carried on the same broadcast channel as
     /// scope events purely so the websocket layer can route it; the fanout
     /// must NOT broadcast it to scope subscribers — see `ws::fanout`.
@@ -53,7 +52,6 @@ impl StoreEvent {
             StoreEvent::ArtifactPublished(_) => None,
             StoreEvent::ReceiptRecorded(_) => None,
             StoreEvent::DeliveryUpdated(_) => None,
-            StoreEvent::HandoffCreated(e) => Some(e.scope.clone()),
             // Trace frames are owner-private; ws fanout routes them by
             // turn owner, never by scope.
             StoreEvent::TraceAppended(_) => None,
@@ -435,18 +433,14 @@ impl Store {
 
         // Memberships: any actor explicitly targeted joins too.
         for r in &event.relations {
-            if matches!(r.kind, RelationKind::Targets | RelationKind::HandsOffTo)
-                && r.target.kind == RefKind::Actor
-            {
+            if matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor {
                 let _ = self.touch_membership(r.target.id.clone(), scope.clone(), None);
             }
         }
 
         // Deliveries: explicit directed receivers only.
         for r in &event.relations {
-            if matches!(r.kind, RelationKind::Targets | RelationKind::HandsOffTo)
-                && r.target.kind == RefKind::Actor
-            {
+            if matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor {
                 let delivery = Delivery {
                     event_id: event.id.clone(),
                     actor_id: r.target.id.clone(),
@@ -481,9 +475,6 @@ impl Store {
         }
 
         self.emit(StoreEvent::EventCreated(event.clone()));
-        if event.kind == "handoff.offer" {
-            self.emit(StoreEvent::HandoffCreated(event.clone()));
-        }
 
         if implicit_turn {
             let _ = self.close_turn(&assigned_turn_id, TurnStatus::Closed);

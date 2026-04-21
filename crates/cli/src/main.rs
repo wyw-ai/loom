@@ -53,7 +53,8 @@ enum Cmd {
         #[arg(long)]
         reply: Option<String>,
     },
-    /// Send a handoff.offer to an agent in a thread.
+    /// Hand off the turn to an agent: a `content.add` event carrying a
+    /// `HandsOffTo` relation pointing at the target actor.
     Handoff {
         /// Target actor id; omit to pick from a list of registered agents/humans.
         agent: Option<String>,
@@ -145,12 +146,6 @@ enum ActorCmd {
 enum ArtifactCmd {
     /// Publish an inline-text artifact (body comes from --text, --file, or stdin).
     Publish {
-        /// Scope id (thread id by default; pass --channel to publish into a channel scope).
-        #[arg(long)]
-        r#in: String,
-        /// Treat --in as a channel id rather than a thread id.
-        #[arg(long)]
-        channel: bool,
         /// Filename to record on the artifact (also used in the artifact:// uri).
         #[arg(long)]
         name: String,
@@ -325,24 +320,12 @@ async fn main() -> Result<()> {
         },
         Cmd::Artifact { sub } => match sub {
             ArtifactCmd::Publish {
-                r#in,
-                channel,
                 name,
                 media_type,
                 text,
                 file,
             } => {
-                cmd::artifact::publish(
-                    client,
-                    cfg.actor_id,
-                    r#in,
-                    channel,
-                    name,
-                    media_type,
-                    text,
-                    file,
-                )
-                .await?
+                cmd::artifact::publish(client, cfg.actor_id, name, media_type, text, file).await?
             }
             ArtifactCmd::Get { id_or_uri } => cmd::artifact::get(client, id_or_uri).await?,
             ArtifactCmd::Read {

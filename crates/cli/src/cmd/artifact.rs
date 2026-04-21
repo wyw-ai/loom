@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
-use proto::types::ScopeKind;
 use serde_json::json;
 
 use crate::client::Client;
@@ -13,8 +12,6 @@ use crate::render;
 pub async fn publish(
     client: Arc<Client>,
     actor_id: String,
-    scope_id: String,
-    is_channel: bool,
     name: String,
     media_type: Option<String>,
     text: Option<String>,
@@ -37,13 +34,7 @@ pub async fn publish(
         }
     };
     let media_type = media_type.unwrap_or_else(|| "text/markdown".into());
-    let kind = if is_channel {
-        ScopeKind::Channel
-    } else {
-        ScopeKind::Thread
-    };
     let params = json!({
-        "scope": { "kind": kind, "id": scope_id },
         "createdBy": actor_id,
         "ingress": {
             "kind": "inline_text",

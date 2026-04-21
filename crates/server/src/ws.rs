@@ -150,7 +150,6 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::ArtifactPublished(a) => (sk::ARTIFACT_PUBLISHED, json!({ "artifact": a })),
         StoreEvent::ReceiptRecorded(r) => (sk::RECEIPT_RECORDED, json!({ "receipt": r })),
         StoreEvent::DeliveryUpdated(d) => (sk::DELIVERY_UPDATED, json!({ "delivery": d })),
-        StoreEvent::HandoffCreated(e) => (sk::HANDOFF_CREATED, json!({ "event": e })),
         StoreEvent::TraceAppended(_) => unreachable!("trace handled above"),
     };
     let Some(scope) = scope else {

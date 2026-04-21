@@ -43,7 +43,17 @@ pub fn render_event(event: &Event) {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            println!("[{ts}] {actor}: {text}");
+            // content.add carrying a HandsOffTo relation is a handoff —
+            // surface the target so the line reads `... ↪ → target: text`.
+            let handoff_target = event
+                .relations
+                .iter()
+                .find(|r| matches!(r.kind, RelationKind::HandsOffTo))
+                .map(|r| r.target.id.as_str());
+            match handoff_target {
+                Some(to) => println!("[{ts}] {actor} ↪ → {to}: {text}"),
+                None => println!("[{ts}] {actor}: {text}"),
+            }
         }
         "action.request" => {
             let title = event
@@ -67,20 +77,6 @@ pub fn render_event(event: &Event) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             println!("[{ts}] {actor} ✓ action.response → {opt}");
-        }
-        "handoff.offer" => {
-            let msg = event
-                .payload
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let to = event
-                .relations
-                .iter()
-                .find(|r| matches!(r.kind, RelationKind::HandsOffTo))
-                .map(|r| r.target.id.clone())
-                .unwrap_or_default();
-            println!("[{ts}] {actor} ↪ handoff → {to}: {msg}");
         }
         "turn.close" => {
             let status = event
@@ -147,7 +143,7 @@ pub fn render_stream_update(payload: &Value) {
     let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let data = payload.get("data").cloned().unwrap_or(Value::Null);
     match kind {
-        "event.created" | "handoff.created" => {
+        "event.created" => {
             if let Some(ev) = data.get("event") {
                 if let Ok(ev) = serde_json::from_value::<Event>(ev.clone()) {
                     render_event(&ev);

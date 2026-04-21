@@ -49,7 +49,7 @@ v0 明确不处理以下问题：
 ### 3.5 关系显式，调度更显式
 
 - `reply`、handoff、artifact 关联都必须显式表达，不依赖客户端本地推断。
-- 协议只把 `targets` 与 `hands_off_to` 当成可机器处理的 actor-directed 关系。
+- 协议把 `hands_off_to` 当成可机器处理的 actor-directed 关系。
 - 纯文本中的 `@handle` 是否存在、如何高亮、是否弹候选框，属于 binding 层，不属于核心协作语义。
 
 ### 3.6 Turn 可回看
@@ -155,7 +155,7 @@ flowchart TD
 ### 5.5 Delivery 不变量
 
 - `Delivery` 是 event 级事实，不是 scope 级成员关系。
-- `Delivery` 只应由显式的 actor-directed 语义产生，例如 `targets` 或 `hands_off_to`。
+- `Delivery` 只应由显式的 actor-directed 语义产生，例如 `hands_off_to`。
 - 服务端不得从纯文本 `@handle` 自动推导出 `Delivery`。
 
 ### 5.6 Access 不变量
@@ -262,7 +262,7 @@ flowchart TD
 
 ```json
 {
-  "kind": "replies_to | targets | hands_off_to | responds_to | attaches_artifact | references",
+  "kind": "replies_to | hands_off_to | responds_to | attaches_artifact",
   "target": {
     "kind": "actor",
     "id": "actor_456"
@@ -334,13 +334,12 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 | `content.add` | 追加可展示内容，如文本、Markdown、结构化片段 | 必需 |
 | `action.request` | 请求审批、输入或选择 | 必需 |
 | `action.response` | 对某个 `action.request` 的响应 | 必需 |
-| `handoff.offer` | 显式把后续处理责任交给目标 Actor | 必需 |
 | `artifact.publish` | 发布共享产物并产生稳定引用 | 必需 |
 | `turn.close` | 标记一次 Turn 的结束状态 | 必需 |
 
 判别规则：
 
-- 一个事实是否值得变成 `Event`，取决于它有没有跨 actor 的语义关系（`targets` / `hands_off_to` / `responds_to` / `attaches_artifact`）。有就写成 `Event`；没有的内部活动属于该 Turn 的私有 trace。
+- 一个事实是否值得变成 `Event`，取决于它有没有跨 actor 的语义关系（`hands_off_to` / `responds_to` / `attaches_artifact`）。有就写成 `Event`；没有的内部活动属于该 Turn 的私有 trace。
 - 异步性不影响这个判别 —— "需要别人未来回应" 的请求即便不阻塞，也仍然是 inter-actor 事件。
 
 说明：
@@ -349,7 +348,7 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 - Agent 的流式输出在 server 侧聚合：同一 `Turn` 内的增量 chunk 仅作为 trace 帧实时回推给 turn owner，turn 关闭时一次性写入一条最终 `content.add` 事件。其它 actor 不会看到中间的 partial chunk。
 - `reply`、handoff、artifact 等语义通过 `relations` 表达，不依赖文本解析。
 - 事件与共享产物的关联通过 `attaches_artifact` 关系表达。
-- Agent 的工具调用、内部状态变化、运行时错误属于 Turn 私有 trace，由 `turn/trace.update` 通道承载，不写入 `Event` 流，不进入任何 actor 的 `scope/read` 历史。trace 不可被 `replies_to` / `responds_to` / `references` 寻址；如果其它 actor 需要细节，由该 actor 用 `content.add` 自行解释。
+- Agent 的工具调用、内部状态变化、运行时错误属于 Turn 私有 trace，由 `turn/trace.update` 通道承载，不写入 `Event` 流，不进入任何 actor 的 `scope/read` 历史。trace 不可被 `replies_to` / `responds_to` 寻址；如果其它 actor 需要细节，由该 actor 用 `content.add` 自行解释。
 - v0 阶段不提供 journal 兼容迁移：升级实现后，旧 journal 中遗留的 `tool.report` / `status.report` 事件可被允许直接清空 journal 重建。
 
 ## 9. 核心关系类型
@@ -357,17 +356,14 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 | 关系类型 | 源 | 目标 | 语义 |
 | --- | --- | --- | --- |
 | `replies_to` | Event | Event | 当前事件与某个上游事件形成 `reply` 关系 |
-| `targets` | Event | Actor | 当前事件明确期望某个参与者提供输入、审批或关注 |
 | `hands_off_to` | Event | Actor | 当前事件把后续处理责任转交给某个参与者 |
 | `responds_to` | Event | Event | 当前事件是对某个请求事件的响应 |
 | `attaches_artifact` | Event | Artifact | 当前事件附带某个共享产物 |
-| `references` | Event | Event / Artifact | 当前事件引用某个历史对象 |
 
 额外说明：
 
-- `targets` 适合表达“请你看一下 / 请你批准 / 请你补充输入”。
 - `hands_off_to` 适合表达“后续动作交给你接”。
-- 如果某个 UI 允许用户输入 `@handle`，那只是输入层能力；除非 UI 显式调用 `handoff/create` 或构造 `targets` / `hands_off_to`，否则协议层不为其赋予机器语义。
+- 如果某个 UI 允许用户输入 `@handle`，那只是输入层能力；除非 UI 显式构造 `hands_off_to` relation，否则协议层不为其赋予机器语义。
 
 ## 10. 协议操作
 
@@ -449,31 +445,19 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 }
 ```
 
-### 10.7 `handoff/create`
-
-用途：
-
-- 创建显式 handoff。
-- handoff 本身仍然表现为 `handoff.offer + hands_off_to`。
-
-约束：
-
-- 服务端应为 handoff 目标 actor 创建或刷新该 scope 上的 `Membership`。
-- handoff 目标 actor 后续被唤醒时，应能通过 `scope/read` 补看中间历史。
-
-### 10.8 `turn/close`
+### 10.7 `turn/close`
 
 用途：
 
 - 显式结束一个 Turn，并报告最终状态。
 
-### 10.9 `artifact/publish`
+### 10.8 `artifact/publish`
 
 用途：
 
 - 发布共享产物，返回稳定 `artifact URI`。
 
-### 10.10 `receipt/record`
+### 10.9 `receipt/record`
 
 用途：
 
@@ -507,9 +491,9 @@ sequenceDiagram
   participant S as "Server"
   participant B as "Actor B"
 
-  A->>S: handoff/create(target=B, scope=thread)
+  A->>S: event/append(content.add, relations=[hands_off_to -> B])
   S->>S: create Membership(B, scope)
-  S-->>B: delivery(handoff.offer)
+  S-->>B: delivery(content.add)
   B->>S: scope/read(scope)
   B->>S: receipt/record(accepted)
   B->>S: turn/open(scope)
@@ -523,7 +507,7 @@ sequenceDiagram
   participant S as "Server"
   participant U as "Actor U"
 
-  A->>S: event/append(action.request, relations=[targets -> U])
+  A->>S: event/append(action.request, relations=[hands_off_to -> U])
   S-->>U: delivery(action.request)
   U->>S: event/append(action.response, responds_to=request)
   U->>S: receipt/record(accepted)
@@ -566,7 +550,7 @@ sequenceDiagram
 
 ### 12.2 Membership 约束
 
-- 服务端应在 actor 首次在某个 scope 发言、被显式 handoff，或被显式 `targets` 请求输入时，创建或刷新对应 `Membership`。
+- 服务端应在 actor 首次在某个 scope 发言或被显式 `hands_off_to` 时，创建或刷新对应 `Membership`。
 - `Membership` 的存在应足以支撑稍后通过 `scope/read` 补看历史。
 - `Membership` 本身不要求服务端主动推送该 scope 的所有新消息。
 
@@ -601,7 +585,6 @@ sequenceDiagram
 - `scope/read`
 - `thread/create`
 - `event/append`
-- `handoff/create`
 - `artifact/publish`
 - `receipt/record`
 - `turn/trace.read`

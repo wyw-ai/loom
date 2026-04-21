@@ -19,17 +19,18 @@ pub async fn run(
         Some(t) if !t.is_empty() => t,
         _ => pick_target(&client).await?,
     };
-    let res: HandoffCreateResult = client
-        .call(
-            method::HANDOFF_CREATE,
-            json!({
-                "sourceActorId": actor_id,
-                "targetActorId": target,
-                "scope": { "kind": "thread", "id": thread_id },
-                "message": message,
-            }),
-        )
-        .await?;
+    let payload = json!({
+        "event": {
+            "type": "content.add",
+            "actorId": actor_id,
+            "scope": { "kind": "thread", "id": thread_id },
+            "payload": { "contentType": "text/markdown", "text": message },
+            "relations": [
+                { "kind": "hands_off_to", "target": { "kind": "actor", "id": target } }
+            ],
+        }
+    });
+    let res: EventAppendResult = client.call(method::EVENT_APPEND, payload).await?;
     println!("handoff event {} → {}", res.event.id, target);
     Ok(())
 }

@@ -88,7 +88,7 @@ Three ways to add an agent — all of them write a JSON spec into `agents/` that
    ```
    Save as `agents/<actor-id>.json` or register at runtime: `joi agent register <path>`.
 
-The server scans `agents/` at boot and registers each as an `Actor { kind: agent }`. The runtime is started lazily when the agent first becomes the target of a `handoff/create` or `targets` relation, unless `"autostart": true`.
+The server scans `agents/` at boot and registers each as an `Actor { kind: agent }`. The runtime is started lazily when the agent first becomes the target of a `hands_off_to` relation (i.e. when someone @-mentions it or hands off to it), unless `"autostart": true`.
 
 Template variables in `cwd` / `env` values:
 

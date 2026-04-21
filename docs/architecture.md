@@ -86,14 +86,14 @@ RPC 方法除了协议本身，还增加了本地 runtime 所需的 registry / r
 - `runtime.stop`
 - `runtime.log.read`
 
-当前 app 的本地 RPC binding 使用 dot 形式方法名，例如 `scope.read`、`handoff.create`。
+当前 app 的本地 RPC binding 使用 dot 形式方法名，例如 `scope.read`、`event.append`。
 协议文档中的 canonical 名称仍使用 slash 形式。
 
 ### 4.3 投递模型
 
 事件入库后会按显式定向接收者写 `deliveries`：
 
-1. relation 里被 `targets` / `hands_off_to` 指向的 actor
+1. relation 里被 `hands_off_to` 指向的 actor
 
 `scope.subscribe` 只决定哪个连接接收实时流，不决定谁属于 scope 的持续上下文。
 持续上下文由 `memberships` 表示，离线 actor 的 directed event 才会进入 `pending`。

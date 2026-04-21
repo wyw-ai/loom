@@ -54,7 +54,6 @@ pub async fn dispatch(
         method::TURN_CLOSE => turn_close(state, params),
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
         method::EVENT_APPEND => event_append(state, params).await,
-        method::HANDOFF_CREATE => handoff_create(state, params).await,
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
         method::ARTIFACT_GET => artifact_get(state, params),
         method::ARTIFACT_READ => artifact_read(state, params),
@@ -333,35 +332,6 @@ async fn event_append(state: &AppState, params: Option<Value>) -> HandlerResult 
         });
     }
     ok(EventAppendResult { event })
-}
-
-// ---- handoff/create ----
-
-async fn handoff_create(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: HandoffCreateParams = parse_params(params)?;
-    let payload = json!({ "message": p.message });
-    let relations = vec![Relation {
-        kind: RelationKind::HandsOffTo,
-        target: Ref {
-            kind: RefKind::Actor,
-            id: p.target_actor_id.clone(),
-            _meta: None,
-        },
-        _meta: None,
-    }];
-    let event = state
-        .store
-        .append_event(
-            "handoff.offer".into(),
-            p.source_actor_id,
-            p.scope,
-            None,
-            payload,
-            relations,
-            None,
-        )
-        .map_err(map_store_err)?;
-    ok(HandoffCreateResult { event })
 }
 
 // ---- artifact ----

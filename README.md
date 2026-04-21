@@ -1,133 +1,236 @@
 # joi-apps
 
-A no-auth reference server for the [Open Multi-Actor Collaboration Protocol v0](docs/protocol/open-multi-actor-collaboration-protocol-v0.md), with:
+[Open Multi-Actor Collaboration Protocol v0](docs/protocol/open-multi-actor-collaboration-protocol-v0.md)
+的免认证参考实现。包含：
 
-- a Rust **server** (`joi-server`) speaking JSON-RPC 2.0 over WebSocket,
-- a Rust **CLI** (`joi`) for humans to drive conversations from the terminal,
-- pluggable **ACP-protocol agent runtimes** declared as `agents/*.json`.
+- Rust **server**（`joi-server`）：基于 WebSocket 的 JSON-RPC 2.0 消息枢纽。
+- Rust **CLI**（`joi`）：人类用的终端客户端，也可作为 v1 模式下的 agent 客户端常驻进程。
+- 可插拔 **agent runtime**：支持 ACP 协议子进程（如 `claude-acp`、`codex-acp`）以及
+  一次性 CLI（`claude -p`、`codex` 等）两类 transport。
 
-The point of v0 is small: a human opens a conversation in a CLI, drops in one or more configured ACP agents via `handoff`, and watches them stream back as protocol events. No auth, no GUI, no database.
+v0 的目标很小：人在 CLI 里打开一个 thread，把一个或多个配置好的 agent `handoff`
+进来，看它们以协议事件的形式流回。无认证、无 GUI、无数据库。
 
-## Layout
+## 仓库结构
 
 ```
-crates/proto    shared protocol types + JSON-RPC envelopes
-crates/server   joi-server binary (WebSocket + ACP runtime host)
-crates/cli      joi binary (human terminal client)
-agents/         agent JSON specs
-data/           journal + artifacts (created at runtime)
-docs/           protocol spec
+crates/proto           协议类型 + JSON-RPC 信封
+crates/agent-runtime   Adapter trait + AcpAdapter / CommandAdapter 实现
+crates/server          joi-server 二进制（WebSocket + 嵌入式 supervisor）
+crates/cli             joi 二进制（人类终端 + v1 agent 客户端）
+agents/                示例 agent JSON spec
+assets/marketplace.json  内置 marketplace 编目
+data/                  运行时生成（journal + artifacts + agent workspace）
+docs/                  协议规范 + 架构文档
 ```
 
-## Quickstart
+## 准备环境
+
+仓库已经把 toolchain pin 在 `rust-toolchain.toml`（stable + rustfmt + clippy），
+直接 `cargo` 即可。除此之外**唯一**的运行时依赖：每个具体 agent 自己的命令行工具
+（例如 `claude-acp` 走 `npx`，`claude` 走二进制 PATH）。
 
 ```sh
+# 验证编译 + 跑测试
 cargo build
-
-# Terminal 1: server
-cargo run -p joi-server -- --bind 127.0.0.1:7878 --data-dir ./data --agents-dir ./agents
-
-# Terminal 2: install an agent from the bundled marketplace, then chat
-cargo run -p joi-cli -- agent install claude-acp --actor-id actor_claude --name "Claude"
-cargo run -p joi-cli -- space create --title "Demo"
-cargo run -p joi-cli -- conv create --space <space_id> --title "Kickoff"
-cargo run -p joi-cli -- chat --in <conv_id>
+cargo test --workspace
 ```
 
-In the chat TUI:
+## 部署模式
 
-| keys                          | what happens                                                              |
-| ----------------------------- | ------------------------------------------------------------------------- |
-| any plain text + `Enter`      | `event/append content.add` to the conversation                            |
-| `/` (start of input)          | inline slash-command dropdown above the input box                         |
-| `Tab` / `↑` / `↓`             | navigate the dropdown                                                     |
-| `Enter` (with dropdown open)  | populate input with the chosen command (e.g. `/handoff `) — does not send |
-| `/handoff` + `Enter`          | open modal target picker (lists agents + humans), pick to send the offer  |
-| `/action` + `Enter`           | open modal picker over pending `action.request` events                    |
-| `/agents` + `Enter`           | print registered agents in the history pane                               |
-| `/quit` + `Enter` or `Ctrl-C` | leave the TUI                                                             |
-| `PgUp` / `PgDn` / `End`       | scroll history                                                            |
+joi-apps 当前支持两种拓扑，由 server 端的 `JOI_DISABLE_EMBEDDED_RUNTIME`
+环境变量切换。两者**不可同时运行**——会在 `turn/open` 上互相抢占。
 
-Outgoing messages render with `⏳` until the server echoes them through the stream, then flip to `✓`.
+### 模式 A：v0 嵌入式（默认，最省事）
 
-## Configuring an ACP agent
-
-Three ways to add an agent — all of them write a JSON spec into `agents/` that the server reloads on the next `agent/list`:
-
-1. **From the bundled marketplace** (recommended):
-   ```sh
-   joi agent marketplace                                        # list bundled entries
-   joi agent install claude-acp --actor-id actor_claude --name "Claude"
-   ```
-   Resolves `npx`/`uvx`/binary on PATH (no downloads); writes the spec.
-
-2. **Interactively**, for a custom command:
-   ```sh
-   joi agent add
-   ```
-
-3. **Hand-rolled**, for power users:
-   ```json
-   {
-     "actor": {
-       "id": "actor_my_agent",
-       "displayName": "My Agent",
-       "kind": "agent",
-       "capabilities": {}
-     },
-     "transport": {
-       "kind": "acp_stdio",
-       "command": "my-acp-binary",
-       "args": [],
-       "env": {},
-       "cwd": "{agent.workspace}",
-       "authMethod": null
-     },
-     "autostart": false
-   }
-   ```
-   Save as `agents/<actor-id>.json` or register at runtime: `joi agent register <path>`.
-
-The server scans `agents/` at boot and registers each as an `Actor { kind: agent }`. The runtime is started lazily when the agent first becomes the target of a `hands_off_to` relation (i.e. when someone @-mentions it or hands off to it), unless `"autostart": true`.
-
-Template variables in `cwd` / `env` values:
-
-- `{agent.workspace}` → `data/agents/<actor-id>/workspace`
-- `{agent.cache}`     → `data/agents/<actor-id>/cache`
-- `{agent.logs}`      → `data/agents/<actor-id>/logs`
-- `{agent.root}`      → `data/agents/<actor-id>`
-
-## Reading state from the CLI (for humans and agents)
-
-Read-only RPCs are wrapped as subcommands so an ACP child process (or any shell)
-can introspect the server. Add `--json` (or `JOI_JSON=1`) to any output-producing
-command to get a single-line JSON document instead of the human-friendly text.
+server 内嵌 agent supervisor，启动时扫描 `--agents-dir` 下的 `*.json` spec、
+按需 spawn ACP 子进程。
 
 ```sh
-joi --json space list
-joi --json conv list --space <space_id>
-joi --json actor list
-joi --json event list --in <conv_id> --limit 200          # scope/read on a conversation
-joi --json event list --in <space_id> --space             # scope/read on a space
-joi --json event list --in <conv_id> --before <event_id>  # paginate older
-joi --json agent list
+# 终端 1：启 server
+cargo run -p joi-server -- \
+    --bind 127.0.0.1:7878 \
+    --data-dir ./data \
+    --agents-dir ./agents
+
+# 终端 2：装一个 agent + 开 chat
+cargo run -p joi-cli -- agent install claude-acp \
+    --actor-id actor_claude --name "Claude"
+cargo run -p joi-cli -- channel create --title "Demo"
+cargo run -p joi-cli -- thread create --channel <channel_id> --title "Kickoff"
+cargo run -p joi-cli -- chat --in <thread_id>
 ```
 
-When the server spawns an ACP child it injects two environment variables (only
-if the agent's spec doesn't already set them):
+### 模式 B：v1 拆分式（外置 agent 客户端）
 
-- `JOI_SERVER` → the WebSocket URL the server is bound to (e.g. `ws://127.0.0.1:7878/rpc`)
-- `JOI_ACTOR`  → the agent's own actor id
+server 退化为纯消息枢纽；agent runtime 由独立的 `joi agent serve` 进程托管，
+通过 WebSocket 跟 server 通信。每个被管理的 agent 在 server 上是一条独立连接。
+适合：多机部署、异构 agent 接入（命令行 + ACP 混用）、想 ship 第三方 adapter。
 
-so the child can run `joi --json event list --in <conv_id>` etc. without any
-extra flags. The very first prompt of each session is also prefixed with a
-short auto-generated manifest telling the model who it is, what scope it is in,
-and which read-only commands are available; subsequent prompts are clean.
+```sh
+# 终端 1：启 server，关掉嵌入 supervisor
+JOI_DISABLE_EMBEDDED_RUNTIME=1 cargo run -p joi-server
 
-## What's not in v0
+# 终端 2：把 agent spec 放到 agent-client 配置目录
+mkdir -p ~/.config/joi/agents
+cp agents/*.json ~/.config/joi/agents/
 
-- no auth, no RBAC
-- no HTTP/SSE transport (WebSocket only)
-- artifact ingress is `inline_text` only
-- empty `mcpServers` is passed to ACP children — bring your own
-- no GUI, no federation, no SQLite, no automated test suite
+# 终端 3：启 agent client；它会为每个 spec 起一条到 server 的连接
+cargo run -p joi-cli -- agent serve
+
+# 终端 4：照常用 chat
+cargo run -p joi-cli -- chat --in <thread_id>
+```
+
+详细设计与 phase 切分见
+[docs/architecture-v1-agent-client.md](docs/architecture-v1-agent-client.md)。
+
+## CLI 速览
+
+`joi --help` 列出所有子命令。常用流程：
+
+| 命令 | 作用 |
+| --- | --- |
+| `joi who` | 显示当前 server URL / actor / 配置文件路径 |
+| `joi channel create --title …` | 新建 channel（顶级容器） |
+| `joi thread create --channel <id> --title …` | 在 channel 下新建 thread |
+| `joi chat --in <thread_id>` | 进入交互式 TUI |
+| `joi say <text> --in <thread_id>` | 一次性发一条消息（脚本用） |
+| `joi handoff [agent] --in <thread_id> --message "…"` | 把 turn 交给某个 agent |
+| `joi action accept <event_id>` / `decline` | 回应 ACP 提出的 `action.request` |
+| `joi event list --in <scope_id> [--channel] [--limit] [--before]` | 拉历史事件 |
+| `joi actor list` | 列出 server 知道的所有 actor |
+| `joi artifact publish --name foo.md --file ./foo.md` | 发布 artifact |
+| `joi artifact get <art_id\|artifact://…>` | 查 artifact 元数据 |
+| `joi artifact read <art_id>` | 打印 artifact 正文 |
+| `joi agent serve [--specs <dir>]` | v1：启动 agent client 常驻进程 |
+
+加 `--json`（或环境变量 `JOI_JSON=1`）任何输出命令都改成单行 JSON，方便 agent
+shell out。
+
+### Chat TUI 按键
+
+| 按键 | 行为 |
+| --- | --- |
+| 普通文字 + `Enter` | 写一条 `content.add` 到当前 thread |
+| `/` 起头 | 弹出内联 slash-command 下拉 |
+| `Tab` / `↑` / `↓` | 在下拉中导航 |
+| `Enter`（下拉打开时） | 把命令模板填进输入框（不发送） |
+| `/handoff` + `Enter` | 弹出目标选择器，选完发送 handoff |
+| `/action` + `Enter` | 弹出待响应 `action.request` 列表 |
+| `/agents` + `Enter` | 在历史区打印已注册 agent |
+| `/quit` + `Enter` 或 `Ctrl-C` | 退出 |
+| `PgUp` / `PgDn` / `End` | 翻历史 |
+
+发出的消息显示 `⏳`，server echo 回来变 `✓`。
+
+## 配置文件路径
+
+| 内容 | 模式 A（v0） | 模式 B（v1） |
+| --- | --- | --- |
+| Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） | 同左 |
+| Agent spec | `--agents-dir`（默认 `./agents`） | `~/.config/joi/agents/`（`--specs <dir>` 可覆盖） |
+| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,cache,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,cache,logs}` |
+| Command transport session 簿记 | （仅 v1 用到） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
+| CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） | 同左 |
+
+## 配置 agent
+
+三种添加方式——结果都是写一份 spec JSON 到 spec 目录（模式 A 是 `agents/`，
+模式 B 是 `~/.config/joi/agents/`）。
+
+### 1. 从内置 marketplace 装（推荐）
+
+```sh
+joi agent marketplace                         # 列出内置 6 个 ACP agent
+joi agent install claude-acp \
+    --actor-id actor_claude --name "Claude"
+```
+
+会按 `npx → uvx → 平台匹配的 binary` 顺序解析 PATH 上的可用项；不下载任何东西，
+只写 spec 文件。
+
+### 2. 交互式添加自定义命令
+
+```sh
+joi agent add
+```
+
+### 3. 手写 spec
+
+**ACP transport**（长连接子进程）：
+
+```json
+{
+  "actor": {
+    "id": "actor_my_agent",
+    "displayName": "My Agent",
+    "kind": "agent",
+    "capabilities": {}
+  },
+  "transport": {
+    "kind": "acp_stdio",
+    "command": "my-acp-binary",
+    "args": [],
+    "env": {},
+    "cwd": "{agent.workspace}",
+    "authMethod": null
+  },
+  "autostart": false
+}
+```
+
+**Command transport**（一次性 CLI，例如 `claude -p`）：
+
+完整 schema、`first_run_capture` 规则、`output_format` 翻译表与 worked example 见
+[docs/command-transport-v0.md](docs/command-transport-v0.md)。
+
+保存为 `agents/<actor-id>.json`，或运行时注册：`joi agent register <path>`。
+
+模板变量（`cwd` / `env` 值里可用）：`{agent.workspace}` / `{agent.cache}` /
+`{agent.logs}` / `{agent.root}` / `{actor.id}` / `{scope.id}`（command transport）。
+
+## Agent 子进程能反向调 joi 读历史
+
+server 或 agent client 在 spawn agent 子进程时会自动注入两个环境变量
+（前提是 spec 自己没设）：
+
+- `JOI_SERVER` → server 的 WebSocket URL
+- `JOI_ACTOR`  → 该 agent 自己的 actor id
+
+所以子进程可以直接：
+
+```sh
+joi --json event list --in <thread_id> --limit 200
+joi --json actor list
+joi --json channel list
+```
+
+每条会话的**第一次** prompt 还会自动前缀一段简短 manifest，告诉 agent 自己是谁、
+当前在哪个 scope、有哪些只读命令可用；后续 prompt 不再加前缀。
+
+## 文档导航
+
+- 协议层
+  - [`docs/protocol/open-multi-actor-collaboration-protocol-v0.md`](docs/protocol/open-multi-actor-collaboration-protocol-v0.md)
+    —— 协议正文（领域模型 + RPC 列表）
+  - [`docs/protocol/open-multi-actor-collaboration-schema-v0.md`](docs/protocol/open-multi-actor-collaboration-schema-v0.md)
+    —— 类型 schema
+  - [`docs/protocol/channel-workspace-model.md`](docs/protocol/channel-workspace-model.md)
+    —— Channel / Thread / Turn / Event 数据模型
+- 实现层
+  - [`docs/architecture.md`](docs/architecture.md) —— v0 当前架构（默认拓扑）
+  - [`docs/current-app-implementation.md`](docs/current-app-implementation.md)
+    —— v0 各 crate 实现现状
+  - [`docs/architecture-v1-agent-client.md`](docs/architecture-v1-agent-client.md)
+    —— v1 拆分设计与 phase 切分（已落 E1–E3）
+  - [`docs/command-transport-v0.md`](docs/command-transport-v0.md)
+    —— Command transport schema + worked example
+
+## v0 不在范围内的事
+
+- 无认证、无 RBAC
+- 仅 WebSocket，没有 HTTP/SSE 传输
+- artifact 入口仅 `inline_text`
+- 传给 ACP 子进程的 `mcpServers` 永远为空——自带
+- 无 GUI、无 federation、无 SQLite、无完整自动化测试集

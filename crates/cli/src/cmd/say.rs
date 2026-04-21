@@ -9,7 +9,7 @@ use crate::client::Client;
 pub async fn run(
     client: Arc<Client>,
     actor_id: String,
-    conversation_id: String,
+    thread_id: String,
     text: String,
     reply: Option<String>,
 ) -> Result<()> {
@@ -24,7 +24,7 @@ pub async fn run(
         "event": {
             "type": "content.add",
             "actorId": actor_id,
-            "scope": { "kind": "conversation", "id": conversation_id },
+            "scope": { "kind": "thread", "id": thread_id },
             "payload": { "contentType": "text/markdown", "text": text },
             "relations": relations,
         }

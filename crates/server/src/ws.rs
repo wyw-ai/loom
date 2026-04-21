@@ -123,18 +123,35 @@ pub fn spawn_stream_broadcaster(state: AppState) {
 
 fn fanout(state: &AppState, ev: StoreEvent) {
     use proto::methods::stream_kind as sk;
+
+    // Trace frames are turn-owner-private; route them by owner actor and
+    // never broadcast on a scope subscription.
+    if let StoreEvent::TraceAppended(frame) = &ev {
+        let Some(turn) = state.store.get_turn(&frame.turn_id) else {
+            tracing::warn!(turn = %frame.turn_id, "trace frame for unknown turn; dropping");
+            return;
+        };
+        let payload = json!({
+            "turnId": frame.turn_id,
+            "frame": frame,
+        });
+        state
+            .subscriptions
+            .send_to_actor(&turn.actor_id, method::TURN_TRACE_UPDATE, payload);
+        return;
+    }
+
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::EventCreated(e) => (sk::EVENT_CREATED, json!({ "event": e })),
         StoreEvent::TurnOpened(t) => (sk::TURN_OPENED, json!({ "turn": t })),
         StoreEvent::TurnClosed(t) => (sk::TURN_CLOSED, json!({ "turn": t })),
-        StoreEvent::ConversationCreated(c) => {
-            (sk::CONVERSATION_CREATED, json!({ "conversation": c }))
-        }
+        StoreEvent::ThreadCreated(t) => (sk::THREAD_CREATED, json!({ "thread": t })),
         StoreEvent::ArtifactPublished(a) => (sk::ARTIFACT_PUBLISHED, json!({ "artifact": a })),
         StoreEvent::ReceiptRecorded(r) => (sk::RECEIPT_RECORDED, json!({ "receipt": r })),
         StoreEvent::DeliveryUpdated(d) => (sk::DELIVERY_UPDATED, json!({ "delivery": d })),
         StoreEvent::HandoffCreated(e) => (sk::HANDOFF_CREATED, json!({ "event": e })),
+        StoreEvent::TraceAppended(_) => unreachable!("trace handled above"),
     };
     let Some(scope) = scope else {
         return;

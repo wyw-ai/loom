@@ -46,12 +46,13 @@ pub async fn dispatch(
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::SCOPE_READ => scope_read(state, params),
-        method::SPACE_CREATE => space_create(state, params),
-        method::SPACE_LIST => space_list(state),
-        method::CONVERSATION_CREATE => conversation_create(state, params),
-        method::CONVERSATION_LIST => conversation_list(state, params),
+        method::CHANNEL_CREATE => channel_create(state, params),
+        method::CHANNEL_LIST => channel_list(state),
+        method::THREAD_CREATE => thread_create(state, params),
+        method::THREAD_LIST => thread_list(state, params),
         method::TURN_OPEN => turn_open(state, params),
         method::TURN_CLOSE => turn_close(state, params),
+        method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
         method::EVENT_APPEND => event_append(state, params).await,
         method::HANDOFF_CREATE => handoff_create(state, params).await,
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
@@ -86,7 +87,7 @@ fn initialize(params: Option<Value>) -> HandlerResult {
             version: proto::SERVER_VERSION.into(),
         },
         server_capabilities: json!({
-            "scopes": ["space", "conversation"],
+            "scopes": ["channel", "thread"],
             "extensions": ["agent"],
         }),
     };
@@ -213,38 +214,36 @@ fn scope_read(state: &AppState, params: Option<Value>) -> HandlerResult {
     })
 }
 
-// ---- space ----
+// ---- channel ----
 
-fn space_create(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: SpaceCreateParams = parse_params(params)?;
-    let space = state.store.create_space(p.title).map_err(map_store_err)?;
-    ok(SpaceCreateResult { space })
+fn channel_create(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ChannelCreateParams = parse_params(params)?;
+    let channel = state.store.create_channel(p.title).map_err(map_store_err)?;
+    ok(ChannelCreateResult { channel })
 }
 
-fn space_list(state: &AppState) -> HandlerResult {
-    ok(SpaceListResult {
-        spaces: state.store.list_spaces(),
+fn channel_list(state: &AppState) -> HandlerResult {
+    ok(ChannelListResult {
+        channels: state.store.list_channels(),
     })
 }
 
-// ---- conversation ----
+// ---- thread ----
 
-fn conversation_create(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: ConversationCreateParams = parse_params(params)?;
-    let conv = state
+fn thread_create(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ThreadCreateParams = parse_params(params)?;
+    let thread = state
         .store
-        .create_conversation(p.space_id, p.title, p.root_event_id)
+        .create_thread(p.channel_id, p.title, p.root_event_id)
         .map_err(map_store_err)?;
-    ok(ConversationCreateResult { conversation: conv })
+    ok(ThreadCreateResult { thread })
 }
 
-fn conversation_list(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: ConversationListParams =
-        parse_params(params).unwrap_or(ConversationListParams { space_id: None });
-    let convs = state.store.list_conversations(p.space_id.as_deref());
-    ok(ConversationListResult {
-        conversations: convs,
-    })
+fn thread_list(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ThreadListParams =
+        parse_params(params).unwrap_or(ThreadListParams { channel_id: None });
+    let threads = state.store.list_threads(p.channel_id.as_deref());
+    ok(ThreadListResult { threads })
 }
 
 // ---- turn ----
@@ -265,6 +264,45 @@ fn turn_close(state: &AppState, params: Option<Value>) -> HandlerResult {
         .close_turn(&p.turn_id, p.status)
         .map_err(map_store_err)?;
     ok(TurnCloseResult { turn })
+}
+
+fn turn_trace_read(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TurnTraceReadParams = parse_params(params)?;
+    let turn = state
+        .store
+        .get_turn(&p.turn_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "turn"))?;
+    // Owner-only: the connection must be bound to the actor that owns the
+    // turn. Trace frames are private execution detail of that actor; other
+    // actors must not see them.
+    let caller_actor = state
+        .subscriptions
+        .actor_for_connection(connection_id)
+        .ok_or_else(|| {
+            ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor")
+        })?;
+    if caller_actor != turn.actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "trace is private to the turn owner",
+        ));
+    }
+    let (frames, has_more) = state
+        .store
+        .read_turn_trace(&p.turn_id, p.limit, p.before_seq)
+        .map_err(map_store_err)?;
+    ok(TurnTraceReadResult {
+        frames,
+        page_info: PageInfo {
+            has_more,
+            next_cursor: None,
+            _meta: None,
+        },
+    })
 }
 
 // ---- event/append ----

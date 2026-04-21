@@ -35,17 +35,17 @@ struct Args {
 enum Cmd {
     /// Show local config + server info.
     Who,
-    /// Manage spaces.
-    Space {
+    /// Manage channels.
+    Channel {
         #[command(subcommand)]
-        sub: SpaceCmd,
+        sub: ChannelCmd,
     },
-    /// Manage conversations.
-    Conv {
+    /// Manage threads.
+    Thread {
         #[command(subcommand)]
-        sub: ConvCmd,
+        sub: ThreadCmd,
     },
-    /// Send a content.add event into a conversation.
+    /// Send a content.add event into a thread.
     Say {
         text: String,
         #[arg(long)]
@@ -53,7 +53,7 @@ enum Cmd {
         #[arg(long)]
         reply: Option<String>,
     },
-    /// Send a handoff.offer to an agent in a conversation.
+    /// Send a handoff.offer to an agent in a thread.
     Handoff {
         /// Target actor id; omit to pick from a list of registered agents/humans.
         agent: Option<String>,
@@ -72,7 +72,7 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentCmd,
     },
-    /// Read events / history from a scope.
+    /// Read events / history from a scope (thread by default; pass --channel for a channel scope).
     Event {
         #[command(subcommand)]
         sub: EventCmd,
@@ -82,7 +82,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: ActorCmd,
     },
-    /// Interactive chat REPL inside a conversation.
+    /// Publish, fetch, or read artifacts.
+    Artifact {
+        #[command(subcommand)]
+        sub: ArtifactCmd,
+    },
+    /// Interactive chat REPL inside a thread.
     Chat {
         #[arg(long)]
         r#in: String,
@@ -90,7 +95,7 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum SpaceCmd {
+enum ChannelCmd {
     Create {
         #[arg(long)]
         title: String,
@@ -99,29 +104,29 @@ enum SpaceCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum ConvCmd {
+enum ThreadCmd {
     Create {
         #[arg(long)]
-        space: String,
+        channel: String,
         #[arg(long, default_value = "Untitled")]
         title: String,
     },
     List {
         #[arg(long)]
-        space: Option<String>,
+        channel: Option<String>,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum EventCmd {
-    /// List events in a conversation (default) or space scope.
+    /// List events in a thread (default) or channel scope.
     List {
-        /// Scope id (conversation id by default; pass --space to read a space scope).
+        /// Scope id (thread id by default; pass --channel to read a channel scope).
         #[arg(long)]
         r#in: String,
-        /// Read a space scope instead of a conversation scope.
+        /// Read a channel scope instead of a thread scope.
         #[arg(long)]
-        space: bool,
+        channel: bool,
         #[arg(long, default_value_t = 50)]
         limit: u32,
         /// Cursor: only return events older than this event id.
@@ -134,6 +139,41 @@ enum EventCmd {
 enum ActorCmd {
     /// List every actor the server knows about.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactCmd {
+    /// Publish an inline-text artifact (body comes from --text, --file, or stdin).
+    Publish {
+        /// Scope id (thread id by default; pass --channel to publish into a channel scope).
+        #[arg(long)]
+        r#in: String,
+        /// Treat --in as a channel id rather than a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Filename to record on the artifact (also used in the artifact:// uri).
+        #[arg(long)]
+        name: String,
+        /// Defaults to text/markdown.
+        #[arg(long = "media-type")]
+        media_type: Option<String>,
+        /// Inline body text. Mutually exclusive with --file.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read body from a local file. Mutually exclusive with --text.
+        #[arg(long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+    },
+    /// Fetch artifact metadata by id (`art_…`) or by `artifact://` uri.
+    Get {
+        id_or_uri: String,
+    },
+    /// Print artifact body (text only). Use --max-bytes to fetch more than 64 KiB.
+    Read {
+        artifact_id: String,
+        #[arg(long, default_value_t = 65536)]
+        max_bytes: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -227,13 +267,15 @@ async fn main() -> Result<()> {
 
     match args.cmd {
         Cmd::Who => unreachable!(),
-        Cmd::Space { sub } => match sub {
-            SpaceCmd::Create { title } => cmd::space::create(client, title).await?,
-            SpaceCmd::List => cmd::space::list(client).await?,
+        Cmd::Channel { sub } => match sub {
+            ChannelCmd::Create { title } => cmd::channel::create(client, title).await?,
+            ChannelCmd::List => cmd::channel::list(client).await?,
         },
-        Cmd::Conv { sub } => match sub {
-            ConvCmd::Create { space, title } => cmd::conv::create(client, space, title).await?,
-            ConvCmd::List { space } => cmd::conv::list(client, space).await?,
+        Cmd::Thread { sub } => match sub {
+            ThreadCmd::Create { channel, title } => {
+                cmd::thread::create(client, channel, title).await?
+            }
+            ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
         },
         Cmd::Say { text, r#in, reply } => {
             cmd::say::run(client, cfg.actor_id, r#in, text, reply).await?
@@ -273,13 +315,40 @@ async fn main() -> Result<()> {
         Cmd::Event { sub } => match sub {
             EventCmd::List {
                 r#in,
-                space,
+                channel,
                 limit,
                 before,
-            } => cmd::event::list(client, r#in, space, limit, before).await?,
+            } => cmd::event::list(client, r#in, channel, limit, before).await?,
         },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,
+        },
+        Cmd::Artifact { sub } => match sub {
+            ArtifactCmd::Publish {
+                r#in,
+                channel,
+                name,
+                media_type,
+                text,
+                file,
+            } => {
+                cmd::artifact::publish(
+                    client,
+                    cfg.actor_id,
+                    r#in,
+                    channel,
+                    name,
+                    media_type,
+                    text,
+                    file,
+                )
+                .await?
+            }
+            ArtifactCmd::Get { id_or_uri } => cmd::artifact::get(client, id_or_uri).await?,
+            ArtifactCmd::Read {
+                artifact_id,
+                max_bytes,
+            } => cmd::artifact::read(client, artifact_id, max_bytes).await?,
         },
         Cmd::Chat { r#in } => cmd::chat::run(client, cfg.actor_id, r#in).await?,
     }

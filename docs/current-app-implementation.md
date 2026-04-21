@@ -19,8 +19,8 @@
 
 当前产品形态是一个面向人和多 agent 协作的本地工作台：
 
-- 顶层协作域是 `Room`，对应协议里的 `Space`
-- 分支协作域是 `Thread`，对应协议里的 `Conversation`
+- 顶层协作域是 `Room`，对应协议里的 `Channel`
+- 分支协作域是 `Thread`，对应协议里的 `Thread`
 - 人和 agent 都是平等的 `Actor`
 - 协作事实通过不可变 `Event` 进入时间线
 - agent 的一次执行被组织成 `Turn`
@@ -91,8 +91,8 @@
 | --- | --- | --- |
 | `Actor` | `actors` 表 + agent 文档映射 | 人、agent、system 都统一进 actor 模型 |
 | `Endpoint` | `endpoints` 表 | GUI session 和 runtime 接入点 |
-| `Space` | `spaces` 表 | 产品中的 room |
-| `Conversation` | `conversations` 表 | 产品中的 thread |
+| `Channel` | `channels` 表 | 产品中的 room |
+| `Thread` | `threads` 表 | 产品中的 thread |
 | `Turn` | `turns` 表 | 一次 agent 执行回合 |
 | `Event` | `events` 表 | 消息、tool update、审批、状态变化 |
 | `Relation` | `relations` 表 | reply、target、handoff、artifact attach |
@@ -132,8 +132,8 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 - `session.open`
 - `scope.subscribe`
 - `scope.read`
-- `space.create`
-- `conversation.create`
+- `channel.create`
+- `thread.create`
 - `turn.open`
 - `event.append`
 - `handoff.create`
@@ -282,8 +282,9 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 
 当前映射逻辑：
 
-- 文本 chunk -> `content.add` buffer
-- tool 调用更新 -> `tool.report`
+- 文本 chunk -> 同 turn 内累积，turn 关闭时 flush 成单条 `content.add`；过程中 partial chunk 仅作 `turn/trace.update(text.delta)` 推 owner
+- tool 调用更新 -> turn 私有 trace（`turn/trace.update(tool.start|tool.update|tool.end)`，仅推 owner，不进事件流）
+- 内部状态变化 / 运行时错误 -> turn 私有 trace（`turn/trace.update(status|error)`）
 - permission request -> `action.request`
 - prompt 完成 -> `turn.close`
 
@@ -387,7 +388,7 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 还没有完全做完的部分主要是：
 
 1. thread context 文件化产物还不完整
-2. `tool.report` 还没有更细粒度的专门分析视图
+2. turn 私有 trace（tool 调用、status、error）还没有 owner-only 的可视化视图
 3. adapter 安装、更新、健康检查流程还不完整
 4. delivery trace / permission trace / audit trace 仍偏基础
 5. 现在还是单机 / 本地 server-first 形态，不是跨端联邦形态

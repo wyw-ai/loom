@@ -45,19 +45,6 @@ pub fn render_event(event: &Event) {
                 .unwrap_or("");
             println!("[{ts}] {actor}: {text}");
         }
-        "tool.report" => {
-            let name = event
-                .payload
-                .get("toolName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool");
-            let status = event
-                .payload
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            println!("[{ts}] {actor} ↯ tool {name} ({status})");
-        }
         "action.request" => {
             let title = event
                 .payload
@@ -110,6 +97,50 @@ pub fn render_event(event: &Event) {
             );
         }
     }
+}
+
+/// Render a `turn/trace.update` notification. These frames are the agent's
+/// private execution trail (tool calls, partial text, status, errors) and
+/// only ever arrive at the turn owner — typically the agent itself when
+/// connected as a debug client. Subscribed humans never see them.
+pub fn render_trace_update(payload: &Value) {
+    let turn_id = payload
+        .get("turnId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let frame = match payload.get("frame") {
+        Some(f) => f,
+        None => return,
+    };
+    let kind = frame.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+    let seq = frame.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let body = frame.get("payload").cloned().unwrap_or(Value::Null);
+    let summary = match kind {
+        "text.delta" => body
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "tool.start" | "tool.update" | "tool.end" => {
+            let name = body
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
+            format!("{name}")
+        }
+        "status" => body
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "error" => body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => serde_json::to_string(&body).unwrap_or_default(),
+    };
+    println!("· trace [{turn_id} #{seq}] {kind}: {summary}");
 }
 
 pub fn render_stream_update(payload: &Value) {

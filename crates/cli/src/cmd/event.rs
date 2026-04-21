@@ -11,14 +11,14 @@ use crate::render;
 pub async fn list(
     client: Arc<Client>,
     scope_id: String,
-    is_space: bool,
+    is_channel: bool,
     limit: u32,
     before: Option<String>,
 ) -> Result<()> {
-    let kind = if is_space {
-        ScopeKind::Space
+    let kind = if is_channel {
+        ScopeKind::Channel
     } else {
-        ScopeKind::Conversation
+        ScopeKind::Thread
     };
     let mut params = json!({
         "scope": { "kind": kind, "id": scope_id },

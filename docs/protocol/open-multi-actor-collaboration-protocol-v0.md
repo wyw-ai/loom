@@ -74,8 +74,8 @@ v0 明确不处理以下问题：
 | `Actor` | 稳定参与者，可以是人、Agent 或服务 | 是 |
 | `Endpoint` | `Actor` 的一个接入端实现 | 否 |
 | `Connection` | `Endpoint` 和服务器之间的一次在线连接 | 否 |
-| `Space` | 顶层共享作用域 | 是 |
-| `Conversation` | `Space` 下的子作用域 | 是 |
+| `Channel` | 顶层共享作用域 | 是 |
+| `Thread` | `Channel` 下的子作用域 | 是 |
 | `Turn` | 一个 Actor 在一个作用域中的一次处理回合 | 是 |
 | `Event` | 不可变事实 | 是 |
 | `Relation` | 从一个事件指向某个目标的显式边 | 是 |
@@ -90,8 +90,8 @@ v0 明确不处理以下问题：
 flowchart TD
   subgraph Collaboration["Collaboration Domain"]
     ACTOR["Actor"]
-    SPACE["Space"]
-    CONV["Conversation"]
+    SPACE["Channel"]
+    CONV["Thread"]
     TURN["Turn"]
     EVENT["Event"]
     REL["Relation"]
@@ -127,10 +127,10 @@ flowchart TD
 
 ### 5.1 Scope 不变量
 
-- `Conversation` 必须隶属于且仅隶属于一个 `Space`。
-- `Conversation` 不能再嵌套 `Conversation`。
+- `Thread` 必须隶属于且仅隶属于一个 `Channel`。
+- `Thread` 不能再嵌套 `Thread`。
 - 一个 `Event` 必须且只能属于一个 `ScopeRef`。
-- `ScopeRef` 只能取两种值：`space` 或 `conversation`。
+- `ScopeRef` 只能取两种值：`channel` 或 `thread`。
 
 ### 5.2 Turn 不变量
 
@@ -162,7 +162,7 @@ flowchart TD
 
 - `Connection` 不得作为协作上下文的主键。
 - `scope/subscribe` 绑定的是连接上的实时流，不创建 `Membership`。
-- 断线重连不得改变既有 `Event`、`Turn`、`Conversation` 的身份。
+- 断线重连不得改变既有 `Event`、`Turn`、`Thread` 的身份。
 
 ## 6. 标准引用类型
 
@@ -170,7 +170,7 @@ flowchart TD
 
 ```json
 {
-  "kind": "actor | space | conversation | turn | event | artifact",
+  "kind": "actor | channel | thread | turn | event | artifact",
   "id": "string"
 }
 ```
@@ -179,7 +179,7 @@ flowchart TD
 
 ```json
 {
-  "kind": "space | conversation",
+  "kind": "channel | thread",
   "id": "string"
 }
 ```
@@ -198,22 +198,22 @@ flowchart TD
 }
 ```
 
-### 7.2 Space
+### 7.2 Channel
 
 ```json
 {
-  "id": "space_123",
+  "id": "chan_123",
   "title": "string",
   "metadata": {}
 }
 ```
 
-### 7.3 Conversation
+### 7.3 Thread
 
 ```json
 {
-  "id": "conv_123",
-  "space_id": "space_123",
+  "id": "thread_123",
+  "channel_id": "chan_123",
   "title": "string",
   "root_event_id": "evt_001",
   "metadata": {}
@@ -227,8 +227,8 @@ flowchart TD
   "id": "turn_123",
   "actor_id": "actor_123",
   "scope": {
-    "kind": "conversation",
-    "id": "conv_123"
+    "kind": "thread",
+    "id": "thread_123"
   },
   "trigger_event_id": "evt_001",
   "status": "open | closed | failed | cancelled",
@@ -246,8 +246,8 @@ flowchart TD
   "type": "content.add",
   "actor_id": "actor_123",
   "scope": {
-    "kind": "conversation",
-    "id": "conv_123"
+    "kind": "thread",
+    "id": "thread_123"
   },
   "turn_id": "turn_123",
   "seq": 1,
@@ -291,8 +291,8 @@ flowchart TD
 {
   "actor_id": "actor_456",
   "scope": {
-    "kind": "conversation",
-    "id": "conv_123"
+    "kind": "thread",
+    "id": "thread_123"
   },
   "joined_at": "2026-04-18T12:00:00Z",
   "updated_at": "2026-04-18T12:00:10Z",
@@ -332,20 +332,25 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 | 事件类型 | 用途 | 最低要求 |
 | --- | --- | --- |
 | `content.add` | 追加可展示内容，如文本、Markdown、结构化片段 | 必需 |
-| `tool.report` | 报告一次工具调用、命令执行或外部交互 | 必需 |
 | `action.request` | 请求审批、输入或选择 | 必需 |
 | `action.response` | 对某个 `action.request` 的响应 | 必需 |
 | `handoff.offer` | 显式把后续处理责任交给目标 Actor | 必需 |
 | `artifact.publish` | 发布共享产物并产生稳定引用 | 必需 |
-| `status.report` | 报告某个 Turn 的中间状态 | 可选 |
 | `turn.close` | 标记一次 Turn 的结束状态 | 必需 |
+
+判别规则：
+
+- 一个事实是否值得变成 `Event`，取决于它有没有跨 actor 的语义关系（`targets` / `hands_off_to` / `responds_to` / `attaches_artifact`）。有就写成 `Event`；没有的内部活动属于该 Turn 的私有 trace。
+- 异步性不影响这个判别 —— "需要别人未来回应" 的请求即便不阻塞，也仍然是 inter-actor 事件。
 
 说明：
 
 - 普通用户消息可以表示为一个只包含单条 `content.add` 的隐式 Turn。
-- 流式输出通过同一 `Turn` 下的多条 `content.add` 表达。
+- Agent 的流式输出在 server 侧聚合：同一 `Turn` 内的增量 chunk 仅作为 trace 帧实时回推给 turn owner，turn 关闭时一次性写入一条最终 `content.add` 事件。其它 actor 不会看到中间的 partial chunk。
 - `reply`、handoff、artifact 等语义通过 `relations` 表达，不依赖文本解析。
 - 事件与共享产物的关联通过 `attaches_artifact` 关系表达。
+- Agent 的工具调用、内部状态变化、运行时错误属于 Turn 私有 trace，由 `turn/trace.update` 通道承载，不写入 `Event` 流，不进入任何 actor 的 `scope/read` 历史。trace 不可被 `replies_to` / `responds_to` / `references` 寻址；如果其它 actor 需要细节，由该 actor 用 `content.add` 自行解释。
+- v0 阶段不提供 journal 兼容迁移：升级实现后，旧 journal 中遗留的 `tool.report` / `status.report` 事件可被允许直接清空 journal 重建。
 
 ## 9. 核心关系类型
 
@@ -381,7 +386,7 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 
 用途：
 
-- 把当前 `Connection` 绑定到某个 `Space` 或 `Conversation` 的实时更新流。
+- 把当前 `Connection` 绑定到某个 `Channel` 或 `Thread` 的实时更新流。
 
 约束：
 
@@ -394,11 +399,11 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 
 - 按作用域读取历史事件，可支持 cursor、窗口和过滤条件。
 
-### 10.4 `conversation/create`
+### 10.4 `thread/create`
 
 用途：
 
-- 在某个 `Space` 下创建新的 `Conversation`。
+- 在某个 `Channel` 下创建新的 `Thread`。
 
 ### 10.5 `turn/open`
 
@@ -423,8 +428,8 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
       "type": "content.add",
       "actor_id": "actor_user_1",
       "scope": {
-        "kind": "conversation",
-        "id": "conv_123"
+        "kind": "thread",
+        "id": "thread_123"
       },
       "payload": {
         "content_type": "text/markdown",
@@ -484,7 +489,7 @@ sequenceDiagram
   participant S as "Server"
   participant C as "Subscribed Connection"
 
-  U->>S: event/append(content.add, scope=space)
+  U->>S: event/append(content.add, scope=channel)
   S-->>C: stream/update(event.created)
 ```
 
@@ -502,7 +507,7 @@ sequenceDiagram
   participant S as "Server"
   participant B as "Actor B"
 
-  A->>S: handoff/create(target=B, scope=conversation)
+  A->>S: handoff/create(target=B, scope=thread)
   S->>S: create Membership(B, scope)
   S-->>B: delivery(handoff.offer)
   B->>S: scope/read(scope)
@@ -524,6 +529,29 @@ sequenceDiagram
   U->>S: receipt/record(accepted)
 ```
 
+### 11.4 Agent 内部 trace
+
+```mermaid
+sequenceDiagram
+  participant AG as "Agent (turn owner)"
+  participant S as "Server"
+  participant O as "Other actor (subscribed to scope)"
+
+  AG->>S: tool call / partial text / status change
+  S-->>AG: turn/trace.update (owner only)
+  Note over O: nothing — trace is private
+  AG->>S: turn finishes
+  S->>S: flush aggregated text into one content.add
+  S-->>O: stream/update(event.created, content.add)
+  S-->>O: stream/update(event.created, turn.close)
+```
+
+说明：
+
+- trace 帧只对当前 Turn 的 owner（即 `Turn.actor_id`）可见。
+- trace 不写入 `events_by_scope`，不出现在 `scope/read` 结果里。
+- owner 在重连后可通过 `turn/trace.read` 拉取该 turn 的历史 trace。
+
 ## 12. 实现约束
 
 ### 12.1 服务端约束
@@ -533,6 +561,8 @@ sequenceDiagram
 - 服务端必须支持按 `ScopeRef` 查询历史。
 - 服务端必须支持将 `Relation` 原样返回给订阅者。
 - 服务端不得从纯文本 `@handle` 自动推导 `Delivery` 或 `handoff`。
+- 服务端不得把 agent 的工具调用、partial 文本 chunk、内部状态变化作为可订阅 `Event` 广播；这类信号属于 Turn 私有 trace，仅通过 `turn/trace.update` 通道回推给当前 Turn 的 owner。
+- 服务端必须在 Turn 关闭时把同一 Turn 内累积的 partial 文本 chunk 聚合成至多一条最终 `content.add` 事件再广播。
 
 ### 12.2 Membership 约束
 
@@ -542,7 +572,7 @@ sequenceDiagram
 
 ### 12.3 客户端约束
 
-- 客户端不得把本地连接状态当作 `Turn` 或 `Conversation` 的身份来源。
+- 客户端不得把本地连接状态当作 `Turn` 或 `Thread` 的身份来源。
 - 客户端不得依赖裸文本解析来重建 handoff 或 directed delivery。
 - 客户端可以聚合同一 `Turn` 的事件，但不得篡改原始事件顺序。
 
@@ -557,8 +587,8 @@ sequenceDiagram
 一个实现若要宣称兼容本协议 v0，至少应支持：
 
 - `Actor`
-- `Space`
-- `Conversation`
+- `Channel`
+- `Thread`
 - `Turn`
 - `Event`
 - `Relation`
@@ -569,11 +599,12 @@ sequenceDiagram
 - `connection/open`
 - `scope/subscribe`
 - `scope/read`
-- `conversation/create`
+- `thread/create`
 - `event/append`
 - `handoff/create`
 - `artifact/publish`
 - `receipt/record`
+- `turn/trace.read`
 
 ## 14. 总结
 

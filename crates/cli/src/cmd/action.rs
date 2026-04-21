@@ -44,26 +44,21 @@ pub async fn respond(
 }
 
 async fn fetch_event_scope(client: &Client, event_id: &str) -> Result<serde_json::Value> {
-    // We don't have a direct event/get RPC; use scope/read with no scope info isn't possible.
-    // For v0, infer scope by asking the user to also pass it; simplify by reading recent
-    // history on a hypothesis isn't practical. Punt: require the action.request to live in
-    // the only conversation the actor knows. Use conversation/list as a fallback.
-    let lst: ConversationListResult = client.call(method::CONVERSATION_LIST, json!({})).await?;
-    for c in lst.conversations {
+    // We don't have a direct event/get RPC. Infer scope by walking every thread
+    // the server knows about and matching event ids — fine for v0 demo scale.
+    let lst: ThreadListResult = client.call(method::THREAD_LIST, json!({})).await?;
+    for t in lst.threads {
         let res: ScopeReadResult = client
             .call(
                 method::SCOPE_READ,
-                json!({ "scope": { "kind": "conversation", "id": c.id }, "limit": 200 }),
+                json!({ "scope": { "kind": "thread", "id": t.id }, "limit": 200 }),
             )
             .await?;
         for ev in res.events {
             if ev.id == event_id {
-                return Ok(json!({ "kind": "conversation", "id": c.id }));
+                return Ok(json!({ "kind": "thread", "id": t.id }));
             }
         }
     }
-    Err(anyhow!(
-        "could not find event {} in any conversation",
-        event_id
-    ))
+    Err(anyhow!("could not find event {} in any thread", event_id))
 }

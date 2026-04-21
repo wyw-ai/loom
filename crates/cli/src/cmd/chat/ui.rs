@@ -79,7 +79,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("#{}", app.conversation_id),
+            format!("#{}", app.thread_id),
             Style::default().fg(Color::Cyan),
         ),
         Span::raw("  "),

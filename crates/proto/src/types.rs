@@ -10,8 +10,10 @@ pub type Meta = BTreeMap<String, Value>;
 #[serde(rename_all = "lowercase")]
 pub enum RefKind {
     Actor,
-    Space,
-    Conversation,
+    #[serde(alias = "space")]
+    Channel,
+    #[serde(alias = "conversation")]
+    Thread,
     Turn,
     Event,
     Artifact,
@@ -28,8 +30,10 @@ pub struct Ref {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ScopeKind {
-    Space,
-    Conversation,
+    #[serde(alias = "space")]
+    Channel,
+    #[serde(alias = "conversation")]
+    Thread,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -61,7 +65,7 @@ pub struct Actor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Space {
+pub struct Channel {
     pub id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,9 +74,10 @@ pub struct Space {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Conversation {
+pub struct Thread {
     pub id: String,
-    pub space_id: String,
+    #[serde(alias = "spaceId")]
+    pub channel_id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_event_id: Option<String>,
@@ -128,9 +133,11 @@ pub struct Relation {
 #[serde(rename_all = "camelCase")]
 pub struct Event {
     pub id: String,
-    /// Event type, e.g. "content.add", "tool.report", "action.request",
-    /// "action.response", "handoff.offer", "artifact.publish", "status.report",
-    /// "turn.close". Vendor extensions allowed.
+    /// Event type, e.g. "content.add", "action.request", "action.response",
+    /// "handoff.offer", "artifact.publish", "turn.close". Vendor extensions
+    /// allowed. Agent tool calls and internal status changes are NOT events;
+    /// they are turn-private trace frames carried by `turn/trace.update`
+    /// (see `proto::types::trace`).
     #[serde(rename = "type")]
     pub kind: String,
     pub actor_id: String,
@@ -263,7 +270,6 @@ pub struct PageInfo {
 pub mod payload {
     use super::Meta;
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
 
     /// Payload for `content.add`.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,19 +284,6 @@ pub mod payload {
 
     fn default_content_type() -> String {
         "text/markdown".into()
-    }
-
-    /// Payload for `tool.report`.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct ToolReport {
-        pub tool_name: String,
-        #[serde(default)]
-        pub input: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub status: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub output: Option<Value>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,5 +333,58 @@ pub mod payload {
         pub status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub stop_reason: Option<String>,
+    }
+}
+
+// ---- turn-private trace ----
+//
+// Trace frames live on a `Turn` and are visible only to the turn's owner
+// actor (the agent that runs the turn). They are NOT events: they have no
+// global event id, are not stored in `events_by_scope`, are never returned by
+// `scope/read`, and cannot be addressed by `replies_to` / `responds_to` /
+// `references`. They are delivered through the dedicated `turn/trace.update`
+// notification and can be re-read by the owner via `turn/trace.read`.
+
+pub mod trace {
+    use super::{Meta, Timestamp};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    /// Discriminator for trace frame payloads.
+    ///
+    /// - `tool.start` / `tool.update` / `tool.end`: agent tool invocations
+    ///   reported by the runtime
+    /// - `text.delta`: streaming partial chunks of the agent's reply, before
+    ///   they are aggregated into a final `content.add` event at turn close
+    /// - `status`: agent runtime state changes
+    /// - `error`: agent runtime errors that are private to the agent
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    pub enum TraceKind {
+        #[serde(rename = "tool.start")]
+        ToolStart,
+        #[serde(rename = "tool.update")]
+        ToolUpdate,
+        #[serde(rename = "tool.end")]
+        ToolEnd,
+        #[serde(rename = "text.delta")]
+        TextDelta,
+        #[serde(rename = "status")]
+        Status,
+        #[serde(rename = "error")]
+        Error,
+    }
+
+    /// A single trace frame attached to a turn. `seq` is monotonic per-turn.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TraceFrame {
+        pub turn_id: String,
+        pub seq: u64,
+        pub kind: TraceKind,
+        pub occurred_at: Timestamp,
+        #[serde(default)]
+        pub payload: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub _meta: Option<Meta>,
     }
 }

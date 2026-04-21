@@ -24,17 +24,17 @@ pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: Arc<Client>,
     actor_id: String,
-    conversation_id: String,
+    thread_id: String,
 ) -> Result<()> {
     let scope = ScopeRef {
-        kind: ScopeKind::Conversation,
-        id: conversation_id.clone(),
+        kind: ScopeKind::Thread,
+        id: thread_id.clone(),
     };
 
     let display_name = bootstrap_display_name(&client, &actor_id).await;
     let mut app = App::new(
         actor_id.clone(),
-        conversation_id.clone(),
+        thread_id.clone(),
         display_name.clone(),
     );
 
@@ -49,7 +49,7 @@ pub async fn run(
     refresh_actor_directory(&client, &mut app).await;
     app.set_status(format!(
         "connected as {} · {}",
-        display_name, conversation_id
+        display_name, thread_id
     ));
 
     loop {
@@ -162,6 +162,12 @@ async fn refresh_actor_directory(client: &Client, app: &mut App) {
 }
 
 fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) {
+    if n.method == method::TURN_TRACE_UPDATE {
+        if let Some(params) = n.params {
+            handle_trace_update(app, &params);
+        }
+        return;
+    }
     if n.method != method::STREAM_UPDATE {
         return;
     }
@@ -195,6 +201,49 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
             }
         }
         _ => {}
+    }
+}
+
+/// Turn/trace.update is owner-only; the server has already verified that this
+/// connection is bound to the turn's actor before pushing the frame. We surface
+/// it on the status line so the operator can see the agent's internal cursor
+/// (tool starts, status transitions) without polluting history.
+fn handle_trace_update(app: &mut App, params: &serde_json::Value) {
+    let frame = match params.get("frame") {
+        Some(f) => f,
+        None => return,
+    };
+    let kind = frame.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let body = frame.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    let summary = match kind {
+        "text.delta" => body
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect::<String>(),
+        "tool.start" | "tool.update" | "tool.end" => body
+            .get("toolName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tool")
+            .to_string(),
+        "status" => body
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "error" => body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    };
+    if summary.is_empty() {
+        app.set_status(format!("trace · {}", kind));
+    } else {
+        app.set_status(format!("trace · {}: {}", kind, summary));
     }
 }
 
@@ -507,7 +556,7 @@ async fn do_action_response(
         "event": {
             "type": "action.response",
             "actorId": app.actor_id,
-            "scope": { "kind": "conversation", "id": app.conversation_id },
+            "scope": { "kind": "thread", "id": app.thread_id },
             "payload": { "optionId": option_id, "kind": kind },
             "relations": [
                 { "kind": "responds_to", "target": { "kind": "event", "id": event_id.clone() } }
@@ -649,7 +698,7 @@ mod tests {
     fn arm_reply_target_clears_reply_command_residue() {
         let mut app = App::new(
             "actor_human_current".into(),
-            "conv_demo".into(),
+            "thread_demo".into(),
             "bojun.cbj".into(),
         );
         app.input = "/reply ".into();
@@ -667,7 +716,7 @@ mod tests {
     fn reply_to_other_actor_adds_targets_relation() {
         let mut app = App::new(
             "actor_human_current".into(),
-            "conv_demo".into(),
+            "thread_demo".into(),
             "bojun.cbj".into(),
         );
         app.history.bubbles.push(Bubble {
@@ -698,7 +747,7 @@ mod tests {
     fn reply_to_self_does_not_add_targets_relation() {
         let mut app = App::new(
             "actor_human_current".into(),
-            "conv_demo".into(),
+            "thread_demo".into(),
             "bojun.cbj".into(),
         );
         app.history.bubbles.push(Bubble {

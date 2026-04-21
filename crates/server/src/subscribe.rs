@@ -149,4 +149,26 @@ impl Subscriptions {
             false
         }
     }
+
+    /// Send a JSON-RPC notification to the (at most one) connection currently
+    /// bound to `actor_id`. Used for owner-only delivery of turn-private
+    /// trace frames. Returns false if no connection is bound or the send
+    /// channel is closed.
+    pub fn send_to_actor(&self, actor_id: &str, method: &str, payload: Value) -> bool {
+        let frame = match serde_json::to_string(&proto::Notification::new(method, Some(payload))) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, %method, "failed to serialize actor notification");
+                return false;
+            }
+        };
+        let inner = self.inner.read();
+        let Some(conn_id) = inner.actor_conn.get(actor_id) else {
+            return false;
+        };
+        let Some(c) = inner.connections.get(conn_id) else {
+            return false;
+        };
+        c.tx.send(frame).is_ok()
+    }
 }

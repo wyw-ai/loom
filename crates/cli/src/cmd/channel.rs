@@ -8,28 +8,28 @@ use crate::client::Client;
 use crate::render;
 
 pub async fn create(client: Arc<Client>, title: String) -> Result<()> {
-    let res: SpaceCreateResult = client
-        .call(method::SPACE_CREATE, json!({ "title": title }))
+    let res: ChannelCreateResult = client
+        .call(method::CHANNEL_CREATE, json!({ "title": title }))
         .await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
-        println!("space {}\t{}", res.space.id, res.space.title);
+        println!("channel {}\t{}", res.channel.id, res.channel.title);
     }
     Ok(())
 }
 
 pub async fn list(client: Arc<Client>) -> Result<()> {
-    let res: SpaceListResult = client.call(method::SPACE_LIST, json!({})).await?;
+    let res: ChannelListResult = client.call(method::CHANNEL_LIST, json!({})).await?;
     if render::is_json() {
         render::print_json(&res);
         return Ok(());
     }
-    if res.spaces.is_empty() {
-        println!("(no spaces)");
+    if res.channels.is_empty() {
+        println!("(no channels)");
     }
-    for s in res.spaces {
-        println!("{}\t{}", s.id, s.title);
+    for c in res.channels {
+        println!("{}\t{}", c.id, c.title);
     }
     Ok(())
 }

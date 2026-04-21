@@ -12,12 +12,14 @@ pub mod method {
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const SCOPE_READ: &str = "scope/read";
-    pub const SPACE_CREATE: &str = "space/create";
-    pub const SPACE_LIST: &str = "space/list";
-    pub const CONVERSATION_CREATE: &str = "conversation/create";
-    pub const CONVERSATION_LIST: &str = "conversation/list";
+    pub const CHANNEL_CREATE: &str = "channel/create";
+    pub const CHANNEL_LIST: &str = "channel/list";
+    pub const THREAD_CREATE: &str = "thread/create";
+    pub const THREAD_LIST: &str = "thread/list";
     pub const TURN_OPEN: &str = "turn/open";
     pub const TURN_CLOSE: &str = "turn/close";
+    pub const TURN_TRACE_READ: &str = "turn/trace.read";
+    pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const EVENT_APPEND: &str = "event/append";
     pub const HANDOFF_CREATE: &str = "handoff/create";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
@@ -157,49 +159,51 @@ pub struct ScopeReadResult {
     pub page_info: PageInfo,
 }
 
-// ---- space/create ----
+// ---- channel/create ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpaceCreateParams {
+pub struct ChannelCreateParams {
     pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpaceCreateResult {
-    pub space: Space,
+pub struct ChannelCreateResult {
+    pub channel: Channel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpaceListResult {
-    pub spaces: Vec<Space>,
+pub struct ChannelListResult {
+    pub channels: Vec<Channel>,
 }
 
-// ---- conversation/create / list ----
+// ---- thread/create / list ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConversationCreateParams {
-    pub space_id: String,
+pub struct ThreadCreateParams {
+    #[serde(alias = "spaceId")]
+    pub channel_id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationCreateResult {
-    pub conversation: Conversation,
+pub struct ThreadCreateResult {
+    pub thread: Thread,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConversationListParams {
+pub struct ThreadListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space_id: Option<String>,
+    #[serde(alias = "spaceId")]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationListResult {
-    pub conversations: Vec<Conversation>,
+pub struct ThreadListResult {
+    pub threads: Vec<Thread>,
 }
 
 // ---- turn/open / close ----
@@ -233,6 +237,37 @@ fn default_close_status() -> TurnStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnCloseResult {
     pub turn: Turn,
+}
+
+// ---- turn/trace.read ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnTraceReadParams {
+    pub turn_id: String,
+    #[serde(default = "default_trace_limit")]
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<u64>,
+}
+
+fn default_trace_limit() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnTraceReadResult {
+    pub frames: Vec<crate::types::trace::TraceFrame>,
+    pub page_info: PageInfo,
+}
+
+// ---- turn/trace.update notification ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnTraceUpdate {
+    pub turn_id: String,
+    pub frame: crate::types::trace::TraceFrame,
 }
 
 // ---- event/append ----
@@ -494,7 +529,7 @@ pub struct StreamUpdate {
 }
 
 pub mod stream_kind {
-    pub const CONVERSATION_CREATED: &str = "conversation.created";
+    pub const THREAD_CREATED: &str = "thread.created";
     pub const TURN_OPENED: &str = "turn.opened";
     pub const TURN_CLOSED: &str = "turn.closed";
     pub const EVENT_CREATED: &str = "event.created";

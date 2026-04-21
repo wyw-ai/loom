@@ -39,8 +39,8 @@
 定义对象和行为的含义：
 
 - `Actor`
-- `Space`
-- `Conversation`
+- `Channel`
+- `Thread`
 - `Turn`
 - `Event`
 - `Relation`
@@ -191,7 +191,7 @@ v0 推荐 JSON-RPC 2.0 作为默认 binding 形状，理由是：
     "clientCapabilities": {
       "stream": { "update": true },
       "scope": { "read": true, "subscribe": true },
-      "conversation": { "create": true },
+      "thread": { "create": true },
       "turn": { "explicit": true },
       "event": { "append": true },
       "artifact": { "publish": true, "get": true, "read": true },
@@ -218,7 +218,7 @@ v0 推荐 JSON-RPC 2.0 作为默认 binding 形状，理由是：
     "serverCapabilities": {
       "stream": { "update": true },
       "scope": { "read": true, "subscribe": true, "unsubscribe": true },
-      "conversation": { "create": true },
+      "thread": { "create": true },
       "turn": { "explicit": true },
       "event": { "append": true },
       "artifact": { "publish": true, "get": true, "read": true },
@@ -245,7 +245,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 {
   "stream": { "update": true },
   "scope": { "read": true, "subscribe": true, "unsubscribe": true },
-  "conversation": { "create": true },
+  "thread": { "create": true },
   "turn": { "explicit": true },
   "event": { "append": true },
   "artifact": { "publish": true, "get": true, "read": true },
@@ -260,7 +260,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 ```json
 {
-  "kind": "actor | space | conversation | turn | event | artifact",
+  "kind": "actor | channel | thread | turn | event | artifact",
   "id": "string",
   "_meta": {}
 }
@@ -270,7 +270,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 ```json
 {
-  "kind": "space | conversation",
+  "kind": "channel | thread",
   "id": "string",
   "_meta": {}
 }
@@ -312,22 +312,22 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 }
 ```
 
-### 7.6 `Space`
+### 7.6 `Channel`
 
 ```json
 {
-  "id": "space_123",
+  "id": "chan_123",
   "title": "string",
   "_meta": {}
 }
 ```
 
-### 7.7 `Conversation`
+### 7.7 `Thread`
 
 ```json
 {
-  "id": "conv_123",
-  "spaceId": "space_123",
+  "id": "thread_123",
+  "channelId": "chan_123",
   "title": "string",
   "rootEventId": "evt_001",
   "_meta": {}
@@ -341,8 +341,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "id": "turn_123",
   "actorId": "actor_123",
   "scope": {
-    "kind": "conversation",
-    "id": "conv_123"
+    "kind": "thread",
+    "id": "thread_123"
   },
   "triggerEventId": "evt_001",
   "status": "open | closed | failed | cancelled",
@@ -373,8 +373,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "type": "content.add",
   "actorId": "actor_123",
   "scope": {
-    "kind": "conversation",
-    "id": "conv_123"
+    "kind": "thread",
+    "id": "thread_123"
   },
   "turnId": "turn_123",
   "seq": 1,
@@ -423,8 +423,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 {
   "actorId": "actor_456",
   "scope": {
-    "kind": "conversation",
-    "id": "conv_123"
+    "kind": "thread",
+    "id": "thread_123"
   },
   "joinedAt": "2026-04-19T03:20:00Z",
   "updatedAt": "2026-04-19T03:25:00Z",
@@ -472,13 +472,13 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 | 类型 | 用途 |
 | --- | --- |
 | `content.add` | 追加可展示内容 |
-| `tool.report` | 报告工具调用或外部操作 |
 | `action.request` | 请求审批、输入或选择 |
 | `action.response` | 对 action request 的响应 |
 | `handoff.offer` | 显式 handoff |
 | `artifact.publish` | 记录一次 artifact 发布 |
-| `status.report` | 报告中间状态 |
 | `turn.close` | 标记 turn 结束 |
+
+工具调用、内部状态变化、partial 文本 chunk 不再是 `Event`，而是属于该 Turn 的私有 trace，通过 §11.3 的 `turn/trace.update` 通道仅回推给 turn owner。详见语义层 protocol-v0.md §8。
 
 ## 9. 方法目录
 
@@ -562,7 +562,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 用途：
 
-- 把当前连接绑定到 `Space` 或 `Conversation` 的后续实时流。
+- 把当前连接绑定到 `Channel` 或 `Thread` 的后续实时流。
 - 不创建、不删除、不暗示任何 `Membership`。
 
 请求：
@@ -574,8 +574,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "method": "scope/subscribe",
   "params": {
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "_meta": {}
   }
@@ -593,8 +593,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
     "createdAt": "2026-04-19T03:20:00Z",
     "actorId": "actor_123",
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     }
   }
 }
@@ -615,8 +615,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "method": "scope/unsubscribe",
   "params": {
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     }
   }
 }
@@ -649,8 +649,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "method": "scope/read",
   "params": {
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "limit": 50,
     "beforeEventId": "evt_999",
@@ -675,21 +675,21 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 }
 ```
 
-### 9.6 `conversation/create`
+### 9.6 `thread/create`
 
 用途：
 
-- 在某个 `Space` 下创建新的 `Conversation`。
+- 在某个 `Channel` 下创建新的 `Thread`。
 
 请求：
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": "req_conv_create_1",
-  "method": "conversation/create",
+  "id": "req_thread_create_1",
+  "method": "thread/create",
   "params": {
-    "spaceId": "space_123",
+    "channelId": "chan_123",
     "title": "局部收敛",
     "rootEventId": "evt_001",
     "_meta": {}
@@ -702,11 +702,11 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 ```json
 {
   "jsonrpc": "2.0",
-  "id": "req_conv_create_1",
+  "id": "req_thread_create_1",
   "result": {
-    "conversation": {
-      "id": "conv_123",
-      "spaceId": "space_123",
+    "thread": {
+      "id": "thread_123",
+      "channelId": "chan_123",
       "title": "局部收敛",
       "rootEventId": "evt_001"
     }
@@ -731,8 +731,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "params": {
     "actorId": "actor_agent_1",
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "triggerEventId": "evt_001",
     "_meta": {}
@@ -751,8 +751,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
       "id": "turn_123",
       "actorId": "actor_agent_1",
       "scope": {
-        "kind": "conversation",
-        "id": "conv_123"
+        "kind": "thread",
+        "id": "thread_123"
       },
       "triggerEventId": "evt_001",
       "status": "open",
@@ -781,8 +781,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
       "type": "content.add",
       "actorId": "actor_agent_1",
       "scope": {
-        "kind": "conversation",
-        "id": "conv_123"
+        "kind": "thread",
+        "id": "thread_123"
       },
       "turnId": "turn_123",
       "seq": 1,
@@ -817,8 +817,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
       "type": "content.add",
       "actorId": "actor_agent_1",
       "scope": {
-        "kind": "conversation",
-        "id": "conv_123"
+        "kind": "thread",
+        "id": "thread_123"
       },
       "turnId": "turn_123",
       "seq": 1,
@@ -888,8 +888,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "method": "artifact/publish",
   "params": {
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "ingress": {
       "kind": "inline_text",
@@ -1018,8 +1018,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
     "sourceActorId": "actor_agent_1",
     "targetActorId": "actor_agent_2",
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "message": "请继续处理补丁验证。",
     "_meta": {}
@@ -1039,8 +1039,8 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
       "type": "handoff.offer",
       "actorId": "actor_agent_1",
       "scope": {
-        "kind": "conversation",
-        "id": "conv_123"
+        "kind": "thread",
+        "id": "thread_123"
       },
       "payload": {
         "message": "请继续处理补丁验证。"
@@ -1093,6 +1093,61 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
       "actorId": "actor_agent_2",
       "kind": "accepted",
       "recordedAt": "2026-04-19T03:20:04Z"
+    }
+  }
+}
+```
+
+### 9.15 `turn/trace.read`
+
+用途：
+
+- 拉取某个 Turn 已记录的 trace 帧历史。
+- 调用方必须是该 Turn 的 owner（即 `Turn.actorId`）；其它 actor 调用应返回错误。
+- trace 不参与 `scope/read`，必须通过该方法显式拉取。
+
+请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_turn_trace_read_1",
+  "method": "turn/trace.read",
+  "params": {
+    "turnId": "turn_123",
+    "limit": 100,
+    "beforeSeq": null,
+    "_meta": {}
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_turn_trace_read_1",
+  "result": {
+    "frames": [
+      {
+        "seq": 1,
+        "kind": "tool.start",
+        "occurredAt": "2026-04-19T03:20:01Z",
+        "payload": {
+          "toolName": "search",
+          "input": { "query": "..." }
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "text.delta",
+        "occurredAt": "2026-04-19T03:20:01Z",
+        "payload": { "text": "正在分析" }
+      }
+    ],
+    "pageInfo": {
+      "hasMore": false
     }
   }
 }
@@ -1155,13 +1210,15 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 ## 11. Notification Schema
 
-v0 定义单一 notification：`stream/update`
+v0 定义两类 notification：
+
+- `stream/update` —— 面向 scope 订阅者的多 actor 共享事件流，由 `kind` 区分子类型。
+- `turn/trace.update` —— 面向单个 Turn owner 的私有 trace 帧推送，**不**参与 scope 广播。
 
 这样做的目的是：
 
-- stream 出口统一
-- 客户端只需要订阅一种更新通道
-- 具体更新类型由 `kind` 区分
+- 公共事件流出口统一，客户端只需要订阅一种更新通道。
+- agent 内部活动（工具调用、partial 文本、状态变化、运行时错误）走独立的私有通道，不污染公共事件流，也不消耗其它 actor 的 token。
 
 ### 11.1 `stream/update`
 
@@ -1172,8 +1229,8 @@ v0 定义单一 notification：`stream/update`
   "params": {
     "kind": "event.created",
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "data": {},
     "_meta": {}
@@ -1183,7 +1240,7 @@ v0 定义单一 notification：`stream/update`
 
 标准 `kind`：
 
-- `conversation.created`
+- `thread.created`
 - `turn.opened`
 - `turn.closed`
 - `event.created`
@@ -1201,8 +1258,8 @@ v0 定义单一 notification：`stream/update`
   "params": {
     "kind": "event.created",
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "data": {
       "event": {
@@ -1223,8 +1280,8 @@ v0 定义单一 notification：`stream/update`
   "params": {
     "kind": "artifact.published",
     "scope": {
-      "kind": "conversation",
-      "id": "conv_123"
+      "kind": "thread",
+      "id": "thread_123"
     },
     "data": {
       "artifact": {
@@ -1236,22 +1293,61 @@ v0 定义单一 notification：`stream/update`
 }
 ```
 
+### 11.4 `turn/trace.update`
+
+`turn/trace.update` 是 server → client 的私有 notification，仅发给当前 Turn 的 owner（`Turn.actorId` 对应的 connection）。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "turn/trace.update",
+  "params": {
+    "turnId": "turn_123",
+    "frame": {
+      "seq": 7,
+      "kind": "tool.start",
+      "occurredAt": "2026-04-19T03:20:01Z",
+      "payload": {
+        "toolName": "search",
+        "input": { "query": "..." }
+      }
+    },
+    "_meta": {}
+  }
+}
+```
+
+标准 `frame.kind`：
+
+- `tool.start` —— agent 开始一次工具调用；payload 含 `toolName` / `input`。
+- `tool.update` —— 同一次调用的中间进度；payload 含 ACP adapter 提供的部分输出。
+- `tool.end` —— 工具调用结束；payload 含 `status` / `output` / `error`。
+- `text.delta` —— agent partial 文本 chunk；payload 含 `text`。
+- `status` —— agent 上报的运行时状态变化；payload 含 `status` 字符串。
+- `error` —— agent 报告的运行时错误；payload 含 `message`。
+
+约束：
+
+- 服务端不得把 trace 帧广播给除 owner 之外的任何 connection。
+- 服务端不得把 trace 帧记录为可寻址的 `Event`（不分配 `eventId`，不能被 `replies_to` / `responds_to` / `references` 指向）。
+- 重连后 owner 仍可通过 `turn/trace.read` 拉历史。
+
 ## 12. 校验规则
 
 ### 12.1 Scope 校验
 
-- `Conversation.spaceId` 必须指向已存在的 `Space`。
-- `Event.scope` 只能是 `Space` 或 `Conversation`。
+- `Thread.channelId` 必须指向已存在的 `Channel`。
+- `Event.scope` 只能是 `Channel` 或 `Thread`。
 - `Turn.scope` 必须与其下 `Event.scope` 保持一致。
 
 ### 12.2 `reply` 校验
 
 - `replies_to` 的目标必须是 `Event`。
 - `replies_to` 可以形成任意深度的 reply chain。
-- `Conversation` 不可嵌套。
-- 在 `Conversation` 内，`replies_to` 的目标必须满足其一：
-  - 指向同一个 `Conversation` 中的某个 `Event`
-  - 指向该 `Conversation.rootEventId`
+- `Thread` 不可嵌套。
+- 在 `Thread` 内，`replies_to` 的目标必须满足其一：
+  - 指向同一个 `Thread` 中的某个 `Event`
+  - 指向该 `Thread.rootEventId`
 
 ### 12.3 Relation 校验
 
@@ -1277,7 +1373,7 @@ human UI 不需要向用户暴露 raw schema。
 | --- | --- |
 | 发送消息 | `event/append` |
 | 选择 agent 作为下一步处理者 | `handoff/create` |
-| 新开 thread / 局部讨论 | `conversation/create` |
+| 新开 thread / 局部讨论 | `thread/create` |
 | 拖拽上传附件 | `artifact/publish` |
 | 在消息里附加附件卡片 | `event/append` + `attaches_artifact` |
 | 点击接受 handoff | `receipt/record` |
@@ -1314,7 +1410,7 @@ MCP tool 名可以与 schema 方法一一映射。
 
 | MCP Tool | Schema 方法 |
 | --- | --- |
-| `conversation_create` | `conversation/create` |
+| `thread_create` | `thread/create` |
 | `event_append` | `event/append` |
 | `artifact_publish` | `artifact/publish` |
 | `artifact_get` | `artifact/get` |
@@ -1357,7 +1453,7 @@ MCP tool 名可以与 schema 方法一一映射。
 - `connection/open`
 - `scope/subscribe`
 - `scope/read`
-- `conversation/create`
+- `thread/create`
 - `event/append`
 - `artifact/publish`
 - `artifact/get`
@@ -1365,12 +1461,14 @@ MCP tool 名可以与 schema 方法一一映射。
 - `handoff/create`
 - `receipt/record`
 - `stream/update`
+- `turn/trace.read`
+- `turn/trace.update`
 
 并且至少应支持以下对象：
 
 - `Actor`
-- `Space`
-- `Conversation`
+- `Channel`
+- `Thread`
 - `Turn`
 - `Event`
 - `Relation`

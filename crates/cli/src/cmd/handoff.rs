@@ -12,7 +12,7 @@ pub async fn run(
     client: Arc<Client>,
     actor_id: String,
     target_actor_id: Option<String>,
-    conversation_id: String,
+    thread_id: String,
     message: String,
 ) -> Result<()> {
     let target = match target_actor_id {
@@ -25,7 +25,7 @@ pub async fn run(
             json!({
                 "sourceActorId": actor_id,
                 "targetActorId": target,
-                "scope": { "kind": "conversation", "id": conversation_id },
+                "scope": { "kind": "thread", "id": thread_id },
                 "message": message,
             }),
         )

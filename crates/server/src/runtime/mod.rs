@@ -49,6 +49,11 @@ pub struct RegisteredAgent {
     pub active_turn_id: Option<String>,
     /// True after the agent's session has received its first manifest-bearing prompt.
     pub seeded: bool,
+    /// Per-turn streaming text buffer. Partial text chunks accumulate here and
+    /// are flushed as a single `content.add` event when the turn closes; the
+    /// raw chunks themselves are exposed as turn-private `text.delta` trace
+    /// frames so the owner can see the cursor moving.
+    pub text_buffer: HashMap<String, String>,
 }
 
 impl RegisteredAgent {
@@ -63,6 +68,7 @@ impl RegisteredAgent {
             action_map: HashMap::new(),
             active_turn_id: None,
             seeded: false,
+            text_buffer: HashMap::new(),
         }
     }
 
@@ -168,10 +174,13 @@ impl RuntimeManager {
                 a.log,
                 a.action_map,
                 a.active_turn_id,
+                a.text_buffer,
             )
         });
         let mut entry = RegisteredAgent::new(spec.clone());
-        if let Some((adapter, status, pid, session_id, log, action_map, turn)) = existing {
+        if let Some((adapter, status, pid, session_id, log, action_map, turn, text_buffer)) =
+            existing
+        {
             entry.adapter = adapter;
             entry.status = status;
             entry.pid = pid;
@@ -179,6 +188,7 @@ impl RuntimeManager {
             entry.log = log;
             entry.action_map = action_map;
             entry.active_turn_id = turn;
+            entry.text_buffer = text_buffer;
         }
         let info = entry.info();
         agents.insert(spec.actor.id.clone(), entry);
@@ -274,6 +284,37 @@ impl RuntimeManager {
             a.status = "stopped".into();
             a.active_turn_id = None;
             a.seeded = false;
+            a.text_buffer.clear();
+        }
+    }
+
+    /// Append a chunk of streaming agent text to the per-turn buffer. Returns
+    /// the chunk back so callers can also emit it as a `text.delta` trace
+    /// frame without re-borrowing.
+    pub fn push_text_chunk(&self, actor_id: &str, turn_id: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let mut agents = self.agents.lock();
+        if let Some(a) = agents.get_mut(actor_id) {
+            a.text_buffer
+                .entry(turn_id.to_string())
+                .or_default()
+                .push_str(chunk);
+        }
+    }
+
+    /// Drain the per-turn streaming text buffer. Returns `None` when nothing
+    /// has been buffered for the turn (e.g. the agent never produced text
+    /// before closing).
+    pub fn take_text_buffer(&self, actor_id: &str, turn_id: &str) -> Option<String> {
+        let mut agents = self.agents.lock();
+        let entry = agents.get_mut(actor_id)?;
+        let text = entry.text_buffer.remove(turn_id)?;
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
         }
     }
 

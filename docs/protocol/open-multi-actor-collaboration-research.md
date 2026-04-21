@@ -124,9 +124,9 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 协议需要比产品 UI 更稳定、更抽象：
 
 - UI 里可以叫频道、房间、论坛、项目、工单。
-- 协议里更适合统一抽象成 `space`。
+- 协议里更适合统一抽象成 `channel`。
 - UI 里可以叫线程、话题、子讨论、reply chain。
-- 协议里更适合统一抽象成 `conversation`。
+- 协议里更适合统一抽象成 `thread`。
 
 这样协议可以承载 Discord 风格界面，也可以承载邮件视图、工单视图或 timeline 视图。
 
@@ -149,8 +149,8 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 - `Endpoint`：Actor 的一个接入端实现，比如 GUI、CLI、bot adapter。
 - `Connection`：Endpoint 和服务器的一次在线连接。
 - `Runtime Session`：Endpoint 内部和模型、工具运行时之间的一次私有会话。
-- `Space`：顶层共享作用域。
-- `Conversation`：`Space` 下的子作用域，用于局部收敛。
+- `Channel`：顶层共享作用域。
+- `Thread`：`Channel` 下的子作用域，用于局部收敛。
 - `Turn`：某个 Actor 在一个作用域中的一次处理回合。
 - `Event`：不可变事实。
 - `Relation`：事件到事件、事件到 Actor、事件到 Artifact 的显式边。
@@ -160,7 +160,7 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 
 这里最重要的不是名词本身，而是边界：
 
-- `Space / Conversation / Turn / Event` 属于协作域。
+- `Channel / Thread / Turn / Event` 属于协作域。
 - `Endpoint / Connection / Runtime Session` 属于接入域。
 
 ## 7. 设计决策
@@ -178,8 +178,8 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 
 比起直接把 `channel` 和 `thread` 写死，协议更适合统一成：
 
-- `Space`：顶层作用域。
-- `Conversation`：`Space` 的子作用域。
+- `Channel`：顶层作用域。
+- `Thread`：`Channel` 的子作用域。
 
 这样做的好处：
 
@@ -266,13 +266,13 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 
 | 能力 | 协议中至少需要的抽象 |
 | --- | --- |
-| 顶层共享时间线 | `Space + Event` |
-| 局部子讨论 | `Conversation` |
+| 顶层共享时间线 | `Channel + Event` |
+| 局部子讨论 | `Thread` |
 | `reply` 关系 | `Relation(replies_to)` |
 | actor 定向投递 | `Relation(targets or hands_off_to) + Delivery` |
 | 显式 handoff | `Event + Relation(hands_off_to)` |
 | 流式输出 | `Turn + ordered Event` |
-| 工具轨迹 | `tool.report` 一类事件 |
+| 工具轨迹 | turn 私有 trace 通道（owner-only），不进事件流 |
 | 用户审批/输入/选择 | `action.request / action.response` |
 | 共享文件与稳定引用 | `Artifact + artifact URI` |
 | 历史检索与窗口读取 | `scope.read / event.list` 一类能力 |
@@ -286,7 +286,7 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 可以把这轮研究压缩成六条结论：
 
 1. 协作协议的主轴应该是 `scope + event`，不是 `session + prompt`。
-2. `Space` 和 `Conversation` 属于协作域，`Connection` 和 `Runtime Session` 属于接入域。
+2. `Channel` 和 `Thread` 属于协作域，`Connection` 和 `Runtime Session` 属于接入域。
 3. `Actor` 必须统一建模，人和 Agent 在领域层平等。
 4. `Turn` 必须存在，用来承载一次可回看的处理过程。
 5. `Artifact` 必须是一等对象，不能退化成路径字符串。

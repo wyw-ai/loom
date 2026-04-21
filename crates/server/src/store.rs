@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use parking_lot::RwLock;
+use proto::types::trace::TraceFrame;
 use proto::types::*;
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -29,11 +30,15 @@ pub enum StoreEvent {
     EventCreated(Event),
     TurnOpened(Turn),
     TurnClosed(Turn),
-    ConversationCreated(Conversation),
+    ThreadCreated(Thread),
     ArtifactPublished(Artifact),
     ReceiptRecorded(Receipt),
     DeliveryUpdated(Delivery),
     HandoffCreated(Event),
+    /// Turn-private trace frame. Carried on the same broadcast channel as
+    /// scope events purely so the websocket layer can route it; the fanout
+    /// must NOT broadcast it to scope subscribers — see `ws::fanout`.
+    TraceAppended(TraceFrame),
 }
 
 impl StoreEvent {
@@ -41,14 +46,17 @@ impl StoreEvent {
         match self {
             StoreEvent::EventCreated(e) => Some(e.scope.clone()),
             StoreEvent::TurnOpened(t) | StoreEvent::TurnClosed(t) => Some(t.scope.clone()),
-            StoreEvent::ConversationCreated(c) => Some(ScopeRef {
-                kind: ScopeKind::Space,
-                id: c.space_id.clone(),
+            StoreEvent::ThreadCreated(c) => Some(ScopeRef {
+                kind: ScopeKind::Channel,
+                id: c.channel_id.clone(),
             }),
             StoreEvent::ArtifactPublished(_) => None,
             StoreEvent::ReceiptRecorded(_) => None,
             StoreEvent::DeliveryUpdated(_) => None,
             StoreEvent::HandoffCreated(e) => Some(e.scope.clone()),
+            // Trace frames are owner-private; ws fanout routes them by
+            // turn owner, never by scope.
+            StoreEvent::TraceAppended(_) => None,
         }
     }
 }
@@ -56,8 +64,8 @@ impl StoreEvent {
 #[derive(Default)]
 struct Inner {
     actors: HashMap<String, Actor>,
-    spaces: HashMap<String, Space>,
-    conversations: HashMap<String, Conversation>,
+    channels: HashMap<String, Channel>,
+    threads: HashMap<String, Thread>,
     turns: HashMap<String, Turn>,
     /// scope ref -> ordered events
     events_by_scope: HashMap<ScopeRef, Vec<String>>,
@@ -69,6 +77,10 @@ struct Inner {
     deliveries: HashMap<(String, String), Delivery>,
     receipts: HashMap<(String, String, ReceiptKind), Receipt>,
     artifacts: HashMap<String, Artifact>,
+    /// turn id -> ordered trace frames (owner-private; never broadcast)
+    trace_by_turn: HashMap<String, Vec<TraceFrame>>,
+    /// turn id -> next trace seq
+    trace_seq: HashMap<String, u64>,
 }
 
 pub struct Store {
@@ -126,92 +138,91 @@ impl Store {
         self.inner.read().actors.values().cloned().collect()
     }
 
-    // -------- Spaces --------
+    // -------- Channels --------
 
-    pub fn create_space(&self, title: String) -> StoreResult<Space> {
-        let space = Space {
-            id: format!("space_{}", short_id()),
+    pub fn create_channel(&self, title: String) -> StoreResult<Channel> {
+        let channel = Channel {
+            id: format!("chan_{}", short_id()),
             title,
             _meta: None,
         };
-        self.journal.append(&Mutation::SpaceCreate(space.clone()))?;
+        self.journal
+            .append(&Mutation::ChannelCreate(channel.clone()))?;
         self.inner
             .write()
-            .spaces
-            .insert(space.id.clone(), space.clone());
-        Ok(space)
+            .channels
+            .insert(channel.id.clone(), channel.clone());
+        Ok(channel)
     }
 
-    pub fn list_spaces(&self) -> Vec<Space> {
-        self.inner.read().spaces.values().cloned().collect()
+    pub fn list_channels(&self) -> Vec<Channel> {
+        self.inner.read().channels.values().cloned().collect()
     }
 
-    pub fn get_space(&self, id: &str) -> Option<Space> {
-        self.inner.read().spaces.get(id).cloned()
+    pub fn get_channel(&self, id: &str) -> Option<Channel> {
+        self.inner.read().channels.get(id).cloned()
     }
 
-    // -------- Conversations --------
+    // -------- Threads --------
 
-    pub fn create_conversation(
+    pub fn create_thread(
         &self,
-        space_id: String,
+        channel_id: String,
         title: String,
         root_event_id: Option<String>,
-    ) -> StoreResult<Conversation> {
-        if self.get_space(&space_id).is_none() {
-            return Err(StoreError::NotFound(format!("space {space_id}")));
+    ) -> StoreResult<Thread> {
+        if self.get_channel(&channel_id).is_none() {
+            return Err(StoreError::NotFound(format!("channel {channel_id}")));
         }
-        let conv = Conversation {
-            id: format!("conv_{}", short_id()),
-            space_id,
+        let thread = Thread {
+            id: format!("thread_{}", short_id()),
+            channel_id,
             title,
             root_event_id,
             _meta: None,
         };
         self.journal
-            .append(&Mutation::ConversationCreate(conv.clone()))?;
+            .append(&Mutation::ThreadCreate(thread.clone()))?;
         self.inner
             .write()
-            .conversations
-            .insert(conv.id.clone(), conv.clone());
-        self.emit(StoreEvent::ConversationCreated(conv.clone()));
-        Ok(conv)
+            .threads
+            .insert(thread.id.clone(), thread.clone());
+        self.emit(StoreEvent::ThreadCreated(thread.clone()));
+        Ok(thread)
     }
 
-    pub fn list_conversations(&self, space_id: Option<&str>) -> Vec<Conversation> {
+    pub fn list_threads(&self, channel_id: Option<&str>) -> Vec<Thread> {
         let inner = self.inner.read();
         inner
-            .conversations
+            .threads
             .values()
-            .filter(|c| match space_id {
-                Some(id) => c.space_id == id,
+            .filter(|t| match channel_id {
+                Some(id) => t.channel_id == id,
                 None => true,
             })
             .cloned()
             .collect()
     }
 
-    pub fn get_conversation(&self, id: &str) -> Option<Conversation> {
-        self.inner.read().conversations.get(id).cloned()
+    pub fn get_thread(&self, id: &str) -> Option<Thread> {
+        self.inner.read().threads.get(id).cloned()
     }
 
-    pub fn set_conversation_root(
+    pub fn set_thread_root(
         &self,
-        conversation_id: String,
+        thread_id: String,
         root_event_id: String,
     ) -> StoreResult<()> {
-        self.journal.append(&Mutation::ConversationRootSet {
-            conversation_id: conversation_id.clone(),
+        self.journal.append(&Mutation::ThreadRootSet {
+            thread_id: thread_id.clone(),
             root_event_id: root_event_id.clone(),
         })?;
         let mut inner = self.inner.write();
-        if let Some(c) = inner.conversations.get_mut(&conversation_id) {
-            c.root_event_id = Some(root_event_id);
+        if let Some(t) = inner.threads.get_mut(&thread_id) {
+            t.root_event_id = Some(root_event_id);
             Ok(())
         } else {
-            Err(StoreError::NotFound(format!(
-                "conversation {conversation_id}"
-            )))
+            Err(StoreError::NotFound(format!("thread {thread_id}")))
         }
     }
 
@@ -266,6 +277,86 @@ impl Store {
         self.inner.read().turns.get(id).cloned()
     }
 
+    // -------- Turn-private trace --------
+
+    /// Append a turn-private trace frame. Caller passes `kind` and `payload`;
+    /// this method assigns the frame's monotonic per-turn `seq` and a
+    /// `occurred_at` timestamp, persists it to the journal, and emits a
+    /// `StoreEvent::TraceAppended` for the websocket layer to route to the
+    /// turn owner only.
+    ///
+    /// Returns the persisted frame.
+    pub fn append_trace_frame(
+        &self,
+        turn_id: &str,
+        kind: proto::types::trace::TraceKind,
+        payload: serde_json::Value,
+    ) -> StoreResult<TraceFrame> {
+        // Validate turn exists. We do not require it to be Open: callers may
+        // emit a final trace frame as part of the same handler that closes
+        // the turn (order is best-effort; the frame is owner-private anyway).
+        if self.inner.read().turns.get(turn_id).is_none() {
+            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+        }
+
+        let now = Utc::now();
+        let seq = {
+            let mut inner = self.inner.write();
+            let entry = inner.trace_seq.entry(turn_id.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        let frame = TraceFrame {
+            turn_id: turn_id.to_string(),
+            seq,
+            kind,
+            occurred_at: now,
+            payload,
+            _meta: None,
+        };
+        self.journal.append(&Mutation::TraceAppend(frame.clone()))?;
+        self.inner
+            .write()
+            .trace_by_turn
+            .entry(turn_id.to_string())
+            .or_default()
+            .push(frame.clone());
+        self.emit(StoreEvent::TraceAppended(frame.clone()));
+        Ok(frame)
+    }
+
+    /// Read trace frames for a turn. `before_seq` selects frames with
+    /// `seq < before_seq` (older); when `None`, the latest `limit` frames
+    /// are returned. Returns frames in ascending `seq` order along with
+    /// `has_more`.
+    pub fn read_turn_trace(
+        &self,
+        turn_id: &str,
+        limit: u32,
+        before_seq: Option<u64>,
+    ) -> StoreResult<(Vec<TraceFrame>, bool)> {
+        if self.inner.read().turns.get(turn_id).is_none() {
+            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+        }
+        let inner = self.inner.read();
+        let frames = match inner.trace_by_turn.get(turn_id) {
+            Some(v) => v.clone(),
+            None => return Ok((vec![], false)),
+        };
+        let end = match before_seq {
+            Some(before) => frames
+                .iter()
+                .position(|f| f.seq >= before)
+                .unwrap_or(frames.len()),
+            None => frames.len(),
+        };
+        let limit = limit.max(1) as usize;
+        let start = end.saturating_sub(limit);
+        let has_more = start > 0;
+        Ok((frames[start..end].to_vec(), has_more))
+    }
+
     // -------- Events --------
 
     /// Append an event. Implicit-turn behavior: if `turn_id` is None, an implicit Turn
@@ -282,14 +373,14 @@ impl Store {
     ) -> StoreResult<Event> {
         // Validate scope exists.
         match scope.kind {
-            ScopeKind::Space => {
-                if self.get_space(&scope.id).is_none() {
-                    return Err(StoreError::NotFound(format!("space {}", scope.id)));
+            ScopeKind::Channel => {
+                if self.get_channel(&scope.id).is_none() {
+                    return Err(StoreError::NotFound(format!("channel {}", scope.id)));
                 }
             }
-            ScopeKind::Conversation => {
-                if self.get_conversation(&scope.id).is_none() {
-                    return Err(StoreError::NotFound(format!("conversation {}", scope.id)));
+            ScopeKind::Thread => {
+                if self.get_thread(&scope.id).is_none() {
+                    return Err(StoreError::NotFound(format!("thread {}", scope.id)));
                 }
             }
         }
@@ -373,19 +464,19 @@ impl Store {
             }
         }
 
-        // For conversations whose root_event_id is unset, set it on the first
+        // For threads whose root_event_id is unset, set it on the first
         // appended event if it has no replies_to.
-        if let ScopeKind::Conversation = event.scope.kind {
+        if let ScopeKind::Thread = event.scope.kind {
             let needs_root = matches!(
-                self.get_conversation(&event.scope.id),
-                Some(c) if c.root_event_id.is_none()
+                self.get_thread(&event.scope.id),
+                Some(t) if t.root_event_id.is_none()
             );
             let is_top_level = !event
                 .relations
                 .iter()
                 .any(|r| matches!(r.kind, RelationKind::RepliesTo));
             if needs_root && is_top_level {
-                let _ = self.set_conversation_root(event.scope.id.clone(), event.id.clone());
+                let _ = self.set_thread_root(event.scope.id.clone(), event.id.clone());
             }
         }
 
@@ -537,11 +628,11 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::ActorUpsert(a) => {
             inner.actors.insert(a.id.clone(), a);
         }
-        Mutation::SpaceCreate(s) => {
-            inner.spaces.insert(s.id.clone(), s);
+        Mutation::ChannelCreate(c) => {
+            inner.channels.insert(c.id.clone(), c);
         }
-        Mutation::ConversationCreate(c) => {
-            inner.conversations.insert(c.id.clone(), c);
+        Mutation::ThreadCreate(t) => {
+            inner.threads.insert(t.id.clone(), t);
         }
         Mutation::TurnOpen(t) => {
             inner.turns.insert(t.id.clone(), t);
@@ -589,13 +680,24 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::ArtifactCreate(a) => {
             inner.artifacts.insert(a.id.clone(), a);
         }
-        Mutation::ConversationRootSet {
-            conversation_id,
+        Mutation::ThreadRootSet {
+            thread_id,
             root_event_id,
         } => {
-            if let Some(c) = inner.conversations.get_mut(&conversation_id) {
-                c.root_event_id = Some(root_event_id);
+            if let Some(t) = inner.threads.get_mut(&thread_id) {
+                t.root_event_id = Some(root_event_id);
             }
+        }
+        Mutation::TraceAppend(frame) => {
+            let entry = inner.trace_seq.entry(frame.turn_id.clone()).or_insert(0);
+            if frame.seq > *entry {
+                *entry = frame.seq;
+            }
+            inner
+                .trace_by_turn
+                .entry(frame.turn_id.clone())
+                .or_default()
+                .push(frame);
         }
     }
 }

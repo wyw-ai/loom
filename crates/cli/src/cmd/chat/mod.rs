@@ -18,9 +18,9 @@ use ratatui::Terminal;
 
 use crate::client::Client;
 
-pub async fn run(client: Arc<Client>, actor_id: String, conversation_id: String) -> Result<()> {
+pub async fn run(client: Arc<Client>, actor_id: String, thread_id: String) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = events::run(&mut terminal, client, actor_id, conversation_id).await;
+    let result = events::run(&mut terminal, client, actor_id, thread_id).await;
     restore_terminal(&mut terminal)?;
     result
 }

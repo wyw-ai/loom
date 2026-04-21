@@ -42,7 +42,7 @@ pub struct App {
     /// handoff message before pressing Enter.
     pub at_menu: Option<Picker>,
     pub actor_id: String,
-    pub conversation_id: String,
+    pub thread_id: String,
     pub display_for: HashMap<String, String>,
     /// Best-effort kind ("agent" / "human" / "service") per actor id; used
     /// only as a hint label in the @-mention picker.
@@ -63,7 +63,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(actor_id: String, conversation_id: String, self_display: String) -> Self {
+    pub fn new(actor_id: String, thread_id: String, self_display: String) -> Self {
         let mut display_for = HashMap::new();
         display_for.insert(actor_id.clone(), self_display);
         display_for.insert("system".to_string(), "system".to_string());
@@ -75,7 +75,7 @@ impl App {
             slash_menu: None,
             at_menu: None,
             actor_id,
-            conversation_id,
+            thread_id,
             display_for,
             actor_kinds: HashMap::new(),
             agent_ids: HashSet::new(),
@@ -217,7 +217,7 @@ impl App {
     pub fn open_action_picker(&mut self) {
         let pending = self.history.pending_action_requests();
         if pending.is_empty() {
-            self.set_status("no pending action.request in this conversation");
+            self.set_status("no pending action.request in this thread");
             return;
         }
         let items = pending
@@ -237,7 +237,7 @@ impl App {
             .map(|(id, label)| PickerItem::new(id, label))
             .collect::<Vec<_>>();
         if items.is_empty() {
-            self.set_status("no replyable events in this conversation");
+            self.set_status("no replyable events in this thread");
             return;
         }
         let picker = Picker::new("Reply to…", items);
@@ -300,7 +300,7 @@ pub fn slash_command_items() -> Vec<PickerItem> {
         PickerItem::new("/reply", "Reply to a previous event")
             .with_hint("sets replies_to for the next message"),
         PickerItem::new("/action", "Respond to a pending action.request"),
-        PickerItem::new("/agents", "List active agents in the conversation"),
+        PickerItem::new("/agents", "List active agents in the thread"),
         PickerItem::new("/quit", "Leave the chat"),
     ]
 }
@@ -313,7 +313,7 @@ mod tests {
     fn at_menu_only_lists_registered_agents() {
         let mut app = App::new(
             "actor_human_current".into(),
-            "conv_demo".into(),
+            "thread_demo".into(),
             "bojun.cbj".into(),
         );
         app.display_for
@@ -339,7 +339,7 @@ mod tests {
     fn duplicate_display_names_are_disambiguated_by_kind_when_possible() {
         let mut app = App::new(
             "actor_human_current".into(),
-            "conv_demo".into(),
+            "thread_demo".into(),
             "Alice".into(),
         );
         app.display_for
@@ -360,7 +360,7 @@ mod tests {
     fn duplicate_display_names_same_kind_fall_back_to_actor_ref() {
         let mut app = App::new(
             "actor_human_current".into(),
-            "conv_demo".into(),
+            "thread_demo".into(),
             "OpenCode".into(),
         );
         app.display_for

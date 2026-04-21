@@ -32,7 +32,7 @@
 负责：
 
 - 人类 actor 打开 GUI session
-- 浏览 `Space` / `Conversation`
+- 浏览 `Channel` / `Thread`
 - 观察 timeline
 - 对 agent 发任务与显式 handoff
 - 把 `@handle` 作为普通文本引用显示，而不是机器路由
@@ -45,8 +45,8 @@
 | 协议对象 | 这次实现 | joi 对应概念 |
 | --- | --- | --- |
 | `Actor` | `actors` 表 | user / agent / system sender |
-| `Space` | `spaces` 表 | channel |
-| `Conversation` | `conversations` 表 | thread |
+| `Channel` | `channels` 表 | channel（长期承载） |
+| `Thread` | `threads` 表 | thread（短期任务） |
 | `Turn` | `turns` 表 | 一次 agent 执行回合 |
 | `Event` | `events` 表 | message + runtime event stream |
 | `Relation` | `relations` 表 | reply / target / handoff / artifact link |
@@ -145,10 +145,10 @@ Registry 会扫描两套来源：
 - 把 targeted event 排队给对应 agent
 - 打开 `Turn`
 - 把 ACP 输出映射成：
-  - `content.add`
-  - `tool.report`
+  - `content.add`（按 turn 聚合，partial chunk 不直接广播）
   - `action.request`
   - `turn.close`
+  - 工具调用 / 状态变化 / 内部错误 / partial chunk → turn 私有 trace（`turn/trace.update`，仅推 owner）
 - 把 runtime status / runtime log 推给 GUI
 
 ### 5.4 Workspace
@@ -216,6 +216,6 @@ GUI 已经换成协作平台式布局，而不是早期“控制台按钮墙”�
 如果还要往 `joi` 正式产品的完成度继续收，下一批最值得补的是：
 
 1. thread context 文件化，比如 `summary.md` / `handoff.md`
-2. `tool.report` 的专门可视化视图
+2. turn trace 的 owner-only 可视化视图（折叠/展开、按 tool 名分组）
 3. adapter 安装 / 更新 / 健康检查的完整设置流
 4. 更强的 permission trace / delivery trace / audit trace

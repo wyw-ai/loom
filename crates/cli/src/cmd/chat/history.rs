@@ -19,7 +19,7 @@ pub struct Bubble {
 pub enum BubbleKind {
     /// content.add (streamed); subsequent same-actor/turn chunks append in place
     Stream,
-    /// non-streaming events (handoff, action.request/response, tool.report, system)
+    /// non-streaming events (handoff, action.request/response, system)
     Static,
     /// system / informational lines (server hints, errors)
     System,
@@ -44,7 +44,6 @@ impl History {
     pub fn push_event(&mut self, ev: &Event) {
         match ev.kind.as_str() {
             "content.add" => self.append_stream(ev),
-            "tool.report" => self.push_static(ev, format_tool(ev)),
             "action.request" => self.push_static(ev, format_action_request(ev)),
             "action.response" => self.push_static(ev, format_action_response(ev)),
             "handoff.offer" => self.push_static(ev, format_handoff(ev)),
@@ -276,20 +275,6 @@ fn delivery_span(state: DeliveryState) -> Option<Span<'static>> {
     }
 }
 
-fn format_tool(ev: &Event) -> String {
-    let name = ev
-        .payload
-        .get("toolName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("tool");
-    let status = ev
-        .payload
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    format!("↯ tool {} ({})", name, status)
-}
-
 fn format_action_request(ev: &Event) -> String {
     let title = ev
         .payload
@@ -368,8 +353,8 @@ mod tests {
             kind: "content.add".into(),
             actor_id: "actor_a".into(),
             scope: ScopeRef {
-                kind: ScopeKind::Conversation,
-                id: "conv_1".into(),
+                kind: ScopeKind::Thread,
+                id: "thread_1".into(),
             },
             turn_id: Some("turn_1".into()),
             seq: 1,

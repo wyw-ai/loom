@@ -6,8 +6,9 @@
 
 use std::sync::Arc;
 
+use proto::types::trace::TraceKind;
 use proto::types::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::acp::AgentEvent;
@@ -113,11 +114,11 @@ fn render_prompt(trigger: &Event) -> String {
 /// JOI_ACTOR are already injected into the child process.
 fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
     let scope_kind = match scope.kind {
-        ScopeKind::Conversation => "conversation",
-        ScopeKind::Space => "space",
+        ScopeKind::Thread => "thread",
+        ScopeKind::Channel => "channel",
     };
-    let scope_flag = if matches!(scope.kind, ScopeKind::Space) {
-        " --space"
+    let scope_flag = if matches!(scope.kind, ScopeKind::Channel) {
+        " --channel"
     } else {
         ""
     };
@@ -132,11 +133,16 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          JOI_SERVER and JOI_ACTOR are already set, so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
            joi --json event list --in {scope_id}{scope_flag} --before <event_id>\n\
-           joi --json conv list\n\
-           joi --json space list\n\
+           joi --json thread list\n\
+           joi --json channel list\n\
            joi --json actor list\n\
            joi --json agent list\n\
+           joi --json artifact get <art_id|artifact://...>\n\
+           joi --json artifact read <art_id> [--max-bytes N]\n\
          will work without flags. Use `--json` for machine-readable output.\n\
+         To publish a text artifact (e.g. a draft, plan, summary):\n\
+           joi --json artifact publish --in {scope_id}{scope_flag} --name <file> \\\n\
+             [--media-type <type>] (--text <body> | --file <path>)\n\
          Use `joi --help` and `joi <subcommand> --help` for the full surface.\n\
          Only the message after the marker line is the new user input.\n\
          ",
@@ -180,36 +186,47 @@ async fn translate_event(
     };
     let actor = actor_id.to_string();
     match ev {
-        AgentEvent::Text { content, .. } => {
-            let payload = json!({
-                "contentType": "text/markdown",
-                "text": content,
-            });
-            let _ = store.append_event(
-                "content.add".into(),
-                actor,
-                scope,
-                turn_id,
-                payload,
-                vec![],
-                None,
+        // Streaming text. Partial chunks are accumulated in a per-turn buffer
+        // and pushed live as `text.delta` trace frames to the turn owner only;
+        // they do NOT produce events. A non-partial chunk gets appended to
+        // the buffer and flushed immediately as a single `content.add`. The
+        // common path (Finished) flushes whatever is left.
+        AgentEvent::Text {
+            content,
+            is_partial,
+        } => {
+            let Some(tid) = turn_id.as_deref() else {
+                return;
+            };
+            manager.push_text_chunk(&actor, tid, &content);
+            emit_trace(
+                manager,
+                store,
+                tid,
+                TraceKind::TextDelta,
+                json!({ "text": content }),
             );
+            if !is_partial {
+                if let Some(text) = manager.take_text_buffer(&actor, tid) {
+                    flush_text_as_event(store, &actor, &scope, tid, text);
+                }
+            }
         }
+        // Agent tool invocations are private: never an event, only a trace
+        // frame to the turn owner.
         AgentEvent::ToolUse { tool_name, input } => {
-            let payload = json!({
-                "toolName": tool_name,
-                "input": input,
-                "status": "running",
-            });
-            let _ = store.append_event(
-                "tool.report".into(),
-                actor,
-                scope,
-                turn_id,
-                payload,
-                vec![],
-                None,
-            );
+            if let Some(tid) = turn_id.as_deref() {
+                emit_trace(
+                    manager,
+                    store,
+                    tid,
+                    TraceKind::ToolStart,
+                    json!({
+                        "toolName": tool_name,
+                        "input": input,
+                    }),
+                );
+            }
         }
         AgentEvent::ActionRequest {
             id,
@@ -261,11 +278,29 @@ async fn translate_event(
                 }
             }
         }
+        // Runtime status changes are private agent state; reflect them on the
+        // manager so other server code can observe them, AND emit a `status`
+        // trace frame so the owner sees the transition. No event.
         AgentEvent::StatusChange { status } => {
             manager.set_status(&actor, &status);
+            if let Some(tid) = turn_id.as_deref() {
+                emit_trace(
+                    manager,
+                    store,
+                    tid,
+                    TraceKind::Status,
+                    json!({ "status": status }),
+                );
+            }
         }
+        // Turn finished: flush any buffered streaming text into a single
+        // `content.add` event (this is what other actors see), then write the
+        // `turn.close` event and close the turn.
         AgentEvent::Finished { success, summary } => {
             if let Some(tid) = turn_id {
+                if let Some(text) = manager.take_text_buffer(&actor, &tid) {
+                    flush_text_as_event(store, &actor, &scope, &tid, text);
+                }
                 let status = if success {
                     TurnStatus::Closed
                 } else {
@@ -284,21 +319,58 @@ async fn translate_event(
             }
             manager.set_active_turn(&actor, None);
         }
+        // Runtime errors are private execution detail. The agent itself can
+        // decide whether to surface a user-visible message via `content.add`;
+        // the raw error becomes an `error` trace frame to the owner.
         AgentEvent::Error { message } => {
-            let payload = json!({
-                "contentType": "text/plain",
-                "text": format!("[error] {}", message),
-            });
-            let _ = store.append_event(
-                "content.add".into(),
-                actor,
-                scope,
-                turn_id,
-                payload,
-                vec![],
-                None,
-            );
+            if let Some(tid) = turn_id.as_deref() {
+                emit_trace(
+                    manager,
+                    store,
+                    tid,
+                    TraceKind::Error,
+                    json!({ "message": message }),
+                );
+            }
         }
+    }
+}
+
+/// Persist a turn-private trace frame and emit it on the store broadcast so
+/// `ws::fanout` can route it to the turn owner.
+fn emit_trace(
+    _manager: &Arc<RuntimeManager>,
+    store: &Arc<Store>,
+    turn_id: &str,
+    kind: TraceKind,
+    payload: Value,
+) {
+    if let Err(e) = store.append_trace_frame(turn_id, kind, payload) {
+        tracing::warn!(turn = %turn_id, %e, "failed to append trace frame");
+    }
+}
+
+fn flush_text_as_event(
+    store: &Arc<Store>,
+    actor: &str,
+    scope: &ScopeRef,
+    turn_id: &str,
+    text: String,
+) {
+    let payload = json!({
+        "contentType": "text/markdown",
+        "text": text,
+    });
+    if let Err(e) = store.append_event(
+        "content.add".into(),
+        actor.to_string(),
+        scope.clone(),
+        Some(turn_id.to_string()),
+        payload,
+        vec![],
+        None,
+    ) {
+        tracing::warn!(turn = %turn_id, %e, "failed to flush turn text into content.add");
     }
 }
 

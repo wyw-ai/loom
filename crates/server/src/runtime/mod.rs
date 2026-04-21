@@ -1,6 +1,11 @@
-pub mod acp;
-pub mod adapter;
-pub mod command;
+// Adapter trait + ACP / command transports moved to the standalone
+// `agent-runtime` crate so the v1 `joi agent serve` external client can reuse
+// them. Re-exported here so existing in-server call sites
+// (`runtime::acp`, `runtime::command`, `runtime::adapter`) keep compiling.
+pub use agent_runtime::acp;
+pub use agent_runtime::adapter;
+pub use agent_runtime::command;
+
 pub mod registry;
 pub mod wakeup;
 

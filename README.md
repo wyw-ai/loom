@@ -92,7 +92,11 @@ cargo run -p joi-cli -- chat --in <thread_id>
 | 命令 | 作用 |
 | --- | --- |
 | `joi who` | 显示当前 server URL / actor / 配置文件路径 |
-| `joi channel create --title …` | 新建 channel（顶级容器） |
+| `joi channel create --title …` | 新建 channel（默认 **private**，仅 creator 可见） |
+| `joi channel list` | 列出可见 channel（public + 自己是 member 的 private） |
+| `joi channel invite <channel_id> <actor_id>` | 把 actor 加进 channel |
+| `joi channel revoke <channel_id> <actor_id>` | 把 actor 移出 channel |
+| `joi channel members <channel_id>` | 打印当前成员表 |
 | `joi thread create --channel <id> --title …` | 在 channel 下新建 thread |
 | `joi chat --in <thread_id>` | 进入交互式 TUI |
 | `joi say <text> --in <thread_id>` | 一次性发一条消息（脚本用） |
@@ -103,7 +107,7 @@ cargo run -p joi-cli -- chat --in <thread_id>
 | `joi artifact publish --name foo.md --file ./foo.md` | 发布 artifact |
 | `joi artifact get <art_id\|artifact://…>` | 查 artifact 元数据 |
 | `joi artifact read <art_id>` | 打印 artifact 正文 |
-| `joi agent serve [--specs <dir>]` | v1：启动 agent client 常驻进程 |
+| `joi agent serve [--specs <dir>] [--allow-actors a,b,c]` | v1：启动 agent client；`--allow-actors` 仅放行白名单内的 actor id |
 
 加 `--json`（或环境变量 `JOI_JSON=1`）任何输出命令都改成单行 JSON，方便 agent
 shell out。
@@ -113,16 +117,43 @@ shell out。
 | 按键 | 行为 |
 | --- | --- |
 | 普通文字 + `Enter` | 写一条 `content.add` 到当前 thread |
+| `@<actor>` + `Enter` | handoff 给该 agent；若不在当前 channel 会先弹确认框邀请 |
 | `/` 起头 | 弹出内联 slash-command 下拉 |
 | `Tab` / `↑` / `↓` | 在下拉中导航 |
 | `Enter`（下拉打开时） | 把命令模板填进输入框（不发送） |
 | `/handoff` + `Enter` | 弹出目标选择器，选完发送 handoff |
 | `/action` + `Enter` | 弹出待响应 `action.request` 列表 |
 | `/agents` + `Enter` | 在历史区打印已注册 agent |
+| `/invite` / `/members` | 操作当前 thread 所属 channel 的成员表 |
+| `Ctrl-B` | 打开 / 关闭左侧 Channels / Threads / Members 三栏侧栏 |
+| 侧栏 `Tab` | 在三栏间切焦点 |
+| 侧栏 `n` / `r` / `d` | 在 Channels / Threads 栏新建 / 重命名 / 删除 |
+| 侧栏 Members 栏 `i` / `I` / `x` | 选 actor 邀请 / 直接键入 actor id 邀请 / 移除选中成员 |
 | `/quit` + `Enter` 或 `Ctrl-C` | 退出 |
 | `PgUp` / `PgDn` / `End` | 翻历史 |
 
 发出的消息显示 `⏳`，server echo 回来变 `✓`。
+
+## Channel 隔离
+
+每个 channel 现在有 **public / private** 两态：
+
+- 旧 journal 里的 channel 反序列化为 `public`（任何 actor 可读写，全保后向兼容）。
+- `joi channel create` 与 chat TUI 里新建的 channel 默认 **private**，creator 是
+  唯一初始成员；`scope/read`、`scope/subscribe`、`event/append`、`channel/list`、
+  `ws::fanout` 全部按 ACL gate，非成员看不到也写不进。
+- 没有角色分级——只要是成员，都能 invite / revoke 别人；只有把自己 revoke 出
+  最后一个成员的 channel 这种自废武功的操作会被拒。
+
+如果想限制本机 `joi agent serve` 实际拉起哪些 agent，加 `--allow-actors`：
+
+```sh
+# 本机只跑 actor_a 和 actor_b，其它 spec 文件即便存在也不连
+joi agent serve --allow-actors actor_a,actor_b
+```
+
+ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公网的 server 抱有任何
+真正意义上的安全幻想，这是 v0 的边界，见文末。
 
 ## 配置文件路径
 
@@ -229,7 +260,7 @@ joi --json channel list
 
 ## v0 不在范围内的事
 
-- 无认证、无 RBAC
+- 无认证、无签名（channel ACL 仅按 actor id 信任过滤，无 RBAC 角色分级）
 - 仅 WebSocket，没有 HTTP/SSE 传输
 - artifact 入口仅 `inline_text`
 - 传给 ACP 子进程的 `mcpServers` 永远为空——自带

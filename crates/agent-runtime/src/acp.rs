@@ -1,10 +1,15 @@
 //! Minimal ACP (Agent Client Protocol) stdio adapter.
 //!
 //! Lifted and slimmed from joi/src-tauri/src/agents/acp.rs — only the wire
-//! handling we need for v0:
-//!   initialize → optional authenticate → session/new → session/prompt loop,
-//!   inbound session/update streams (text + tool_call), session/request_permission,
-//!   stop via session/cancel + child kill.
+//! handling we need:
+//!   initialize → optional authenticate → (lazy per-scope session/new) →
+//!   session/prompt loop, inbound session/update streams (text + tool_call),
+//!   session/request_permission, stop via session/cancel + child kill.
+//!
+//! Sessions are allocated lazily on the first prompt for each `scope`, so the
+//! same agent driving two channels concurrently uses two independent ACP
+//! sessions — preventing the cross-talk that biting v0 had when only a single
+//! `session_id` existed per child.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -32,13 +37,11 @@ pub struct AcpConfig {
     pub auth_method: Option<String>,
 }
 
-/// Internal start info — adds ACP-specific fields the adapter helper happens to
-/// surface from `initialize`. Not exposed outside this module; the public
-/// `Adapter::start` implementation downcasts to `AdapterStartInfo`.
+/// Internal start info. Sessions are no longer minted at start — they are
+/// created on demand per scope inside `send_prompt`.
 #[derive(Debug, Clone)]
 struct AcpStartInfo {
     pid: Option<u32>,
-    session_id: String,
     #[allow(dead_code)]
     agent_info: Option<Value>,
     #[allow(dead_code)]
@@ -48,15 +51,28 @@ struct AcpStartInfo {
 struct PendingPermission {
     request_id: Value,
     option_ids: HashSet<String>,
+    #[allow(dead_code)]
+    scope: ScopeRef,
 }
 
 struct AcpShared {
     stdin: Mutex<ChildStdin>,
     next_request_id: AtomicU64,
     response_waiters: Mutex<HashMap<String, std::sync::mpsc::Sender<Result<Value, String>>>>,
-    in_flight_prompts: Mutex<HashSet<String>>,
+    /// Outstanding `session/prompt` requests we are waiting on. Maps request id
+    /// → originating scope so the asynchronous `Finished` event can be tagged
+    /// with the right scope when the response comes back.
+    in_flight_prompts: Mutex<HashMap<String, ScopeRef>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
+    /// Reverse map populated when `send_prompt` mints a new ACP session for a
+    /// scope. Inbound `session/update` and `session/request_permission` carry
+    /// `params.sessionId`; the stdout reader uses this to tag the resulting
+    /// `AdapterEvent` with the originating scope.
+    sessions_by_id: Mutex<HashMap<String, ScopeRef>>,
     action_namespace: String,
+    /// Fixed cwd passed to every `session/new`. v0's behavior — every scope
+    /// shares the agent's workspace dir.
+    workdir: PathBuf,
     event_sender: mpsc::UnboundedSender<AdapterEvent>,
 }
 
@@ -68,7 +84,8 @@ pub struct AcpAdapter {
 struct AcpInner {
     child: Option<Child>,
     shared: Option<Arc<AcpShared>>,
-    session_id: Option<String>,
+    /// scope.id → ACP session id. Built up lazily by `send_prompt`.
+    sessions: HashMap<String, String>,
 }
 
 impl AcpAdapter {
@@ -78,7 +95,7 @@ impl AcpAdapter {
             inner: Mutex::new(AcpInner {
                 child: None,
                 shared: None,
-                session_id: None,
+                sessions: HashMap::new(),
             }),
         }
     }
@@ -91,26 +108,76 @@ impl AcpAdapter {
         tokio::task::spawn_blocking(move || start_blocking(cfg, event_sender))
             .await
             .map_err(|e| e.to_string())?
-            .map(|(info, child, shared, session_id)| {
+            .map(|(info, child, shared)| {
                 let mut inner = self.inner.lock();
                 inner.child = Some(child);
                 inner.shared = Some(shared);
-                inner.session_id = Some(info.session_id.clone());
                 drop(inner);
                 info
             })
     }
 
-    async fn send_prompt_internal(&self, content: String) -> Result<(), String> {
-        let (shared, session_id) = {
+    async fn send_prompt_internal(&self, scope: ScopeRef, content: String) -> Result<(), String> {
+        // Snapshot what we need under the parking_lot guard, then drop it
+        // before any spawn_blocking / await.
+        let (shared, existing_sid) = {
             let inner = self.inner.lock();
             let shared = inner.shared.clone().ok_or("ACP agent not running")?;
-            let session_id = inner.session_id.clone().ok_or("ACP session not ready")?;
-            (shared, session_id)
+            (shared, inner.sessions.get(&scope.id).cloned())
         };
+
+        // Lazy session/new for this scope. The runtime layer serializes prompts
+        // per scope, so we shouldn't see two concurrent send_prompt calls for
+        // the same scope racing on this allocation.
+        let session_id = match existing_sid {
+            Some(sid) => sid,
+            None => {
+                let scope_for_new = scope.clone();
+                let shared_for_new = shared.clone();
+                let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                    let res = shared_for_new.request_and_wait(
+                        "session/new",
+                        json!({
+                            "cwd": shared_for_new.workdir.to_string_lossy(),
+                            "mcpServers": [],
+                        }),
+                        Duration::from_secs(30),
+                    )?;
+                    let sid = res
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "ACP agent did not return sessionId".to_string())?
+                        .to_string();
+                    shared_for_new
+                        .sessions_by_id
+                        .lock()
+                        .insert(sid.clone(), scope_for_new);
+                    Ok(sid)
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                self.inner
+                    .lock()
+                    .sessions
+                    .insert(scope.id.clone(), new_sid.clone());
+                new_sid
+            }
+        };
+
+        let scope_for_prompt = scope.clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let request_id = shared.next_request_id_string();
-            shared.in_flight_prompts.lock().insert(request_id.clone());
+            shared
+                .in_flight_prompts
+                .lock()
+                .insert(request_id.clone(), scope_for_prompt.clone());
+            eprintln!(
+                "[joi:acp] session/prompt sent id={} session={} scope={} (in_flight={})",
+                request_id,
+                session_id,
+                scope_for_prompt.id,
+                shared.in_flight_prompts.lock().len()
+            );
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -123,10 +190,7 @@ impl AcpAdapter {
                 },
             });
             if let Err(err) = shared.write_message(&request) {
-                shared
-                    .in_flight_prompts
-                    .lock()
-                    .remove(&shared.next_request_id_string());
+                shared.in_flight_prompts.lock().remove(&request_id);
                 return Err(err);
             }
             Ok(())
@@ -172,17 +236,15 @@ impl AcpAdapter {
     }
 
     async fn stop_internal(&self) -> Result<(), String> {
-        let (shared, session_id, mut child) = {
+        let (shared, session_ids, mut child) = {
             let mut inner = self.inner.lock();
-            (
-                inner.shared.take(),
-                inner.session_id.take(),
-                inner.child.take(),
-            )
+            let session_ids: Vec<String> = inner.sessions.values().cloned().collect();
+            inner.sessions.clear();
+            (inner.shared.take(), session_ids, inner.child.take())
         };
         tokio::task::spawn_blocking(move || -> Result<(), String> {
-            if let (Some(shared), Some(session_id)) = (shared.as_ref(), session_id.as_deref()) {
-                if !shared.in_flight_prompts.lock().is_empty() {
+            if let Some(shared) = shared.as_ref() {
+                for session_id in &session_ids {
                     let _ = shared.write_message(&json!({
                         "jsonrpc": "2.0",
                         "method": "session/cancel",
@@ -216,21 +278,16 @@ impl Adapter for AcpAdapter {
         let info = self.start_internal(events).await?;
         Ok(AdapterStartInfo {
             pid: info.pid,
-            session_id: info.session_id,
+            // Sessions are lazy per scope; nothing useful to expose here.
+            session_id: None,
         })
     }
 
-    async fn send_prompt(&self, _scope: ScopeRef, prompt: String) -> Result<(), String> {
-        // ACP is long-lived per actor; the underlying child handles every scope
-        // through the same session, so `scope` is informational only here.
-        self.send_prompt_internal(prompt).await
+    async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String> {
+        self.send_prompt_internal(scope, prompt).await
     }
 
-    async fn respond_action(
-        &self,
-        request_id: String,
-        option_id: String,
-    ) -> Result<(), String> {
+    async fn respond_action(&self, request_id: String, option_id: String) -> Result<(), String> {
         self.respond_permission_internal(request_id, option_id)
             .await
     }
@@ -243,7 +300,7 @@ impl Adapter for AcpAdapter {
 fn start_blocking(
     cfg: AcpConfig,
     event_sender: mpsc::UnboundedSender<AdapterEvent>,
-) -> Result<(AcpStartInfo, Child, Arc<AcpShared>, String), String> {
+) -> Result<(AcpStartInfo, Child, Arc<AcpShared>), String> {
     let workdir = if cfg.cwd.is_absolute() {
         cfg.cwd.clone()
     } else {
@@ -282,9 +339,11 @@ fn start_blocking(
         stdin: Mutex::new(stdin),
         next_request_id: AtomicU64::new(1),
         response_waiters: Mutex::new(HashMap::new()),
-        in_flight_prompts: Mutex::new(HashSet::new()),
+        in_flight_prompts: Mutex::new(HashMap::new()),
         pending_permissions: Mutex::new(HashMap::new()),
+        sessions_by_id: Mutex::new(HashMap::new()),
         action_namespace: Uuid::new_v4().to_string(),
+        workdir: workdir.clone(),
         event_sender: event_sender.clone(),
     });
     spawn_stdout_reader(stdout, shared.clone());
@@ -321,32 +380,18 @@ fn start_blocking(
         }
     }
 
-    let session_result = shared.request_and_wait(
-        "session/new",
-        json!({
-            "cwd": workdir.to_string_lossy(),
-            "mcpServers": [],
-        }),
-        Duration::from_secs(30),
-    )?;
-    let session_id = session_result
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .ok_or("ACP agent did not return sessionId")?
-        .to_string();
-
     let _ = event_sender.send(AdapterEvent::StatusChange {
+        scope: None,
         status: "idle".into(),
     });
 
     let pid = child.id();
     let info = AcpStartInfo {
         pid: Some(pid),
-        session_id: session_id.clone(),
         agent_info: initialize.get("agentInfo").cloned(),
         agent_capabilities: initialize.get("agentCapabilities").cloned(),
     };
-    Ok((info, child, shared, session_id))
+    Ok((info, child, shared))
 }
 
 impl AcpShared {
@@ -398,6 +443,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
                 Ok(l) => l,
                 Err(err) => {
                     let _ = shared.event_sender.send(AdapterEvent::Error {
+                        scope: None,
                         message: format!("Failed to read ACP output: {}", err),
                     });
                     break;
@@ -407,10 +453,12 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
             if trimmed.is_empty() {
                 continue;
             }
+            eprintln!("[joi:acp] <- {}", truncate_for_log(trimmed, 400));
             let message: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(err) => {
                     let _ = shared.event_sender.send(AdapterEvent::Error {
+                        scope: None,
                         message: format!("Invalid ACP JSON: {}", err),
                     });
                     continue;
@@ -418,10 +466,29 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
             };
             handle_incoming_message(&shared, message);
         }
+        // Stream closed: fail every in-flight synchronous request, AND every
+        // outstanding session/prompt. Without the per-prompt fan-out the
+        // runtime would never see Finished and would leave the turn open
+        // forever.
         fail_pending_waiters(&shared, "ACP agent disconnected".into());
-        shared.in_flight_prompts.lock().clear();
+        {
+            let mut prompts = shared.in_flight_prompts.lock();
+            for (req_id, scope) in prompts.drain() {
+                let _ = shared.event_sender.send(AdapterEvent::Error {
+                    scope: Some(scope.clone()),
+                    message: format!("ACP agent disconnected (pending request {req_id})"),
+                });
+                let _ = shared.event_sender.send(AdapterEvent::Finished {
+                    scope: Some(scope),
+                    success: false,
+                    summary: "agent disconnected".into(),
+                });
+            }
+        }
         shared.pending_permissions.lock().clear();
+        shared.sessions_by_id.lock().clear();
         let _ = shared.event_sender.send(AdapterEvent::StatusChange {
+            scope: None,
             status: "stopped".into(),
         });
     });
@@ -444,6 +511,11 @@ fn handle_incoming_message(shared: &Arc<AcpShared>, message: Value) {
         .and_then(|v| v.as_str())
         .map(|v| v.to_string());
     let id = message.get("id").cloned();
+    eprintln!(
+        "[joi:acp] dispatch method={:?} id={:?}",
+        method.as_deref(),
+        id.as_ref().and_then(request_id_key)
+    );
     match (method.as_deref(), id) {
         (Some(method), Some(id_value)) => handle_agent_request(shared, method, id_value, message),
         (Some(method), None) => handle_agent_notification(shared, method, message),
@@ -456,6 +528,25 @@ fn handle_agent_request(shared: &Arc<AcpShared>, method: &str, id: Value, messag
     match method {
         "session/request_permission" => {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            let session_id = params.get("sessionId").and_then(|v| v.as_str());
+            let scope =
+                match session_id.and_then(|sid| shared.sessions_by_id.lock().get(sid).cloned()) {
+                    Some(s) => s,
+                    None => {
+                        // Permission request for a session we don't recognize. Reject
+                        // so the agent doesn't hang waiting for a response we'll
+                        // never produce.
+                        let _ = shared.write_message(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": "permission request for unknown session",
+                            }
+                        }));
+                        return;
+                    }
+                };
             let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
             let action_id = compose_action_id(&shared.action_namespace, &id);
             let (title, description) = describe_permission_request(&tool_call);
@@ -466,9 +557,11 @@ fn handle_agent_request(shared: &Arc<AcpShared>, method: &str, id: Value, messag
                 PendingPermission {
                     request_id: id,
                     option_ids: allowed_ids,
+                    scope: scope.clone(),
                 },
             );
             let _ = shared.event_sender.send(AdapterEvent::ActionRequest {
+                scope: Some(scope),
                 id: action_id,
                 request_type: "permission".into(),
                 title,
@@ -493,6 +586,15 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
     if method != "session/update" {
         return;
     }
+    let session_id = message
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let scope = session_id
+        .as_ref()
+        .and_then(|sid| shared.sessions_by_id.lock().get(sid).cloned());
+
     let update = message
         .get("params")
         .and_then(|p| p.get("update"))
@@ -502,6 +604,7 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
         Some("agent_message_chunk") => {
             if let Some(text) = extract_text_chunk(&update) {
                 let _ = shared.event_sender.send(AdapterEvent::Text {
+                    scope: scope.clone(),
                     content: text,
                     is_partial: true,
                 });
@@ -516,6 +619,7 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
                 .unwrap_or("tool_call")
                 .to_string();
             let _ = shared.event_sender.send(AdapterEvent::ToolUse {
+                scope,
                 tool_name,
                 input: update,
             });
@@ -538,12 +642,24 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         let _ = waiter.send(response);
         return;
     }
-    if shared.in_flight_prompts.lock().remove(&id_key) {
+    let popped = {
+        let mut guard = shared.in_flight_prompts.lock();
+        let popped = guard.remove(&id_key);
+        let remaining = guard.len();
+        popped.map(|scope| (scope, remaining))
+    };
+    if let Some((scope, remaining)) = popped {
+        eprintln!(
+            "[joi:acp] session/prompt response id={} scope={} (in_flight remaining={})",
+            id_key, scope.id, remaining
+        );
         if let Some(error) = message.get("error") {
             let _ = shared.event_sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
                 message: json_value_to_string(error),
             });
             let _ = shared.event_sender.send(AdapterEvent::Finished {
+                scope: Some(scope),
                 success: false,
                 summary: json_value_to_string(error),
             });
@@ -556,10 +672,16 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
             .unwrap_or("completed")
             .to_string();
         let _ = shared.event_sender.send(AdapterEvent::Finished {
+            scope: Some(scope),
             success: stop_reason != "cancelled",
             summary: stop_reason,
         });
+        return;
     }
+    eprintln!(
+        "[joi:acp] response id={} matched no waiter and no in-flight prompt (orphan)",
+        id_key
+    );
 }
 
 fn fail_pending_waiters(shared: &Arc<AcpShared>, message: String) {
@@ -633,6 +755,17 @@ fn compose_action_id(namespace: &str, id: &Value) -> String {
         Some(req) => format!("{}:{}", namespace, req),
         None => format!("{}:unknown", namespace),
     }
+}
+
+fn truncate_for_log(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…(+{}b)", &s[..cut], s.len() - cut)
 }
 
 fn json_value_to_string(value: &Value) -> String {

@@ -3,7 +3,6 @@ use std::sync::OnceLock;
 use chrono::Local;
 use proto::types::*;
 use serde::Serialize;
-use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -95,77 +94,3 @@ pub fn render_event(event: &Event) {
     }
 }
 
-/// Render a `turn/trace.update` notification. These frames are the agent's
-/// private execution trail (tool calls, partial text, status, errors) and
-/// only ever arrive at the turn owner — typically the agent itself when
-/// connected as a debug client. Subscribed humans never see them.
-pub fn render_trace_update(payload: &Value) {
-    let turn_id = payload
-        .get("turnId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    let frame = match payload.get("frame") {
-        Some(f) => f,
-        None => return,
-    };
-    let kind = frame.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-    let seq = frame.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let body = frame.get("payload").cloned().unwrap_or(Value::Null);
-    let summary = match kind {
-        "text.delta" => body
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "tool.start" | "tool.update" | "tool.end" => {
-            let name = body
-                .get("toolName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool");
-            format!("{name}")
-        }
-        "status" => body
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "error" => body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        _ => serde_json::to_string(&body).unwrap_or_default(),
-    };
-    println!("· trace [{turn_id} #{seq}] {kind}: {summary}");
-}
-
-pub fn render_stream_update(payload: &Value) {
-    let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let data = payload.get("data").cloned().unwrap_or(Value::Null);
-    match kind {
-        "event.created" => {
-            if let Some(ev) = data.get("event") {
-                if let Ok(ev) = serde_json::from_value::<Event>(ev.clone()) {
-                    render_event(&ev);
-                }
-            }
-        }
-        "turn.opened" => {
-            if let Some(t) = data.get("turn") {
-                if let Some(actor) = t.get("actorId").and_then(|v| v.as_str()) {
-                    println!("· {} opened a turn", actor);
-                }
-            }
-        }
-        "turn.closed" => {
-            if let Some(t) = data.get("turn") {
-                if let Some(actor) = t.get("actorId").and_then(|v| v.as_str()) {
-                    println!("· {} closed a turn", actor);
-                }
-            }
-        }
-        other => {
-            println!("· stream/update {}: {}", other, data);
-        }
-    }
-}

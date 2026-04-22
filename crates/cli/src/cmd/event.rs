@@ -40,7 +40,10 @@ pub async fn list(
     }
     if res.page_info.has_more {
         if let Some(first) = res.events.first() {
-            println!("(more events before {} — use --before {})", first.id, first.id);
+            println!(
+                "(more events before {} — use --before {})",
+                first.id, first.id
+            );
         }
     }
     Ok(())

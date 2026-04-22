@@ -14,8 +14,15 @@ pub mod method {
     pub const SCOPE_READ: &str = "scope/read";
     pub const CHANNEL_CREATE: &str = "channel/create";
     pub const CHANNEL_LIST: &str = "channel/list";
+    pub const CHANNEL_UPDATE: &str = "channel/update";
+    pub const CHANNEL_DELETE: &str = "channel/delete";
+    pub const CHANNEL_INVITE: &str = "channel/invite";
+    pub const CHANNEL_REVOKE: &str = "channel/revoke";
+    pub const CHANNEL_MEMBERS: &str = "channel/members";
     pub const THREAD_CREATE: &str = "thread/create";
     pub const THREAD_LIST: &str = "thread/list";
+    pub const THREAD_UPDATE: &str = "thread/update";
+    pub const THREAD_DELETE: &str = "thread/delete";
     pub const TURN_OPEN: &str = "turn/open";
     pub const TURN_CLOSE: &str = "turn/close";
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
@@ -27,6 +34,7 @@ pub mod method {
     pub const ARTIFACT_READ: &str = "artifact/read";
     pub const RECEIPT_RECORD: &str = "receipt/record";
     pub const ACTOR_LIST: &str = "actor/list";
+    pub const ACTOR_UPSERT: &str = "actor/upsert";
 
     // local extensions
     pub const AGENT_LIST: &str = "agent/list";
@@ -162,8 +170,14 @@ pub struct ScopeReadResult {
 // ---- channel/create ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChannelCreateParams {
     pub title: String,
+    /// When provided, the new channel is created `Private` and the creator
+    /// is its sole initial member. When omitted, the channel is created
+    /// `Public` (legacy behavior, for back-compat with old callers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +188,70 @@ pub struct ChannelCreateResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelListResult {
     pub channels: Vec<Channel>,
+}
+
+// ---- channel/invite + channel/revoke + channel/members ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelInviteParams {
+    pub channel_id: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelInviteResult {
+    pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelRevokeParams {
+    pub channel_id: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRevokeResult {
+    pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMembersParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMembersResult {
+    /// Resolved actor rows, not just ids — the chat sidebar needs the
+    /// display name + kind to render rows.
+    pub members: Vec<Actor>,
+}
+
+// ---- channel/update / delete ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelUpdateParams {
+    pub channel_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelUpdateResult {
+    pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDeleteParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDeleteResult {
+    pub deleted: bool,
 }
 
 // ---- thread/create / list ----
@@ -204,6 +282,31 @@ pub struct ThreadListParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadListResult {
     pub threads: Vec<Thread>,
+}
+
+// ---- thread/update / delete ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUpdateParams {
+    pub thread_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadUpdateResult {
+    pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadDeleteParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadDeleteResult {
+    pub deleted: bool,
 }
 
 // ---- turn/open / close ----
@@ -403,11 +506,21 @@ pub struct ReceiptRecordResult {
     pub receipt: Receipt,
 }
 
-// ---- actor/list ----
+// ---- actor/list + actor/upsert ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorListResult {
     pub actors: Vec<Actor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorUpsertParams {
+    pub actor: Actor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorUpsertResult {
+    pub actor: Actor,
 }
 
 // ---- agent/* ----
@@ -610,4 +723,12 @@ pub mod stream_kind {
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     pub const DELIVERY_UPDATED: &str = "delivery.updated";
     pub const RECEIPT_RECORDED: &str = "receipt.recorded";
+    /// Direct-to-actor notification: the recipient was added to a channel
+    /// and is now allowed to read/subscribe/append. Carries the full
+    /// `Channel` so the receiving client can patch its sidebar cache
+    /// without a follow-up RPC.
+    pub const CHANNEL_INVITED: &str = "channel.invited";
+    /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
+    /// channel. Carries `{ channelId, actorId }`.
+    pub const CHANNEL_REVOKED: &str = "channel.revoked";
 }

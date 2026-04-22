@@ -85,6 +85,7 @@ impl Response {
     }
 }
 
+#[allow(non_snake_case)]
 pub mod ErrorCode {
     pub const PARSE_ERROR: i32 = -32700;
     pub const INVALID_REQUEST: i32 = -32600;

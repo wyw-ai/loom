@@ -38,6 +38,19 @@ pub enum StoreEvent {
     /// scope events purely so the websocket layer can route it; the fanout
     /// must NOT broadcast it to scope subscribers — see `ws::fanout`.
     TraceAppended(TraceFrame),
+    /// `actor_id` was just added to `channel_id`'s ACL. ws::fanout pushes
+    /// this directly to the affected actor's connection (if any) — never
+    /// broadcast to scope subscribers.
+    ChannelGranted {
+        channel: Channel,
+        actor_id: String,
+    },
+    /// `actor_id` was just removed from `channel_id`'s ACL. Same routing
+    /// as `ChannelGranted`.
+    ChannelRevoked {
+        channel_id: String,
+        actor_id: String,
+    },
 }
 
 impl StoreEvent {
@@ -55,6 +68,10 @@ impl StoreEvent {
             // Trace frames are owner-private; ws fanout routes them by
             // turn owner, never by scope.
             StoreEvent::TraceAppended(_) => None,
+            // ACL grants/revokes are direct-to-actor notifications; ws
+            // fanout routes them via `send_to_actor`, not scope subs.
+            StoreEvent::ChannelGranted { .. } => None,
+            StoreEvent::ChannelRevoked { .. } => None,
         }
     }
 }
@@ -138,10 +155,25 @@ impl Store {
 
     // -------- Channels --------
 
-    pub fn create_channel(&self, title: String) -> StoreResult<Channel> {
+    /// Create a channel. When `creator_actor_id` is `Some`, the new channel
+    /// is `Private` and the creator is its sole initial member. When `None`
+    /// (legacy / test callers), the channel is `Public` so the ACL gate
+    /// is skipped — matches the behavior journals predating the ACL roll-out
+    /// replay with.
+    pub fn create_channel(
+        &self,
+        title: String,
+        creator_actor_id: Option<String>,
+    ) -> StoreResult<Channel> {
+        let (visibility, members) = match creator_actor_id {
+            Some(id) => (ChannelVisibility::Private, vec![id]),
+            None => (ChannelVisibility::Public, Vec::new()),
+        };
         let channel = Channel {
             id: format!("chan_{}", short_id()),
             title,
+            visibility,
+            members,
             _meta: None,
         };
         self.journal
@@ -153,12 +185,136 @@ impl Store {
         Ok(channel)
     }
 
+    /// `true` when `actor_id` is allowed to read/write `channel_id`.
+    /// Public channels always return `true`; private channels check the
+    /// `members` set. Returns `false` if the channel doesn't exist.
+    pub fn is_channel_member(&self, channel_id: &str, actor_id: &str) -> bool {
+        let inner = self.inner.read();
+        let Some(ch) = inner.channels.get(channel_id) else {
+            return false;
+        };
+        match ch.visibility {
+            ChannelVisibility::Public => true,
+            ChannelVisibility::Private => ch.members.iter().any(|m| m == actor_id),
+        }
+    }
+
+    /// Resolve a `ScopeRef` to its owning channel and check membership.
+    /// Returns `Ok(())` when allowed, `Err(InvalidState)` when denied,
+    /// `Err(NotFound)` when the scope doesn't exist.
+    pub fn check_scope_access(&self, scope: &ScopeRef, actor_id: &str) -> StoreResult<()> {
+        let channel_id = match scope.kind {
+            ScopeKind::Channel => scope.id.clone(),
+            ScopeKind::Thread => match self.get_thread(&scope.id) {
+                Some(t) => t.channel_id,
+                None => return Err(StoreError::NotFound(format!("thread {}", scope.id))),
+            },
+        };
+        if !self.is_channel_member(&channel_id, actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "actor {actor_id} is not a member of channel {channel_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Add `actor_id` to `channel_id`'s member set. Idempotent. Emits
+    /// `ChannelGranted` for the websocket layer to push to the affected
+    /// actor.
+    pub fn grant_channel(&self, channel_id: &str, actor_id: &str) -> StoreResult<Channel> {
+        let updated = {
+            let mut inner = self.inner.write();
+            let ch = inner
+                .channels
+                .get_mut(channel_id)
+                .ok_or_else(|| StoreError::NotFound(format!("channel {channel_id}")))?;
+            if !ch.members.iter().any(|m| m == actor_id) {
+                ch.members.push(actor_id.to_string());
+            }
+            ch.clone()
+        };
+        self.journal.append(&Mutation::ChannelGrant {
+            channel_id: channel_id.to_string(),
+            actor_id: actor_id.to_string(),
+        })?;
+        self.emit(StoreEvent::ChannelGranted {
+            channel: updated.clone(),
+            actor_id: actor_id.to_string(),
+        });
+        Ok(updated)
+    }
+
+    /// Remove `actor_id` from `channel_id`'s member set. Idempotent. Emits
+    /// `ChannelRevoked` for the websocket layer.
+    pub fn revoke_channel(&self, channel_id: &str, actor_id: &str) -> StoreResult<Channel> {
+        let updated = {
+            let mut inner = self.inner.write();
+            let ch = inner
+                .channels
+                .get_mut(channel_id)
+                .ok_or_else(|| StoreError::NotFound(format!("channel {channel_id}")))?;
+            ch.members.retain(|m| m != actor_id);
+            ch.clone()
+        };
+        self.journal.append(&Mutation::ChannelRevoke {
+            channel_id: channel_id.to_string(),
+            actor_id: actor_id.to_string(),
+        })?;
+        self.emit(StoreEvent::ChannelRevoked {
+            channel_id: channel_id.to_string(),
+            actor_id: actor_id.to_string(),
+        });
+        Ok(updated)
+    }
+
     pub fn list_channels(&self) -> Vec<Channel> {
         self.inner.read().channels.values().cloned().collect()
     }
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
         self.inner.read().channels.get(id).cloned()
+    }
+
+    pub fn update_channel(&self, id: &str, title: String) -> StoreResult<Channel> {
+        if self.get_channel(id).is_none() {
+            return Err(StoreError::NotFound(format!("channel {id}")));
+        }
+        self.journal.append(&Mutation::ChannelUpdate {
+            channel_id: id.to_string(),
+            title: title.clone(),
+        })?;
+        let mut inner = self.inner.write();
+        let ch = inner
+            .channels
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
+        ch.title = title;
+        Ok(ch.clone())
+    }
+
+    /// Refuses when the channel still contains threads — caller must delete
+    /// child threads first. Avoids cascading event/turn cleanup at v0.
+    pub fn delete_channel(&self, id: &str) -> StoreResult<bool> {
+        if self.get_channel(id).is_none() {
+            return Err(StoreError::NotFound(format!("channel {id}")));
+        }
+        let child_threads = self
+            .inner
+            .read()
+            .threads
+            .values()
+            .filter(|t| t.channel_id == id)
+            .count();
+        if child_threads > 0 {
+            return Err(StoreError::Conflict(format!(
+                "channel {id} still has {child_threads} thread(s); delete them first"
+            )));
+        }
+        self.journal.append(&Mutation::ChannelDelete {
+            channel_id: id.to_string(),
+        })?;
+        let removed = self.inner.write().channels.remove(id).is_some();
+        Ok(removed)
     }
 
     // -------- Threads --------
@@ -206,11 +362,45 @@ impl Store {
         self.inner.read().threads.get(id).cloned()
     }
 
-    pub fn set_thread_root(
-        &self,
-        thread_id: String,
-        root_event_id: String,
-    ) -> StoreResult<()> {
+    pub fn update_thread(&self, id: &str, title: String) -> StoreResult<Thread> {
+        if self.get_thread(id).is_none() {
+            return Err(StoreError::NotFound(format!("thread {id}")));
+        }
+        self.journal.append(&Mutation::ThreadUpdate {
+            thread_id: id.to_string(),
+            title: title.clone(),
+        })?;
+        let mut inner = self.inner.write();
+        let t = inner
+            .threads
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("thread {id}")))?;
+        t.title = title;
+        Ok(t.clone())
+    }
+
+    /// Hard-removes the thread row and the events_by_scope index for its
+    /// scope so the thread no longer appears in `list_threads` / `read_scope`.
+    /// Event rows, deliveries, receipts, and trace frames are kept on disk;
+    /// they become orphaned but harmless because their thread is gone.
+    pub fn delete_thread(&self, id: &str) -> StoreResult<bool> {
+        if self.get_thread(id).is_none() {
+            return Err(StoreError::NotFound(format!("thread {id}")));
+        }
+        self.journal.append(&Mutation::ThreadDelete {
+            thread_id: id.to_string(),
+        })?;
+        let mut inner = self.inner.write();
+        let removed = inner.threads.remove(id).is_some();
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: id.to_string(),
+        };
+        inner.events_by_scope.remove(&scope);
+        Ok(removed)
+    }
+
+    pub fn set_thread_root(&self, thread_id: String, root_event_id: String) -> StoreResult<()> {
         self.journal.append(&Mutation::ThreadRootSet {
             thread_id: thread_id.clone(),
             root_event_id: root_event_id.clone(),
@@ -382,6 +572,10 @@ impl Store {
                 }
             }
         }
+
+        // ACL gate: a non-member can't append into a private channel/thread.
+        // Public channels short-circuit to allow.
+        self.check_scope_access(&scope, &actor_id)?;
 
         let (assigned_turn_id, implicit_turn) = if let Some(tid) = turn_id {
             let t = self
@@ -690,6 +884,45 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .or_default()
                 .push(frame);
         }
+        Mutation::ChannelUpdate { channel_id, title } => {
+            if let Some(c) = inner.channels.get_mut(&channel_id) {
+                c.title = title;
+            }
+        }
+        Mutation::ChannelDelete { channel_id } => {
+            inner.channels.remove(&channel_id);
+        }
+        Mutation::ThreadUpdate { thread_id, title } => {
+            if let Some(t) = inner.threads.get_mut(&thread_id) {
+                t.title = title;
+            }
+        }
+        Mutation::ThreadDelete { thread_id } => {
+            inner.threads.remove(&thread_id);
+            let scope = ScopeRef {
+                kind: ScopeKind::Thread,
+                id: thread_id,
+            };
+            inner.events_by_scope.remove(&scope);
+        }
+        Mutation::ChannelGrant {
+            channel_id,
+            actor_id,
+        } => {
+            if let Some(c) = inner.channels.get_mut(&channel_id) {
+                if !c.members.iter().any(|m| m == &actor_id) {
+                    c.members.push(actor_id);
+                }
+            }
+        }
+        Mutation::ChannelRevoke {
+            channel_id,
+            actor_id,
+        } => {
+            if let Some(c) = inner.channels.get_mut(&channel_id) {
+                c.members.retain(|m| m != &actor_id);
+            }
+        }
     }
 }
 
@@ -702,4 +935,218 @@ fn short_id() -> String {
 #[allow(dead_code)]
 fn _meta_keep() -> BTreeMap<String, serde_json::Value> {
     BTreeMap::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Per-test journal file under the OS temp dir. We don't bother cleaning
+    /// up — the file is tiny and lives in /tmp which the OS will sweep.
+    fn fresh_store() -> Arc<Store> {
+        let dir = std::env::temp_dir().join(format!("joi-store-test-{}", Uuid::new_v4().simple()));
+        let path: PathBuf = dir.join("journal.jsonl");
+        let journal = Journal::open(path).expect("open journal");
+        Store::open(journal).expect("open store")
+    }
+
+    #[test]
+    fn update_channel_changes_title_and_persists_via_replay() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("orig title".into(), None)
+            .expect("create channel");
+        let updated = store
+            .update_channel(&ch.id, "renamed".into())
+            .expect("update channel");
+        assert_eq!(updated.title, "renamed");
+        assert_eq!(store.get_channel(&ch.id).unwrap().title, "renamed");
+
+        // Re-open from the same journal: the rename must replay.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert_eq!(store2.get_channel(&ch.id).unwrap().title, "renamed");
+    }
+
+    #[test]
+    fn delete_channel_refuses_when_threads_exist() {
+        let store = fresh_store();
+        let ch = store.create_channel("keep me".into(), None).unwrap();
+        let _t = store
+            .create_thread(ch.id.clone(), "t".into(), None)
+            .unwrap();
+
+        let err = store
+            .delete_channel(&ch.id)
+            .expect_err("delete should refuse");
+        match err {
+            StoreError::Conflict(msg) => assert!(msg.contains("thread"), "got {msg}"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        assert!(store.get_channel(&ch.id).is_some(), "channel must remain");
+    }
+
+    #[test]
+    fn delete_channel_succeeds_when_empty_and_replays() {
+        let store = fresh_store();
+        let ch = store.create_channel("disposable".into(), None).unwrap();
+        assert!(store.delete_channel(&ch.id).unwrap());
+        assert!(store.get_channel(&ch.id).is_none());
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert!(store2.get_channel(&ch.id).is_none());
+    }
+
+    #[test]
+    fn update_thread_renames_and_replays() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let t = store
+            .create_thread(ch.id.clone(), "old".into(), None)
+            .unwrap();
+        let updated = store.update_thread(&t.id, "fresh".into()).unwrap();
+        assert_eq!(updated.title, "fresh");
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert_eq!(store2.get_thread(&t.id).unwrap().title, "fresh");
+    }
+
+    #[test]
+    fn delete_thread_removes_row_and_scope_index_and_replays() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let t = store
+            .create_thread(ch.id.clone(), "doomed".into(), None)
+            .unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: t.id.clone(),
+        };
+
+        assert!(store.delete_thread(&t.id).unwrap());
+        assert!(store.get_thread(&t.id).is_none());
+        // events_by_scope is private; re-check via list_threads.
+        assert!(store
+            .list_threads(Some(&ch.id))
+            .iter()
+            .all(|x| x.id != t.id));
+        // Internal: index should be gone too.
+        assert!(!store.inner.read().events_by_scope.contains_key(&scope));
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert!(store2.get_thread(&t.id).is_none());
+    }
+
+    #[test]
+    fn update_or_delete_missing_channel_returns_not_found() {
+        let store = fresh_store();
+        let err = store
+            .update_channel("chan_missing", "x".into())
+            .expect_err("must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)));
+        let err = store
+            .delete_channel("chan_missing")
+            .expect_err("must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn private_channel_seeds_creator_and_gates_others() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("priv".into(), Some("actor_alice".into()))
+            .unwrap();
+        assert!(matches!(ch.visibility, ChannelVisibility::Private));
+        assert_eq!(ch.members, vec!["actor_alice".to_string()]);
+        assert!(store.is_channel_member(&ch.id, "actor_alice"));
+        assert!(!store.is_channel_member(&ch.id, "actor_bob"));
+    }
+
+    #[test]
+    fn public_channel_lets_anyone_in() {
+        let store = fresh_store();
+        let ch = store.create_channel("pub".into(), None).unwrap();
+        assert!(matches!(ch.visibility, ChannelVisibility::Public));
+        assert!(ch.members.is_empty());
+        // Anyone — even an actor never seen — passes the gate.
+        assert!(store.is_channel_member(&ch.id, "actor_random"));
+    }
+
+    #[test]
+    fn grant_then_revoke_round_trips_through_replay() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("priv".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_bob").unwrap();
+        assert!(store.is_channel_member(&ch.id, "actor_bob"));
+        // Replay the journal in a fresh store; bob still in.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert!(store2.is_channel_member(&ch.id, "actor_bob"));
+
+        store.revoke_channel(&ch.id, "actor_bob").unwrap();
+        assert!(!store.is_channel_member(&ch.id, "actor_bob"));
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store3 = Store::open(journal).unwrap();
+        assert!(!store3.is_channel_member(&ch.id, "actor_bob"));
+    }
+
+    #[test]
+    fn append_event_into_private_channel_rejects_non_member() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("priv".into(), Some("actor_alice".into()))
+            .unwrap();
+        let t = store
+            .create_thread(ch.id.clone(), "t".into(), None)
+            .unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: t.id.clone(),
+        };
+        let err = store
+            .append_event(
+                "content.add".into(),
+                "actor_bob".into(),
+                scope.clone(),
+                None,
+                serde_json::json!({"text": "hi"}),
+                vec![],
+                None,
+            )
+            .expect_err("non-member must be denied");
+        assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
+
+        // After grant, bob can post.
+        store.grant_channel(&ch.id, "actor_bob").unwrap();
+        store
+            .append_event(
+                "content.add".into(),
+                "actor_bob".into(),
+                scope,
+                None,
+                serde_json::json!({"text": "hi"}),
+                vec![],
+                None,
+            )
+            .expect("member may now append");
+    }
+
+    #[test]
+    fn update_or_delete_missing_thread_returns_not_found() {
+        let store = fresh_store();
+        let err = store
+            .update_thread("thread_missing", "x".into())
+            .expect_err("must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)));
+        let err = store
+            .delete_thread("thread_missing")
+            .expect_err("must be NotFound");
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
 }

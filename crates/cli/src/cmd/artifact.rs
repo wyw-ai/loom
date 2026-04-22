@@ -20,8 +20,9 @@ pub async fn publish(
     let body = match (text, file) {
         (Some(_), Some(_)) => bail!("--text and --file are mutually exclusive"),
         (Some(t), None) => t,
-        (None, Some(p)) => std::fs::read_to_string(&p)
-            .with_context(|| format!("read {}", p.display()))?,
+        (None, Some(p)) => {
+            std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?
+        }
         (None, None) => {
             let mut buf = String::new();
             std::io::stdin()

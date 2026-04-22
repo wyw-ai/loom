@@ -63,11 +63,37 @@ pub struct Actor {
     pub _meta: Option<Meta>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelVisibility {
+    /// Legacy / pre-ACL channels: any actor known to the server may read,
+    /// subscribe, and append. Existing journals deserialize as `Public` so
+    /// previously-created channels keep working with no migration step.
+    Public,
+    /// Explicit member set only — listed/readable/writable iff the caller
+    /// is in `Channel.members`.
+    Private,
+}
+
+fn default_visibility() -> ChannelVisibility {
+    ChannelVisibility::Public
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
     pub id: String,
     pub title: String,
+    /// `Public` for back-compat (channels in journals predating the ACL
+    /// roll-out deserialize via `default_visibility`); newly-created
+    /// channels with a known creator are `Private`.
+    #[serde(default = "default_visibility")]
+    pub visibility: ChannelVisibility,
+    /// Always present, even for `Public` channels (used by the chat TUI's
+    /// Members pane). For `Public` channels this set is best-effort and
+    /// the ACL gate is skipped; for `Private` channels it is authoritative.
+    #[serde(default)]
+    pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _meta: Option<Meta>,
 }

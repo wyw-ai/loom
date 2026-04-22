@@ -2,6 +2,7 @@ use chrono::{DateTime, Local, Utc};
 use proto::types::{Event, RelationKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 
 #[derive(Debug, Clone)]
 pub struct Bubble {
@@ -38,6 +39,12 @@ pub enum DeliveryState {
 #[derive(Default)]
 pub struct History {
     pub bubbles: Vec<Bubble>,
+}
+
+pub struct RenderedHistory {
+    pub lines: Vec<Line<'static>>,
+    pub total_rows: u16,
+    pub selected_row_range: Option<(u16, u16)>,
 }
 
 impl History {
@@ -173,19 +180,32 @@ impl History {
         self.bubbles
             .iter()
             .rev()
-            .filter_map(|b| {
-                if b.kind == BubbleKind::System {
-                    return None;
-                }
-                let event_id = b.trailing_event_id.as_ref()?.clone();
-                let actor = display_for(&b.actor_id);
-                let preview = preview_text(&b.text);
-                Some((
-                    event_id.clone(),
-                    format!("{}  {}  {}", short_id(&event_id), actor, preview),
-                ))
-            })
+            .filter_map(|b| reply_target_label(b, display_for))
             .collect()
+    }
+
+    pub fn newest_replyable_index(&self) -> Option<usize> {
+        self.bubbles.iter().rposition(is_replyable_bubble)
+    }
+
+    pub fn older_replyable_index(&self, current: Option<usize>) -> Option<usize> {
+        let end = current.unwrap_or(self.bubbles.len());
+        (0..end)
+            .rev()
+            .find(|idx| is_replyable_bubble(&self.bubbles[*idx]))
+    }
+
+    pub fn newer_replyable_index(&self, current: usize) -> Option<usize> {
+        ((current + 1)..self.bubbles.len()).find(|idx| is_replyable_bubble(&self.bubbles[*idx]))
+    }
+
+    pub fn reply_target_at(
+        &self,
+        index: usize,
+        display_for: &dyn Fn(&str) -> String,
+    ) -> Option<(String, String)> {
+        let bubble = self.bubbles.get(index)?;
+        reply_target_label(bubble, display_for)
     }
 
     pub fn actor_for_event(&self, event_id: &str) -> Option<&str> {
@@ -195,9 +215,17 @@ impl History {
             .map(|b| b.actor_id.as_str())
     }
 
-    pub fn render_lines(&self, display_for: &dyn Fn(&str) -> String) -> Vec<Line<'static>> {
+    pub fn render_lines(
+        &self,
+        width: u16,
+        selected_bubble_idx: Option<usize>,
+        display_for: &dyn Fn(&str) -> String,
+    ) -> RenderedHistory {
         let mut out = Vec::new();
-        for b in &self.bubbles {
+        let mut total_rows = 0usize;
+        let mut selected_row_range = None;
+
+        for (idx, b) in self.bubbles.iter().enumerate() {
             let ts = b.ts.with_timezone(&Local).format("%H:%M:%S").to_string();
             let actor = display_for(&b.actor_id);
             let (color, prefix) = match b.kind {
@@ -205,7 +233,10 @@ impl History {
                 BubbleKind::Static => (Color::Yellow, "· "),
                 BubbleKind::System => (Color::DarkGray, "· "),
             };
+            let selected = selected_bubble_idx == Some(idx);
+            let gutter = selection_gutter(selected);
             let header = vec![
+                gutter.clone(),
                 Span::styled(format!("[{}] ", ts), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     actor,
@@ -220,8 +251,9 @@ impl History {
                 .map(|id| format!("↩ {}  ", short_id(id)))
                 .unwrap_or_default();
             let mut first = true;
+            let start_row = total_rows;
             for line in display_text(&b.text).split('\n') {
-                if first {
+                let rendered = if first {
                     let mut spans = header.clone();
                     spans.push(Span::styled(
                         reply_prefix.clone(),
@@ -232,14 +264,29 @@ impl History {
                         spans.push(Span::raw("  "));
                         spans.push(span);
                     }
-                    out.push(Line::from(spans));
                     first = false;
+                    Line::from(spans)
                 } else {
-                    out.push(Line::from(Span::raw(format!("            {}", line))));
-                }
+                    Line::from(vec![
+                        gutter.clone(),
+                        Span::raw(format!("            {}", line)),
+                    ])
+                };
+                total_rows = total_rows.saturating_add(wrapped_rows(&rendered, width));
+                out.push(rendered);
+            }
+            if selected && total_rows > start_row {
+                selected_row_range = Some((
+                    start_row.min(u16::MAX as usize) as u16,
+                    total_rows.saturating_sub(1).min(u16::MAX as usize) as u16,
+                ));
             }
         }
-        out
+        RenderedHistory {
+            lines: out,
+            total_rows: total_rows.min(u16::MAX as usize) as u16,
+            selected_row_range,
+        }
     }
 }
 
@@ -265,6 +312,26 @@ fn preview_text(text: &str) -> String {
     }
 }
 
+fn is_replyable_bubble(bubble: &Bubble) -> bool {
+    bubble.kind != BubbleKind::System && bubble.trailing_event_id.is_some()
+}
+
+fn reply_target_label(
+    bubble: &Bubble,
+    display_for: &dyn Fn(&str) -> String,
+) -> Option<(String, String)> {
+    if !is_replyable_bubble(bubble) {
+        return None;
+    }
+    let event_id = bubble.trailing_event_id.as_ref()?.clone();
+    let actor = display_for(&bubble.actor_id);
+    let preview = preview_text(&bubble.text);
+    Some((
+        event_id.clone(),
+        format!("{}  {}  {}", short_id(&event_id), actor, preview),
+    ))
+}
+
 fn reply_target(ev: &Event) -> Option<String> {
     ev.relations
         .iter()
@@ -278,6 +345,24 @@ fn delivery_span(state: DeliveryState) -> Option<Span<'static>> {
         DeliveryState::Pending => Some(Span::styled("⏳", Style::default().fg(Color::DarkGray))),
         DeliveryState::Delivered => Some(Span::styled("✓", Style::default().fg(Color::Green))),
     }
+}
+
+fn selection_gutter(selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled("> ", Style::default().fg(Color::Magenta))
+    } else {
+        Span::raw("  ")
+    }
+}
+
+fn wrapped_rows(line: &Line<'_>, width: u16) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
 }
 
 fn format_action_request(ev: &Event) -> String {
@@ -341,6 +426,7 @@ mod tests {
     };
     use chrono::Utc;
     use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef};
+    use ratatui::widgets::{Paragraph, Wrap};
     use serde_json::json;
 
     #[test]
@@ -403,5 +489,80 @@ mod tests {
             Some("actor_agent_opencode")
         );
         assert_eq!(history.actor_for_event("evt_missing"), None);
+    }
+
+    #[test]
+    fn replyable_navigation_skips_system_bubbles() {
+        let mut history = History::default();
+        history.push_system("system");
+        history.bubbles.push(Bubble {
+            actor_id: "actor_a".into(),
+            turn_id: None,
+            kind: BubbleKind::Static,
+            text: "first".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_1".into()),
+            delivery: DeliveryState::NotApplicable,
+        });
+        history.push_system("system");
+        history.bubbles.push(Bubble {
+            actor_id: "actor_b".into(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: "second".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_2".into()),
+            delivery: DeliveryState::NotApplicable,
+        });
+
+        assert_eq!(history.newest_replyable_index(), Some(3));
+        assert_eq!(history.older_replyable_index(None), Some(3));
+        assert_eq!(history.older_replyable_index(Some(3)), Some(1));
+        assert_eq!(history.newer_replyable_index(1), Some(3));
+        assert_eq!(history.newer_replyable_index(3), None);
+    }
+
+    #[test]
+    fn render_lines_marks_selected_bubble_range() {
+        let mut history = History::default();
+        history.bubbles.push(Bubble {
+            actor_id: "actor_a".into(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: "hello\nworld".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_1".into()),
+            delivery: DeliveryState::NotApplicable,
+        });
+
+        let rendered = history.render_lines(80, Some(0), &|id| id.to_string());
+
+        assert_eq!(rendered.lines.len(), 2);
+        assert_eq!(rendered.selected_row_range, Some((0, 1)));
+    }
+
+    #[test]
+    fn render_lines_total_rows_matches_paragraph_wrapping() {
+        let mut history = History::default();
+        history.bubbles.push(Bubble {
+            actor_id: "actor_a".into(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: "this is a line that should wrap in a narrow history pane".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_1".into()),
+            delivery: DeliveryState::NotApplicable,
+        });
+
+        let rendered = history.render_lines(16, Some(0), &|id| id.to_string());
+        let expected = Paragraph::new(rendered.lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(16) as u16;
+
+        assert_eq!(rendered.total_rows, expected);
     }
 }

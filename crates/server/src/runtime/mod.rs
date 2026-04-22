@@ -6,10 +6,9 @@ pub use agent_runtime::acp;
 pub use agent_runtime::adapter;
 pub use agent_runtime::command;
 
-pub mod registry;
 pub mod wakeup;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,8 +28,6 @@ use self::command::{CommandAdapter, CommandConfig};
 pub enum RuntimeError {
     #[error("agent not found: {0}")]
     NotFound(String),
-    #[error("already started")]
-    AlreadyStarted,
     #[error("not running")]
     NotRunning,
     #[error("io: {0}")]
@@ -50,20 +47,34 @@ pub struct RegisteredAgent {
     pub adapter: Option<Arc<dyn Adapter>>,
     pub status: String,
     pub pid: Option<u32>,
+    /// Adapter-reported session id from `start`. ACP returns `None` (sessions are
+    /// allocated lazily per scope inside the adapter); command transport returns
+    /// `Some("cmd:<actor>")`. Surfaced via `AgentInfo` for ops only.
     pub session_id: Option<String>,
     pub log: VecDeque<String>,
     /// Pending action.request -> adapter request id mapping (key = event id).
     /// The adapter handle is held so the action response can be routed even if
     /// the agent is unregistered/re-registered between request and response.
     pub action_map: HashMap<String, (Arc<dyn Adapter>, String)>,
-    /// Currently active turn for this agent (only one in-flight prompt at a time in v0)
-    pub active_turn_id: Option<String>,
-    /// True after the agent's session has received its first manifest-bearing prompt.
-    pub seeded: bool,
+    /// Currently active turn per scope. The same agent can be @-mentioned in
+    /// multiple channels concurrently; each scope is its own conversation, so
+    /// each gets its own turn slot keyed by `scope.id`.
+    pub active_turns: HashMap<String, String>,
+    /// Per-scope FIFO of triggers (chat events that wake this agent) that
+    /// arrived while the scope was already in flight. Drained one at a time
+    /// when the scope's current turn closes — same-scope back-to-back prompts
+    /// are strictly serialized.
+    pub pending_triggers: HashMap<String, VecDeque<Event>>,
+    /// Per-scope first-prompt-seeded flag. Each scope's first prompt to a
+    /// freshly-started agent gets the bootstrap manifest prepended; subsequent
+    /// prompts in the same scope (or any prompt in any other scope after the
+    /// agent has been seeded once) skip it.
+    pub seeded: HashSet<String>,
     /// Per-turn streaming text buffer. Partial text chunks accumulate here and
     /// are flushed as a single `content.add` event when the turn closes; the
     /// raw chunks themselves are exposed as turn-private `text.delta` trace
-    /// frames so the owner can see the cursor moving.
+    /// frames so the owner can see the cursor moving. Keyed by `turn_id` (which
+    /// is itself unique per scope), so no scope axis needed here.
     pub text_buffer: HashMap<String, String>,
 }
 
@@ -77,8 +88,9 @@ impl RegisteredAgent {
             session_id: None,
             log: VecDeque::new(),
             action_map: HashMap::new(),
-            active_turn_id: None,
-            seeded: false,
+            active_turns: HashMap::new(),
+            pending_triggers: HashMap::new(),
+            seeded: HashSet::new(),
             text_buffer: HashMap::new(),
         }
     }
@@ -176,30 +188,19 @@ impl RuntimeManager {
         };
         let _ = self.store.upsert_actor(actor);
         let mut agents = self.agents.lock();
-        let existing = agents.remove(&spec.actor.id).map(|a| {
-            (
-                a.adapter,
-                a.status,
-                a.pid,
-                a.session_id,
-                a.log,
-                a.action_map,
-                a.active_turn_id,
-                a.text_buffer,
-            )
-        });
+        let existing = agents.remove(&spec.actor.id);
         let mut entry = RegisteredAgent::new(spec.clone());
-        if let Some((adapter, status, pid, session_id, log, action_map, turn, text_buffer)) =
-            existing
-        {
-            entry.adapter = adapter;
-            entry.status = status;
-            entry.pid = pid;
-            entry.session_id = session_id;
-            entry.log = log;
-            entry.action_map = action_map;
-            entry.active_turn_id = turn;
-            entry.text_buffer = text_buffer;
+        if let Some(prev) = existing {
+            entry.adapter = prev.adapter;
+            entry.status = prev.status;
+            entry.pid = prev.pid;
+            entry.session_id = prev.session_id;
+            entry.log = prev.log;
+            entry.action_map = prev.action_map;
+            entry.active_turns = prev.active_turns;
+            entry.pending_triggers = prev.pending_triggers;
+            entry.seeded = prev.seeded;
+            entry.text_buffer = prev.text_buffer;
         }
         let info = entry.info();
         agents.insert(spec.actor.id.clone(), entry);
@@ -260,16 +261,6 @@ impl RuntimeManager {
         self.data_dir.join("agent-client").join("sessions")
     }
 
-    pub fn append_log(&self, actor_id: &str, line: String) {
-        let mut agents = self.agents.lock();
-        if let Some(a) = agents.get_mut(actor_id) {
-            if a.log.len() >= 500 {
-                a.log.pop_front();
-            }
-            a.log.push_back(line);
-        }
-    }
-
     pub fn set_status(&self, actor_id: &str, status: &str) {
         let mut agents = self.agents.lock();
         if let Some(a) = agents.get_mut(actor_id) {
@@ -300,8 +291,9 @@ impl RuntimeManager {
             a.pid = None;
             a.session_id = None;
             a.status = "stopped".into();
-            a.active_turn_id = None;
-            a.seeded = false;
+            a.active_turns.clear();
+            a.pending_triggers.clear();
+            a.seeded.clear();
             a.text_buffer.clear();
         }
     }
@@ -336,17 +328,15 @@ impl RuntimeManager {
         }
     }
 
-    /// Returns `true` exactly once per session — flips the agent's `seeded` flag
-    /// from false to true so callers can prepend a one-time bootstrap manifest
-    /// to the very first prompt of a freshly-started ACP child.
-    pub fn take_seed_slot(&self, actor_id: &str) -> bool {
+    /// Returns `true` exactly once per (actor, scope) pair — flips the seeded
+    /// bit so callers can prepend the bootstrap manifest to the first prompt
+    /// each scope sends to a freshly-started agent. Subsequent calls for the
+    /// same scope (or a re-register that preserved `seeded`) return `false`.
+    pub fn take_seed_slot(&self, actor_id: &str, scope_id: &str) -> bool {
         let mut agents = self.agents.lock();
         match agents.get_mut(actor_id) {
-            Some(a) if !a.seeded => {
-                a.seeded = true;
-                true
-            }
-            _ => false,
+            Some(a) => a.seeded.insert(scope_id.to_string()),
+            None => false,
         }
     }
 
@@ -379,18 +369,47 @@ impl RuntimeManager {
         agents.get_mut(actor_id)?.action_map.remove(event_id)
     }
 
-    pub fn set_active_turn(&self, actor_id: &str, turn_id: Option<String>) {
+    pub fn set_active_turn(&self, actor_id: &str, scope_id: &str, turn_id: String) {
         let mut agents = self.agents.lock();
         if let Some(a) = agents.get_mut(actor_id) {
-            a.active_turn_id = turn_id;
+            a.active_turns.insert(scope_id.to_string(), turn_id);
         }
     }
 
-    pub fn active_turn(&self, actor_id: &str) -> Option<String> {
+    /// Drop the active turn for `(actor, scope)` and atomically pop the next
+    /// queued trigger for that scope (if any). Returning the trigger inside the
+    /// same lock prevents a racing `enqueue_trigger` from getting wedged behind
+    /// the now-empty active slot.
+    pub fn clear_active_turn(&self, actor_id: &str, scope_id: &str) -> Option<Event> {
+        let mut agents = self.agents.lock();
+        let a = agents.get_mut(actor_id)?;
+        a.active_turns.remove(scope_id);
+        let queue = a.pending_triggers.get_mut(scope_id)?;
+        let next = queue.pop_front();
+        if queue.is_empty() {
+            a.pending_triggers.remove(scope_id);
+        }
+        next
+    }
+
+    pub fn active_turn(&self, actor_id: &str, scope_id: &str) -> Option<String> {
         self.agents
             .lock()
             .get(actor_id)
-            .and_then(|a| a.active_turn_id.clone())
+            .and_then(|a| a.active_turns.get(scope_id).cloned())
+    }
+
+    /// Push a trigger event onto the per-scope queue. Caller must already have
+    /// determined the scope is busy (i.e. `active_turn` returned `Some`); if it
+    /// isn't, it'd be simpler to dispatch directly than to enqueue.
+    pub fn enqueue_trigger(&self, actor_id: &str, scope_id: &str, event: Event) {
+        let mut agents = self.agents.lock();
+        if let Some(a) = agents.get_mut(actor_id) {
+            a.pending_triggers
+                .entry(scope_id.to_string())
+                .or_default()
+                .push_back(event);
+        }
     }
 
     pub fn spec_for(&self, actor_id: &str) -> Option<AgentSpec> {
@@ -476,7 +495,7 @@ impl RuntimeManager {
             .start(event_tx)
             .await
             .map_err(|e| RuntimeError::Acp(e.to_string()))?;
-        self.set_runtime_handle(actor_id, adapter.clone(), info.pid, Some(info.session_id));
+        self.set_runtime_handle(actor_id, adapter.clone(), info.pid, info.session_id);
         wakeup::spawn_event_consumer(
             self.clone(),
             self.store.clone(),

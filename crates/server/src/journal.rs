@@ -43,6 +43,30 @@ pub enum Mutation {
     /// These never enter `events_by_scope` and are never broadcast on a
     /// scope subscription.
     TraceAppend(proto::types::trace::TraceFrame),
+    ChannelUpdate {
+        channel_id: String,
+        title: String,
+    },
+    ChannelDelete {
+        channel_id: String,
+    },
+    ThreadUpdate {
+        thread_id: String,
+        title: String,
+    },
+    ThreadDelete {
+        thread_id: String,
+    },
+    /// Add `actor_id` to `channel_id`'s member set. Idempotent on replay.
+    ChannelGrant {
+        channel_id: String,
+        actor_id: String,
+    },
+    /// Remove `actor_id` from `channel_id`'s member set. Idempotent on replay.
+    ChannelRevoke {
+        channel_id: String,
+        actor_id: String,
+    },
 }
 
 /// Variant names accepted as legacy envelope discriminators. Keep in sync
@@ -64,6 +88,8 @@ const LEGACY_VARIANTS: &[&str] = &[
     "artifact_create",
     "conversation_root_set",
     "thread_root_set",
+    "channel_grant",
+    "channel_revoke",
 ];
 
 pub struct Journal {
@@ -91,6 +117,7 @@ impl Journal {
         }))
     }
 
+    #[allow(dead_code)] // used by store.rs test fixtures
     pub fn path(&self) -> &Path {
         &self.path
     }

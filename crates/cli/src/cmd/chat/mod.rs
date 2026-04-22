@@ -15,18 +15,24 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use proto::types::ScopeKind;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::client::Client;
 
-/// Launch the chat TUI. `thread_id` may be empty — that's the sentinel for
-/// "user invoked `joi chat` without `--in`", in which case `events::run`
-/// auto-opens the sidebar so the operator can pick or create a thread from
-/// inside the UI instead of having to quit and re-run with `--in`.
-pub async fn run(client: Arc<Client>, actor_id: String, thread_id: String) -> Result<()> {
+/// Launch the chat TUI. `scope_id` may be empty — that's the sentinel for
+/// "user invoked `joi chat` without `--in`/`--channel`", in which case
+/// `events::run` auto-opens the sidebar so the operator can pick or create
+/// a channel/thread from inside the UI instead of having to quit and re-run.
+pub async fn run(
+    client: Arc<Client>,
+    actor_id: String,
+    scope_id: String,
+    scope_kind: ScopeKind,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = events::run(&mut terminal, client, actor_id, thread_id).await;
+    let result = events::run(&mut terminal, client, actor_id, scope_id, scope_kind).await;
     restore_terminal(&mut terminal)?;
     result
 }

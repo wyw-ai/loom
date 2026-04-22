@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use proto::types::Event;
+use proto::types::{Event, ScopeKind, ScopeRef};
 
 use super::history::History;
 use super::picker::{Picker, PickerItem};
@@ -49,7 +49,14 @@ pub struct App {
     /// handoff message before pressing Enter.
     pub at_menu: Option<Picker>,
     pub actor_id: String,
+    /// Id of the currently bound scope. Empty = no scope bound (launched
+    /// `joi chat` without `--in`/`--channel`). When non-empty, `scope_kind`
+    /// disambiguates whether this is a thread or a channel scope.
     pub thread_id: String,
+    /// Kind of the currently bound scope. `Thread` by default for
+    /// back-compat with `--in <thread_id>`; flipped to `Channel` when the
+    /// operator binds the chat to a channel's common area.
+    pub scope_kind: ScopeKind,
     pub display_for: HashMap<String, String>,
     /// Best-effort kind ("agent" / "human" / "service") per actor id; used
     /// only as a hint label in the @-mention picker.
@@ -72,13 +79,19 @@ pub struct App {
     pub sidebar: Option<Sidebar>,
     /// Modal text input or confirm dialog (used by sidebar CRUD).
     pub prompt: Option<PromptModal>,
-    /// Filled by the sidebar when the user picks a different thread; the
-    /// chat main loop drains this and re-binds its scope subscription.
-    pub pending_thread_switch: Option<String>,
+    /// Filled by the sidebar when the user picks a different scope
+    /// (thread OR channel common area); the chat main loop drains this
+    /// and re-binds its scope subscription.
+    pub pending_scope_switch: Option<ScopeRef>,
 }
 
 impl App {
-    pub fn new(actor_id: String, thread_id: String, self_display: String) -> Self {
+    pub fn new(
+        actor_id: String,
+        scope_id: String,
+        scope_kind: ScopeKind,
+        self_display: String,
+    ) -> Self {
         let mut display_for = HashMap::new();
         display_for.insert(actor_id.clone(), self_display);
         display_for.insert("system".to_string(), "system".to_string());
@@ -90,7 +103,8 @@ impl App {
             slash_menu: None,
             at_menu: None,
             actor_id,
-            thread_id,
+            thread_id: scope_id,
+            scope_kind,
             display_for,
             actor_kinds: HashMap::new(),
             agent_ids: HashSet::new(),
@@ -104,15 +118,31 @@ impl App {
             disconnected: false,
             sidebar: None,
             prompt: None,
-            pending_thread_switch: None,
+            pending_scope_switch: None,
         }
     }
 
-    /// `true` when a thread is bound. Empty `thread_id` means the user
-    /// launched `joi chat` without `--in`; server writes (send, handoff,
-    /// subscribe, unsubscribe) should guard on this.
-    pub fn has_thread(&self) -> bool {
+    /// `true` when any scope (thread OR channel) is bound.
+    pub fn has_scope(&self) -> bool {
         !self.thread_id.is_empty()
+    }
+
+    /// `true` when the bound scope is specifically a thread. Several
+    /// sidebar/prompt helpers only make sense inside a thread; this gate
+    /// keeps channel-common-area chat out of their control flow.
+    pub fn has_thread(&self) -> bool {
+        self.has_scope() && matches!(self.scope_kind, ScopeKind::Thread)
+    }
+
+    /// Snapshot the current scope, if any.
+    pub fn current_scope(&self) -> Option<ScopeRef> {
+        if !self.has_scope() {
+            return None;
+        }
+        Some(ScopeRef {
+            kind: self.scope_kind.clone(),
+            id: self.thread_id.clone(),
+        })
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -121,13 +151,25 @@ impl App {
         } else {
             // Pass `None` when no thread is bound — the sidebar uses this
             // to skip the "auto-focus the owning channel" logic and just
-            // lands on the first channel in the list.
-            let current = if self.has_thread() {
+            // lands on the first channel in the list. Channel-bound mode
+            // feeds `current_channel_id` so the Channels pane still marks
+            // the bound channel with a green dot.
+            let current_thread = if self.has_thread() {
                 Some(self.thread_id.clone())
             } else {
                 None
             };
-            self.sidebar = Some(Sidebar::new(current).with_me(self.actor_id.clone()));
+            let current_channel = if matches!(self.scope_kind, ScopeKind::Channel) && self.has_scope()
+            {
+                Some(self.thread_id.clone())
+            } else {
+                None
+            };
+            self.sidebar = Some(
+                Sidebar::new(current_thread)
+                    .with_me(self.actor_id.clone())
+                    .with_current_channel(current_channel),
+            );
         }
     }
 
@@ -136,10 +178,11 @@ impl App {
     }
 
     /// Reset the visible message stream when the chat re-binds to a different
-    /// thread. Scroll/auto-follow/reply-target/at-menu/slash-menu all become
-    /// stale across threads; clear them in one place.
-    pub fn reset_for_new_thread(&mut self, new_thread_id: String) {
-        self.thread_id = new_thread_id;
+    /// scope (thread or channel). Scroll/auto-follow/reply-target/at-menu/
+    /// slash-menu all become stale across scopes; clear them in one place.
+    pub fn reset_for_new_scope(&mut self, new_scope: &ScopeRef) {
+        self.thread_id = new_scope.id.clone();
+        self.scope_kind = new_scope.kind.clone();
         self.history = History::default();
         self.scroll = 0;
         self.auto_follow = true;
@@ -269,12 +312,17 @@ impl App {
     ) -> Option<(String, std::collections::HashSet<String>)> {
         use proto::types::ChannelVisibility;
         let s = self.sidebar.as_ref()?;
-        let channel_id = s.threads_by_channel.iter().find_map(|(ch, threads)| {
-            threads
-                .iter()
-                .find(|t| t.id == self.thread_id)
-                .map(|_| ch.clone())
-        })?;
+        // Channel-bound: the scope id IS the channel id.
+        let channel_id = if matches!(self.scope_kind, ScopeKind::Channel) && self.has_scope() {
+            self.thread_id.clone()
+        } else {
+            s.threads_by_channel.iter().find_map(|(ch, threads)| {
+                threads
+                    .iter()
+                    .find(|t| t.id == self.thread_id)
+                    .map(|_| ch.clone())
+            })?
+        };
         let ch = s.channels.iter().find(|c| c.id == channel_id)?;
         if !matches!(ch.visibility, ChannelVisibility::Private) {
             return None;
@@ -479,6 +527,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.display_for
@@ -508,6 +557,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         // Two registered agents: alpha is a channel member, beta is not.
@@ -572,6 +622,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.agent_ids.insert("actor_agent_loner".into());
@@ -612,6 +663,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "Alice".into(),
         );
         app.display_for
@@ -633,6 +685,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "OpenCode".into(),
         );
         app.display_for
@@ -659,6 +712,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.history.push_system("system");

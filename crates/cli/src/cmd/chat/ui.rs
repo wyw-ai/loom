@@ -108,14 +108,18 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         }
         None => "(/ commands · r=reply selected · Ctrl-R=picker · Ctrl-B=channels · Ctrl-C=quit)",
     };
-    let (thread_label, thread_style) = if app.has_thread() {
+    let (thread_label, thread_style) = if app.has_scope() {
+        let prefix = match app.scope_kind {
+            proto::types::ScopeKind::Channel => "#",
+            proto::types::ScopeKind::Thread => "🧵",
+        };
         (
-            format!("#{}", app.thread_id),
+            format!("{}{}", prefix, app.thread_id),
             Style::default().fg(Color::Cyan),
         )
     } else {
         (
-            "(no thread — pick one in the sidebar)".to_string(),
+            "(no scope — pick a channel/thread in the sidebar)".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -218,9 +222,9 @@ fn render_streaming_bar(
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
-    let (title, border_color) = if !app.has_thread() {
+    let (title, border_color) = if !app.has_scope() {
         (
-            " Message (select a thread to start chatting) ".to_string(),
+            " Message (pick a channel or thread to start chatting) ".to_string(),
             Color::DarkGray,
         )
     } else {

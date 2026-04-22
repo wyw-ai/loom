@@ -60,6 +60,10 @@ pub struct Sidebar {
     pub threads_state: ListState,
     pub members_state: ListState,
     pub current_thread_id: Option<String>,
+    /// When the chat is bound to a channel's common area (not a thread), this
+    /// holds the bound channel id. Used to mark the bound channel row with a
+    /// green dot in the Channels pane.
+    pub current_channel_id: Option<String>,
     /// Caller's own actor id; used to mark "you" in the Members pane and to
     /// guard the local revoke shortcut against self-removal foot-guns.
     pub me_actor_id: Option<String>,
@@ -79,8 +83,14 @@ impl Sidebar {
             threads_state: ListState::default(),
             members_state: ListState::default(),
             current_thread_id,
+            current_channel_id: None,
             me_actor_id: None,
         }
+    }
+
+    pub fn with_current_channel(mut self, channel_id: Option<String>) -> Self {
+        self.current_channel_id = channel_id;
+        self
     }
 
     pub fn with_me(mut self, me: String) -> Self {
@@ -347,7 +357,7 @@ impl Sidebar {
         };
     }
 
-    fn sync_state(&mut self) {
+    pub fn sync_state(&mut self) {
         if self.channels.is_empty() {
             self.channels_state.select(None);
         } else {
@@ -398,7 +408,7 @@ impl Sidebar {
     fn render_channels(&mut self, f: &mut Frame, area: Rect) {
         let focused = matches!(self.focus, SidebarFocus::Channels);
         let title = if focused {
-            " ▸ Channels  [n/r/d] "
+            " ▸ Channels  [Enter=threads · c=enter · n/r/d] "
         } else {
             "   Channels "
         };
@@ -423,7 +433,9 @@ impl Sidebar {
                     .current_thread_id
                     .as_ref()
                     .and_then(|tid| owning_channel_id(self, tid));
-                let mark = if owning.as_deref() == Some(c.id.as_str()) {
+                let bound_via_thread = owning.as_deref() == Some(c.id.as_str());
+                let bound_via_channel = self.current_channel_id.as_deref() == Some(c.id.as_str());
+                let mark = if bound_via_thread || bound_via_channel {
                     "●"
                 } else {
                     " "

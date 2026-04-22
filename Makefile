@@ -9,14 +9,17 @@
 #   make all                 # debug + release
 #
 # Override on command line:
-#   make linux-x86-release LINUX_BUILDER=cargo
+#   make linux-x86-release LINUX_BUILDER=cross
 #   make all-release DIST_DIR=/tmp/out
 
 CARGO          ?= cargo
 CROSS          ?= cross
 LIPO           ?= lipo
 DIST_DIR       ?= dist
-LINUX_BUILDER  ?= $(CROSS)
+# Default to native cargo + musl-cross toolchain; cross+Docker is broken on
+# Apple Silicon (rustc segfaults under QEMU). Override with LINUX_BUILDER=cross
+# if you actually have a working cross container setup.
+LINUX_BUILDER  ?= $(CARGO)
 
 VERSION := $(shell awk -F\" '/^version/ {print $$2; exit}' Cargo.toml 2>/dev/null || echo 0.0.0)
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -69,7 +72,7 @@ help:
 	@echo "Overrides:"
 	@echo "  CARGO=$(CARGO)  CROSS=$(CROSS)  LIPO=$(LIPO)"
 	@echo "  DIST_DIR=$(DIST_DIR)"
-	@echo "  LINUX_BUILDER=$(LINUX_BUILDER)   (set to '$(CARGO)' to skip cross)"
+	@echo "  LINUX_BUILDER=$(LINUX_BUILDER)   (set to '$(CROSS)' to use cross-rs containers)"
 
 # ---- Native --------------------------------------------------------------
 

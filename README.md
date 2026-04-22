@@ -36,6 +36,57 @@ cargo build
 cargo test --workspace
 ```
 
+## 出包（多平台）
+
+所有交叉编译走 `Makefile`。产物落在 `dist/<profile>/<triple>/{joi,joi-server}`，
+`dist/` 已在 `.gitignore` 里。
+
+```sh
+make help                 # 列所有 target
+make release              # 当前 host 的 release（最快看效果）
+make install-targets      # 一次性装齐 4 个 triple 的 std：
+                          #   aarch64-apple-darwin / x86_64-apple-darwin
+                          #   aarch64-unknown-linux-musl / x86_64-unknown-linux-musl
+```
+
+| 场景 | 命令 | 产物位置 |
+| --- | --- | --- |
+| 本机快速验证 | `make build` | `target/debug/{joi,joi-server}` |
+| 本机 release | `make release` | 同上 `target/release/` |
+| mac ARM | `make mac-arm-release` | `dist/release/aarch64-apple-darwin/` |
+| mac x86 | `make mac-x86-release` | `dist/release/x86_64-apple-darwin/` |
+| mac 通用二进制 | `make mac-universal-release` | `dist/release/universal-apple-darwin/`（`lipo` 合并 arm+x86） |
+| linux x86 | `make linux-x86-release` | `dist/release/x86_64-unknown-linux-musl/` |
+| linux ARM | `make linux-arm-release` | `dist/release/aarch64-unknown-linux-musl/` |
+| 全平台 release | `make all-release` | 上述所有 |
+| 全平台 debug+release | `make all` | 同上再加 `dist/debug/...` |
+
+linux 档默认用 host 的 `cargo` 原生交叉，需要装好 musl 工具链。macOS 上推荐：
+
+```sh
+brew install filosottile/musl-cross/musl-cross   # 同时提供 x86_64 + aarch64 musl gcc
+```
+
+`~/.cargo/config.toml` 里已经把 linker 指向 `x86_64-linux-musl-gcc` /
+`aarch64-linux-musl-gcc`，装完即用。如果你偏好容器化的 `cross` 流程，`cargo
+install cross` 后用 `make linux-x86-release LINUX_BUILDER=cross` 显式切回去；
+Apple Silicon 上 cross 会在 QEMU 里跑 x86 rustc，实测会 SIGSEGV，因此默认不走这条路。
+
+国内环境装 toolchain 可能被墙，可以走 rsproxy 镜像：
+
+```sh
+export RUSTUP_DIST_SERVER=https://rsproxy.cn
+export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+# 再把 crates.io 也换成 sparse 镜像，写到 ~/.cargo/config.toml：
+# [source.crates-io]
+# replace-with = "rsproxy-sparse"
+# [source.rsproxy-sparse]
+# registry = "sparse+https://rsproxy.cn/index/"
+```
+
+其他常用 Make 目标：`make test` / `make fmt` / `make lint` / `make clean`
+（仅清 `dist/`）/ `make distclean`（连 `cargo clean` 也做掉）。
+
 ## 部署模式
 
 joi-apps 当前支持两种拓扑，由 server 端的 `JOI_DISABLE_EMBEDDED_RUNTIME`

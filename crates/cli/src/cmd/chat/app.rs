@@ -108,13 +108,26 @@ impl App {
         }
     }
 
+    /// `true` when a thread is bound. Empty `thread_id` means the user
+    /// launched `joi chat` without `--in`; server writes (send, handoff,
+    /// subscribe, unsubscribe) should guard on this.
+    pub fn has_thread(&self) -> bool {
+        !self.thread_id.is_empty()
+    }
+
     pub fn toggle_sidebar(&mut self) {
         if self.sidebar.is_some() {
             self.sidebar = None;
         } else {
-            self.sidebar = Some(
-                Sidebar::new(Some(self.thread_id.clone())).with_me(self.actor_id.clone()),
-            );
+            // Pass `None` when no thread is bound — the sidebar uses this
+            // to skip the "auto-focus the owning channel" logic and just
+            // lands on the first channel in the list.
+            let current = if self.has_thread() {
+                Some(self.thread_id.clone())
+            } else {
+                None
+            };
+            self.sidebar = Some(Sidebar::new(current).with_me(self.actor_id.clone()));
         }
     }
 

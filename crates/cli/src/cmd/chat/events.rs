@@ -36,16 +36,36 @@ pub async fn run(
     let display_name = bootstrap_display_name(&client, &actor_id).await;
     let mut app = App::new(actor_id.clone(), thread_id.clone(), display_name.clone());
 
-    if let Err(e) = subscribe(&client, &actor_id, &scope).await {
-        app.history
-            .push_system(format!("scope/subscribe failed: {}", e));
-    }
-    if let Err(e) = backfill(&client, &mut app, &scope).await {
-        app.history
-            .push_system(format!("scope/read backfill failed: {}", e));
+    if app.has_thread() {
+        if let Err(e) = subscribe(&client, &actor_id, &scope).await {
+            app.history
+                .push_system(format!("scope/subscribe failed: {}", e));
+        }
+        if let Err(e) = backfill(&client, &mut app, &scope).await {
+            app.history
+                .push_system(format!("scope/read backfill failed: {}", e));
+        }
     }
     refresh_actor_directory(&client, &mut app).await;
-    app.set_status(format!("connected as {} · {}", display_name, thread_id));
+    if app.has_thread() {
+        app.set_status(format!("connected as {} · {}", display_name, thread_id));
+    } else {
+        // `joi chat` without `--in`: auto-open the sidebar + populate the
+        // channel list so the operator can immediately pick/create a
+        // thread instead of staring at an empty chat pane.
+        app.history
+            .push_system("Welcome to Joi chat.");
+        app.history
+            .push_system("No thread selected. Use the sidebar (Ctrl+B) to pick a channel, or");
+        app.history
+            .push_system("press n in the Channels pane to create one. Press Enter on a thread to open it.");
+        app.toggle_sidebar();
+        initialize_sidebar(&client, &mut app).await;
+        app.set_status(format!(
+            "connected as {} · pick a thread from the sidebar",
+            display_name
+        ));
+    }
 
     loop {
         // Sidebar may have queued a thread switch on the previous frame —
@@ -96,13 +116,17 @@ async fn switch_thread(
         return;
     }
     // Fire and forget unsubscribe — the server tolerates duplicate/missing
-    // unsubscribes, and we don't want to block the UI on it.
-    let _ = client
-        .call::<_, serde_json::Value>(
-            method::SCOPE_UNSUBSCRIBE,
-            json!({ "actorId": app.actor_id, "scope": scope }),
-        )
-        .await;
+    // unsubscribes, and we don't want to block the UI on it. Skip when the
+    // previous scope id is empty (launched without `--in`, so we never
+    // subscribed in the first place).
+    if !scope.id.is_empty() {
+        let _ = client
+            .call::<_, serde_json::Value>(
+                method::SCOPE_UNSUBSCRIBE,
+                json!({ "actorId": app.actor_id, "scope": scope }),
+            )
+            .await;
+    }
 
     let new_scope = ScopeRef {
         kind: ScopeKind::Thread,
@@ -1132,10 +1156,18 @@ async fn handle_prompt_submit(
                 .await;
             match res {
                 Ok(r) => {
+                    let new_thread_id = r.thread.id.clone();
+                    let new_thread_title = r.thread.title.clone();
                     if let Some(s) = app.sidebar.as_mut() {
-                        s.add_thread(r.thread.clone());
+                        s.add_thread(r.thread);
                     }
-                    app.set_status(format!("created thread '{}'", r.thread.title));
+                    // Auto-bind into the newly created thread so the user
+                    // can start chatting without a second keystroke. The
+                    // main loop drains `pending_thread_switch` on the next
+                    // frame and re-subscribes.
+                    app.pending_thread_switch = Some(new_thread_id);
+                    app.sidebar = None;
+                    app.set_status(format!("created thread '{}'", new_thread_title));
                 }
                 Err(e) => app.set_status(format!("thread/create failed: {}", e)),
             }
@@ -1606,6 +1638,10 @@ async fn do_handoff_with_message(
     scope: &ScopeRef,
 ) {
     use proto::methods::EventAppendResult;
+    if !app.has_thread() {
+        app.set_status("open a thread first (Ctrl+B, then Enter on a thread)");
+        return;
+    }
     let payload = json!({
         "event": {
             "type": "content.add",
@@ -1756,6 +1792,10 @@ fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
 
 async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &ScopeRef) {
     use proto::methods::EventAppendResult;
+    if !app.has_thread() {
+        app.set_status("open a thread first (Ctrl+B, then Enter on a thread)");
+        return;
+    }
     let (relations, reply_target) = message_relations(app);
     let payload = json!({
         "event": {

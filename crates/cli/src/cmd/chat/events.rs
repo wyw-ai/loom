@@ -27,16 +27,22 @@ pub async fn run(
     client: Arc<Client>,
     actor_id: String,
     thread_id: String,
+    scope_kind: ScopeKind,
 ) -> Result<()> {
     let mut scope = ScopeRef {
-        kind: ScopeKind::Thread,
+        kind: scope_kind.clone(),
         id: thread_id.clone(),
     };
 
     let display_name = bootstrap_display_name(&client, &actor_id).await;
-    let mut app = App::new(actor_id.clone(), thread_id.clone(), display_name.clone());
+    let mut app = App::new(
+        actor_id.clone(),
+        thread_id.clone(),
+        scope_kind.clone(),
+        display_name.clone(),
+    );
 
-    if app.has_thread() {
+    if app.has_scope() {
         if let Err(e) = subscribe(&client, &actor_id, &scope).await {
             app.history
                 .push_system(format!("scope/subscribe failed: {}", e));
@@ -47,32 +53,37 @@ pub async fn run(
         }
     }
     refresh_actor_directory(&client, &mut app).await;
-    if app.has_thread() {
-        app.set_status(format!("connected as {} · {}", display_name, thread_id));
+    if app.has_scope() {
+        let label = match scope_kind {
+            ScopeKind::Thread => format!("thread {}", thread_id),
+            ScopeKind::Channel => format!("#channel {}", thread_id),
+        };
+        app.set_status(format!("connected as {} · {}", display_name, label));
     } else {
         // `joi chat` without `--in`: auto-open the sidebar + populate the
         // channel list so the operator can immediately pick/create a
         // thread instead of staring at an empty chat pane.
         app.history.push_system("Welcome to Joi chat.");
-        app.history
-            .push_system("No thread selected. Use the sidebar (Ctrl+B) to pick a channel, or");
         app.history.push_system(
-            "press n in the Channels pane to create one. Press Enter on a thread to open it.",
+            "No scope bound. Use the sidebar (Ctrl+B) to pick a channel,",
+        );
+        app.history.push_system(
+            "press Enter to drill into its threads, or press c to enter the channel common area.",
         );
         app.toggle_sidebar();
         initialize_sidebar(&client, &mut app).await;
         app.set_status(format!(
-            "connected as {} · pick a thread from the sidebar",
+            "connected as {} · pick a channel or thread from the sidebar",
             display_name
         ));
     }
 
     loop {
-        // Sidebar may have queued a thread switch on the previous frame —
+        // Sidebar may have queued a scope switch on the previous frame —
         // drain it before the next render so the user immediately sees the
-        // new thread's history.
-        if let Some(target_thread) = app.pending_thread_switch.take() {
-            switch_thread(&client, &mut app, &mut scope, target_thread).await;
+        // new scope's history.
+        if let Some(target_scope) = app.pending_scope_switch.take() {
+            switch_scope(&client, &mut app, &mut scope, target_scope).await;
         }
 
         let disconnected = drain_notifications(&mut app, &scope, &client).await;
@@ -103,16 +114,16 @@ pub async fn run(
     Ok(())
 }
 
-/// Re-bind the chat to a different thread. Best-effort: any RPC failure here
-/// leaves the previous subscription intact and surfaces the error on the
-/// status line so the user can decide to retry or quit.
-async fn switch_thread(
+/// Re-bind the chat to a different scope (thread or channel). Best-effort:
+/// any RPC failure here leaves the previous subscription intact and surfaces
+/// the error on the status line so the user can decide to retry or quit.
+async fn switch_scope(
     client: &Arc<Client>,
     app: &mut App,
     scope: &mut ScopeRef,
-    target_thread_id: String,
+    target_scope: ScopeRef,
 ) {
-    if target_thread_id == scope.id {
+    if target_scope == *scope {
         return;
     }
     // Fire and forget unsubscribe — the server tolerates duplicate/missing
@@ -128,22 +139,33 @@ async fn switch_thread(
             .await;
     }
 
-    let new_scope = ScopeRef {
-        kind: ScopeKind::Thread,
-        id: target_thread_id.clone(),
-    };
-
-    if let Err(e) = subscribe(client, &app.actor_id, &new_scope).await {
+    if let Err(e) = subscribe(client, &app.actor_id, &target_scope).await {
         app.set_status(format!("scope/subscribe failed: {}", e));
         return;
     }
-    app.reset_for_new_thread(target_thread_id.clone());
-    *scope = new_scope.clone();
-    if let Err(e) = backfill(client, app, &new_scope).await {
+    app.reset_for_new_scope(&target_scope);
+    if let Some(s) = app.sidebar.as_mut() {
+        match target_scope.kind {
+            ScopeKind::Thread => {
+                s.current_thread_id = Some(target_scope.id.clone());
+                s.current_channel_id = None;
+            }
+            ScopeKind::Channel => {
+                s.current_channel_id = Some(target_scope.id.clone());
+                s.current_thread_id = None;
+            }
+        }
+    }
+    *scope = target_scope.clone();
+    if let Err(e) = backfill(client, app, &target_scope).await {
         app.history
             .push_system(format!("scope/read backfill failed: {}", e));
     }
-    app.set_status(format!("switched → {}", target_thread_id));
+    let label = match target_scope.kind {
+        ScopeKind::Thread => format!("thread {}", target_scope.id),
+        ScopeKind::Channel => format!("#channel {}", target_scope.id),
+    };
+    app.set_status(format!("switched → {}", label));
 }
 
 async fn subscribe(client: &Client, actor_id: &str, scope: &ScopeRef) -> Result<()> {
@@ -717,9 +739,26 @@ async fn initialize_sidebar(client: &Arc<Client>, app: &mut App) {
     if let Some(s) = app.sidebar.as_mut() {
         s.replace_channels(channels.clone());
     }
-    // To find the current thread's owning channel, we need to scan threads
-    // until we hit it. Walk channels in order and stop after the match.
+    // Short-circuit: when bound to a channel's common area, we already
+    // know the owning channel — skip the thread-scan and just refresh
+    // that channel's members cache.
+    if matches!(app.scope_kind, ScopeKind::Channel) && app.has_scope() {
+        let ch_id = app.thread_id.clone();
+        if let Some(s) = app.sidebar.as_mut() {
+            if let Some(idx) = s.channels.iter().position(|c| c.id == ch_id) {
+                s.selected_channel_idx = idx;
+                s.sync_state();
+            }
+        }
+        refresh_members(client, app, &ch_id).await;
+        return;
+    }
+    // Thread-bound path: scan threads across channels to find the owning
+    // channel so we can auto-focus it in the sidebar.
     let current_thread_id = app.thread_id.clone();
+    if current_thread_id.is_empty() {
+        return;
+    }
     let mut owning_channel: Option<String> = None;
     for ch in &channels {
         let res = client
@@ -868,8 +907,13 @@ async fn handle_sidebar_key(client: &Arc<Client>, app: &mut App, key: KeyEvent) 
                 }
                 SidebarFocus::Threads => {
                     if let Some(tid) = thread_id {
-                        if tid != app.thread_id {
-                            app.pending_thread_switch = Some(tid);
+                        let current = app.current_scope();
+                        let target = ScopeRef {
+                            kind: ScopeKind::Thread,
+                            id: tid,
+                        };
+                        if Some(&target) != current.as_ref() {
+                            app.pending_scope_switch = Some(target);
                         }
                         // Hide the sidebar after a switch so the chat fills the
                         // screen again — Ctrl+B toggles it back if needed.
@@ -887,6 +931,31 @@ async fn handle_sidebar_key(client: &Arc<Client>, app: &mut App, key: KeyEvent) 
                     true
                 }
             }
+        }
+        KeyCode::Char('c') => {
+            // Bind chat to the selected channel's common area. Only
+            // meaningful when the Channels pane has focus; ignore on
+            // other panes so `c` remains free for their future use.
+            let (focus, channel_id) = match app.sidebar.as_ref() {
+                Some(s) => (s.focus, s.selected_channel().map(|c| c.id.clone())),
+                None => return true,
+            };
+            if !matches!(focus, SidebarFocus::Channels) {
+                return true;
+            }
+            let Some(cid) = channel_id else {
+                return true;
+            };
+            let current = app.current_scope();
+            let target = ScopeRef {
+                kind: ScopeKind::Channel,
+                id: cid,
+            };
+            if Some(&target) != current.as_ref() {
+                app.pending_scope_switch = Some(target);
+            }
+            app.sidebar = None;
+            true
         }
         KeyCode::Char('n') => {
             open_create_prompt(app);
@@ -1207,9 +1276,12 @@ async fn handle_prompt_submit(
                     }
                     // Auto-bind into the newly created thread so the user
                     // can start chatting without a second keystroke. The
-                    // main loop drains `pending_thread_switch` on the next
+                    // main loop drains `pending_scope_switch` on the next
                     // frame and re-subscribes.
-                    app.pending_thread_switch = Some(new_thread_id);
+                    app.pending_scope_switch = Some(ScopeRef {
+                        kind: ScopeKind::Thread,
+                        id: new_thread_id,
+                    });
                     app.sidebar = None;
                     app.set_status(format!("created thread '{}'", new_thread_title));
                 }
@@ -1273,10 +1345,12 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
             message,
         } => {
             // Snapshot the scope before re-borrowing app for status updates.
-            let scope = ScopeRef {
+            // Falls back to thread scope for back-compat; the picker flow
+            // only runs from inside a bound scope anyway.
+            let scope = app.current_scope().unwrap_or(ScopeRef {
                 kind: ScopeKind::Thread,
                 id: app.thread_id.clone(),
-            };
+            });
             do_channel_invite(client, app, channel_id, actor_id.clone()).await;
             // Even if invite failed, attempting the handoff surfaces the
             // server's PERMISSION_DENIED verbatim — useful signal for the
@@ -1587,6 +1661,10 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
 }
 
 fn current_chat_channel(app: &App) -> Option<String> {
+    // Channel-bound mode: the bound scope id *is* the channel id.
+    if matches!(app.scope_kind, ScopeKind::Channel) && app.has_scope() {
+        return Some(app.thread_id.clone());
+    }
     let s = app.sidebar.as_ref()?;
     s.threads_by_channel.iter().find_map(|(ch, threads)| {
         threads
@@ -1687,8 +1765,8 @@ async fn do_handoff_with_message(
     scope: &ScopeRef,
 ) {
     use proto::methods::EventAppendResult;
-    if !app.has_thread() {
-        app.set_status("open a thread first (Ctrl+B, then Enter on a thread)");
+    if !app.has_scope() {
+        app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
         return;
     }
     let payload = json!({
@@ -1718,11 +1796,15 @@ async fn do_action_response(
 ) {
     use proto::methods::EventAppendResult;
     let kind = if accepted { "accepted" } else { "declined" };
+    let Some(scope) = app.current_scope() else {
+        app.set_status("no scope bound — cannot respond to action");
+        return;
+    };
     let payload = json!({
         "event": {
             "type": "action.response",
             "actorId": app.actor_id,
-            "scope": { "kind": "thread", "id": app.thread_id },
+            "scope": scope,
             "payload": { "optionId": option_id, "kind": kind },
             "relations": [
                 { "kind": "responds_to", "target": { "kind": "event", "id": event_id.clone() } }
@@ -1841,8 +1923,8 @@ fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
 
 async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &ScopeRef) {
     use proto::methods::EventAppendResult;
-    if !app.has_thread() {
-        app.set_status("open a thread first (Ctrl+B, then Enter on a thread)");
+    if !app.has_scope() {
+        app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
         return;
     }
     let (relations, reply_target) = message_relations(app);
@@ -1953,6 +2035,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.input = "/reply ".into();
@@ -1971,6 +2054,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.history.bubbles.push(Bubble {
@@ -2003,6 +2087,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.history.bubbles.push(Bubble {
@@ -2029,6 +2114,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         app.history.bubbles.push(Bubble {
@@ -2059,6 +2145,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
 
@@ -2071,6 +2158,7 @@ mod tests {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
         for (a, t) in actors_and_turns {

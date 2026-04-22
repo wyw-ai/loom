@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use proto::types::ScopeRef;
+use proto::types::{ActorKind, ScopeRef};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -44,12 +44,66 @@ impl Subscriptions {
         inner.connections.insert(conn.id.clone(), conn);
     }
 
-    pub fn bind_actor(&self, connection_id: &str, actor_id: String) {
+    /// Bind this connection to `actor_id`. The connection always learns its
+    /// actor identity (so it can send events as that actor); whether it also
+    /// becomes the actor-inbox owner depends on `actor_kind`:
+    ///
+    /// * `Agent` — always takes over. `joi agent serve` claiming an actor
+    ///   means "I am the runtime for this actor"; a restart after a crash
+    ///   needs to win even if the previous WS hasn't been reaped yet (the
+    ///   old conn's TCP close detection on the server side may lag the new
+    ///   process's `connection/open` by tens of ms).
+    /// * `Human` / `Service` — only take if no other live connection holds
+    ///   the slot. Stops short-lived `joi` subcommands shelled from inside
+    ///   an agent's tool call (which inherit `JOI_ACTOR` pointing at the
+    ///   *agent*'s actor and dial `connection/open` on every invocation)
+    ///   from yanking the long-lived agent runtime out of the routing
+    ///   table when their connection later closes.
+    ///
+    /// Stale entries (binding points at a conn no longer in `connections`)
+    /// are evicted unconditionally, so a fresh `agent serve` after a clean
+    /// shutdown also takes over.
+    pub fn bind_actor(&self, connection_id: &str, actor_id: String, actor_kind: ActorKind) {
         let mut inner = self.inner.write();
         if let Some(c) = inner.connections.get_mut(connection_id) {
             c.actor_id = Some(actor_id.clone());
         }
-        inner.actor_conn.insert(actor_id, connection_id.into());
+        let take_inbox = match inner.actor_conn.get(&actor_id) {
+            None => true,
+            Some(prev) if prev == connection_id => true,
+            Some(prev) if !inner.connections.contains_key(prev) => {
+                tracing::info!(
+                    actor = %actor_id,
+                    stale_conn = %prev,
+                    new_conn = %connection_id,
+                    "actor_conn taking over stale binding",
+                );
+                true
+            }
+            Some(prev) if matches!(actor_kind, ActorKind::Agent) => {
+                tracing::info!(
+                    actor = %actor_id,
+                    prev_conn = %prev,
+                    new_conn = %connection_id,
+                    "agent connection preempting existing actor_conn binding (likely \
+                     `agent serve` restart with old WS still in connections table)",
+                );
+                true
+            }
+            Some(prev) => {
+                tracing::debug!(
+                    actor = %actor_id,
+                    holder = %prev,
+                    secondary = %connection_id,
+                    kind = ?actor_kind,
+                    "actor_conn already owned; new connection shares identity but not inbox",
+                );
+                false
+            }
+        };
+        if take_inbox {
+            inner.actor_conn.insert(actor_id, connection_id.into());
+        }
     }
 
     pub fn remove_connection(&self, connection_id: &str) {
@@ -103,21 +157,24 @@ impl Subscriptions {
         removed_a || removed_b
     }
 
-    pub fn connection_for_actor(&self, actor_id: &str) -> Option<Connection> {
-        let inner = self.inner.read();
-        inner
-            .actor_conn
-            .get(actor_id)
-            .and_then(|id| inner.connections.get(id))
-            .cloned()
-    }
-
     pub fn actor_for_connection(&self, connection_id: &str) -> Option<String> {
         let inner = self.inner.read();
         inner
             .connections
             .get(connection_id)
             .and_then(|c| c.actor_id.clone())
+    }
+
+    /// Snapshot the set of connection ids currently subscribed to `scope`.
+    /// Returned as a `Vec<String>` (not borrowed) so the caller can drop
+    /// the read lock before doing per-connection work like ACL filtering.
+    pub fn scope_subscribers(&self, scope: &ScopeRef) -> Vec<String> {
+        let inner = self.inner.read();
+        inner
+            .subs
+            .get(scope)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Send a JSON-RPC notification to all connections subscribed to scope.
@@ -164,11 +221,31 @@ impl Subscriptions {
         };
         let inner = self.inner.read();
         let Some(conn_id) = inner.actor_conn.get(actor_id) else {
+            tracing::warn!(
+                actor = %actor_id,
+                %method,
+                "actor-inbox send dropped: no connection bound to actor",
+            );
             return false;
         };
         let Some(c) = inner.connections.get(conn_id) else {
+            tracing::warn!(
+                actor = %actor_id,
+                conn = %conn_id,
+                %method,
+                "actor-inbox send dropped: bound connection vanished from registry",
+            );
             return false;
         };
-        c.tx.send(frame).is_ok()
+        if c.tx.send(frame).is_err() {
+            tracing::warn!(
+                actor = %actor_id,
+                conn = %conn_id,
+                %method,
+                "actor-inbox send dropped: writer channel closed (WS dead?)",
+            );
+            return false;
+        }
+        true
     }
 }

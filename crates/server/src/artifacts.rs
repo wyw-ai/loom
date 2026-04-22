@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::Utc;
 use proto::methods::{ArtifactIngress, ArtifactPublishParams, ArtifactReadResult};
@@ -17,10 +17,6 @@ impl ArtifactStore {
         let root: PathBuf = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self { root })
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     pub fn publish(&self, store: &Store, params: ArtifactPublishParams) -> StoreResult<Artifact> {

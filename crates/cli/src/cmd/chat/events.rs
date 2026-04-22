@@ -8,7 +8,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use proto::methods::{method, stream_kind};
-use proto::types::{Event, ScopeKind, ScopeRef};
+use proto::types::{Channel, Event, ScopeKind, ScopeRef};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::json;
@@ -18,6 +18,8 @@ use crate::client::Client;
 
 use super::app::{App, Mode, PickerKind};
 use super::picker::{PickerItem, PickerOutcome};
+use super::prompt::{ConfirmKind, PromptKind, PromptModal, PromptOutcome};
+use super::sidebar::SidebarFocus;
 use super::ui;
 
 pub async fn run(
@@ -26,17 +28,13 @@ pub async fn run(
     actor_id: String,
     thread_id: String,
 ) -> Result<()> {
-    let scope = ScopeRef {
+    let mut scope = ScopeRef {
         kind: ScopeKind::Thread,
         id: thread_id.clone(),
     };
 
     let display_name = bootstrap_display_name(&client, &actor_id).await;
-    let mut app = App::new(
-        actor_id.clone(),
-        thread_id.clone(),
-        display_name.clone(),
-    );
+    let mut app = App::new(actor_id.clone(), thread_id.clone(), display_name.clone());
 
     if let Err(e) = subscribe(&client, &actor_id, &scope).await {
         app.history
@@ -47,12 +45,16 @@ pub async fn run(
             .push_system(format!("scope/read backfill failed: {}", e));
     }
     refresh_actor_directory(&client, &mut app).await;
-    app.set_status(format!(
-        "connected as {} · {}",
-        display_name, thread_id
-    ));
+    app.set_status(format!("connected as {} · {}", display_name, thread_id));
 
     loop {
+        // Sidebar may have queued a thread switch on the previous frame —
+        // drain it before the next render so the user immediately sees the
+        // new thread's history.
+        if let Some(target_thread) = app.pending_thread_switch.take() {
+            switch_thread(&client, &mut app, &mut scope, target_thread).await;
+        }
+
         let disconnected = drain_notifications(&mut app, &scope, &client).await;
         if disconnected && !app.disconnected {
             app.history.push_system("server connection closed");
@@ -79,6 +81,45 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Re-bind the chat to a different thread. Best-effort: any RPC failure here
+/// leaves the previous subscription intact and surfaces the error on the
+/// status line so the user can decide to retry or quit.
+async fn switch_thread(
+    client: &Arc<Client>,
+    app: &mut App,
+    scope: &mut ScopeRef,
+    target_thread_id: String,
+) {
+    if target_thread_id == scope.id {
+        return;
+    }
+    // Fire and forget unsubscribe — the server tolerates duplicate/missing
+    // unsubscribes, and we don't want to block the UI on it.
+    let _ = client
+        .call::<_, serde_json::Value>(
+            method::SCOPE_UNSUBSCRIBE,
+            json!({ "actorId": app.actor_id, "scope": scope }),
+        )
+        .await;
+
+    let new_scope = ScopeRef {
+        kind: ScopeKind::Thread,
+        id: target_thread_id.clone(),
+    };
+
+    if let Err(e) = subscribe(client, &app.actor_id, &new_scope).await {
+        app.set_status(format!("scope/subscribe failed: {}", e));
+        return;
+    }
+    app.reset_for_new_thread(target_thread_id.clone());
+    *scope = new_scope.clone();
+    if let Err(e) = backfill(client, app, &new_scope).await {
+        app.history
+            .push_system(format!("scope/read backfill failed: {}", e));
+    }
+    app.set_status(format!("switched → {}", target_thread_id));
 }
 
 async fn subscribe(client: &Client, actor_id: &str, scope: &ScopeRef) -> Result<()> {
@@ -185,6 +226,24 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let data = params
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    // Channel ACL pushes are actor-inbox direct messages, not scope-bound,
+    // so they must be processed BEFORE the scope filter below — otherwise an
+    // invite into a different channel would be discarded.
+    match kind.as_str() {
+        stream_kind::CHANNEL_INVITED => {
+            apply_channel_invited(app, &data);
+            return;
+        }
+        stream_kind::CHANNEL_REVOKED => {
+            apply_channel_revoked(app, &data);
+            return;
+        }
+        _ => {}
+    }
     let n_scope = params.get("scope").cloned();
     if let Some(s) = n_scope {
         if let Ok(parsed) = serde_json::from_value::<ScopeRef>(s) {
@@ -193,10 +252,6 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
             }
         }
     }
-    let data = params
-        .get("data")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
     match kind.as_str() {
         stream_kind::EVENT_CREATED => {
             if let Some(ev_value) = data.get("event").cloned() {
@@ -206,6 +261,126 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
             }
         }
         _ => {}
+    }
+}
+
+/// Apply a `channel.invited` actor-inbox push: patch the sidebar's channel +
+/// member cache from the embedded `Channel`, and surface a system message
+/// when the inviting actor is `app.actor_id` so the operator gets a clear
+/// "you were added" line in the chat history.
+fn apply_channel_invited(app: &mut App, data: &serde_json::Value) {
+    use super::sidebar::MemberRow;
+    let actor_id = data
+        .get("actorId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let channel_id = data
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let channel: Option<Channel> = data
+        .get("channel")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok());
+
+    if let (Some(s), Some(ch)) = (app.sidebar.as_mut(), channel.as_ref()) {
+        // Insert or replace the channel meta so the sidebar reflects the new
+        // membership and visibility immediately.
+        if let Some(existing) = s.channels.iter_mut().find(|c| c.id == ch.id) {
+            existing.members = ch.members.clone();
+            existing.visibility = ch.visibility;
+            existing.title = ch.title.clone();
+        } else {
+            s.add_channel(ch.clone());
+        }
+    }
+
+    // Patch the per-channel member cache. We only have the actor id, not a
+    // resolved Actor row; build a MemberRow from `display_for` / `actor_kinds`
+    // (populated by `refresh_actor_directory`) so the row renders nicely.
+    let display = app
+        .display_for
+        .get(&actor_id)
+        .cloned()
+        .unwrap_or_else(|| actor_id.clone());
+    let kind = match app.actor_kinds.get(&actor_id).map(String::as_str) {
+        Some("agent") => proto::types::ActorKind::Agent,
+        Some("service") => proto::types::ActorKind::Service,
+        _ => proto::types::ActorKind::Human,
+    };
+    if let Some(s) = app.sidebar.as_mut() {
+        s.add_member(
+            &channel_id,
+            MemberRow {
+                actor_id: actor_id.clone(),
+                display: display.clone(),
+                kind,
+            },
+        );
+    }
+
+    // Surface the event. If the local actor is the invitee, prefer a strong
+    // history line (it's actionable: they can now read/write that channel).
+    let title = channel
+        .as_ref()
+        .map(|c| c.title.clone())
+        .unwrap_or_else(|| channel_id.clone());
+    if actor_id == app.actor_id {
+        app.history
+            .push_system(format!("you were added to #{}", title));
+        app.set_status(format!("invited to #{}", title));
+    } else {
+        app.set_status(format!("{} joined #{}", display, title));
+    }
+}
+
+/// Apply a `channel.revoked` actor-inbox push: drop the row from the cache
+/// and (when we ourselves got revoked from the channel hosting the active
+/// thread) surface a clear warning into chat history so the operator sees
+/// why subsequent appends will fail.
+fn apply_channel_revoked(app: &mut App, data: &serde_json::Value) {
+    let actor_id = data
+        .get("actorId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let channel_id = data
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let title = if let Some(s) = app.sidebar.as_mut() {
+        s.remove_member(&channel_id, &actor_id);
+        s.channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| channel_id.clone())
+    } else {
+        channel_id.clone()
+    };
+
+    if actor_id == app.actor_id {
+        // If the active chat thread lives in this channel, surface a strong
+        // warning in history; further `event/append` calls will be rejected.
+        let in_revoked_channel = current_chat_channel(app).as_deref() == Some(channel_id.as_str());
+        if in_revoked_channel {
+            app.history.push_system(format!(
+                "you were removed from #{} — this thread is no longer writable",
+                title
+            ));
+        }
+        app.set_status(format!("removed from #{}", title));
+    } else {
+        let display = app
+            .display_for
+            .get(&actor_id)
+            .cloned()
+            .unwrap_or_else(|| actor_id.clone());
+        app.set_status(format!("{} left #{}", display, title));
     }
 }
 
@@ -219,7 +394,10 @@ fn handle_trace_update(app: &mut App, params: &serde_json::Value) {
         None => return,
     };
     let kind = frame.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let body = frame.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    let body = frame
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let summary = match kind {
         "text.delta" => body
             .get("text")
@@ -275,10 +453,39 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
         app.should_quit = true;
         return;
     }
-    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.open_reply_picker();
+    // Prompt modal eats every key when active. It deliberately runs before
+    // Ctrl+B / sidebar so the user can't accidentally close the dialog.
+    if app.prompt.is_some() {
+        let outcome = app.prompt.as_mut().map(|p| p.handle_key(key));
+        match outcome {
+            Some(PromptOutcome::None) => {}
+            Some(PromptOutcome::Cancelled) => app.close_prompt(),
+            Some(PromptOutcome::SubmittedText { kind, value }) => {
+                app.close_prompt();
+                handle_prompt_submit(client, app, kind, value).await;
+            }
+            Some(PromptOutcome::Confirmed(kind)) => {
+                app.close_prompt();
+                handle_confirm(client, app, kind).await;
+            }
+            None => {}
+        }
         return;
     }
+    // Ctrl+B toggles the sidebar regardless of focus.
+    if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.sidebar.is_none() {
+            app.toggle_sidebar();
+            initialize_sidebar(client, app).await;
+        } else {
+            app.toggle_sidebar();
+        }
+        return;
+    }
+    // Modal picker takes priority over the sidebar — even when the picker
+    // was opened *from* the sidebar (e.g. InviteActor via `i` on the Members
+    // pane), the sidebar must yield keyboard focus or it'll consume Enter
+    // and cycle panes instead of letting the picker confirm.
     if let Mode::Picker(_) = app.mode {
         if let Some(p) = app.picker.as_mut() {
             match p.handle_key(key) {
@@ -290,6 +497,11 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                             PickerKind::HandoffTarget => PickerKind::HandoffTarget,
                             PickerKind::Action => PickerKind::Action,
                             PickerKind::Reply => PickerKind::Reply,
+                            PickerKind::InviteActor { channel_id } => {
+                                PickerKind::InviteActor {
+                                    channel_id: channel_id.clone(),
+                                }
+                            }
                         },
                         _ => return,
                     };
@@ -298,6 +510,18 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                 }
             }
         }
+        return;
+    }
+    // Sidebar is focused whenever it's visible — keys go to it first.
+    if app.sidebar.is_some() {
+        if handle_sidebar_key(client, app, key).await {
+            return;
+        }
+        // fall through if sidebar declined the key (none today, but keeps
+        // the door open for hotkeys we want to reach the chat input)
+    }
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.open_reply_picker();
         return;
     }
 
@@ -346,22 +570,41 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
         }
     }
 
+    if key.code == KeyCode::Char('r') && key.modifiers.is_empty() && app.input.is_empty() {
+        reply_selected_history(app);
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => {
             if app.input.is_empty() && app.reply_target.is_some() {
                 app.clear_reply_target();
+            } else if app.input.is_empty() && app.selected_history_idx.is_some() {
+                app.clear_history_selection();
             } else {
                 app.input.clear();
                 app.slash_menu = None;
                 app.at_menu = None;
             }
         }
-        KeyCode::Up => app.scroll_up(1),
-        KeyCode::Down => app.scroll_down(1),
-        KeyCode::PageUp => app.scroll_up(10),
-        KeyCode::PageDown => app.scroll_down(10),
-        KeyCode::Home => app.jump_to_top(),
-        KeyCode::End => app.jump_to_bottom(),
+        KeyCode::Up => app.select_older_history(),
+        KeyCode::Down => app.select_newer_history(),
+        KeyCode::PageUp => {
+            app.clear_history_selection();
+            app.scroll_up(10);
+        }
+        KeyCode::PageDown => {
+            app.clear_history_selection();
+            app.scroll_down(10);
+        }
+        KeyCode::Home => {
+            app.clear_history_selection();
+            app.jump_to_top();
+        }
+        KeyCode::End => {
+            app.clear_history_selection();
+            app.jump_to_bottom();
+        }
         KeyCode::Backspace => {
             app.input.pop();
             app.update_slash_menu();
@@ -391,10 +634,621 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
     }
 }
 
+/// First-time sidebar load: pull all channels, then lazy-load threads for the
+/// channel the current chat thread belongs to (if we can locate it). All other
+/// channels' threads are fetched on demand when the user navigates to them.
+async fn initialize_sidebar(client: &Arc<Client>, app: &mut App) {
+    use proto::methods::{ChannelListResult, ThreadListResult};
+    let channels = match client
+        .call::<_, ChannelListResult>(method::CHANNEL_LIST, json!({}))
+        .await
+    {
+        Ok(res) => res.channels,
+        Err(e) => {
+            app.set_status(format!("channel/list failed: {}", e));
+            Vec::new()
+        }
+    };
+    if let Some(s) = app.sidebar.as_mut() {
+        s.replace_channels(channels.clone());
+    }
+    // To find the current thread's owning channel, we need to scan threads
+    // until we hit it. Walk channels in order and stop after the match.
+    let current_thread_id = app.thread_id.clone();
+    let mut owning_channel: Option<String> = None;
+    for ch in &channels {
+        let res = client
+            .call::<_, ThreadListResult>(method::THREAD_LIST, json!({ "channelId": ch.id }))
+            .await;
+        match res {
+            Ok(list) => {
+                let hit = list.threads.iter().any(|t| t.id == current_thread_id);
+                if let Some(s) = app.sidebar.as_mut() {
+                    s.replace_threads(&ch.id, list.threads);
+                }
+                if hit {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.focus_channel_of_current_thread();
+                    }
+                    owning_channel = Some(ch.id.clone());
+                    break;
+                }
+            }
+            Err(e) => {
+                app.set_status(format!("thread/list failed: {}", e));
+            }
+        }
+    }
+    // Lazily fetch members for the active chat channel only — other channels
+    // refresh on demand the first time the operator opens their Members pane
+    // via `/members` or by switching channel focus.
+    if let Some(ch_id) = owning_channel {
+        refresh_members(client, app, &ch_id).await;
+    }
+}
+
+/// Pull the latest member set for `channel_id` and patch the sidebar cache.
+/// Best-effort: surfaces failure on the status line and leaves the existing
+/// cache intact (so subsequent renders don't flicker an empty list).
+async fn refresh_members(client: &Arc<Client>, app: &mut App, channel_id: &str) {
+    use proto::methods::ChannelMembersResult;
+    use super::sidebar::MemberRow;
+    let res = client
+        .call::<_, ChannelMembersResult>(
+            method::CHANNEL_MEMBERS,
+            json!({ "channelId": channel_id }),
+        )
+        .await;
+    match res {
+        Ok(r) => {
+            // Side-effect: enrich the actor directory caches so future
+            // @-mention picks and history rendering know each member's
+            // display name + kind without a follow-up `actor/list` call.
+            for a in &r.members {
+                let name = if a.display_name.is_empty() {
+                    a.id.clone()
+                } else {
+                    a.display_name.clone()
+                };
+                let kind_label = match a.kind {
+                    proto::types::ActorKind::Human => "human",
+                    proto::types::ActorKind::Agent => "agent",
+                    proto::types::ActorKind::Service => "service",
+                };
+                app.actor_kinds
+                    .insert(a.id.clone(), kind_label.to_string());
+                app.display_for.insert(a.id.clone(), name);
+                if matches!(a.kind, proto::types::ActorKind::Agent) {
+                    app.agent_ids.insert(a.id.clone());
+                }
+            }
+            let rows: Vec<MemberRow> = r.members.iter().map(MemberRow::from_actor).collect();
+            if let Some(s) = app.sidebar.as_mut() {
+                s.replace_members(channel_id, rows);
+            }
+        }
+        Err(e) => app.set_status(format!("channel/members failed: {}", e)),
+    }
+}
+
+/// Sidebar key dispatch. Returns true if the key was consumed (so the chat
+/// input handler should not see it). Esc / Ctrl+B closes the sidebar; other
+/// keys either move the cursor, switch panes, open a CRUD prompt, or trigger
+/// the actual channel/thread switch.
+async fn handle_sidebar_key(client: &Arc<Client>, app: &mut App, key: KeyEvent) -> bool {
+    use proto::methods::ThreadListResult;
+    if matches!(key.code, KeyCode::Esc) {
+        app.sidebar = None;
+        return true;
+    }
+    match key.code {
+        KeyCode::Up => {
+            if let Some(s) = app.sidebar.as_mut() {
+                s.move_up();
+            }
+            true
+        }
+        KeyCode::Down => {
+            if let Some(s) = app.sidebar.as_mut() {
+                s.move_down();
+            }
+            true
+        }
+        KeyCode::Tab => {
+            if let Some(s) = app.sidebar.as_mut() {
+                s.next_pane();
+            }
+            true
+        }
+        KeyCode::Enter => {
+            // Pull out everything we need from the sidebar before any await,
+            // since `.await` on `&mut app` would invalidate borrows.
+            let (focus, channel_id, thread_id, has_threads_cached) = {
+                let Some(s) = app.sidebar.as_ref() else {
+                    return true;
+                };
+                let ch = s.selected_channel().map(|c| c.id.clone());
+                let th = s.selected_thread().map(|t| t.id.clone());
+                let cached = ch
+                    .as_ref()
+                    .map(|cid| s.threads_by_channel.contains_key(cid))
+                    .unwrap_or(false);
+                (s.focus, ch, th, cached)
+            };
+            match focus {
+                SidebarFocus::Channels => {
+                    if let Some(cid) = channel_id {
+                        if !has_threads_cached {
+                            match client
+                                .call::<_, ThreadListResult>(
+                                    method::THREAD_LIST,
+                                    json!({ "channelId": cid }),
+                                )
+                                .await
+                            {
+                                Ok(res) => {
+                                    if let Some(s) = app.sidebar.as_mut() {
+                                        s.replace_threads(&cid, res.threads);
+                                    }
+                                }
+                                Err(e) => {
+                                    app.set_status(format!("thread/list failed: {}", e));
+                                }
+                            }
+                        }
+                        if let Some(s) = app.sidebar.as_mut() {
+                            s.next_pane();
+                        }
+                    }
+                    true
+                }
+                SidebarFocus::Threads => {
+                    if let Some(tid) = thread_id {
+                        if tid != app.thread_id {
+                            app.pending_thread_switch = Some(tid);
+                        }
+                        // Hide the sidebar after a switch so the chat fills the
+                        // screen again — Ctrl+B toggles it back if needed.
+                        app.sidebar = None;
+                    }
+                    true
+                }
+                SidebarFocus::Members => {
+                    // Enter on a member is a no-op for v1 — the actionable
+                    // keys live on `i`/`x`. Cycle back to Channels so the
+                    // operator gets a visible response to their keystroke.
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.next_pane();
+                    }
+                    true
+                }
+            }
+        }
+        KeyCode::Char('n') => {
+            open_create_prompt(app);
+            true
+        }
+        KeyCode::Char('r') => {
+            open_rename_prompt(app);
+            true
+        }
+        KeyCode::Char('d') => {
+            open_delete_confirm(app);
+            true
+        }
+        KeyCode::Char('i') => {
+            // Picker-driven invite: only valid on the Members pane to avoid
+            // accidentally opening it while navigating channels/threads.
+            let on_members = app
+                .sidebar
+                .as_ref()
+                .map(|s| matches!(s.focus, SidebarFocus::Members))
+                .unwrap_or(false);
+            if on_members {
+                open_invite_actor_picker(client, app).await;
+            }
+            on_members
+        }
+        KeyCode::Char('I') => {
+            // Free-text fallback for an actor id we don't have cached
+            // (operator just registered an offline agent's spec, etc.).
+            let on_members = app
+                .sidebar
+                .as_ref()
+                .map(|s| matches!(s.focus, SidebarFocus::Members))
+                .unwrap_or(false);
+            if on_members {
+                open_invite_by_id_prompt(app);
+            }
+            on_members
+        }
+        KeyCode::Char('x') => {
+            let on_members = app
+                .sidebar
+                .as_ref()
+                .map(|s| matches!(s.focus, SidebarFocus::Members))
+                .unwrap_or(false);
+            if on_members {
+                open_revoke_confirm(app);
+            }
+            on_members
+        }
+        _ => false,
+    }
+}
+
+fn open_invite_by_id_prompt(app: &mut App) {
+    let Some(s) = app.sidebar.as_ref() else { return };
+    let Some(ch) = s.selected_channel() else {
+        app.set_status("select a channel first");
+        return;
+    };
+    app.prompt = Some(PromptModal::text(
+        PromptKind::InviteToChannel {
+            channel_id: ch.id.clone(),
+        },
+        format!("Invite into #{} (actor id)", ch.title),
+        "",
+    ));
+}
+
+fn open_revoke_confirm(app: &mut App) {
+    let Some(s) = app.sidebar.as_ref() else { return };
+    let Some(ch) = s.selected_channel().cloned() else {
+        app.set_status("select a channel first");
+        return;
+    };
+    let Some(member) = s.selected_member().cloned() else {
+        app.set_status("nothing selected");
+        return;
+    };
+    if Some(member.actor_id.as_str()) == app.actor_id.as_str().into() {
+        app.set_status("can't revoke yourself from chat — leave the channel from the CLI");
+        return;
+    }
+    app.prompt = Some(PromptModal::confirm(
+        ConfirmKind::RevokeFromChannel {
+            channel_id: ch.id,
+            actor_id: member.actor_id.clone(),
+            display: member.display.clone(),
+        },
+        "Revoke member",
+        format!("Remove {} from #{}?", member.display, ch.title),
+    ));
+}
+
+async fn open_invite_actor_picker(client: &Arc<Client>, app: &mut App) {
+    use proto::methods::ActorListResult;
+    let Some(channel_id) = app
+        .sidebar
+        .as_ref()
+        .and_then(|s| s.selected_channel().map(|c| c.id.clone()))
+    else {
+        app.set_status("select a channel first");
+        return;
+    };
+    let already_members: std::collections::HashSet<String> = app
+        .sidebar
+        .as_ref()
+        .and_then(|s| s.members_by_channel.get(&channel_id))
+        .map(|rows| rows.iter().map(|r| r.actor_id.clone()).collect())
+        .unwrap_or_default();
+
+    let actors = match client
+        .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
+        .await
+    {
+        Ok(r) => r.actors,
+        Err(e) => {
+            app.set_status(format!("actor/list failed: {}", e));
+            return;
+        }
+    };
+    let items: Vec<PickerItem> = actors
+        .into_iter()
+        .filter(|a| !already_members.contains(&a.id))
+        .map(|a| {
+            let kind_label = match a.kind {
+                proto::types::ActorKind::Human => "human",
+                proto::types::ActorKind::Agent => "agent",
+                proto::types::ActorKind::Service => "service",
+            };
+            let label = if a.display_name.is_empty() {
+                a.id.clone()
+            } else {
+                format!("{} ({})", a.display_name, kind_label)
+            };
+            PickerItem::new(a.id, label).with_hint(kind_label)
+        })
+        .collect();
+    app.open_invite_picker(channel_id, items);
+}
+
+fn open_create_prompt(app: &mut App) {
+    let Some(s) = app.sidebar.as_ref() else {
+        return;
+    };
+    match s.focus {
+        SidebarFocus::Channels => {
+            app.prompt = Some(PromptModal::text(
+                PromptKind::CreateChannel,
+                "New channel title",
+                "",
+            ));
+        }
+        SidebarFocus::Threads => {
+            let Some(ch) = s.selected_channel() else {
+                app.set_status("select a channel first");
+                return;
+            };
+            app.prompt = Some(PromptModal::text(
+                PromptKind::CreateThread {
+                    channel_id: ch.id.clone(),
+                },
+                format!("New thread in #{}", ch.title),
+                "",
+            ));
+        }
+        SidebarFocus::Members => {
+            // No `n` semantic on Members — invite uses `i`/`I` (wired in
+            // task #10). Hint the operator instead of opening a prompt.
+            app.set_status("press i to invite a member, I to invite by id");
+        }
+    }
+}
+
+fn open_rename_prompt(app: &mut App) {
+    let Some(s) = app.sidebar.as_ref() else {
+        return;
+    };
+    match s.focus {
+        SidebarFocus::Channels => {
+            let Some(ch) = s.selected_channel() else {
+                app.set_status("nothing selected");
+                return;
+            };
+            app.prompt = Some(PromptModal::text(
+                PromptKind::RenameChannel {
+                    channel_id: ch.id.clone(),
+                },
+                format!("Rename channel #{}", ch.title),
+                ch.title.clone(),
+            ));
+        }
+        SidebarFocus::Threads => {
+            let Some(th) = s.selected_thread() else {
+                app.set_status("nothing selected");
+                return;
+            };
+            app.prompt = Some(PromptModal::text(
+                PromptKind::RenameThread {
+                    thread_id: th.id.clone(),
+                },
+                format!("Rename thread '{}'", th.title),
+                th.title.clone(),
+            ));
+        }
+        SidebarFocus::Members => {
+            // Members aren't renameable from chat — that's a property of
+            // the actor row itself, not the channel membership.
+            app.set_status("members aren't renameable here");
+        }
+    }
+}
+
+fn open_delete_confirm(app: &mut App) {
+    let Some(s) = app.sidebar.as_ref() else {
+        return;
+    };
+    match s.focus {
+        SidebarFocus::Channels => {
+            let Some(ch) = s.selected_channel() else {
+                app.set_status("nothing selected");
+                return;
+            };
+            app.prompt = Some(PromptModal::confirm(
+                ConfirmKind::DeleteChannel {
+                    channel_id: ch.id.clone(),
+                },
+                "Delete channel",
+                format!(
+                    "Delete channel #{}? Channel must be empty (delete its threads first)",
+                    ch.title
+                ),
+            ));
+        }
+        SidebarFocus::Threads => {
+            let Some(th) = s.selected_thread() else {
+                app.set_status("nothing selected");
+                return;
+            };
+            app.prompt = Some(PromptModal::confirm(
+                ConfirmKind::DeleteThread {
+                    thread_id: th.id.clone(),
+                },
+                "Delete thread",
+                format!(
+                    "Delete thread '{}'? Event history is left orphaned.",
+                    th.title
+                ),
+            ));
+        }
+        SidebarFocus::Members => {
+            // Use `x` (wired in task #10) to revoke; `d` is a destructive
+            // shortcut bound to channel/thread deletion and would be
+            // surprising here.
+            app.set_status("press x to remove the selected member");
+        }
+    }
+}
+
+async fn handle_prompt_submit(
+    client: &Arc<Client>,
+    app: &mut App,
+    kind: PromptKind,
+    value: String,
+) {
+    use proto::methods::{
+        ChannelCreateResult, ChannelUpdateResult, ThreadCreateResult, ThreadUpdateResult,
+    };
+    match kind {
+        PromptKind::CreateChannel => {
+            let res = client
+                .call::<_, ChannelCreateResult>(method::CHANNEL_CREATE, json!({ "title": value }))
+                .await;
+            match res {
+                Ok(r) => {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.add_channel(r.channel.clone());
+                    }
+                    app.set_status(format!("created channel #{}", r.channel.title));
+                }
+                Err(e) => app.set_status(format!("channel/create failed: {}", e)),
+            }
+        }
+        PromptKind::RenameChannel { channel_id } => {
+            let res = client
+                .call::<_, ChannelUpdateResult>(
+                    method::CHANNEL_UPDATE,
+                    json!({ "channelId": channel_id, "title": value }),
+                )
+                .await;
+            match res {
+                Ok(r) => {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.rename_channel(r.channel.clone());
+                    }
+                    app.set_status(format!("renamed → #{}", r.channel.title));
+                }
+                Err(e) => app.set_status(format!("channel/update failed: {}", e)),
+            }
+        }
+        PromptKind::CreateThread { channel_id } => {
+            let res = client
+                .call::<_, ThreadCreateResult>(
+                    method::THREAD_CREATE,
+                    json!({ "channelId": channel_id, "title": value }),
+                )
+                .await;
+            match res {
+                Ok(r) => {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.add_thread(r.thread.clone());
+                    }
+                    app.set_status(format!("created thread '{}'", r.thread.title));
+                }
+                Err(e) => app.set_status(format!("thread/create failed: {}", e)),
+            }
+        }
+        PromptKind::RenameThread { thread_id } => {
+            let res = client
+                .call::<_, ThreadUpdateResult>(
+                    method::THREAD_UPDATE,
+                    json!({ "threadId": thread_id, "title": value }),
+                )
+                .await;
+            match res {
+                Ok(r) => {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.rename_thread(r.thread.clone());
+                    }
+                    app.set_status(format!("renamed → '{}'", r.thread.title));
+                }
+                Err(e) => app.set_status(format!("thread/update failed: {}", e)),
+            }
+        }
+        PromptKind::InviteToChannel { channel_id } => {
+            do_channel_invite(client, app, channel_id, value).await;
+        }
+    }
+}
+
+async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) {
+    use proto::methods::{ChannelDeleteResult, ThreadDeleteResult};
+    match kind {
+        ConfirmKind::DeleteChannel { channel_id } => {
+            let res = client
+                .call::<_, ChannelDeleteResult>(
+                    method::CHANNEL_DELETE,
+                    json!({ "channelId": channel_id }),
+                )
+                .await;
+            match res {
+                Ok(_) => {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.remove_channel(&channel_id);
+                    }
+                    app.set_status("channel deleted");
+                }
+                Err(e) => app.set_status(format!("channel/delete failed: {}", e)),
+            }
+        }
+        ConfirmKind::RevokeFromChannel {
+            channel_id,
+            actor_id,
+            display: _,
+        } => {
+            do_channel_revoke(client, app, channel_id, actor_id).await;
+            return;
+        }
+        ConfirmKind::InviteThenHandoff {
+            channel_id,
+            actor_id,
+            message,
+        } => {
+            // Snapshot the scope before re-borrowing app for status updates.
+            let scope = ScopeRef {
+                kind: ScopeKind::Thread,
+                id: app.thread_id.clone(),
+            };
+            do_channel_invite(client, app, channel_id, actor_id.clone()).await;
+            // Even if invite failed, attempting the handoff surfaces the
+            // server's PERMISSION_DENIED verbatim — useful signal for the
+            // operator. So we don't gate on invite success.
+            do_handoff_with_message(client, app, actor_id, message, &scope).await;
+            return;
+        }
+        ConfirmKind::DeleteThread { thread_id } => {
+            // We need the owning channel id to update the local cache. Look it
+            // up from the sidebar before issuing the delete so we can still
+            // patch the cache cleanly even if the thread vanishes server-side.
+            let owning_channel = app.sidebar.as_ref().and_then(|s| {
+                s.threads_by_channel.iter().find_map(|(ch, threads)| {
+                    threads
+                        .iter()
+                        .find(|t| t.id == thread_id)
+                        .map(|_| ch.clone())
+                })
+            });
+            let res = client
+                .call::<_, ThreadDeleteResult>(
+                    method::THREAD_DELETE,
+                    json!({ "threadId": thread_id }),
+                )
+                .await;
+            match res {
+                Ok(_) => {
+                    if let (Some(s), Some(ch)) = (app.sidebar.as_mut(), owning_channel.as_ref()) {
+                        s.remove_thread(ch, &thread_id);
+                    }
+                    app.set_status("thread deleted");
+                }
+                Err(e) => app.set_status(format!("thread/delete failed: {}", e)),
+            }
+        }
+    }
+}
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(3),
-        MouseEventKind::ScrollDown => app.scroll_down(3),
+        MouseEventKind::ScrollUp => {
+            app.clear_history_selection();
+            app.scroll_up(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.clear_history_selection();
+            app.scroll_down(3);
+        }
         _ => {}
     }
 }
@@ -414,7 +1268,65 @@ async fn handle_at_input(client: &Arc<Client>, app: &mut App, rest: &str, scope:
         app.set_status(format!("unknown agent `{}`", target));
         return;
     }
+    // Best-effort membership pre-check: if the target isn't in the current
+    // channel's member cache and the channel is private, route through a
+    // confirm modal that does `channel/invite` then the handoff. This
+    // pre-check is racy (membership cache can be stale) but the server is
+    // authoritative — `event/append` will surface PERMISSION_DENIED if the
+    // local cache lied to us, which we surface verbatim from `do_handoff`.
+    if let Some(channel_id) = current_chat_channel(app) {
+        if needs_invite_for(app, &channel_id, &target) {
+            let display = app
+                .display_for
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| target.clone());
+            let title = app
+                .sidebar
+                .as_ref()
+                .and_then(|s| s.channels.iter().find(|c| c.id == channel_id))
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| channel_id.clone());
+            app.prompt = Some(PromptModal::confirm(
+                ConfirmKind::InviteThenHandoff {
+                    channel_id,
+                    actor_id: target.clone(),
+                    message,
+                },
+                "Invite first?",
+                format!(
+                    "@{} isn't in #{}. Invite them first, then send the handoff?",
+                    display, title
+                ),
+            ));
+            return;
+        }
+    }
     do_handoff_with_message(client, app, target, message, scope).await;
+}
+
+/// `true` iff we have enough cache to know that `actor_id` is NOT yet a
+/// member of `channel_id` AND the channel is private (so the missing
+/// membership actually matters). Returns `false` in the absence of a
+/// definitive answer — better to attempt the handoff and let the server
+/// reject than to spam the operator with bogus invite confirms.
+fn needs_invite_for(app: &App, channel_id: &str, actor_id: &str) -> bool {
+    let Some(s) = app.sidebar.as_ref() else {
+        return false;
+    };
+    let Some(ch) = s.channels.iter().find(|c| c.id == channel_id) else {
+        return false;
+    };
+    if !matches!(ch.visibility, proto::types::ChannelVisibility::Private) {
+        return false;
+    }
+    // Prefer the resolved members_by_channel cache (populated lazily); fall
+    // back to Channel.members which is always sent on the wire.
+    if let Some(rows) = s.members_by_channel.get(channel_id) {
+        !rows.iter().any(|r| r.actor_id == actor_id)
+    } else {
+        !ch.members.iter().any(|m| m == actor_id)
+    }
 }
 
 async fn on_picker_selected(
@@ -435,6 +1347,94 @@ async fn on_picker_selected(
         PickerKind::Reply => {
             arm_reply_target(app, id);
         }
+        PickerKind::InviteActor { channel_id } => {
+            do_channel_invite(client, app, channel_id, id).await;
+        }
+    }
+}
+
+async fn do_channel_invite(
+    client: &Arc<Client>,
+    app: &mut App,
+    channel_id: String,
+    actor_id: String,
+) {
+    use proto::methods::ChannelInviteResult;
+    let res = client
+        .call::<_, ChannelInviteResult>(
+            method::CHANNEL_INVITE,
+            json!({ "channelId": channel_id, "actorId": actor_id }),
+        )
+        .await;
+    match res {
+        Ok(r) => {
+            // Optimistic local cache patch: the server will also broadcast a
+            // `channel.invited` notification but echoing it now means the
+            // sidebar refreshes immediately rather than after a round-trip.
+            patch_member_cache_after_invite(app, &channel_id, &actor_id);
+            // Replace channel meta so members list / visibility stays accurate.
+            if let Some(s) = app.sidebar.as_mut() {
+                s.rename_channel(r.channel.clone()); // reuses sort + cursor logic
+                if let Some(ch) = s.channels.iter_mut().find(|c| c.id == r.channel.id) {
+                    ch.members = r.channel.members.clone();
+                    ch.visibility = r.channel.visibility;
+                }
+            }
+            app.set_status(format!("invited {} into #{}", actor_id, r.channel.title));
+        }
+        Err(e) => app.set_status(format!("channel/invite failed: {}", e)),
+    }
+}
+
+fn patch_member_cache_after_invite(app: &mut App, channel_id: &str, actor_id: &str) {
+    use super::sidebar::MemberRow;
+    let display = app
+        .display_for
+        .get(actor_id)
+        .cloned()
+        .unwrap_or_else(|| actor_id.to_string());
+    let kind = match app.actor_kinds.get(actor_id).map(String::as_str) {
+        Some("agent") => proto::types::ActorKind::Agent,
+        Some("service") => proto::types::ActorKind::Service,
+        _ => proto::types::ActorKind::Human,
+    };
+    if let Some(s) = app.sidebar.as_mut() {
+        s.add_member(
+            channel_id,
+            MemberRow {
+                actor_id: actor_id.to_string(),
+                display,
+                kind,
+            },
+        );
+    }
+}
+
+async fn do_channel_revoke(
+    client: &Arc<Client>,
+    app: &mut App,
+    channel_id: String,
+    actor_id: String,
+) {
+    use proto::methods::ChannelRevokeResult;
+    let res = client
+        .call::<_, ChannelRevokeResult>(
+            method::CHANNEL_REVOKE,
+            json!({ "channelId": channel_id, "actorId": actor_id }),
+        )
+        .await;
+    match res {
+        Ok(r) => {
+            if let Some(s) = app.sidebar.as_mut() {
+                s.remove_member(&channel_id, &actor_id);
+                if let Some(ch) = s.channels.iter_mut().find(|c| c.id == r.channel.id) {
+                    ch.members = r.channel.members.clone();
+                    ch.visibility = r.channel.visibility;
+                }
+            }
+            app.set_status(format!("revoked {} from #{}", actor_id, r.channel.title));
+        }
+        Err(e) => app.set_status(format!("channel/revoke failed: {}", e)),
     }
 }
 
@@ -465,8 +1465,83 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
         }
         "action" => app.open_action_picker(),
         "agents" => list_agents(client, app).await,
+        "invite" => {
+            // Resolve the current chat thread's owning channel — `/invite`
+            // always targets the channel we're chatting in, not whatever the
+            // sidebar happens to highlight (which may be another channel the
+            // operator was browsing).
+            let Some(channel_id) = current_chat_channel(app) else {
+                app.set_status(
+                    "can't resolve the current channel; open the sidebar (Ctrl+B) first",
+                );
+                return;
+            };
+            if arg.is_empty() {
+                // Snapshot for the open helper to consume.
+                if let Some(s) = app.sidebar.as_mut() {
+                    if let Some(idx) = s.channels.iter().position(|c| c.id == channel_id) {
+                        s.selected_channel_idx = idx;
+                        s.focus = SidebarFocus::Members;
+                    }
+                }
+                open_invite_actor_picker(client, app).await;
+            } else {
+                do_channel_invite(client, app, channel_id, arg).await;
+            }
+        }
+        "members" => {
+            let Some(channel_id) = current_chat_channel(app) else {
+                app.set_status(
+                    "can't resolve the current channel; open the sidebar (Ctrl+B) first",
+                );
+                return;
+            };
+            refresh_members(client, app, &channel_id).await;
+            print_members_into_history(app, &channel_id);
+        }
         "quit" | "q" | "exit" => app.should_quit = true,
         other => app.set_status(format!("unknown /{}", other)),
+    }
+}
+
+fn current_chat_channel(app: &App) -> Option<String> {
+    let s = app.sidebar.as_ref()?;
+    s.threads_by_channel.iter().find_map(|(ch, threads)| {
+        threads
+            .iter()
+            .find(|t| t.id == app.thread_id)
+            .map(|_| ch.clone())
+    })
+}
+
+fn print_members_into_history(app: &mut App, channel_id: &str) {
+    let rows = app
+        .sidebar
+        .as_ref()
+        .and_then(|s| s.members_by_channel.get(channel_id))
+        .cloned()
+        .unwrap_or_default();
+    let title = app
+        .sidebar
+        .as_ref()
+        .and_then(|s| s.channels.iter().find(|c| c.id == channel_id))
+        .map(|c| c.title.clone())
+        .unwrap_or_else(|| channel_id.to_string());
+    if rows.is_empty() {
+        app.history
+            .push_system(format!("(no members for #{}, public channel?)", title));
+        return;
+    }
+    app.history
+        .push_system(format!("Members of #{}:", title));
+    for r in rows {
+        let kind = match r.kind {
+            proto::types::ActorKind::Human => "human",
+            proto::types::ActorKind::Agent => "agent",
+            proto::types::ActorKind::Service => "service",
+        };
+        app.history
+            .push_system(format!("  • {:<24} {} ({})", r.actor_id, r.display, kind));
     }
 }
 
@@ -613,8 +1688,7 @@ async fn list_agents(client: &Arc<Client>, app: &mut App) {
             if !matches!(a.kind, proto::types::ActorKind::Agent) {
                 continue;
             }
-            rows.entry(a.id)
-                .or_insert((a.display_name, String::new()));
+            rows.entry(a.id).or_insert((a.display_name, String::new()));
         }
     }
 
@@ -647,6 +1721,14 @@ fn arm_reply_target(app: &mut App, event_id: String) {
         app.at_menu = None;
     }
     app.set_reply_target(event_id, preview);
+}
+
+fn reply_selected_history(app: &mut App) {
+    let Some((event_id, _)) = app.selected_history_target() else {
+        app.set_status("select a message with ↑/↓ first");
+        return;
+    };
+    arm_reply_target(app, event_id);
 }
 
 fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
@@ -697,6 +1779,7 @@ async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &S
                 text.to_string(),
                 reply_target,
             );
+            app.selected_history_idx = app.history.newest_replyable_index();
             app.reply_target = None;
             app.jump_to_bottom();
         }
@@ -714,7 +1797,7 @@ fn short_event_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_reply_target, message_relations};
+    use super::{arm_reply_target, message_relations, reply_selected_history};
     use crate::cmd::chat::app::App;
     use crate::cmd::chat::history::{Bubble, BubbleKind, DeliveryState};
     use chrono::Utc;
@@ -791,5 +1874,47 @@ mod tests {
 
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0]["kind"], "replies_to");
+    }
+
+    #[test]
+    fn reply_selected_history_arms_selected_event() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            "bojun.cbj".into(),
+        );
+        app.history.bubbles.push(Bubble {
+            actor_id: "actor_agent_opencode".into(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: "hello".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_123".into()),
+            delivery: DeliveryState::NotApplicable,
+        });
+        app.selected_history_idx = Some(0);
+
+        reply_selected_history(&mut app);
+
+        assert_eq!(
+            app.reply_target
+                .as_ref()
+                .map(|target| target.event_id.as_str()),
+            Some("evt_123")
+        );
+    }
+
+    #[test]
+    fn reply_selected_history_requires_selection() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            "bojun.cbj".into(),
+        );
+
+        reply_selected_history(&mut app);
+
+        assert_eq!(app.status, "select a message with ↑/↓ first");
     }
 }

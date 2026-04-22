@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use proto::methods::{CommandOutputFormat, PromptVia};
 use proto::types::ScopeRef;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
@@ -135,14 +135,20 @@ impl Adapter for CommandAdapter {
         self.inner.lock().event_sender = Some(events);
         Ok(AdapterStartInfo {
             pid: None,
-            session_id: format!("cmd:{}", self.cfg.actor_id),
+            session_id: Some(format!("cmd:{}", self.cfg.actor_id)),
         })
     }
 
     async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String> {
         if prompt.is_empty() {
             let _ = self.sender()?.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
                 message: "empty prompt".into(),
+            });
+            let _ = self.sender()?.send(AdapterEvent::Finished {
+                scope: Some(scope),
+                success: false,
+                summary: "empty prompt".into(),
             });
             return Ok(());
         }
@@ -153,11 +159,7 @@ impl Adapter for CommandAdapter {
             .map_err(|e| e.to_string())?
     }
 
-    async fn respond_action(
-        &self,
-        _request_id: String,
-        _option_id: String,
-    ) -> Result<(), String> {
+    async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
         // Command transport does not surface permission prompts (no reverse
         // channel from the one-shot subprocess back into joi). Anyone calling
         // this for a command adapter has a bug elsewhere; report it loudly.
@@ -192,10 +194,7 @@ fn run_prompt(
             expand_argv(template, &cfg, &scope, Some(sid), &prompt),
             false,
         ),
-        _ => (
-            expand_first_run_argv(&cfg, &scope, &prompt),
-            true,
-        ),
+        _ => (expand_first_run_argv(&cfg, &scope, &prompt), true),
     };
 
     let result = spawn_and_collect(&cfg, &scope, &prompt, &argv, &sender);
@@ -203,9 +202,11 @@ fn run_prompt(
         Ok(o) => o,
         Err(e) => {
             let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
                 message: format!("command adapter spawn error: {e}"),
             });
             let _ = sender.send(AdapterEvent::Finished {
+                scope: Some(scope.clone()),
                 success: false,
                 summary: e.clone(),
             });
@@ -255,13 +256,17 @@ struct SpawnOutcome {
 
 fn spawn_and_collect(
     cfg: &CommandConfig,
-    _scope: &ScopeRef,
+    scope: &ScopeRef,
     prompt: &str,
     argv: &[String],
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> Result<SpawnOutcome, String> {
     std::fs::create_dir_all(&cfg.cwd).map_err(|e| {
-        format!("failed to create command cwd `{}`: {}", cfg.cwd.display(), e)
+        format!(
+            "failed to create command cwd `{}`: {}",
+            cfg.cwd.display(),
+            e
+        )
     })?;
     let mut cmd = Command::new(&cfg.command);
     cmd.args(argv)
@@ -312,7 +317,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_ndjson_line(&line, sender);
+                translate_ndjson_line(&line, scope, sender);
             }
         }
         CommandOutputFormat::ClaudeStreamJson => {
@@ -320,7 +325,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_claude_stream_line(&line, sender);
+                translate_claude_stream_line(&line, scope, sender);
             }
         }
         CommandOutputFormat::CodexStreamJson => {
@@ -328,7 +333,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_codex_stream_line(&line, sender);
+                translate_codex_stream_line(&line, scope, sender);
             }
         }
     }
@@ -356,6 +361,7 @@ fn spawn_and_collect(
         CommandOutputFormat::Text => {
             if !collected_stdout.is_empty() {
                 let _ = sender.send(AdapterEvent::Text {
+                    scope: Some(scope.clone()),
                     content: collected_stdout.clone(),
                     is_partial: false,
                 });
@@ -366,12 +372,17 @@ fn spawn_and_collect(
             // is_partial=false Text frame; the runtime's `take_text_buffer`
             // will turn whatever was accumulated into a single content.add.
             let _ = sender.send(AdapterEvent::Text {
+                scope: Some(scope.clone()),
                 content: String::new(),
                 is_partial: false,
             });
         }
     }
-    let _ = sender.send(AdapterEvent::Finished { success, summary });
+    let _ = sender.send(AdapterEvent::Finished {
+        scope: Some(scope.clone()),
+        success,
+        summary,
+    });
 
     Ok(SpawnOutcome {
         exit_code,
@@ -393,7 +404,11 @@ fn truncate_for_summary(s: &str) -> String {
 
 // ---------------- output_format translators ----------------
 
-fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+fn translate_ndjson_line(
+    line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
@@ -403,6 +418,7 @@ fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent
         "text" => {
             if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
                 let _ = sender.send(AdapterEvent::Text {
+                    scope: Some(scope.clone()),
                     content: t.to_string(),
                     is_partial: true,
                 });
@@ -416,6 +432,7 @@ fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent
                 .to_string();
             let input = v.get("input").cloned().unwrap_or(Value::Null);
             let _ = sender.send(AdapterEvent::ToolUse {
+                scope: Some(scope.clone()),
                 tool_name: name,
                 input,
             });
@@ -423,6 +440,7 @@ fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent
         "status" => {
             if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
                 let _ = sender.send(AdapterEvent::StatusChange {
+                    scope: Some(scope.clone()),
                     status: s.to_string(),
                 });
             }
@@ -433,7 +451,10 @@ fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent
                 .and_then(|x| x.as_str())
                 .unwrap_or("ndjson error frame")
                 .to_string();
-            let _ = sender.send(AdapterEvent::Error { message: msg });
+            let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
+                message: msg,
+            });
         }
         // "done" and unknown kinds: caller handles the final flush + Finished
         // outside the per-line loop, so nothing to do here.
@@ -441,7 +462,11 @@ fn translate_ndjson_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent
     }
 }
 
-fn translate_claude_stream_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+fn translate_claude_stream_line(
+    line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
@@ -460,6 +485,7 @@ fn translate_claude_stream_line(line: &str, sender: &mpsc::UnboundedSender<Adapt
                     "text" => {
                         if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
                             let _ = sender.send(AdapterEvent::Text {
+                                scope: Some(scope.clone()),
                                 content: t.to_string(),
                                 is_partial: true,
                             });
@@ -473,6 +499,7 @@ fn translate_claude_stream_line(line: &str, sender: &mpsc::UnboundedSender<Adapt
                             .to_string();
                         let input = b.get("input").cloned().unwrap_or(Value::Null);
                         let _ = sender.send(AdapterEvent::ToolUse {
+                            scope: Some(scope.clone()),
                             tool_name: name,
                             input,
                         });
@@ -488,7 +515,11 @@ fn translate_claude_stream_line(line: &str, sender: &mpsc::UnboundedSender<Adapt
     }
 }
 
-fn translate_codex_stream_line(line: &str, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+fn translate_codex_stream_line(
+    line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) {
     // Placeholder per docs/command-transport-v0.md §6.3. The schema is not
     // pinned yet; treat any `output_text.delta` we see as text and leave the
     // rest for the next iteration.
@@ -501,6 +532,7 @@ fn translate_codex_stream_line(line: &str, sender: &mpsc::UnboundedSender<Adapte
             "output_text.delta" => {
                 if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
                     let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(scope.clone()),
                         content: d.to_string(),
                         is_partial: true,
                     });
@@ -514,6 +546,7 @@ fn translate_codex_stream_line(line: &str, sender: &mpsc::UnboundedSender<Adapte
                     .to_string();
                 let input = v.get("arguments").cloned().unwrap_or(Value::Null);
                 let _ = sender.send(AdapterEvent::ToolUse {
+                    scope: Some(scope.clone()),
                     tool_name: name,
                     input,
                 });
@@ -564,7 +597,9 @@ fn save_session(cfg: &CommandConfig, scope_id: &str, session_id: &str) -> std::i
             id: scope_id.to_string(),
         },
         session_id: session_id.to_string(),
-        created_at: existing.map(|e| e.created_at).unwrap_or_else(|| now.clone()),
+        created_at: existing
+            .map(|e| e.created_at)
+            .unwrap_or_else(|| now.clone()),
         last_used_at: now,
         command_signature: cfg.command_signature.clone(),
     };
@@ -779,12 +814,9 @@ mod tests {
 
     #[test]
     fn json_path_nested_with_index() {
-        let v: Value = serde_json::from_str(r#"{"items":[{"id":"first"},{"id":"second"}]}"#)
-            .unwrap();
-        assert_eq!(
-            json_path_lookup(&v, ".items[1].id"),
-            Some("second".into())
-        );
+        let v: Value =
+            serde_json::from_str(r#"{"items":[{"id":"first"},{"id":"second"}]}"#).unwrap();
+        assert_eq!(json_path_lookup(&v, ".items[1].id"), Some("second".into()));
     }
 
     #[test]

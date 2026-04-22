@@ -64,37 +64,72 @@ async fn wake_agent(
     actor_id: String,
     trigger: Event,
 ) -> Result<(), String> {
-    let adapter = manager
-        .ensure_started(&actor_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    // Open a turn for this agent in the trigger's scope.
-    let store = manager.store();
-    let turn = store
-        .open_turn(
-            actor_id.clone(),
-            trigger.scope.clone(),
-            Some(trigger.id.clone()),
-        )
-        .map_err(|e| e.to_string())?;
-    manager.set_active_turn(&actor_id, Some(turn.id.clone()));
-
-    let user_text = render_prompt(&trigger);
-    let prompt_text = if manager.take_seed_slot(&actor_id) {
-        format!(
-            "{}\n\n=== User message ===\n{}",
-            seed_manifest(&actor_id, &trigger.scope),
-            user_text
-        )
-    } else {
-        user_text
-    };
-    if let Err(e) = adapter.send_prompt(trigger.scope.clone(), prompt_text).await {
-        let _ = store.close_turn(&turn.id, TurnStatus::Failed);
-        manager.set_active_turn(&actor_id, None);
-        return Err(e);
+    // Same-scope FIFO: if this scope already has an in-flight turn, queue the
+    // trigger and let the Finished handler pick it up. Different scopes run
+    // concurrently — that is the whole point of the rewrite.
+    if manager.active_turn(&actor_id, &trigger.scope.id).is_some() {
+        let scope_id = trigger.scope.id.clone();
+        manager.enqueue_trigger(&actor_id, &scope_id, trigger);
+        return Ok(());
     }
-    Ok(())
+    dispatch_trigger(manager, actor_id, trigger).await
+}
+
+/// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
+/// both the initial wake path and the Finished handler when it pops the next
+/// queued trigger for a scope. On `send_prompt` failure we iteratively drain
+/// the queue (rather than spawn-recursing) so a single bad prompt can't strand
+/// the rest, and so the future stays Send for `tokio::spawn`.
+async fn dispatch_trigger(
+    manager: Arc<RuntimeManager>,
+    actor_id: String,
+    mut trigger: Event,
+) -> Result<(), String> {
+    loop {
+        let adapter = manager
+            .ensure_started(&actor_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let store = manager.store();
+        let turn = store
+            .open_turn(
+                actor_id.clone(),
+                trigger.scope.clone(),
+                Some(trigger.id.clone()),
+            )
+            .map_err(|e| e.to_string())?;
+        manager.set_active_turn(&actor_id, &trigger.scope.id, turn.id.clone());
+
+        let user_text = render_prompt(&trigger);
+        let prompt_text = if manager.take_seed_slot(&actor_id, &trigger.scope.id) {
+            format!(
+                "{}\n\n=== User message ===\n{}",
+                seed_manifest(&actor_id, &trigger.scope),
+                user_text
+            )
+        } else {
+            user_text
+        };
+        match adapter
+            .send_prompt(trigger.scope.clone(), prompt_text)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = store.close_turn(&turn.id, TurnStatus::Failed);
+                let scope_id = trigger.scope.id.clone();
+                match manager.clear_active_turn(&actor_id, &scope_id) {
+                    Some(next) => {
+                        tracing::warn!(actor = %actor_id, %e,
+                            "send_prompt failed; trying next queued trigger for scope");
+                        trigger = next;
+                        continue;
+                    }
+                    None => return Err(e),
+                }
+            }
+        }
+    }
 }
 
 fn render_prompt(trigger: &Event) -> String {
@@ -177,16 +212,18 @@ async fn translate_event(
     actor_id: &str,
     ev: AdapterEvent,
 ) {
-    let turn_id = manager.active_turn(actor_id);
-    let scope = match turn_id
-        .as_deref()
-        .and_then(|id| store.get_turn(id))
-        .map(|t| t.scope)
-    {
-        Some(s) => s,
-        None => return,
-    };
     let actor = actor_id.to_string();
+
+    // Resolve the per-scope active turn the event belongs to. Per-scope events
+    // (Text/ToolUse/ActionRequest/Finished) require this — a missing scope tag
+    // is an adapter bug we log and drop. Agent-wide events (StatusChange/Error
+    // with `scope: None`) are handled in their own arms below without touching
+    // a turn, so we only fail-fast for events that actually need one.
+    let scope_for_event = ev.scope().cloned();
+    let turn_id = scope_for_event
+        .as_ref()
+        .and_then(|s| manager.active_turn(&actor, &s.id));
+
     match ev {
         // Streaming text. Partial chunks are accumulated in a per-turn buffer
         // and pushed live as `text.delta` trace frames to the turn owner only;
@@ -194,10 +231,12 @@ async fn translate_event(
         // the buffer and flushed immediately as a single `content.add`. The
         // common path (Finished) flushes whatever is left.
         AdapterEvent::Text {
+            scope,
             content,
             is_partial,
         } => {
-            let Some(tid) = turn_id.as_deref() else {
+            let (Some(scope), Some(tid)) = (scope, turn_id.as_deref()) else {
+                tracing::warn!(actor = %actor, "Text event missing scope or active turn; dropping");
                 return;
             };
             manager.push_text_chunk(&actor, tid, &content);
@@ -216,27 +255,38 @@ async fn translate_event(
         }
         // Agent tool invocations are private: never an event, only a trace
         // frame to the turn owner.
-        AdapterEvent::ToolUse { tool_name, input } => {
-            if let Some(tid) = turn_id.as_deref() {
-                emit_trace(
-                    manager,
-                    store,
-                    tid,
-                    TraceKind::ToolStart,
-                    json!({
-                        "toolName": tool_name,
-                        "input": input,
-                    }),
-                );
-            }
+        AdapterEvent::ToolUse {
+            scope: _,
+            tool_name,
+            input,
+        } => {
+            let Some(tid) = turn_id.as_deref() else {
+                tracing::warn!(actor = %actor, "ToolUse event missing scope or active turn; dropping");
+                return;
+            };
+            emit_trace(
+                manager,
+                store,
+                tid,
+                TraceKind::ToolStart,
+                json!({
+                    "toolName": tool_name,
+                    "input": input,
+                }),
+            );
         }
         AdapterEvent::ActionRequest {
+            scope,
             id,
             request_type,
             title,
             description,
             choices,
         } => {
+            let (Some(scope), Some(tid)) = (scope, turn_id.clone()) else {
+                tracing::warn!(actor = %actor, "ActionRequest event missing scope or active turn; dropping");
+                return;
+            };
             let payload = json!({
                 "requestType": request_type,
                 "title": title,
@@ -248,9 +298,8 @@ async fn translate_event(
             });
             // We need to know the human (or other) actor that triggered this turn
             // so they can respond. Use the trigger event's actor.
-            let trigger_actor = turn_id
-                .as_deref()
-                .and_then(|tid| store.get_turn(tid))
+            let trigger_actor = store
+                .get_turn(&tid)
                 .and_then(|t| t.trigger_event_id.clone())
                 .and_then(|eid| store.get_event(&eid))
                 .map(|e| e.actor_id);
@@ -270,7 +319,7 @@ async fn translate_event(
                 "action.request".into(),
                 actor.clone(),
                 scope,
-                turn_id.clone(),
+                Some(tid),
                 payload,
                 relations,
                 None,
@@ -280,10 +329,10 @@ async fn translate_event(
                 }
             }
         }
-        // Runtime status changes are private agent state; reflect them on the
-        // manager so other server code can observe them, AND emit a `status`
-        // trace frame so the owner sees the transition. No event.
-        AdapterEvent::StatusChange { status } => {
+        // Runtime status changes are private agent state. Reflect them on the
+        // manager either way; if the event is scope-tagged AND that scope has
+        // an active turn, also drop a `status` trace for the turn owner.
+        AdapterEvent::StatusChange { scope: _, status } => {
             manager.set_status(&actor, &status);
             if let Some(tid) = turn_id.as_deref() {
                 emit_trace(
@@ -297,34 +346,51 @@ async fn translate_event(
         }
         // Turn finished: flush any buffered streaming text into a single
         // `content.add` event (this is what other actors see), then write the
-        // `turn.close` event and close the turn.
-        AdapterEvent::Finished { success, summary } => {
-            if let Some(tid) = turn_id {
-                if let Some(text) = manager.take_text_buffer(&actor, &tid) {
-                    flush_text_as_event(store, &actor, &scope, &tid, text);
-                }
-                let status = if success {
-                    TurnStatus::Closed
-                } else {
-                    TurnStatus::Failed
-                };
-                let _ = store.append_event(
-                    "turn.close".into(),
-                    actor.clone(),
-                    scope,
-                    Some(tid.clone()),
-                    json!({ "status": format!("{:?}", status).to_lowercase(), "stopReason": summary }),
-                    vec![],
-                    None,
-                );
-                let _ = store.close_turn(&tid, status);
+        // `turn.close` event and close the turn. Same-scope FIFO: pop the
+        // next queued trigger for this scope and dispatch it.
+        AdapterEvent::Finished {
+            scope,
+            success,
+            summary,
+        } => {
+            let (Some(scope), Some(tid)) = (scope, turn_id) else {
+                tracing::warn!(actor = %actor, "Finished event missing scope or active turn; dropping");
+                return;
+            };
+            if let Some(text) = manager.take_text_buffer(&actor, &tid) {
+                flush_text_as_event(store, &actor, &scope, &tid, text);
             }
-            manager.set_active_turn(&actor, None);
+            let status = if success {
+                TurnStatus::Closed
+            } else {
+                TurnStatus::Failed
+            };
+            let _ = store.append_event(
+                "turn.close".into(),
+                actor.clone(),
+                scope.clone(),
+                Some(tid.clone()),
+                json!({ "status": format!("{:?}", status).to_lowercase(), "stopReason": summary }),
+                vec![],
+                None,
+            );
+            let _ = store.close_turn(&tid, status);
+            if let Some(next) = manager.clear_active_turn(&actor, &scope.id) {
+                let mgr = manager.clone();
+                let actor_clone = actor.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dispatch_trigger(mgr, actor_clone.clone(), next).await {
+                        tracing::warn!(actor = %actor_clone, %e,
+                            "failed to dispatch queued trigger after turn close");
+                    }
+                });
+            }
         }
-        // Runtime errors are private execution detail. The agent itself can
-        // decide whether to surface a user-visible message via `content.add`;
-        // the raw error becomes an `error` trace frame to the owner.
-        AdapterEvent::Error { message } => {
+        // Runtime errors are private execution detail. If the event is scoped
+        // and the scope has an open turn, surface as an `error` trace frame
+        // to the owner; agent-wide errors (no scope) just go to tracing so
+        // they show up in the server log.
+        AdapterEvent::Error { scope: _, message } => {
             if let Some(tid) = turn_id.as_deref() {
                 emit_trace(
                     manager,
@@ -333,6 +399,8 @@ async fn translate_event(
                     TraceKind::Error,
                     json!({ "message": message }),
                 );
+            } else {
+                tracing::warn!(actor = %actor, %message, "agent-wide adapter error");
             }
         }
     }

@@ -23,14 +23,14 @@
 //! both the embedded supervisor AND `joi agent serve` will try to drive the same
 //! agent — racing on `turn/open` and double-flushing text.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{method, stream_kind, AgentSpec, EventAppendResult, TurnOpenResult};
 use proto::types::trace::TraceKind;
-use proto::types::{Event, Relation, Ref, RefKind, RelationKind, ScopeKind, ScopeRef, TurnStatus};
+use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -41,7 +41,11 @@ use agent_runtime::{Adapter, AdapterEvent};
 
 use crate::client::Client;
 
-pub async fn run(specs_dir_opt: Option<PathBuf>, server_url: String) -> Result<()> {
+pub async fn run(
+    specs_dir_opt: Option<PathBuf>,
+    server_url: String,
+    allow_actors: Vec<String>,
+) -> Result<()> {
     let specs_dir = specs_dir_opt.unwrap_or_else(default_specs_dir);
     std::fs::create_dir_all(&specs_dir)
         .with_context(|| format!("create specs dir {}", specs_dir.display()))?;
@@ -49,11 +53,44 @@ pub async fn run(specs_dir_opt: Option<PathBuf>, server_url: String) -> Result<(
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create data dir {}", data_root.display()))?;
 
-    let specs = load_specs(&specs_dir)?;
+    let mut specs = load_specs(&specs_dir)?;
+    let total_loaded = specs.len();
+    if !allow_actors.is_empty() {
+        let allow: HashSet<&str> = allow_actors.iter().map(String::as_str).collect();
+        let (kept, skipped): (Vec<_>, Vec<_>) = specs
+            .into_iter()
+            .partition(|s| allow.contains(s.actor.id.as_str()));
+        specs = kept;
+        let skipped_ids: Vec<&str> = skipped.iter().map(|s| s.actor.id.as_str()).collect();
+        let unknown: Vec<&str> = allow_actors
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !specs.iter().any(|s| s.actor.id == *id))
+            .collect();
+        eprintln!(
+            "joi agent serve: --allow-actors filter active; loaded {} of {} agent(s){}{}",
+            specs.len(),
+            total_loaded,
+            if skipped_ids.is_empty() {
+                String::new()
+            } else {
+                format!("; skipped: {}", skipped_ids.join(","))
+            },
+            if unknown.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; warning: requested ids with no matching spec: {}",
+                    unknown.join(",")
+                )
+            },
+        );
+    }
     if specs.is_empty() {
         return Err(anyhow!(
-            "no agent specs found in {}; drop AgentSpec JSON files there or pass --specs <dir>",
-            specs_dir.display()
+            "no agent specs to serve under {} (loaded {}, after --allow-actors filter: 0)",
+            specs_dir.display(),
+            total_loaded,
         ));
     }
 
@@ -96,16 +133,16 @@ fn default_data_root() -> PathBuf {
 
 fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("read specs dir {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("read specs dir {}", dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         match serde_json::from_str::<AgentSpec>(&text) {
             Ok(spec) => out.push(spec),
             Err(e) => eprintln!("[warn] skipping {}: {}", path.display(), e),
@@ -155,14 +192,19 @@ impl AgentPaths {
 
 struct WorkerState {
     actor_id: String,
-    /// Currently in-flight turn id (v0 also serializes one prompt at a time).
-    active_turn: Mutex<Option<ActiveTurn>>,
+    /// In-flight turn per scope. Same agent in multiple channels => multiple
+    /// concurrent turns, one per scope.id; same scope back-to-back is enforced
+    /// to be FIFO via `pending_triggers` below.
+    active_turns: Mutex<HashMap<String, ActiveTurn>>,
+    /// Per-scope queue of triggers received while the scope was busy. Drained
+    /// one-at-a-time when the scope's current turn closes.
+    pending_triggers: Mutex<HashMap<String, VecDeque<Event>>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
     /// `Finished` (and on any non-partial `Text` chunk).
     text_buffer: Mutex<HashMap<String, String>>,
-    /// Set once on the first prompt; used to inject the bootstrap manifest just
-    /// like the embedded runtime does.
-    seeded: Mutex<bool>,
+    /// Per-scope first-prompt-seeded set; first prompt for a given scope on a
+    /// freshly-started agent gets the bootstrap manifest prepended.
+    seeded: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -178,18 +220,51 @@ impl WorkerState {
     fn new(actor_id: String) -> Self {
         Self {
             actor_id,
-            active_turn: Mutex::new(None),
+            active_turns: Mutex::new(HashMap::new()),
+            pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
-            seeded: Mutex::new(false),
+            seeded: Mutex::new(HashSet::new()),
         }
     }
 
-    fn current_turn(&self) -> Option<ActiveTurn> {
-        self.active_turn.lock().expect("active_turn poisoned").clone()
+    fn current_turn(&self, scope_id: &str) -> Option<ActiveTurn> {
+        self.active_turns
+            .lock()
+            .expect("active_turns poisoned")
+            .get(scope_id)
+            .cloned()
     }
 
-    fn set_turn(&self, t: Option<ActiveTurn>) {
-        *self.active_turn.lock().expect("active_turn poisoned") = t;
+    fn set_turn(&self, turn: ActiveTurn) {
+        self.active_turns
+            .lock()
+            .expect("active_turns poisoned")
+            .insert(turn.scope.id.clone(), turn);
+    }
+
+    /// Drop the active turn for `scope_id` and atomically pop the next queued
+    /// trigger (if any). Returning the trigger inside the same lock keeps a
+    /// racing `enqueue` from getting wedged behind the now-empty slot.
+    fn clear_turn(&self, scope_id: &str) -> Option<Event> {
+        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        active.remove(scope_id);
+        drop(active);
+        let mut queues = self.pending_triggers.lock().expect("pending poisoned");
+        let q = queues.get_mut(scope_id)?;
+        let next = q.pop_front();
+        if q.is_empty() {
+            queues.remove(scope_id);
+        }
+        next
+    }
+
+    fn enqueue(&self, scope_id: &str, event: Event) {
+        self.pending_triggers
+            .lock()
+            .expect("pending poisoned")
+            .entry(scope_id.to_string())
+            .or_default()
+            .push_back(event);
     }
 
     fn push_text(&self, turn_id: &str, chunk: &str) {
@@ -209,22 +284,15 @@ impl WorkerState {
         buf.remove(turn_id).filter(|s| !s.is_empty())
     }
 
-    fn take_seed_slot(&self) -> bool {
-        let mut s = self.seeded.lock().expect("seeded poisoned");
-        if !*s {
-            *s = true;
-            true
-        } else {
-            false
-        }
+    fn take_seed_slot(&self, scope_id: &str) -> bool {
+        self.seeded
+            .lock()
+            .expect("seeded poisoned")
+            .insert(scope_id.to_string())
     }
 }
 
-async fn run_agent_worker(
-    spec: AgentSpec,
-    server_url: String,
-    data_root: PathBuf,
-) -> Result<()> {
+async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -236,6 +304,18 @@ async fn run_agent_worker(
 
     let client = Client::connect(&server_url).await?;
     client.initialize().await?;
+    // Pre-register the actor row before opening our agent-bound connection.
+    // `connection/open` would auto-upsert under the hood, but it can't carry
+    // the spec's full `Actor` (display name, kind, capabilities) — explicitly
+    // upserting first guarantees the invite UI on humans' machines lists the
+    // agent with its proper metadata even before we own the inbox.
+    let _: Value = client
+        .call(
+            method::ACTOR_UPSERT,
+            json!({ "actor": spec.actor }),
+        )
+        .await
+        .with_context(|| format!("actor/upsert for {}", actor_id))?;
     client
         .open_connection_as(&actor_id, "agent", Some(&display_name))
         .await?;
@@ -247,13 +327,15 @@ async fn run_agent_worker(
 
     // Translator: AdapterEvent → server RPC. Drains until adapter drops the
     // sender (worker exit) — at which point the loop falls out and the task
-    // ends.
+    // ends. The adapter handle is passed in so the Finished branch can pop the
+    // next queued trigger for the same scope and dispatch it.
     {
         let client = client.clone();
         let state = state.clone();
         let actor = actor_id.clone();
+        let adapter = adapter.clone();
         tokio::spawn(async move {
-            translate_events(client, state, actor, event_rx).await;
+            translate_events(client, state, adapter, actor, event_rx).await;
         });
     }
 
@@ -349,8 +431,7 @@ async fn notification_loop(
         if params.get("kind").and_then(|v| v.as_str()) != Some(stream_kind::EVENT_CREATED) {
             continue;
         }
-        let Some(event_value) = params.get("data").and_then(|d| d.get("event")).cloned()
-        else {
+        let Some(event_value) = params.get("data").and_then(|d| d.get("event")).cloned() else {
             continue;
         };
         let Ok(event) = serde_json::from_value::<Event>(event_value) else {
@@ -363,11 +444,16 @@ async fn notification_loop(
         // Lazy start the adapter on first hands_off_to event. Same shape as the
         // embedded `RuntimeManager::ensure_started` lifecycle.
         if !started {
+            eprintln!(
+                "[{actor_id}] starting adapter (first hand-off; ACP cold-start \
+                 can take 30-60s while the agent refreshes its model registry)…"
+            );
             if let Err(e) = adapter.start(event_tx.clone()).await {
                 eprintln!("[{actor_id}] adapter start failed: {e}");
                 continue;
             }
             started = true;
+            eprintln!("[{actor_id}] adapter ready");
         }
 
         if let Err(e) = handle_handoff(&client, &state, &adapter, &event).await {
@@ -393,40 +479,75 @@ async fn handle_handoff(
     adapter: &Arc<dyn Adapter>,
     trigger: &Event,
 ) -> Result<()> {
-    let turn_res: TurnOpenResult = client
-        .call(
-            method::TURN_OPEN,
-            json!({
-                "actorId": state.actor_id,
-                "scope": trigger.scope,
-                "triggerEventId": trigger.id,
-            }),
-        )
-        .await?;
-    let active = ActiveTurn {
-        id: turn_res.turn.id.clone(),
-        scope: trigger.scope.clone(),
-        trigger_actor: trigger.actor_id.clone(),
-    };
-    state.set_turn(Some(active.clone()));
-
-    let user_text = render_prompt(trigger);
-    let prompt = if state.take_seed_slot() {
-        format!(
-            "{}\n\n=== User message ===\n{}",
-            seed_manifest(&state.actor_id, &trigger.scope),
-            user_text
-        )
-    } else {
-        user_text
-    };
-
-    if let Err(e) = adapter.send_prompt(trigger.scope.clone(), prompt).await {
-        let _ = close_turn(client, &active.id, TurnStatus::Failed).await;
-        state.set_turn(None);
-        return Err(anyhow!("adapter send_prompt failed: {e}"));
+    // Same-scope FIFO: if the scope already has a turn in flight, queue this
+    // trigger and let translate_one pick it up after `Finished`.
+    if state.current_turn(&trigger.scope.id).is_some() {
+        state.enqueue(&trigger.scope.id, trigger.clone());
+        return Ok(());
     }
-    Ok(())
+    dispatch_handoff(client, state, adapter, trigger.clone()).await
+}
+
+/// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
+/// both the initial hand-off and the Finished handler when it pops the next
+/// queued trigger. On `send_prompt` failure we iteratively drain the queue
+/// (rather than spawn-recursing) so a single bad prompt can't strand the rest
+/// and the future stays Send for `tokio::spawn`.
+async fn dispatch_handoff(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    mut trigger: Event,
+) -> Result<()> {
+    loop {
+        let turn_res: TurnOpenResult = client
+            .call(
+                method::TURN_OPEN,
+                json!({
+                    "actorId": state.actor_id,
+                    "scope": trigger.scope,
+                    "triggerEventId": trigger.id,
+                }),
+            )
+            .await?;
+        let active = ActiveTurn {
+            id: turn_res.turn.id.clone(),
+            scope: trigger.scope.clone(),
+            trigger_actor: trigger.actor_id.clone(),
+        };
+        state.set_turn(active.clone());
+
+        let user_text = render_prompt(&trigger);
+        let prompt = if state.take_seed_slot(&trigger.scope.id) {
+            format!(
+                "{}\n\n=== User message ===\n{}",
+                seed_manifest(&state.actor_id, &trigger.scope),
+                user_text
+            )
+        } else {
+            user_text
+        };
+
+        match adapter.send_prompt(trigger.scope.clone(), prompt).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = close_turn(client, &active.id, TurnStatus::Failed).await;
+                let scope_id = trigger.scope.id.clone();
+                match state.clear_turn(&scope_id) {
+                    Some(next) => {
+                        tracing::warn!(
+                            actor = %state.actor_id,
+                            %e,
+                            "send_prompt failed; trying next queued trigger"
+                        );
+                        trigger = next;
+                        continue;
+                    }
+                    None => return Err(anyhow!("adapter send_prompt failed: {e}")),
+                }
+            }
+        }
+    }
 }
 
 fn render_prompt(trigger: &Event) -> String {
@@ -477,6 +598,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
 async fn translate_events(
     client: Arc<Client>,
     state: Arc<WorkerState>,
+    adapter: Arc<dyn Adapter>,
     actor_id: String,
     mut rx: mpsc::UnboundedReceiver<AdapterEvent>,
 ) {
@@ -485,13 +607,13 @@ async fn translate_events(
         // keeps the order strict (mpsc is FIFO) without ever holding the lock
         // across awaits.
         let Some(ev) = rx.recv().await else { return };
-        if let Err(e) = translate_one(&client, &state, &actor_id, ev).await {
+        if let Err(e) = translate_one(&client, &state, &adapter, &actor_id, ev).await {
             eprintln!("[{actor_id}] translate failed: {e}");
         }
         loop {
             match rx.try_recv() {
                 Ok(ev) => {
-                    if let Err(e) = translate_one(&client, &state, &actor_id, ev).await {
+                    if let Err(e) = translate_one(&client, &state, &adapter, &actor_id, ev).await {
                         eprintln!("[{actor_id}] translate failed: {e}");
                     }
                 }
@@ -505,16 +627,29 @@ async fn translate_events(
 async fn translate_one(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
     actor_id: &str,
     ev: AdapterEvent,
 ) -> Result<()> {
-    // Without an active turn there's nowhere to attach the output. This
-    // matches the embedded runtime's behavior of dropping out-of-turn events.
-    let Some(active) = state.current_turn() else {
-        return Ok(());
-    };
+    // Resolve the scope this event belongs to and look up the active turn for
+    // it. Per-scope variants (Text/ToolUse/ActionRequest/Finished) require a
+    // scope tag; agent-wide ones (StatusChange/Error with `scope: None`) are
+    // handled in their own arms below.
+    let scope_for_event = ev.scope().cloned();
+    let active = scope_for_event
+        .as_ref()
+        .and_then(|s| state.current_turn(&s.id));
+
     match ev {
-        AdapterEvent::Text { content, is_partial } => {
+        AdapterEvent::Text {
+            scope: _,
+            content,
+            is_partial,
+        } => {
+            let Some(active) = active else {
+                tracing::warn!(actor = %actor_id, "Text event without matching active turn; dropping");
+                return Ok(());
+            };
             state.push_text(&active.id, &content);
             append_trace(
                 client,
@@ -529,7 +664,15 @@ async fn translate_one(
                 }
             }
         }
-        AdapterEvent::ToolUse { tool_name, input } => {
+        AdapterEvent::ToolUse {
+            scope: _,
+            tool_name,
+            input,
+        } => {
+            let Some(active) = active else {
+                tracing::warn!(actor = %actor_id, "ToolUse event without matching active turn; dropping");
+                return Ok(());
+            };
             append_trace(
                 client,
                 &active.id,
@@ -539,12 +682,17 @@ async fn translate_one(
             .await?;
         }
         AdapterEvent::ActionRequest {
+            scope: _,
             id: _,
             request_type,
             title,
             description,
             choices,
         } => {
+            let Some(active) = active else {
+                tracing::warn!(actor = %actor_id, "ActionRequest event without matching active turn; dropping");
+                return Ok(());
+            };
             // For v1 MVP we surface the request to the trigger actor (so they
             // can `joi action accept/decline`), but the response routing back
             // into the adapter is not yet wired — `respond_action` plumbing
@@ -559,8 +707,7 @@ async fn translate_one(
                     "label": c.label,
                 })).collect::<Vec<_>>(),
             });
-            let mut relations = Vec::new();
-            relations.push(Relation {
+            let relations = vec![Relation {
                 kind: RelationKind::HandsOffTo,
                 target: Ref {
                     kind: RefKind::Actor,
@@ -568,7 +715,7 @@ async fn translate_one(
                     _meta: None,
                 },
                 _meta: None,
-            });
+            }];
             append_event(
                 client,
                 "action.request",
@@ -580,16 +727,34 @@ async fn translate_one(
             )
             .await?;
         }
-        AdapterEvent::StatusChange { status } => {
-            append_trace(
-                client,
-                &active.id,
-                TraceKind::Status,
-                json!({ "status": status }),
-            )
-            .await?;
+        AdapterEvent::StatusChange { scope: _, status } => {
+            // If the event is scope-tagged AND that scope has a live turn,
+            // surface as a Status trace; otherwise just log it.
+            if let Some(active) = active {
+                append_trace(
+                    client,
+                    &active.id,
+                    TraceKind::Status,
+                    json!({ "status": status }),
+                )
+                .await?;
+            } else {
+                tracing::debug!(actor = %actor_id, %status, "adapter status (no active turn)");
+            }
         }
-        AdapterEvent::Finished { success, summary } => {
+        AdapterEvent::Finished {
+            scope,
+            success,
+            summary,
+        } => {
+            let Some(active) = active else {
+                tracing::warn!(
+                    actor = %actor_id,
+                    ?scope,
+                    "Finished event without matching active turn; dropping"
+                );
+                return Ok(());
+            };
             if let Some(text) = state.take_text(&active.id) {
                 flush_text(client, actor_id, &active.scope, &active.id, text).await?;
             }
@@ -598,7 +763,6 @@ async fn translate_one(
             } else {
                 TurnStatus::Failed
             };
-            // turn.close event mirrors v0; close_turn is the state-machine call.
             let _ = append_event(
                 client,
                 "turn.close",
@@ -612,17 +776,41 @@ async fn translate_one(
                 vec![],
             )
             .await;
-            close_turn(client, &active.id, status).await?;
-            state.set_turn(None);
+            if let Err(e) = close_turn(client, &active.id, status).await {
+                tracing::warn!(
+                    actor = %actor_id,
+                    turn = %active.id,
+                    scope = %active.scope.id,
+                    %e,
+                    "close_turn RPC failed; clearing slot anyway so the queue can drain"
+                );
+            }
+            // Drop the active slot for this scope and pick up the next queued
+            // trigger (if any). Clear unconditionally — if close_turn failed
+            // server-side we still need to free the slot, otherwise the queue
+            // is stranded forever.
+            let scope_id = scope
+                .map(|s| s.id)
+                .unwrap_or_else(|| active.scope.id.clone());
+            let next_trigger = state.clear_turn(&scope_id);
+            if let Some(next) = next_trigger {
+                if let Err(e) = dispatch_handoff(client, state, adapter, next).await {
+                    eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}");
+                }
+            }
         }
-        AdapterEvent::Error { message } => {
-            append_trace(
-                client,
-                &active.id,
-                TraceKind::Error,
-                json!({ "message": message }),
-            )
-            .await?;
+        AdapterEvent::Error { scope: _, message } => {
+            if let Some(active) = active {
+                append_trace(
+                    client,
+                    &active.id,
+                    TraceKind::Error,
+                    json!({ "message": message }),
+                )
+                .await?;
+            } else {
+                eprintln!("[{actor_id}] adapter error (agent-wide): {message}");
+            }
         }
     }
     Ok(())
@@ -677,7 +865,7 @@ async fn flush_text(
     turn_id: &str,
     text: String,
 ) -> Result<()> {
-    let _ = append_event(
+    append_event(
         client,
         "content.add",
         actor_id,
@@ -686,8 +874,18 @@ async fn flush_text(
         json!({ "contentType": "text/markdown", "text": text }),
         vec![],
     )
-    .await?;
-    Ok(())
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        tracing::warn!(
+            actor = %actor_id,
+            turn = %turn_id,
+            scope = %scope.id,
+            %e,
+            "content.add failed"
+        );
+        e
+    })
 }
 
 async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> Result<()> {

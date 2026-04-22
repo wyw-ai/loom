@@ -143,7 +143,8 @@ impl Client {
         actor_id: &str,
         display_name: Option<&str>,
     ) -> Result<Value> {
-        self.open_connection_as(actor_id, "human", display_name).await
+        self.open_connection_as(actor_id, "human", display_name)
+            .await
     }
 
     /// Open a connection bound to `actor_id` with an explicit `actor_kind`

@@ -2,6 +2,8 @@ mod app;
 mod events;
 mod history;
 mod picker;
+mod prompt;
+mod sidebar;
 mod ui;
 
 use std::io::{self, Stdout};

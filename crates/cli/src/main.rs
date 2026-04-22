@@ -97,11 +97,30 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum ChannelCmd {
+    /// Create a new channel. Channels created via this CLI are private by
+    /// default — the caller is the sole initial member; invite others
+    /// with `joi channel invite`.
     Create {
         #[arg(long)]
         title: String,
     },
+    /// List channels visible to this caller (public channels + private
+    /// channels the caller is a member of).
     List,
+    /// Add an actor to a channel's member set.
+    Invite {
+        channel_id: String,
+        actor_id: String,
+    },
+    /// Remove an actor from a channel's member set.
+    Revoke {
+        channel_id: String,
+        actor_id: String,
+    },
+    /// Print the resolved member rows for a channel.
+    Members {
+        channel_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -160,9 +179,7 @@ enum ArtifactCmd {
         file: Option<PathBuf>,
     },
     /// Fetch artifact metadata by id (`art_…`) or by `artifact://` uri.
-    Get {
-        id_or_uri: String,
-    },
+    Get { id_or_uri: String },
     /// Print artifact body (text only). Use --max-bytes to fetch more than 64 KiB.
     Read {
         artifact_id: String,
@@ -232,6 +249,10 @@ enum AgentCmd {
         /// Override the directory of AgentSpec JSON files.
         #[arg(long)]
         specs: Option<PathBuf>,
+        /// Comma-separated actor ids to load. Empty/omitted = load every
+        /// AgentSpec under --specs.
+        #[arg(long = "allow-actors", value_delimiter = ',')]
+        allow_actors: Vec<String>,
     },
 }
 
@@ -244,7 +265,11 @@ async fn main() -> Result<()> {
     } else {
         OutputMode::Pretty
     });
-    let cfg = config::resolve(args.server.clone(), args.actor.clone(), args.display.clone())?;
+    let cfg = config::resolve(
+        args.server.clone(),
+        args.actor.clone(),
+        args.display.clone(),
+    )?;
 
     if let Cmd::Who = args.cmd {
         if render::is_json() {
@@ -267,10 +292,13 @@ async fn main() -> Result<()> {
     // local human actor — bypass the up-front connection_open below so we
     // don't pollute the server's actor table with an unused row.
     if let Cmd::Agent {
-        sub: AgentCmd::Serve { specs },
+        sub: AgentCmd::Serve {
+            specs,
+            allow_actors,
+        },
     } = args.cmd
     {
-        return cmd::agent_serve::run(specs, cfg.server_url).await;
+        return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
     }
 
     let client = Client::connect(&cfg.server_url).await?;
@@ -282,8 +310,21 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Who => unreachable!(),
         Cmd::Channel { sub } => match sub {
-            ChannelCmd::Create { title } => cmd::channel::create(client, title).await?,
+            ChannelCmd::Create { title } => {
+                cmd::channel::create(client, cfg.actor_id.clone(), title).await?
+            }
             ChannelCmd::List => cmd::channel::list(client).await?,
+            ChannelCmd::Invite {
+                channel_id,
+                actor_id,
+            } => cmd::channel::invite(client, channel_id, actor_id).await?,
+            ChannelCmd::Revoke {
+                channel_id,
+                actor_id,
+            } => cmd::channel::revoke(client, channel_id, actor_id).await?,
+            ChannelCmd::Members { channel_id } => {
+                cmd::channel::members(client, channel_id).await?
+            }
         },
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create { channel, title } => {
@@ -344,9 +385,7 @@ async fn main() -> Result<()> {
                 media_type,
                 text,
                 file,
-            } => {
-                cmd::artifact::publish(client, cfg.actor_id, name, media_type, text, file).await?
-            }
+            } => cmd::artifact::publish(client, cfg.actor_id, name, media_type, text, file).await?,
             ArtifactCmd::Get { id_or_uri } => cmd::artifact::get(client, id_or_uri).await?,
             ArtifactCmd::Read {
                 artifact_id,

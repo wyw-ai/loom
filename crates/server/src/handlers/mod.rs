@@ -45,11 +45,18 @@ pub async fn dispatch(
         method::CONNECTION_CLOSE => connection_close(state, params),
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
-        method::SCOPE_READ => scope_read(state, params),
-        method::CHANNEL_CREATE => channel_create(state, params),
-        method::CHANNEL_LIST => channel_list(state),
+        method::SCOPE_READ => scope_read(state, connection_id, params),
+        method::CHANNEL_CREATE => channel_create(state, connection_id, params),
+        method::CHANNEL_LIST => channel_list(state, connection_id),
+        method::CHANNEL_UPDATE => channel_update(state, params),
+        method::CHANNEL_DELETE => channel_delete(state, params),
+        method::CHANNEL_INVITE => channel_invite(state, connection_id, params),
+        method::CHANNEL_REVOKE => channel_revoke(state, connection_id, params),
+        method::CHANNEL_MEMBERS => channel_members(state, connection_id, params),
         method::THREAD_CREATE => thread_create(state, params),
         method::THREAD_LIST => thread_list(state, params),
+        method::THREAD_UPDATE => thread_update(state, params),
+        method::THREAD_DELETE => thread_delete(state, params),
         method::TURN_OPEN => turn_open(state, params),
         method::TURN_CLOSE => turn_close(state, params),
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
@@ -60,6 +67,7 @@ pub async fn dispatch(
         method::ARTIFACT_READ => artifact_read(state, params),
         method::RECEIPT_RECORD => receipt_record(state, params),
         method::ACTOR_LIST => actor_list(state),
+        method::ACTOR_UPSERT => actor_upsert(state, params),
         method::AGENT_LIST => agent_list(state),
         method::AGENT_REGISTER => agent_register(state, params),
         method::AGENT_UNREGISTER => agent_unregister(state, params),
@@ -99,12 +107,13 @@ fn initialize(params: Option<Value>) -> HandlerResult {
 fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ConnectionOpenParams = parse_params(params)?;
     let actor_id = p.actor_id.clone();
+    let claim_kind = p.actor_kind.unwrap_or(ActorKind::Human);
     let actor = match state.store.get_actor(&actor_id) {
         Some(existing) => existing,
         None => {
             let new_actor = Actor {
                 id: actor_id.clone(),
-                kind: p.actor_kind.unwrap_or(ActorKind::Human),
+                kind: claim_kind,
                 display_name: p.display_name.unwrap_or_else(|| actor_id.clone()),
                 capabilities: None,
                 _meta: None,
@@ -114,7 +123,7 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
     };
     state
         .subscriptions
-        .bind_actor(connection_id, actor_id.clone());
+        .bind_actor(connection_id, actor_id.clone(), claim_kind);
     let endpoint_id = format!(
         "ep_{}",
         p.endpoint
@@ -165,6 +174,13 @@ fn connection_close(_state: &AppState, params: Option<Value>) -> HandlerResult {
 
 fn scope_subscribe(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ScopeOnlyParams = parse_params(params)?;
+    let actor_id = caller_actor(state, connection_id)?;
+    // ACL gate: refuse subscriptions to private channels the caller isn't
+    // a member of, so a non-member can't even passively watch.
+    state
+        .store
+        .check_scope_access(&p.scope, &actor_id)
+        .map_err(map_store_err)?;
     if !state
         .subscriptions
         .subscribe(connection_id, p.scope.clone())
@@ -174,10 +190,6 @@ fn scope_subscribe(state: &AppState, connection_id: &str, params: Option<Value>)
             "connection not registered",
         ));
     }
-    let actor_id = state
-        .subscriptions
-        .actor_for_connection(connection_id)
-        .unwrap_or_default();
     ok(ScopeSubscribeResult {
         mode: "live".into(),
         created_at: Utc::now(),
@@ -198,8 +210,13 @@ fn scope_unsubscribe(
     })
 }
 
-fn scope_read(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn scope_read(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ScopeReadParams = parse_params(params)?;
+    let actor_id = caller_actor(state, connection_id)?;
+    state
+        .store
+        .check_scope_access(&p.scope, &actor_id)
+        .map_err(map_store_err)?;
     let (events, has_more) =
         state
             .store
@@ -214,18 +231,171 @@ fn scope_read(state: &AppState, params: Option<Value>) -> HandlerResult {
     })
 }
 
+/// Look up the actor id bound to this connection. All ACL gates rely on
+/// the connection's bound actor (set by `connection/open`) and treat an
+/// unbound connection as "no actor identity to authorize" — a 4xx-style
+/// app error rather than a server panic.
+fn caller_actor(state: &AppState, connection_id: &str) -> Result<String, ErrorObject> {
+    state
+        .subscriptions
+        .actor_for_connection(connection_id)
+        .ok_or_else(|| {
+            ErrorObject::new(
+                ErrorCode::APP_INVALID_STATE,
+                "connection has no bound actor; call connection/open first",
+            )
+        })
+}
+
 // ---- channel ----
 
-fn channel_create(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn channel_create(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
     let p: ChannelCreateParams = parse_params(params)?;
-    let channel = state.store.create_channel(p.title).map_err(map_store_err)?;
+    // Prefer an explicit `actorId` from the params (so a tool can create
+    // a private channel on behalf of the operator); fall back to the
+    // connection's bound actor. Only when both are absent (legacy v0
+    // callers) do we fall through to a Public channel.
+    let creator = match p.actor_id {
+        Some(id) => Some(id),
+        None => state.subscriptions.actor_for_connection(connection_id),
+    };
+    let channel = state
+        .store
+        .create_channel(p.title, creator)
+        .map_err(map_store_err)?;
     ok(ChannelCreateResult { channel })
 }
 
-fn channel_list(state: &AppState) -> HandlerResult {
-    ok(ChannelListResult {
-        channels: state.store.list_channels(),
-    })
+fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
+    let caller = state.subscriptions.actor_for_connection(connection_id);
+    let channels = state
+        .store
+        .list_channels()
+        .into_iter()
+        .filter(|c| match c.visibility {
+            // Public channels are always listable.
+            ChannelVisibility::Public => true,
+            // Private channels: only members see them. Unbound callers
+            // (no actor) see no private channels — better to omit than
+            // to leak titles to a stranger holding a websocket.
+            ChannelVisibility::Private => match caller.as_deref() {
+                Some(actor) => c.members.iter().any(|m| m == actor),
+                None => false,
+            },
+        })
+        .collect();
+    ok(ChannelListResult { channels })
+}
+
+fn channel_invite(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelInviteParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    // Only existing members can invite. Public channels make this
+    // vacuously true (everyone is implicitly a member).
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot invite to channel {}", p.channel_id),
+        ));
+    }
+    let channel = state
+        .store
+        .grant_channel(&p.channel_id, &p.actor_id)
+        .map_err(map_store_err)?;
+    ok(ChannelInviteResult { channel })
+}
+
+fn channel_revoke(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelRevokeParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    // Same access rule as invite: must be an existing member.
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot revoke from channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    // Guardrail: refuse to remove the channel's first/creator member when
+    // there are other members. Without this, a clueless invitee could
+    // orphan everyone else from the channel they were welcomed into.
+    if let Some(ch) = state.store.get_channel(&p.channel_id) {
+        if matches!(ch.visibility, ChannelVisibility::Private)
+            && ch.members.first().map(|s| s.as_str()) == Some(p.actor_id.as_str())
+            && ch.members.len() > 1
+        {
+            return Err(ErrorObject::new(
+                ErrorCode::APP_INVALID_STATE,
+                "cannot revoke the channel creator while other members exist",
+            ));
+        }
+    }
+    let channel = state
+        .store
+        .revoke_channel(&p.channel_id, &p.actor_id)
+        .map_err(map_store_err)?;
+    ok(ChannelRevokeResult { channel })
+}
+
+fn channel_members(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMembersParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let ch = state
+        .store
+        .get_channel(&p.channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?;
+    // Reading the member list is itself member-only on private channels —
+    // otherwise anyone could enumerate who's in a private channel.
+    if matches!(ch.visibility, ChannelVisibility::Private)
+        && !ch.members.iter().any(|m| m == &caller)
+    {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "actor is not a member of this channel",
+        ));
+    }
+    let members = ch
+        .members
+        .iter()
+        .filter_map(|id| state.store.get_actor(id))
+        .collect();
+    ok(ChannelMembersResult { members })
+}
+
+fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ChannelUpdateParams = parse_params(params)?;
+    let channel = state
+        .store
+        .update_channel(&p.channel_id, p.title)
+        .map_err(map_store_err)?;
+    ok(ChannelUpdateResult { channel })
+}
+
+fn channel_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ChannelDeleteParams = parse_params(params)?;
+    let deleted = state
+        .store
+        .delete_channel(&p.channel_id)
+        .map_err(map_store_err)?;
+    ok(ChannelDeleteResult { deleted })
 }
 
 // ---- thread ----
@@ -240,10 +410,27 @@ fn thread_create(state: &AppState, params: Option<Value>) -> HandlerResult {
 }
 
 fn thread_list(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: ThreadListParams =
-        parse_params(params).unwrap_or(ThreadListParams { channel_id: None });
+    let p: ThreadListParams = parse_params(params).unwrap_or(ThreadListParams { channel_id: None });
     let threads = state.store.list_threads(p.channel_id.as_deref());
     ok(ThreadListResult { threads })
+}
+
+fn thread_update(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ThreadUpdateParams = parse_params(params)?;
+    let thread = state
+        .store
+        .update_thread(&p.thread_id, p.title)
+        .map_err(map_store_err)?;
+    ok(ThreadUpdateResult { thread })
+}
+
+fn thread_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ThreadDeleteParams = parse_params(params)?;
+    let deleted = state
+        .store
+        .delete_thread(&p.thread_id)
+        .map_err(map_store_err)?;
+    ok(ThreadDeleteResult { deleted })
 }
 
 // ---- turn ----
@@ -266,11 +453,7 @@ fn turn_close(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(TurnCloseResult { turn })
 }
 
-fn turn_trace_read(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+fn turn_trace_read(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: TurnTraceReadParams = parse_params(params)?;
     let turn = state
         .store
@@ -282,9 +465,7 @@ fn turn_trace_read(
     let caller_actor = state
         .subscriptions
         .actor_for_connection(connection_id)
-        .ok_or_else(|| {
-            ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor")
-        })?;
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor"))?;
     if caller_actor != turn.actor_id {
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
@@ -318,9 +499,7 @@ fn turn_trace_append(
     let caller_actor = state
         .subscriptions
         .actor_for_connection(connection_id)
-        .ok_or_else(|| {
-            ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor")
-        })?;
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor"))?;
     // Same owner-only constraint as turn_trace_read: only the actor that owns
     // the turn (the agent for which it was opened) may write its own trace.
     if caller_actor != turn.actor_id {
@@ -424,6 +603,19 @@ fn actor_list(state: &AppState) -> HandlerResult {
     ok(ActorListResult {
         actors: state.store.list_actors(),
     })
+}
+
+/// Pre-register or update an actor row. `connection/open` already does an
+/// implicit upsert, but it stamps `kind = Human` if the caller forgets to
+/// pass `actorKind`. This dedicated RPC lets `joi agent serve` (and any
+/// other operator) declare an agent's full `Actor` (id, kind, display,
+/// capabilities) before the agent ever opens its own connection — which
+/// is what makes the "invite this agent into the channel, agent connects
+/// later" flow possible.
+fn actor_upsert(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ActorUpsertParams = parse_params(params)?;
+    let actor = state.store.upsert_actor(p.actor).map_err(map_store_err)?;
+    ok(ActorUpsertResult { actor })
 }
 
 fn agent_list(state: &AppState) -> HandlerResult {
@@ -569,16 +761,6 @@ fn path_lookup_via_env(bin: &str) -> bool {
         }
     }
     false
-}
-
-// ---- stream/update fanout (called from supervisor) ----
-
-pub fn stream_update_payload(kind: &str, scope: ScopeRef, data: Value) -> Value {
-    json!(StreamUpdate {
-        kind: kind.into(),
-        scope,
-        data,
-    })
 }
 
 #[allow(dead_code)]

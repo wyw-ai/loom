@@ -88,12 +88,17 @@ enum Cmd {
         #[command(subcommand)]
         sub: ArtifactCmd,
     },
-    /// Interactive chat REPL inside a thread. Omit `--in` to launch the UI
-    /// without a bound thread — the sidebar opens automatically so you can
-    /// pick or create a channel/thread without leaving the TUI.
+    /// Interactive chat REPL. Bind to a thread with `--in <tid>` or to a
+    /// channel's common area with `--channel <cid>`. Omit both to launch
+    /// the UI without a bound scope — the sidebar opens automatically so
+    /// you can pick or create one without leaving the TUI.
     Chat {
+        /// Bind to a thread scope.
         #[arg(long)]
         r#in: Option<String>,
+        /// Bind to a channel's public common area.
+        #[arg(long, conflicts_with = "in")]
+        channel: Option<String>,
     },
     /// Run joi as a stdio MCP server. Typically not invoked by humans —
     /// the runtime auto-injects this as a `session/new.mcpServers` entry
@@ -433,8 +438,13 @@ async fn main() -> Result<()> {
                 max_bytes,
             } => cmd::artifact::read(client, artifact_id, max_bytes).await?,
         },
-        Cmd::Chat { r#in } => {
-            cmd::chat::run(client, cfg.actor_id, r#in.unwrap_or_default()).await?
+        Cmd::Chat { r#in, channel } => {
+            let (scope_id, scope_kind) = match (r#in, channel) {
+                (Some(tid), _) => (tid, proto::types::ScopeKind::Thread),
+                (None, Some(cid)) => (cid, proto::types::ScopeKind::Channel),
+                (None, None) => (String::new(), proto::types::ScopeKind::Thread),
+            };
+            cmd::chat::run(client, cfg.actor_id, scope_id, scope_kind).await?
         }
     }
     Ok(())

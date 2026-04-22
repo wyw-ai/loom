@@ -103,6 +103,14 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         }
         None => "(/ commands · r=reply selected · Ctrl-R=picker · Ctrl-B=channels · Ctrl-C=quit)",
     };
+    let (thread_label, thread_style) = if app.has_thread() {
+        (format!("#{}", app.thread_id), Style::default().fg(Color::Cyan))
+    } else {
+        (
+            "(no thread — pick one in the sidebar)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
     let line = Line::from(vec![
         Span::styled(
             " Joi ",
@@ -112,10 +120,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(
-            format!("#{}", app.thread_id),
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled(thread_label, thread_style),
         Span::raw("  "),
         Span::styled(
             format!("as {}", display),
@@ -164,17 +169,25 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
-    let title = match app.reply_target.as_ref() {
-        Some(target) => format!(
-            " Message (reply → {} · Enter=send · Esc=clear · /… for slash) ",
-            target.preview
-        ),
-        None => " Message (Enter to send · /…  for slash) ".to_string(),
+    let (title, border_color) = if !app.has_thread() {
+        (
+            " Message (select a thread to start chatting) ".to_string(),
+            Color::DarkGray,
+        )
+    } else {
+        let title = match app.reply_target.as_ref() {
+            Some(target) => format!(
+                " Message (reply → {} · Enter=send · Esc=clear · /… for slash) ",
+                target.preview
+            ),
+            None => " Message (Enter to send · /…  for slash) ".to_string(),
+        };
+        (title, Color::Cyan)
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     let visible = visible_input_tail(&app.input, inner.width.saturating_sub(3) as usize);
     let line = Line::from(vec![

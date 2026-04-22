@@ -88,10 +88,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: ArtifactCmd,
     },
-    /// Interactive chat REPL inside a thread.
+    /// Interactive chat REPL inside a thread. Omit `--in` to launch the UI
+    /// without a bound thread — the sidebar opens automatically so you can
+    /// pick or create a channel/thread without leaving the TUI.
     Chat {
         #[arg(long)]
-        r#in: String,
+        r#in: Option<String>,
     },
 }
 
@@ -392,7 +394,9 @@ async fn main() -> Result<()> {
                 max_bytes,
             } => cmd::artifact::read(client, artifact_id, max_bytes).await?,
         },
-        Cmd::Chat { r#in } => cmd::chat::run(client, cfg.actor_id, r#in).await?,
+        Cmd::Chat { r#in } => {
+            cmd::chat::run(client, cfg.actor_id, r#in.unwrap_or_default()).await?
+        }
     }
     Ok(())
 }

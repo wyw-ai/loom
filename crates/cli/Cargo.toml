@@ -29,3 +29,4 @@ ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 futures = { workspace = true }
 unicode-width = { workspace = true }
+pulldown-cmark = { workspace = true }

@@ -252,10 +252,14 @@ impl App {
     /// before the first space (so once the user types `@actor_x ` and starts
     /// the message body, the menu disappears and Enter sends a handoff).
     ///
-    /// Non-members of the current private channel stay listed (so the
-    /// auto-invite-then-handoff confirm flow remains reachable from `@`),
-    /// but get a `(not in #foo)` hint so the operator isn't surprised by
-    /// the confirm modal that pops up on Enter.
+    /// In a private channel the picker is restricted to actors the operator
+    /// can actually hand off to without first inviting: members of the
+    /// current channel ∪ "公区" actors (today: union of all Public channel
+    /// memberships). Non-members are deliberately *not* listed — explicit
+    /// invitation goes through the dedicated invite picker.
+    /// TODO: once the dedicated lobby channel concept lands (in-flight on
+    /// another branch), narrow "公区" from "any Public channel" to that
+    /// single lobby channel.
     pub fn update_at_menu(&mut self) {
         if let Some(rest) = self.input.strip_prefix('@') {
             let token = rest.split_whitespace().next().unwrap_or("");
@@ -265,10 +269,20 @@ impl App {
                 return;
             }
             let chan_ctx = self.current_channel_membership_ctx();
+            let public_actors = self.publicly_addressable_actors();
             let mut items: Vec<PickerItem> = self
                 .agent_ids
                 .iter()
                 .filter(|id| id.as_str() != self.actor_id && id.as_str() != "system")
+                .filter(|id| match chan_ctx.as_ref() {
+                    // Public channel: every known agent is addressable.
+                    None => true,
+                    // Private channel: keep the current channel's members
+                    // and anyone reachable via the public area.
+                    Some((_, members)) => {
+                        members.contains(id.as_str()) || public_actors.contains(id.as_str())
+                    }
+                })
                 .map(|id| {
                     let display = self
                         .display_for
@@ -276,15 +290,8 @@ impl App {
                         .cloned()
                         .unwrap_or_else(|| id.clone());
                     let mut it = PickerItem::new(id.clone(), display);
-                    // Status (running/stopped) wins over the membership hint
-                    // when both apply — agent runtime state is what the
-                    // operator actually needs to see at a glance.
                     if let Some(status) = self.agent_statuses.get(id) {
                         it = it.with_status(status.clone());
-                    } else if let Some((title, members)) = chan_ctx.as_ref() {
-                        if !members.contains(id.as_str()) {
-                            it = it.with_hint(format!("not in #{}", title));
-                        }
                     }
                     it
                 })
@@ -301,6 +308,36 @@ impl App {
         } else {
             self.at_menu = None;
         }
+    }
+
+    /// Union of member sets across all Public channels currently visible in
+    /// the sidebar — actors the operator can address from anywhere because
+    /// they live in the shared "公区". Empty when there's no sidebar yet
+    /// (first frame after launch); the caller's filter falls back to "no
+    /// public actors" which is the safe default.
+    fn publicly_addressable_actors(&self) -> std::collections::HashSet<String> {
+        use proto::types::ChannelVisibility;
+        let mut out = std::collections::HashSet::new();
+        let Some(s) = self.sidebar.as_ref() else {
+            return out;
+        };
+        for ch in &s.channels {
+            if !matches!(ch.visibility, ChannelVisibility::Public) {
+                continue;
+            }
+            // Prefer the resolved members_by_channel cache when populated;
+            // fall back to Channel.members which always rides on the wire.
+            if let Some(rows) = s.members_by_channel.get(&ch.id) {
+                for r in rows {
+                    out.insert(r.actor_id.clone());
+                }
+            } else {
+                for m in &ch.members {
+                    out.insert(m.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Resolve the current chat thread's owning channel via the sidebar
@@ -550,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn at_menu_marks_non_members_of_private_channel_with_hint() {
+    fn at_menu_in_private_channel_lists_members_and_public_actors_only() {
         use crate::cmd::chat::sidebar::{MemberRow, Sidebar};
         use proto::types::{ActorKind, Channel, ChannelVisibility, Thread};
 
@@ -560,22 +597,37 @@ mod tests {
             proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
-        // Two registered agents: alpha is a channel member, beta is not.
+        // Three registered agents:
+        //   alpha: member of the current private channel
+        //   gamma: member of a separate Public channel ("公区")
+        //   beta:  member of nothing visible — should be filtered out
         app.agent_ids.insert("actor_agent_alpha".into());
         app.agent_ids.insert("actor_agent_beta".into());
+        app.agent_ids.insert("actor_agent_gamma".into());
         app.display_for
             .insert("actor_agent_alpha".into(), "Alpha".into());
         app.display_for
             .insert("actor_agent_beta".into(), "Beta".into());
+        app.display_for
+            .insert("actor_agent_gamma".into(), "Gamma".into());
 
         let mut sidebar = Sidebar::new(Some("thread_demo".into()));
-        sidebar.replace_channels(vec![Channel {
-            id: "ch_design".into(),
-            title: "design".into(),
-            visibility: ChannelVisibility::Private,
-            members: vec!["actor_human_current".into(), "actor_agent_alpha".into()],
-            _meta: None,
-        }]);
+        sidebar.replace_channels(vec![
+            Channel {
+                id: "ch_design".into(),
+                title: "design".into(),
+                visibility: ChannelVisibility::Private,
+                members: vec!["actor_human_current".into(), "actor_agent_alpha".into()],
+                _meta: None,
+            },
+            Channel {
+                id: "ch_lobby".into(),
+                title: "lobby".into(),
+                visibility: ChannelVisibility::Public,
+                members: vec!["actor_agent_gamma".into()],
+                _meta: None,
+            },
+        ]);
         sidebar.replace_threads(
             "ch_design",
             vec![Thread {
@@ -600,18 +652,11 @@ mod tests {
         app.update_at_menu();
 
         let picker = app.at_menu.expect("expected @-menu");
-        let by_id: std::collections::HashMap<String, _> = picker
-            .items
-            .into_iter()
-            .map(|it| (it.id.clone(), it))
-            .collect();
-        // Alpha is a member: no hint
-        assert_eq!(by_id["actor_agent_alpha"].hint, None);
-        // Beta is NOT a member: hint mentions the channel title
-        assert_eq!(
-            by_id["actor_agent_beta"].hint.as_deref(),
-            Some("not in #design")
-        );
+        let ids: Vec<String> = picker.items.iter().map(|it| it.id.clone()).collect();
+        // Alpha (channel member) and Gamma (公区) are listed; Beta is gone.
+        assert_eq!(ids, vec!["actor_agent_alpha", "actor_agent_gamma"]);
+        // No more `(not in #foo)` hints — non-members don't appear at all.
+        assert!(picker.items.iter().all(|it| it.hint.is_none()));
     }
 
     #[test]

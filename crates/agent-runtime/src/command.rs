@@ -23,7 +23,7 @@
 //! All work happens in `send_prompt`, which spawns a child, drains it, and emits
 //! `AdapterEvent`s synchronously.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -38,6 +38,16 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterStartInfo};
+
+/// Per-scope handle to an in-flight subprocess. The PID is set after spawn
+/// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
+/// the post-wait flow can label the Finished summary as "cancelled" rather
+/// than the raw exit code.
+#[derive(Default)]
+struct InFlight {
+    pid: Option<u32>,
+    cancel_requested: bool,
+}
 
 /// Snapshot of the bits of `AgentTransport` the command adapter cares about,
 /// pre-expanded with template variables that don't depend on the per-prompt
@@ -104,13 +114,20 @@ pub struct CommandAdapter {
 
 struct CommandInner {
     event_sender: Option<mpsc::UnboundedSender<AdapterEvent>>,
+    /// scope.id → in-flight subprocess slot. Lives across the spawn_blocking
+    /// boundary so `cancel()` (called from the async runtime) can read the
+    /// PID and signal it.
+    in_flight: HashMap<String, Arc<Mutex<InFlight>>>,
 }
 
 impl CommandAdapter {
     pub fn new(cfg: CommandConfig) -> Self {
         Self {
             cfg,
-            inner: Mutex::new(CommandInner { event_sender: None }),
+            inner: Mutex::new(CommandInner {
+                event_sender: None,
+                in_flight: HashMap::new(),
+            }),
         }
     }
 
@@ -120,6 +137,17 @@ impl CommandAdapter {
             .event_sender
             .clone()
             .ok_or_else(|| "command adapter not started".to_string())
+    }
+
+    /// Get or create the per-scope in-flight slot. Reused across resume calls
+    /// for the same scope so we don't leak entries.
+    fn slot_for(&self, scope_id: &str) -> Arc<Mutex<InFlight>> {
+        let mut inner = self.inner.lock();
+        inner
+            .in_flight
+            .entry(scope_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(InFlight::default())))
+            .clone()
     }
 }
 
@@ -154,7 +182,11 @@ impl Adapter for CommandAdapter {
         }
         let sender = self.sender()?;
         let cfg = self.cfg.clone();
-        tokio::task::spawn_blocking(move || run_prompt(cfg, scope, prompt, sender))
+        let slot = self.slot_for(&scope.id);
+        // Reset cancel flag for this scope's new prompt; old PID is already
+        // gone (cleared after the previous wait).
+        slot.lock().cancel_requested = false;
+        tokio::task::spawn_blocking(move || run_prompt(cfg, scope, prompt, sender, slot))
             .await
             .map_err(|e| e.to_string())?
     }
@@ -166,12 +198,62 @@ impl Adapter for CommandAdapter {
         Err("command transport does not support action requests".into())
     }
 
+    async fn cancel(&self, scope: ScopeRef) -> Result<(), String> {
+        let slot = {
+            let inner = self.inner.lock();
+            inner.in_flight.get(&scope.id).cloned()
+        };
+        let Some(slot) = slot else {
+            // No prompt has ever run for this scope — nothing to cancel.
+            return Ok(());
+        };
+        let pid = {
+            let mut s = slot.lock();
+            s.cancel_requested = true;
+            s.pid
+        };
+        let Some(pid) = pid else {
+            // Slot exists but no PID — either we're between prompts, or the
+            // child hasn't been spawned yet. Setting cancel_requested is
+            // enough; if a spawn is in flight it'll be killed once it lands
+            // (handled by send_prompt's spawn_and_collect on the next
+            // wait iteration only if we extend that — for now, no-op).
+            return Ok(());
+        };
+        signal_child(pid)
+    }
+
     async fn stop(&self) -> Result<(), String> {
         // Nothing to stop — each prompt's subprocess exits on its own. Drop the
         // sender so the runtime's event consumer can close cleanly.
         self.inner.lock().event_sender = None;
+        self.inner.lock().in_flight.clear();
         Ok(())
     }
+}
+
+/// Send SIGTERM to `pid`. Unix only — Windows builds get a stub error so
+/// callers know cancel isn't wired there yet (joi-server's audience is Unix).
+#[cfg(unix)]
+fn signal_child(pid: u32) -> Result<(), String> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        // ESRCH (no such process) means the child already exited — racy but
+        // harmless; treat as a successful no-op.
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(format!("kill({pid}, SIGTERM) failed: {err}"))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_child(_pid: u32) -> Result<(), String> {
+    Err("command transport cancel is not implemented for this platform".into())
 }
 
 fn run_prompt(
@@ -179,6 +261,7 @@ fn run_prompt(
     scope: ScopeRef,
     prompt: String,
     sender: mpsc::UnboundedSender<AdapterEvent>,
+    slot: Arc<Mutex<InFlight>>,
 ) -> Result<(), String> {
     let session = load_session(&cfg, &scope.id);
     let resume_session_id = session
@@ -197,7 +280,7 @@ fn run_prompt(
         _ => (expand_first_run_argv(&cfg, &scope, &prompt), true),
     };
 
-    let result = spawn_and_collect(&cfg, &scope, &prompt, &argv, &sender);
+    let result = spawn_and_collect(&cfg, &scope, &prompt, &argv, &sender, &slot);
     let outcome = match result {
         Ok(o) => o,
         Err(e) => {
@@ -260,6 +343,7 @@ fn spawn_and_collect(
     prompt: &str,
     argv: &[String],
     sender: &mpsc::UnboundedSender<AdapterEvent>,
+    slot: &Arc<Mutex<InFlight>>,
 ) -> Result<SpawnOutcome, String> {
     std::fs::create_dir_all(&cfg.cwd).map_err(|e| {
         format!(
@@ -283,6 +367,18 @@ fn spawn_and_collect(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))?;
+    // Register the PID so cancel() can find and signal it. If a cancel call
+    // landed BEFORE we got here (cancel_requested already true), kill the
+    // child immediately; the wait below will pick up the SIGTERM exit.
+    {
+        let mut s = slot.lock();
+        s.pid = Some(child.id());
+        if s.cancel_requested {
+            let pid = child.id();
+            drop(s);
+            let _ = signal_child(pid);
+        }
+    }
 
     if matches!(cfg.prompt_via, PromptVia::Stdin) {
         if let Some(mut stdin) = child.stdin.take() {
@@ -343,13 +439,24 @@ fn spawn_and_collect(
         .map_err(|e| format!("failed to wait on child: {e}"))?;
     let collected_stderr = stderr_handle.join().unwrap_or_default();
     let exit_code = exit.code().unwrap_or(-1);
+    // Snapshot + clear the cancel flag now that the child is reaped, before
+    // building the Finished summary below.
+    let was_cancelled = {
+        let mut s = slot.lock();
+        s.pid = None;
+        let req = s.cancel_requested;
+        s.cancel_requested = false;
+        req
+    };
 
     // Emit the closing events appropriate to the chosen format. Stream formats
     // already pushed partial Text frames inline; we only need the final flush
     // + Finished here. The Text format never pushed anything, so we emit the
     // whole stdout as a single Text and then Finished.
-    let success = exit_code == 0;
-    let summary = if success {
+    let success = exit_code == 0 && !was_cancelled;
+    let summary = if was_cancelled {
+        "cancelled".into()
+    } else if success {
         String::new()
     } else if !collected_stderr.is_empty() {
         truncate_for_summary(&collected_stderr)
@@ -870,5 +977,66 @@ mod tests {
         assert!(looks_like_session_lost("error: Session not found"));
         assert!(looks_like_session_lost("UNKNOWN session abc"));
         assert!(!looks_like_session_lost("everything is fine"));
+    }
+
+    /// Spawning a long-lived child and cancelling it should reap quickly with
+    /// the cancelled label set, instead of waiting for the natural exit.
+    /// Unix-only because `signal_child` is gated on cfg(unix).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_running_child_and_labels_summary() {
+        let mut cfg = cfg();
+        cfg.command = "sleep".into();
+        cfg.args = vec!["30".into()];
+        // Use Stdin so the prompt body does NOT get appended to argv (which
+        // would make BSD `sleep` reject the extra non-numeric token and exit
+        // immediately, racing with the test's PID poll).
+        cfg.prompt_via = PromptVia::Stdin;
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let scope = scope();
+        let send = {
+            let adapter = adapter.clone();
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                adapter.send_prompt(scope, "ignored".into()).await.unwrap();
+            })
+        };
+
+        // Wait until the slot has a PID, then cancel.
+        let slot = adapter.slot_for(&scope.id);
+        let start = std::time::Instant::now();
+        loop {
+            if slot.lock().pid.is_some() {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("child never registered a PID");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        adapter.cancel(scope.clone()).await.expect("cancel");
+
+        // The Finished event should arrive promptly with summary "cancelled".
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got_cancelled = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(AdapterEvent::Finished {
+                    success, summary, ..
+                })) => {
+                    assert!(!success, "cancelled finish should not be success");
+                    assert_eq!(summary, "cancelled");
+                    got_cancelled = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(got_cancelled, "did not receive cancelled Finished event");
+        send.await.unwrap();
     }
 }

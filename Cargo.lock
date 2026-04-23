@@ -9,6 +9,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
+ "libc",
  "parking_lot",
  "proto",
  "serde",

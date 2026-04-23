@@ -35,22 +35,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
         0
     };
 
-    let constraints: Vec<Constraint> = if dropdown_h > 0 {
-        vec![
-            Constraint::Length(1),          // title
-            Constraint::Min(3),             // history
-            Constraint::Length(dropdown_h), // inline dropdown
-            Constraint::Length(3),          // input
-            Constraint::Length(1),          // status
-        ]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ]
-    };
+    // Streaming status: 1 dim row above the input, only when at least one
+    // agent is currently typing. Gives the operator a visible "Esc to cancel"
+    // affordance without stealing space when nothing is in flight.
+    let streaming = app.history.streaming_turns();
+    let streaming_h: u16 = if streaming.is_empty() { 0 } else { 1 };
+
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(1), // title
+        Constraint::Min(3),    // history
+    ];
+    if streaming_h > 0 {
+        constraints.push(Constraint::Length(streaming_h));
+    }
+    if dropdown_h > 0 {
+        constraints.push(Constraint::Length(dropdown_h));
+    }
+    constraints.push(Constraint::Length(3)); // input
+    constraints.push(Constraint::Length(1)); // status
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -60,18 +62,21 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_title(f, app, outer[0]);
     render_history(f, app, outer[1]);
 
+    let mut idx = 2usize;
+    if streaming_h > 0 {
+        render_streaming_bar(f, app, outer[idx], &streaming);
+        idx += 1;
+    }
     if dropdown_h > 0 {
         if let Some(p) = app.slash_menu.as_mut() {
-            p.render_inline(f, outer[2]);
+            p.render_inline(f, outer[idx]);
         } else if let Some(p) = app.at_menu.as_mut() {
-            p.render_inline(f, outer[2]);
+            p.render_inline(f, outer[idx]);
         }
-        render_input(f, app, outer[3]);
-        render_status(f, app, outer[4]);
-    } else {
-        render_input(f, app, outer[2]);
-        render_status(f, app, outer[3]);
+        idx += 1;
     }
+    render_input(f, app, outer[idx]);
+    render_status(f, app, outer[idx + 1]);
 
     if let Some(sidebar_rect) = sidebar_area {
         if let Some(s) = app.sidebar.as_mut() {
@@ -169,6 +174,47 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0));
     f.render_widget(para, inner);
+}
+
+/// Single-row dim bar that lists every agent currently streaming text into
+/// the chat. Hint at the end tells the user how to stop them: Esc cancels
+/// the only one (or the selected bubble), `/cancel @agent` for explicit.
+fn render_streaming_bar(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    streaming: &[(String, String, chrono::DateTime<chrono::Utc>)],
+) {
+    let now = chrono::Utc::now();
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        " ⠋ ",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )];
+    let mut first = true;
+    for (actor, _turn, started) in streaming {
+        if !first {
+            spans.push(Span::styled(
+                "   ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        first = false;
+        let elapsed = (now - *started).num_seconds().max(0);
+        let display = app.display_name_for(actor);
+        spans.push(Span::styled(
+            format!("@{display} · {elapsed}s"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(Span::styled(
+        if streaming.len() == 1 {
+            "    Esc to cancel".to_string()
+        } else {
+            "    Esc cancels selected · /cancel @agent for one".to_string()
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {

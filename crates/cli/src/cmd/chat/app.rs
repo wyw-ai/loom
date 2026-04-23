@@ -460,6 +460,8 @@ pub fn slash_command_items() -> Vec<PickerItem> {
             .with_hint("sets replies_to for the next message"),
         PickerItem::new("/action", "Respond to a pending action.request"),
         PickerItem::new("/agents", "List active agents in the thread"),
+        PickerItem::new("/cancel", "Cancel an in-flight agent turn")
+            .with_hint("/cancel @agent for a specific one"),
         PickerItem::new("/invite", "Invite an actor into the current channel"),
         PickerItem::new("/members", "List members of the current channel"),
         PickerItem::new("/quit", "Leave the chat"),
@@ -669,6 +671,7 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
+            streaming: false,
         });
         app.history.bubbles.push(Bubble {
             actor_id: "system".into(),
@@ -679,6 +682,7 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: None,
             delivery: DeliveryState::NotApplicable,
+            streaming: false,
         });
         app.history.bubbles.push(Bubble {
             actor_id: "actor_agent_beta".into(),
@@ -689,6 +693,7 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_2".into()),
             delivery: DeliveryState::NotApplicable,
+            streaming: false,
         });
 
         app.select_older_history();

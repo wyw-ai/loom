@@ -28,6 +28,12 @@ pub mod method {
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
+    /// Outbound notification: scope-broadcast partial text from an in-flight
+    /// agent turn. Unlike `TURN_TRACE_UPDATE` (owner-only) this fans out to
+    /// every scope subscriber so other channel members can watch the agent
+    /// type. Carries `TurnStreamUpdate`. Never journaled — the canonical
+    /// record is the `content.add` event written when the turn closes.
+    pub const TURN_STREAM_UPDATE: &str = "turn/stream.update";
     pub const EVENT_APPEND: &str = "event/append";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
@@ -392,6 +398,22 @@ pub struct TurnTraceAppendResult {
 pub struct TurnTraceUpdate {
     pub turn_id: String,
     pub frame: crate::types::trace::TraceFrame,
+}
+
+// ---- turn/stream.update notification ----
+
+/// Scope-broadcast partial text from an in-flight agent turn. `seq` is
+/// monotonic per-turn and lets clients detect dropped frames; ordering
+/// across turns is not defined. Never persisted — the final `content.add`
+/// event written at turn close is canonical.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStreamUpdate {
+    pub turn_id: String,
+    pub scope: ScopeRef,
+    pub actor_id: String,
+    pub seq: u64,
+    pub delta_text: String,
 }
 
 // ---- event/append ----

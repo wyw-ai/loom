@@ -76,6 +76,10 @@ pub struct RegisteredAgent {
     /// frames so the owner can see the cursor moving. Keyed by `turn_id` (which
     /// is itself unique per scope), so no scope axis needed here.
     pub text_buffer: HashMap<String, String>,
+    /// Per-turn monotonic counter for `turn/stream.update` notifications.
+    /// Lets clients detect dropped frames; ordering is undefined across turns.
+    /// Cleared (along with `text_buffer`) when the agent stops.
+    pub stream_seq: HashMap<String, u64>,
 }
 
 impl RegisteredAgent {
@@ -92,6 +96,7 @@ impl RegisteredAgent {
             pending_triggers: HashMap::new(),
             seeded: HashSet::new(),
             text_buffer: HashMap::new(),
+            stream_seq: HashMap::new(),
         }
     }
 
@@ -201,6 +206,7 @@ impl RuntimeManager {
             entry.pending_triggers = prev.pending_triggers;
             entry.seeded = prev.seeded;
             entry.text_buffer = prev.text_buffer;
+            entry.stream_seq = prev.stream_seq;
         }
         let info = entry.info();
         agents.insert(spec.actor.id.clone(), entry);
@@ -295,6 +301,7 @@ impl RuntimeManager {
             a.pending_triggers.clear();
             a.seeded.clear();
             a.text_buffer.clear();
+            a.stream_seq.clear();
         }
     }
 
@@ -326,6 +333,19 @@ impl RuntimeManager {
         } else {
             Some(text)
         }
+    }
+
+    /// Allocate the next monotonic seq for `turn/stream.update` notifications
+    /// on `turn_id`. Counter starts at 1 per turn; returns 0 when the agent
+    /// is unknown (caller should drop the delta in that case).
+    pub fn next_stream_seq(&self, actor_id: &str, turn_id: &str) -> u64 {
+        let mut agents = self.agents.lock();
+        let Some(entry) = agents.get_mut(actor_id) else {
+            return 0;
+        };
+        let n = entry.stream_seq.entry(turn_id.to_string()).or_insert(0);
+        *n += 1;
+        *n
     }
 
     /// Returns `true` exactly once per (actor, scope) pair — flips the seeded

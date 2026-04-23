@@ -58,7 +58,7 @@ pub async fn dispatch(
         method::THREAD_UPDATE => thread_update(state, params),
         method::THREAD_DELETE => thread_delete(state, params),
         method::TURN_OPEN => turn_open(state, params),
-        method::TURN_CLOSE => turn_close(state, params),
+        method::TURN_CLOSE => turn_close(state, connection_id, params).await,
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
         method::TURN_TRACE_APPEND => turn_trace_append(state, connection_id, params),
         method::EVENT_APPEND => event_append(state, params).await,
@@ -425,13 +425,121 @@ fn turn_open(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(TurnOpenResult { turn })
 }
 
-fn turn_close(state: &AppState, params: Option<Value>) -> HandlerResult {
+async fn turn_close(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
     let p: TurnCloseParams = parse_params(params)?;
+
+    // Non-cancel paths: keep the v0 behavior — just write to store. Closing a
+    // turn this way is the agent's own internal lifecycle event (the embedded
+    // wakeup translator does this directly via store), or an external `joi
+    // agent serve` reporting completion. No adapter side-effects.
+    if !matches!(p.status, TurnStatus::Cancelled) {
+        let turn = state
+            .store
+            .close_turn(&p.turn_id, p.status)
+            .map_err(map_store_err)?;
+        return ok(TurnCloseResult { turn });
+    }
+
+    // ---- cancel path ----
+    let caller = state
+        .subscriptions
+        .actor_for_connection(connection_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_INVALID_STATE, "connection has no actor"))?;
+
     let turn = state
         .store
-        .close_turn(&p.turn_id, p.status)
+        .get_turn(&p.turn_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "turn"))?;
+
+    // ACL: any member of the channel hosting the turn's scope may cancel.
+    let channel_id = crate::ws::channel_id_for_scope(state, &turn.scope).ok_or_else(|| {
+        ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel for turn scope")
+    })?;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot cancel turn in channel {channel_id}"),
+        ));
+    }
+
+    // Best-effort: nudge the adapter to stop. The eventual `Finished
+    // {success:false, summary:"cancelled"}` echo is no-oped below by the
+    // active-turn clearance — the journal write here is what other
+    // subscribers see.
+    if let Some(adapter) = state.runtime.adapter_for(&turn.actor_id) {
+        if let Err(e) = adapter.cancel(turn.scope.clone()).await {
+            tracing::warn!(actor = %turn.actor_id, %e, "adapter cancel failed");
+        }
+    }
+
+    // Flush any partial text the agent had already produced into a final
+    // `content.add` carrying `_meta.cancelled: true`. Preserves the work so
+    // the user can read what got typed before they stopped it.
+    if let Some(text) = state.runtime.take_text_buffer(&turn.actor_id, &p.turn_id) {
+        let payload = json!({
+            "contentType": "text/markdown",
+            "text": text,
+            "_meta": { "cancelled": true },
+        });
+        if let Err(e) = state.store.append_event(
+            "content.add".into(),
+            turn.actor_id.clone(),
+            turn.scope.clone(),
+            Some(p.turn_id.clone()),
+            payload,
+            vec![],
+            None,
+        ) {
+            tracing::warn!(turn = %p.turn_id, %e, "failed to flush cancelled text buffer");
+        }
+    }
+
+    // Journal the cancel as a `turn.close` event so channel members render a
+    // system divider. `_meta.cancelledBy` lets clients show who pressed stop.
+    let close_payload = json!({
+        "status": "cancelled",
+        "stopReason": "user_cancelled",
+        "_meta": { "cancelledBy": caller },
+    });
+    if let Err(e) = state.store.append_event(
+        "turn.close".into(),
+        turn.actor_id.clone(),
+        turn.scope.clone(),
+        Some(p.turn_id.clone()),
+        close_payload,
+        vec![],
+        None,
+    ) {
+        tracing::warn!(turn = %p.turn_id, %e, "failed to write turn.close cancellation event");
+    }
+
+    let closed = state
+        .store
+        .close_turn(&p.turn_id, TurnStatus::Cancelled)
         .map_err(map_store_err)?;
-    ok(TurnCloseResult { turn })
+
+    // Clear runtime state so (a) the late ACP `Finished` echo is a no-op
+    // (its `let Some(tid) = active_turn ...` guard fails) and (b) the next
+    // FIFO trigger for this scope gets dispatched. Mirrors the wakeup path
+    // at wakeup.rs:426.
+    if let Some(next) = state
+        .runtime
+        .clear_active_turn(&turn.actor_id, &turn.scope.id)
+    {
+        let mgr = state.runtime.clone();
+        let actor = turn.actor_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = wakeup::dispatch_trigger(mgr, actor.clone(), next).await {
+                tracing::warn!(actor = %actor, %e, "post-cancel queued trigger dispatch failed");
+            }
+        });
+    }
+
+    ok(TurnCloseResult { turn: closed })
 }
 
 fn turn_trace_read(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {

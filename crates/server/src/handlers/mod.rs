@@ -249,11 +249,7 @@ fn caller_actor(state: &AppState, connection_id: &str) -> Result<String, ErrorOb
 
 // ---- channel ----
 
-fn channel_create(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelCreateParams = parse_params(params)?;
     // Prefer an explicit `actorId` from the params (so a tool can create
     // a private channel on behalf of the operator); fall back to the
@@ -291,11 +287,7 @@ fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
     ok(ChannelListResult { channels })
 }
 
-fn channel_invite(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelInviteParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
     // Only existing members can invite. Public channels make this
@@ -313,21 +305,14 @@ fn channel_invite(
     ok(ChannelInviteResult { channel })
 }
 
-fn channel_revoke(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+fn channel_revoke(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelRevokeParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
     // Same access rule as invite: must be an existing member.
     if !state.store.is_channel_member(&p.channel_id, &caller) {
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
-            format!(
-                "actor {caller} cannot revoke from channel {}",
-                p.channel_id
-            ),
+            format!("actor {caller} cannot revoke from channel {}", p.channel_id),
         ));
     }
     // Guardrail: refuse to remove the channel's first/creator member when
@@ -351,11 +336,7 @@ fn channel_revoke(
     ok(ChannelRevokeResult { channel })
 }
 
-fn channel_members(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+fn channel_members(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelMembersParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
     let ch = state
@@ -727,6 +708,19 @@ fn agent_install(state: &AppState, params: Option<Value>) -> HandlerResult {
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        // Marketplace install gets persona + memory on by default: identity
+        // files scaffold from the marketplace description, memory prompt /
+        // MCP delivery are enabled so `memory.query` is reachable from the
+        // first turn. Old hand-written specs that skip these fields get
+        // `None` via serde default — behavior preserved.
+        identity: Some(proto::methods::IdentitySpec::default()),
+        memory: Some(proto::methods::MemorySpec {
+            delivery: proto::methods::MemoryDeliverySpec {
+                prompt: true,
+                mcp: true,
+            },
+            ..Default::default()
+        }),
     };
 
     let info = state

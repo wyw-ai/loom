@@ -617,6 +617,196 @@ pub struct AgentSpec {
     pub transport: AgentTransport,
     #[serde(default)]
     pub autostart: bool,
+    /// Optional per-actor persona configuration. When present, the runtime
+    /// loads the referenced markdown files from `{agent.profile}` and injects
+    /// them as labeled prompt sections on **every** turn. Absent means "no
+    /// persona injection" and preserves pre-persona behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentitySpec>,
+    /// Optional per-actor memory configuration. Defines where records live
+    /// under `{agent.profile}/memory/`, how they are selected each turn, and
+    /// how they reach the agent (prompt section and/or MCP bridge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySpec>,
+}
+
+// ---- identity ----
+
+/// Persona config: which markdown files under `{agent.profile}` carry the
+/// agent's role definition (identity) and operating style (soul).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentitySpec {
+    #[serde(default)]
+    pub files: IdentityFiles,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityFiles {
+    /// Markdown path relative to `{agent.profile}` (or absolute). Default
+    /// `identity.md`.
+    #[serde(default = "default_identity_file")]
+    pub identity: String,
+    /// Markdown path relative to `{agent.profile}` (or absolute). Default
+    /// `soul.md`.
+    #[serde(default = "default_soul_file")]
+    pub soul: String,
+}
+
+impl Default for IdentityFiles {
+    fn default() -> Self {
+        Self {
+            identity: default_identity_file(),
+            soul: default_soul_file(),
+        }
+    }
+}
+
+fn default_identity_file() -> String {
+    "identity.md".into()
+}
+fn default_soul_file() -> String {
+    "soul.md".into()
+}
+
+// ---- memory ----
+
+/// Per-actor memory: storage layout + per-turn selection + delivery channels.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySpec {
+    #[serde(default)]
+    pub store: MemoryStoreSpec,
+    #[serde(default)]
+    pub query: MemoryQuerySpec,
+    #[serde(default)]
+    pub delivery: MemoryDeliverySpec,
+    /// Reserved: auto-extract records from conversation. Off by default.
+    #[serde(default)]
+    pub extraction: FeatureMode,
+    /// Reserved: auto-compact old records. Off by default.
+    #[serde(default)]
+    pub compaction: FeatureMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStoreSpec {
+    /// Only `"jsonl"` is implemented. Future: `"sqlite"`, `"qdrant"`.
+    #[serde(default = "default_memory_store_type")]
+    pub store_type: String,
+    /// Path relative to `{agent.profile}` (or absolute). Default
+    /// `./memory/records`.
+    #[serde(default = "default_memory_root")]
+    pub root: String,
+    /// Shard JSONL files by time bucket. `"month"` → `YYYY-MM.jsonl`,
+    /// `"day"` → `YYYY-MM-DD.jsonl`. Default `"month"`.
+    #[serde(default = "default_shard_by")]
+    pub shard_by: String,
+}
+
+impl Default for MemoryStoreSpec {
+    fn default() -> Self {
+        Self {
+            store_type: default_memory_store_type(),
+            root: default_memory_root(),
+            shard_by: default_shard_by(),
+        }
+    }
+}
+
+fn default_memory_store_type() -> String {
+    "jsonl".into()
+}
+fn default_memory_root() -> String {
+    "./memory/records".into()
+}
+fn default_shard_by() -> String {
+    "month".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryQuerySpec {
+    /// Only `"heuristic"` is implemented (token-overlap). Reserved for future
+    /// embedding-based modes.
+    #[serde(default = "default_query_mode")]
+    pub mode: String,
+    /// Top-K recent / high-confidence records always injected at the top of
+    /// the memory section. Default 8.
+    #[serde(default = "default_bootstrap_top_k")]
+    pub bootstrap_top_k: usize,
+    /// Top-K records selected by keyword overlap with the current prompt +
+    /// thread context. Default 4.
+    #[serde(default = "default_turn_top_k")]
+    pub turn_top_k: usize,
+    /// When true (default), queries filter out records whose
+    /// `source.channelId` differs from the current turn's channel, preventing
+    /// cross-channel leakage of private memory. Set false only for "journal"
+    /// style agents whose memories are not channel-sensitive.
+    #[serde(default = "default_true")]
+    pub per_channel: bool,
+}
+
+impl Default for MemoryQuerySpec {
+    fn default() -> Self {
+        Self {
+            mode: default_query_mode(),
+            bootstrap_top_k: default_bootstrap_top_k(),
+            turn_top_k: default_turn_top_k(),
+            per_channel: true,
+        }
+    }
+}
+
+fn default_query_mode() -> String {
+    "heuristic".into()
+}
+fn default_bootstrap_top_k() -> usize {
+    8
+}
+fn default_turn_top_k() -> usize {
+    4
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDeliverySpec {
+    /// When true, the runtime renders bootstrap + turn records as a labeled
+    /// "Memory" section and prepends it to every `session/prompt`. Default
+    /// false — opt-in.
+    #[serde(default)]
+    pub prompt: bool,
+    /// When true, the ACP `session/new` call synthesizes a `joi-memory`
+    /// stdio MCP server so the agent can `memory.query` / `memory.append` /
+    /// `memory.get` on demand. Default false — opt-in.
+    #[serde(default)]
+    pub mcp: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureMode {
+    /// `"disabled"` (default), or reserved future modes like `"auto"` /
+    /// `"manual"`.
+    #[serde(default = "default_disabled_mode")]
+    pub mode: String,
+}
+
+impl Default for FeatureMode {
+    fn default() -> Self {
+        Self {
+            mode: default_disabled_mode(),
+        }
+    }
+}
+
+fn default_disabled_mode() -> String {
+    "disabled".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -104,7 +104,10 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         None => "(/ commands · r=reply selected · Ctrl-R=picker · Ctrl-B=channels · Ctrl-C=quit)",
     };
     let (thread_label, thread_style) = if app.has_thread() {
-        (format!("#{}", app.thread_id), Style::default().fg(Color::Cyan))
+        (
+            format!("#{}", app.thread_id),
+            Style::default().fg(Color::Cyan),
+        )
     } else {
         (
             "(no thread — pick one in the sidebar)".to_string(),

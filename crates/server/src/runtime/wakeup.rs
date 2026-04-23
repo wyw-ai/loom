@@ -101,15 +101,7 @@ async fn dispatch_trigger(
         manager.set_active_turn(&actor_id, &trigger.scope.id, turn.id.clone());
 
         let user_text = render_prompt(&trigger);
-        let prompt_text = if manager.take_seed_slot(&actor_id, &trigger.scope.id) {
-            format!(
-                "{}\n\n=== User message ===\n{}",
-                seed_manifest(&actor_id, &trigger.scope),
-                user_text
-            )
-        } else {
-            user_text
-        };
+        let prompt_text = compose_envelope_prompt(&manager, &actor_id, &trigger.scope, &user_text);
         match adapter
             .send_prompt(trigger.scope.clone(), prompt_text)
             .await
@@ -129,6 +121,62 @@ async fn dispatch_trigger(
                 }
             }
         }
+    }
+}
+
+/// Orchestrates the per-turn prompt envelope: identity + soul + memory +
+/// (optional) scope bootstrap + user message. See
+/// [`agent_runtime::envelope`] for the composer itself.
+///
+/// The scope bootstrap (`seed_manifest`) still fires **exactly once** per
+/// (actor, scope); the other sections are every-turn by design — they are
+/// the agent's stable persona and should not get washed out by compaction.
+fn compose_envelope_prompt(
+    manager: &Arc<RuntimeManager>,
+    actor_id: &str,
+    scope: &ScopeRef,
+    user_text: &str,
+) -> String {
+    let scope_bootstrap = if manager.take_seed_slot(actor_id, &scope.id) {
+        seed_manifest(actor_id, scope)
+    } else {
+        String::new()
+    };
+
+    let spec = manager.spec_for(actor_id);
+    let identity_spec = spec.as_ref().and_then(|s| s.identity.as_ref());
+    let memory_spec = spec.as_ref().and_then(|s| s.memory.as_ref());
+
+    // Nothing to orchestrate — fall back to the pre-envelope shape so agents
+    // without persona config see exactly what they used to see.
+    if identity_spec.is_none() && memory_spec.is_none() {
+        return if scope_bootstrap.is_empty() {
+            user_text.to_string()
+        } else {
+            format!("{scope_bootstrap}\n\n=== User message ===\n{user_text}")
+        };
+    }
+
+    let profile_dir = manager.profile_for(actor_id);
+    let channel_id = channel_for_scope(&manager.store(), scope);
+
+    let (prompt, _sections) =
+        agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
+            profile_dir: &profile_dir,
+            identity_spec,
+            memory_spec,
+            channel_id: channel_id.as_deref(),
+            thread_context: "",
+            user_message: user_text,
+            scope_bootstrap: &scope_bootstrap,
+        });
+    prompt
+}
+
+fn channel_for_scope(store: &Arc<Store>, scope: &ScopeRef) -> Option<String> {
+    match scope.kind {
+        ScopeKind::Channel => Some(scope.id.clone()),
+        ScopeKind::Thread => store.get_thread(&scope.id).map(|t| t.channel_id),
     }
 }
 

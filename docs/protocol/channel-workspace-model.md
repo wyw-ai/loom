@@ -56,7 +56,7 @@ Supported templates:
 
 - `{agent.workspace}`: the agent's private workspace
 - `{agent.root}`: the agent's channel-scoped private root
-- `{agent.cache}`: the agent's private cache directory
+- `{agent.profile}`: the agent's persistent state directory (Skills, MCP configs, long-lived agent memory, local model weights, etc.) — per-actor, shared across threads
 - `{agent.logs}`: the agent's private log directory
 - `{channel.root}`: the channel root
 - `{channel.shared}`: the channel shared directory

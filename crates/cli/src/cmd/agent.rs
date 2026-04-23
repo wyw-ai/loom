@@ -146,6 +146,14 @@ pub async fn add(client: Arc<Client>) -> Result<()> {
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        identity: Some(proto::methods::IdentitySpec::default()),
+        memory: Some(proto::methods::MemorySpec {
+            delivery: proto::methods::MemoryDeliverySpec {
+                prompt: true,
+                mcp: true,
+            },
+            ..Default::default()
+        }),
     };
     let res: AgentRegisterResult = client
         .call(method::AGENT_REGISTER, json!({ "spec": spec }))

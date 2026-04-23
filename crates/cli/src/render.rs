@@ -93,4 +93,3 @@ pub fn render_event(event: &Event) {
         }
     }
 }
-

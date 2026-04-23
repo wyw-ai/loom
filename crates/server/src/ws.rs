@@ -335,14 +335,14 @@ fn broadcast_filtered(
     payload: &Value,
     allowed: &std::collections::HashSet<String>,
 ) {
-    let frame = match serde_json::to_string(&proto::Notification::new(method, Some(payload.clone())))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(%e, "failed to serialize filtered stream/update");
-            return;
-        }
-    };
+    let frame =
+        match serde_json::to_string(&proto::Notification::new(method, Some(payload.clone()))) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "failed to serialize filtered stream/update");
+                return;
+            }
+        };
     for conn_id in state.subscriptions.scope_subscribers(scope) {
         let Some(actor) = state.subscriptions.actor_for_connection(&conn_id) else {
             continue;
@@ -350,6 +350,8 @@ fn broadcast_filtered(
         if !allowed.contains(&actor) {
             continue;
         }
-        state.subscriptions.send_to_connection(&conn_id, frame.clone());
+        state
+            .subscriptions
+            .send_to_connection(&conn_id, frame.clone());
     }
 }

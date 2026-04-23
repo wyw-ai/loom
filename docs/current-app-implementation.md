@@ -262,14 +262,14 @@ GUI 和 runtime 当前统一走 `POST /api/rpc`。
 ```text
 /tmp/joi-agent-<actor-id>-xxxxxx/
   workspace/
-  cache/
+  profile/
   logs/
 ```
 
 模板变量会解析到这套目录：
 
 - `{agent.workspace}`
-- `{agent.cache}`
+- `{agent.profile}`
 - `{agent.logs}`
 - `{agent.root}`
 - `{channel.workspace}`

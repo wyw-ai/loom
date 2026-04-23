@@ -136,7 +136,7 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
 }
 ```
 
-模板变量与 v0 一致：`{agent.workspace}` / `{agent.cache}` / `{agent.logs}` /
+模板变量与 v0 一致：`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` /
 `{agent.root}`，再加上 v1 新增的 `{env.NAME}`（从 agent client 进程 env 取值）。
 
 ---
@@ -236,7 +236,7 @@ first_run_capture: "stderr_regex:Session: ([a-f0-9-]{36})"
 适用于：CLI 把 session_id 写在一个固定文件里。
 
 ```
-first_run_capture: "file:{agent.cache}/last_session_id"
+first_run_capture: "file:{agent.profile}/last_session_id"
 ```
 
 行为：进程退出后读文件内容，trim 空白后当作 session_id。
@@ -252,7 +252,7 @@ first_run_capture: "file:{agent.cache}/last_session_id"
 | `{scope.id}` | 当前 scope id（trigger event 的 scope） |
 | `{scope.kind}` | `"thread"` 或 `"channel"` |
 | `{agent.workspace}` | `~/.local/share/joi/agents/<actor>/workspace` |
-| `{agent.cache}` | 同上的 `cache/` |
+| `{agent.profile}` | 同上的 `profile/`（per-actor 持久化状态：Skills / MCP / agent memory / 本地模型权重等） |
 | `{agent.logs}` | 同上的 `logs/` |
 | `{agent.root}` | 同上的根目录 |
 | `{env.NAME}` | agent client 进程的 env var |

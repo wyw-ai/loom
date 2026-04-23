@@ -264,7 +264,9 @@ impl App {
     /// cache, returning `(channel_title, member_actor_ids)` only when the
     /// channel is **private** — public channels need no membership hint
     /// since every actor can post.
-    fn current_channel_membership_ctx(&self) -> Option<(String, std::collections::HashSet<String>)> {
+    fn current_channel_membership_ctx(
+        &self,
+    ) -> Option<(String, std::collections::HashSet<String>)> {
         use proto::types::ChannelVisibility;
         let s = self.sidebar.as_ref()?;
         let channel_id = s.threads_by_channel.iter().find_map(|(ch, threads)| {

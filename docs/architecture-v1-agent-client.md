@@ -234,7 +234,7 @@ pub trait Adapter: Send + Sync {
 pub struct AdapterContext {
     pub actor_id: String,
     pub workspace: PathBuf,   // {agent.workspace}
-    pub cache: PathBuf,       // {agent.cache}
+    pub profile: PathBuf,     // {agent.profile}
     pub logs: PathBuf,        // {agent.logs}
     pub server_url: String,   // JOI_SERVER
     /// agent 自己回头要 shell 出 joi 时，PATH 上带的 cli 目录

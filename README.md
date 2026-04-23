@@ -212,7 +212,7 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 | --- | --- | --- |
 | Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） | 同左 |
 | Agent spec | `--agents-dir`（默认 `./agents`） | `~/.config/joi/agents/`（`--specs <dir>` 可覆盖） |
-| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,cache,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,cache,logs}` |
+| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,profile,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,profile,logs}` |
 | Command transport session 簿记 | （仅 v1 用到） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
 | CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） | 同左 |
 
@@ -269,8 +269,14 @@ joi agent add
 
 保存为 `agents/<actor-id>.json`，或运行时注册：`joi agent register <path>`。
 
-模板变量（`cwd` / `env` 值里可用）：`{agent.workspace}` / `{agent.cache}` /
+模板变量（`cwd` / `env` 值里可用）：`{agent.workspace}` / `{agent.profile}` /
 `{agent.logs}` / `{agent.root}` / `{actor.id}` / `{scope.id}`（command transport）。
+
+`{agent.profile}` 是该 actor 的**持久化状态**目录（per-actor、跨 thread 共享），
+适合放 Skills、MCP 配置、agent 自己维护的 KV memory、本地 agent 的模型权重等
+"不该跨 actor 共享、又不该跨 thread 重复构建"的资产。**注意**这不是 agent 子
+进程看到的 `$HOME`——OAuth token / CLI 配置（如 `~/.claude/`）等用户级状态仍由
+agent 自己写入用户 HOME，joi 不接管。
 
 ## Agent 子进程能反向调 joi 读历史
 
@@ -290,6 +296,72 @@ joi --json channel list
 
 每条会话的**第一次** prompt 还会自动前缀一段简短 manifest，告诉 agent 自己是谁、
 当前在哪个 scope、有哪些只读命令可用；后续 prompt 不再加前缀。
+
+首 prompt 前缀容易随上下文变长被模型注意力稀释，也可能在 agent 内部的自动
+compaction 里被丢掉。为此 joi 在每次 spawn agent 前还会把同一份命令目录写到
+`{agent.workspace}/AGENTS.md`——Claude Code / Codex 等都遵循 AGENTS.md 约定、
+每轮都会把它放回上下文，所以即使首 prompt manifest 被压缩走了，agent 也能从
+AGENTS.md 里重新拿到 joi 的 CLI 表面。
+
+joi 只管自己那段，用 `<!-- BEGIN joi -->` / `<!-- END joi -->` 两条 marker
+包夹；用户或其它工具在 AGENTS.md 里写在 marker 之外的内容会被保留，不会被
+joi 重写时覆盖。
+
+## 身份、灵魂、记忆（per-actor 持久化）
+
+每个 actor 在 `{agent.profile}/` 下有三类**持久化状态**，由 spec 里的
+`identity` 和 `memory` 字段按需启用：
+
+```
+{agent.profile}/
+├── identity.md     # 角色 / 职责 / 目标 / 非目标（Role definition）
+├── soul.md         # 行事风格 / 沟通偏好（Operating style）
+└── memory/
+    ├── meta.json
+    └── records/
+        └── 2026-04.jsonl   # 月分片 append-only 记忆流
+```
+
+**注入时机**：agent 每轮 `session/prompt` 都前置 identity + soul + memory
+labeled sections（不是只首轮），确保不被上下文压缩吃掉。相关模块在
+`agent-runtime/src/{envelope,memory,profile}`。
+
+**scaffold**：`joi agent install` / `joi agent add` 在第一次启动 agent 时
+按模板生成 `identity.md` 和 `soul.md`；用户改了就不再覆盖。`memory/records/`
+每次 spawn 都 mkdir，JSONL 文件按月自动切片。
+
+**跨 channel 隔离**：`memory.query.perChannel` 默认 `true`——查询记忆时会
+按 `source.channelId` 过滤，防止 actor 在 private channel 学到的事实在
+public channel 被召回。关掉走 `"perChannel": false`。
+
+**双通道投递**（spec `memory.delivery`）：
+- `"prompt": true` — 每轮把 `Bootstrap memory` + `Relevant memory` 两段
+  拼进 `session/prompt`。Bootstrap 走近期 + 高 confidence；Relevant 走
+  当前 prompt 关键词匹配。两边 topK 各自可配（默认 8 / 4）。
+- `"mcp": true` — ACP `session/new.mcpServers` 里自动注入
+  `joi-memory` stdio server（joi 可执行文件加 `mcp memory --profile-dir`
+  参数自指），agent 通过 `memory.query` / `memory.append` / `memory.get`
+  三个 MCP tool 主动读写。
+
+marketplace install 和 `joi agent add` 现在默认**两条都开**。手写老 spec
+没这两个字段照样工作，行为跟过去一致。
+
+### spec 片段示例
+
+```jsonc
+{
+  "actor": { "id": "actor_claude", "displayName": "Claude", "kind": "agent" },
+  "transport": { "kind": "acp_stdio", "command": "claude-acp", ... },
+  "identity": {
+    "files": { "identity": "identity.md", "soul": "soul.md" }
+  },
+  "memory": {
+    "store":    { "type": "jsonl", "root": "./memory/records", "shardBy": "month" },
+    "query":    { "mode": "heuristic", "bootstrapTopK": 8, "turnTopK": 4, "perChannel": true },
+    "delivery": { "prompt": true, "mcp": true }
+  }
+}
+```
 
 ## 文档导航
 
@@ -314,5 +386,4 @@ joi --json channel list
 - 无认证、无签名（channel ACL 仅按 actor id 信任过滤，无 RBAC 角色分级）
 - 仅 WebSocket，没有 HTTP/SSE 传输
 - artifact 入口仅 `inline_text`
-- 传给 ACP 子进程的 `mcpServers` 永远为空——自带
 - 无 GUI、无 federation、无 SQLite、无完整自动化测试集

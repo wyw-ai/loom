@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use super::markdown;
+
 #[derive(Debug, Clone)]
 pub struct Bubble {
     pub actor_id: String,
@@ -347,13 +349,17 @@ impl History {
             };
             let selected = selected_bubble_idx == Some(idx);
             let gutter = selection_gutter(selected);
+            let actor_style = if selected {
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            };
             let header = vec![
                 gutter.clone(),
                 Span::styled(format!("[{}] ", ts), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    actor,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(actor, actor_style),
                 Span::raw("  "),
                 Span::raw(prefix.to_string()),
             ];
@@ -379,9 +385,23 @@ impl History {
                 None => String::new(),
             };
 
-            let body_lines: Vec<&str> = display_text(&b.text).split('\n').collect();
-            let last_idx = body_lines.len().saturating_sub(1);
-            for (line_idx, line) in body_lines.iter().enumerate() {
+            // Markdown-render the bubble body into rows of styled spans. System
+            // / static bubbles bypass markdown — they're already pre-formatted
+            // strings (handoff arrows, action.request prefixes, etc.) and we
+            // don't want `*` / `#` in those treated as syntax.
+            let body_rows: Vec<Vec<Span<'static>>> = match b.kind {
+                BubbleKind::Stream => markdown::render_to_rows(
+                    display_text(&b.text),
+                    Style::default(),
+                ),
+                _ => display_text(&b.text)
+                    .split('\n')
+                    .map(|line| vec![Span::raw(line.to_string())])
+                    .collect(),
+            };
+            let body_rows = trim_trailing_blank_rows(body_rows);
+            let last_idx = body_rows.len().saturating_sub(1);
+            for (line_idx, row_spans) in body_rows.into_iter().enumerate() {
                 let is_last = line_idx == last_idx;
                 let rendered = if line_idx == 0 {
                     let mut spans = header.clone();
@@ -391,7 +411,7 @@ impl History {
                             Style::default().fg(Color::DarkGray),
                         ));
                     }
-                    spans.push(Span::raw(line.to_string()));
+                    spans.extend(row_spans);
                     if b.streaming && is_last {
                         spans.push(Span::styled("▍", Style::default().fg(Color::Cyan)));
                     }
@@ -403,8 +423,9 @@ impl History {
                 } else {
                     let mut spans = vec![
                         gutter.clone(),
-                        Span::raw(format!("            {}", line)),
+                        Span::raw(BODY_INDENT.to_string()),
                     ];
+                    spans.extend(row_spans);
                     if b.streaming && is_last {
                         spans.push(Span::styled("▍", Style::default().fg(Color::Cyan)));
                     }
@@ -540,12 +561,44 @@ fn delivery_span(state: DeliveryState) -> Option<Span<'static>> {
     }
 }
 
+/// Indent applied to non-first body rows so wrapped text aligns under the
+/// bubble's actor name. Width = gutter (2) + `[HH:MM:SS] ` (11) - gutter (2)
+/// already on the row = 11; we keep a 12-wide pad so a one-row delta in
+/// timestamp formatting doesn't desync the column.
+const BODY_INDENT: &str = "            ";
+
+/// Selected bubbles get a high-contrast magenta block as the gutter so the
+/// chevron shows up clearly even on light or low-contrast terminal themes.
+/// Width matches the unselected `"  "` gutter so wrap math stays identical.
 fn selection_gutter(selected: bool) -> Span<'static> {
     if selected {
-        Span::styled("> ", Style::default().fg(Color::Magenta))
+        Span::styled(
+            "▌ ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("  ")
     }
+}
+
+/// Drop trailing rows whose spans are all empty so a markdown body ending in
+/// `\n\n` doesn't pad the bubble with phantom rows.
+fn trim_trailing_blank_rows(
+    mut rows: Vec<Vec<Span<'static>>>,
+) -> Vec<Vec<Span<'static>>> {
+    while rows
+        .last()
+        .map(|r| r.iter().all(|s| s.content.as_ref().is_empty()))
+        .unwrap_or(false)
+    {
+        rows.pop();
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
 }
 
 fn wrapped_rows(line: &Line<'_>, width: u16) -> usize {

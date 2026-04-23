@@ -1,6 +1,7 @@
 mod app;
 mod events;
 mod history;
+mod markdown;
 mod picker;
 mod prompt;
 mod sidebar;

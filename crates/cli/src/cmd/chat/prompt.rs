@@ -10,20 +10,32 @@ use ratatui::Frame;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptKind {
     CreateChannel,
-    RenameChannel { channel_id: String },
-    CreateThread { channel_id: String },
-    RenameThread { thread_id: String },
+    RenameChannel {
+        channel_id: String,
+    },
+    CreateThread {
+        channel_id: String,
+    },
+    RenameThread {
+        thread_id: String,
+    },
     /// Free-text actor id fallback when the picker doesn't have the actor
     /// cached (operator just registered an offline agent's spec, or just
     /// knows the id and doesn't want to scroll a picker).
-    InviteToChannel { channel_id: String },
+    InviteToChannel {
+        channel_id: String,
+    },
 }
 
 /// Discriminator for confirm-style modals (delete + revoke + auto-invite).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmKind {
-    DeleteChannel { channel_id: String },
-    DeleteThread { thread_id: String },
+    DeleteChannel {
+        channel_id: String,
+    },
+    DeleteThread {
+        thread_id: String,
+    },
     /// Confirm revocation of an actor from a channel — mirrors the Delete
     /// confirms in spirit, but membership is cheap to restore so the
     /// guardrail is just a one-keystroke `y`.

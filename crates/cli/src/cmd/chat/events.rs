@@ -53,12 +53,12 @@ pub async fn run(
         // `joi chat` without `--in`: auto-open the sidebar + populate the
         // channel list so the operator can immediately pick/create a
         // thread instead of staring at an empty chat pane.
-        app.history
-            .push_system("Welcome to Joi chat.");
+        app.history.push_system("Welcome to Joi chat.");
         app.history
             .push_system("No thread selected. Use the sidebar (Ctrl+B) to pick a channel, or");
-        app.history
-            .push_system("press n in the Channels pane to create one. Press Enter on a thread to open it.");
+        app.history.push_system(
+            "press n in the Channels pane to create one. Press Enter on a thread to open it.",
+        );
         app.toggle_sidebar();
         initialize_sidebar(&client, &mut app).await;
         app.set_status(format!(
@@ -521,11 +521,9 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                             PickerKind::HandoffTarget => PickerKind::HandoffTarget,
                             PickerKind::Action => PickerKind::Action,
                             PickerKind::Reply => PickerKind::Reply,
-                            PickerKind::InviteActor { channel_id } => {
-                                PickerKind::InviteActor {
-                                    channel_id: channel_id.clone(),
-                                }
-                            }
+                            PickerKind::InviteActor { channel_id } => PickerKind::InviteActor {
+                                channel_id: channel_id.clone(),
+                            },
                         },
                         _ => return,
                     };
@@ -715,8 +713,8 @@ async fn initialize_sidebar(client: &Arc<Client>, app: &mut App) {
 /// Best-effort: surfaces failure on the status line and leaves the existing
 /// cache intact (so subsequent renders don't flicker an empty list).
 async fn refresh_members(client: &Arc<Client>, app: &mut App, channel_id: &str) {
-    use proto::methods::ChannelMembersResult;
     use super::sidebar::MemberRow;
+    use proto::methods::ChannelMembersResult;
     let res = client
         .call::<_, ChannelMembersResult>(
             method::CHANNEL_MEMBERS,
@@ -739,8 +737,7 @@ async fn refresh_members(client: &Arc<Client>, app: &mut App, channel_id: &str) 
                     proto::types::ActorKind::Agent => "agent",
                     proto::types::ActorKind::Service => "service",
                 };
-                app.actor_kinds
-                    .insert(a.id.clone(), kind_label.to_string());
+                app.actor_kinds.insert(a.id.clone(), kind_label.to_string());
                 app.display_for.insert(a.id.clone(), name);
                 if matches!(a.kind, proto::types::ActorKind::Agent) {
                     app.agent_ids.insert(a.id.clone());
@@ -902,7 +899,9 @@ async fn handle_sidebar_key(client: &Arc<Client>, app: &mut App, key: KeyEvent) 
 }
 
 fn open_invite_by_id_prompt(app: &mut App) {
-    let Some(s) = app.sidebar.as_ref() else { return };
+    let Some(s) = app.sidebar.as_ref() else {
+        return;
+    };
     let Some(ch) = s.selected_channel() else {
         app.set_status("select a channel first");
         return;
@@ -917,7 +916,9 @@ fn open_invite_by_id_prompt(app: &mut App) {
 }
 
 fn open_revoke_confirm(app: &mut App) {
-    let Some(s) = app.sidebar.as_ref() else { return };
+    let Some(s) = app.sidebar.as_ref() else {
+        return;
+    };
     let Some(ch) = s.selected_channel().cloned() else {
         app.set_status("select a channel first");
         return;
@@ -1564,8 +1565,7 @@ fn print_members_into_history(app: &mut App, channel_id: &str) {
             .push_system(format!("(no members for #{}, public channel?)", title));
         return;
     }
-    app.history
-        .push_system(format!("Members of #{}:", title));
+    app.history.push_system(format!("Members of #{}:", title));
     for r in rows {
         let kind = match r.kind {
             proto::types::ActorKind::Human => "human",

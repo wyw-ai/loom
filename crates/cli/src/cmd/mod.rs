@@ -7,5 +7,6 @@ pub mod channel;
 pub mod chat;
 pub mod event;
 pub mod handoff;
+pub mod mcp_memory;
 pub mod say;
 pub mod thread;

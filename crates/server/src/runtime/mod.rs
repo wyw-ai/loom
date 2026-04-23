@@ -242,8 +242,8 @@ impl RuntimeManager {
             .join("workspace")
     }
 
-    pub fn cache_for(&self, actor_id: &str) -> PathBuf {
-        self.data_dir.join("agents").join(actor_id).join("cache")
+    pub fn profile_for(&self, actor_id: &str) -> PathBuf {
+        self.data_dir.join("agents").join(actor_id).join("profile")
     }
 
     pub fn logs_for(&self, actor_id: &str) -> PathBuf {
@@ -428,8 +428,42 @@ impl RuntimeManager {
             .spec_for(actor_id)
             .ok_or_else(|| RuntimeError::NotFound(actor_id.into()))?;
         std::fs::create_dir_all(self.workspace_for(actor_id))?;
-        std::fs::create_dir_all(self.cache_for(actor_id))?;
+        std::fs::create_dir_all(self.profile_for(actor_id))?;
         std::fs::create_dir_all(self.logs_for(actor_id))?;
+        if let Err(e) = agent_runtime::ensure_agents_md(&self.workspace_for(actor_id), actor_id) {
+            tracing::warn!(actor = %actor_id, %e, "failed to write AGENTS.md");
+        }
+        if spec.identity.is_some() || spec.memory.is_some() {
+            let identity_file = spec
+                .identity
+                .as_ref()
+                .map(|s| s.files.identity.as_str())
+                .unwrap_or("identity.md");
+            let soul_file = spec
+                .identity
+                .as_ref()
+                .map(|s| s.files.soul.as_str())
+                .unwrap_or("soul.md");
+            let memory_root = spec
+                .memory
+                .as_ref()
+                .map(|m| m.store.root.as_str())
+                .unwrap_or("./memory/records");
+            let profile_dir = self.profile_for(actor_id);
+            if let Err(e) =
+                agent_runtime::ensure_profile_scaffold(&agent_runtime::ProfileScaffold {
+                    profile_dir: &profile_dir,
+                    actor_id,
+                    display_name: &spec.actor.display_name,
+                    description: "",
+                    identity_file,
+                    soul_file,
+                    memory_root,
+                })
+            {
+                tracing::warn!(actor = %actor_id, %e, "failed to scaffold profile");
+            }
+        }
 
         let workdir = if spec.transport.cwd.is_empty() {
             self.workspace_for(actor_id)
@@ -463,12 +497,20 @@ impl RuntimeManager {
             // "acp_stdio" is the default and the only kind v0 understood. Empty
             // string is also tolerated for legacy specs that predate the field.
             "acp_stdio" | "" => {
+                let joi_binary = self.cli_dir.as_ref().map(|d| d.join(cli_binary_name()));
+                let mcp_servers = agent_runtime::build_mcp_servers(
+                    joi_binary.as_deref(),
+                    actor_id,
+                    &self.profile_for(actor_id),
+                    spec.memory.as_ref(),
+                );
                 let cfg = acp::AcpConfig {
                     command: spec.transport.command.clone(),
                     args,
                     env,
                     cwd: workdir,
                     auth_method: spec.transport.auth_method.clone(),
+                    mcp_servers,
                 };
                 Arc::new(AcpAdapter::new(cfg))
             }
@@ -518,12 +560,12 @@ impl RuntimeManager {
 
     fn expand_path_vars(&self, input: &str, actor_id: &str) -> String {
         let workspace = self.workspace_for(actor_id).display().to_string();
-        let cache = self.cache_for(actor_id).display().to_string();
+        let profile = self.profile_for(actor_id).display().to_string();
         let logs = self.logs_for(actor_id).display().to_string();
         let root = self.root_for(actor_id).display().to_string();
         input
             .replace("{agent.workspace}", &workspace)
-            .replace("{agent.cache}", &cache)
+            .replace("{agent.profile}", &profile)
             .replace("{agent.logs}", &logs)
             .replace("{agent.root}", &root)
     }

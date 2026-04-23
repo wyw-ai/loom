@@ -79,10 +79,7 @@ pub async fn revoke(client: Arc<Client>, channel_id: String, actor_id: String) -
 
 pub async fn members(client: Arc<Client>, channel_id: String) -> Result<()> {
     let res: ChannelMembersResult = client
-        .call(
-            method::CHANNEL_MEMBERS,
-            json!({ "channelId": channel_id }),
-        )
+        .call(method::CHANNEL_MEMBERS, json!({ "channelId": channel_id }))
         .await?;
     if render::is_json() {
         render::print_json(&res);

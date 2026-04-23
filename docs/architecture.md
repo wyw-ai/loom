@@ -171,14 +171,14 @@ Registry 会扫描两套来源：
 ```text
 /tmp/joi-agent-<actor-id>-xxxxxx/
   workspace/
-  cache/
+  profile/
   logs/
 ```
 
 支持的模板变量：
 
 - `{agent.workspace}`
-- `{agent.cache}`
+- `{agent.profile}`
 - `{agent.logs}`
 - `{agent.root}`
 - `{channel.workspace}`

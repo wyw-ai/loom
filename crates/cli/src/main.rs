@@ -95,6 +95,33 @@ enum Cmd {
         #[arg(long)]
         r#in: Option<String>,
     },
+    /// Run joi as a stdio MCP server. Typically not invoked by humans —
+    /// the runtime auto-injects this as a `session/new.mcpServers` entry
+    /// when an agent's spec opts into `memory.delivery.mcp`.
+    Mcp {
+        #[command(subcommand)]
+        sub: McpCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// Expose the running actor's per-actor memory as MCP tools
+    /// (`memory.query` / `memory.append` / `memory.get`).
+    Memory {
+        /// Actor id used as `actorId` on newly-appended records. Usually
+        /// supplied via the env (`JOI_ACTOR`) but explicit takes precedence.
+        #[arg(long = "actor-id", env = "JOI_ACTOR")]
+        actor_id: String,
+        /// Path to `{agent.profile}` — the runtime expands `{agent.profile}`
+        /// before spawn, so specs should hand over a fully-resolved path.
+        #[arg(long = "profile-dir")]
+        profile_dir: PathBuf,
+        /// Optional override for the store's shard granularity. Defaults to
+        /// `month`. Accepted: `month`, `day`.
+        #[arg(long = "shard-by")]
+        shard_by: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -120,9 +147,7 @@ enum ChannelCmd {
         actor_id: String,
     },
     /// Print the resolved member rows for a channel.
-    Members {
-        channel_id: String,
-    },
+    Members { channel_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -303,6 +328,21 @@ async fn main() -> Result<()> {
         return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
     }
 
+    // `mcp memory` never talks to the joi server — it's spawned by the ACP
+    // runtime as a stdio MCP child. Short-circuit before opening a websocket
+    // so we don't wait on an online server that the agent doesn't need.
+    if let Cmd::Mcp {
+        sub:
+            McpCmd::Memory {
+                actor_id,
+                profile_dir,
+                shard_by,
+            },
+    } = &args.cmd
+    {
+        return cmd::mcp_memory::run(actor_id.clone(), profile_dir.clone(), shard_by.clone());
+    }
+
     let client = Client::connect(&cfg.server_url).await?;
     client.initialize().await?;
     let _ = client
@@ -324,9 +364,7 @@ async fn main() -> Result<()> {
                 channel_id,
                 actor_id,
             } => cmd::channel::revoke(client, channel_id, actor_id).await?,
-            ChannelCmd::Members { channel_id } => {
-                cmd::channel::members(client, channel_id).await?
-            }
+            ChannelCmd::Members { channel_id } => cmd::channel::members(client, channel_id).await?,
         },
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create { channel, title } => {
@@ -370,6 +408,7 @@ async fn main() -> Result<()> {
             AgentCmd::Log { actor_id, tail } => cmd::agent::log(client, actor_id, tail).await?,
             AgentCmd::Serve { .. } => unreachable!("handled before client setup"),
         },
+        Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Event { sub } => match sub {
             EventCmd::List {
                 r#in,

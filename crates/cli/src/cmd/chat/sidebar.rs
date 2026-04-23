@@ -238,9 +238,7 @@ impl Sidebar {
         let current_ch = self.selected_channel().map(|c| c.id.clone());
         if let Some(rows) = self.members_by_channel.get_mut(channel_id) {
             rows.retain(|m| m.actor_id != actor_id);
-            if current_ch.as_deref() == Some(channel_id)
-                && self.selected_member_idx >= rows.len()
-            {
+            if current_ch.as_deref() == Some(channel_id) && self.selected_member_idx >= rows.len() {
                 self.selected_member_idx = rows.len().saturating_sub(1);
             }
         }
@@ -708,7 +706,10 @@ mod tests {
         // remove the selected one — cursor must collapse to last in range
         s.remove_member("c1", "a_zoe");
         assert_eq!(s.selected_member_idx, 1);
-        assert_eq!(s.selected_member().map(|m| m.actor_id.as_str()), Some("a_bob"));
+        assert_eq!(
+            s.selected_member().map(|m| m.actor_id.as_str()),
+            Some("a_bob")
+        );
         // adding back doesn't move the cursor
         s.add_member("c1", mr("a_zoe", "zoe", ActorKind::Agent));
         assert_eq!(s.selected_member_idx, 1);

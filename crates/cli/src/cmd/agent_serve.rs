@@ -119,6 +119,15 @@ pub async fn run(
     Ok(())
 }
 
+/// The path to *this* joi binary. Used as the `command` for the
+/// auto-injected `joi-memory` MCP server entry; falls back to the bare
+/// name `"joi"` (hoping it's on PATH) if we can't resolve our own exe.
+fn current_joi_binary() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .or_else(|| Some(PathBuf::from("joi")))
+}
+
 fn default_specs_dir() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("joi").join("agents"))
@@ -155,7 +164,7 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
 /// (`{agent.workspace}` etc.) consistent between embedded and external mode.
 struct AgentPaths {
     workspace: PathBuf,
-    cache: PathBuf,
+    profile: PathBuf,
     logs: PathBuf,
     root: PathBuf,
     sessions: PathBuf,
@@ -166,25 +175,58 @@ impl AgentPaths {
         let agent_root = root.join("agents").join(actor_id);
         Self {
             workspace: agent_root.join("workspace"),
-            cache: agent_root.join("cache"),
+            profile: agent_root.join("profile"),
             logs: agent_root.join("logs"),
             root: agent_root,
             sessions: root.join("sessions"),
         }
     }
 
-    fn ensure(&self) -> std::io::Result<()> {
+    fn ensure(&self, actor_id: &str, spec: &AgentSpec) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.workspace)?;
-        std::fs::create_dir_all(&self.cache)?;
+        std::fs::create_dir_all(&self.profile)?;
         std::fs::create_dir_all(&self.logs)?;
         std::fs::create_dir_all(&self.sessions)?;
+        if let Err(e) = agent_runtime::ensure_agents_md(&self.workspace, actor_id) {
+            tracing::warn!(actor = %actor_id, %e, "failed to write AGENTS.md");
+        }
+        if spec.identity.is_some() || spec.memory.is_some() {
+            let identity_file = spec
+                .identity
+                .as_ref()
+                .map(|s| s.files.identity.as_str())
+                .unwrap_or("identity.md");
+            let soul_file = spec
+                .identity
+                .as_ref()
+                .map(|s| s.files.soul.as_str())
+                .unwrap_or("soul.md");
+            let memory_root = spec
+                .memory
+                .as_ref()
+                .map(|m| m.store.root.as_str())
+                .unwrap_or("./memory/records");
+            if let Err(e) =
+                agent_runtime::ensure_profile_scaffold(&agent_runtime::ProfileScaffold {
+                    profile_dir: &self.profile,
+                    actor_id,
+                    display_name: &spec.actor.display_name,
+                    description: "",
+                    identity_file,
+                    soul_file,
+                    memory_root,
+                })
+            {
+                tracing::warn!(actor = %actor_id, %e, "failed to scaffold profile");
+            }
+        }
         Ok(())
     }
 
     fn expand(&self, input: &str) -> String {
         input
             .replace("{agent.workspace}", &self.workspace.display().to_string())
-            .replace("{agent.cache}", &self.cache.display().to_string())
+            .replace("{agent.profile}", &self.profile.display().to_string())
             .replace("{agent.logs}", &self.logs.display().to_string())
             .replace("{agent.root}", &self.root.display().to_string())
     }
@@ -192,6 +234,12 @@ impl AgentPaths {
 
 struct WorkerState {
     actor_id: String,
+    /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
+    spec: AgentSpec,
+    /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
+    /// here so prompt-envelope code can read identity/soul/memory without
+    /// threading `paths` through every call.
+    profile_dir: PathBuf,
     /// In-flight turn per scope. Same agent in multiple channels => multiple
     /// concurrent turns, one per scope.id; same scope back-to-back is enforced
     /// to be FIFO via `pending_triggers` below.
@@ -205,6 +253,10 @@ struct WorkerState {
     /// Per-scope first-prompt-seeded set; first prompt for a given scope on a
     /// freshly-started agent gets the bootstrap manifest prepended.
     seeded: Mutex<HashSet<String>>,
+    /// thread_id → channel_id cache. Populated on miss by a single
+    /// `thread/list` RPC and reused from then on. Channel scopes don't need
+    /// resolution (scope.id IS the channel id) so those don't populate it.
+    scope_channel_cache: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -217,13 +269,16 @@ struct ActiveTurn {
 }
 
 impl WorkerState {
-    fn new(actor_id: String) -> Self {
+    fn new(actor_id: String, spec: AgentSpec, profile_dir: PathBuf) -> Self {
         Self {
             actor_id,
+            spec,
+            profile_dir,
             active_turns: Mutex::new(HashMap::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
+            scope_channel_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -300,7 +355,7 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         spec.actor.display_name.clone()
     };
     let paths = AgentPaths::new(&data_root, &actor_id);
-    paths.ensure()?;
+    paths.ensure(&actor_id, &spec)?;
 
     let client = Client::connect(&server_url).await?;
     client.initialize().await?;
@@ -310,10 +365,7 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     // upserting first guarantees the invite UI on humans' machines lists the
     // agent with its proper metadata even before we own the inbox.
     let _: Value = client
-        .call(
-            method::ACTOR_UPSERT,
-            json!({ "actor": spec.actor }),
-        )
+        .call(method::ACTOR_UPSERT, json!({ "actor": spec.actor }))
         .await
         .with_context(|| format!("actor/upsert for {}", actor_id))?;
     client
@@ -321,7 +373,11 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         .await?;
     eprintln!("[{actor_id}] connected to {server_url} as agent");
 
-    let state = Arc::new(WorkerState::new(actor_id.clone()));
+    let state = Arc::new(WorkerState::new(
+        actor_id.clone(),
+        spec.clone(),
+        paths.profile.clone(),
+    ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
     let adapter = build_adapter(&spec, &paths, &server_url)?;
 
@@ -374,12 +430,20 @@ fn build_adapter(
 
     match spec.transport.kind.as_str() {
         "acp_stdio" | "" => {
+            let joi_binary = current_joi_binary();
+            let mcp_servers = agent_runtime::build_mcp_servers(
+                joi_binary.as_deref(),
+                &spec.actor.id,
+                &paths.profile,
+                spec.memory.as_ref(),
+            );
             let cfg = AcpConfig {
                 command: spec.transport.command.clone(),
                 args,
                 env,
                 cwd: workdir,
                 auth_method: spec.transport.auth_method.clone(),
+                mcp_servers,
             };
             Ok(Arc::new(AcpAdapter::new(cfg)))
         }
@@ -518,15 +582,7 @@ async fn dispatch_handoff(
         state.set_turn(active.clone());
 
         let user_text = render_prompt(&trigger);
-        let prompt = if state.take_seed_slot(&trigger.scope.id) {
-            format!(
-                "{}\n\n=== User message ===\n{}",
-                seed_manifest(&state.actor_id, &trigger.scope),
-                user_text
-            )
-        } else {
-            user_text
-        };
+        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
 
         match adapter.send_prompt(trigger.scope.clone(), prompt).await {
             Ok(()) => return Ok(()),
@@ -558,6 +614,84 @@ fn render_prompt(trigger: &Event) -> String {
         return text.to_string();
     }
     serde_json::to_string(&trigger.payload).unwrap_or_default()
+}
+
+/// Per-turn prompt composition for v1. Mirrors
+/// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
+/// configure identity / memory fall back to the pre-envelope shape.
+async fn compose_envelope_prompt(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+    user_text: &str,
+) -> String {
+    let scope_bootstrap = if state.take_seed_slot(&scope.id) {
+        seed_manifest(&state.actor_id, scope)
+    } else {
+        String::new()
+    };
+
+    let identity_spec = state.spec.identity.as_ref();
+    let memory_spec = state.spec.memory.as_ref();
+
+    if identity_spec.is_none() && memory_spec.is_none() {
+        return if scope_bootstrap.is_empty() {
+            user_text.to_string()
+        } else {
+            format!("{scope_bootstrap}\n\n=== User message ===\n{user_text}")
+        };
+    }
+
+    let channel_id = resolve_channel_for_scope(client, state, scope).await;
+
+    let (prompt, _sections) =
+        agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
+            profile_dir: &state.profile_dir,
+            identity_spec,
+            memory_spec,
+            channel_id: channel_id.as_deref(),
+            thread_context: "",
+            user_message: user_text,
+            scope_bootstrap: &scope_bootstrap,
+        });
+    prompt
+}
+
+/// Resolve a scope → channel_id. Channel scopes are identity — they are the
+/// channel. Thread scopes need a one-time `thread/list` sweep; the result is
+/// cached on `WorkerState` so we don't hit the server per turn. A lookup
+/// failure (network error, thread not visible, etc.) returns `None`, which
+/// the memory selector interprets as "no channel scope available" and falls
+/// open — slightly leakier but never-wedging.
+async fn resolve_channel_for_scope(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+) -> Option<String> {
+    match scope.kind {
+        ScopeKind::Channel => Some(scope.id.clone()),
+        ScopeKind::Thread => {
+            if let Some(cached) = state
+                .scope_channel_cache
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&scope.id).cloned())
+            {
+                return Some(cached);
+            }
+            let res: proto::methods::ThreadListResult =
+                client.call(method::THREAD_LIST, json!({})).await.ok()?;
+            let mut cache = state.scope_channel_cache.lock().ok()?;
+            let mut found: Option<String> = None;
+            for t in res.threads {
+                if t.id == scope.id {
+                    found = Some(t.channel_id.clone());
+                }
+                cache.insert(t.id, t.channel_id);
+            }
+            found
+        }
+    }
 }
 
 /// Mirror of `runtime::wakeup::seed_manifest`. Duplicated rather than extracted

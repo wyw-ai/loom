@@ -35,6 +35,12 @@ pub struct AcpConfig {
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub auth_method: Option<String>,
+    /// Passed verbatim as `mcpServers` in every `session/new`. Callers
+    /// synthesize this (e.g. from `memory.delivery.mcp = true` + the joi
+    /// binary path). An empty vec reproduces the pre-envelope behavior of
+    /// always sending `mcpServers: []`.
+    #[allow(dead_code)]
+    pub mcp_servers: Vec<Value>,
 }
 
 /// Internal start info. Sessions are no longer minted at start — they are
@@ -73,6 +79,9 @@ struct AcpShared {
     /// Fixed cwd passed to every `session/new`. v0's behavior — every scope
     /// shares the agent's workspace dir.
     workdir: PathBuf,
+    /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
+    /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
+    mcp_servers: Vec<Value>,
     event_sender: mpsc::UnboundedSender<AdapterEvent>,
 }
 
@@ -134,12 +143,13 @@ impl AcpAdapter {
             None => {
                 let scope_for_new = scope.clone();
                 let shared_for_new = shared.clone();
+                let mcp_servers = shared.mcp_servers.clone();
                 let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
                     let res = shared_for_new.request_and_wait(
                         "session/new",
                         json!({
                             "cwd": shared_for_new.workdir.to_string_lossy(),
-                            "mcpServers": [],
+                            "mcpServers": mcp_servers,
                         }),
                         Duration::from_secs(30),
                     )?;
@@ -344,6 +354,7 @@ fn start_blocking(
         sessions_by_id: Mutex::new(HashMap::new()),
         action_namespace: Uuid::new_v4().to_string(),
         workdir: workdir.clone(),
+        mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
     });
     spawn_stdout_reader(stdout, shared.clone());

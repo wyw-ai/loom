@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use proto::types::{Event, ScopeKind, ScopeRef};
 
 use super::history::History;
@@ -32,6 +33,19 @@ pub enum PickerKind {
 pub struct ReplyTarget {
     pub event_id: String,
     pub preview: String,
+}
+
+/// Light snapshot of an open turn the client has observed via `turn.opened`
+/// and not yet seen `turn.closed` for. Independent of the chat history's
+/// "streaming bubble" concept: an agent can be working on a turn before
+/// emitting any `turn/stream.update` deltas, so we need a separate registry
+/// to know what's cancelable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTurn {
+    pub turn_id: String,
+    pub actor_id: String,
+    pub scope: ScopeRef,
+    pub opened_at: DateTime<Utc>,
 }
 
 pub struct App {
@@ -67,6 +81,12 @@ pub struct App {
     /// Runtime status per registered agent, sourced from `agent/list`.
     pub agent_statuses: HashMap<String, String>,
     pub reply_target: Option<ReplyTarget>,
+    /// Turns the server has told us are open and not yet closed. Keyed by
+    /// turn id; populated from `turn.opened` / `turn.closed` notifications.
+    /// Used by Esc-cancel and the streaming status bar so cancellability
+    /// doesn't depend on whether the agent has emitted `turn/stream.update`
+    /// deltas yet.
+    pub open_turns: HashMap<String, OpenTurn>,
     pub selected_history_idx: Option<usize>,
     pub scroll: u16,
     pub auto_follow: bool,
@@ -110,6 +130,7 @@ impl App {
             agent_ids: HashSet::new(),
             agent_statuses: HashMap::new(),
             reply_target: None,
+            open_turns: HashMap::new(),
             selected_history_idx: None,
             scroll: 0,
             auto_follow: true,
@@ -187,10 +208,29 @@ impl App {
         self.scroll = 0;
         self.auto_follow = true;
         self.reply_target = None;
+        // Drop open-turn entries that don't belong to the new scope. We keep
+        // the rest because cancel cares about scope-bound turns; an entry
+        // for a different scope would still be valid but never actionable
+        // from this view, so dropping is fine and avoids unbounded growth
+        // for operators that bounce between many scopes.
+        self.open_turns
+            .retain(|_, t| &t.scope == new_scope);
         self.selected_history_idx = None;
         self.input.clear();
         self.slash_menu = None;
         self.at_menu = None;
+    }
+
+    /// Open turns currently registered for `scope`, sorted by open time so the
+    /// most recent is last (matches the streaming-bubble convention).
+    pub fn open_turns_in_scope(&self, scope: &ScopeRef) -> Vec<&OpenTurn> {
+        let mut v: Vec<&OpenTurn> = self
+            .open_turns
+            .values()
+            .filter(|t| &t.scope == scope)
+            .collect();
+        v.sort_by_key(|t| t.opened_at);
+        v
     }
 
     pub fn display_name_for(&self, id: &str) -> String {

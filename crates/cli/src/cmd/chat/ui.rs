@@ -35,11 +35,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
         0
     };
 
-    // Streaming status: 1 dim row above the input, only when at least one
-    // agent is currently typing. Gives the operator a visible "Esc to cancel"
-    // affordance without stealing space when nothing is in flight.
-    let streaming = app.history.streaming_turns();
-    let streaming_h: u16 = if streaming.is_empty() { 0 } else { 1 };
+    // In-flight status: 1 dim row above the input, only when at least one
+    // agent has an open turn in this scope. Sourced from `open_turns` (driven
+    // by `turn.opened` / `turn.closed`) so the bar appears even before the
+    // agent has emitted a single `turn/stream.update` delta — that's the
+    // window during which Esc-cancel needs to be discoverable.
+    let streaming_bubbles = app.history.streaming_turns();
+    let in_flight = if let Some(scope) = app.current_scope() {
+        in_flight_turns(app, &scope, &streaming_bubbles)
+    } else {
+        Vec::new()
+    };
+    let streaming_h: u16 = if in_flight.is_empty() { 0 } else { 1 };
 
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(1), // title
@@ -64,7 +71,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let mut idx = 2usize;
     if streaming_h > 0 {
-        render_streaming_bar(f, app, outer[idx], &streaming);
+        render_streaming_bar(f, app, outer[idx], &in_flight);
         idx += 1;
     }
     if dropdown_h > 0 {
@@ -180,14 +187,14 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(para, inner);
 }
 
-/// Single-row dim bar that lists every agent currently streaming text into
-/// the chat. Hint at the end tells the user how to stop them: Esc cancels
-/// the only one (or the selected bubble), `/cancel @agent` for explicit.
+/// Single-row dim bar that lists every agent with an open turn in scope.
+/// Hint at the end tells the user how to stop them: Esc cancels the only
+/// one (or the selected bubble), `/cancel @agent` for explicit.
 fn render_streaming_bar(
     f: &mut Frame,
     app: &App,
     area: Rect,
-    streaming: &[(String, String, chrono::DateTime<chrono::Utc>)],
+    in_flight: &[InFlightRow],
 ) {
     let now = chrono::Utc::now();
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
@@ -195,7 +202,7 @@ fn render_streaming_bar(
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )];
     let mut first = true;
-    for (actor, _turn, started) in streaming {
+    for row in in_flight {
         if !first {
             spans.push(Span::styled(
                 "   ",
@@ -203,15 +210,16 @@ fn render_streaming_bar(
             ));
         }
         first = false;
-        let elapsed = (now - *started).num_seconds().max(0);
-        let display = app.display_name_for(actor);
+        let elapsed = (now - row.started).num_seconds().max(0);
+        let display = app.display_name_for(&row.actor);
+        let suffix = if row.streaming { "" } else { " (waiting)" };
         spans.push(Span::styled(
-            format!("@{display} · {elapsed}s"),
+            format!("@{display} · {elapsed}s{suffix}"),
             Style::default().fg(Color::DarkGray),
         ));
     }
     spans.push(Span::styled(
-        if streaming.len() == 1 {
+        if in_flight.len() == 1 {
             "    Esc to cancel".to_string()
         } else {
             "    Esc cancels selected · /cancel @agent for one".to_string()
@@ -219,6 +227,46 @@ fn render_streaming_bar(
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// One row in the in-flight bar. `streaming=true` when the agent has emitted
+/// at least one stream delta (so we know it's actively producing output);
+/// `false` when only `turn.opened` has fired (queued or thinking, no output yet).
+pub(super) struct InFlightRow {
+    pub actor: String,
+    pub started: chrono::DateTime<chrono::Utc>,
+    pub streaming: bool,
+}
+
+/// Merge open-turn registry entries with streaming-bubble metadata into the
+/// rows the in-flight bar renders. Open turns without a corresponding
+/// streaming bubble still surface — that's the whole point of this fix —
+/// but get a `(waiting)` suffix so the operator knows the agent hasn't
+/// started typing yet.
+pub(super) fn in_flight_turns(
+    app: &App,
+    scope: &proto::types::ScopeRef,
+    streaming_bubbles: &[(String, String, chrono::DateTime<chrono::Utc>)],
+) -> Vec<InFlightRow> {
+    use std::collections::HashMap;
+    let stream_by_turn: HashMap<&str, &chrono::DateTime<chrono::Utc>> = streaming_bubbles
+        .iter()
+        .map(|(_, turn_id, started)| (turn_id.as_str(), started))
+        .collect();
+    let mut rows: Vec<InFlightRow> = app
+        .open_turns_in_scope(scope)
+        .into_iter()
+        .map(|t| InFlightRow {
+            actor: t.actor_id.clone(),
+            started: stream_by_turn
+                .get(t.turn_id.as_str())
+                .map(|&&dt| dt)
+                .unwrap_or(t.opened_at),
+            streaming: stream_by_turn.contains_key(t.turn_id.as_str()),
+        })
+        .collect();
+    rows.sort_by_key(|r| r.started);
+    rows
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {

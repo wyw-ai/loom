@@ -8,7 +8,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use proto::methods::{method, stream_kind};
-use proto::types::{Channel, Event, ScopeKind, ScopeRef};
+use proto::types::{Channel, Event, ScopeKind, ScopeRef, Turn};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::json;
@@ -16,7 +16,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::client::Client;
 
-use super::app::{App, Mode, PickerKind};
+use super::app::{App, Mode, OpenTurn, PickerKind};
 use super::picker::{PickerItem, PickerOutcome};
 use super::prompt::{ConfirmKind, PromptKind, PromptModal, PromptOutcome};
 use super::sidebar::SidebarFocus;
@@ -312,8 +312,42 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
                 }
             }
         }
+        stream_kind::TURN_OPENED => {
+            if let Some(turn_value) = data.get("turn").cloned() {
+                if let Ok(t) = serde_json::from_value::<Turn>(turn_value) {
+                    apply_turn_opened(app, t);
+                }
+            }
+        }
+        stream_kind::TURN_CLOSED => {
+            if let Some(turn_value) = data.get("turn").cloned() {
+                if let Ok(t) = serde_json::from_value::<Turn>(turn_value) {
+                    app.open_turns.remove(&t.id);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Register a freshly opened turn so cancel and the streaming bar know about
+/// it even before the agent emits its first `turn/stream.update` delta. Skip
+/// turns we ourselves own — humans don't run agent-style turns through this
+/// chat, and even if they did, cancel would be a no-op against the same
+/// connection.
+fn apply_turn_opened(app: &mut App, t: Turn) {
+    if t.actor_id == app.actor_id {
+        return;
+    }
+    app.open_turns.insert(
+        t.id.clone(),
+        OpenTurn {
+            turn_id: t.id,
+            actor_id: t.actor_id,
+            scope: t.scope,
+            opened_at: t.opened_at,
+        },
+    );
 }
 
 /// Apply a `channel.invited` actor-inbox push: patch the sidebar's channel +
@@ -664,8 +698,8 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             //   4. Otherwise: clear input + close any open picker.
             if app.input.is_empty() && app.reply_target.is_some() {
                 app.clear_reply_target();
-            } else if app.input.is_empty() && has_streaming_turn(app) {
-                cancel_in_scope(client, app, None).await;
+            } else if app.input.is_empty() && has_open_turn(app, scope) {
+                cancel_in_scope(client, app, scope, None).await;
             } else if app.input.is_empty() && app.selected_history_idx.is_some() {
                 app.clear_history_selection();
             } else {
@@ -1616,10 +1650,10 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
         "action" => app.open_action_picker(),
         "agents" => list_agents(client, app).await,
         "cancel" => {
-            // `/cancel`               → most recent streaming bubble
-            // `/cancel @agent`        → most recent streaming bubble for that actor
+            // `/cancel`               → the unique open turn (or selected one)
+            // `/cancel @agent`        → most recent open turn for that actor
             let target = arg.strip_prefix('@').map(|s| s.trim().to_string());
-            cancel_in_scope(client, app, target).await;
+            cancel_in_scope(client, app, scope, target).await;
         }
         "invite" => {
             // Resolve the current chat thread's owning channel — `/invite`
@@ -1958,49 +1992,61 @@ async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &S
     }
 }
 
-/// True when the user's current scope has at least one in-flight streaming
-/// bubble. Cheap (linear scan; chat history is small).
-fn has_streaming_turn(app: &App) -> bool {
-    !app.history.streaming_turns().is_empty()
+/// True when the current scope has at least one open turn that's cancellable.
+/// Source of truth is the `open_turns` registry (driven by `turn.opened` /
+/// `turn.closed` notifications), not the chat history's streaming-bubble
+/// state — agents may take a turn without ever emitting a stream delta.
+fn has_open_turn(app: &App, scope: &ScopeRef) -> bool {
+    !app.open_turns_in_scope(scope).is_empty()
 }
 
 /// Pick which in-flight turn to cancel.
 ///
-/// - `target_actor: Some(actor)` → most recent streaming bubble for that
-///   actor; status hint if none found.
+/// - `target_actor: Some(actor)` → most recent open turn for that actor;
+///   status hint if none found.
 /// - `target_actor: None`        → the bubble at `selected_history_idx` if
-///   it's streaming; otherwise the unique streaming bubble in scope; if
-///   multiple, status hint asking the user to disambiguate.
-fn pick_cancel_target(app: &App, target_actor: Option<&str>) -> Result<(String, String), String> {
-    let streaming = app.history.streaming_turns();
-    if streaming.is_empty() {
+///   it's tied to an open turn; otherwise the unique open turn in scope;
+///   if multiple, status hint asking the user to disambiguate.
+fn pick_cancel_target(
+    app: &App,
+    scope: &ScopeRef,
+    target_actor: Option<&str>,
+) -> Result<(String, String), String> {
+    let open = app.open_turns_in_scope(scope);
+    if open.is_empty() {
         return Err("no in-flight agent turn to cancel".into());
     }
     if let Some(actor) = target_actor {
-        if let Some((a, t, _)) = streaming.iter().rev().find(|(a, _, _)| a == actor) {
-            return Ok((a.clone(), t.clone()));
+        if let Some(t) = open.iter().rev().find(|t| t.actor_id == actor) {
+            return Ok((t.actor_id.clone(), t.turn_id.clone()));
         }
         return Err(format!("no in-flight turn for @{actor}"));
     }
-    // Selected bubble first.
+    // If the user has explicitly selected a bubble whose turn is still open,
+    // prefer that — it matches the selection-driven mental model.
     if let Some(idx) = app.selected_history_idx {
         if let Some(b) = app.history.bubbles.get(idx) {
-            if b.streaming {
-                if let Some(tid) = b.turn_id.clone() {
-                    return Ok((b.actor_id.clone(), tid));
+            if let Some(tid) = b.turn_id.as_ref() {
+                if open.iter().any(|t| t.turn_id.as_str() == tid.as_str()) {
+                    return Ok((b.actor_id.clone(), tid.clone()));
                 }
             }
         }
     }
-    if streaming.len() == 1 {
-        let (a, t, _) = &streaming[0];
-        return Ok((a.clone(), t.clone()));
+    if open.len() == 1 {
+        let t = open[0];
+        return Ok((t.actor_id.clone(), t.turn_id.clone()));
     }
-    Err("multiple agents are streaming — select one with ↑/↓ or use /cancel @agent".into())
+    Err("multiple agents are working — select one with ↑/↓ or use /cancel @agent".into())
 }
 
-async fn cancel_in_scope(client: &Arc<Client>, app: &mut App, target_actor: Option<String>) {
-    let (actor, turn_id) = match pick_cancel_target(app, target_actor.as_deref()) {
+async fn cancel_in_scope(
+    client: &Arc<Client>,
+    app: &mut App,
+    scope: &ScopeRef,
+    target_actor: Option<String>,
+) {
+    let (actor, turn_id) = match pick_cancel_target(app, scope, target_actor.as_deref()) {
         Ok(t) => t,
         Err(msg) => {
             app.set_status(msg);
@@ -2018,7 +2064,13 @@ async fn cancel_in_scope(client: &Arc<Client>, app: &mut App, target_actor: Opti
         )
         .await;
     match res {
-        Ok(_) => app.set_status(format!("cancelled @{display}'s turn")),
+        Ok(_) => {
+            // Optimistic cleanup: drop our local entry so a quick second Esc
+            // doesn't try to cancel the same already-cancelled turn before
+            // the `turn.closed` notification round-trips back.
+            app.open_turns.remove(&turn_id);
+            app.set_status(format!("cancelled @{display}'s turn"))
+        }
         Err(e) => app.set_status(format!("cancel failed: {}", e)),
     }
 }
@@ -2154,14 +2206,34 @@ mod tests {
         assert_eq!(app.status, "select a message with ↑/↓ first");
     }
 
-    fn app_with_streaming(actors_and_turns: &[(&str, &str)]) -> App {
+    fn test_scope() -> proto::types::ScopeRef {
+        proto::types::ScopeRef {
+            kind: proto::types::ScopeKind::Thread,
+            id: "thread_demo".into(),
+        }
+    }
+
+    fn app_with_open_turns(actors_and_turns: &[(&str, &str)]) -> App {
+        use crate::cmd::chat::app::OpenTurn;
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
+        let scope = test_scope();
         for (a, t) in actors_and_turns {
+            // Mirror real flow: register the open turn AND push a streaming
+            // bubble. The bubble lets us exercise the selection-aware branch.
+            app.open_turns.insert(
+                (*t).into(),
+                OpenTurn {
+                    turn_id: (*t).into(),
+                    actor_id: (*a).into(),
+                    scope: scope.clone(),
+                    opened_at: chrono::Utc::now(),
+                },
+            );
             app.history
                 .append_stream_delta(a, t, "live", chrono::Utc::now());
         }
@@ -2169,49 +2241,101 @@ mod tests {
     }
 
     #[test]
-    fn pick_cancel_target_none_when_no_streaming() {
-        let app = app_with_streaming(&[]);
-        let err = pick_cancel_target(&app, None).unwrap_err();
+    fn pick_cancel_target_none_when_no_open_turns() {
+        let app = app_with_open_turns(&[]);
+        let err = pick_cancel_target(&app, &test_scope(), None).unwrap_err();
         assert!(err.contains("no in-flight"));
     }
 
     #[test]
-    fn pick_cancel_target_picks_only_streaming_when_unspecified() {
-        let app = app_with_streaming(&[("Coder", "turn_1")]);
-        let (a, t) = pick_cancel_target(&app, None).unwrap();
+    fn pick_cancel_target_picks_only_open_when_unspecified() {
+        let app = app_with_open_turns(&[("Coder", "turn_1")]);
+        let (a, t) = pick_cancel_target(&app, &test_scope(), None).unwrap();
         assert_eq!(a, "Coder");
         assert_eq!(t, "turn_1");
     }
 
     #[test]
     fn pick_cancel_target_requires_disambiguation_when_multiple() {
-        let app = app_with_streaming(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
-        let err = pick_cancel_target(&app, None).unwrap_err();
+        let app = app_with_open_turns(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
+        let err = pick_cancel_target(&app, &test_scope(), None).unwrap_err();
         assert!(err.contains("/cancel @agent"));
     }
 
     #[test]
-    fn pick_cancel_target_uses_selected_streaming_bubble() {
-        let mut app = app_with_streaming(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
+    fn pick_cancel_target_uses_selected_bubble() {
+        let mut app = app_with_open_turns(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
         // Select the first (Coder) bubble.
         app.selected_history_idx = Some(0);
-        let (a, t) = pick_cancel_target(&app, None).unwrap();
+        let (a, t) = pick_cancel_target(&app, &test_scope(), None).unwrap();
         assert_eq!(a, "Coder");
         assert_eq!(t, "turn_1");
     }
 
     #[test]
     fn pick_cancel_target_filters_by_actor() {
-        let app = app_with_streaming(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
-        let (a, t) = pick_cancel_target(&app, Some("OpenCode")).unwrap();
+        let app = app_with_open_turns(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
+        let (a, t) = pick_cancel_target(&app, &test_scope(), Some("OpenCode")).unwrap();
         assert_eq!(a, "OpenCode");
         assert_eq!(t, "turn_2");
     }
 
     #[test]
-    fn pick_cancel_target_actor_not_streaming_errors() {
-        let app = app_with_streaming(&[("Coder", "turn_1")]);
-        let err = pick_cancel_target(&app, Some("OpenCode")).unwrap_err();
+    fn pick_cancel_target_actor_not_open_errors() {
+        let app = app_with_open_turns(&[("Coder", "turn_1")]);
+        let err = pick_cancel_target(&app, &test_scope(), Some("OpenCode")).unwrap_err();
         assert!(err.contains("@OpenCode"));
+    }
+
+    #[test]
+    fn pick_cancel_target_works_without_streaming_bubbles() {
+        // The whole point of the fix: an agent that hasn't emitted any
+        // `turn/stream.update` deltas yet should still be cancellable.
+        use crate::cmd::chat::app::OpenTurn;
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.open_turns.insert(
+            "turn_silent".into(),
+            OpenTurn {
+                turn_id: "turn_silent".into(),
+                actor_id: "Coder".into(),
+                scope: test_scope(),
+                opened_at: chrono::Utc::now(),
+            },
+        );
+        // No streaming bubbles, no history at all — used to error before fix.
+        let (a, t) = pick_cancel_target(&app, &test_scope(), None).unwrap();
+        assert_eq!(a, "Coder");
+        assert_eq!(t, "turn_silent");
+    }
+
+    #[test]
+    fn pick_cancel_target_ignores_open_turns_in_other_scopes() {
+        use crate::cmd::chat::app::OpenTurn;
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        let other = proto::types::ScopeRef {
+            kind: proto::types::ScopeKind::Thread,
+            id: "thread_other".into(),
+        };
+        app.open_turns.insert(
+            "turn_x".into(),
+            OpenTurn {
+                turn_id: "turn_x".into(),
+                actor_id: "Coder".into(),
+                scope: other,
+                opened_at: chrono::Utc::now(),
+            },
+        );
+        let err = pick_cancel_target(&app, &test_scope(), None).unwrap_err();
+        assert!(err.contains("no in-flight"));
     }
 }

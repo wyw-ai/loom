@@ -245,6 +245,33 @@ impl AcpAdapter {
         .map_err(|e| e.to_string())?
     }
 
+    async fn cancel_internal(&self, scope: ScopeRef) -> Result<(), String> {
+        // Look up the per-scope ACP session id. No session means no in-flight
+        // prompt for this scope — silent no-op (cancel is idempotent).
+        let (shared, session_id) = {
+            let inner = self.inner.lock();
+            let Some(shared) = inner.shared.clone() else {
+                return Ok(());
+            };
+            let Some(sid) = inner.sessions.get(&scope.id).cloned() else {
+                return Ok(());
+            };
+            (shared, sid)
+        };
+        // Fire-and-forget: the agent's pending session/prompt response will
+        // come back with stopReason="cancelled" and run through the existing
+        // Finished path. We don't wait on it here.
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            shared.write_message(&json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": session_id },
+            }))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn stop_internal(&self) -> Result<(), String> {
         let (shared, session_ids, mut child) = {
             let mut inner = self.inner.lock();
@@ -300,6 +327,10 @@ impl Adapter for AcpAdapter {
     async fn respond_action(&self, request_id: String, option_id: String) -> Result<(), String> {
         self.respond_permission_internal(request_id, option_id)
             .await
+    }
+
+    async fn cancel(&self, scope: ScopeRef) -> Result<(), String> {
+        self.cancel_internal(scope).await
     }
 
     async fn stop(&self) -> Result<(), String> {

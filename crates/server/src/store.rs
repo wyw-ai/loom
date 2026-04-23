@@ -51,6 +51,17 @@ pub enum StoreEvent {
         channel_id: String,
         actor_id: String,
     },
+    /// Partial text from an in-flight agent turn. Pure broadcast signal —
+    /// NEVER persisted (the canonical record is the `content.add` event
+    /// written when the turn closes). ws::fanout maps this to a
+    /// `turn/stream.update` notification for scope subscribers.
+    TurnStreamDelta {
+        turn_id: String,
+        scope: ScopeRef,
+        actor_id: String,
+        seq: u64,
+        delta: String,
+    },
 }
 
 impl StoreEvent {
@@ -72,6 +83,7 @@ impl StoreEvent {
             // fanout routes them via `send_to_actor`, not scope subs.
             StoreEvent::ChannelGranted { .. } => None,
             StoreEvent::ChannelRevoked { .. } => None,
+            StoreEvent::TurnStreamDelta { scope, .. } => Some(scope.clone()),
         }
     }
 }
@@ -512,6 +524,28 @@ impl Store {
             .push(frame.clone());
         self.emit(StoreEvent::TraceAppended(frame.clone()));
         Ok(frame)
+    }
+
+    /// Broadcast a partial-text delta for an in-flight turn to scope
+    /// subscribers. NOT persisted: `seq` is supplied by the caller (see
+    /// `RuntimeManager::next_stream_seq`) and the canonical record of what
+    /// the agent said is the `content.add` event written at turn close.
+    /// Use this purely for live-typing UX in chat clients.
+    pub fn broadcast_stream_delta(
+        &self,
+        turn_id: String,
+        scope: ScopeRef,
+        actor_id: String,
+        seq: u64,
+        delta: String,
+    ) {
+        self.emit(StoreEvent::TurnStreamDelta {
+            turn_id,
+            scope,
+            actor_id,
+            seq,
+            delta,
+        });
     }
 
     /// Read trace frames for a turn. `before_seq` selects frames with

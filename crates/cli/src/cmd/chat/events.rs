@@ -241,6 +241,12 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         }
         return;
     }
+    if n.method == method::TURN_STREAM_UPDATE {
+        if let Some(params) = n.params {
+            handle_stream_update(app, scope, &params);
+        }
+        return;
+    }
     if n.method != method::STREAM_UPDATE {
         return;
     }
@@ -412,6 +418,35 @@ fn apply_channel_revoked(app: &mut App, data: &serde_json::Value) {
 /// connection is bound to the turn's actor before pushing the frame. We surface
 /// it on the status line so the operator can see the agent's internal cursor
 /// (tool starts, status transitions) without polluting history.
+/// Apply a `turn/stream.update` notification: append a partial-text delta
+/// into the streaming bubble for `(actorId, turnId)`. Drops frames whose
+/// scope doesn't match the user's current scope; that bubble would belong
+/// to a different room and the server still routed it to us because we're
+/// also a subscriber there.
+fn handle_stream_update(app: &mut App, scope: &ScopeRef, params: &serde_json::Value) {
+    if let Some(s) = params.get("scope").cloned() {
+        if let Ok(parsed) = serde_json::from_value::<ScopeRef>(s) {
+            if &parsed != scope {
+                return;
+            }
+        }
+    }
+    let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+    let actor_id = params.get("actorId").and_then(|v| v.as_str()).unwrap_or("");
+    let delta = params
+        .get("deltaText")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if turn_id.is_empty() || actor_id.is_empty() || delta.is_empty() {
+        return;
+    }
+    app.history
+        .append_stream_delta(actor_id, turn_id, delta, chrono::Utc::now());
+    if app.auto_follow {
+        app.jump_to_bottom();
+    }
+}
+
 fn handle_trace_update(app: &mut App, params: &serde_json::Value) {
     let frame = match params.get("frame") {
         Some(f) => f,
@@ -599,8 +634,16 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
 
     match key.code {
         KeyCode::Esc => {
+            // Priority order on Esc with empty input:
+            //   1. Clear an armed reply target.
+            //   2. Cancel an in-flight agent turn (selected one if any,
+            //      otherwise "the only one" or a hint to disambiguate).
+            //   3. Clear history selection (read-only nav reset).
+            //   4. Otherwise: clear input + close any open picker.
             if app.input.is_empty() && app.reply_target.is_some() {
                 app.clear_reply_target();
+            } else if app.input.is_empty() && has_streaming_turn(app) {
+                cancel_in_scope(client, app, None).await;
             } else if app.input.is_empty() && app.selected_history_idx.is_some() {
                 app.clear_history_selection();
             } else {
@@ -1498,6 +1541,12 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
         }
         "action" => app.open_action_picker(),
         "agents" => list_agents(client, app).await,
+        "cancel" => {
+            // `/cancel`               → most recent streaming bubble
+            // `/cancel @agent`        → most recent streaming bubble for that actor
+            let target = arg.strip_prefix('@').map(|s| s.trim().to_string());
+            cancel_in_scope(client, app, target).await;
+        }
         "invite" => {
             // Resolve the current chat thread's owning channel — `/invite`
             // always targets the channel we're chatting in, not whatever the
@@ -1750,7 +1799,7 @@ fn arm_reply_target(app: &mut App, event_id: String) {
         .into_iter()
         .find(|(id, _)| id == &event_id)
         .map(|(_, label)| label)
-        .unwrap_or_else(|| short_event_id(&event_id));
+        .unwrap_or_else(|| "(unknown message)".to_string());
     if app.input.trim_start().starts_with("/reply") {
         app.input.clear();
         app.slash_menu = None;
@@ -1827,17 +1876,74 @@ async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &S
     }
 }
 
-fn short_event_id(id: &str) -> String {
-    if id.len() > 12 {
-        format!("{}…", &id[..12])
-    } else {
-        id.to_string()
+/// True when the user's current scope has at least one in-flight streaming
+/// bubble. Cheap (linear scan; chat history is small).
+fn has_streaming_turn(app: &App) -> bool {
+    !app.history.streaming_turns().is_empty()
+}
+
+/// Pick which in-flight turn to cancel.
+///
+/// - `target_actor: Some(actor)` → most recent streaming bubble for that
+///   actor; status hint if none found.
+/// - `target_actor: None`        → the bubble at `selected_history_idx` if
+///   it's streaming; otherwise the unique streaming bubble in scope; if
+///   multiple, status hint asking the user to disambiguate.
+fn pick_cancel_target(app: &App, target_actor: Option<&str>) -> Result<(String, String), String> {
+    let streaming = app.history.streaming_turns();
+    if streaming.is_empty() {
+        return Err("no in-flight agent turn to cancel".into());
+    }
+    if let Some(actor) = target_actor {
+        if let Some((a, t, _)) = streaming.iter().rev().find(|(a, _, _)| a == actor) {
+            return Ok((a.clone(), t.clone()));
+        }
+        return Err(format!("no in-flight turn for @{actor}"));
+    }
+    // Selected bubble first.
+    if let Some(idx) = app.selected_history_idx {
+        if let Some(b) = app.history.bubbles.get(idx) {
+            if b.streaming {
+                if let Some(tid) = b.turn_id.clone() {
+                    return Ok((b.actor_id.clone(), tid));
+                }
+            }
+        }
+    }
+    if streaming.len() == 1 {
+        let (a, t, _) = &streaming[0];
+        return Ok((a.clone(), t.clone()));
+    }
+    Err("multiple agents are streaming — select one with ↑/↓ or use /cancel @agent".into())
+}
+
+async fn cancel_in_scope(client: &Arc<Client>, app: &mut App, target_actor: Option<String>) {
+    let (actor, turn_id) = match pick_cancel_target(app, target_actor.as_deref()) {
+        Ok(t) => t,
+        Err(msg) => {
+            app.set_status(msg);
+            return;
+        }
+    };
+    let display = app.display_name_for(&actor);
+    let res = client
+        .call_raw(
+            method::TURN_CLOSE,
+            Some(json!({
+                "turnId": turn_id,
+                "status": "cancelled",
+            })),
+        )
+        .await;
+    match res {
+        Ok(_) => app.set_status(format!("cancelled @{display}'s turn")),
+        Err(e) => app.set_status(format!("cancel failed: {}", e)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_reply_target, message_relations, reply_selected_history};
+    use super::{arm_reply_target, message_relations, pick_cancel_target, reply_selected_history};
     use crate::cmd::chat::app::App;
     use crate::cmd::chat::history::{Bubble, BubbleKind, DeliveryState};
     use chrono::Utc;
@@ -1876,6 +1982,7 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
+            streaming: false,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
@@ -1907,6 +2014,7 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
+            streaming: false,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
@@ -1932,6 +2040,7 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
+            streaming: false,
         });
         app.selected_history_idx = Some(0);
 
@@ -1956,5 +2065,65 @@ mod tests {
         reply_selected_history(&mut app);
 
         assert_eq!(app.status, "select a message with ↑/↓ first");
+    }
+
+    fn app_with_streaming(actors_and_turns: &[(&str, &str)]) -> App {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            "bojun.cbj".into(),
+        );
+        for (a, t) in actors_and_turns {
+            app.history
+                .append_stream_delta(a, t, "live", chrono::Utc::now());
+        }
+        app
+    }
+
+    #[test]
+    fn pick_cancel_target_none_when_no_streaming() {
+        let app = app_with_streaming(&[]);
+        let err = pick_cancel_target(&app, None).unwrap_err();
+        assert!(err.contains("no in-flight"));
+    }
+
+    #[test]
+    fn pick_cancel_target_picks_only_streaming_when_unspecified() {
+        let app = app_with_streaming(&[("Coder", "turn_1")]);
+        let (a, t) = pick_cancel_target(&app, None).unwrap();
+        assert_eq!(a, "Coder");
+        assert_eq!(t, "turn_1");
+    }
+
+    #[test]
+    fn pick_cancel_target_requires_disambiguation_when_multiple() {
+        let app = app_with_streaming(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
+        let err = pick_cancel_target(&app, None).unwrap_err();
+        assert!(err.contains("/cancel @agent"));
+    }
+
+    #[test]
+    fn pick_cancel_target_uses_selected_streaming_bubble() {
+        let mut app = app_with_streaming(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
+        // Select the first (Coder) bubble.
+        app.selected_history_idx = Some(0);
+        let (a, t) = pick_cancel_target(&app, None).unwrap();
+        assert_eq!(a, "Coder");
+        assert_eq!(t, "turn_1");
+    }
+
+    #[test]
+    fn pick_cancel_target_filters_by_actor() {
+        let app = app_with_streaming(&[("Coder", "turn_1"), ("OpenCode", "turn_2")]);
+        let (a, t) = pick_cancel_target(&app, Some("OpenCode")).unwrap();
+        assert_eq!(a, "OpenCode");
+        assert_eq!(t, "turn_2");
+    }
+
+    #[test]
+    fn pick_cancel_target_actor_not_streaming_errors() {
+        let app = app_with_streaming(&[("Coder", "turn_1")]);
+        let err = pick_cancel_target(&app, Some("OpenCode")).unwrap_err();
+        assert!(err.contains("@OpenCode"));
     }
 }

@@ -37,6 +37,13 @@ pub trait Adapter: Send + Sync {
     /// a no-op or return an error if called.
     async fn respond_action(&self, request_id: String, option_id: String) -> Result<(), String>;
 
+    /// Cancel any in-flight prompt for `scope`. Idempotent — calling on a
+    /// scope with no active prompt is a no-op. Implementations should NOT
+    /// block on the cancellation completing; the eventual
+    /// `AdapterEvent::Finished { success: false, .. }` will arrive on the
+    /// event stream just like a normal completion.
+    async fn cancel(&self, scope: ScopeRef) -> Result<(), String>;
+
     /// Stop the agent. Implementations should be idempotent.
     async fn stop(&self) -> Result<(), String>;
 }

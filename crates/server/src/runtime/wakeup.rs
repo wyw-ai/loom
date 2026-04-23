@@ -80,7 +80,7 @@ async fn wake_agent(
 /// queued trigger for a scope. On `send_prompt` failure we iteratively drain
 /// the queue (rather than spawn-recursing) so a single bad prompt can't strand
 /// the rest, and so the future stays Send for `tokio::spawn`.
-async fn dispatch_trigger(
+pub async fn dispatch_trigger(
     manager: Arc<RuntimeManager>,
     actor_id: String,
     mut trigger: Event,
@@ -295,6 +295,20 @@ async fn translate_event(
                 TraceKind::TextDelta,
                 json!({ "text": content }),
             );
+            // Public scope broadcast: partial chunks fan out to every scope
+            // subscriber as `turn/stream.update` so other channel members see
+            // the agent typing in real time. Not journaled — the canonical
+            // record is the `content.add` flushed at turn close.
+            if !content.is_empty() {
+                let seq = manager.next_stream_seq(&actor, tid);
+                store.broadcast_stream_delta(
+                    tid.to_string(),
+                    scope.clone(),
+                    actor.clone(),
+                    seq,
+                    content.clone(),
+                );
+            }
             if !is_partial {
                 if let Some(text) = manager.take_text_buffer(&actor, tid) {
                     flush_text_as_event(store, &actor, &scope, tid, text);

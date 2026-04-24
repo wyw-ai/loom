@@ -8,15 +8,23 @@ pub struct DraftInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedWorkspaceRef {
+    pub display: String,
+    pub submission: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftSubmission {
+    pub text: String,
+    pub attached_artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DraftSegment {
     Text(String),
-    Pasted {
-        display: String,
-        text: String,
-    },
-    SavedWorkspace {
-        display: String,
-    },
+    Pasted { display: String, text: String },
+    SavedWorkspace(SavedWorkspaceRef),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +114,8 @@ impl DraftInput {
         self.insert_segment(DraftSegment::Pasted { display, text });
     }
 
-    pub fn push_saved_workspace_ref(&mut self, display: String) {
-        self.insert_segment(DraftSegment::SavedWorkspace { display });
+    pub fn push_saved_workspace_ref(&mut self, saved: SavedWorkspaceRef) {
+        self.insert_segment(DraftSegment::SavedWorkspace(saved));
     }
 
     pub fn move_left(&mut self) -> bool {
@@ -206,16 +214,31 @@ impl DraftInput {
             .sum::<usize>()
     }
 
-    pub fn submission_text(&self) -> String {
-        self.segments
-            .iter()
-            .map(submission_for_segment)
-            .collect::<Vec<_>>()
-            .concat()
+    pub fn submission(&self) -> DraftSubmission {
+        let mut text = String::new();
+        let mut attached_artifact_ids = Vec::new();
+        for segment in &self.segments {
+            match segment {
+                DraftSegment::Text(value) => text.push_str(value),
+                DraftSegment::Pasted { text: value, .. } => text.push_str(value),
+                DraftSegment::SavedWorkspace(saved) => {
+                    text.push_str(&saved.submission);
+                    attached_artifact_ids.push(saved.artifact_id.clone());
+                }
+            }
+        }
+        DraftSubmission {
+            text,
+            attached_artifact_ids,
+        }
     }
 
-    pub fn take_submission_text(&mut self) -> String {
-        std::mem::take(self).submission_text()
+    pub fn submission_text(&self) -> String {
+        self.submission().text
+    }
+
+    pub fn take_submission(&mut self) -> DraftSubmission {
+        std::mem::take(self).submission()
     }
 
     fn insert_text(&mut self, text: &str) {
@@ -242,11 +265,13 @@ impl DraftInput {
                 if let Some(DraftSegment::Text(buf)) = self.segments.get_mut(insert_at - 1) {
                     buf.push_str(text);
                 } else {
-                    self.segments.insert(insert_at, DraftSegment::Text(text.to_string()));
+                    self.segments
+                        .insert(insert_at, DraftSegment::Text(text.to_string()));
                 }
             }
             _ => {
-                self.segments.insert(insert_at, DraftSegment::Text(text.to_string()));
+                self.segments
+                    .insert(insert_at, DraftSegment::Text(text.to_string()));
             }
         }
         self.cursor += text.chars().count();
@@ -318,9 +343,9 @@ impl DraftInput {
                     segment_idx,
                     display,
                 }),
-                DraftSegment::SavedWorkspace { display } => units.push(UnitRef::Token {
+                DraftSegment::SavedWorkspace(saved) => units.push(UnitRef::Token {
                     segment_idx,
-                    display,
+                    display: &saved.display,
                 }),
             }
         }
@@ -344,9 +369,12 @@ impl DraftInput {
                 UnitRef::Char {
                     segment_idx: idx, ..
                 } if *idx == segment_idx => count += 1,
-                UnitRef::Char { segment_idx: idx, .. } | UnitRef::Token { segment_idx: idx, .. }
-                    if *idx > segment_idx =>
-                {
+                UnitRef::Char {
+                    segment_idx: idx, ..
+                }
+                | UnitRef::Token {
+                    segment_idx: idx, ..
+                } if *idx > segment_idx => {
                     break;
                 }
                 _ => {}
@@ -452,15 +480,7 @@ fn display_for_segment(segment: &DraftSegment) -> String {
     match segment {
         DraftSegment::Text(text) => text.clone(),
         DraftSegment::Pasted { display, .. } => display.clone(),
-        DraftSegment::SavedWorkspace { display } => display.clone(),
-    }
-}
-
-fn submission_for_segment(segment: &DraftSegment) -> String {
-    match segment {
-        DraftSegment::Text(text) => text.clone(),
-        DraftSegment::Pasted { text, .. } => text.clone(),
-        DraftSegment::SavedWorkspace { display } => display.clone(),
+        DraftSegment::SavedWorkspace(saved) => saved.display.clone(),
     }
 }
 
@@ -508,7 +528,7 @@ impl From<&str> for DraftInput {
 
 #[cfg(test)]
 mod tests {
-    use super::DraftInput;
+    use super::{DraftInput, SavedWorkspaceRef};
 
     #[test]
     fn pop_removes_entire_pasted_token() {
@@ -525,10 +545,19 @@ mod tests {
     fn submission_text_expands_pasted_chunk() {
         let mut input = DraftInput::default();
         input.push_pasted_chunk(2, "hello\nworld".into());
-        input.push_saved_workspace_ref("[Saved pasted content to workspace (5.0 KB) id=3]".into());
+        input.push_saved_workspace_ref(SavedWorkspaceRef {
+            display: "[Saved pasted content to workspace (5.0 KB) id=3]".into(),
+            submission:
+                "[Saved pasted content to workspace (5.0 KB) id=3 artifactUri=artifact://art_123/pasted-content.md workspacePath=/tmp/thread/pasted-content-3.md]".into(),
+            artifact_id: "art_123".into(),
+        });
         assert_eq!(
             input.submission_text(),
-            "hello\nworld[Saved pasted content to workspace (5.0 KB) id=3]"
+            "hello\nworld[Saved pasted content to workspace (5.0 KB) id=3 artifactUri=artifact://art_123/pasted-content.md workspacePath=/tmp/thread/pasted-content-3.md]"
+        );
+        assert_eq!(
+            input.submission().attached_artifact_ids,
+            vec!["art_123".to_string()]
         );
     }
 

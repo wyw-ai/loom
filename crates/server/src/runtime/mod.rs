@@ -510,11 +510,11 @@ impl RuntimeManager {
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(&paths.root)?;
         let Some(bundle) = spec.bundle.as_ref() else {
-            std::fs::create_dir_all(&paths.current)?;
+            reset_bundle_current_dir(&paths.current)?;
             return Ok(());
         };
         if bundle.source.trim().is_empty() {
-            std::fs::create_dir_all(&paths.current)?;
+            reset_bundle_current_dir(&paths.current)?;
             return Ok(());
         }
 
@@ -747,6 +747,11 @@ fn link_current_bundle(installed: &Path, current: &Path) -> std::io::Result<()> 
     symlink_path(installed, current)
 }
 
+fn reset_bundle_current_dir(current: &Path) -> std::io::Result<()> {
+    remove_path_if_exists(current)?;
+    std::fs::create_dir_all(current)
+}
+
 fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -821,4 +826,40 @@ fn prepend_path(dir: &Path) -> String {
     std::env::join_paths(paths)
         .map(|os| os.to_string_lossy().to_string())
         .unwrap_or_else(|_| dir.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "joi-runtime-tests-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos()
+        ));
+        path
+    }
+
+    #[test]
+    fn reset_bundle_current_dir_replaces_stale_symlink() {
+        let root = temp_path("bundle-cleanup");
+        let old_target = root.join("old-bundle");
+        let current = root.join("bundles").join("current");
+        std::fs::create_dir_all(&old_target).expect("create old target");
+        std::fs::create_dir_all(current.parent().expect("current parent"))
+            .expect("create current parent");
+        symlink_path(&old_target, &current).expect("seed stale symlink");
+
+        reset_bundle_current_dir(&current).expect("reset current");
+
+        let meta = std::fs::symlink_metadata(&current).expect("current metadata");
+        assert!(meta.is_dir());
+        assert!(!meta.file_type().is_symlink());
+
+        std::fs::remove_dir_all(root).ok();
+    }
 }

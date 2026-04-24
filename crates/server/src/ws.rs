@@ -272,19 +272,33 @@ fn fanout(state: &AppState, ev: StoreEvent) {
     // there's no hands_off_to to follow, so they only ride the scope fan-out.
     if let StoreEvent::EventCreated(e) = &ev {
         use proto::types::{RefKind, RelationKind};
-        let mut already_sent: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut already_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Don't double-send to an actor whose own connection is also a scope
         // subscriber — that's a minor optimization but more importantly avoids
         // self-loops when the agent emits its own events on the same scope.
-        already_sent.insert(e.actor_id.as_str());
+        already_sent.insert(e.actor_id.clone());
+
+        // Resolve targets up-front: explicit HandsOffTo plus the implicit
+        // RespondsTo reverse-target (the actor whose event is being replied
+        // to). Reverse-delivery makes service plugins reachable without
+        // subscribing to every scope they touch — see store.rs append_event.
+        let mut targets: Vec<(String, &'static str)> = Vec::new();
         for r in &e.relations {
-            if !matches!(r.kind, RelationKind::HandsOffTo) {
-                continue;
+            match r.kind {
+                RelationKind::HandsOffTo if r.target.kind == RefKind::Actor => {
+                    targets.push((r.target.id.clone(), "hands_off_to"));
+                }
+                RelationKind::RespondsTo if r.target.kind == RefKind::Event => {
+                    if let Some(orig) = state.store.get_event(&r.target.id) {
+                        targets.push((orig.actor_id, "responds_to"));
+                    }
+                }
+                _ => {}
             }
-            if r.target.kind != RefKind::Actor {
-                continue;
-            }
-            if !already_sent.insert(r.target.id.as_str()) {
+        }
+
+        for (target_id, reason) in targets {
+            if !already_sent.insert(target_id.clone()) {
                 continue;
             }
             // ACL gate the actor-inbox push: an outsider being mentioned
@@ -293,19 +307,20 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             // already-invited actors fall through.
             if !state.store.is_channel_member(
                 &channel_id_for_scope(state, &e.scope).unwrap_or_default(),
-                &r.target.id,
+                &target_id,
             ) && !is_public_scope(state, &e.scope)
             {
                 tracing::debug!(
                     event = %e.id,
-                    target = %r.target.id,
+                    target = %target_id,
+                    reason = reason,
                     scope = ?e.scope,
                     "actor-inbox push skipped: target not a member of private channel",
                 );
                 continue;
             }
             let delivered = state.subscriptions.send_to_actor(
-                &r.target.id,
+                &target_id,
                 method::STREAM_UPDATE,
                 payload.clone(),
             );
@@ -313,7 +328,8 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                 event = %e.id,
                 kind = %e.kind,
                 from = %e.actor_id,
-                target = %r.target.id,
+                target = %target_id,
+                reason = reason,
                 delivered,
                 "actor-inbox fanout",
             );

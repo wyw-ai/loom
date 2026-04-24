@@ -709,6 +709,48 @@ impl Store {
             }
         }
 
+        // Reverse-delivery for RespondsTo: when an event responds to a prior
+        // event, the original event's actor is an implicit recipient. This is
+        // what lets a service plugin that emitted a hand-off receive the
+        // agent's reply via actor-inbox without subscribing to every scope it
+        // touches. Self-responses (replying to your own event) are skipped to
+        // avoid pending rows the speaker would have to acknowledge themselves.
+        let mut reverse_targets: Vec<String> = Vec::new();
+        {
+            let inner = self.inner.read();
+            for r in &event.relations {
+                if !matches!(r.kind, RelationKind::RespondsTo) || r.target.kind != RefKind::Event {
+                    continue;
+                }
+                let Some(orig) = inner.events.get(&r.target.id) else {
+                    continue;
+                };
+                if orig.actor_id == actor_id {
+                    continue;
+                }
+                if reverse_targets.contains(&orig.actor_id) {
+                    continue;
+                }
+                reverse_targets.push(orig.actor_id.clone());
+            }
+        }
+        for target in reverse_targets {
+            let delivery = Delivery {
+                event_id: event.id.clone(),
+                actor_id: target,
+                state: DeliveryState::Pending,
+                updated_at: now,
+                _meta: None,
+            };
+            self.journal
+                .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+            self.inner.write().deliveries.insert(
+                (delivery.event_id.clone(), delivery.actor_id.clone()),
+                delivery.clone(),
+            );
+            self.emit(StoreEvent::DeliveryUpdated(delivery));
+        }
+
         // For threads whose root_event_id is unset, set it on the first
         // appended event if it has no replies_to.
         if let ScopeKind::Thread = event.scope.kind {
@@ -1242,5 +1284,150 @@ mod tests {
             .delete_thread("thread_missing")
             .expect_err("must be NotFound");
         assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    /// Helper for RespondsTo tests below: append `kind` from `actor` into
+    /// `scope` with the given relations. Returns the created event id.
+    fn append_with_relations(
+        store: &Arc<Store>,
+        kind: &str,
+        actor: &str,
+        scope: ScopeRef,
+        relations: Vec<Relation>,
+    ) -> String {
+        store
+            .append_event(
+                kind.into(),
+                actor.into(),
+                scope,
+                None,
+                serde_json::json!({"text": "hi"}),
+                relations,
+                None,
+            )
+            .expect("append event")
+            .id
+    }
+
+    fn responds_to(event_id: &str) -> Relation {
+        Relation {
+            kind: RelationKind::RespondsTo,
+            target: Ref {
+                kind: RefKind::Event,
+                id: event_id.into(),
+                _meta: None,
+            },
+            _meta: None,
+        }
+    }
+
+    #[test]
+    fn responds_to_writes_pending_delivery_for_original_actor() {
+        // svc_am_bridge appends a question, agent_qa replies with RespondsTo
+        // -> question event. The reply event must produce a pending delivery
+        // row for svc_am_bridge so a restarted service host can replay it via
+        // the future delivery/list API.
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        store.grant_channel(&ch.id, "svc_am_bridge").unwrap();
+        store.grant_channel(&ch.id, "agent_qa").unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: ch.id.clone(),
+        };
+
+        let trigger_id = append_with_relations(
+            &store,
+            "content.add",
+            "svc_am_bridge",
+            scope.clone(),
+            vec![],
+        );
+        let reply_id = append_with_relations(
+            &store,
+            "content.add",
+            "agent_qa",
+            scope,
+            vec![responds_to(&trigger_id)],
+        );
+
+        let key = (reply_id.clone(), "svc_am_bridge".to_string());
+        let delivery = store
+            .inner
+            .read()
+            .deliveries
+            .get(&key)
+            .cloned()
+            .expect("reverse delivery row exists");
+        assert!(matches!(delivery.state, DeliveryState::Pending));
+        assert_eq!(delivery.event_id, reply_id);
+        assert_eq!(delivery.actor_id, "svc_am_bridge");
+    }
+
+    #[test]
+    fn responds_to_skips_self_response() {
+        // An actor responding to its own prior event should not generate a
+        // self-deliver row — it would just be noise the speaker has to ack.
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        store.grant_channel(&ch.id, "agent_qa").unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: ch.id.clone(),
+        };
+
+        let first_id =
+            append_with_relations(&store, "content.add", "agent_qa", scope.clone(), vec![]);
+        let second_id = append_with_relations(
+            &store,
+            "content.add",
+            "agent_qa",
+            scope,
+            vec![responds_to(&first_id)],
+        );
+
+        let key = (second_id, "agent_qa".to_string());
+        assert!(
+            store.inner.read().deliveries.get(&key).is_none(),
+            "self-response must not write a delivery row",
+        );
+    }
+
+    #[test]
+    fn responds_to_replays_through_journal() {
+        // Reverse-delivery rows must round-trip through the journal so that
+        // restarting the server preserves the pending inbox for offline
+        // service actors.
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        store.grant_channel(&ch.id, "svc_am_bridge").unwrap();
+        store.grant_channel(&ch.id, "agent_qa").unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: ch.id.clone(),
+        };
+
+        let trigger_id = append_with_relations(
+            &store,
+            "content.add",
+            "svc_am_bridge",
+            scope.clone(),
+            vec![],
+        );
+        let reply_id = append_with_relations(
+            &store,
+            "content.add",
+            "agent_qa",
+            scope,
+            vec![responds_to(&trigger_id)],
+        );
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        let key = (reply_id, "svc_am_bridge".to_string());
+        assert!(
+            store2.inner.read().deliveries.get(&key).is_some(),
+            "reverse delivery row must replay from journal",
+        );
     }
 }

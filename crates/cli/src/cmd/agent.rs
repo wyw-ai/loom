@@ -146,6 +146,7 @@ pub async fn add(client: Arc<Client>) -> Result<()> {
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        bundle: None,
         identity: Some(proto::methods::IdentitySpec::default()),
         memory: Some(proto::methods::MemorySpec {
             delivery: proto::methods::MemoryDeliverySpec {

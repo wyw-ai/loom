@@ -212,7 +212,7 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 | --- | --- | --- |
 | Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） | 同左 |
 | Agent spec | `--agents-dir`（默认 `./agents`） | `~/.config/joi/agents/`（`--specs <dir>` 可覆盖） |
-| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,profile,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,profile,logs}` |
+| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,profile,logs,bundles}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,profile,logs,bundles}` |
 | Command transport session 簿记 | （仅 v1 用到） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
 | CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） | 同左 |
 

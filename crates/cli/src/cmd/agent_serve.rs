@@ -28,7 +28,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use proto::methods::{method, stream_kind, AgentSpec, EventAppendResult, TurnOpenResult};
+use proto::methods::{
+    method, stream_kind, AgentBundleSpec, AgentSpec, BundleInstallMode, EventAppendResult,
+    TurnOpenResult,
+};
 use proto::types::trace::TraceKind;
 use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus};
 use serde_json::{json, Value};
@@ -167,6 +170,8 @@ struct AgentPaths {
     profile: PathBuf,
     logs: PathBuf,
     root: PathBuf,
+    bundle_root: PathBuf,
+    bundle_current: PathBuf,
     sessions: PathBuf,
 }
 
@@ -177,6 +182,8 @@ impl AgentPaths {
             workspace: agent_root.join("workspace"),
             profile: agent_root.join("profile"),
             logs: agent_root.join("logs"),
+            bundle_root: agent_root.join("bundles"),
+            bundle_current: agent_root.join("bundles").join("current"),
             root: agent_root,
             sessions: root.join("sessions"),
         }
@@ -187,6 +194,7 @@ impl AgentPaths {
         std::fs::create_dir_all(&self.profile)?;
         std::fs::create_dir_all(&self.logs)?;
         std::fs::create_dir_all(&self.sessions)?;
+        ensure_bundle(actor_id, spec, self)?;
         if let Err(e) = agent_runtime::ensure_agents_md(&self.workspace, actor_id) {
             tracing::warn!(actor = %actor_id, %e, "failed to write AGENTS.md");
         }
@@ -229,6 +237,128 @@ impl AgentPaths {
             .replace("{agent.profile}", &self.profile.display().to_string())
             .replace("{agent.logs}", &self.logs.display().to_string())
             .replace("{agent.root}", &self.root.display().to_string())
+            .replace("{agent.home}", &self.root.display().to_string())
+            .replace(
+                "{agent.bundle_root}",
+                &self.bundle_root.display().to_string(),
+            )
+            .replace("{agent.bundle}", &self.bundle_current.display().to_string())
+    }
+}
+
+fn ensure_bundle(_actor_id: &str, spec: &AgentSpec, paths: &AgentPaths) -> std::io::Result<()> {
+    std::fs::create_dir_all(&paths.bundle_root)?;
+    let Some(bundle) = spec.bundle.as_ref() else {
+        std::fs::create_dir_all(&paths.bundle_current)?;
+        return Ok(());
+    };
+    if bundle.source.trim().is_empty() {
+        std::fs::create_dir_all(&paths.bundle_current)?;
+        return Ok(());
+    }
+    let source = PathBuf::from(paths.expand(&bundle.source));
+    let version = normalized_bundle_version(bundle, &source);
+    let install_dir = paths.bundle_root.join(&version);
+    install_bundle_dir(&source, &install_dir, bundle.install_mode)?;
+    link_current_bundle(&install_dir, &paths.bundle_current)?;
+    Ok(())
+}
+
+fn normalized_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
+    let raw = if !bundle.version.trim().is_empty() {
+        bundle.version.trim().to_string()
+    } else {
+        source
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bundle")
+            .to_string()
+    };
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn install_bundle_dir(
+    source: &Path,
+    target: &Path,
+    mode: BundleInstallMode,
+) -> std::io::Result<()> {
+    if !source.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("bundle source `{}` does not exist", source.display()),
+        ));
+    }
+    remove_path_if_exists(target)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match mode {
+        BundleInstallMode::Copy => copy_recursively(source, target),
+        BundleInstallMode::Symlink => symlink_path(source, target),
+    }
+}
+
+fn link_current_bundle(installed: &Path, current: &Path) -> std::io::Result<()> {
+    remove_path_if_exists(current)?;
+    if let Some(parent) = current.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    symlink_path(installed, current)
+}
+
+fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if meta.file_type().is_symlink() || meta.is_file() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::remove_dir_all(path)
+    }
+}
+
+fn copy_recursively(source: &Path, target: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(source)?;
+    if meta.file_type().is_symlink() {
+        let real = std::fs::canonicalize(source)?;
+        return copy_recursively(&real, target);
+    }
+    if meta.is_file() {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, target)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        copy_recursively(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        std::os::windows::fs::symlink_dir(source, target)
+    } else {
+        std::os::windows::fs::symlink_file(source, target)
     }
 }
 
@@ -421,6 +551,28 @@ fn build_adapter(
         .or_insert_with(|| server_url.to_string());
     env.entry("JOI_ACTOR".into())
         .or_insert_with(|| spec.actor.id.clone());
+    env.entry("JOI_AGENT_ROOT".into())
+        .or_insert_with(|| paths.root.display().to_string());
+    env.entry("JOI_ACTOR_HOME".into())
+        .or_insert_with(|| paths.root.display().to_string());
+    env.entry("JOI_AGENT_WORKSPACE".into())
+        .or_insert_with(|| paths.workspace.display().to_string());
+    env.entry("JOI_AGENT_PROFILE".into())
+        .or_insert_with(|| paths.profile.display().to_string());
+    env.entry("JOI_AGENT_LOGS".into())
+        .or_insert_with(|| paths.logs.display().to_string());
+    env.entry("JOI_AGENT_BUNDLE_ROOT".into())
+        .or_insert_with(|| paths.bundle_root.display().to_string());
+    env.entry("JOI_AGENT_BUNDLE_DIR".into())
+        .or_insert_with(|| paths.bundle_current.display().to_string());
+    if let Some(bundle) = spec.bundle.as_ref() {
+        if !bundle.version.trim().is_empty() {
+            let version =
+                normalized_bundle_version(bundle, &PathBuf::from(paths.expand(&bundle.source)));
+            env.entry("JOI_AGENT_BUNDLE_VERSION".into())
+                .or_insert(version);
+        }
+    }
     let args: Vec<String> = spec
         .transport
         .args

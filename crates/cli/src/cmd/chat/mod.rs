@@ -12,6 +12,7 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -48,7 +49,8 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        SetCursorStyle::SteadyBar
     )?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
@@ -60,7 +62,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;
     Ok(())

@@ -137,7 +137,9 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
 ```
 
 模板变量与 v0 一致：`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` /
-`{agent.root}`，再加上 v1 新增的 `{env.NAME}`（从 agent client 进程 env 取值）。
+`{agent.root}`，并补充 actor-home / bundle 相关变量：`{agent.home}`（`{agent.root}`
+别名）、`{agent.bundle_root}`、`{agent.bundle}`。再加上 v1 新增的 `{env.NAME}`
+（从 agent client 进程 env 取值）。
 
 ---
 

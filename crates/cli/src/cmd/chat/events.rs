@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    poll, read, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    poll, read, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    MouseEvent, MouseEventKind,
 };
 use proto::methods::{method, stream_kind};
 use proto::types::{Channel, Event, ScopeKind, ScopeRef, Turn};
@@ -102,7 +102,9 @@ pub async fn run(
             match read()? {
                 CtEvent::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        handle_key(&client, &mut app, key, &scope).await;
+                        if let Some(key) = normalize_key_event(key)? {
+                            handle_key(&client, &mut app, key, &scope).await;
+                        }
                     }
                 }
                 CtEvent::Paste(text) => handle_paste(&client, &mut app, text, &scope).await,
@@ -113,6 +115,69 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+fn normalize_key_event(key: KeyEvent) -> std::io::Result<Option<KeyEvent>> {
+    if key.code == KeyCode::Esc {
+        return read_escape_sequence(key).map(Some);
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return Ok(Some(match key.code {
+            KeyCode::Char('b') | KeyCode::Char('B') => alt_arrow(KeyCode::Left),
+            KeyCode::Char('f') | KeyCode::Char('F') => alt_arrow(KeyCode::Right),
+            _ => key,
+        }));
+    }
+    Ok(Some(key))
+}
+
+fn read_escape_sequence(fallback: KeyEvent) -> std::io::Result<KeyEvent> {
+    if !poll(Duration::from_millis(15))? {
+        return Ok(fallback);
+    }
+    let CtEvent::Key(next) = read()? else {
+        return Ok(fallback);
+    };
+    if next.kind != KeyEventKind::Press {
+        return Ok(fallback);
+    }
+    match next.code {
+        KeyCode::Char('b') | KeyCode::Char('B') => Ok(alt_arrow(KeyCode::Left)),
+        KeyCode::Char('f') | KeyCode::Char('F') => Ok(alt_arrow(KeyCode::Right)),
+        KeyCode::Char('[') => {
+            if !poll(Duration::from_millis(15))? {
+                return Ok(fallback);
+            }
+            let CtEvent::Key(third) = read()? else {
+                return Ok(fallback);
+            };
+            if third.kind != KeyEventKind::Press {
+                return Ok(fallback);
+            }
+            Ok(match third.code {
+                KeyCode::Char('A') => alt_arrow(KeyCode::Up),
+                KeyCode::Char('B') => alt_arrow(KeyCode::Down),
+                KeyCode::Char('C') => alt_arrow(KeyCode::Right),
+                KeyCode::Char('D') => alt_arrow(KeyCode::Left),
+                _ => fallback,
+            })
+        }
+        other => Ok(KeyEvent {
+            code: other,
+            modifiers: next.modifiers | KeyModifiers::ALT,
+            kind: next.kind,
+            state: next.state,
+        }),
+    }
+}
+
+fn alt_arrow(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::ALT,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
 }
 
 /// Re-bind the chat to a different scope (thread or channel). Best-effort:
@@ -709,10 +774,50 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                 app.at_menu = None;
             }
         }
-        KeyCode::Up => app.select_older_history(),
-        KeyCode::Down => app.select_newer_history(),
-        KeyCode::Left if app.input.is_empty() => app.collapse_selected_history(),
-        KeyCode::Right if app.input.is_empty() => app.expand_selected_history(),
+        KeyCode::Up => {
+            if app.input.is_empty() {
+                app.select_older_history();
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_to_start();
+                app.clear_history_selection();
+            } else {
+                let _ = app.input.move_up();
+                app.clear_history_selection();
+            }
+        }
+        KeyCode::Down => {
+            if app.input.is_empty() {
+                app.select_newer_history();
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_to_end();
+                app.clear_history_selection();
+            } else {
+                let _ = app.input.move_down();
+                app.clear_history_selection();
+            }
+        }
+        KeyCode::Left => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_word_left();
+                app.clear_history_selection();
+            } else if app.input.is_empty() {
+                app.collapse_selected_history();
+            } else {
+                let _ = app.input.move_left();
+                app.clear_history_selection();
+            }
+        }
+        KeyCode::Right => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_word_right();
+                app.clear_history_selection();
+            } else if app.input.is_empty() {
+                app.expand_selected_history();
+            } else {
+                let _ = app.input.move_right();
+                app.clear_history_selection();
+            }
+        }
         KeyCode::PageUp => {
             app.clear_history_selection();
             app.scroll_up(10);
@@ -730,7 +835,13 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             app.jump_to_bottom();
         }
         KeyCode::Backspace => {
-            app.input.pop();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.delete_word_left();
+            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input.delete_to_line_start();
+            } else {
+                app.input.pop();
+            }
             app.update_slash_menu();
             app.update_at_menu();
         }
@@ -758,6 +869,10 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
         KeyCode::Char(c) => {
             if key.modifiers == KeyModifiers::CONTROL && c == 'j' {
                 app.input.push_char('\n');
+            } else if key.modifiers == KeyModifiers::CONTROL && c == 'w' {
+                app.input.delete_word_left();
+            } else if key.modifiers == KeyModifiers::CONTROL && c == 'u' {
+                app.input.delete_to_line_start();
             } else {
                 app.input.push_char(c);
             }
@@ -1974,9 +2089,9 @@ async fn handle_paste(client: &Arc<Client>, app: &mut App, text: String, scope: 
         return;
     }
     let char_count = normalized.chars().count();
-    if char_count < 300 {
+    if char_count < INLINE_PASTE_CHAR_LIMIT {
         app.input.push_str(&normalized);
-    } else if char_count <= 5000 {
+    } else if char_count <= WORKSPACE_PASTE_CHAR_LIMIT {
         let token_id = app.next_paste_token_id();
         app.input.push_pasted_chunk(token_id, normalized);
     } else {
@@ -1996,6 +2111,9 @@ fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+const INLINE_PASTE_CHAR_LIMIT: usize = 2200;
+const WORKSPACE_PASTE_CHAR_LIMIT: usize = 7500;
+
 async fn save_pasted_content_to_workspace(
     client: &Arc<Client>,
     app: &mut App,
@@ -2006,7 +2124,9 @@ async fn save_pasted_content_to_workspace(
     use proto::methods::ArtifactPublishResult;
 
     if !app.has_scope() {
-        bail!("open a channel or thread before pasting content larger than 5000 characters");
+        bail!(
+            "open a channel or thread before pasting content larger than {WORKSPACE_PASTE_CHAR_LIMIT} characters"
+        );
     }
 
     let res: ArtifactPublishResult = client
@@ -2031,7 +2151,11 @@ async fn save_pasted_content_to_workspace(
         .as_ref()
         .and_then(|meta| meta.get("workspaceEntryId"))
         .and_then(|value| value.as_u64())
-        .ok_or_else(|| anyhow!("workspace entry id missing from artifact response"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "workspace entry id missing from artifact response (restart joi-server with the updated binary)"
+            )
+        })?;
 
     Ok(format!(
         "[Saved pasted content to workspace ({}) id={entry_id}]",

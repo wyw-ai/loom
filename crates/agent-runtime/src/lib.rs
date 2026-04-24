@@ -12,6 +12,7 @@
 pub mod acp;
 pub mod adapter;
 pub mod agents_md;
+pub mod bundle;
 pub mod command;
 pub mod envelope;
 pub mod mcp_servers;
@@ -20,6 +21,9 @@ pub mod profile;
 
 pub use adapter::{ActionChoice, Adapter, AdapterEvent, AdapterStartInfo};
 pub use agents_md::ensure_agents_md;
+pub use bundle::{
+    prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,
+};
 pub use envelope::{compose_prompt, EnvelopeInput, PromptSection};
 pub use mcp_servers::build_mcp_servers;
 pub use profile::{ensure_profile_scaffold, ProfileScaffold};

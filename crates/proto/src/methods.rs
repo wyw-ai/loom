@@ -651,6 +651,12 @@ pub struct AgentSpec {
     pub transport: AgentTransport,
     #[serde(default)]
     pub autostart: bool,
+    /// Optional actor-local bundle configuration. When present, the runtime
+    /// ensures a skill / tool bundle is available under the actor home before
+    /// the transport is started, then exposes its resolved paths through
+    /// template variables / env injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AgentBundleSpec>,
     /// Optional per-actor persona configuration. When present, the runtime
     /// loads the referenced markdown files from `{agent.profile}` and injects
     /// them as labeled prompt sections on **every** turn. Absent means "no
@@ -683,6 +689,58 @@ pub struct AnnouncementSpec {
     /// stdio MCP server. Default false — opt-in.
     #[serde(default)]
     pub mcp: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBundleSpec {
+    /// Source directory or file to install into the actor home. Relative paths
+    /// should be resolved by the caller before registration.
+    #[serde(default)]
+    pub source: String,
+    /// Logical bundle version. Used to create a stable installed path under the
+    /// actor home. Empty means derive from the source basename.
+    #[serde(default)]
+    pub version: String,
+    /// Install mode for the versioned bundle directory.
+    #[serde(default)]
+    pub install_mode: BundleInstallMode,
+    /// Resolved with the same template variables as transport paths. Default
+    /// `{agent.root}/bundles`.
+    #[serde(default = "default_bundle_root")]
+    pub root: String,
+    /// Resolved with the same template variables as transport paths. Default
+    /// `{agent.root}/bundles/current`.
+    #[serde(default = "default_bundle_current")]
+    pub current: String,
+}
+
+impl Default for AgentBundleSpec {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            version: String::new(),
+            install_mode: BundleInstallMode::default(),
+            root: default_bundle_root(),
+            current: default_bundle_current(),
+        }
+    }
+}
+
+fn default_bundle_root() -> String {
+    "{agent.root}/bundles".into()
+}
+
+fn default_bundle_current() -> String {
+    "{agent.root}/bundles/current".into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleInstallMode {
+    #[default]
+    Copy,
+    Symlink,
 }
 
 // ---- identity ----

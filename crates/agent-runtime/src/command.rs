@@ -107,6 +107,22 @@ impl CommandConfig {
     }
 }
 
+pub fn expand_session_templates<F>(
+    session: Option<&proto::methods::CommandSession>,
+    mut expand: F,
+) -> Option<proto::methods::CommandSession>
+where
+    F: FnMut(&str) -> String,
+{
+    session.map(|session| proto::methods::CommandSession {
+        first_run_capture: session.first_run_capture.as_deref().map(&mut expand),
+        resume_args: session
+            .resume_args
+            .as_ref()
+            .map(|args| args.iter().map(|arg| expand(arg)).collect()),
+    })
+}
+
 pub struct CommandAdapter {
     cfg: CommandConfig,
     inner: Mutex<CommandInner>,
@@ -977,6 +993,30 @@ mod tests {
         assert!(looks_like_session_lost("error: Session not found"));
         assert!(looks_like_session_lost("UNKNOWN session abc"));
         assert!(!looks_like_session_lost("everything is fine"));
+    }
+
+    #[test]
+    fn expand_session_templates_rewrites_capture_and_resume_args() {
+        let session = proto::methods::CommandSession {
+            first_run_capture: Some("file:{agent.bundle}/sid".into()),
+            resume_args: Some(vec!["--resume".into(), "{agent.home}/run".into()]),
+        };
+
+        let expanded = expand_session_templates(Some(&session), |input| {
+            input
+                .replace("{agent.bundle}", "/tmp/bundles/current")
+                .replace("{agent.home}", "/tmp/actor")
+        })
+        .expect("session should expand");
+
+        assert_eq!(
+            expanded.first_run_capture.as_deref(),
+            Some("file:/tmp/bundles/current/sid")
+        );
+        assert_eq!(
+            expanded.resume_args,
+            Some(vec!["--resume".into(), "/tmp/actor/run".into()])
+        );
     }
 
     /// Spawning a long-lived child and cancelling it should reap quickly with

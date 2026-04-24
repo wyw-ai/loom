@@ -212,7 +212,7 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 | --- | --- | --- |
 | Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） | 同左 |
 | Agent spec | `--agents-dir`（默认 `./agents`） | `~/.config/joi/agents/`（`--specs <dir>` 可覆盖） |
-| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,profile,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,profile,logs}` |
+| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,profile,logs,bundles}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,profile,logs,bundles}`（`{agent.home}` = `{agent.root}`） |
 | Command transport session 簿记 | （仅 v1 用到） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
 | CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） | 同左 |
 
@@ -269,14 +269,18 @@ joi agent add
 
 保存为 `agents/<actor-id>.json`，或运行时注册：`joi agent register <path>`。
 
-模板变量（`cwd` / `env` 值里可用）：`{agent.workspace}` / `{agent.profile}` /
-`{agent.logs}` / `{agent.root}` / `{actor.id}` / `{scope.id}`（command transport）。
+模板变量（`cwd` / `env`，以及 command transport 的
+`session.first_run_capture` / `session.resume_args` 里可用）：
+`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` / `{agent.root}` /
+`{agent.home}` / `{agent.bundle_root}` / `{agent.bundle}` / `{actor.id}` /
+`{scope.id}`。
 
 `{agent.profile}` 是该 actor 的**持久化状态**目录（per-actor、跨 thread 共享），
-适合放 Skills、MCP 配置、agent 自己维护的 KV memory、本地 agent 的模型权重等
-"不该跨 actor 共享、又不该跨 thread 重复构建"的资产。**注意**这不是 agent 子
-进程看到的 `$HOME`——OAuth token / CLI 配置（如 `~/.claude/`）等用户级状态仍由
-agent 自己写入用户 HOME，joi 不接管。
+适合放 identity、memory、MCP 配置等 actor 自己维护的状态。runtime 管理的版本化
+skills / toolchains / model assets 则放在和 `profile/` 平级的 `bundles/` 下，通过
+`{agent.bundle_root}` / `{agent.bundle}` 访问。`{agent.home}` 只是 `{agent.root}`
+的别名。**注意**这不是 agent 子进程看到的 `$HOME`——OAuth token / CLI 配置（如
+`~/.claude/`）等用户级状态仍由 agent 自己写入用户 HOME，joi 不接管。
 
 ## Agent 子进程能反向调 joi 读历史
 

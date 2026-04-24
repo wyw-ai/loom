@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    poll, read, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    poll, read, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    MouseEvent, MouseEventKind,
 };
 use proto::methods::{method, stream_kind};
 use proto::types::{Channel, Event, ScopeKind, ScopeRef, Turn};
@@ -102,9 +102,12 @@ pub async fn run(
             match read()? {
                 CtEvent::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        handle_key(&client, &mut app, key, &scope).await;
+                        if let Some(key) = normalize_key_event(key)? {
+                            handle_key(&client, &mut app, key, &scope).await;
+                        }
                     }
                 }
+                CtEvent::Paste(text) => handle_paste(&client, &mut app, text, &scope).await,
                 CtEvent::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 CtEvent::Resize(_, _) => {}
                 _ => {}
@@ -112,6 +115,69 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+fn normalize_key_event(key: KeyEvent) -> std::io::Result<Option<KeyEvent>> {
+    if key.code == KeyCode::Esc {
+        return read_escape_sequence(key).map(Some);
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return Ok(Some(match key.code {
+            KeyCode::Char('b') | KeyCode::Char('B') => alt_arrow(KeyCode::Left),
+            KeyCode::Char('f') | KeyCode::Char('F') => alt_arrow(KeyCode::Right),
+            _ => key,
+        }));
+    }
+    Ok(Some(key))
+}
+
+fn read_escape_sequence(fallback: KeyEvent) -> std::io::Result<KeyEvent> {
+    if !poll(Duration::from_millis(15))? {
+        return Ok(fallback);
+    }
+    let CtEvent::Key(next) = read()? else {
+        return Ok(fallback);
+    };
+    if next.kind != KeyEventKind::Press {
+        return Ok(fallback);
+    }
+    match next.code {
+        KeyCode::Char('b') | KeyCode::Char('B') => Ok(alt_arrow(KeyCode::Left)),
+        KeyCode::Char('f') | KeyCode::Char('F') => Ok(alt_arrow(KeyCode::Right)),
+        KeyCode::Char('[') => {
+            if !poll(Duration::from_millis(15))? {
+                return Ok(fallback);
+            }
+            let CtEvent::Key(third) = read()? else {
+                return Ok(fallback);
+            };
+            if third.kind != KeyEventKind::Press {
+                return Ok(fallback);
+            }
+            Ok(match third.code {
+                KeyCode::Char('A') => alt_arrow(KeyCode::Up),
+                KeyCode::Char('B') => alt_arrow(KeyCode::Down),
+                KeyCode::Char('C') => alt_arrow(KeyCode::Right),
+                KeyCode::Char('D') => alt_arrow(KeyCode::Left),
+                _ => fallback,
+            })
+        }
+        other => Ok(KeyEvent {
+            code: other,
+            modifiers: next.modifiers | KeyModifiers::ALT,
+            kind: next.kind,
+            state: next.state,
+        }),
+    }
+}
+
+fn alt_arrow(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::ALT,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
 }
 
 /// Re-bind the chat to a different scope (thread or channel). Best-effort:
@@ -659,7 +725,7 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                             .map(|it| it.id.clone())
                     });
                     if let Some(cmd) = chosen {
-                        app.input = format!("{} ", cmd);
+                        app.input = format!("{} ", cmd).into();
                         app.slash_menu = None;
                         return;
                     }
@@ -672,7 +738,7 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                     if let Some(id) = chosen {
                         // Rewrite the leading `@<filter>` token to `@<id> ` so
                         // the user can type the message body before Enter.
-                        app.input = format!("@{} ", id);
+                        app.input = format!("@{} ", id).into();
                         app.at_menu = None;
                         return;
                     }
@@ -708,8 +774,50 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                 app.at_menu = None;
             }
         }
-        KeyCode::Up => app.select_older_history(),
-        KeyCode::Down => app.select_newer_history(),
+        KeyCode::Up => {
+            if app.input.is_empty() {
+                app.select_older_history();
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_to_start();
+                app.clear_history_selection();
+            } else {
+                let _ = app.input.move_up();
+                app.clear_history_selection();
+            }
+        }
+        KeyCode::Down => {
+            if app.input.is_empty() {
+                app.select_newer_history();
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_to_end();
+                app.clear_history_selection();
+            } else {
+                let _ = app.input.move_down();
+                app.clear_history_selection();
+            }
+        }
+        KeyCode::Left => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_word_left();
+                app.clear_history_selection();
+            } else if app.input.is_empty() {
+                app.collapse_selected_history();
+            } else {
+                let _ = app.input.move_left();
+                app.clear_history_selection();
+            }
+        }
+        KeyCode::Right => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.move_word_right();
+                app.clear_history_selection();
+            } else if app.input.is_empty() {
+                app.expand_selected_history();
+            } else {
+                let _ = app.input.move_right();
+                app.clear_history_selection();
+            }
+        }
         KeyCode::PageUp => {
             app.clear_history_selection();
             app.scroll_up(10);
@@ -727,12 +835,24 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             app.jump_to_bottom();
         }
         KeyCode::Backspace => {
-            app.input.pop();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.input.delete_word_left();
+            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input.delete_to_line_start();
+            } else {
+                app.input.pop();
+            }
             app.update_slash_menu();
             app.update_at_menu();
         }
         KeyCode::Enter => {
-            let text = std::mem::take(&mut app.input);
+            if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+                app.input.push_char('\n');
+                app.update_slash_menu();
+                app.update_at_menu();
+                return;
+            }
+            let text = app.input.take_submission_text();
             app.slash_menu = None;
             app.at_menu = None;
             if text.trim().is_empty() {
@@ -747,7 +867,15 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             }
         }
         KeyCode::Char(c) => {
-            app.input.push(c);
+            if key.modifiers == KeyModifiers::CONTROL && c == 'j' {
+                app.input.push_char('\n');
+            } else if key.modifiers == KeyModifiers::CONTROL && c == 'w' {
+                app.input.delete_word_left();
+            } else if key.modifiers == KeyModifiers::CONTROL && c == 'u' {
+                app.input.delete_to_line_start();
+            } else {
+                app.input.push_char(c);
+            }
             app.update_slash_menu();
             app.update_at_menu();
         }
@@ -1916,7 +2044,7 @@ fn arm_reply_target(app: &mut App, event_id: String) {
         .find(|(id, _)| id == &event_id)
         .map(|(_, label)| label)
         .unwrap_or_else(|| "(unknown message)".to_string());
-    if app.input.trim_start().starts_with("/reply") {
+    if app.input.display_text().trim_start().starts_with("/reply") {
         app.input.clear();
         app.slash_menu = None;
         app.at_menu = None;
@@ -1953,6 +2081,129 @@ fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
         }
     }
     (relations, reply_target)
+}
+
+async fn handle_paste(client: &Arc<Client>, app: &mut App, text: String, scope: &ScopeRef) {
+    let normalized = normalize_pasted_text(&text);
+    if normalized.is_empty() {
+        return;
+    }
+    if route_paste_to_focused_ui(app, &normalized) {
+        return;
+    }
+    let char_count = normalized.chars().count();
+    if char_count < INLINE_PASTE_CHAR_LIMIT {
+        app.input.push_str(&normalized);
+    } else if char_count <= WORKSPACE_PASTE_CHAR_LIMIT {
+        let token_id = app.next_paste_token_id();
+        app.input.push_pasted_chunk(token_id, normalized);
+    } else {
+        match save_pasted_content_to_workspace(client, app, scope, normalized).await {
+            Ok(saved) => app
+                .input
+                .push_saved_workspace_ref(saved.display, saved.submission),
+            Err(e) => {
+                app.set_status(format!("save pasted content failed: {e}"));
+                return;
+            }
+        }
+    }
+    app.update_slash_menu();
+    app.update_at_menu();
+}
+
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn route_paste_to_focused_ui(app: &mut App, text: &str) -> bool {
+    if let Some(prompt) = app.prompt.as_mut() {
+        prompt.handle_paste(text);
+        return true;
+    }
+    if let Mode::Picker(_) = app.mode {
+        if let Some(picker) = app.picker.as_mut() {
+            picker.handle_paste(text);
+        }
+        return true;
+    }
+    app.sidebar.is_some()
+}
+
+const INLINE_PASTE_CHAR_LIMIT: usize = 2200;
+const WORKSPACE_PASTE_CHAR_LIMIT: usize = 7500;
+
+struct SavedWorkspaceRef {
+    display: String,
+    submission: String,
+}
+
+async fn save_pasted_content_to_workspace(
+    client: &Arc<Client>,
+    app: &mut App,
+    scope: &ScopeRef,
+    text: String,
+) -> anyhow::Result<SavedWorkspaceRef> {
+    use anyhow::bail;
+    use proto::methods::ArtifactPublishResult;
+
+    if !app.has_scope() {
+        bail!(
+            "open a channel or thread before pasting content larger than {WORKSPACE_PASTE_CHAR_LIMIT} characters"
+        );
+    }
+
+    let res: ArtifactPublishResult = client
+        .call(
+            method::ARTIFACT_PUBLISH,
+            json!({
+                "createdBy": app.actor_id,
+                "scope": scope,
+                "ingress": {
+                    "kind": "inline_text",
+                    "name": "pasted-content.md",
+                    "mediaType": "text/markdown",
+                    "text": text,
+                }
+            }),
+        )
+        .await?;
+
+    let workspace_path = res
+        .artifact
+        ._meta
+        .as_ref()
+        .and_then(|meta| meta.get("workspacePath"))
+        .and_then(|value| value.as_str());
+    let size = human_size(res.artifact.size);
+    let display = format!("[Saved pasted content to workspace ({size})]");
+    let submission = match workspace_path {
+        Some(path) => format!(
+            "[Saved pasted content to workspace ({size}); artifactId={}; artifactUri={}; workspacePath={path}]",
+            res.artifact.id, res.artifact.uri
+        ),
+        None => format!(
+            "[Saved pasted content to workspace ({size}); artifactId={}; artifactUri={}]",
+            res.artifact.id, res.artifact.uri
+        ),
+    };
+    Ok(SavedWorkspaceRef {
+        display,
+        submission,
+    })
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= MB {
+        format!("{:.1} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &ScopeRef) {
@@ -2077,9 +2328,14 @@ async fn cancel_in_scope(
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_reply_target, message_relations, pick_cancel_target, reply_selected_history};
-    use crate::cmd::chat::app::App;
+    use super::{
+        arm_reply_target, message_relations, pick_cancel_target, reply_selected_history,
+        route_paste_to_focused_ui,
+    };
+    use crate::cmd::chat::app::{App, Mode, PickerKind};
     use crate::cmd::chat::history::{Bubble, BubbleKind, DeliveryState};
+    use crate::cmd::chat::picker::Picker;
+    use crate::cmd::chat::prompt::{PromptKind, PromptModal};
     use chrono::Utc;
 
     #[test]
@@ -2337,5 +2593,60 @@ mod tests {
         );
         let err = pick_cancel_target(&app, &test_scope(), None).unwrap_err();
         assert!(err.contains("no in-flight"));
+    }
+
+    #[test]
+    fn paste_routes_to_prompt_modal_before_chat_input() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.prompt = Some(PromptModal::text(
+            PromptKind::CreateChannel,
+            "New channel",
+            "",
+        ));
+
+        assert!(route_paste_to_focused_ui(&mut app, "hello"));
+        assert!(app.input.is_empty());
+        match app.prompt.as_ref() {
+            Some(PromptModal::Text { value, .. }) => assert_eq!(value, "hello"),
+            _ => panic!("expected text prompt"),
+        }
+    }
+
+    #[test]
+    fn paste_routes_to_picker_filter_before_chat_input() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.mode = Mode::Picker(PickerKind::Action);
+        app.picker = Some(Picker::new("Pick actor", vec![]));
+
+        assert!(route_paste_to_focused_ui(&mut app, "coder"));
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.picker.as_ref().map(|picker| picker.filter.as_str()),
+            Some("coder")
+        );
+    }
+
+    #[test]
+    fn paste_is_swallowed_when_sidebar_has_focus() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.toggle_sidebar();
+
+        assert!(route_paste_to_focused_ui(&mut app, "hello"));
+        assert!(app.input.is_empty());
     }
 }

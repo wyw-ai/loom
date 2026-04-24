@@ -468,6 +468,7 @@ impl RuntimeManager {
         let default_root = self.bundle_root_for(actor_id).display().to_string();
         let default_current = self.bundle_current_for(actor_id).display().to_string();
         let bundle = spec.bundle.as_ref().cloned().unwrap_or_default();
+        let source_value = self.expand_base_vars(&bundle.source, actor_id);
         let root_value = if bundle.root.is_empty() {
             default_root
         } else {
@@ -481,7 +482,7 @@ impl RuntimeManager {
         BundlePaths {
             root: PathBuf::from(root_value),
             current: PathBuf::from(current_value),
-            version: bundle.version,
+            version: resolved_bundle_version(&bundle, Path::new(&source_value)),
         }
     }
 
@@ -718,6 +719,14 @@ fn normalized_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String 
         .collect()
 }
 
+fn resolved_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
+    if bundle.source.trim().is_empty() {
+        String::new()
+    } else {
+        normalized_bundle_version(bundle, source)
+    }
+}
+
 fn install_bundle_dir(
     source: &Path,
     target: &Path,
@@ -861,5 +870,19 @@ mod tests {
         assert!(!meta.file_type().is_symlink());
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolved_bundle_version_derives_from_source_basename() {
+        let bundle = AgentBundleSpec {
+            source: "{agent.root}/bundles/demo-bundle".into(),
+            version: String::new(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolved_bundle_version(&bundle, Path::new("/tmp/demo-bundle")),
+            "demo-bundle"
+        );
     }
 }

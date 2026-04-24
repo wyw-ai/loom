@@ -254,6 +254,7 @@ impl AgentPaths {
 
     fn bundle_paths(&self, spec: &AgentSpec) -> BundlePaths {
         let bundle = spec.bundle.as_ref().cloned().unwrap_or_default();
+        let source_value = self.expand_base(&bundle.source);
         let root = if bundle.root.trim().is_empty() {
             self.bundle_root.clone()
         } else {
@@ -267,7 +268,7 @@ impl AgentPaths {
         BundlePaths {
             root,
             current,
-            version: bundle.version,
+            version: resolved_bundle_version(&bundle, Path::new(&source_value)),
         }
     }
 
@@ -326,6 +327,14 @@ fn normalized_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String 
             }
         })
         .collect()
+}
+
+fn resolved_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
+    if bundle.source.trim().is_empty() {
+        String::new()
+    } else {
+        normalized_bundle_version(bundle, source)
+    }
 }
 
 fn install_bundle_dir(
@@ -1318,6 +1327,21 @@ mod tests {
         assert!(meta.is_dir());
         assert!(!meta.file_type().is_symlink());
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bundle_paths_derive_version_from_source_basename() {
+        let root = temp_path("bundle-version");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let spec = sample_spec(Some(AgentBundleSpec {
+            source: "{agent.root}/bundles/demo-bundle".into(),
+            ..Default::default()
+        }));
+
+        let bundle_paths = paths.bundle_paths(&spec);
+
+        assert_eq!(bundle_paths.version, "demo-bundle");
         std::fs::remove_dir_all(root).ok();
     }
 }

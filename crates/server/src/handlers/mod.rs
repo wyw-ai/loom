@@ -633,6 +633,12 @@ async fn event_append(state: &AppState, params: Option<Value>) -> HandlerResult 
 
 fn artifact_publish(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ArtifactPublishParams = parse_params(params)?;
+    if let Some(scope) = p.scope.as_ref() {
+        state
+            .store
+            .check_scope_access(scope, &p.created_by)
+            .map_err(map_store_err)?;
+    }
     let artifact = state
         .artifacts
         .publish(&state.store, p)
@@ -864,4 +870,101 @@ fn path_lookup_via_env(bin: &str) -> bool {
 #[allow(dead_code)]
 pub fn _ensure_arc<T>(x: Arc<T>) -> Arc<T> {
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifacts::ArtifactStore;
+    use crate::journal::Journal;
+    use crate::runtime::RuntimeManager;
+    use crate::state::AppState;
+    use crate::store::Store;
+    use crate::subscribe::Subscriptions;
+    use std::path::PathBuf;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "joi-handler-tests-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos()
+        ));
+        path
+    }
+
+    fn test_state(name: &str) -> AppState {
+        let root = temp_path(name);
+        std::fs::create_dir_all(&root).expect("create root");
+        let journal = Journal::open(root.join("journal.jsonl")).expect("open journal");
+        let store = Store::open(journal).expect("open store");
+        let subscriptions = Subscriptions::new();
+        let artifacts = Arc::new(
+            ArtifactStore::new(root.join("artifacts"), root.join("workspaces"))
+                .expect("open artifacts"),
+        );
+        let runtime = RuntimeManager::new(
+            root.join("runtime"),
+            root.join("agents"),
+            store.clone(),
+            "ws://test/rpc".into(),
+        )
+        .expect("create runtime");
+        AppState {
+            store,
+            subscriptions,
+            runtime,
+            artifacts,
+        }
+    }
+
+    #[test]
+    fn artifact_publish_rejects_inaccessible_scope() {
+        let state = test_state("artifact-publish-acl");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+
+        let err = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_guest",
+                "scope": { "kind": "channel", "id": channel.id },
+                "ingress": {
+                    "kind": "inline_text",
+                    "name": "note.md",
+                    "mediaType": "text/markdown",
+                    "text": "hello"
+                }
+            })),
+        )
+        .expect_err("artifact publish should fail");
+
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+    }
+
+    #[test]
+    fn artifact_publish_rejects_missing_scope() {
+        let state = test_state("artifact-publish-missing-scope");
+
+        let err = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_owner",
+                "scope": { "kind": "thread", "id": "thread_missing" },
+                "ingress": {
+                    "kind": "inline_text",
+                    "name": "note.md",
+                    "mediaType": "text/markdown",
+                    "text": "hello"
+                }
+            })),
+        )
+        .expect_err("artifact publish should fail");
+
+        assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
 }

@@ -285,18 +285,63 @@ Scheduler 是 service plugin，不是 server 内置定时器。
 
 ### 8.3 Job 执行模型
 
-每个 job 有：
+每个 job 在 spec 里定义如下字段（参见 §6.1 scheduler 示例）：
 
-- `jobId`
-- schedule
-- source
-- target scope
-- optional target agent
-- dedupe key
-- cursor
-- retry policy
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 同一 service 内唯一；进入 dedupe key 与 cursor 文件名 |
+| `schedule` | 是 | 5-field cron 表达式，UTC 解释（§13 Q3） |
+| `source.kind` | 是 | `command` / `http`（S3 仅这两种） |
+| `source.command` / `source.args` | command 时必填 | 子进程执行，捕获 stdout |
+| `source.url` / `source.method` / `source.headers` | http 时必填 | GET/POST，捕获响应 body |
+| `source.timeoutMs` | 否 | 默认 30000 |
+| `scope` | 是 | `{ "kind": "thread"\|"channel", "id": "..." }`；目标必须 svc_scheduler 已加入 |
+| `targetAgent` | 否 | 设置后触发 handoff；不设置则纯 logging |
+| `dedupeBy` | 否 | `payload_hash`（默认） / `source_event_id` / `none` |
+| `cursorBy` | 否 | `none`（默认） / `body_hash` / `jq:<expr>` |
 
-Job 到点后生成标准 Joi event：
+#### 触发流
+
+```mermaid
+sequenceDiagram
+    participant Cron as cron tick
+    participant Plugin as scheduler plugin
+    participant Source as cmd / http
+    participant Runtime as ServiceRuntime
+    participant Server as joi-server
+    participant Agent as target agent (opt)
+
+    Cron->>Plugin: fire(job_id, fire_time_utc)
+    Plugin->>Source: exec(timeout)
+    Source-->>Plugin: stdout / response
+    Note over Plugin: cursor diff vs last; dedupe_once first
+    alt new event
+        Plugin->>Runtime: append_content(scope, body, hands_off_to?)
+        Runtime->>Server: event/append
+        opt targetAgent set
+            Server-->>Agent: actor-inbox push
+        end
+    else no change or already seen
+        Plugin->>Runtime: cursor_save(new_cursor)
+    end
+```
+
+#### Source kinds
+
+- `command`：以 `Command::new(cmd).args(args)` 起子进程，捕获 stdout 作为 body，stderr 进 log，exit code != 0 视为失败（计入 retry policy，不发 event）。子进程 exec 与失败语义留在 plugin 内部，不进 ServiceRuntime（理由见 §8.7）。
+- `http`：单次 GET/POST，非 2xx 视为失败（同上）。响应 body 作为 event payload。
+
+#### Cursor 语义
+
+- `none`：每次 tick 都视为新事件，结合 `dedupe_once` 防 idempotency。适合"按时间汇总"型 job。
+- `body_hash`：cursor 是上次成功 body 的 sha256；本次 hash 相同则跳过。适合状态轮询（CI / 任务队列）。
+- `jq:<expr>`：从 body 用 jq 提取游标值（如 `jq:.runs[0].id`），与上次比较。适合带天然 id 的 source（GitHub Actions 的 run id、消息列表的 last message_id）。
+
+cursor 持久化到 `~/.local/share/joi/service-host/services/<sid>/cursors/<job_id>.json`，failover 后重启即可恢复（与 §9.2 durable inbox 同语义但局限在 plugin 私有状态，不进 server journal）。
+
+#### 标准 Joi event
+
+Job 触发并通过 dedupe 后生成：
 
 ```json
 {
@@ -308,7 +353,9 @@ Job 到点后生成标准 Joi event：
     "text": "CI changed: ...",
     "_meta": {
       "service": "scheduler",
-      "jobId": "ci_watch"
+      "jobId": "ci_watch",
+      "fireTimeUtc": "2026-04-24T09:00:00Z",
+      "sourceCursor": "run_982371"
     }
   },
   "relations": [
@@ -319,13 +366,69 @@ Job 到点后生成标准 Joi event：
 
 ### 8.4 幂等要求
 
-Scheduler 必须默认防重复。建议 dedupe key：
+Scheduler 必须默认防重复。dedupe key 选择优先级：
+
+1. **source 有天然 event id**（如 GitHub workflow_run.id、消息 id）：
+
+   ```text
+   service:<service_id>:job:<job_id>:source_event:<source_id>
+   ```
+
+2. **source 无天然 id**：
+
+   ```text
+   service:<service_id>:job:<job_id>:fire:<fire_time_utc>:hash:<body_hash>
+   ```
+
+`dedupe_once(key)` 必须在 `append_content` **之前**调用：写 dedupe 行 → 写 event。倒序会留下窗口，让两次 tick 撞同一个 source state 时双发。
+
+dedupe 存储与 cursor 同目录：`~/.local/share/joi/service-host/services/<sid>/dedupe.jsonl`，append-only。S1 可以做按时间窗口截断（默认保留 14 天）。
+
+### 8.5 Scope 映射与等待 agent
+
+与 §7.2 不同，scheduler 的 scope 是 **per-job 静态的**，不需要 auto-thread 之类按 source 字段动态分配。原因是 cron job 通常代表一个固定关注点（CI watcher 永远进 `#ops/ci` 线程），动态分流会模糊 job 责任边界。
+
+Job 触发后是否等 agent 回复：
+
+- **Fire-and-forget**（默认，几乎所有 watcher 类 job）：append event with handoff，立刻 return，tick 之间不持有 turn-level 状态。agent 的回复通过 §9.5 RespondsTo 反向投递落到 `svc_scheduler` 的 inbox，但 plugin 可以选择仅订阅 cron 调度、忽略 actor-inbox push，让 reply 只在 channel/thread 给人看。
+- **Awaited**（少数报告类 job，如"每天 9 点跑总结"）：append event 后调用 `await_responds_to(trigger_event_id, timeout)`，把 agent 文本作为 job 输出（写日志、回写另一个 channel、触发下一步 job）。timeout 必须显式（推荐 ≤ 单次 tick 间隔的 1/2），超时按 retry policy 处理。
+
+下一次 tick 与上一次 await 冲突时：plugin 内部用 `single_in_flight: bool` 默认拒绝叠加（同一 job 不能同时持两个未完成 turn），打 warning 日志并跳过本次 tick。这是 plugin 级语义，不需要 ServiceRuntime 介入。
+
+### 8.6 状态目录布局
 
 ```text
-service:<service_id>:job:<job_id>:source_event:<source_id>
+~/.local/share/joi/service-host/services/<service_id>/
+  state.json           # 服务级元数据（启动时间、版本、上次 graceful shutdown）
+  cursors/
+    <job_id>.json      # cursor 值 + 上次成功 fire_time
+  dedupe.jsonl         # append-only，按 §8.4 key 去重
+  pending/             # 仅 awaited 模式使用：未完成 turn 的 (job_id, trigger_event_id, deadline)
+  logs/
+    scheduler.log
+    job-<job_id>.log
 ```
 
-如果 source 没有天然 event id，用 job id + scheduled fire time + payload hash。
+跟 §10 同语义：这些都是 connector 私有状态，不进 server journal。
+
+### 8.7 ServiceRuntime API 验证（S0.5 结论）
+
+§12 Phase S0.5 要求用第二个 plugin 验证 §6.3 的 API 列表不是 `am` 形状的拓印。scheduler 的设计实测如下：
+
+**scheduler 用到的方法**：`actor_upsert` / `open_connection` / `ensure_channel_member` / `append_content` / `handoff` / `state_dir` / `dedupe_once` / `cursor_load|save` / retry+backoff+logging。
+
+**scheduler 没用到的方法**（am 用到）：
+
+- `create_or_get_thread`：scheduler 用静态 scope，不需要按外部字段动态建 thread。
+- `reply_external`：scheduler 是单向 ingress，没有"回发到外部系统"语义。
+- `await_responds_to`：fire-and-forget 模式不用；少数 awaited 模式用到，属 plugin-optional 而非必选。
+
+**scheduler 需要但 §6.3 缺失**的方法：**无**。
+
+- 子进程执行 (`exec_command`) 与 HTTP 取数 (`http_fetch`) 应留在 plugin 内部，不进 runtime —— 这两个能力的失败语义（exit code、HTTP status、超时）与 source 类型紧耦合，runtime 抽象会丢精度。S3 之后若多个 plugin 共享同一套 subprocess wrapper，再评估上提。
+- cron 解析与调度循环留在 plugin 内部（§13 Q3 选定 5-field UTC 后，runtime 没必要承担调度器角色）。
+
+**结论**：§6.3 通过第二 plugin 测试，S1 可以按既有列表抽 trait，不需要因 scheduler 而 rebase。`cursor_load|save` 这条原本为 am 假想的 API，scheduler 的实际使用反而比 am 更典型，确认不是死代码。`reply_external` 与 `await_responds_to` 在 scheduler 路径不被强制依赖，证明 §6.3 没有把 am 单形态作为下限。
 
 ## 9. Server 侧需要补的协议能力
 
@@ -441,16 +544,16 @@ joi service log <service_id>
 
 后续 §9.2（durable actor inbox）作为 S1 一部分推进，与 ServiceRuntime 的 `await_responds_to` 一同设计，避免在 plugin 形态明确前提前敲死 `delivery/list` / `receipt/record` 的 schema。
 
-### Phase S0.5：第二个 plugin 的纸面设计
+### Phase S0.5：第二个 plugin 的纸面设计（已完成 / scheduler）
 
-在 ServiceRuntime trait 落地之前，至少为 scheduler 与 webhook（或 CI watcher）其中之一写一份与 §7 (`am`) 同等深度的设计稿，验证 §6.3 的 API 列表不是 `am` 形状的拓印。
+§8 现在与 §7 (`am`) 同等深度，覆盖：
 
-具体输出：
+- spec schema 字段表（§8.3 表格）。
+- 触发流：cron tick → source exec → 标准 event（§8.3 sequenceDiagram）。
+- 状态需求：cursor / dedupe / pending callback（§8.3-§8.6）。
+- 是否需要新增 ServiceRuntime 方法（§8.7 结论：无）。
 
-- spec schema 字段。
-- 触发流：cron tick / HTTP 入站到标准 event。
-- 状态需求：cursor / dedupe / pending callback。
-- 是否需要新增 ServiceRuntime 方法。
+webhook / CI watcher 的同深度设计延后到 S4 配合 marketplace 安全模型一起评估（§13 Q4），不再是 S1 的前置条件。
 
 ### Phase S1：抽 ServiceRuntime
 
@@ -484,7 +587,7 @@ joi service log <service_id>
 2. `wait_response` 的实现路径？
    倾向：runtime 不提供，由 §9.2 durable inbox + §9.1 `responds_to` 组合实现。该结论已并入 §6.3。
 3. scheduler 的 cron 语法。
-   倾向：仅 5-field + UTC，不支持 seconds / timezone。需要 timezone 的 job 自己换算。
+   决定（§8.3 已采用）：仅 5-field + UTC，不支持 seconds / timezone。需要 timezone 的 job 自己换算。
 4. webhook plugin 的 HTTP 端口。
    倾向：S3 不开 HTTP；仅支持本地命令 / 轮询。HTTP listener 留到 S4 配合 marketplace 安全模型一起评估。
 5. marketplace 是否允许任意 command？

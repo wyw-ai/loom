@@ -51,7 +51,10 @@ async fn main() -> Result<()> {
     let journal = Journal::open(args.data_dir.join("journal.jsonl"))?;
     let store = Store::open(journal)?;
     let subscriptions = Subscriptions::new();
-    let artifacts = Arc::new(ArtifactStore::new(args.data_dir.join("artifacts"))?);
+    let artifacts = Arc::new(ArtifactStore::new(
+        args.data_dir.join("artifacts"),
+        args.data_dir.join("workspaces"),
+    )?);
     let server_url = format!("ws://{}/rpc", args.bind);
     let runtime = RuntimeManager::new(
         args.data_dir.clone(),

@@ -471,6 +471,8 @@ fn default_text_media_type() -> String {
 pub struct ArtifactPublishParams {
     pub ingress: ArtifactIngress,
     pub created_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

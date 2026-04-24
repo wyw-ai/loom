@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use proto::methods::{AgentInfo, AgentSpec};
+use proto::methods::{AgentBundleSpec, AgentInfo, AgentSpec, BundleInstallMode};
 use proto::types::*;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -108,6 +108,13 @@ impl RegisteredAgent {
             session_id: self.session_id.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct BundlePaths {
+    root: PathBuf,
+    current: PathBuf,
+    version: String,
 }
 
 pub struct RuntimeManager {
@@ -250,6 +257,14 @@ impl RuntimeManager {
 
     pub fn profile_for(&self, actor_id: &str) -> PathBuf {
         self.data_dir.join("agents").join(actor_id).join("profile")
+    }
+
+    pub fn bundle_root_for(&self, actor_id: &str) -> PathBuf {
+        self.root_for(actor_id).join("bundles")
+    }
+
+    pub fn bundle_current_for(&self, actor_id: &str) -> PathBuf {
+        self.bundle_root_for(actor_id).join("current")
     }
 
     pub fn logs_for(&self, actor_id: &str) -> PathBuf {
@@ -436,6 +451,81 @@ impl RuntimeManager {
         self.agents.lock().get(actor_id).map(|a| a.spec.clone())
     }
 
+    fn expand_base_vars(&self, input: &str, actor_id: &str) -> String {
+        let workspace = self.workspace_for(actor_id).display().to_string();
+        let profile = self.profile_for(actor_id).display().to_string();
+        let logs = self.logs_for(actor_id).display().to_string();
+        let root = self.root_for(actor_id).display().to_string();
+        input
+            .replace("{agent.workspace}", &workspace)
+            .replace("{agent.profile}", &profile)
+            .replace("{agent.logs}", &logs)
+            .replace("{agent.root}", &root)
+            .replace("{agent.home}", &root)
+    }
+
+    fn bundle_paths_for(&self, actor_id: &str, spec: &AgentSpec) -> BundlePaths {
+        let default_root = self.bundle_root_for(actor_id).display().to_string();
+        let default_current = self.bundle_current_for(actor_id).display().to_string();
+        let bundle = spec.bundle.as_ref().cloned().unwrap_or_default();
+        let root_value = if bundle.root.is_empty() {
+            default_root
+        } else {
+            self.expand_base_vars(&bundle.root, actor_id)
+        };
+        let current_value = if bundle.current.is_empty() {
+            default_current
+        } else {
+            self.expand_base_vars(&bundle.current, actor_id)
+        };
+        BundlePaths {
+            root: PathBuf::from(root_value),
+            current: PathBuf::from(current_value),
+            version: bundle.version,
+        }
+    }
+
+    fn expand_path_vars(
+        &self,
+        input: &str,
+        actor_id: &str,
+        bundle_paths: Option<&BundlePaths>,
+    ) -> String {
+        let base = self.expand_base_vars(input, actor_id);
+        let bundle_root = bundle_paths
+            .map(|p| p.root.display().to_string())
+            .unwrap_or_else(|| self.bundle_root_for(actor_id).display().to_string());
+        let bundle_current = bundle_paths
+            .map(|p| p.current.display().to_string())
+            .unwrap_or_else(|| self.bundle_current_for(actor_id).display().to_string());
+        base.replace("{agent.bundle_root}", &bundle_root)
+            .replace("{agent.bundle}", &bundle_current)
+    }
+
+    fn ensure_bundle(
+        &self,
+        actor_id: &str,
+        spec: &AgentSpec,
+        paths: &BundlePaths,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(&paths.root)?;
+        let Some(bundle) = spec.bundle.as_ref() else {
+            std::fs::create_dir_all(&paths.current)?;
+            return Ok(());
+        };
+        if bundle.source.trim().is_empty() {
+            std::fs::create_dir_all(&paths.current)?;
+            return Ok(());
+        }
+
+        let source = PathBuf::from(self.expand_base_vars(&bundle.source, actor_id));
+        let version = normalized_bundle_version(bundle, &source);
+        let install_dir = paths.root.join(&version);
+        install_bundle_dir(&source, &install_dir, bundle.install_mode)?;
+        link_current_bundle(&install_dir, &paths.current)?;
+        Ok(())
+    }
+
     /// Start the agent process if not already running, returning the adapter.
     pub async fn ensure_started(
         self: &Arc<Self>,
@@ -450,6 +540,8 @@ impl RuntimeManager {
         std::fs::create_dir_all(self.workspace_for(actor_id))?;
         std::fs::create_dir_all(self.profile_for(actor_id))?;
         std::fs::create_dir_all(self.logs_for(actor_id))?;
+        let bundle_paths = self.bundle_paths_for(actor_id, &spec);
+        self.ensure_bundle(actor_id, &spec, &bundle_paths)?;
         if let Err(e) = agent_runtime::ensure_agents_md(&self.workspace_for(actor_id), actor_id) {
             tracing::warn!(actor = %actor_id, %e, "failed to write AGENTS.md");
         }
@@ -488,19 +580,42 @@ impl RuntimeManager {
         let workdir = if spec.transport.cwd.is_empty() {
             self.workspace_for(actor_id)
         } else {
-            PathBuf::from(self.expand_path_vars(&spec.transport.cwd, actor_id))
+            PathBuf::from(self.expand_path_vars(&spec.transport.cwd, actor_id, Some(&bundle_paths)))
         };
 
         let mut env: BTreeMap<String, String> = spec
             .transport
             .env
             .iter()
-            .map(|(k, v)| (k.clone(), self.expand_path_vars(v, actor_id)))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    self.expand_path_vars(v, actor_id, Some(&bundle_paths)),
+                )
+            })
             .collect();
         env.entry("JOI_SERVER".into())
             .or_insert_with(|| self.server_url.clone());
         env.entry("JOI_ACTOR".into())
             .or_insert_with(|| actor_id.to_string());
+        env.entry("JOI_AGENT_ROOT".into())
+            .or_insert_with(|| self.root_for(actor_id).display().to_string());
+        env.entry("JOI_ACTOR_HOME".into())
+            .or_insert_with(|| self.root_for(actor_id).display().to_string());
+        env.entry("JOI_AGENT_WORKSPACE".into())
+            .or_insert_with(|| self.workspace_for(actor_id).display().to_string());
+        env.entry("JOI_AGENT_PROFILE".into())
+            .or_insert_with(|| self.profile_for(actor_id).display().to_string());
+        env.entry("JOI_AGENT_LOGS".into())
+            .or_insert_with(|| self.logs_for(actor_id).display().to_string());
+        env.entry("JOI_AGENT_BUNDLE_ROOT".into())
+            .or_insert_with(|| bundle_paths.root.display().to_string());
+        env.entry("JOI_AGENT_BUNDLE_DIR".into())
+            .or_insert_with(|| bundle_paths.current.display().to_string());
+        if !bundle_paths.version.is_empty() {
+            env.entry("JOI_AGENT_BUNDLE_VERSION".into())
+                .or_insert_with(|| bundle_paths.version.clone());
+        }
         if let Some(dir) = self.cli_dir.as_ref() {
             env.entry("PATH".into())
                 .or_insert_with(|| prepend_path(dir));
@@ -509,7 +624,7 @@ impl RuntimeManager {
             .transport
             .args
             .iter()
-            .map(|a| self.expand_path_vars(a, actor_id))
+            .map(|a| self.expand_path_vars(a, actor_id, Some(&bundle_paths)))
             .collect::<Vec<_>>();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -577,22 +692,108 @@ impl RuntimeManager {
     pub fn store(&self) -> Arc<Store> {
         self.store.clone()
     }
-
-    fn expand_path_vars(&self, input: &str, actor_id: &str) -> String {
-        let workspace = self.workspace_for(actor_id).display().to_string();
-        let profile = self.profile_for(actor_id).display().to_string();
-        let logs = self.logs_for(actor_id).display().to_string();
-        let root = self.root_for(actor_id).display().to_string();
-        input
-            .replace("{agent.workspace}", &workspace)
-            .replace("{agent.profile}", &profile)
-            .replace("{agent.logs}", &logs)
-            .replace("{agent.root}", &root)
-    }
 }
 
 #[allow(dead_code)]
 pub(crate) fn _silence_event_unused(_e: &AdapterEvent) {}
+
+fn normalized_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
+    let raw = if !bundle.version.trim().is_empty() {
+        bundle.version.trim().to_string()
+    } else {
+        source
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bundle")
+            .to_string()
+    };
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn install_bundle_dir(
+    source: &Path,
+    target: &Path,
+    mode: BundleInstallMode,
+) -> std::io::Result<()> {
+    if !source.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("bundle source `{}` does not exist", source.display()),
+        ));
+    }
+    remove_path_if_exists(target)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match mode {
+        BundleInstallMode::Copy => copy_recursively(source, target),
+        BundleInstallMode::Symlink => symlink_path(source, target),
+    }
+}
+
+fn link_current_bundle(installed: &Path, current: &Path) -> std::io::Result<()> {
+    remove_path_if_exists(current)?;
+    if let Some(parent) = current.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    symlink_path(installed, current)
+}
+
+fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if meta.file_type().is_symlink() || meta.is_file() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::remove_dir_all(path)
+    }
+}
+
+fn copy_recursively(source: &Path, target: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(source)?;
+    if meta.file_type().is_symlink() {
+        let real = std::fs::canonicalize(source)?;
+        return copy_recursively(&real, target);
+    }
+    if meta.is_file() {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, target)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        copy_recursively(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        std::os::windows::fs::symlink_dir(source, target)
+    } else {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+}
 
 fn cli_binary_name() -> &'static str {
     if cfg!(windows) {

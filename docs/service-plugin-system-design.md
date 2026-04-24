@@ -555,17 +555,26 @@ joi service log <service_id>
 
 webhook / CI watcher 的同深度设计延后到 S4 配合 marketplace 安全模型一起评估（§13 Q4），不再是 S1 的前置条件。
 
-### Phase S1：抽 ServiceRuntime
+### Phase S1：抽 ServiceRuntime（已完成）
 
-- 在 `crates/cli` 或新 crate 中沉淀 service host 公共代码。
-- 支持 actor upsert、connection/open、event append、handoff、`await_responds_to`、state dir、retry。
-- trait API 以 S0.5 验证后的并集为准。
+- ✅ Service host 公共代码落到 `crates/cli/src/service/`（doc 允许 in-crate 路径，未抽独立 `joi-client` crate）。
+- ✅ `ServiceRuntime` 暴露 actor_upsert / open_connection / ensure_channel_member / invite_member / create_thread / append_content / handoff / await_responds_to / state_dir / dedupe_once / cursor_load|save。
+- ✅ §9.2 durable inbox：proto + server `delivery/list` 带游标分页 + caller-actor ACL，5 个单元测试。
+- ✅ ServiceSpec proto 类型 + 校验（actor.kind = service 强制），6 个单元测试。
+- ✅ `joi service serve | validate` CLI 子命令；S1 不带任何内置 plugin（specs 的 kind 没匹配的 plugin 时记 warn 跳过），保留 host 监督壳。
+- ⚠️ `await_responds_to` 是 polling-only（§9.2 push 路径在 server 已就绪，但 host 还没 fan-out notification）。S2 第一个长进程 plugin 上线时会改成 hybrid drain-then-watch。
 
-### Phase S2：迁移 AM
+### Phase S2：迁移 AM（已完成 / 短进程 handler）
 
-- 将 `examples/am-joi-channel-bridge.py` 的通用能力挪到 ServiceRuntime。
-- 保留 `am` 字段提取和回发兼容逻辑为 plugin。
-- 文档从“运行脚本”升级为“安装/启动 am service”。
+实际形态选了短进程方案（不是 §6.2 的长进程 plugin）：`am listen --script` 强制 per-message 子进程，长进程 plugin 不能直接接管。
+
+- ✅ Python 脚本通用能力按职责拆 5 个 Rust 模块（`crates/cli/src/service/am/{extract, text, scope, reply, handler}.rs`），61 个单元测试。
+- ✅ AmConfig 解析 ServiceSpec.config，env 配置全数迁到 spec.config（迁移表见 `docs/am-joi-bridge.md` §6）。
+- ✅ `joi service am-handler --service-id <id>` CLI 子命令；从 stdin 读消息 → 解析 → 解析 scope → handoff → 三种 reply 模式（callback / send / async_send）。
+- ✅ 旧 thread-map 一次性迁移：检测 `~/.config/aone-message-cli/joi-thread-map.json` 存在且新路径未初始化，copy 到 `<state_dir>/thread-map.json`，原文件保留。
+- ✅ `examples/am-joi-channel-bridge.py` 标记 deprecated（顶部注释指向 Rust handler）。
+- ✅ `docs/am-joi-bridge.md` 重写：换成 ServiceSpec 配置 + `am listen --script "joi service am-handler ..."`。
+- ⚠️ §6.2 的「ServicePlugin trait 长进程模型」在 S2 不被 AM 使用——S1 trait 仍然 ship 着，等 S3/scheduler 落地或者后续真有需要长进程的 plugin（webhook 类）时再被消费。该 trait 不算死代码，是 S3 的预留 API。
 
 ### Phase S3：新增 Scheduler
 

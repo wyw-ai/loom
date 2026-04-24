@@ -94,6 +94,19 @@ pub async fn serve(
     host.serve(specs).await
 }
 
+/// `joi service am-handler --service-id <id>` — per-message AM bridge
+/// handler. Stage 4 wires the CLI; the orchestrator + plugin logic
+/// lives in `crate::service::am::handler` (S2).
+pub async fn am_handler(
+    server_url: String,
+    service_id: String,
+    specs_dir: Option<PathBuf>,
+    async_reply: Option<String>,
+) -> Result<()> {
+    let dir = specs_dir.unwrap_or_else(default_specs_dir);
+    crate::service::am::run_handler(server_url, service_id, dir, async_reply).await
+}
+
 /// `joi service validate <path>` — read a single ServiceSpec JSON file,
 /// run `ServiceSpec::validate()`, exit 0 on success, propagate the
 /// error otherwise. Useful in CI / pre-deploy hooks.

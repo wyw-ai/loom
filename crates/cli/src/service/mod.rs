@@ -21,6 +21,7 @@
 //! `state` is the file-ops layer for per-service private storage
 //! (`~/.local/share/joi/service-host/services/<sid>/`). Pure I/O, no WS.
 
+pub mod am;
 pub mod host;
 pub mod plugin;
 pub mod runtime;

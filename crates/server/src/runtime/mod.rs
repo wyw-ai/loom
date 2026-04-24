@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use proto::methods::{AgentBundleSpec, AgentInfo, AgentSpec, BundleInstallMode};
+use proto::methods::{AgentInfo, AgentSpec, BundleInstallMode};
 use proto::types::*;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -23,6 +23,7 @@ use crate::store::{Store, StoreError};
 use self::acp::AcpAdapter;
 use self::adapter::{Adapter, AdapterEvent};
 use self::command::{CommandAdapter, CommandConfig};
+use agent_runtime::{prepare_bundle_install, resolved_bundle_version};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -520,8 +521,7 @@ impl RuntimeManager {
         }
 
         let source = PathBuf::from(self.expand_base_vars(&bundle.source, actor_id));
-        let version = normalized_bundle_version(bundle, &source);
-        let install_dir = paths.root.join(&version);
+        let install_dir = prepare_bundle_install(&paths.root, &source, bundle)?.install_dir;
         install_bundle_dir(&source, &install_dir, bundle.install_mode)?;
         link_current_bundle(&install_dir, &paths.current)?;
         Ok(())
@@ -698,34 +698,6 @@ impl RuntimeManager {
 #[allow(dead_code)]
 pub(crate) fn _silence_event_unused(_e: &AdapterEvent) {}
 
-fn normalized_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
-    let raw = if !bundle.version.trim().is_empty() {
-        bundle.version.trim().to_string()
-    } else {
-        source
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("bundle")
-            .to_string()
-    };
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-fn resolved_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
-    if bundle.source.trim().is_empty() {
-        String::new()
-    } else {
-        normalized_bundle_version(bundle, source)
-    }
-}
 fn install_bundle_dir(
     source: &Path,
     target: &Path,
@@ -869,18 +841,5 @@ mod tests {
         assert!(!meta.file_type().is_symlink());
 
         std::fs::remove_dir_all(root).ok();
-    }
-    #[test]
-    fn resolved_bundle_version_derives_from_source_basename() {
-        let bundle = AgentBundleSpec {
-            source: "{agent.root}/bundles/demo-bundle".into(),
-            version: String::new(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            resolved_bundle_version(&bundle, Path::new("/tmp/demo-bundle")),
-            "demo-bundle"
-        );
     }
 }

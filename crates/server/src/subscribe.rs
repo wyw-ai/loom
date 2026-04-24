@@ -48,20 +48,22 @@ impl Subscriptions {
     /// actor identity (so it can send events as that actor); whether it also
     /// becomes the actor-inbox owner depends on `actor_kind`:
     ///
-    /// * `Agent` — always takes over. `joi agent serve` claiming an actor
-    ///   means "I am the runtime for this actor"; a restart after a crash
-    ///   needs to win even if the previous WS hasn't been reaped yet (the
-    ///   old conn's TCP close detection on the server side may lag the new
-    ///   process's `connection/open` by tens of ms).
-    /// * `Human` / `Service` — only take if no other live connection holds
-    ///   the slot. Stops short-lived `joi` subcommands shelled from inside
-    ///   an agent's tool call (which inherit `JOI_ACTOR` pointing at the
-    ///   *agent*'s actor and dial `connection/open` on every invocation)
-    ///   from yanking the long-lived agent runtime out of the routing
-    ///   table when their connection later closes.
+    /// * `Agent` / `Service` — always takes over. Long-lived host processes
+    ///   (`joi agent serve`, `joi service serve`) claiming an actor means
+    ///   "I am the runtime for this actor"; a restart after a crash needs
+    ///   to win even if the previous WS hasn't been reaped yet (the old
+    ///   conn's TCP close detection on the server side may lag the new
+    ///   process's `connection/open` by tens of ms). See
+    ///   `docs/service-plugin-system-design.md` §9.4.
+    /// * `Human` — only take if no other live connection holds the slot.
+    ///   Stops short-lived `joi` subcommands shelled from inside an agent
+    ///   or service tool call (which inherit `JOI_ACTOR` pointing at the
+    ///   long-lived actor and dial `connection/open` on every invocation,
+    ///   defaulting to `kind = Human`) from yanking the runtime out of
+    ///   the routing table when their connection later closes.
     ///
     /// Stale entries (binding points at a conn no longer in `connections`)
-    /// are evicted unconditionally, so a fresh `agent serve` after a clean
+    /// are evicted unconditionally, so a fresh host process after a clean
     /// shutdown also takes over.
     pub fn bind_actor(&self, connection_id: &str, actor_id: String, actor_kind: ActorKind) {
         let mut inner = self.inner.write();
@@ -80,13 +82,14 @@ impl Subscriptions {
                 );
                 true
             }
-            Some(prev) if matches!(actor_kind, ActorKind::Agent) => {
+            Some(prev) if matches!(actor_kind, ActorKind::Agent | ActorKind::Service) => {
                 tracing::info!(
                     actor = %actor_id,
                     prev_conn = %prev,
                     new_conn = %connection_id,
-                    "agent connection preempting existing actor_conn binding (likely \
-                     `agent serve` restart with old WS still in connections table)",
+                    kind = ?actor_kind,
+                    "long-lived host connection preempting existing actor_conn binding \
+                     (agent/service serve restart with old WS still in connections table)",
                 );
                 true
             }
@@ -247,5 +250,80 @@ impl Subscriptions {
             return false;
         }
         true
+    }
+
+    #[cfg(test)]
+    fn inbox_owner(&self, actor_id: &str) -> Option<String> {
+        self.inner.read().actor_conn.get(actor_id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_conn(id: &str) -> Connection {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Connection {
+            id: id.into(),
+            actor_id: None,
+            tx,
+        }
+    }
+
+    #[test]
+    fn service_kind_preempts_existing_live_binding() {
+        // §9.4: a long-lived `joi service serve` restart must take over the
+        // actor-inbox even if the previous WS hasn't been reaped yet — same
+        // contract as `joi agent serve`. Without preempt, the new host can't
+        // receive any actor-inbox push until the old conn TCP-times out.
+        let subs = Subscriptions::new();
+        subs.add_connection(make_conn("conn_old"));
+        subs.add_connection(make_conn("conn_new"));
+
+        subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service);
+        assert_eq!(subs.inbox_owner("svc_am_bridge").as_deref(), Some("conn_old"));
+
+        subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Service);
+        assert_eq!(
+            subs.inbox_owner("svc_am_bridge").as_deref(),
+            Some("conn_new"),
+            "service kind must preempt the previous live binding",
+        );
+    }
+
+    #[test]
+    fn human_kind_does_not_preempt_live_binding() {
+        // A short-lived `joi --as svc_xxx say` defaults to actor_kind=Human
+        // (see client::open_connection). It must NOT yank the long-lived
+        // service host out of the routing table, otherwise its eventual
+        // disconnect would leave the actor with no inbox owner at all.
+        let subs = Subscriptions::new();
+        subs.add_connection(make_conn("conn_host"));
+        subs.add_connection(make_conn("conn_shell"));
+
+        subs.bind_actor("conn_host", "svc_am_bridge".into(), ActorKind::Service);
+        subs.bind_actor("conn_shell", "svc_am_bridge".into(), ActorKind::Human);
+
+        assert_eq!(
+            subs.inbox_owner("svc_am_bridge").as_deref(),
+            Some("conn_host"),
+            "human-kind shell must not preempt the long-lived service host",
+        );
+    }
+
+    #[test]
+    fn stale_binding_is_evicted_for_any_kind() {
+        // The "stale entry" branch fires before kind matching, so even a
+        // human-kind connection takes over when the prior binding points at
+        // a connection that is no longer in the table.
+        let subs = Subscriptions::new();
+        subs.add_connection(make_conn("conn_old"));
+        subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service);
+        subs.remove_connection("conn_old");
+
+        subs.add_connection(make_conn("conn_new"));
+        subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Human);
+        assert_eq!(subs.inbox_owner("svc_am_bridge").as_deref(), Some("conn_new"));
     }
 }

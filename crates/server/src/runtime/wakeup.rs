@@ -493,13 +493,36 @@ fn flush_text_as_event(
         "contentType": "text/markdown",
         "text": text,
     });
+    // Tag the agent reply with `responds_to -> trigger_event_id`. This is the
+    // protocol invariant external `joi agent serve` already maintains
+    // (crates/cli/src/cmd/agent_serve.rs::flush_text); the embedded runtime
+    // must match so service plugins waiting on a hand-off receive the reply
+    // via §9.5 RespondsTo reverse-delivery instead of polling event/list.
+    // Missing turn or missing trigger event (e.g. agent-initiated speech
+    // with no upstream prompt) falls back to no relation — same shape as
+    // the external client.
+    let relations = store
+        .get_turn(turn_id)
+        .and_then(|t| t.trigger_event_id.clone())
+        .map(|trigger_id| {
+            vec![Relation {
+                kind: RelationKind::RespondsTo,
+                target: Ref {
+                    kind: RefKind::Event,
+                    id: trigger_id,
+                    _meta: None,
+                },
+                _meta: None,
+            }]
+        })
+        .unwrap_or_default();
     if let Err(e) = store.append_event(
         "content.add".into(),
         actor.to_string(),
         scope.clone(),
         Some(turn_id.to_string()),
         payload,
-        vec![],
+        relations,
         None,
     ) {
         tracing::warn!(turn = %turn_id, %e, "failed to flush turn text into content.add");

@@ -53,10 +53,10 @@ pub async fn dispatch(
         method::CHANNEL_INVITE => channel_invite(state, connection_id, params),
         method::CHANNEL_REVOKE => channel_revoke(state, connection_id, params),
         method::CHANNEL_MEMBERS => channel_members(state, connection_id, params),
-        method::THREAD_CREATE => thread_create(state, params),
-        method::THREAD_LIST => thread_list(state, params),
-        method::THREAD_UPDATE => thread_update(state, params),
-        method::THREAD_DELETE => thread_delete(state, params),
+        method::THREAD_CREATE => thread_create(state, connection_id, params),
+        method::THREAD_LIST => thread_list(state, connection_id, params),
+        method::THREAD_UPDATE => thread_update(state, connection_id, params),
+        method::THREAD_DELETE => thread_delete(state, connection_id, params),
         method::TURN_OPEN => turn_open(state, params),
         method::TURN_CLOSE => turn_close(state, connection_id, params).await,
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
@@ -391,8 +391,22 @@ fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) 
 
 // ---- thread ----
 
-fn thread_create(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn thread_create(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ThreadCreateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    // Channel-membership gate: a non-member cannot spawn a thread inside a
+    // private channel, even though the underlying store would happily create
+    // one. Mirrors the channel_invite pattern; public channels short-circuit
+    // via is_channel_member.
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot create thread in channel {}",
+                p.channel_id
+            ),
+        ));
+    }
     let thread = state
         .store
         .create_thread(p.channel_id, p.title, p.root_event_id)
@@ -400,14 +414,46 @@ fn thread_create(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(ThreadCreateResult { thread })
 }
 
-fn thread_list(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn thread_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ThreadListParams = parse_params(params).unwrap_or(ThreadListParams { channel_id: None });
-    let threads = state.store.list_threads(p.channel_id.as_deref());
+    let caller = state.subscriptions.actor_for_connection(connection_id);
+    // Silently drop threads in channels the caller can't see — same shape
+    // as channel_list. Unbound callers (no actor) only see public-channel
+    // threads. This means an unauthorized client never learns thread titles
+    // or ids, just an empty list.
+    let threads = state
+        .store
+        .list_threads(p.channel_id.as_deref())
+        .into_iter()
+        .filter(|t| match caller.as_deref() {
+            Some(actor) => state.store.is_channel_member(&t.channel_id, actor),
+            None => state
+                .store
+                .get_channel(&t.channel_id)
+                .map(|c| matches!(c.visibility, ChannelVisibility::Public))
+                .unwrap_or(false),
+        })
+        .collect();
     ok(ThreadListResult { threads })
 }
 
-fn thread_update(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ThreadUpdateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot update thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
     let thread = state
         .store
         .update_thread(&p.thread_id, p.title)
@@ -415,8 +461,23 @@ fn thread_update(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(ThreadUpdateResult { thread })
 }
 
-fn thread_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn thread_delete(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ThreadDeleteParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot delete thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
     let deleted = state
         .store
         .delete_thread(&p.thread_id)
@@ -1050,5 +1111,135 @@ mod tests {
         assert_eq!(result.deleted_threads, 1);
         assert!(state.store.get_channel(&channel.id).is_none());
         assert!(state.store.list_threads(Some(&channel.id)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_create_refuses_non_member_in_private_channel() {
+        let state = fresh_state();
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        let err = dispatch(
+            &state,
+            "conn_intruder",
+            method::THREAD_CREATE,
+            Some(json!({ "channelId": channel.id, "title": "sneaky" })),
+        )
+        .await
+        .expect_err("thread/create should be denied");
+
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert!(state.store.list_threads(Some(&channel.id)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_create_allows_member() {
+        let state = fresh_state();
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::THREAD_CREATE,
+            Some(json!({ "channelId": channel.id, "title": "ok" })),
+        )
+        .await
+        .expect("thread/create should succeed");
+        let result: ThreadCreateResult = serde_json::from_value(value).expect("create result");
+
+        assert_eq!(result.thread.title, "ok");
+        assert_eq!(state.store.list_threads(Some(&channel.id)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thread_list_filters_to_visible_channels() {
+        let state = fresh_state();
+        // alice is in private_a; intruder is not. private_b is invisible to both.
+        let private_a = state
+            .store
+            .create_channel("a".into(), Some("actor_alice".into()))
+            .expect("create a");
+        let _t_a = state
+            .store
+            .create_thread(private_a.id.clone(), "in-a".into(), None)
+            .expect("thread in a");
+        let private_b = state
+            .store
+            .create_channel("b".into(), Some("actor_bob".into()))
+            .expect("create b");
+        let _t_b = state
+            .store
+            .create_thread(private_b.id.clone(), "in-b".into(), None)
+            .expect("thread in b");
+
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        let value = dispatch(&state, "conn_alice", method::THREAD_LIST, None)
+            .await
+            .expect("thread/list");
+        let result: ThreadListResult = serde_json::from_value(value).expect("list result");
+        let titles: Vec<&str> = result.threads.iter().map(|t| t.title.as_str()).collect();
+        assert!(
+            titles.contains(&"in-a") && !titles.contains(&"in-b"),
+            "alice must see in-a but not in-b; got {titles:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_delete_refuses_non_member() {
+        let state = fresh_state();
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        let thread = state
+            .store
+            .create_thread(channel.id.clone(), "doomed".into(), None)
+            .expect("create thread");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        let err = dispatch(
+            &state,
+            "conn_intruder",
+            method::THREAD_DELETE,
+            Some(json!({ "threadId": thread.id })),
+        )
+        .await
+        .expect_err("thread/delete should be denied");
+
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert!(state.store.get_thread(&thread.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn thread_update_refuses_non_member() {
+        let state = fresh_state();
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        let thread = state
+            .store
+            .create_thread(channel.id.clone(), "orig".into(), None)
+            .expect("create thread");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        let err = dispatch(
+            &state,
+            "conn_intruder",
+            method::THREAD_UPDATE,
+            Some(json!({ "threadId": thread.id, "title": "renamed" })),
+        )
+        .await
+        .expect_err("thread/update should be denied");
+
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert_eq!(state.store.get_thread(&thread.id).unwrap().title, "orig");
     }
 }

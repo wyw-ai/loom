@@ -407,28 +407,45 @@ fn visible_input_window(input: &str, cursor_char_idx: usize, max_width: usize) -
 
     let budget = max_width - marker_width;
     let chars: Vec<char> = input.chars().collect();
+    let widths: Vec<usize> = chars.iter().map(|ch| char_display_width(*ch)).collect();
     let total = chars.len();
-    let mut start_char = cursor_char_idx.saturating_sub(budget / 2);
-    if start_char + budget > total {
-        start_char = total.saturating_sub(budget);
+    let cursor_char_idx = cursor_char_idx.min(total);
+    let mut cumulative = Vec::with_capacity(total + 1);
+    cumulative.push(0);
+    for width in &widths {
+        cumulative.push(cumulative.last().copied().unwrap_or(0) + width);
     }
-    let end_char = (start_char + budget).min(total);
+
+    let total_width = cumulative[total];
+    let cursor_width = cumulative[cursor_char_idx];
+    let target_left_width = cursor_width.saturating_sub(budget / 2);
+    let mut start_char = cumulative.partition_point(|width| *width <= target_left_width);
+    start_char = start_char.saturating_sub(1).min(total);
+
+    let mut end_char = start_char;
+    while end_char < total && cumulative[end_char + 1] - cumulative[start_char] <= budget {
+        end_char += 1;
+    }
+    while end_char == total
+        && start_char > 0
+        && total_width - cumulative[start_char - 1] <= budget
+    {
+        start_char -= 1;
+    }
+
     let body: String = chars[start_char..end_char].iter().collect();
-    let visible_char_idx = cursor_char_idx
-        .saturating_sub(start_char)
-        .min(body.chars().count());
+    let visible_width = cursor_width.saturating_sub(cumulative[start_char]);
     if start_char > 0 {
         InputWindow {
             text: format!("{marker}{body}"),
             cursor_x: marker_width
-                .saturating_add(width_of_chars(&body, visible_char_idx))
+                .saturating_add(visible_width)
                 .min(u16::MAX as usize) as u16,
         }
     } else {
         InputWindow {
             text: body.clone(),
-            cursor_x: width_of_chars(&body, visible_char_idx)
-                .min(u16::MAX as usize) as u16,
+            cursor_x: visible_width.min(u16::MAX as usize) as u16,
         }
     }
 }
@@ -514,8 +531,12 @@ fn width_of_chars(input: &str, char_count: usize) -> usize {
     input
         .chars()
         .take(char_count)
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0).max(1))
+        .map(char_display_width)
         .sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
 }
 
 #[cfg(test)]
@@ -530,6 +551,13 @@ mod tests {
 
         let visible = visible_input_window("abcdefghij", 3, 6);
         assert_eq!(visible.text, "<bcdef");
+        assert_eq!(visible.cursor_x, 3);
+    }
+
+    #[test]
+    fn visible_input_window_respects_wide_char_width() {
+        let visible = visible_input_window("你好世界ab", 2, 5);
+        assert_eq!(visible.text, "<好世");
         assert_eq!(visible.cursor_x, 3);
     }
 

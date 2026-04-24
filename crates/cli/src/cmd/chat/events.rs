@@ -2088,6 +2088,9 @@ async fn handle_paste(client: &Arc<Client>, app: &mut App, text: String, scope: 
     if normalized.is_empty() {
         return;
     }
+    if route_paste_to_focused_ui(app, &normalized) {
+        return;
+    }
     let char_count = normalized.chars().count();
     if char_count < INLINE_PASTE_CHAR_LIMIT {
         app.input.push_str(&normalized);
@@ -2096,7 +2099,9 @@ async fn handle_paste(client: &Arc<Client>, app: &mut App, text: String, scope: 
         app.input.push_pasted_chunk(token_id, normalized);
     } else {
         match save_pasted_content_to_workspace(client, app, scope, normalized).await {
-            Ok(display) => app.input.push_saved_workspace_ref(display),
+            Ok(saved) => app
+                .input
+                .push_saved_workspace_ref(saved.display, saved.submission),
             Err(e) => {
                 app.set_status(format!("save pasted content failed: {e}"));
                 return;
@@ -2111,16 +2116,35 @@ fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn route_paste_to_focused_ui(app: &mut App, text: &str) -> bool {
+    if let Some(prompt) = app.prompt.as_mut() {
+        prompt.handle_paste(text);
+        return true;
+    }
+    if let Mode::Picker(_) = app.mode {
+        if let Some(picker) = app.picker.as_mut() {
+            picker.handle_paste(text);
+        }
+        return true;
+    }
+    app.sidebar.is_some()
+}
+
 const INLINE_PASTE_CHAR_LIMIT: usize = 2200;
 const WORKSPACE_PASTE_CHAR_LIMIT: usize = 7500;
+
+struct SavedWorkspaceRef {
+    display: String,
+    submission: String,
+}
 
 async fn save_pasted_content_to_workspace(
     client: &Arc<Client>,
     app: &mut App,
     scope: &ScopeRef,
     text: String,
-) -> anyhow::Result<String> {
-    use anyhow::{anyhow, bail};
+) -> anyhow::Result<SavedWorkspaceRef> {
+    use anyhow::bail;
     use proto::methods::ArtifactPublishResult;
 
     if !app.has_scope() {
@@ -2145,22 +2169,28 @@ async fn save_pasted_content_to_workspace(
         )
         .await?;
 
-    let entry_id = res
+    let workspace_path = res
         .artifact
         ._meta
         .as_ref()
-        .and_then(|meta| meta.get("workspaceEntryId"))
-        .and_then(|value| value.as_u64())
-        .ok_or_else(|| {
-            anyhow!(
-                "workspace entry id missing from artifact response (restart joi-server with the updated binary)"
-            )
-        })?;
-
-    Ok(format!(
-        "[Saved pasted content to workspace ({}) id={entry_id}]",
-        human_size(res.artifact.size)
-    ))
+        .and_then(|meta| meta.get("workspacePath"))
+        .and_then(|value| value.as_str());
+    let size = human_size(res.artifact.size);
+    let display = format!("[Saved pasted content to workspace ({size})]");
+    let submission = match workspace_path {
+        Some(path) => format!(
+            "[Saved pasted content to workspace ({size}); artifactId={}; artifactUri={}; workspacePath={path}]",
+            res.artifact.id, res.artifact.uri
+        ),
+        None => format!(
+            "[Saved pasted content to workspace ({size}); artifactId={}; artifactUri={}]",
+            res.artifact.id, res.artifact.uri
+        ),
+    };
+    Ok(SavedWorkspaceRef {
+        display,
+        submission,
+    })
 }
 
 fn human_size(bytes: u64) -> String {
@@ -2298,9 +2328,14 @@ async fn cancel_in_scope(
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_reply_target, message_relations, pick_cancel_target, reply_selected_history};
-    use crate::cmd::chat::app::App;
+    use super::{
+        arm_reply_target, message_relations, pick_cancel_target, reply_selected_history,
+        route_paste_to_focused_ui,
+    };
+    use crate::cmd::chat::app::{App, Mode, PickerKind};
     use crate::cmd::chat::history::{Bubble, BubbleKind, DeliveryState};
+    use crate::cmd::chat::picker::Picker;
+    use crate::cmd::chat::prompt::{PromptKind, PromptModal};
     use chrono::Utc;
 
     #[test]
@@ -2558,5 +2593,60 @@ mod tests {
         );
         let err = pick_cancel_target(&app, &test_scope(), None).unwrap_err();
         assert!(err.contains("no in-flight"));
+    }
+
+    #[test]
+    fn paste_routes_to_prompt_modal_before_chat_input() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.prompt = Some(PromptModal::text(
+            PromptKind::CreateChannel,
+            "New channel",
+            "",
+        ));
+
+        assert!(route_paste_to_focused_ui(&mut app, "hello"));
+        assert!(app.input.is_empty());
+        match app.prompt.as_ref() {
+            Some(PromptModal::Text { value, .. }) => assert_eq!(value, "hello"),
+            _ => panic!("expected text prompt"),
+        }
+    }
+
+    #[test]
+    fn paste_routes_to_picker_filter_before_chat_input() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.mode = Mode::Picker(PickerKind::Action);
+        app.picker = Some(Picker::new("Pick actor", vec![]));
+
+        assert!(route_paste_to_focused_ui(&mut app, "coder"));
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.picker.as_ref().map(|picker| picker.filter.as_str()),
+            Some("coder")
+        );
+    }
+
+    #[test]
+    fn paste_is_swallowed_when_sidebar_has_focus() {
+        let mut app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+        app.toggle_sidebar();
+
+        assert!(route_paste_to_focused_ui(&mut app, "hello"));
+        assert!(app.input.is_empty());
     }
 }

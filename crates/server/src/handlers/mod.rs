@@ -66,6 +66,7 @@ pub async fn dispatch(
         method::ARTIFACT_GET => artifact_get(state, params),
         method::ARTIFACT_READ => artifact_read(state, params),
         method::RECEIPT_RECORD => receipt_record(state, params),
+        method::DELIVERY_LIST => delivery_list(state, connection_id, params),
         method::ACTOR_LIST => actor_list(state),
         method::ACTOR_UPSERT => actor_upsert(state, params),
         method::AGENT_LIST => agent_list(state),
@@ -758,6 +759,76 @@ fn receipt_record(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(ReceiptRecordResult { receipt: r })
 }
 
+// ---- delivery/list (§9.2 durable actor inbox) ----
+//
+// Cursor format is `<rfc3339_utc>|<event_id>`. The `|` separator avoids
+// collision with the `:` characters inside an RFC3339 timestamp; event ids
+// are uuid v4 (no `|`) so the split is unambiguous. Cursor is opaque to
+// callers — the format is an implementation detail of this handler and
+// `Store::list_deliveries`.
+
+fn encode_delivery_cursor(d: &Delivery) -> String {
+    format!("{}|{}", d.updated_at.to_rfc3339(), d.event_id)
+}
+
+fn decode_delivery_cursor(raw: &str) -> Result<(Timestamp, String), ErrorObject> {
+    let (ts_str, eid) = raw.split_once('|').ok_or_else(|| {
+        ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("delivery/list: malformed cursor `{raw}` (expected `<ts>|<event_id>`)"),
+        )
+    })?;
+    let ts = chrono::DateTime::parse_from_rfc3339(ts_str)
+        .map_err(|e| {
+            ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                format!("delivery/list: bad cursor timestamp `{ts_str}`: {e}"),
+            )
+        })?
+        .with_timezone(&chrono::Utc);
+    Ok((ts, eid.to_string()))
+}
+
+fn delivery_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: DeliveryListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if caller != p.actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "delivery/list: caller actor `{caller}` cannot read inbox of `{}`",
+                p.actor_id
+            ),
+        ));
+    }
+    let limit = p.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let after = p.cursor.as_deref().map(decode_delivery_cursor).transpose()?;
+    // Fetch one extra row to detect whether a follow-up page exists.
+    let mut rows = state
+        .store
+        .list_deliveries(&p.actor_id, p.state, limit + 1, after);
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        rows.last().map(encode_delivery_cursor)
+    } else {
+        None
+    };
+    let entries: Vec<DeliveryListEntry> = rows
+        .into_iter()
+        .map(|d| {
+            let event = state.store.get_event(&d.event_id);
+            DeliveryListEntry { delivery: d, event }
+        })
+        .collect();
+    ok(DeliveryListResult {
+        deliveries: entries,
+        next_cursor,
+    })
+}
+
 // ---- actor / agent ----
 
 fn actor_list(state: &AppState) -> HandlerResult {
@@ -1241,5 +1312,236 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
         assert_eq!(state.store.get_thread(&thread.id).unwrap().title, "orig");
+    }
+
+    // ---- delivery/list (§9.2 durable inbox) ----
+
+    fn handoff_to(actor_id: &str) -> Relation {
+        Relation {
+            kind: RelationKind::HandsOffTo,
+            target: Ref {
+                kind: RefKind::Actor,
+                id: actor_id.into(),
+                _meta: None,
+            },
+            _meta: None,
+        }
+    }
+
+    fn append_handoff(state: &AppState, channel_id: &str, from: &str, to: &str) -> String {
+        state
+            .store
+            .append_event(
+                "content.add".into(),
+                from.into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel_id.into(),
+                },
+                None,
+                json!({"text": "hi"}),
+                vec![handoff_to(to)],
+                None,
+            )
+            .expect("append handoff")
+            .id
+    }
+
+    #[tokio::test]
+    async fn delivery_list_returns_pending_for_caller_inbox() {
+        // Baseline: an event with hands_off_to writes a Pending delivery row
+        // for the target. The bound caller can list it back, and the result
+        // includes the inline event payload (no follow-up scope/read needed).
+        let state = fresh_state();
+        let ch = state.store.create_channel("c".into(), None).expect("ch");
+        state.store.grant_channel(&ch.id, "svc_writer").expect("g w");
+        state
+            .store
+            .grant_channel(&ch.id, "actor_target")
+            .expect("g t");
+        let event_id = append_handoff(&state, &ch.id, "svc_writer", "actor_target");
+        open_conn(&state, "conn_t", "actor_target").await;
+
+        let value = dispatch(
+            &state,
+            "conn_t",
+            method::DELIVERY_LIST,
+            Some(json!({ "actorId": "actor_target", "state": "pending" })),
+        )
+        .await
+        .expect("delivery/list ok");
+        let res: DeliveryListResult = serde_json::from_value(value).expect("decode");
+
+        assert_eq!(res.deliveries.len(), 1);
+        let entry = &res.deliveries[0];
+        assert_eq!(entry.delivery.event_id, event_id);
+        assert_eq!(entry.delivery.actor_id, "actor_target");
+        assert!(matches!(entry.delivery.state, DeliveryState::Pending));
+        let event = entry.event.as_ref().expect("inline event payload");
+        assert_eq!(event.id, event_id);
+        assert!(res.next_cursor.is_none(), "single page");
+    }
+
+    #[tokio::test]
+    async fn delivery_list_filters_by_state_after_receipt() {
+        // record_receipt advances Pending -> Delivered. After that the
+        // pending filter must drop the row, and the delivered filter picks
+        // it up. Proves state is a real index, not a noop.
+        let state = fresh_state();
+        let ch = state.store.create_channel("c".into(), None).expect("ch");
+        state.store.grant_channel(&ch.id, "svc_writer").expect("gw");
+        state
+            .store
+            .grant_channel(&ch.id, "actor_target")
+            .expect("gt");
+        let event_id = append_handoff(&state, &ch.id, "svc_writer", "actor_target");
+        state
+            .store
+            .record_receipt(event_id.clone(), "actor_target".into(), ReceiptKind::Completed)
+            .expect("ack");
+        open_conn(&state, "conn_t", "actor_target").await;
+
+        let pending: DeliveryListResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_t",
+                method::DELIVERY_LIST,
+                Some(json!({ "actorId": "actor_target", "state": "pending" })),
+            )
+            .await
+            .expect("pending ok"),
+        )
+        .expect("decode");
+        assert!(
+            pending.deliveries.is_empty(),
+            "pending filter must drop acked row"
+        );
+
+        let delivered: DeliveryListResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_t",
+                method::DELIVERY_LIST,
+                Some(json!({ "actorId": "actor_target", "state": "delivered" })),
+            )
+            .await
+            .expect("delivered ok"),
+        )
+        .expect("decode");
+        assert_eq!(delivered.deliveries.len(), 1);
+        assert_eq!(delivered.deliveries[0].delivery.event_id, event_id);
+    }
+
+    #[tokio::test]
+    async fn delivery_list_paginates_with_cursor() {
+        // Three deliveries, limit=2. First page returns 2 + cursor; second
+        // page returns the remaining 1 with no cursor. Together they cover
+        // every event id exactly once — order-independent so the test is
+        // resilient to clock-resolution ties (sort tiebreak is uuid event_id).
+        let state = fresh_state();
+        let ch = state.store.create_channel("c".into(), None).expect("ch");
+        state.store.grant_channel(&ch.id, "svc_writer").expect("gw");
+        state
+            .store
+            .grant_channel(&ch.id, "actor_target")
+            .expect("gt");
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(append_handoff(&state, &ch.id, "svc_writer", "actor_target"));
+        }
+        open_conn(&state, "conn_t", "actor_target").await;
+
+        let page1: DeliveryListResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_t",
+                method::DELIVERY_LIST,
+                Some(json!({ "actorId": "actor_target", "limit": 2 })),
+            )
+            .await
+            .expect("p1"),
+        )
+        .expect("decode");
+        assert_eq!(page1.deliveries.len(), 2);
+        let cursor = page1.next_cursor.expect("more rows -> cursor present");
+
+        let page2: DeliveryListResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_t",
+                method::DELIVERY_LIST,
+                Some(json!({ "actorId": "actor_target", "limit": 2, "cursor": cursor })),
+            )
+            .await
+            .expect("p2"),
+        )
+        .expect("decode");
+        assert_eq!(page2.deliveries.len(), 1);
+        assert!(page2.next_cursor.is_none(), "drained -> no cursor");
+
+        let mut seen: Vec<String> = page1
+            .deliveries
+            .iter()
+            .chain(page2.deliveries.iter())
+            .map(|e| e.delivery.event_id.clone())
+            .collect();
+        seen.sort();
+        let mut want = ids;
+        want.sort();
+        assert_eq!(seen, want, "pages must cover every id exactly once");
+    }
+
+    #[tokio::test]
+    async fn delivery_list_refuses_other_actors_inbox() {
+        // Reading another actor's inbox would let any connected client snoop
+        // every directed event in the system. The handler refuses with the
+        // same error class as "no bound actor".
+        let state = fresh_state();
+        let ch = state.store.create_channel("c".into(), None).expect("ch");
+        state.store.grant_channel(&ch.id, "svc_writer").expect("gw");
+        state
+            .store
+            .grant_channel(&ch.id, "actor_target")
+            .expect("gt");
+        append_handoff(&state, &ch.id, "svc_writer", "actor_target");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        let err = dispatch(
+            &state,
+            "conn_intruder",
+            method::DELIVERY_LIST,
+            Some(json!({ "actorId": "actor_target" })),
+        )
+        .await
+        .expect_err("must refuse cross-actor read");
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert!(
+            err.message.contains("inbox"),
+            "error message should mention inbox: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_list_requires_bound_actor() {
+        // A connection that never called connection/open has no actor
+        // identity; delivery/list cannot pick a default and must refuse.
+        let state = fresh_state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_anon".into(),
+            actor_id: None,
+            tx,
+        });
+
+        let err = dispatch(
+            &state,
+            "conn_anon",
+            method::DELIVERY_LIST,
+            Some(json!({ "actorId": "actor_target" })),
+        )
+        .await
+        .expect_err("must refuse anonymous caller");
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
     }
 }

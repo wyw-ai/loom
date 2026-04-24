@@ -10,4 +10,5 @@ pub mod handoff;
 pub mod mcp_announcement;
 pub mod mcp_memory;
 pub mod say;
+pub mod service;
 pub mod thread;

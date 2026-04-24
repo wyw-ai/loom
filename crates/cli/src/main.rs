@@ -2,6 +2,7 @@ mod client;
 mod cmd;
 mod config;
 mod render;
+mod service;
 
 use std::path::PathBuf;
 
@@ -112,6 +113,36 @@ enum Cmd {
     Mcp {
         #[command(subcommand)]
         sub: McpCmd,
+    },
+    /// Manage the long-lived service host (am bridge, scheduler, ...). See
+    /// `docs/service-plugin-system-design.md` §11.
+    Service {
+        #[command(subcommand)]
+        sub: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCmd {
+    /// Run as the service host: load every ServiceSpec under --specs and
+    /// supervise each plugin instance over its own server connection.
+    /// S1 ships no built-in plugins; specs whose `kind` lacks a plugin
+    /// are logged-and-skipped (see `docs/service-plugin-system-design.md`
+    /// §12 phases S2/S3).
+    Serve {
+        /// Override the directory of ServiceSpec JSON files. Defaults
+        /// to `~/.config/joi/services/` (or `$JOI_SERVICE_SPECS`).
+        #[arg(long)]
+        specs: Option<PathBuf>,
+        /// Comma-separated spec ids to load. Empty/omitted = load every
+        /// spec under --specs.
+        #[arg(long = "allow-services", value_delimiter = ',')]
+        allow_services: Vec<String>,
+    },
+    /// Validate a single ServiceSpec JSON file. Exits 0 on success and
+    /// non-zero with the parsing/validation error otherwise.
+    Validate {
+        path: PathBuf,
     },
 }
 
@@ -362,6 +393,29 @@ async fn main() -> Result<()> {
         return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
     }
 
+    // `service serve` follows the same shape as `agent serve`: it opens
+    // its own per-service connections (one per ServiceSpec, bound to the
+    // service actor) and must not pollute the actor table with a human
+    // entry. Same early-exit pattern.
+    if let Cmd::Service {
+        sub:
+            ServiceCmd::Serve {
+                specs,
+                allow_services,
+            },
+    } = args.cmd
+    {
+        return cmd::service::serve(specs, cfg.server_url, allow_services).await;
+    }
+
+    // `service validate` is offline — no server contact needed.
+    if let Cmd::Service {
+        sub: ServiceCmd::Validate { path },
+    } = &args.cmd
+    {
+        return cmd::service::validate(path.clone());
+    }
+
     // `mcp memory` never talks to the joi server — it's spawned by the ACP
     // runtime as a stdio MCP child. Short-circuit before opening a websocket
     // so we don't wait on an online server that the agent doesn't need.
@@ -496,6 +550,7 @@ async fn main() -> Result<()> {
             };
             cmd::chat::run(client, cfg.actor_id, scope_id, scope_kind).await?
         }
+        Cmd::Service { .. } => unreachable!("handled before client setup"),
     }
     Ok(())
 }

@@ -39,6 +39,10 @@ pub mod method {
     pub const ARTIFACT_GET: &str = "artifact/get";
     pub const ARTIFACT_READ: &str = "artifact/read";
     pub const RECEIPT_RECORD: &str = "receipt/record";
+    /// §9.2 Durable actor inbox. Caller (must be bound to `actorId`) lists
+    /// deliveries pending against its inbox, with cursor pagination so a
+    /// host can resume after restart without losing directed events.
+    pub const DELIVERY_LIST: &str = "delivery/list";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
 
@@ -540,6 +544,48 @@ pub struct ReceiptRecordResult {
     pub receipt: Receipt,
 }
 
+// ---- delivery/list (§9.2 durable actor inbox) ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryListParams {
+    /// Caller must be bound to this actor (via `connection/open`); cross-actor
+    /// inbox reads are refused. Mirrors the `actorId`-scoped contract that
+    /// `service-plugin-system-design.md` §9.2 calls out.
+    pub actor_id: String,
+    /// Optional state filter. `None` = all states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<DeliveryState>,
+    /// Page size. Server default 50, hard cap 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Opaque cursor returned from a previous call. Pass as-is to fetch the
+    /// next page; omit on the first call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryListEntry {
+    pub delivery: Delivery,
+    /// Inline event payload so plugins don't need a follow-up `scope/read`.
+    /// `None` only when the event row has been compacted away (defensive —
+    /// the current store keeps events forever).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Event>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryListResult {
+    pub deliveries: Vec<DeliveryListEntry>,
+    /// Opaque cursor for the next page. Absent when the result set was
+    /// fully drained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 // ---- actor/list + actor/upsert ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -922,6 +968,95 @@ fn default_disabled_mode() -> String {
     "disabled".into()
 }
 
+// ---- service spec (parallel to AgentSpec; runs under `joi service serve`) ----
+
+/// On-disk spec for a service actor (kind = Service). Mirrors `AgentSpec`
+/// for the host process: `joi service serve` loads `*.json` from a specs
+/// directory, instantiates the named plugin (`kind`), and binds it to a
+/// long-lived service actor connection. See
+/// `docs/service-plugin-system-design.md` §6.1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSpec {
+    /// Unique within a specs directory. Used for state-dir naming
+    /// (`~/.local/share/joi/service-host/services/<id>/`) and for the
+    /// `--allow-services` filter on `joi service serve`. Distinct from
+    /// `actor.id` because one actor may be reachable from multiple specs
+    /// (e.g., a default and a test variant).
+    pub id: String,
+    /// Plugin kind discriminator. Service-host looks up the registered
+    /// plugin factory by this name (`"am"`, `"scheduler"`, ...). v1 only
+    /// permits built-in kinds (see §13 Q5).
+    pub kind: String,
+    /// The service actor this spec runs as. `actor.kind` MUST equal
+    /// `Service`; loaders reject anything else (see `validate_kind`). §6.1
+    /// is explicit that `ServiceSpec` does not inherit kind by convention
+    /// the way `AgentSpec` does — the field is mandatory because a host
+    /// process can mount multiple actor kinds and the spec is the only
+    /// signal of intent.
+    pub actor: Actor,
+    /// Start this service automatically when `joi service serve` boots.
+    /// Default true — services exist to run continuously, the override is
+    /// for staged rollout / debugging.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+    /// Primary channel the service writes into. Optional because some
+    /// plugins compute scope per-event from external context (e.g., am's
+    /// `auto_thread` mode in §7.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Default handoff target. When set, plugin-emitted events typically
+    /// carry `hands_off_to -> actor:<targetAgent>` unless the plugin
+    /// overrides per-event. Plugins are not forced to honor this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent: Option<String>,
+    /// Plugin-specific configuration. Parsed by the plugin itself, not by
+    /// the host. Schema is the plugin's contract (see §7 for am, §8 for
+    /// scheduler).
+    #[serde(default)]
+    pub config: Value,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ServiceSpecError {
+    #[error("ServiceSpec `{spec_id}`: actor `{actor_id}` must declare kind = service, got {got:?}")]
+    WrongActorKind {
+        spec_id: String,
+        actor_id: String,
+        got: ActorKind,
+    },
+    #[error("ServiceSpec `{spec_id}`: kind must be non-empty")]
+    EmptyKind { spec_id: String },
+    #[error("ServiceSpec id must be non-empty")]
+    EmptyId,
+}
+
+impl ServiceSpec {
+    /// Reject specs with a malformed actor or empty discriminators. §6.1's
+    /// invariant is "actor.kind must be service"; the loader calls this
+    /// after `serde_json::from_str` and surfaces the error to the operator.
+    /// Other invariants beyond JSON-shape (e.g., does the plugin kind exist
+    /// in this build?) belong to the host's plugin registry, not here.
+    pub fn validate(&self) -> Result<(), ServiceSpecError> {
+        if self.id.trim().is_empty() {
+            return Err(ServiceSpecError::EmptyId);
+        }
+        if self.kind.trim().is_empty() {
+            return Err(ServiceSpecError::EmptyKind {
+                spec_id: self.id.clone(),
+            });
+        }
+        if !matches!(self.actor.kind, ActorKind::Service) {
+            return Err(ServiceSpecError::WrongActorKind {
+                spec_id: self.id.clone(),
+                actor_id: self.actor.id.clone(),
+                got: self.actor.kind,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
@@ -1034,4 +1169,117 @@ pub mod stream_kind {
     /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
     /// channel. Carries `{ channelId, actorId }`.
     pub const CHANNEL_REVOKED: &str = "channel.revoked";
+}
+
+#[cfg(test)]
+mod service_spec_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn service_actor() -> Actor {
+        Actor {
+            id: "svc_am_bridge".into(),
+            kind: ActorKind::Service,
+            display_name: "DingTalk QA Bridge".into(),
+            capabilities: None,
+            _meta: None,
+        }
+    }
+
+    fn base_spec() -> ServiceSpec {
+        ServiceSpec {
+            id: "am_dingtalk_qa".into(),
+            kind: "am".into(),
+            actor: service_actor(),
+            autostart: true,
+            channel_id: Some("chan_x".into()),
+            target_agent: Some("actor_qa".into()),
+            config: json!({}),
+        }
+    }
+
+    #[test]
+    fn validate_passes_for_service_actor() {
+        assert!(base_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_human_actor() {
+        let mut spec = base_spec();
+        spec.actor.kind = ActorKind::Human;
+        let err = spec.validate().expect_err("human kind must fail");
+        assert!(matches!(err, ServiceSpecError::WrongActorKind { got: ActorKind::Human, .. }));
+    }
+
+    #[test]
+    fn validate_rejects_agent_actor() {
+        // §6.1: an AgentSpec-shaped actor must not be loaded as a service —
+        // catching the typo at load time stops a long-lived agent host from
+        // accidentally claiming service-actor semantics.
+        let mut spec = base_spec();
+        spec.actor.kind = ActorKind::Agent;
+        let err = spec.validate().expect_err("agent kind must fail");
+        assert!(matches!(err, ServiceSpecError::WrongActorKind { got: ActorKind::Agent, .. }));
+    }
+
+    #[test]
+    fn validate_rejects_empty_id_or_kind() {
+        let mut spec = base_spec();
+        spec.id = "  ".into();
+        assert_eq!(spec.validate(), Err(ServiceSpecError::EmptyId));
+
+        let mut spec = base_spec();
+        spec.kind = "".into();
+        assert_eq!(
+            spec.validate(),
+            Err(ServiceSpecError::EmptyKind {
+                spec_id: "am_dingtalk_qa".into()
+            })
+        );
+    }
+
+    #[test]
+    fn round_trips_through_section_6_1_example() {
+        // The doc's §6.1 am example must deserialize cleanly. If this test
+        // breaks the doc and the type are out of sync — fix one or the other,
+        // not the test.
+        let raw = json!({
+            "id": "am_dingtalk_qa",
+            "kind": "am",
+            "actor": {
+                "id": "svc_am_bridge",
+                "kind": "service",
+                "displayName": "DingTalk QA Bridge"
+            },
+            "channelId": "chan_x",
+            "targetAgent": "actor_qa",
+            "config": {
+                "amBin": "am",
+                "topic": "/v1.0/im/bot/messages/get",
+                "scope": "auto_thread",
+                "replyMode": "async_send"
+            }
+        });
+        let spec: ServiceSpec = serde_json::from_value(raw.clone()).expect("deserialize");
+        spec.validate().expect("valid");
+        assert_eq!(spec.id, "am_dingtalk_qa");
+        assert_eq!(spec.kind, "am");
+        assert!(spec.autostart, "autostart defaults to true when absent");
+        assert_eq!(spec.config["scope"], "auto_thread");
+        assert_eq!(spec.config["replyMode"], "async_send");
+    }
+
+    #[test]
+    fn autostart_defaults_true_when_field_missing() {
+        let raw = json!({
+            "id": "x",
+            "kind": "am",
+            "actor": {
+                "id": "svc_x",
+                "kind": "service"
+            }
+        });
+        let spec: ServiceSpec = serde_json::from_value(raw).expect("deserialize");
+        assert!(spec.autostart);
+    }
 }

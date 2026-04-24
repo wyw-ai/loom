@@ -105,6 +105,7 @@ pub async fn run(
                         handle_key(&client, &mut app, key, &scope).await;
                     }
                 }
+                CtEvent::Paste(text) => handle_paste(&client, &mut app, text, &scope).await,
                 CtEvent::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 CtEvent::Resize(_, _) => {}
                 _ => {}
@@ -659,7 +660,7 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                             .map(|it| it.id.clone())
                     });
                     if let Some(cmd) = chosen {
-                        app.input = format!("{} ", cmd);
+                        app.input = format!("{} ", cmd).into();
                         app.slash_menu = None;
                         return;
                     }
@@ -672,7 +673,7 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                     if let Some(id) = chosen {
                         // Rewrite the leading `@<filter>` token to `@<id> ` so
                         // the user can type the message body before Enter.
-                        app.input = format!("@{} ", id);
+                        app.input = format!("@{} ", id).into();
                         app.at_menu = None;
                         return;
                     }
@@ -710,6 +711,8 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
         }
         KeyCode::Up => app.select_older_history(),
         KeyCode::Down => app.select_newer_history(),
+        KeyCode::Left if app.input.is_empty() => app.collapse_selected_history(),
+        KeyCode::Right if app.input.is_empty() => app.expand_selected_history(),
         KeyCode::PageUp => {
             app.clear_history_selection();
             app.scroll_up(10);
@@ -732,7 +735,13 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             app.update_at_menu();
         }
         KeyCode::Enter => {
-            let text = std::mem::take(&mut app.input);
+            if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+                app.input.push_char('\n');
+                app.update_slash_menu();
+                app.update_at_menu();
+                return;
+            }
+            let text = app.input.take_submission_text();
             app.slash_menu = None;
             app.at_menu = None;
             if text.trim().is_empty() {
@@ -747,7 +756,11 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             }
         }
         KeyCode::Char(c) => {
-            app.input.push(c);
+            if key.modifiers == KeyModifiers::CONTROL && c == 'j' {
+                app.input.push_char('\n');
+            } else {
+                app.input.push_char(c);
+            }
             app.update_slash_menu();
             app.update_at_menu();
         }
@@ -1916,7 +1929,7 @@ fn arm_reply_target(app: &mut App, event_id: String) {
         .find(|(id, _)| id == &event_id)
         .map(|(_, label)| label)
         .unwrap_or_else(|| "(unknown message)".to_string());
-    if app.input.trim_start().starts_with("/reply") {
+    if app.input.display_text().trim_start().starts_with("/reply") {
         app.input.clear();
         app.slash_menu = None;
         app.at_menu = None;
@@ -1953,6 +1966,90 @@ fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
         }
     }
     (relations, reply_target)
+}
+
+async fn handle_paste(client: &Arc<Client>, app: &mut App, text: String, scope: &ScopeRef) {
+    let normalized = normalize_pasted_text(&text);
+    if normalized.is_empty() {
+        return;
+    }
+    let char_count = normalized.chars().count();
+    if char_count < 300 {
+        app.input.push_str(&normalized);
+    } else if char_count <= 5000 {
+        let token_id = app.next_paste_token_id();
+        app.input.push_pasted_chunk(token_id, normalized);
+    } else {
+        match save_pasted_content_to_workspace(client, app, scope, normalized).await {
+            Ok(display) => app.input.push_saved_workspace_ref(display),
+            Err(e) => {
+                app.set_status(format!("save pasted content failed: {e}"));
+                return;
+            }
+        }
+    }
+    app.update_slash_menu();
+    app.update_at_menu();
+}
+
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+async fn save_pasted_content_to_workspace(
+    client: &Arc<Client>,
+    app: &mut App,
+    scope: &ScopeRef,
+    text: String,
+) -> anyhow::Result<String> {
+    use anyhow::{anyhow, bail};
+    use proto::methods::ArtifactPublishResult;
+
+    if !app.has_scope() {
+        bail!("open a channel or thread before pasting content larger than 5000 characters");
+    }
+
+    let res: ArtifactPublishResult = client
+        .call(
+            method::ARTIFACT_PUBLISH,
+            json!({
+                "createdBy": app.actor_id,
+                "scope": scope,
+                "ingress": {
+                    "kind": "inline_text",
+                    "name": "pasted-content.md",
+                    "mediaType": "text/markdown",
+                    "text": text,
+                }
+            }),
+        )
+        .await?;
+
+    let entry_id = res
+        .artifact
+        ._meta
+        .as_ref()
+        .and_then(|meta| meta.get("workspaceEntryId"))
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| anyhow!("workspace entry id missing from artifact response"))?;
+
+    Ok(format!(
+        "[Saved pasted content to workspace ({}) id={entry_id}]",
+        human_size(res.artifact.size)
+    ))
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= MB {
+        format!("{:.1} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &ScopeRef) {

@@ -58,7 +58,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if dropdown_h > 0 {
         constraints.push(Constraint::Length(dropdown_h));
     }
-    constraints.push(Constraint::Length(3)); // input
+    constraints.push(Constraint::Length(input_height(app, main_area.width))); // input
     constraints.push(Constraint::Length(1)); // status
 
     let outer = Layout::default()
@@ -154,7 +154,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" History  (↑/↓=select · r=reply · Ctrl-R=picker · PgUp/PgDn=scroll) ")
+        .title(
+            " History  (↑/↓=select · ←/→=collapse/expand · r=reply · Ctrl-R=picker · PgUp/PgDn=scroll) ",
+        )
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -162,7 +164,12 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
     let display_for = |id: &str| app.display_name_for(id);
     let rendered = app
         .history
-        .render_lines(inner.width, app.selected_history_idx, &display_for);
+        .render_lines(
+            inner.width,
+            app.selected_history_idx,
+            &app.expanded_history,
+            &display_for,
+        );
     let visible = inner.height.max(1);
     let max_scroll = rendered.total_rows.saturating_sub(visible);
     if app.auto_follow {
@@ -278,10 +285,12 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let title = match app.reply_target.as_ref() {
             Some(target) => format!(
-                " Message (reply → {} · Enter=send · Esc=clear · /… for slash) ",
+                " Message (reply → {} · Enter=send · Alt+Enter/Ctrl+J=new line · Esc=clear · /… for slash) ",
                 target.preview
             ),
-            None => " Message (Enter to send · /…  for slash) ".to_string(),
+            None => {
+                " Message (Enter=send · Alt+Enter/Ctrl+J=new line · /… for slash) ".to_string()
+            }
         };
         (title, Color::Cyan)
     };
@@ -290,13 +299,12 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
-    let visible = visible_input_tail(&app.input, inner.width.saturating_sub(3) as usize);
-    let line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(visible),
-        Span::styled("_", Style::default().fg(Color::Cyan)),
-    ]);
-    f.render_widget(Paragraph::new(line).block(block), area);
+    f.render_widget(
+        Paragraph::new(input_display_text(app, inner.width))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
@@ -305,6 +313,26 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     )]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn input_height(app: &App, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(2).max(1);
+    let rows = Paragraph::new(input_display_text(app, inner_width))
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width)
+        .max(1)
+        .min(6);
+    rows.saturating_add(2) as u16
+}
+
+fn input_display_text(app: &App, width: u16) -> String {
+    let input = app.input.display_text();
+    let visible = if input.contains('\n') {
+        input
+    } else {
+        visible_input_tail(&input, width.saturating_sub(3) as usize)
+    };
+    format!("> {visible}_")
 }
 
 fn visible_input_tail(input: &str, max_width: usize) -> String {

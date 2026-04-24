@@ -1,3 +1,4 @@
+mod announcement;
 mod app;
 mod draft;
 mod events;

@@ -45,11 +45,14 @@ enum Cmd {
         #[command(subcommand)]
         sub: ThreadCmd,
     },
-    /// Send a content.add event into a thread.
+    /// Send a content.add event into a thread or channel.
     Say {
         text: String,
         #[arg(long)]
         r#in: String,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
         #[arg(long)]
         reply: Option<String>,
     },
@@ -60,6 +63,9 @@ enum Cmd {
         agent: Option<String>,
         #[arg(long)]
         r#in: String,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
         #[arg(long, default_value = "")]
         message: String,
     },
@@ -127,6 +133,19 @@ enum McpCmd {
         #[arg(long = "shard-by")]
         shard_by: Option<String>,
     },
+    /// Expose pinned-announcement tools (`announcement.set` /
+    /// `announcement.clear`) so an agent can publish a recap to the
+    /// right-side panel of any chat scope it has write access to. Connects
+    /// back to the running joi-server over WebSocket and proxies each tool
+    /// call to one `event/append`.
+    Announcement {
+        #[arg(long = "actor-id", env = "JOI_ACTOR")]
+        actor_id: String,
+        /// joi-server WebSocket URL. Falls back to `JOI_SERVER`; the
+        /// runtime hands this over explicitly when spawning the MCP child.
+        #[arg(long = "server", env = "JOI_SERVER")]
+        server: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -191,6 +210,16 @@ enum EventCmd {
 enum ActorCmd {
     /// List every actor the server knows about.
     List,
+    /// Create or update an actor row. Useful for service bridge identities.
+    Upsert {
+        actor_id: String,
+        /// Actor kind: human, agent, or service.
+        #[arg(long, default_value = "service")]
+        kind: String,
+        /// Display name. Defaults to actor_id.
+        #[arg(long)]
+        display: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -348,6 +377,18 @@ async fn main() -> Result<()> {
         return cmd::mcp_memory::run(actor_id.clone(), profile_dir.clone(), shard_by.clone());
     }
 
+    // `mcp announcement` does talk to the server, but it must bind as the
+    // *agent's* actor (so ACL gates apply correctly), not as the operator
+    // running the binary. Short-circuit before the generic
+    // `connection/open` below so the agent's connection isn't shadowed by
+    // a human-actor binding.
+    if let Cmd::Mcp {
+        sub: McpCmd::Announcement { actor_id, server },
+    } = &args.cmd
+    {
+        return cmd::mcp_announcement::run(actor_id.clone(), server.clone()).await;
+    }
+
     let client = Client::connect(&cfg.server_url).await?;
     client.initialize().await?;
     let _ = client
@@ -377,14 +418,18 @@ async fn main() -> Result<()> {
             }
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
         },
-        Cmd::Say { text, r#in, reply } => {
-            cmd::say::run(client, cfg.actor_id, r#in, text, reply).await?
-        }
+        Cmd::Say {
+            text,
+            r#in,
+            channel,
+            reply,
+        } => cmd::say::run(client, cfg.actor_id, r#in, channel, text, reply).await?,
         Cmd::Handoff {
             agent,
             r#in,
+            channel,
             message,
-        } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, message).await?,
+        } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, channel, message).await?,
         Cmd::Action { sub } => match sub {
             ActionCmd::Accept { event_id, option } => {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, true).await?
@@ -424,6 +469,11 @@ async fn main() -> Result<()> {
         },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,
+            ActorCmd::Upsert {
+                actor_id,
+                kind,
+                display,
+            } => cmd::actor::upsert(client, actor_id, kind, display).await?,
         },
         Cmd::Artifact { sub } => match sub {
             ArtifactCmd::Publish {

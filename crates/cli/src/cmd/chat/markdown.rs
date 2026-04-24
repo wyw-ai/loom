@@ -9,9 +9,10 @@
 //! Trailing blank rows are stripped so a message ending in `\n\n` does not
 //! inflate the bubble's apparent height.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
 /// Render the markdown `text` into rows of styled spans suitable for assembling
 /// `Line`s. The base color is applied to plain text; markdown styling layers
@@ -20,6 +21,7 @@ pub fn render_to_rows(text: &str, base: Style) -> Vec<Vec<Span<'static>>> {
     let mut renderer = Renderer::new(base);
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(text, opts);
     for ev in parser {
         renderer.handle(ev);
@@ -50,6 +52,21 @@ struct Renderer {
     /// True after we've emitted at least one row of content; controls whether
     /// a paragraph break should insert a blank separator row.
     seen_content: bool,
+    /// Buffered table being assembled. Cells are captured into
+    /// `current_cell` rather than `current` while this is `Some`, so the
+    /// emit-on-`End(Table)` path can size columns and draw box borders
+    /// instead of letting raw cell text leak into the surrounding flow.
+    table: Option<TableState>,
+}
+
+#[derive(Default)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    headers: Vec<Vec<Span<'static>>>,
+    rows: Vec<Vec<Vec<Span<'static>>>>,
+    in_header: bool,
+    current_row: Vec<Vec<Span<'static>>>,
+    current_cell: Vec<Span<'static>>,
 }
 
 impl Renderer {
@@ -65,6 +82,7 @@ impl Renderer {
             link_url_stack: Vec::new(),
             in_code_block: false,
             seen_content: false,
+            table: None,
         }
     }
 
@@ -80,7 +98,15 @@ impl Renderer {
             // Chat messages aren't prose — a literal `\n` is meant as a
             // visible line break, not a typographic soft break that should
             // reflow into a space. Treat both break kinds the same.
-            Event::SoftBreak | Event::HardBreak => self.flush_row(),
+            // Inside a table cell, collapse to a single space so the row
+            // stays one visual line.
+            Event::SoftBreak | Event::HardBreak => {
+                if self.table.is_some() {
+                    self.push_span(" ".to_string(), self.active);
+                } else {
+                    self.flush_row();
+                }
+            }
             Event::Rule => {
                 self.flush_row();
                 self.rows.push(vec![Span::styled(
@@ -158,16 +184,37 @@ impl Renderer {
             Tag::Image { dest_url, .. } => {
                 self.write_text(&format!("[image: {}]", dest_url));
             }
+            Tag::Table(alignments) => {
+                self.maybe_block_break();
+                self.table = Some(TableState {
+                    alignments,
+                    ..TableState::default()
+                });
+            }
+            Tag::TableHead => {
+                if let Some(t) = self.table.as_mut() {
+                    t.in_header = true;
+                    t.current_row.clear();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(t) = self.table.as_mut() {
+                    t.in_header = false;
+                    t.current_row.clear();
+                }
+            }
+            Tag::TableCell => {
+                if let Some(t) = self.table.as_mut() {
+                    t.current_cell.clear();
+                }
+            }
             _ => {}
         }
     }
 
     fn end(&mut self, end: TagEnd) {
         match end {
-            TagEnd::Paragraph
-            | TagEnd::Heading(_)
-            | TagEnd::BlockQuote(_)
-            | TagEnd::Item => {
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote(_) | TagEnd::Item => {
                 self.flush_row();
             }
             TagEnd::CodeBlock => {
@@ -196,6 +243,29 @@ impl Renderer {
                 }
                 self.pop_style();
             }
+            TagEnd::TableCell => {
+                if let Some(t) = self.table.as_mut() {
+                    let cell = std::mem::take(&mut t.current_cell);
+                    t.current_row.push(cell);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(t) = self.table.as_mut() {
+                    t.headers = std::mem::take(&mut t.current_row);
+                    t.in_header = false;
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(t) = self.table.as_mut() {
+                    let row = std::mem::take(&mut t.current_row);
+                    t.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    self.emit_table(t);
+                }
+            }
             _ => {}
         }
     }
@@ -222,6 +292,10 @@ impl Renderer {
     }
 
     fn push_span(&mut self, text: String, style: Style) {
+        if let Some(t) = self.table.as_mut() {
+            t.current_cell.push(Span::styled(text, style));
+            return;
+        }
         self.consume_pending_prefix();
         self.current.push(Span::styled(text, style));
     }
@@ -271,6 +345,48 @@ impl Renderer {
         }
     }
 
+    /// Emit a buffered markdown table as a sequence of rows with box-drawing
+    /// borders. Columns are sized to the widest cell in the column (header
+    /// included) and aligned per the markdown header divider (`:--`, `:-:`,
+    /// `--:`). Cells are styled spans, so any inline bold/italic/code inside
+    /// a cell survives.
+    fn emit_table(&mut self, t: TableState) {
+        let cols = t
+            .headers
+            .len()
+            .max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+        if cols == 0 {
+            return;
+        }
+        let widths: Vec<usize> = (0..cols)
+            .map(|c| {
+                let mut w = t.headers.get(c).map(|cell| cell_width(cell)).unwrap_or(0);
+                for r in &t.rows {
+                    if let Some(cell) = r.get(c) {
+                        w = w.max(cell_width(cell));
+                    }
+                }
+                w.max(1)
+            })
+            .collect();
+        let alignments: Vec<Alignment> = (0..cols)
+            .map(|c| t.alignments.get(c).copied().unwrap_or(Alignment::None))
+            .collect();
+        let border_style = Style::default().fg(Color::DarkGray);
+
+        if !t.headers.is_empty() {
+            let row = render_table_row(&t.headers, &widths, &alignments, border_style);
+            self.rows.push(row);
+            self.rows
+                .push(render_table_separator(&widths, &alignments, border_style));
+        }
+        for r in &t.rows {
+            let row = render_table_row(r, &widths, &alignments, border_style);
+            self.rows.push(row);
+        }
+        self.seen_content = true;
+    }
+
     fn finish(mut self) -> Vec<Vec<Span<'static>>> {
         self.flush_row();
         // Strip trailing blank rows — `\n\n` at the end of a streamed bubble
@@ -283,6 +399,80 @@ impl Renderer {
         }
         self.rows
     }
+}
+
+fn cell_width(cell: &[Span<'_>]) -> usize {
+    cell.iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+fn render_table_row(
+    cells: &[Vec<Span<'static>>],
+    widths: &[usize],
+    alignments: &[Alignment],
+    border_style: Style,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, &w) in widths.iter().enumerate() {
+        spans.push(Span::styled("│ ", border_style));
+        let empty: Vec<Span<'static>> = Vec::new();
+        let cell = cells.get(i).unwrap_or(&empty);
+        let cw = cell_width(cell);
+        let pad = w.saturating_sub(cw);
+        let (left, right) = match alignments.get(i).copied().unwrap_or(Alignment::None) {
+            Alignment::Right => (pad, 0),
+            Alignment::Center => (pad / 2, pad - pad / 2),
+            _ => (0, pad),
+        };
+        if left > 0 {
+            spans.push(Span::raw(" ".repeat(left)));
+        }
+        for s in cell {
+            spans.push(s.clone());
+        }
+        if right > 0 {
+            spans.push(Span::raw(" ".repeat(right)));
+        }
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled("│", border_style));
+    spans
+}
+
+fn render_table_separator(
+    widths: &[usize],
+    alignments: &[Alignment],
+    border_style: Style,
+) -> Vec<Span<'static>> {
+    // Header divider, mirroring markdown's own `:---:` form so column
+    // alignment is visible in the rendered table.
+    let mut s = String::from("├");
+    for (i, &w) in widths.iter().enumerate() {
+        if i > 0 {
+            s.push('┼');
+        }
+        let interior = w + 2; // matches the `│ {content} ` cell padding
+        let dashes = "─".repeat(interior);
+        match alignments.get(i).copied().unwrap_or(Alignment::None) {
+            Alignment::Left => {
+                s.push(':');
+                s.push_str(&"─".repeat(interior.saturating_sub(1)));
+            }
+            Alignment::Right => {
+                s.push_str(&"─".repeat(interior.saturating_sub(1)));
+                s.push(':');
+            }
+            Alignment::Center => {
+                s.push(':');
+                s.push_str(&"─".repeat(interior.saturating_sub(2)));
+                s.push(':');
+            }
+            Alignment::None => s.push_str(&dashes),
+        }
+    }
+    s.push('┤');
+    vec![Span::styled(s, border_style)]
 }
 
 #[cfg(test)]
@@ -365,7 +555,10 @@ mod tests {
             t.iter().any(|line| line.contains("fn main()")),
             "got: {t:?}"
         );
-        assert!(t.iter().any(|line| line.contains("let x = 1;")), "got: {t:?}");
+        assert!(
+            t.iter().any(|line| line.contains("let x = 1;")),
+            "got: {t:?}"
+        );
     }
 
     #[test]
@@ -385,6 +578,35 @@ mod tests {
         assert!(rows[0]
             .iter()
             .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn table_renders_with_box_borders_and_header_divider() {
+        let md = "| a | bb |\n|---|---:|\n| 1 | 22 |\n| 33 | 4 |";
+        let rows = render_to_rows(md, Style::default());
+        let t = texts(&rows);
+        // 4 rows: header, separator, two body rows.
+        assert_eq!(t.len(), 4, "got: {t:?}");
+        // Header / body rows use `│ … │`; the separator uses `├ … ┤`.
+        for (i, line) in t.iter().enumerate() {
+            let (l, r) = if i == 1 {
+                ('├', '┤')
+            } else {
+                ('│', '│')
+            };
+            assert!(line.starts_with(l), "row {i} missing left border: {line:?}");
+            assert!(line.ends_with(r), "row {i} missing right border: {line:?}");
+        }
+        // Header divider uses `─` and the right-alignment marker `:` for col 2.
+        assert!(t[1].contains('─'), "no dashes in separator: {:?}", t[1]);
+        assert!(
+            t[1].contains(":┤"),
+            "right-align marker missing: {:?}",
+            t[1]
+        );
+        // Body cells appear in their rows.
+        assert!(t[2].contains('1') && t[2].contains("22"), "got: {:?}", t[2]);
+        assert!(t[3].contains("33") && t[3].contains('4'), "got: {:?}", t[3]);
     }
 
     #[test]

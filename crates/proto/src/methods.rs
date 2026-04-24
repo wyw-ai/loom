@@ -253,11 +253,21 @@ pub struct ChannelUpdateResult {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelDeleteParams {
     pub channel_id: String,
+    /// When true, child threads are deleted in the same call before the
+    /// channel itself is removed. Default false preserves the safe-by-default
+    /// behavior: server refuses to delete a non-empty channel.
+    #[serde(default)]
+    pub cascade: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChannelDeleteResult {
     pub deleted: bool,
+    /// Number of child threads removed when `cascade=true`. Zero on the
+    /// non-cascade path (the empty-channel happy case) and on no-op deletes.
+    #[serde(default)]
+    pub deleted_threads: u32,
 }
 
 // ---- thread/create / list ----
@@ -652,6 +662,27 @@ pub struct AgentSpec {
     /// how they reach the agent (prompt section and/or MCP bridge).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemorySpec>,
+    /// Optional opt-in for the pinned-announcement MCP. When present and
+    /// `mcp = true`, the runtime auto-injects a `joi-announcement` stdio
+    /// server into the ACP session, giving the agent two tools:
+    /// `announcement.set` and `announcement.clear` to publish a recap to
+    /// the right-side panel of any chat client subscribed to the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<AnnouncementSpec>,
+}
+
+// ---- announcement ----
+
+/// Per-actor announcement configuration. v0 has only a single `mcp` switch;
+/// future fields might constrain which scopes the agent can pin to or
+/// require an extra approval step.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnouncementSpec {
+    /// When true, the ACP `session/new` call synthesizes a `joi-announcement`
+    /// stdio MCP server. Default false — opt-in.
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 // ---- identity ----

@@ -5,21 +5,56 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::announcement;
 use super::app::{App, Mode};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    // When the Discord-style sidebar is open, peel off a fixed-width left
-    // column and render the existing chat layout into the remaining area.
-    let (sidebar_area, main_area) = if app.sidebar.is_some() {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(20)])
-            .split(area);
-        (Some(cols[0]), cols[1])
+    // Horizontal split: optional left sidebar (28) | chat | optional right
+    // announcement panel (PANEL_WIDTH). Each side is taken only when the
+    // corresponding state is present, so a screen with neither uses the full
+    // width for chat. The announcement column is omitted on narrow terminals
+    // (chat falls below 40 cols) so the chat pane keeps a usable width.
+    let want_announcement = app.history.current_announcement.is_some();
+    let sidebar_w: u16 = if app.sidebar.is_some() { 28 } else { 0 };
+    let chat_min: u16 = 40;
+    let announce_w: u16 = if want_announcement
+        && area.width >= sidebar_w + chat_min + announcement::PANEL_WIDTH
+    {
+        announcement::PANEL_WIDTH
     } else {
-        (None, area)
+        0
+    };
+
+    let mut h_constraints: Vec<Constraint> = Vec::new();
+    if sidebar_w > 0 {
+        h_constraints.push(Constraint::Length(sidebar_w));
+    }
+    h_constraints.push(Constraint::Min(20));
+    if announce_w > 0 {
+        h_constraints.push(Constraint::Length(announce_w));
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(h_constraints)
+        .split(area);
+
+    let mut col_idx = 0usize;
+    let sidebar_area = if sidebar_w > 0 {
+        let r = cols[col_idx];
+        col_idx += 1;
+        Some(r)
+    } else {
+        None
+    };
+    let main_area = cols[col_idx];
+    col_idx += 1;
+    let announcement_area = if announce_w > 0 {
+        Some(cols[col_idx])
+    } else {
+        None
     };
 
     // Inline dropdown sizing: 1 border + N items + 1 border, capped at 8 rows.
@@ -89,6 +124,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         if let Some(s) = app.sidebar.as_mut() {
             s.render(f, sidebar_rect);
         }
+    }
+
+    if let (Some(rect), Some(a)) = (announcement_area, app.history.current_announcement.as_ref()) {
+        let display = |id: &str| app.display_name_for(id);
+        announcement::render(f, a, &display, rect);
     }
 
     if let (Mode::Picker(_), Some(p)) = (&app.mode, app.picker.as_mut()) {
@@ -162,14 +202,14 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
 
     let display_for = |id: &str| app.display_name_for(id);
-    let rendered = app
-        .history
-        .render_lines(
-            inner.width,
-            app.selected_history_idx,
-            &app.expanded_history,
-            &display_for,
-        );
+    let kind_for = |id: &str| app.actor_kinds.get(id).cloned();
+    let rendered = app.history.render_lines(
+        inner.width,
+        app.selected_history_idx,
+        &app.expanded_history,
+        &display_for,
+        &kind_for,
+    );
     let visible = inner.height.max(1);
     let max_scroll = rendered.total_rows.saturating_sub(visible);
     if app.auto_follow {
@@ -200,24 +240,23 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
 /// Single-row dim bar that lists every agent with an open turn in scope.
 /// Hint at the end tells the user how to stop them: Esc cancels the only
 /// one (or the selected bubble), `/cancel @agent` for explicit.
-fn render_streaming_bar(
-    f: &mut Frame,
-    app: &App,
-    area: Rect,
-    in_flight: &[InFlightRow],
-) {
+fn render_streaming_bar(f: &mut Frame, app: &App, area: Rect, in_flight: &[InFlightRow]) {
     let now = chrono::Utc::now();
+    // Frame is a function of wall time so any redraw advances it (the chat
+    // event loop wakes every ~100ms via `poll`, which is the spinner cadence).
+    const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame_idx =
+        ((now.timestamp_millis().max(0) as u64 / 100) % SPINNER_FRAMES.len() as u64) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        " ⠋ ",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        format!(" {} ", SPINNER_FRAMES[frame_idx]),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )];
     let mut first = true;
     for row in in_flight {
         if !first {
-            spans.push(Span::styled(
-                "   ",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled("   ", Style::default().fg(Color::DarkGray)));
         }
         first = false;
         let elapsed = (now - row.started).num_seconds().max(0);

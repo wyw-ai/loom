@@ -523,6 +523,8 @@ impl RuntimeManager {
                     actor_id,
                     &self.profile_for(actor_id),
                     spec.memory.as_ref(),
+                    spec.announcement.as_ref(),
+                    Some(self.server_url.as_str()),
                 );
                 let cfg = acp::AcpConfig {
                     command: spec.transport.command.clone(),

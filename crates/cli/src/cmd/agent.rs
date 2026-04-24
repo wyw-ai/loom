@@ -154,6 +154,7 @@ pub async fn add(client: Arc<Client>) -> Result<()> {
             },
             ..Default::default()
         }),
+        announcement: None,
     };
     let res: AgentRegisterResult = client
         .call(method::AGENT_REGISTER, json!({ "spec": spec }))

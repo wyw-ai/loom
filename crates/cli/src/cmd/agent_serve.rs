@@ -263,6 +263,7 @@ struct WorkerState {
 struct ActiveTurn {
     id: String,
     scope: ScopeRef,
+    trigger_event_id: String,
     /// Actor that triggered the current turn — needed when emitting a
     /// `action.request` so we can hand the choice back to them.
     trigger_actor: String,
@@ -436,6 +437,8 @@ fn build_adapter(
                 &spec.actor.id,
                 &paths.profile,
                 spec.memory.as_ref(),
+                spec.announcement.as_ref(),
+                Some(server_url),
             );
             let cfg = AcpConfig {
                 command: spec.transport.command.clone(),
@@ -577,6 +580,7 @@ async fn dispatch_handoff(
         let active = ActiveTurn {
             id: turn_res.turn.id.clone(),
             scope: trigger.scope.clone(),
+            trigger_event_id: trigger.id.clone(),
             trigger_actor: trigger.actor_id.clone(),
         };
         state.set_turn(active.clone());
@@ -794,7 +798,15 @@ async fn translate_one(
             .await?;
             if !is_partial {
                 if let Some(text) = state.take_text(&active.id) {
-                    flush_text(client, actor_id, &active.scope, &active.id, text).await?;
+                    flush_text(
+                        client,
+                        actor_id,
+                        &active.scope,
+                        &active.id,
+                        &active.trigger_event_id,
+                        text,
+                    )
+                    .await?;
                 }
             }
         }
@@ -890,7 +902,15 @@ async fn translate_one(
                 return Ok(());
             };
             if let Some(text) = state.take_text(&active.id) {
-                flush_text(client, actor_id, &active.scope, &active.id, text).await?;
+                flush_text(
+                    client,
+                    actor_id,
+                    &active.scope,
+                    &active.id,
+                    &active.trigger_event_id,
+                    text,
+                )
+                .await?;
             }
             let status = if success {
                 TurnStatus::Closed
@@ -997,8 +1017,22 @@ async fn flush_text(
     actor_id: &str,
     scope: &ScopeRef,
     turn_id: &str,
+    trigger_event_id: &str,
     text: String,
 ) -> Result<()> {
+    let relations = if trigger_event_id.is_empty() {
+        vec![]
+    } else {
+        vec![Relation {
+            kind: RelationKind::RespondsTo,
+            target: Ref {
+                kind: RefKind::Event,
+                id: trigger_event_id.to_string(),
+                _meta: None,
+            },
+            _meta: None,
+        }]
+    };
     append_event(
         client,
         "content.add",
@@ -1006,7 +1040,7 @@ async fn flush_text(
         scope,
         Some(turn_id),
         json!({ "contentType": "text/markdown", "text": text }),
-        vec![],
+        relations,
     )
     .await
     .map(|_| ())

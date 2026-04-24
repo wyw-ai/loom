@@ -112,6 +112,11 @@ impl Picker {
         }
     }
 
+    pub fn handle_paste(&mut self, text: &str) {
+        self.filter.push_str(text);
+        self.clamp_selection();
+    }
+
     fn move_sel(&mut self, delta: i32) {
         let len = self.filtered().len();
         if len == 0 {

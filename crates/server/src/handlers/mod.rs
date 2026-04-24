@@ -643,6 +643,12 @@ async fn event_append(state: &AppState, params: Option<Value>) -> HandlerResult 
 
 fn artifact_publish(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ArtifactPublishParams = parse_params(params)?;
+    if let Some(scope) = p.scope.as_ref() {
+        state
+            .store
+            .check_scope_access(scope, &p.created_by)
+            .map_err(map_store_err)?;
+    }
     let artifact = state
         .artifacts
         .publish(&state.store, p)
@@ -821,6 +827,7 @@ fn agent_install(state: &AppState, params: Option<Value>) -> HandlerResult {
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        bundle: None,
         // Marketplace install gets persona + memory on by default: identity
         // files scaffold from the marketplace description, memory prompt /
         // MCP delivery are enabled so `memory.query` is reachable from the
@@ -887,13 +894,21 @@ mod tests {
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
-    fn test_root() -> PathBuf {
-        std::env::temp_dir().join(format!("joi-handler-test-{}", Uuid::new_v4().simple()))
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "joi-handler-tests-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos()
+        ));
+        path
     }
 
-    fn fresh_state() -> AppState {
-        let root = test_root();
-        std::fs::create_dir_all(&root).expect("create temp root");
+    fn fresh_state(name: &str) -> AppState {
+        let root = temp_path(name);
+        std::fs::create_dir_all(&root).expect("create root");
         let journal = Journal::open(root.join("journal.jsonl")).expect("open journal");
         let store = Store::open(journal).expect("open store");
         let subscriptions = Subscriptions::new();
@@ -933,9 +948,57 @@ mod tests {
         .expect("connection/open");
     }
 
+    #[test]
+    fn artifact_publish_rejects_inaccessible_scope() {
+        let state = fresh_state("artifact-publish-acl");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+
+        let err = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_guest",
+                "scope": { "kind": "channel", "id": channel.id },
+                "ingress": {
+                    "kind": "inline_text",
+                    "name": "note.md",
+                    "mediaType": "text/markdown",
+                    "text": "hello"
+                }
+            })),
+        )
+        .expect_err("artifact publish should fail");
+
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+    }
+
+    #[test]
+    fn artifact_publish_rejects_missing_scope() {
+        let state = fresh_state("artifact-publish-missing-scope");
+
+        let err = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_owner",
+                "scope": { "kind": "thread", "id": "thread_missing" },
+                "ingress": {
+                    "kind": "inline_text",
+                    "name": "note.md",
+                    "mediaType": "text/markdown",
+                    "text": "hello"
+                }
+            })),
+        )
+        .expect_err("artifact publish should fail");
+
+        assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn channel_delete_refuses_non_member() {
-        let state = fresh_state();
+        let state = fresh_state("channel-delete-non-member");
         let channel = state
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
@@ -962,7 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_delete_allows_member_cascade() {
-        let state = fresh_state();
+        let state = fresh_state("channel-delete-member");
         let channel = state
             .store
             .create_channel("private".into(), Some("actor_owner".into()))

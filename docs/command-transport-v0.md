@@ -137,7 +137,22 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
 ```
 
 模板变量与 v0 一致：`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` /
-`{agent.root}`，再加上 v1 新增的 `{env.NAME}`（从 agent client 进程 env 取值）。
+`{agent.root}`。其中 `{agent.home}` 只是 `{agent.root}` 的别名，用来兼容
+“actor home” 这层说法，不表示 `{agent.profile}`，也不表示进程级 `$HOME`。
+`{agent.profile}` 仍然专指 identity / memory / MCP 配置等 actor 持久状态目录。
+
+bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示 runtime
+管理的版本化资产目录，和 profile 平级，典型目录结构为：
+
+```text
+{agent.root}/
+  workspace/
+  profile/
+  logs/
+  bundles/
+```
+
+再加上 v1 新增的 `{env.NAME}`（从 agent client 进程 env 取值）。
 
 ---
 
@@ -252,9 +267,12 @@ first_run_capture: "file:{agent.profile}/last_session_id"
 | `{scope.id}` | 当前 scope id（trigger event 的 scope） |
 | `{scope.kind}` | `"thread"` 或 `"channel"` |
 | `{agent.workspace}` | `~/.local/share/joi/agents/<actor>/workspace` |
-| `{agent.profile}` | 同上的 `profile/`（per-actor 持久化状态：Skills / MCP / agent memory / 本地模型权重等） |
+| `{agent.profile}` | 同上的 `profile/`（per-actor 持久化状态：identity / memory / MCP 配置等） |
 | `{agent.logs}` | 同上的 `logs/` |
 | `{agent.root}` | 同上的根目录 |
+| `{agent.home}` | `{agent.root}` 的别名 |
+| `{agent.bundle_root}` | 同上的 `bundles/`（runtime 管理的版本化 bundle 根目录） |
+| `{agent.bundle}` | 当前激活 bundle 的目录（通常是 `bundles/current` 指向的版本目录） |
 | `{env.NAME}` | agent client 进程的 env var |
 | `{session_id}` | 仅 `resume_args` 可用 |
 | `{prompt}` | 仅 `resume_args` / `args`（当 `prompt_via=args`）可用 |

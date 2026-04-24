@@ -336,7 +336,6 @@ fn resolved_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
         normalized_bundle_version(bundle, source)
     }
 }
-
 fn install_bundle_dir(
     source: &Path,
     target: &Path,
@@ -1329,7 +1328,6 @@ mod tests {
 
         std::fs::remove_dir_all(root).ok();
     }
-
     #[test]
     fn bundle_paths_derive_version_from_source_basename() {
         let root = temp_path("bundle-version");

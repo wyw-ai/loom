@@ -425,11 +425,7 @@ fn turn_open(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(TurnOpenResult { turn })
 }
 
-async fn turn_close(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: TurnCloseParams = parse_params(params)?;
 
     // Non-cancel paths: keep the v0 behavior — just write to store. Closing a
@@ -456,9 +452,8 @@ async fn turn_close(
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "turn"))?;
 
     // ACL: any member of the channel hosting the turn's scope may cancel.
-    let channel_id = crate::ws::channel_id_for_scope(state, &turn.scope).ok_or_else(|| {
-        ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel for turn scope")
-    })?;
+    let channel_id = crate::ws::channel_id_for_scope(state, &turn.scope)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel for turn scope"))?;
     if !state.store.is_channel_member(&channel_id, &caller) {
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
@@ -816,6 +811,7 @@ fn agent_install(state: &AppState, params: Option<Value>) -> HandlerResult {
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        bundle: None,
         // Marketplace install gets persona + memory on by default: identity
         // files scaffold from the marketplace description, memory prompt /
         // MCP delivery are enabled so `memory.query` is reachable from the

@@ -281,7 +281,26 @@ impl DraftInput {
 
     fn insert_segment(&mut self, segment: DraftSegment) {
         let insert_at = self.segment_insert_index();
-        self.segments.insert(insert_at, segment);
+        match self.unit_position_in_segment(insert_at) {
+            Some(0) => self.segments.insert(insert_at, segment),
+            Some(char_idx) => {
+                let Some(DraftSegment::Text(text)) = self.segments.get_mut(insert_at) else {
+                    self.segments.insert(insert_at, segment);
+                    self.cursor += 1;
+                    self.preferred_column = None;
+                    self.coalesce_text_segments();
+                    return;
+                };
+                let split_at = char_to_byte_idx(text, char_idx);
+                let right = text.split_off(split_at);
+                self.segments.insert(insert_at + 1, segment);
+                if !right.is_empty() {
+                    self.segments
+                        .insert(insert_at + 2, DraftSegment::Text(right));
+                }
+            }
+            None => self.segments.insert(insert_at, segment),
+        }
         self.cursor += 1;
         self.preferred_column = None;
         self.coalesce_text_segments();
@@ -548,12 +567,12 @@ mod tests {
         input.push_saved_workspace_ref(SavedWorkspaceRef {
             display: "[Saved pasted content to workspace (5.0 KB) id=3]".into(),
             submission:
-                "[Saved pasted content to workspace (5.0 KB) id=3 artifactUri=artifact://art_123/pasted-content.md workspacePath=/tmp/thread/pasted-content-3.md]".into(),
+                "[Saved pasted content to workspace (5.0 KB) id=3 artifactId=art_123 artifactUri=artifact://art_123/pasted-content.md workspacePath=/tmp/thread/pasted-content-3.md]".into(),
             artifact_id: "art_123".into(),
         });
         assert_eq!(
             input.submission_text(),
-            "hello\nworld[Saved pasted content to workspace (5.0 KB) id=3 artifactUri=artifact://art_123/pasted-content.md workspacePath=/tmp/thread/pasted-content-3.md]"
+            "hello\nworld[Saved pasted content to workspace (5.0 KB) id=3 artifactId=art_123 artifactUri=artifact://art_123/pasted-content.md workspacePath=/tmp/thread/pasted-content-3.md]"
         );
         assert_eq!(
             input.submission().attached_artifact_ids,
@@ -568,6 +587,38 @@ mod tests {
         input.move_left();
         input.push_str("X");
         assert_eq!(input.display_text(), "helXlo");
+    }
+
+    #[test]
+    fn inserts_pasted_token_at_cursor() {
+        let mut input = DraftInput::from("hello");
+        input.move_left();
+        input.move_left();
+        input.push_pasted_chunk(1, "chunk".into());
+        assert_eq!(input.display_text(), "hel[Pasted text #1]lo");
+        assert_eq!(input.submission_text(), "helchunklo");
+    }
+
+    #[test]
+    fn inserts_saved_workspace_token_at_cursor() {
+        let mut input = DraftInput::from("hello");
+        input.move_left();
+        input.move_left();
+        input.push_saved_workspace_ref(SavedWorkspaceRef {
+            display: "[Saved pasted content to workspace (5.0 KB)]".into(),
+            submission:
+                "[Saved pasted content to workspace (5.0 KB); artifactId=art_3; artifactUri=artifact://art_3/pasted-content.md]".into(),
+            artifact_id: "art_3".into(),
+        });
+        assert_eq!(
+            input.display_text(),
+            "hel[Saved pasted content to workspace (5.0 KB)]lo"
+        );
+        assert_eq!(
+            input.submission_text(),
+            "hel[Saved pasted content to workspace (5.0 KB); artifactId=art_3; artifactUri=artifact://art_3/pasted-content.md]lo"
+        );
+        assert_eq!(input.submission().attached_artifact_ids, vec!["art_3"]);
     }
 
     #[test]

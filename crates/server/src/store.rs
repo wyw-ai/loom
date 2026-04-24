@@ -805,6 +805,52 @@ impl Store {
         (slice, has_more)
     }
 
+    /// List deliveries for `actor_id`, sorted ascending by `(updated_at,
+    /// event_id)` so the oldest pending row is first — that's the order a
+    /// host wants to drain its inbox after restart. `state_filter = None`
+    /// returns all states; pass `Some(DeliveryState::Pending)` for the
+    /// common "what do I still owe processing" query.
+    ///
+    /// `after` is the exclusive lower bound: only rows strictly greater
+    /// than the supplied `(updated_at, event_id)` pair are returned. The
+    /// handler converts the opaque cursor in `delivery/list` params into
+    /// this pair (see §9.2).
+    ///
+    /// Caller must apply ACL — this method does not check who is asking.
+    pub fn list_deliveries(
+        &self,
+        actor_id: &str,
+        state_filter: Option<DeliveryState>,
+        limit: usize,
+        after: Option<(Timestamp, String)>,
+    ) -> Vec<Delivery> {
+        let inner = self.inner.read();
+        let mut rows: Vec<Delivery> = inner
+            .deliveries
+            .values()
+            .filter(|d| d.actor_id == actor_id)
+            .filter(|d| state_filter.map_or(true, |s| d.state == s))
+            .filter(|d| match &after {
+                None => true,
+                Some((ts, eid)) => {
+                    if d.updated_at != *ts {
+                        d.updated_at > *ts
+                    } else {
+                        d.event_id > *eid
+                    }
+                }
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        rows.truncate(limit);
+        rows
+    }
+
     // -------- Membership / Delivery / Receipt --------
 
     pub fn touch_membership(

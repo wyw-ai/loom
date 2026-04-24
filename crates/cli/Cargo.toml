@@ -30,3 +30,5 @@ crossterm = { workspace = true }
 futures = { workspace = true }
 unicode-width = { workspace = true }
 pulldown-cmark = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }

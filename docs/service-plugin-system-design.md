@@ -576,12 +576,19 @@ webhook / CI watcher 的同深度设计延后到 S4 配合 marketplace 安全模
 - ✅ `docs/am-joi-bridge.md` 重写：换成 ServiceSpec 配置 + `am listen --script "joi service am-handler ..."`。
 - ⚠️ §6.2 的「ServicePlugin trait 长进程模型」在 S2 不被 AM 使用——S1 trait 仍然 ship 着，等 S3/scheduler 落地或者后续真有需要长进程的 plugin（webhook 类）时再被消费。该 trait 不算死代码，是 S3 的预留 API。
 
-### Phase S3：新增 Scheduler
+### Phase S3：新增 Scheduler（已完成）
 
-- 实现 cron loop。
-- 支持 command/http source。
-- 支持 cursor/dedupe。
-- 支持直接写 event 或 handoff agent。
+S3 把第一个真正的长进程 plugin 落到 host 里，确认 §6.2 trait + §6.3
+substrate 不只是 S2 留下的死 API。
+
+- ✅ 5-field UTC cron 解析与 `next_after` 计算（`crates/cli/src/service/scheduler/cron.rs`，覆盖 leap-day / 年边界 / DoM/DoW POSIX OR 规则等 13 个单元测试）。
+- ✅ source executors：`command` 走 `tokio::process::Command`，`http` 走 reqwest（rustls-tls，无 openssl），都按 §8.3 的失败语义处理 exit code / 状态码 / 超时（`scheduler/source.rs`，6 个测试）。
+- ✅ `SchedulerPlugin` 长进程 loop：每个 job 一个 tokio task，按 cron tick 唤醒 → exec source → cursor diff → dedupe_once → handoff/append → 可选 `await_responds_to`（`scheduler/plugin.rs`，7 个测试）。
+- ✅ `SchedulerConfig` / `JobSpec` 解析与校验，包含 §8.3 字段表全部字段（`scheduler/spec.rs`，9 个测试）。
+- ✅ `cmd::service::serve` 注册 `SchedulerPlugin`；`scheduler` kind 匹配走长进程，`am` 仍然走 §12 S2 的 `am-handler` 短进程。
+- ✅ `docs/scheduler-plugin.md` ops 文档（spec 例子、字段表、状态目录、常见 cron 模式）。
+- ⚠️ §8.3 表里的 `cursorBy: jq:<expr>` 当前未实现（仅 `none` / `body_hash`）；schema 留着便于后续平滑加。`dedupeBy: source_event_id` 走 `payload_hash` 的实现路径，理由同前。
+- ⚠️ `await_responds_to` 仍是 polling（继承自 S1 的已知限制），延迟接受度依 watcher 类 job 的 tick 间隔评估。Hybrid drain-then-watch 等下一个真有秒级 round-trip 需求的 plugin 再驱动。
 
 ### Phase S4：插件 manifest 与 marketplace
 

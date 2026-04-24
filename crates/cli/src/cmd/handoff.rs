@@ -3,27 +3,37 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use proto::methods::*;
-use proto::types::{Actor, ActorKind};
+use proto::types::{Actor, ActorKind, ScopeKind, ScopeRef};
 use serde_json::json;
 
 use crate::client::Client;
+use crate::render;
 
 pub async fn run(
     client: Arc<Client>,
     actor_id: String,
     target_actor_id: Option<String>,
-    thread_id: String,
+    scope_id: String,
+    is_channel: bool,
     message: String,
 ) -> Result<()> {
     let target = match target_actor_id {
         Some(t) if !t.is_empty() => t,
         _ => pick_target(&client).await?,
     };
+    let scope = ScopeRef {
+        kind: if is_channel {
+            ScopeKind::Channel
+        } else {
+            ScopeKind::Thread
+        },
+        id: scope_id,
+    };
     let payload = json!({
         "event": {
             "type": "content.add",
             "actorId": actor_id,
-            "scope": { "kind": "thread", "id": thread_id },
+            "scope": scope,
             "payload": { "contentType": "text/markdown", "text": message },
             "relations": [
                 { "kind": "hands_off_to", "target": { "kind": "actor", "id": target } }
@@ -31,7 +41,11 @@ pub async fn run(
         }
     });
     let res: EventAppendResult = client.call(method::EVENT_APPEND, payload).await?;
-    println!("handoff event {} → {}", res.event.id, target);
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("handoff event {} → {}", res.event.id, target);
+    }
     Ok(())
 }
 

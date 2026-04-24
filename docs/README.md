@@ -6,6 +6,8 @@
   当前 app 实现技术总览，适合先看
 - [architecture.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/architecture.md)
   较早的架构说明与设计判断
+- [am-joi-bridge.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/am-joi-bridge.md)
+  用 `am listen` 把钉钉 bot 消息接入 Joi thread 并定向 handoff 给 agent
 
 ## 协议与设计
 

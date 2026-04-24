@@ -304,29 +304,52 @@ impl Store {
         Ok(ch.clone())
     }
 
-    /// Refuses when the channel still contains threads — caller must delete
-    /// child threads first. Avoids cascading event/turn cleanup at v0.
-    pub fn delete_channel(&self, id: &str) -> StoreResult<bool> {
+    /// Default (`cascade = false`) refuses when the channel still contains
+    /// threads — caller must delete children first. With `cascade = true`,
+    /// every child thread is deleted (via the existing `delete_thread` path
+    /// — soft-delete, events left orphaned) before the channel row is
+    /// removed. Returns `(removed_channel, removed_thread_count)`.
+    pub fn delete_channel(&self, id: &str, cascade: bool) -> StoreResult<(bool, u32)> {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
         }
-        let child_threads = self
+        // Snapshot child ids under read lock so we can release it before the
+        // per-thread `delete_thread` calls (each takes its own write lock).
+        let child_ids: Vec<String> = self
             .inner
             .read()
             .threads
             .values()
             .filter(|t| t.channel_id == id)
-            .count();
-        if child_threads > 0 {
+            .map(|t| t.id.clone())
+            .collect();
+
+        if !child_ids.is_empty() && !cascade {
             return Err(StoreError::Conflict(format!(
-                "channel {id} still has {child_threads} thread(s); delete them first"
+                "channel {id} still has {} thread(s); delete them first or pass cascade=true",
+                child_ids.len()
             )));
+        }
+
+        let mut deleted_threads: u32 = 0;
+        for tid in &child_ids {
+            // delete_thread is best-effort during cascade — a NotFound on a
+            // child would mean someone else already removed it between our
+            // snapshot and now, which is fine. Anything else (e.g. journal
+            // write failure) bubbles up so we don't strand a half-deleted
+            // channel.
+            match self.delete_thread(tid) {
+                Ok(true) => deleted_threads += 1,
+                Ok(false) => {}
+                Err(StoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         self.journal.append(&Mutation::ChannelDelete {
             channel_id: id.to_string(),
         })?;
         let removed = self.inner.write().channels.remove(id).is_some();
-        Ok(removed)
+        Ok((removed, deleted_threads))
     }
 
     // -------- Threads --------
@@ -1012,7 +1035,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .delete_channel(&ch.id)
+            .delete_channel(&ch.id, false)
             .expect_err("delete should refuse");
         match err {
             StoreError::Conflict(msg) => assert!(msg.contains("thread"), "got {msg}"),
@@ -1025,12 +1048,49 @@ mod tests {
     fn delete_channel_succeeds_when_empty_and_replays() {
         let store = fresh_store();
         let ch = store.create_channel("disposable".into(), None).unwrap();
-        assert!(store.delete_channel(&ch.id).unwrap());
+        let (deleted, threads) = store.delete_channel(&ch.id, false).unwrap();
+        assert!(deleted);
+        assert_eq!(threads, 0);
         assert!(store.get_channel(&ch.id).is_none());
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let store2 = Store::open(journal).unwrap();
         assert!(store2.get_channel(&ch.id).is_none());
+    }
+
+    #[test]
+    fn delete_channel_with_cascade_removes_threads_and_channel() {
+        let store = fresh_store();
+        let ch = store.create_channel("doomed".into(), None).unwrap();
+        let _t1 = store
+            .create_thread(ch.id.clone(), "t1".into(), None)
+            .unwrap();
+        let _t2 = store
+            .create_thread(ch.id.clone(), "t2".into(), None)
+            .unwrap();
+
+        let (deleted, threads) = store
+            .delete_channel(&ch.id, true)
+            .expect("cascade should succeed");
+        assert!(deleted);
+        assert_eq!(threads, 2);
+        assert!(store.get_channel(&ch.id).is_none());
+        assert!(store.list_threads(Some(&ch.id)).is_empty());
+
+        // Replay: cascade write order must round-trip through the journal.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert!(store2.get_channel(&ch.id).is_none());
+        assert!(store2.list_threads(Some(&ch.id)).is_empty());
+    }
+
+    #[test]
+    fn delete_channel_with_cascade_on_empty_channel_is_noop_count_zero() {
+        let store = fresh_store();
+        let ch = store.create_channel("solo".into(), None).unwrap();
+        let (deleted, threads) = store.delete_channel(&ch.id, true).unwrap();
+        assert!(deleted);
+        assert_eq!(threads, 0);
     }
 
     #[test]
@@ -1083,7 +1143,7 @@ mod tests {
             .expect_err("must be NotFound");
         assert!(matches!(err, StoreError::NotFound(_)));
         let err = store
-            .delete_channel("chan_missing")
+            .delete_channel("chan_missing", false)
             .expect_err("must be NotFound");
         assert!(matches!(err, StoreError::NotFound(_)));
     }

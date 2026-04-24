@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use proto::methods::{
     method, ActorUpsertParams, ActorUpsertResult, DeliveryListParams, DeliveryListResult,
-    EventAppendInput, EventAppendParams, EventAppendResult,
+    EventAppendInput, EventAppendParams, EventAppendResult, ThreadCreateParams, ThreadCreateResult,
 };
 use proto::types::{
-    Actor, DeliveryState, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeRef,
+    Actor, DeliveryState, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeRef, Thread,
 };
 use serde_json::json;
 
@@ -156,17 +156,46 @@ impl ServiceRuntime {
     /// no-op). Returns Err only on transport failure or when the caller
     /// lacks permission to invite into the channel.
     pub async fn ensure_channel_member(&self, channel_id: &str) -> Result<()> {
+        self.invite_member(channel_id, &self.actor_id).await
+    }
+
+    /// Invite an arbitrary `actor_id` into `channel_id`. Generalization
+    /// of [`Self::ensure_channel_member`] so plugins can pull a target
+    /// agent into the same channel as the service actor (e.g., AM's
+    /// `auto_invite` mode for the configured `targetAgent`).
+    pub async fn invite_member(&self, channel_id: &str, actor_id: &str) -> Result<()> {
         self.client
             .call_raw(
                 method::CHANNEL_INVITE,
                 Some(json!({
                     "channelId": channel_id,
-                    "actorId": self.actor_id,
+                    "actorId": actor_id,
                 })),
             )
             .await
-            .with_context(|| format!("channel/invite for {channel_id}"))?;
+            .with_context(|| format!("channel/invite {actor_id} into {channel_id}"))?;
         Ok(())
+    }
+
+    /// Create a fresh thread under `channel_id` titled `title` (no root
+    /// event). Returns the new thread row. The "or-get" half of §6.3's
+    /// `create_or_get_thread` lives in plugin-specific thread-map state
+    /// (e.g., `service::am::scope`) — the runtime exposes only the
+    /// stateless server-side primitive.
+    pub async fn create_thread(&self, channel_id: &str, title: &str) -> Result<Thread> {
+        let res: ThreadCreateResult = self
+            .client
+            .call(
+                method::THREAD_CREATE,
+                ThreadCreateParams {
+                    channel_id: channel_id.into(),
+                    title: title.into(),
+                    root_event_id: None,
+                },
+            )
+            .await
+            .with_context(|| format!("thread/create in {channel_id}"))?;
+        Ok(res.thread)
     }
 
     /// Drain pending deliveries off this actor's inbox and return events

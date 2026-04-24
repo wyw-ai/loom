@@ -144,6 +144,21 @@ enum ServiceCmd {
     Validate {
         path: PathBuf,
     },
+    /// Per-message AM bridge handler. Spawned by `am listen --script
+    /// "joi service am-handler --service-id <id>"` once per DingTalk
+    /// message. Replaces `examples/am-joi-channel-bridge.py`.
+    AmHandler {
+        /// ServiceSpec id under --specs (defaults to ~/.config/joi/services/).
+        #[arg(long = "service-id")]
+        service_id: String,
+        /// Override the specs directory.
+        #[arg(long)]
+        specs: Option<PathBuf>,
+        /// Internal: spawned by ourselves in async_send mode. Carries
+        /// the JSON payload `{sourceEvent, triggerId, scopeKind, scopeId}`.
+        #[arg(long = "async-reply", hide = true)]
+        async_reply: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -414,6 +429,22 @@ async fn main() -> Result<()> {
     } = &args.cmd
     {
         return cmd::service::validate(path.clone());
+    }
+
+    // `service am-handler` opens its own connection bound to the AM
+    // service actor; bypass the human-actor `connection/open` below
+    // (would otherwise pollute the actor table and fight the
+    // §9.4 preempt rule).
+    if let Cmd::Service {
+        sub:
+            ServiceCmd::AmHandler {
+                service_id,
+                specs,
+                async_reply,
+            },
+    } = args.cmd
+    {
+        return cmd::service::am_handler(cfg.server_url, service_id, specs, async_reply).await;
     }
 
     // `mcp memory` never talks to the joi server — it's spawned by the ACP

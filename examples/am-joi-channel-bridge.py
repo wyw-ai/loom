@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — kept as reference. New deployments use the Rust handler:
+
+    am listen --script "joi service am-handler --service-id <id>"
+
+See `docs/am-joi-bridge.md` for the ServiceSpec layout and migration
+instructions. The handler picks up the legacy thread-map at
+`~/.config/aone-message-cli/joi-thread-map.json` automatically on first
+run, so an in-place cutover only requires changing the `--script`
+target.
+
 Bridge `am listen --script` bot messages into Joi thread handoffs.
 
 Required env:

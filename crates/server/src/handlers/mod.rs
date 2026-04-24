@@ -372,11 +372,14 @@ fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
 
 fn channel_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ChannelDeleteParams = parse_params(params)?;
-    let deleted = state
+    let (deleted, deleted_threads) = state
         .store
-        .delete_channel(&p.channel_id)
+        .delete_channel(&p.channel_id, p.cascade)
         .map_err(map_store_err)?;
-    ok(ChannelDeleteResult { deleted })
+    ok(ChannelDeleteResult {
+        deleted,
+        deleted_threads,
+    })
 }
 
 // ---- thread ----
@@ -425,11 +428,7 @@ fn turn_open(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(TurnOpenResult { turn })
 }
 
-async fn turn_close(
-    state: &AppState,
-    connection_id: &str,
-    params: Option<Value>,
-) -> HandlerResult {
+async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: TurnCloseParams = parse_params(params)?;
 
     // Non-cancel paths: keep the v0 behavior — just write to store. Closing a
@@ -456,9 +455,8 @@ async fn turn_close(
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "turn"))?;
 
     // ACL: any member of the channel hosting the turn's scope may cancel.
-    let channel_id = crate::ws::channel_id_for_scope(state, &turn.scope).ok_or_else(|| {
-        ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel for turn scope")
-    })?;
+    let channel_id = crate::ws::channel_id_for_scope(state, &turn.scope)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel for turn scope"))?;
     if !state.store.is_channel_member(&channel_id, &caller) {
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
@@ -829,6 +827,7 @@ fn agent_install(state: &AppState, params: Option<Value>) -> HandlerResult {
             },
             ..Default::default()
         }),
+        announcement: None,
     };
 
     let info = state

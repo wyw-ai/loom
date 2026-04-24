@@ -64,9 +64,8 @@ pub async fn run(
         // channel list so the operator can immediately pick/create a
         // thread instead of staring at an empty chat pane.
         app.history.push_system("Welcome to Joi chat.");
-        app.history.push_system(
-            "No scope bound. Use the sidebar (Ctrl+B) to pick a channel,",
-        );
+        app.history
+            .push_system("No scope bound. Use the sidebar (Ctrl+B) to pick a channel,");
         app.history.push_system(
             "press Enter to drill into its threads, or press c to enter the channel common area.",
         );
@@ -1068,19 +1067,26 @@ async fn handle_sidebar_key(client: &Arc<Client>, app: &mut App, key: KeyEvent) 
                     true
                 }
                 SidebarFocus::Threads => {
-                    if let Some(tid) = thread_id {
-                        let current = app.current_scope();
-                        let target = ScopeRef {
+                    let target = if let Some(tid) = thread_id {
+                        ScopeRef {
                             kind: ScopeKind::Thread,
                             id: tid,
-                        };
-                        if Some(&target) != current.as_ref() {
-                            app.pending_scope_switch = Some(target);
                         }
-                        // Hide the sidebar after a switch so the chat fills the
-                        // screen again — Ctrl+B toggles it back if needed.
-                        app.sidebar = None;
+                    } else if let Some(cid) = channel_id {
+                        ScopeRef {
+                            kind: ScopeKind::Channel,
+                            id: cid,
+                        }
+                    } else {
+                        return true;
+                    };
+                    let current = app.current_scope();
+                    if Some(&target) != current.as_ref() {
+                        app.pending_scope_switch = Some(target);
                     }
+                    // Hide the sidebar after a switch so the chat fills the
+                    // screen again — Ctrl+B toggles it back if needed.
+                    app.sidebar = None;
                     true
                 }
                 SidebarFocus::Members => {
@@ -1316,7 +1322,7 @@ fn open_rename_prompt(app: &mut App) {
         }
         SidebarFocus::Threads => {
             let Some(th) = s.selected_thread() else {
-                app.set_status("nothing selected");
+                app.set_status("channel common area can't be renamed");
                 return;
             };
             app.prompt = Some(PromptModal::text(
@@ -1345,20 +1351,32 @@ fn open_delete_confirm(app: &mut App) {
                 app.set_status("nothing selected");
                 return;
             };
+            let thread_count = s
+                .threads_by_channel
+                .get(&ch.id)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let message = if thread_count == 0 {
+                format!("Delete channel #{}? It is empty.", ch.title)
+            } else {
+                // Heads-up wording — the ACTUAL delete is gated by a
+                // typed-name prompt that fires after this confirm.
+                format!(
+                    "Delete channel #{} AND its {} thread(s)? You'll be asked to type the channel name to confirm.",
+                    ch.title, thread_count
+                )
+            };
             app.prompt = Some(PromptModal::confirm(
                 ConfirmKind::DeleteChannel {
                     channel_id: ch.id.clone(),
                 },
                 "Delete channel",
-                format!(
-                    "Delete channel #{}? Channel must be empty (delete its threads first)",
-                    ch.title
-                ),
+                message,
             ));
         }
         SidebarFocus::Threads => {
             let Some(th) = s.selected_thread() else {
-                app.set_status("nothing selected");
+                app.set_status("channel common area can't be deleted");
                 return;
             };
             app.prompt = Some(PromptModal::confirm(
@@ -1470,6 +1488,31 @@ async fn handle_prompt_submit(
         PromptKind::InviteToChannel { channel_id } => {
             do_channel_invite(client, app, channel_id, value).await;
         }
+        PromptKind::CascadeDeleteChannel { channel_id, .. } => {
+            // Reaching here means the typed value already matched
+            // `expected_title` (the prompt's gate enforces it). Fire the
+            // cascade RPC unconditionally; server is the authoritative
+            // truth on whether the channel still exists.
+            use proto::methods::ChannelDeleteResult;
+            let res = client
+                .call::<_, ChannelDeleteResult>(
+                    method::CHANNEL_DELETE,
+                    json!({ "channelId": channel_id, "cascade": true }),
+                )
+                .await;
+            match res {
+                Ok(r) => {
+                    if let Some(s) = app.sidebar.as_mut() {
+                        s.remove_channel(&channel_id);
+                    }
+                    app.set_status(format!(
+                        "channel deleted (cascade: {} thread(s))",
+                        r.deleted_threads
+                    ));
+                }
+                Err(e) => app.set_status(format!("channel/delete cascade failed: {}", e)),
+            }
+        }
     }
 }
 
@@ -1477,10 +1520,46 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
     use proto::methods::{ChannelDeleteResult, ThreadDeleteResult};
     match kind {
         ConfirmKind::DeleteChannel { channel_id } => {
+            // Re-check the thread count NOW (the sidebar cache may have
+            // changed between open_delete_confirm and this y-press).
+            let (thread_count, channel_title) = app
+                .sidebar
+                .as_ref()
+                .map(|s| {
+                    let n = s
+                        .threads_by_channel
+                        .get(&channel_id)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let title = s
+                        .channels
+                        .iter()
+                        .find(|c| c.id == channel_id)
+                        .map(|c| c.title.clone())
+                        .unwrap_or_else(|| channel_id.clone());
+                    (n, title)
+                })
+                .unwrap_or((0, channel_id.clone()));
+
+            if thread_count > 0 {
+                // Hand off to the typed-name danger-zone prompt. The actual
+                // RPC fires from `handle_text_submit::CascadeDeleteChannel`
+                // once the operator types the channel name verbatim.
+                app.prompt = Some(PromptModal::text(
+                    PromptKind::CascadeDeleteChannel {
+                        channel_id: channel_id.clone(),
+                        expected_title: channel_title.clone(),
+                    },
+                    format!("Cascade delete #{channel_title}"),
+                    String::new(),
+                ));
+                return;
+            }
+
             let res = client
                 .call::<_, ChannelDeleteResult>(
                     method::CHANNEL_DELETE,
-                    json!({ "channelId": channel_id }),
+                    json!({ "channelId": channel_id, "cascade": false }),
                 )
                 .await;
             match res {
@@ -1817,6 +1896,13 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
             refresh_members(client, app, &channel_id).await;
             print_members_into_history(app, &channel_id);
         }
+        "announce" => {
+            // `/announce <text>`        → set/replace the pinned announcement
+            // `/announce` (empty) or
+            // `/announce clear`         → drop the current announcement
+            let clear = arg.is_empty() || arg.eq_ignore_ascii_case("clear");
+            do_announce(client, app, scope, if clear { None } else { Some(arg) }).await;
+        }
         "quit" | "q" | "exit" => app.should_quit = true,
         other => app.set_status(format!("unknown /{}", other)),
     }
@@ -1946,6 +2032,40 @@ async fn do_handoff_with_message(
     match res {
         Ok(_) => app.set_status(format!("handoff → {}", target)),
         Err(e) => app.set_status(format!("handoff failed: {}", e)),
+    }
+}
+
+async fn do_announce(
+    client: &Arc<Client>,
+    app: &mut App,
+    scope: &ScopeRef,
+    text: Option<String>,
+) {
+    use proto::methods::EventAppendResult;
+    if !app.has_scope() {
+        app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
+        return;
+    }
+    let (kind, payload_text) = match text.as_deref() {
+        Some(t) => ("announcement.set", t.to_string()),
+        None => ("announcement.clear", String::new()),
+    };
+    let payload = json!({
+        "event": {
+            "type": kind,
+            "actorId": app.actor_id,
+            "scope": scope,
+            "payload": { "text": payload_text },
+        }
+    });
+    let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
+    match res {
+        Ok(_) => app.set_status(if text.is_some() {
+            "announcement updated".to_string()
+        } else {
+            "announcement cleared".to_string()
+        }),
+        Err(e) => app.set_status(format!("announce failed: {}", e)),
     }
 }
 
@@ -2375,6 +2495,7 @@ mod tests {
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
             streaming: false,
+            handoff_target: None,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
@@ -2408,6 +2529,7 @@ mod tests {
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
             streaming: false,
+            handoff_target: None,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
@@ -2435,6 +2557,7 @@ mod tests {
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
             streaming: false,
+            handoff_target: None,
         });
         app.selected_history_idx = Some(0);
 

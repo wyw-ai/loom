@@ -127,7 +127,9 @@ impl Sidebar {
                 self.selected_channel_idx = idx;
                 if let Some(threads) = self.threads_by_channel.get(&ch_id) {
                     if let Some(t_idx) = threads.iter().position(|t| t.id == tid) {
-                        self.selected_thread_idx = t_idx;
+                        // Index 0 in the Threads pane is the channel common
+                        // area; real threads start at 1.
+                        self.selected_thread_idx = t_idx + 1;
                     }
                 }
                 self.sync_state();
@@ -138,8 +140,9 @@ impl Sidebar {
     pub fn replace_threads(&mut self, channel_id: &str, mut threads: Vec<Thread>) {
         threads.sort_by(|a, b| a.title.cmp(&b.title));
         if let Some(current_ch) = self.selected_channel().map(|c| c.id.clone()) {
-            if current_ch == channel_id && self.selected_thread_idx >= threads.len() {
-                self.selected_thread_idx = threads.len().saturating_sub(1);
+            let item_count = threads.len() + 1;
+            if current_ch == channel_id && self.selected_thread_idx >= item_count {
+                self.selected_thread_idx = item_count.saturating_sub(1);
             }
         }
         self.threads_by_channel
@@ -191,8 +194,9 @@ impl Sidebar {
     pub fn remove_thread(&mut self, channel_id: &str, thread_id: &str) {
         if let Some(threads) = self.threads_by_channel.get_mut(channel_id) {
             threads.retain(|t| t.id != thread_id);
-            if self.selected_thread_idx >= threads.len() {
-                self.selected_thread_idx = threads.len().saturating_sub(1);
+            let item_count = threads.len() + 1;
+            if self.selected_thread_idx >= item_count {
+                self.selected_thread_idx = item_count.saturating_sub(1);
             }
         }
         self.sync_state();
@@ -267,7 +271,7 @@ impl Sidebar {
             }
             threads.sort_by(|a, b| a.title.cmp(&b.title));
             if let Some(idx) = threads.iter().position(|x| x.id == t.id) {
-                self.selected_thread_idx = idx;
+                self.selected_thread_idx = idx + 1;
             }
         }
         self.sync_state();
@@ -279,9 +283,8 @@ impl Sidebar {
 
     pub fn selected_thread(&self) -> Option<&Thread> {
         let ch = self.selected_channel()?;
-        self.threads_by_channel
-            .get(&ch.id)?
-            .get(self.selected_thread_idx)
+        let idx = self.selected_thread_idx.checked_sub(1)?;
+        self.threads_by_channel.get(&ch.id)?.get(idx)
     }
 
     pub fn current_threads(&self) -> Option<&Vec<Thread>> {
@@ -332,10 +335,9 @@ impl Sidebar {
                 }
             }
             SidebarFocus::Threads => {
-                if let Some(threads) = self.current_threads() {
-                    if self.selected_thread_idx + 1 < threads.len() {
-                        self.selected_thread_idx += 1;
-                    }
+                let item_count = self.current_threads().map(|t| t.len() + 1).unwrap_or(0);
+                if self.selected_thread_idx + 1 < item_count {
+                    self.selected_thread_idx += 1;
                 }
             }
             SidebarFocus::Members => {
@@ -365,8 +367,13 @@ impl Sidebar {
         }
         let thread_len = self
             .selected_channel()
-            .and_then(|ch| self.threads_by_channel.get(&ch.id))
-            .map(|v| v.len())
+            .map(|ch| {
+                self.threads_by_channel
+                    .get(&ch.id)
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+                    + 1
+            })
             .unwrap_or(0);
         if thread_len == 0 {
             self.threads_state.select(None);
@@ -465,34 +472,35 @@ impl Sidebar {
             .borders(Borders::ALL)
             .title(title)
             .border_style(border_style(focused));
-        let threads = self.current_threads().cloned().unwrap_or_default();
-        if threads.is_empty() {
-            let msg = if self.channels.is_empty() {
-                "(no channel selected)"
-            } else {
-                "(no threads — press n)"
-            };
+        let Some(channel) = self.selected_channel().cloned() else {
             let para = ratatui::widgets::Paragraph::new(Line::from(Span::styled(
-                msg,
+                "(no channel selected)",
                 Style::default().fg(Color::DarkGray),
             )))
             .block(block);
             f.render_widget(para, area);
             return;
-        }
+        };
+        let threads = self.current_threads().cloned().unwrap_or_default();
         let current = self.current_thread_id.clone();
-        let items: Vec<ListItem> = threads
-            .iter()
-            .map(|t| {
-                let is_current = current.as_deref() == Some(t.id.as_str());
-                let prefix = if is_current { "●" } else { " " };
-                ListItem::new(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Green)),
-                    Span::raw(" "),
-                    Span::raw(t.title.clone()),
-                ]))
-            })
-            .collect();
+        let common_current = self.current_channel_id.as_deref() == Some(channel.id.as_str());
+        let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
+            Span::styled(
+                if common_current { "●" } else { " " },
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" #"),
+            Span::raw("common"),
+        ]))];
+        items.extend(threads.iter().map(|t| {
+            let is_current = current.as_deref() == Some(t.id.as_str());
+            let prefix = if is_current { "●" } else { " " };
+            ListItem::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::Green)),
+                Span::raw(" "),
+                Span::raw(t.title.clone()),
+            ]))
+        }));
         let list = List::new(items)
             .block(block)
             .highlight_style(highlight_style(focused))
@@ -632,7 +640,7 @@ mod tests {
         s.replace_threads("c1", vec![th("t1", "c1", "x"), th("t2", "c1", "y")]);
         s.replace_threads("c2", vec![th("t3", "c2", "z")]);
 
-        // start at channels[0] / threads[0]
+        // start at channels[0] / common row
         assert_eq!(s.selected_channel().unwrap().id, "c1");
         assert_eq!(s.selected_thread_idx, 0);
 
@@ -640,9 +648,13 @@ mod tests {
         s.next_pane();
         s.move_down();
         assert_eq!(s.selected_thread_idx, 1);
-        // bound: another move_down stays at 1 (only 2 threads)
+        assert_eq!(s.selected_thread().unwrap().id, "t1");
         s.move_down();
-        assert_eq!(s.selected_thread_idx, 1);
+        assert_eq!(s.selected_thread_idx, 2);
+        assert_eq!(s.selected_thread().unwrap().id, "t2");
+        // bound: another move_down stays at 2 (common + 2 threads)
+        s.move_down();
+        assert_eq!(s.selected_thread_idx, 2);
 
         // back to channels and switch to c2 — thread idx must reset.
         // next_pane cycles Threads → Members → Channels.
@@ -660,11 +672,14 @@ mod tests {
         s.replace_threads("c1", vec![th("t1", "c1", "x"), th("t2", "c1", "y")]);
         s.next_pane();
         s.move_down();
-        assert_eq!(s.selected_thread_idx, 1);
+        s.move_down();
+        assert_eq!(s.selected_thread_idx, 2);
+        assert_eq!(s.selected_thread().unwrap().id, "t2");
 
         s.remove_thread("c1", "t2");
-        // selection moves up to the still-existing item
-        assert_eq!(s.selected_thread_idx, 0);
+        // selection moves up to the still-existing thread, after the common row
+        assert_eq!(s.selected_thread_idx, 1);
+        assert_eq!(s.selected_thread().unwrap().id, "t1");
     }
 
     #[test]
@@ -735,6 +750,7 @@ mod tests {
         s.replace_threads("c2", vec![th("t2", "c2", "y"), th("t3", "c2", "z")]);
         s.focus_channel_of_current_thread();
         assert_eq!(s.selected_channel().unwrap().id, "c2");
+        assert_eq!(s.selected_thread_idx, 2);
         assert_eq!(s.selected_thread().unwrap().id, "t3");
     }
 }

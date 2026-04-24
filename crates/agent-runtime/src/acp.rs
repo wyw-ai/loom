@@ -28,6 +28,11 @@ use uuid::Uuid;
 
 use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterStartInfo};
 
+/// Some ACP runtimes can send the `session/prompt` response before the final
+/// `agent_message_chunk`. Defer success completion briefly so stdout-order
+/// tail chunks can be translated before the turn closes.
+const PROMPT_FINISH_GRACE: Duration = Duration::from_millis(350);
+
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
     pub command: String,
@@ -713,17 +718,34 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("completed")
             .to_string();
-        let _ = shared.event_sender.send(AdapterEvent::Finished {
-            scope: Some(scope),
-            success: stop_reason != "cancelled",
-            summary: stop_reason,
-        });
+        send_finished_after_grace(
+            shared.clone(),
+            scope,
+            stop_reason != "cancelled",
+            stop_reason,
+        );
         return;
     }
     eprintln!(
         "[joi:acp] response id={} matched no waiter and no in-flight prompt (orphan)",
         id_key
     );
+}
+
+fn send_finished_after_grace(
+    shared: Arc<AcpShared>,
+    scope: ScopeRef,
+    success: bool,
+    summary: String,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(PROMPT_FINISH_GRACE);
+        let _ = shared.event_sender.send(AdapterEvent::Finished {
+            scope: Some(scope),
+            success,
+            summary,
+        });
+    });
 }
 
 fn fail_pending_waiters(shared: &Arc<AcpShared>, message: String) {

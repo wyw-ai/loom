@@ -39,8 +39,10 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
-use agent_runtime::command::{CommandAdapter, CommandConfig};
-use agent_runtime::{prepare_bundle_install, resolved_bundle_version, Adapter, AdapterEvent};
+use agent_runtime::command::{expand_session_templates, CommandAdapter, CommandConfig};
+use agent_runtime::{
+    prepare_bundle_install, resolved_bundle_version, validate_bundle_current, Adapter, AdapterEvent,
+};
 
 use crate::client::Client;
 
@@ -292,18 +294,26 @@ fn ensure_bundle(
     agent_paths: &AgentPaths,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(&paths.root)?;
+    let current = validate_bundle_current(
+        &agent_paths.root,
+        &agent_paths.workspace,
+        &agent_paths.profile,
+        &agent_paths.logs,
+        &paths.root,
+        &paths.current,
+    )?;
     let Some(bundle) = spec.bundle.as_ref() else {
-        reset_bundle_current_dir(&paths.current)?;
+        reset_bundle_current_dir(&current)?;
         return Ok(());
     };
     if bundle.source.trim().is_empty() {
-        reset_bundle_current_dir(&paths.current)?;
+        reset_bundle_current_dir(&current)?;
         return Ok(());
     }
     let source = PathBuf::from(agent_paths.expand_base(&bundle.source));
     let install_dir = prepare_bundle_install(&paths.root, &source, bundle)?.install_dir;
     install_bundle_dir(&source, &install_dir, bundle.install_mode)?;
-    link_current_bundle(&install_dir, &paths.current)?;
+    link_current_bundle(&install_dir, &current)?;
     Ok(())
 }
 fn install_bundle_dir(
@@ -627,13 +637,17 @@ fn build_adapter(
             Ok(Arc::new(AcpAdapter::new(cfg)))
         }
         "command" => {
+            let mut transport = spec.transport.clone();
+            transport.session = expand_session_templates(spec.transport.session.as_ref(), |s| {
+                paths.expand(s, Some(bundle_paths))
+            });
             let cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
-                spec.transport.command.clone(),
+                transport.command.clone(),
                 args,
                 env,
                 workdir,
-                &spec.transport,
+                &transport,
                 paths.sessions.clone(),
             );
             Ok(Arc::new(CommandAdapter::new(cfg)))
@@ -1318,6 +1332,9 @@ mod tests {
         let root = temp_path("bundle-cleanup");
         let paths = AgentPaths::new(&root, "actor_demo");
         std::fs::create_dir_all(&paths.bundle_root).expect("create bundle root");
+        std::fs::create_dir_all(&paths.workspace).expect("create workspace");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        std::fs::create_dir_all(&paths.logs).expect("create logs");
         let old_target = paths.root.join("old-bundle");
         std::fs::create_dir_all(&old_target).expect("create old target");
         symlink_path(&old_target, &paths.bundle_current).expect("seed stale symlink");
@@ -1333,6 +1350,27 @@ mod tests {
 
         std::fs::remove_dir_all(root).ok();
     }
+
+    #[test]
+    fn ensure_bundle_rejects_current_inside_profile() {
+        let root = temp_path("bundle-current-profile");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.workspace).expect("create workspace");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        std::fs::create_dir_all(&paths.logs).expect("create logs");
+        let spec = sample_spec(Some(AgentBundleSpec {
+            current: "{agent.profile}/live".into(),
+            ..Default::default()
+        }));
+
+        let bundle_paths = paths.bundle_paths(&spec);
+        let err =
+            ensure_bundle("actor_demo", &spec, &bundle_paths, &paths).expect_err("must reject");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn bundle_paths_derive_version_from_source_basename() {
         let root = temp_path("bundle-version");

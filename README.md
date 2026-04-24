@@ -269,9 +269,11 @@ joi agent add
 
 保存为 `agents/<actor-id>.json`，或运行时注册：`joi agent register <path>`。
 
-模板变量（`cwd` / `env` 值里可用）：`{agent.workspace}` / `{agent.profile}` /
-`{agent.logs}` / `{agent.root}` / `{agent.home}` / `{agent.bundle_root}` /
-`{agent.bundle}` / `{actor.id}` / `{scope.id}`（command transport）。
+模板变量（`cwd` / `env`，以及 command transport 的
+`session.first_run_capture` / `session.resume_args` 里可用）：
+`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` / `{agent.root}` /
+`{agent.home}` / `{agent.bundle_root}` / `{agent.bundle}` / `{actor.id}` /
+`{scope.id}`。
 
 `{agent.profile}` 是该 actor 的**持久化状态**目录（per-actor、跨 thread 共享），
 适合放 identity、memory、MCP 配置等 actor 自己维护的状态。runtime 管理的版本化

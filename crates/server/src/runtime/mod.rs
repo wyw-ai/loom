@@ -22,8 +22,8 @@ use crate::store::{Store, StoreError};
 
 use self::acp::AcpAdapter;
 use self::adapter::{Adapter, AdapterEvent};
-use self::command::{CommandAdapter, CommandConfig};
-use agent_runtime::{prepare_bundle_install, resolved_bundle_version};
+use self::command::{expand_session_templates, CommandAdapter, CommandConfig};
+use agent_runtime::{prepare_bundle_install, resolved_bundle_version, validate_bundle_current};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -511,19 +511,27 @@ impl RuntimeManager {
         paths: &BundlePaths,
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(&paths.root)?;
+        let current = validate_bundle_current(
+            &self.root_for(actor_id),
+            &self.workspace_for(actor_id),
+            &self.profile_for(actor_id),
+            &self.logs_for(actor_id),
+            &paths.root,
+            &paths.current,
+        )?;
         let Some(bundle) = spec.bundle.as_ref() else {
-            reset_bundle_current_dir(&paths.current)?;
+            reset_bundle_current_dir(&current)?;
             return Ok(());
         };
         if bundle.source.trim().is_empty() {
-            reset_bundle_current_dir(&paths.current)?;
+            reset_bundle_current_dir(&current)?;
             return Ok(());
         }
 
         let source = PathBuf::from(self.expand_base_vars(&bundle.source, actor_id));
         let install_dir = prepare_bundle_install(&paths.root, &source, bundle)?.install_dir;
         install_bundle_dir(&source, &install_dir, bundle.install_mode)?;
-        link_current_bundle(&install_dir, &paths.current)?;
+        link_current_bundle(&install_dir, &current)?;
         Ok(())
     }
 
@@ -654,13 +662,18 @@ impl RuntimeManager {
             }
             "command" => {
                 let sessions_dir = self.sessions_dir();
+                let mut transport = spec.transport.clone();
+                transport.session =
+                    expand_session_templates(spec.transport.session.as_ref(), |s| {
+                        self.expand_path_vars(s, actor_id, Some(&bundle_paths))
+                    });
                 let cfg = CommandConfig::from_transport(
                     actor_id.to_string(),
-                    spec.transport.command.clone(),
+                    transport.command.clone(),
                     args,
                     env,
                     workdir,
-                    &spec.transport,
+                    &transport,
                     sessions_dir,
                 );
                 Arc::new(CommandAdapter::new(cfg))

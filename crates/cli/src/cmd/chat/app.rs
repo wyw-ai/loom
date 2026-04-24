@@ -185,12 +185,12 @@ impl App {
             } else {
                 None
             };
-            let current_channel = if matches!(self.scope_kind, ScopeKind::Channel) && self.has_scope()
-            {
-                Some(self.thread_id.clone())
-            } else {
-                None
-            };
+            let current_channel =
+                if matches!(self.scope_kind, ScopeKind::Channel) && self.has_scope() {
+                    Some(self.thread_id.clone())
+                } else {
+                    None
+                };
             self.sidebar = Some(
                 Sidebar::new(current_thread)
                     .with_me(self.actor_id.clone())
@@ -218,8 +218,7 @@ impl App {
         // for a different scope would still be valid but never actionable
         // from this view, so dropping is fine and avoids unbounded growth
         // for operators that bounce between many scopes.
-        self.open_turns
-            .retain(|_, t| &t.scope == new_scope);
+        self.open_turns.retain(|_, t| &t.scope == new_scope);
         self.selected_history_idx = None;
         self.expanded_history.clear();
         self.input.clear();
@@ -619,6 +618,8 @@ pub fn slash_command_items() -> Vec<PickerItem> {
             .with_hint("/cancel @agent for a specific one"),
         PickerItem::new("/invite", "Invite an actor into the current channel"),
         PickerItem::new("/members", "List members of the current channel"),
+        PickerItem::new("/announce", "Pin an announcement to the right panel")
+            .with_hint("/announce clear to remove"),
         PickerItem::new("/quit", "Leave the chat"),
     ]
 }
@@ -841,6 +842,7 @@ mod tests {
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
             streaming: false,
+            handoff_target: None,
         });
         app.history.bubbles.push(Bubble {
             actor_id: "system".into(),
@@ -852,6 +854,7 @@ mod tests {
             trailing_event_id: None,
             delivery: DeliveryState::NotApplicable,
             streaming: false,
+            handoff_target: None,
         });
         app.history.bubbles.push(Bubble {
             actor_id: "actor_agent_beta".into(),
@@ -863,6 +866,7 @@ mod tests {
             trailing_event_id: Some("evt_2".into()),
             delivery: DeliveryState::NotApplicable,
             streaming: false,
+            handoff_target: None,
         });
 
         app.select_older_history();

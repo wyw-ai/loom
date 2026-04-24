@@ -145,11 +145,9 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         if let Some(filter) = scope_acl_filter(state, scope) {
             broadcast_filtered(state, scope, method::TURN_STREAM_UPDATE, &payload, &filter);
         } else {
-            state.subscriptions.broadcast_to_scope(
-                scope,
-                method::TURN_STREAM_UPDATE,
-                payload,
-            );
+            state
+                .subscriptions
+                .broadcast_to_scope(scope, method::TURN_STREAM_UPDATE, payload);
         }
         return;
     }

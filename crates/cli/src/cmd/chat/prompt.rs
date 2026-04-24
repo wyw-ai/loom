@@ -25,6 +25,14 @@ pub enum PromptKind {
     InviteToChannel {
         channel_id: String,
     },
+    /// Danger-zone confirm for cascade channel delete: only Enter-submits
+    /// when the typed value matches the channel title verbatim. The expected
+    /// value is captured upstream so the modal can render a dim hint and
+    /// guard the gate without consulting external state.
+    CascadeDeleteChannel {
+        channel_id: String,
+        expected_title: String,
+    },
 }
 
 /// Discriminator for confirm-style modals (delete + revoke + auto-invite).
@@ -105,13 +113,20 @@ impl PromptModal {
                 }
                 (KeyCode::Enter, _) => {
                     let trimmed = value.trim().to_string();
-                    if trimmed.is_empty() {
-                        PromptOutcome::None
-                    } else {
-                        PromptOutcome::SubmittedText {
-                            kind: kind.clone(),
-                            value: trimmed,
+                    // Danger-zone gate: cascade delete refuses to fire unless
+                    // the typed value matches the channel title byte-for-byte.
+                    // Stays in `None` (modal stays open) on mismatch so the
+                    // operator can correct without re-opening anything.
+                    if let PromptKind::CascadeDeleteChannel { expected_title, .. } = kind {
+                        if &trimmed != expected_title {
+                            return PromptOutcome::None;
                         }
+                    } else if trimmed.is_empty() {
+                        return PromptOutcome::None;
+                    }
+                    PromptOutcome::SubmittedText {
+                        kind: kind.clone(),
+                        value: trimmed,
                     }
                 }
                 (KeyCode::Backspace, _) => {
@@ -159,13 +174,26 @@ impl PromptModal {
             .split(inner);
 
         match self {
-            PromptModal::Text { value, .. } => {
-                let body = Paragraph::new(Line::from(vec![
+            PromptModal::Text { kind, value, .. } => {
+                let mut body_lines: Vec<Line<'static>> = Vec::new();
+                // Cascade-delete prompt: show the expected channel name above
+                // the input so the operator can copy it from the dialog itself
+                // — no need to glance back at the sidebar.
+                if let PromptKind::CascadeDeleteChannel { expected_title, .. } = kind {
+                    body_lines.push(Line::from(vec![Span::styled(
+                        format!("Type '{expected_title}' to confirm cascade delete:"),
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                    body_lines.push(Line::from(Span::raw("")));
+                }
+                body_lines.push(Line::from(vec![
                     Span::styled("> ", Style::default().fg(Color::Cyan)),
                     Span::raw(value.clone()),
                     Span::styled("_", Style::default().fg(Color::Cyan)),
                 ]));
-                f.render_widget(body, layout[0]);
+                f.render_widget(Paragraph::new(body_lines), layout[0]);
                 let hint = Line::from(vec![Span::styled(
                     " Enter=submit · Esc=cancel ",
                     Style::default()
@@ -256,6 +284,45 @@ mod tests {
         } else {
             panic!("expected text prompt");
         }
+    }
+
+    #[test]
+    fn cascade_delete_prompt_only_submits_on_exact_match() {
+        let kind = PromptKind::CascadeDeleteChannel {
+            channel_id: "chan_x".into(),
+            expected_title: "Engineering".into(),
+        };
+        let mut p = PromptModal::text(kind.clone(), "Type the name", "");
+        // Wrong text: stays in None (modal stays open) on Enter.
+        for c in "engineering".chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(p.handle_key(key(KeyCode::Enter)), PromptOutcome::None);
+        // Correct text submits with the typed value, kind preserved.
+        let mut p = PromptModal::text(kind.clone(), "Type the name", "");
+        for c in "Engineering".chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            p.handle_key(key(KeyCode::Enter)),
+            PromptOutcome::SubmittedText {
+                kind,
+                value: "Engineering".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn cascade_delete_prompt_esc_still_cancels() {
+        let kind = PromptKind::CascadeDeleteChannel {
+            channel_id: "chan_x".into(),
+            expected_title: "Engineering".into(),
+        };
+        let mut p = PromptModal::text(kind, "Type the name", "");
+        for c in "wrong".chars() {
+            p.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(p.handle_key(key(KeyCode::Esc)), PromptOutcome::Cancelled);
     }
 
     #[test]

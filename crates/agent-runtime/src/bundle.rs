@@ -325,13 +325,17 @@ mod tests {
         let profile = root.join("profile");
         let logs = root.join("logs");
         let bundle_root = root.join("runtime").join("bundles");
-        let expected = root.join("runtime").join("live");
+        let current = root.join("runtime").join("live");
         for dir in [&workspace, &profile, &logs, &bundle_root] {
             std::fs::create_dir_all(dir).expect("create actor dir");
         }
+        let expected = std::fs::canonicalize(&root)
+            .expect("canonicalize root")
+            .join("runtime")
+            .join("live");
 
         let resolved =
-            validate_bundle_current(&root, &workspace, &profile, &logs, &bundle_root, &expected)
+            validate_bundle_current(&root, &workspace, &profile, &logs, &bundle_root, &current)
                 .expect("current should be valid");
 
         assert_eq!(resolved, expected);

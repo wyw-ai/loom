@@ -1351,20 +1351,21 @@ fn open_delete_confirm(app: &mut App) {
                 app.set_status("nothing selected");
                 return;
             };
-            let thread_count = s
-                .threads_by_channel
-                .get(&ch.id)
-                .map(|v| v.len())
-                .unwrap_or(0);
-            let message = if thread_count == 0 {
-                format!("Delete channel #{}? It is empty.", ch.title)
-            } else {
-                // Heads-up wording — the ACTUAL delete is gated by a
-                // typed-name prompt that fires after this confirm.
-                format!(
-                    "Delete channel #{} AND its {} thread(s)? You'll be asked to type the channel name to confirm.",
-                    ch.title, thread_count
-                )
+            let thread_count = s.threads_by_channel.get(&ch.id).map(|v| v.len());
+            let message = match thread_count {
+                Some(0) => format!("Delete channel #{}? It is empty.", ch.title),
+                Some(n) => {
+                    // Heads-up wording — the ACTUAL delete is gated by a
+                    // typed-name prompt that fires after this confirm.
+                    format!(
+                        "Delete channel #{} AND its {} thread(s)? You'll be asked to type the channel name to confirm.",
+                        ch.title, n
+                    )
+                }
+                None => format!(
+                    "Delete channel #{}? Thread count will be checked before deleting.",
+                    ch.title
+                ),
             };
             app.prompt = Some(PromptModal::confirm(
                 ConfirmKind::DeleteChannel {
@@ -1517,29 +1518,37 @@ async fn handle_prompt_submit(
 }
 
 async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) {
-    use proto::methods::{ChannelDeleteResult, ThreadDeleteResult};
+    use proto::methods::{ChannelDeleteResult, ThreadDeleteResult, ThreadListResult};
     match kind {
         ConfirmKind::DeleteChannel { channel_id } => {
-            // Re-check the thread count NOW (the sidebar cache may have
-            // changed between open_delete_confirm and this y-press).
-            let (thread_count, channel_title) = app
+            let channel_title = app
                 .sidebar
                 .as_ref()
-                .map(|s| {
-                    let n = s
-                        .threads_by_channel
-                        .get(&channel_id)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    let title = s
-                        .channels
+                .and_then(|s| {
+                    s.channels
                         .iter()
                         .find(|c| c.id == channel_id)
                         .map(|c| c.title.clone())
-                        .unwrap_or_else(|| channel_id.clone());
-                    (n, title)
                 })
-                .unwrap_or((0, channel_id.clone()));
+                .unwrap_or_else(|| channel_id.clone());
+
+            let threads = match client
+                .call::<_, ThreadListResult>(
+                    method::THREAD_LIST,
+                    json!({ "channelId": channel_id }),
+                )
+                .await
+            {
+                Ok(res) => res.threads,
+                Err(e) => {
+                    app.set_status(format!("thread/list failed before delete: {}", e));
+                    return;
+                }
+            };
+            let thread_count = threads.len();
+            if let Some(s) = app.sidebar.as_mut() {
+                s.replace_threads(&channel_id, threads);
+            }
 
             if thread_count > 0 {
                 // Hand off to the typed-name danger-zone prompt. The actual

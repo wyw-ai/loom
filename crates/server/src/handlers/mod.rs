@@ -49,7 +49,7 @@ pub async fn dispatch(
         method::CHANNEL_CREATE => channel_create(state, connection_id, params),
         method::CHANNEL_LIST => channel_list(state, connection_id),
         method::CHANNEL_UPDATE => channel_update(state, params),
-        method::CHANNEL_DELETE => channel_delete(state, params),
+        method::CHANNEL_DELETE => channel_delete(state, connection_id, params),
         method::CHANNEL_INVITE => channel_invite(state, connection_id, params),
         method::CHANNEL_REVOKE => channel_revoke(state, connection_id, params),
         method::CHANNEL_MEMBERS => channel_members(state, connection_id, params),
@@ -370,8 +370,15 @@ fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(ChannelUpdateResult { channel })
 }
 
-fn channel_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelDeleteParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot delete channel {}", p.channel_id),
+        ));
+    }
     let (deleted, deleted_threads) = state
         .store
         .delete_channel(&p.channel_id, p.cascade)
@@ -867,4 +874,118 @@ fn path_lookup_via_env(bin: &str) -> bool {
 #[allow(dead_code)]
 pub fn _ensure_arc<T>(x: Arc<T>) -> Arc<T> {
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifacts::ArtifactStore;
+    use crate::journal::Journal;
+    use crate::runtime::RuntimeManager;
+    use crate::store::Store;
+    use crate::subscribe::{Connection, Subscriptions};
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!("joi-handler-test-{}", Uuid::new_v4().simple()))
+    }
+
+    fn fresh_state() -> AppState {
+        let root = test_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let journal = Journal::open(root.join("journal.jsonl")).expect("open journal");
+        let store = Store::open(journal).expect("open store");
+        let subscriptions = Subscriptions::new();
+        let artifacts = Arc::new(
+            ArtifactStore::new(root.join("artifacts"), root.join("workspaces"))
+                .expect("artifact store"),
+        );
+        let runtime = RuntimeManager::new(
+            root.join("data"),
+            root.join("agents"),
+            store.clone(),
+            "ws://127.0.0.1:0/rpc".into(),
+        )
+        .expect("runtime");
+        AppState {
+            store,
+            subscriptions,
+            runtime,
+            artifacts,
+        }
+    }
+
+    async fn open_conn(state: &AppState, connection_id: &str, actor_id: &str) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: connection_id.into(),
+            actor_id: None,
+            tx,
+        });
+        dispatch(
+            state,
+            connection_id,
+            method::CONNECTION_OPEN,
+            Some(json!({ "actorId": actor_id })),
+        )
+        .await
+        .expect("connection/open");
+    }
+
+    #[tokio::test]
+    async fn channel_delete_refuses_non_member() {
+        let state = fresh_state();
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .create_thread(channel.id.clone(), "child".into(), None)
+            .expect("create thread");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        let err = dispatch(
+            &state,
+            "conn_intruder",
+            method::CHANNEL_DELETE,
+            Some(json!({ "channelId": channel.id, "cascade": true })),
+        )
+        .await
+        .expect_err("delete should be denied");
+
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert!(state.store.get_channel(&channel.id).is_some());
+        assert_eq!(state.store.list_threads(Some(&channel.id)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_delete_allows_member_cascade() {
+        let state = fresh_state();
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .create_thread(channel.id.clone(), "child".into(), None)
+            .expect("create thread");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_DELETE,
+            Some(json!({ "channelId": channel.id, "cascade": true })),
+        )
+        .await
+        .expect("delete should succeed");
+        let result: ChannelDeleteResult = serde_json::from_value(value).expect("delete result");
+
+        assert!(result.deleted);
+        assert_eq!(result.deleted_threads, 1);
+        assert!(state.store.get_channel(&channel.id).is_none());
+        assert!(state.store.list_threads(Some(&channel.id)).is_empty());
+    }
 }

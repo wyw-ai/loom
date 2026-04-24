@@ -40,7 +40,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
-use agent_runtime::{Adapter, AdapterEvent};
+use agent_runtime::{prepare_bundle_install, resolved_bundle_version, Adapter, AdapterEvent};
 
 use crate::client::Client;
 
@@ -301,40 +301,10 @@ fn ensure_bundle(
         return Ok(());
     }
     let source = PathBuf::from(agent_paths.expand_base(&bundle.source));
-    let version = normalized_bundle_version(bundle, &source);
-    let install_dir = paths.root.join(&version);
+    let install_dir = prepare_bundle_install(&paths.root, &source, bundle)?.install_dir;
     install_bundle_dir(&source, &install_dir, bundle.install_mode)?;
     link_current_bundle(&install_dir, &paths.current)?;
     Ok(())
-}
-
-fn normalized_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
-    let raw = if !bundle.version.trim().is_empty() {
-        bundle.version.trim().to_string()
-    } else {
-        source
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("bundle")
-            .to_string()
-    };
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-fn resolved_bundle_version(bundle: &AgentBundleSpec, source: &Path) -> String {
-    if bundle.source.trim().is_empty() {
-        String::new()
-    } else {
-        normalized_bundle_version(bundle, source)
-    }
 }
 fn install_bundle_dir(
     source: &Path,

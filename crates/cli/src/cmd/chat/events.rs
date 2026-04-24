@@ -17,6 +17,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use crate::client::Client;
 
 use super::app::{App, Mode, OpenTurn, PickerKind};
+use super::draft::{DraftSubmission, SavedWorkspaceRef};
 use super::picker::{PickerItem, PickerOutcome};
 use super::prompt::{ConfirmKind, PromptKind, PromptModal, PromptOutcome};
 use super::sidebar::SidebarFocus;
@@ -64,9 +65,8 @@ pub async fn run(
         // channel list so the operator can immediately pick/create a
         // thread instead of staring at an empty chat pane.
         app.history.push_system("Welcome to Joi chat.");
-        app.history.push_system(
-            "No scope bound. Use the sidebar (Ctrl+B) to pick a channel,",
-        );
+        app.history
+            .push_system("No scope bound. Use the sidebar (Ctrl+B) to pick a channel,");
         app.history.push_system(
             "press Enter to drill into its threads, or press c to enter the channel common area.",
         );
@@ -846,15 +846,19 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             app.update_at_menu();
         }
         KeyCode::Enter => {
-            if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+            {
                 app.input.push_char('\n');
                 app.update_slash_menu();
                 app.update_at_menu();
                 return;
             }
-            let text = app.input.take_submission_text();
+            let submission = app.input.take_submission();
             app.slash_menu = None;
             app.at_menu = None;
+            let text = submission.text.as_str();
             if text.trim().is_empty() {
                 return;
             }
@@ -863,7 +867,7 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
             } else if let Some(rest) = text.strip_prefix('@') {
                 handle_at_input(client, app, rest, scope).await;
             } else {
-                send_message(client, app, &text, scope).await;
+                send_message(client, app, &submission, scope).await;
             }
         }
         KeyCode::Char(c) => {
@@ -2060,7 +2064,10 @@ fn reply_selected_history(app: &mut App) {
     arm_reply_target(app, event_id);
 }
 
-fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
+fn message_relations(
+    app: &App,
+    attached_artifact_ids: &[String],
+) -> (Vec<serde_json::Value>, Option<String>) {
     let mut relations = Vec::new();
     let reply_target = app
         .reply_target
@@ -2079,6 +2086,12 @@ fn message_relations(app: &App) -> (Vec<serde_json::Value>, Option<String>) {
                 }));
             }
         }
+    }
+    for artifact_id in attached_artifact_ids {
+        relations.push(json!({
+            "kind": "attaches_artifact",
+            "target": { "kind": "artifact", "id": artifact_id }
+        }));
     }
     (relations, reply_target)
 }
@@ -2119,7 +2132,7 @@ async fn save_pasted_content_to_workspace(
     app: &mut App,
     scope: &ScopeRef,
     text: String,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SavedWorkspaceRef> {
     use anyhow::{anyhow, bail};
     use proto::methods::ArtifactPublishResult;
 
@@ -2157,10 +2170,33 @@ async fn save_pasted_content_to_workspace(
             )
         })?;
 
-    Ok(format!(
+    let display = format!(
         "[Saved pasted content to workspace ({}) id={entry_id}]",
         human_size(res.artifact.size)
-    ))
+    );
+    let workspace_path = res
+        .artifact
+        ._meta
+        .as_ref()
+        .and_then(|meta| meta.get("workspacePath"))
+        .and_then(|value| value.as_str());
+    let submission = match workspace_path {
+        Some(path) => format!(
+            "[Saved pasted content to workspace ({}) id={entry_id} artifactUri={} workspacePath={path}]",
+            human_size(res.artifact.size),
+            res.artifact.uri
+        ),
+        None => format!(
+            "[Saved pasted content to workspace ({}) id={entry_id} artifactUri={}]",
+            human_size(res.artifact.size),
+            res.artifact.uri
+        ),
+    };
+    Ok(SavedWorkspaceRef {
+        display,
+        submission,
+        artifact_id: res.artifact.id,
+    })
 }
 
 fn human_size(bytes: u64) -> String {
@@ -2176,19 +2212,24 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &ScopeRef) {
+async fn send_message(
+    client: &Arc<Client>,
+    app: &mut App,
+    submission: &DraftSubmission,
+    scope: &ScopeRef,
+) {
     use proto::methods::EventAppendResult;
     if !app.has_scope() {
         app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
         return;
     }
-    let (relations, reply_target) = message_relations(app);
+    let (relations, reply_target) = message_relations(app, &submission.attached_artifact_ids);
     let payload = json!({
         "event": {
             "type": "content.add",
             "actorId": app.actor_id,
             "scope": scope,
-            "payload": { "contentType": "text/markdown", "text": text },
+            "payload": { "contentType": "text/markdown", "text": submission.text },
             "relations": relations,
         }
     });
@@ -2202,7 +2243,7 @@ async fn send_message(client: &Arc<Client>, app: &mut App, text: &str, scope: &S
                 &actor,
                 &r.event.id,
                 r.event.occurred_at,
-                text.to_string(),
+                submission.text.clone(),
                 reply_target,
             );
             app.selected_history_idx = app.history.newest_replyable_index();
@@ -2343,7 +2384,7 @@ mod tests {
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
-        let (relations, reply_target) = message_relations(&app);
+        let (relations, reply_target) = message_relations(&app, &[]);
 
         assert_eq!(reply_target.as_deref(), Some("evt_123"));
         assert_eq!(relations.len(), 2);
@@ -2376,10 +2417,28 @@ mod tests {
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
-        let (relations, _) = message_relations(&app);
+        let (relations, _) = message_relations(&app, &[]);
 
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0]["kind"], "replies_to");
+    }
+
+    #[test]
+    fn attached_artifacts_are_emitted_as_relations() {
+        let app = App::new(
+            "actor_human_current".into(),
+            "thread_demo".into(),
+            proto::types::ScopeKind::Thread,
+            "bojun.cbj".into(),
+        );
+
+        let (relations, _) = message_relations(&app, &["art_123".into(), "art_456".into()]);
+
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0]["kind"], "attaches_artifact");
+        assert_eq!(relations[0]["target"]["kind"], "artifact");
+        assert_eq!(relations[0]["target"]["id"], "art_123");
+        assert_eq!(relations[1]["target"]["id"], "art_456");
     }
 
     #[test]

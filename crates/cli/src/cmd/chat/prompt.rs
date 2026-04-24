@@ -137,6 +137,12 @@ impl PromptModal {
         }
     }
 
+    pub fn handle_paste(&mut self, text: &str) {
+        if let PromptModal::Text { value, .. } = self {
+            value.push_str(text);
+        }
+    }
+
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let popup = centered_rect(60, 30, area);
         f.render_widget(Clear, popup);

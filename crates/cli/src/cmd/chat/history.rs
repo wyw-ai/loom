@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Local, Utc};
 use proto::types::{Event, RelationKind};
 use ratatui::style::{Color, Modifier, Style};
@@ -329,10 +331,18 @@ impl History {
             .map(|b| b.actor_id.as_str())
     }
 
+    pub fn bubble_is_collapsible(&self, index: usize) -> bool {
+        self.bubbles
+            .get(index)
+            .map(|bubble| bubble_body_rows(bubble).len() > COLLAPSED_BODY_LINES)
+            .unwrap_or(false)
+    }
+
     pub fn render_lines(
         &self,
         width: u16,
         selected_bubble_idx: Option<usize>,
+        expanded_bubble_indices: &HashSet<usize>,
         display_for: &dyn Fn(&str) -> String,
     ) -> RenderedHistory {
         let mut out = Vec::new();
@@ -389,19 +399,17 @@ impl History {
             // / static bubbles bypass markdown — they're already pre-formatted
             // strings (handoff arrows, action.request prefixes, etc.) and we
             // don't want `*` / `#` in those treated as syntax.
-            let body_rows: Vec<Vec<Span<'static>>> = match b.kind {
-                BubbleKind::Stream => markdown::render_to_rows(
-                    display_text(&b.text),
-                    Style::default(),
-                ),
-                _ => display_text(&b.text)
-                    .split('\n')
-                    .map(|line| vec![Span::raw(line.to_string())])
-                    .collect(),
+            let body_rows = bubble_body_rows(b);
+            let body_row_count = body_rows.len();
+            let collapsed =
+                body_row_count > COLLAPSED_BODY_LINES && !expanded_bubble_indices.contains(&idx);
+            let visible_body_rows = if collapsed {
+                COLLAPSED_BODY_LINES
+            } else {
+                body_row_count
             };
-            let body_rows = trim_trailing_blank_rows(body_rows);
-            let last_idx = body_rows.len().saturating_sub(1);
-            for (line_idx, row_spans) in body_rows.into_iter().enumerate() {
+            let last_idx = visible_body_rows.saturating_sub(1);
+            for (line_idx, row_spans) in body_rows.into_iter().take(visible_body_rows).enumerate() {
                 let is_last = line_idx == last_idx;
                 let rendered = if line_idx == 0 {
                     let mut spans = header.clone();
@@ -434,6 +442,19 @@ impl History {
                 total_rows = total_rows.saturating_add(wrapped_rows(&rendered, width));
                 out.push(rendered);
             }
+            if collapsed {
+                let remaining = body_row_count.saturating_sub(COLLAPSED_BODY_LINES);
+                let hint = Line::from(vec![
+                    gutter.clone(),
+                    Span::raw(BODY_INDENT.to_string()),
+                    Span::styled(
+                        format!("… {remaining} more lines (→ expand)"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                total_rows = total_rows.saturating_add(wrapped_rows(&hint, width));
+                out.push(hint);
+            }
             if selected && total_rows > start_row {
                 selected_row_range = Some((
                     start_row.min(u16::MAX as usize) as u16,
@@ -452,6 +473,7 @@ impl History {
 /// Width threshold under which the quote block collapses to a single inline
 /// `↩ @actor` prefix instead of hanging on its own line.
 const QUOTE_LINE_MIN_WIDTH: u16 = 60;
+const COLLAPSED_BODY_LINES: usize = 5;
 
 /// Indent that aligns hanging quote lines with the column where the actor
 /// name starts on the header line (after the `[HH:MM:SS] ` timestamp prefix).
@@ -512,6 +534,17 @@ fn display_text(text: &str) -> &str {
     // payload intact, but collapse those leading breaks in the TUI so a newly
     // arrived reply does not render as "header + empty space".
     text.trim_start_matches(|c| c == '\n' || c == '\r')
+}
+
+fn bubble_body_rows(bubble: &Bubble) -> Vec<Vec<Span<'static>>> {
+    let rows = match bubble.kind {
+        BubbleKind::Stream => markdown::render_to_rows(display_text(&bubble.text), Style::default()),
+        _ => display_text(&bubble.text)
+            .split('\n')
+            .map(|line| vec![Span::raw(line.to_string())])
+            .collect(),
+    };
+    trim_trailing_blank_rows(rows)
 }
 
 fn preview_text(text: &str) -> String {
@@ -667,6 +700,8 @@ fn short_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
         display_text, preview_text, reply_target, reply_target_label, Bubble, BubbleKind,
         DeliveryState, History,
@@ -789,7 +824,7 @@ mod tests {
             streaming: false,
         });
 
-        let rendered = history.render_lines(80, Some(0), &|id| id.to_string());
+        let rendered = history.render_lines(80, Some(0), &HashSet::new(), &|id| id.to_string());
 
         assert_eq!(rendered.lines.len(), 2);
         assert_eq!(rendered.selected_row_range, Some((0, 1)));
@@ -810,7 +845,7 @@ mod tests {
             streaming: false,
         });
 
-        let rendered = history.render_lines(16, Some(0), &|id| id.to_string());
+        let rendered = history.render_lines(16, Some(0), &HashSet::new(), &|id| id.to_string());
         let expected = Paragraph::new(rendered.lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(16) as u16;
@@ -871,7 +906,7 @@ mod tests {
     #[test]
     fn render_lines_emits_quote_line_above_reply_when_wide() {
         let history = parent_and_reply();
-        let rendered = history.render_lines(80, None, &|id| id.to_string());
+        let rendered = history.render_lines(80, None, &HashSet::new(), &|id| id.to_string());
         // parent (1 line) + quote line + reply (1 line) = 3
         assert_eq!(rendered.lines.len(), 3);
         let quote = line_text(&rendered.lines[1]);
@@ -887,7 +922,7 @@ mod tests {
     #[test]
     fn render_lines_inlines_quote_when_narrow() {
         let history = parent_and_reply();
-        let rendered = history.render_lines(50, None, &|id| id.to_string());
+        let rendered = history.render_lines(50, None, &HashSet::new(), &|id| id.to_string());
         // parent + reply (no quote line); inline ↩ @actor on the reply header
         assert_eq!(rendered.lines.len(), 2);
         let reply = line_text(&rendered.lines[1]);
@@ -909,7 +944,7 @@ mod tests {
             delivery: DeliveryState::NotApplicable,
             streaming: false,
         });
-        let rendered = history.render_lines(80, None, &|id| id.to_string());
+        let rendered = history.render_lines(80, None, &HashSet::new(), &|id| id.to_string());
         assert_eq!(rendered.lines.len(), 2);
         let quote = line_text(&rendered.lines[0]);
         assert!(quote.contains("(message unavailable)"), "got: {quote:?}");
@@ -920,9 +955,56 @@ mod tests {
     fn render_lines_selected_range_includes_quote_line() {
         let history = parent_and_reply();
         // Select the reply (index 1). Range should cover both quote line + body.
-        let rendered = history.render_lines(80, Some(1), &|id| id.to_string());
+        let rendered = history.render_lines(80, Some(1), &HashSet::new(), &|id| id.to_string());
         // quote line is at row 1, body at row 2.
         assert_eq!(rendered.selected_row_range, Some((1, 2)));
+    }
+
+    #[test]
+    fn long_messages_are_collapsed_by_default() {
+        let mut history = History::default();
+        history.bubbles.push(Bubble {
+            actor_id: "actor_a".into(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: "1\n2\n3\n4\n5\n6\n7".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_long".into()),
+            delivery: DeliveryState::NotApplicable,
+            streaming: false,
+        });
+
+        let rendered = history.render_lines(80, Some(0), &HashSet::new(), &|id| id.to_string());
+
+        assert!(history.bubble_is_collapsible(0));
+        assert_eq!(rendered.lines.len(), 6);
+        let hint = line_text(rendered.lines.last().unwrap());
+        assert!(hint.contains("2 more lines"));
+    }
+
+    #[test]
+    fn expanded_long_messages_render_full_body() {
+        let mut history = History::default();
+        history.bubbles.push(Bubble {
+            actor_id: "actor_a".into(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: "1\n2\n3\n4\n5\n6\n7".into(),
+            ts: Utc::now(),
+            reply_to_event_id: None,
+            trailing_event_id: Some("evt_long".into()),
+            delivery: DeliveryState::NotApplicable,
+            streaming: false,
+        });
+
+        let mut expanded = HashSet::new();
+        expanded.insert(0);
+        let rendered = history.render_lines(80, Some(0), &expanded, &|id| id.to_string());
+
+        assert_eq!(rendered.lines.len(), 7);
+        let last = line_text(rendered.lines.last().unwrap());
+        assert!(last.contains('7'));
     }
 
     fn make_event(id: &str, actor: &str, turn: Option<&str>, text: &str) -> Event {

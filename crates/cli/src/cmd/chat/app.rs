@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use proto::types::{Event, ScopeKind, ScopeRef};
 
+use super::draft::DraftInput;
 use super::history::History;
 use super::picker::{Picker, PickerItem};
 use super::prompt::PromptModal;
@@ -50,7 +51,7 @@ pub struct OpenTurn {
 
 pub struct App {
     pub history: History,
-    pub input: String,
+    pub input: DraftInput,
     pub mode: Mode,
     pub picker: Option<Picker>,
     /// Inline slash-command dropdown above the input box. Visible whenever
@@ -88,6 +89,7 @@ pub struct App {
     /// deltas yet.
     pub open_turns: HashMap<String, OpenTurn>,
     pub selected_history_idx: Option<usize>,
+    pub expanded_history: HashSet<usize>,
     pub scroll: u16,
     pub auto_follow: bool,
     pub should_quit: bool,
@@ -103,6 +105,7 @@ pub struct App {
     /// (thread OR channel common area); the chat main loop drains this
     /// and re-binds its scope subscription.
     pub pending_scope_switch: Option<ScopeRef>,
+    pub next_paste_token_id: u64,
 }
 
 impl App {
@@ -117,7 +120,7 @@ impl App {
         display_for.insert("system".to_string(), "system".to_string());
         Self {
             history: History::default(),
-            input: String::new(),
+            input: DraftInput::default(),
             mode: Mode::Normal,
             picker: None,
             slash_menu: None,
@@ -132,6 +135,7 @@ impl App {
             reply_target: None,
             open_turns: HashMap::new(),
             selected_history_idx: None,
+            expanded_history: HashSet::new(),
             scroll: 0,
             auto_follow: true,
             should_quit: false,
@@ -140,6 +144,7 @@ impl App {
             sidebar: None,
             prompt: None,
             pending_scope_switch: None,
+            next_paste_token_id: 1,
         }
     }
 
@@ -216,6 +221,7 @@ impl App {
         self.open_turns
             .retain(|_, t| &t.scope == new_scope);
         self.selected_history_idx = None;
+        self.expanded_history.clear();
         self.input.clear();
         self.slash_menu = None;
         self.at_menu = None;
@@ -301,7 +307,8 @@ impl App {
     /// another branch), narrow "公区" from "any Public channel" to that
     /// single lobby channel.
     pub fn update_at_menu(&mut self) {
-        if let Some(rest) = self.input.strip_prefix('@') {
+        let input = self.input.display_text();
+        if let Some(rest) = input.strip_prefix('@') {
             let token = rest.split_whitespace().next().unwrap_or("");
             let still_typing_target = !rest.contains(' ');
             if !still_typing_target {
@@ -419,7 +426,8 @@ impl App {
     /// is shown whenever input starts with `/`; it filters by what comes
     /// after the slash so e.g. `/ha` highlights `/handoff`.
     pub fn update_slash_menu(&mut self) {
-        if let Some(rest) = self.input.strip_prefix('/') {
+        let input = self.input.display_text();
+        if let Some(rest) = input.strip_prefix('/') {
             // Only show while the user is still typing the command name —
             // once they've typed a space, treat the rest as args, not filter.
             let cmd_token = rest.split_whitespace().next().unwrap_or("");
@@ -510,6 +518,28 @@ impl App {
 
     pub fn clear_history_selection(&mut self) {
         self.selected_history_idx = None;
+    }
+
+    pub fn expand_selected_history(&mut self) {
+        let Some(idx) = self.selected_history_idx else {
+            return;
+        };
+        if self.history.bubble_is_collapsible(idx) {
+            self.expanded_history.insert(idx);
+        }
+    }
+
+    pub fn collapse_selected_history(&mut self) {
+        let Some(idx) = self.selected_history_idx else {
+            return;
+        };
+        self.expanded_history.remove(&idx);
+    }
+
+    pub fn next_paste_token_id(&mut self) -> u64 {
+        let id = self.next_paste_token_id;
+        self.next_paste_token_id = self.next_paste_token_id.saturating_add(1);
+        id
     }
 
     pub fn select_older_history(&mut self) {

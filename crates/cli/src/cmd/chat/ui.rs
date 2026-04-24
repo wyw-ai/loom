@@ -58,7 +58,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if dropdown_h > 0 {
         constraints.push(Constraint::Length(dropdown_h));
     }
-    constraints.push(Constraint::Length(3)); // input
+    constraints.push(Constraint::Length(input_height(app, main_area.width))); // input
     constraints.push(Constraint::Length(1)); // status
 
     let outer = Layout::default()
@@ -154,7 +154,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" History  (↑/↓=select · r=reply · Ctrl-R=picker · PgUp/PgDn=scroll) ")
+        .title(
+            " History  (↑/↓=select · ←/→=collapse/expand · r=reply · Ctrl-R=picker · PgUp/PgDn=scroll) ",
+        )
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -162,14 +164,22 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
     let display_for = |id: &str| app.display_name_for(id);
     let rendered = app
         .history
-        .render_lines(inner.width, app.selected_history_idx, &display_for);
+        .render_lines(
+            inner.width,
+            app.selected_history_idx,
+            &app.expanded_history,
+            &display_for,
+        );
     let visible = inner.height.max(1);
     let max_scroll = rendered.total_rows.saturating_sub(visible);
     if app.auto_follow {
         app.scroll = max_scroll;
     } else if let Some((start, end)) = rendered.selected_row_range {
+        let selected_height = end.saturating_sub(start).saturating_add(1);
         let visible_bottom = app.scroll.saturating_add(visible.saturating_sub(1));
-        if start < app.scroll {
+        if selected_height >= visible {
+            app.scroll = start;
+        } else if start < app.scroll {
             app.scroll = start;
         } else if end > visible_bottom {
             app.scroll = end.saturating_sub(visible.saturating_sub(1));
@@ -278,10 +288,12 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         let title = match app.reply_target.as_ref() {
             Some(target) => format!(
-                " Message (reply → {} · Enter=send · Esc=clear · /… for slash) ",
+                " Message (reply → {} · Enter=send · Alt+Enter/Ctrl+J=new line · Esc=clear · /… for slash) ",
                 target.preview
             ),
-            None => " Message (Enter to send · /…  for slash) ".to_string(),
+            None => {
+                " Message (Enter=send · Alt+Enter/Ctrl+J=new line · /… for slash) ".to_string()
+            }
         };
         (title, Color::Cyan)
     };
@@ -290,13 +302,17 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
-    let visible = visible_input_tail(&app.input, inner.width.saturating_sub(3) as usize);
-    let line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(visible),
-        Span::styled("_", Style::default().fg(Color::Cyan)),
-    ]);
-    f.render_widget(Paragraph::new(line).block(block), area);
+    let layout = input_layout(app, inner.width);
+    f.render_widget(
+        Paragraph::new(layout.lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    f.set_cursor_position((
+        inner.x.saturating_add(layout.cursor_x),
+        inner.y.saturating_add(layout.cursor_y),
+    ));
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
@@ -307,43 +323,250 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn visible_input_tail(input: &str, max_width: usize) -> String {
+fn input_height(app: &App, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(2).max(1);
+    input_layout(app, inner_width).lines.len().max(1).min(6) as u16 + 2
+}
+
+struct InputLayout {
+    lines: Vec<Line<'static>>,
+    cursor_x: u16,
+    cursor_y: u16,
+}
+
+fn input_layout(app: &App, width: u16) -> InputLayout {
+    let input = app.input.display_text();
+    let cursor_char_idx = app.input.display_cursor_char_index();
+    let content_width = width.saturating_sub(2).max(1) as usize;
+
+    if input.contains('\n') {
+        let window = visible_multiline_window(&input, cursor_char_idx, content_width, 6);
+        return InputLayout {
+            lines: render_input_lines(&window.rows),
+            cursor_x: if window.cursor_y == 0 {
+                2u16.saturating_add(window.cursor_x)
+            } else {
+                window.cursor_x
+            },
+            cursor_y: window.cursor_y,
+        };
+    }
+
+    let window = visible_input_window(&input, cursor_char_idx, content_width);
+    InputLayout {
+        lines: render_input_lines(&[window.text]),
+        cursor_x: 2u16.saturating_add(window.cursor_x),
+        cursor_y: 0,
+    }
+}
+
+fn render_input_lines(rows: &[String]) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::from("> ")];
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            if idx == 0 {
+                Line::from(format!("> {row}"))
+            } else {
+                Line::from(row.clone())
+            }
+        })
+        .collect()
+}
+
+struct InputWindow {
+    text: String,
+    cursor_x: u16,
+}
+
+fn visible_input_window(input: &str, cursor_char_idx: usize, max_width: usize) -> InputWindow {
     if max_width == 0 {
-        return String::new();
+        return InputWindow {
+            text: String::new(),
+            cursor_x: 0,
+        };
     }
     if input.width() <= max_width {
-        return input.to_string();
+        return InputWindow {
+            text: input.to_string(),
+            cursor_x: width_of_chars(input, cursor_char_idx)
+                .min(u16::MAX as usize) as u16,
+        };
     }
 
     let marker = "<";
     let marker_width = marker.width();
     if max_width <= marker_width {
-        return marker.chars().take(max_width).collect();
+        return InputWindow {
+            text: marker.chars().take(max_width).collect(),
+            cursor_x: marker_width.min(max_width).min(u16::MAX as usize) as u16,
+        };
     }
 
     let budget = max_width - marker_width;
-    let mut width = 0usize;
-    let mut start = input.len();
-
-    for (idx, ch) in input.char_indices().rev() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > budget {
-            break;
-        }
-        width += ch_width;
-        start = idx;
+    let chars: Vec<char> = input.chars().collect();
+    let widths: Vec<usize> = chars.iter().map(|ch| char_display_width(*ch)).collect();
+    let total = chars.len();
+    let cursor_char_idx = cursor_char_idx.min(total);
+    let mut cumulative = Vec::with_capacity(total + 1);
+    cumulative.push(0);
+    for width in &widths {
+        cumulative.push(cumulative.last().copied().unwrap_or(0) + width);
     }
 
-    format!("{}{}", marker, &input[start..])
+    let total_width = cumulative[total];
+    let cursor_width = cumulative[cursor_char_idx];
+    let target_left_width = cursor_width.saturating_sub(budget / 2);
+    let mut start_char = cumulative.partition_point(|width| *width <= target_left_width);
+    start_char = start_char.saturating_sub(1).min(total);
+
+    let mut end_char = start_char;
+    while end_char < total && cumulative[end_char + 1] - cumulative[start_char] <= budget {
+        end_char += 1;
+    }
+    while end_char == total
+        && start_char > 0
+        && total_width - cumulative[start_char - 1] <= budget
+    {
+        start_char -= 1;
+    }
+
+    let body: String = chars[start_char..end_char].iter().collect();
+    let visible_width = cursor_width.saturating_sub(cumulative[start_char]);
+    if start_char > 0 {
+        InputWindow {
+            text: format!("{marker}{body}"),
+            cursor_x: marker_width
+                .saturating_add(visible_width)
+                .min(u16::MAX as usize) as u16,
+        }
+    } else {
+        InputWindow {
+            text: body.clone(),
+            cursor_x: visible_width.min(u16::MAX as usize) as u16,
+        }
+    }
+}
+
+struct MultilineWindow {
+    rows: Vec<String>,
+    cursor_x: u16,
+    cursor_y: u16,
+}
+
+fn visible_multiline_window(
+    input: &str,
+    cursor_char_idx: usize,
+    row_width: usize,
+    max_rows: usize,
+) -> MultilineWindow {
+    let wrapped = wrap_input_rows(input, cursor_char_idx, row_width.max(1));
+    let visible_rows = max_rows.max(1);
+    let max_start = wrapped.rows.len().saturating_sub(visible_rows);
+    let start_row = wrapped
+        .cursor_row
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(max_start);
+    let end_row = (start_row + visible_rows).min(wrapped.rows.len());
+    MultilineWindow {
+        rows: wrapped.rows[start_row..end_row].to_vec(),
+        cursor_x: wrapped.cursor_x.min(u16::MAX as usize) as u16,
+        cursor_y: wrapped
+            .cursor_row
+            .saturating_sub(start_row)
+            .min(u16::MAX as usize) as u16,
+    }
+}
+
+struct WrappedRows {
+    rows: Vec<String>,
+    cursor_row: usize,
+    cursor_x: usize,
+}
+
+fn wrap_input_rows(input: &str, cursor_char_idx: usize, row_width: usize) -> WrappedRows {
+    let row_width = row_width.max(1);
+    let mut rows = vec![String::new()];
+    let mut current_width = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_x = 0usize;
+    let mut seen = 0usize;
+
+    for ch in input.chars() {
+        if seen == cursor_char_idx {
+            cursor_row = rows.len() - 1;
+            cursor_x = current_width;
+        }
+        seen += 1;
+        if ch == '\n' {
+            rows.push(String::new());
+            current_width = 0;
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        if current_width > 0 && current_width + ch_width > row_width {
+            rows.push(String::new());
+            current_width = 0;
+        }
+        rows.last_mut().expect("rows is never empty").push(ch);
+        current_width += ch_width;
+    }
+
+    if seen == cursor_char_idx {
+        cursor_row = rows.len() - 1;
+        cursor_x = current_width;
+    }
+
+    WrappedRows {
+        rows,
+        cursor_row,
+        cursor_x,
+    }
+}
+
+fn width_of_chars(input: &str, char_count: usize) -> usize {
+    input
+        .chars()
+        .take(char_count)
+        .map(char_display_width)
+        .sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::visible_input_tail;
+    use super::{visible_input_window, visible_multiline_window};
 
     #[test]
-    fn visible_input_tail_shows_end_of_long_input() {
-        assert_eq!(visible_input_tail("hello", 8), "hello");
-        assert_eq!(visible_input_tail("abcdefghij", 6), "<fghij");
+    fn visible_input_window_keeps_cursor_visible() {
+        let visible = visible_input_window("hello", 5, 8);
+        assert_eq!(visible.text, "hello");
+        assert_eq!(visible.cursor_x, 5);
+
+        let visible = visible_input_window("abcdefghij", 3, 6);
+        assert_eq!(visible.text, "<bcdef");
+        assert_eq!(visible.cursor_x, 3);
+    }
+
+    #[test]
+    fn visible_input_window_respects_wide_char_width() {
+        let visible = visible_input_window("你好世界ab", 2, 5);
+        assert_eq!(visible.text, "<好世");
+        assert_eq!(visible.cursor_x, 3);
+    }
+
+    #[test]
+    fn visible_multiline_window_keeps_cursor_in_view() {
+        let input = "1\n2\n3\n4\n5\n6\n7";
+        let window = visible_multiline_window(input, input.chars().count(), 20, 6);
+        assert_eq!(window.rows, vec!["2", "3", "4", "5", "6", "7"]);
+        assert_eq!(window.cursor_y, 5);
+        assert_eq!(window.cursor_x, 1);
     }
 }

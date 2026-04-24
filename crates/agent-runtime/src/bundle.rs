@@ -45,15 +45,67 @@ pub fn prepare_bundle_install(
 ) -> io::Result<PreparedBundleInstall> {
     let version = resolved_bundle_version(bundle, source);
     validate_version_component(&version)?;
-
-    let install_dir = bundle_root.join(&version);
-    validate_install_dir(bundle_root, &install_dir)?;
+    let install_dir = resolve_versioned_install_dir(bundle_root, &version)?;
     validate_source_target_overlap(source, &install_dir)?;
 
     Ok(PreparedBundleInstall {
         version,
         install_dir,
     })
+}
+
+pub fn validate_bundle_current(
+    actor_root: &Path,
+    workspace: &Path,
+    profile: &Path,
+    logs: &Path,
+    bundle_root: &Path,
+    current: &Path,
+) -> io::Result<PathBuf> {
+    let resolved_current = resolve_path_within(actor_root, current, "bundle current")?;
+    let canonical_actor_root = std::fs::canonicalize(actor_root)?;
+    if resolved_current == canonical_actor_root {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "bundle current `{}` cannot equal actor root `{}`",
+                current.display(),
+                actor_root.display()
+            ),
+        ));
+    }
+
+    let canonical_bundle_root = std::fs::canonicalize(bundle_root)?;
+    if canonical_bundle_root.starts_with(&resolved_current) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "bundle current `{}` cannot contain bundle root `{}`",
+                current.display(),
+                bundle_root.display()
+            ),
+        ));
+    }
+
+    for (label, protected) in [
+        ("workspace", workspace),
+        ("profile", profile),
+        ("logs", logs),
+    ] {
+        let protected = resolve_path_within(actor_root, protected, label)?;
+        if resolved_current.starts_with(&protected) || protected.starts_with(&resolved_current) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "bundle current `{}` overlaps actor {label} dir `{}`",
+                    current.display(),
+                    protected.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(resolved_current)
 }
 
 fn validate_version_component(version: &str) -> io::Result<()> {
@@ -67,8 +119,9 @@ fn validate_version_component(version: &str) -> io::Result<()> {
     }
 }
 
-fn validate_install_dir(bundle_root: &Path, install_dir: &Path) -> io::Result<()> {
+fn resolve_versioned_install_dir(bundle_root: &Path, version: &str) -> io::Result<PathBuf> {
     let canonical_root = std::fs::canonicalize(bundle_root)?;
+    let install_dir = canonical_root.join(version);
     let canonical_parent = std::fs::canonicalize(install_dir.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -85,15 +138,14 @@ fn validate_install_dir(bundle_root: &Path, install_dir: &Path) -> io::Result<()
             ),
         ));
     }
-    Ok(())
+    Ok(install_dir)
 }
 
 fn validate_source_target_overlap(source: &Path, install_dir: &Path) -> io::Result<()> {
     let canonical_source = std::fs::canonicalize(source)?;
-    let absolute_install = absolutize(install_dir)?;
-    if canonical_source == absolute_install
-        || canonical_source.starts_with(&absolute_install)
-        || absolute_install.starts_with(&canonical_source)
+    if canonical_source == install_dir
+        || canonical_source.starts_with(install_dir)
+        || install_dir.starts_with(&canonical_source)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -113,6 +165,40 @@ fn absolutize(path: &Path) -> io::Result<PathBuf> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
+}
+
+fn resolve_path_within(root: &Path, path: &Path, label: &str) -> io::Result<PathBuf> {
+    let absolute_root = absolutize(root)?;
+    let absolute_path = absolutize(path)?;
+    let relative = absolute_path.strip_prefix(&absolute_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{label} `{}` must stay under `{}`",
+                path.display(),
+                root.display()
+            ),
+        )
+    })?;
+    let relative = normalize_relative_path(relative, label)?;
+    Ok(std::fs::canonicalize(root)?.join(relative))
+}
+
+fn normalize_relative_path(path: &Path, label: &str) -> io::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{label} `{}` is not a safe relative path", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -165,17 +251,90 @@ mod tests {
     #[test]
     fn prepare_bundle_install_rejects_overlapping_source_and_target() {
         let root = temp_path("overlap");
+        std::fs::create_dir_all(root.join("alias")).expect("create alias anchor");
         let source = root.join("demo-bundle");
         std::fs::create_dir_all(&source).expect("create source");
+        let bundle_root = root.join("alias").join("..");
         let bundle = AgentBundleSpec {
             source: source.display().to_string(),
             version: String::new(),
             ..Default::default()
         };
 
-        let err = prepare_bundle_install(&root, &source, &bundle).expect_err("must reject overlap");
+        let err = prepare_bundle_install(&bundle_root, &source, &bundle)
+            .expect_err("must reject overlap");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn validate_bundle_current_rejects_profile_subtree() {
+        let root = temp_path("current-profile");
+        let workspace = root.join("workspace");
+        let profile = root.join("profile");
+        let logs = root.join("logs");
+        let bundle_root = root.join("bundles");
+        for dir in [&workspace, &profile, &logs, &bundle_root] {
+            std::fs::create_dir_all(dir).expect("create actor dir");
+        }
+
+        let err = validate_bundle_current(
+            &root,
+            &workspace,
+            &profile,
+            &logs,
+            &bundle_root,
+            &profile.join("live"),
+        )
+        .expect_err("must reject profile subtree");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn validate_bundle_current_rejects_bundle_root_ancestor() {
+        let root = temp_path("current-ancestor");
+        let workspace = root.join("workspace");
+        let profile = root.join("profile");
+        let logs = root.join("logs");
+        let bundle_root = root.join("runtime").join("bundles");
+        for dir in [&workspace, &profile, &logs, &bundle_root] {
+            std::fs::create_dir_all(dir).expect("create actor dir");
+        }
+
+        let err = validate_bundle_current(
+            &root,
+            &workspace,
+            &profile,
+            &logs,
+            &bundle_root,
+            &root.join("runtime"),
+        )
+        .expect_err("must reject current containing bundle root");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn validate_bundle_current_allows_dedicated_runtime_path() {
+        let root = temp_path("current-valid");
+        let workspace = root.join("workspace");
+        let profile = root.join("profile");
+        let logs = root.join("logs");
+        let bundle_root = root.join("runtime").join("bundles");
+        let expected = root.join("runtime").join("live");
+        for dir in [&workspace, &profile, &logs, &bundle_root] {
+            std::fs::create_dir_all(dir).expect("create actor dir");
+        }
+
+        let resolved =
+            validate_bundle_current(&root, &workspace, &profile, &logs, &bundle_root, &expected)
+                .expect("current should be valid");
+
+        assert_eq!(resolved, expected);
         std::fs::remove_dir_all(root).ok();
     }
 }

@@ -32,3 +32,7 @@ unicode-width = { workspace = true }
 pulldown-cmark = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

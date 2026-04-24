@@ -40,6 +40,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 which = "6"
 async-trait = "0.1"
 libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 
 [profile.release]
 lto = "thin"

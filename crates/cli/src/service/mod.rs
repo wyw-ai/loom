@@ -25,6 +25,7 @@ pub mod am;
 pub mod host;
 pub mod plugin;
 pub mod runtime;
+pub mod scheduler;
 pub mod state;
 
 pub use host::ServiceHost;

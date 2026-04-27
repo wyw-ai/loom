@@ -10,7 +10,10 @@
 //!   * `connection/open` with `actorKind = "agent"` binds the connection to the
 //!     agent's actor id; the server's actor-inbox delivery (see
 //!     `crates/server/src/ws.rs::fanout`) then pushes every `HandsOffTo`-targeted
-//!     `event.created` straight to this connection — no scope/subscribe needed
+//!     `event.created` straight to this connection
+//!   * active scopes are also subscribed while prompts run, so older servers
+//!     that only scope-broadcast `action.response` events still unblock ACP
+//!     permission prompts
 //!   * a notification loop turns those events into `Adapter::send_prompt` calls,
 //!     opening / tracking a turn through `turn/open` + `turn/close`
 //!   * a translator task drains `AdapterEvent`s and re-emits them as
@@ -518,6 +521,11 @@ struct WorkerState {
     /// `thread/list` RPC and reused from then on. Channel scopes don't need
     /// resolution (scope.id IS the channel id) so those don't populate it.
     scope_channel_cache: Mutex<HashMap<String, String>>,
+    /// Event ids already received from the server notification stream. The
+    /// same event can arrive through both scope broadcast and actor-inbox
+    /// routing when we subscribe to an active scope for legacy server
+    /// compatibility.
+    seen_events: Mutex<HashSet<String>>,
     /// action.request event id → underlying ACP request id.
     action_map: Mutex<HashMap<String, String>>,
 }
@@ -551,6 +559,7 @@ impl WorkerState {
             text_buffer: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
+            seen_events: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
         }
     }
@@ -626,11 +635,27 @@ impl WorkerState {
             .insert(event_id, request_id);
     }
 
-    fn take_action_request(&self, event_id: &str) -> Option<String> {
+    fn lookup_action_request(&self, event_id: &str) -> Option<String> {
         self.action_map
             .lock()
             .expect("action_map poisoned")
-            .remove(event_id)
+            .get(event_id)
+            .cloned()
+    }
+
+    fn forget_action_request(&self, event_id: &str) {
+        let _ = self
+            .action_map
+            .lock()
+            .expect("action_map poisoned")
+            .remove(event_id);
+    }
+
+    fn remember_event(&self, event_id: &str) -> bool {
+        self.seen_events
+            .lock()
+            .expect("seen_events poisoned")
+            .insert(event_id.to_string())
     }
 }
 
@@ -827,6 +852,9 @@ async fn notification_loop(
         let Ok(event) = serde_json::from_value::<Event>(event_value) else {
             continue;
         };
+        if !state.remember_event(&event.id) {
+            continue;
+        }
         if event.kind == "action.response" {
             if let Err(e) = handle_action_response(&state, &adapter, &event).await {
                 eprintln!("[{actor_id}] failed to handle action.response: {e}");
@@ -868,14 +896,34 @@ async fn handle_action_response(
     adapter: &Arc<dyn Adapter>,
     event: &Event,
 ) -> Result<()> {
+    let mut saw_response_relation = false;
     for relation in &event.relations {
         if !matches!(relation.kind, RelationKind::RespondsTo)
             || relation.target.kind != RefKind::Event
         {
             continue;
         }
-        let Some(request_id) = state.take_action_request(&relation.target.id) else {
-            continue;
+        saw_response_relation = true;
+        let request_event_id = relation.target.id.as_str();
+        let request_id = match state.lookup_action_request(request_event_id) {
+            Some(id) => id,
+            None => match action_request_id_from_response(event) {
+                Some(id) => {
+                    eprintln!(
+                        "[{}] action.response {} used echoed ACP request id for {}",
+                        state.actor_id, event.id, request_event_id
+                    );
+                    id
+                }
+                None => {
+                    eprintln!(
+                        "[{}] action.response {} ignored: no pending ACP request for {} \
+                         (agent serve may have restarted after the action.request)",
+                        state.actor_id, event.id, request_event_id
+                    );
+                    continue;
+                }
+            },
         };
         let option_id = event
             .payload
@@ -883,13 +931,41 @@ async fn handle_action_response(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if option_id.is_empty() {
+            eprintln!(
+                "[{}] action.response {} ignored: missing payload.optionId",
+                state.actor_id, event.id
+            );
+            return Ok(());
+        }
+        eprintln!(
+            "[{}] action.response {} -> ACP request {} option {}",
+            state.actor_id, event.id, request_id, option_id
+        );
         adapter
-            .respond_action(request_id, option_id)
+            .respond_action(request_id.clone(), option_id)
             .await
             .map_err(|e| anyhow!("adapter respond_action failed: {e}"))?;
+        state.forget_action_request(request_event_id);
         return Ok(());
     }
+    if !saw_response_relation {
+        eprintln!(
+            "[{}] action.response {} ignored: missing responds_to relation",
+            state.actor_id, event.id
+        );
+    }
     Ok(())
+}
+
+fn action_request_id_from_response(event: &Event) -> Option<String> {
+    event
+        .payload
+        .get("requestId")
+        .or_else(|| event.payload.get("actionId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
 }
 
 async fn handle_turn_close(
@@ -982,6 +1058,7 @@ async fn dispatch_handoff(
     mut trigger: Event,
 ) -> Result<()> {
     loop {
+        subscribe_scope(client, state, &trigger.scope).await;
         let turn_res: TurnOpenResult = client
             .call(
                 method::TURN_OPEN,
@@ -1035,6 +1112,23 @@ async fn dispatch_handoff(
                 }
             }
         }
+    }
+}
+
+async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &ScopeRef) {
+    if let Err(e) = client
+        .call::<_, Value>(method::SCOPE_SUBSCRIBE, json!({ "scope": scope }))
+        .await
+    {
+        eprintln!(
+            "[{}] scope/subscribe {}:{} failed: {e}",
+            state.actor_id,
+            match scope.kind {
+                ScopeKind::Channel => "channel",
+                ScopeKind::Thread => "thread",
+            },
+            scope.id
+        );
     }
 }
 
@@ -1272,6 +1366,7 @@ async fn translate_one(
             // The server reverse-delivers the eventual action.response back
             // to this agent connection through actor-inbox fanout.
             let payload = json!({
+                "requestId": id,
                 "requestType": request_type,
                 "title": title,
                 "description": description,
@@ -1299,7 +1394,11 @@ async fn translate_one(
                 relations,
             )
             .await?;
-            state.record_action_request(appended.event.id, id);
+            state.record_action_request(appended.event.id.clone(), id.clone());
+            eprintln!(
+                "[{actor_id}] action.request {} -> trigger {} (ACP request {})",
+                appended.event.id, active.trigger_actor, id
+            );
         }
         AdapterEvent::StatusChange { scope: _, status } => {
             // If the event is scope-tagged AND that scope has a live turn,

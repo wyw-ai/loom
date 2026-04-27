@@ -237,16 +237,26 @@ impl AcpAdapter {
                     option_id, action_id
                 ));
             }
-            shared.write_message(&json!({
+            let response = json!({
                 "jsonrpc": "2.0",
                 "id": pending.request_id,
                 "result": {
                     "outcome": {
                         "outcome": "selected",
-                        "optionId": option_id,
+                        "optionId": option_id.clone(),
                     }
                 }
-            }))
+            });
+            shared.write_message(&response)?;
+            eprintln!(
+                "[joi:acp] -> permission response id={} option={}",
+                response
+                    .get("id")
+                    .and_then(request_id_key)
+                    .unwrap_or_else(|| "?".into()),
+                option_id
+            );
+            Ok(())
         })
         .await
         .map_err(|e| e.to_string())?

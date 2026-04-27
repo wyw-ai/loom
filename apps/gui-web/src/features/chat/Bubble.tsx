@@ -1,6 +1,9 @@
+import { useEffect, useState } from "react";
 import clsx from "clsx";
 import {
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock3,
   Copy,
   CornerDownRight,
@@ -320,7 +323,11 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         type: "action.response",
         actorId: selfId,
         scope: currentScope,
-        payload: { optionId, kind },
+        payload: {
+          optionId,
+          kind,
+          ...(bubble.actionRequestId ? { requestId: bubble.actionRequestId } : {}),
+        },
         relations: [
           { kind: "responds_to", target: { kind: "event", id: bubble.id } },
         ],
@@ -340,30 +347,80 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
   const status = bubble.actionStatus ?? (disabled ? "accepted" : "pending");
   const statusTone = actionStatusTone(status);
   const StatusIcon = statusTone.icon;
+  const [expanded, setExpanded] = useState(() => !disabled);
+  const cardShell = "mt-1 w-full max-w-3xl overflow-hidden rounded-md border shadow-sm";
+  const bodyShell = "px-3 pb-3 pt-2";
+  const hasStructuredBody =
+    bubble.actionReason || bubble.actionCommand || bubble.actionRawInput;
+  const actionTitle =
+    bubble.actionTitle ??
+    (hasStructuredBody ? "Permission required" : "Action requested");
+
+  useEffect(() => {
+    if (disabled) setExpanded(false);
+  }, [disabled]);
+
+  const renderHeader = (collapsed: boolean) => (
+    <div className="grid h-10 w-full grid-cols-[1.25rem_1.25rem_minmax(0,1fr)_auto] items-center gap-2 px-3">
+      {disabled ? (
+        collapsed ? (
+          <ChevronRight size={15} className="justify-self-center text-muted" />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            className="flex h-5 w-5 items-center justify-center rounded text-muted hover:bg-hover hover:text-primary"
+          >
+            <ChevronDown size={14} />
+          </button>
+        )
+      ) : (
+        <span className="h-5 w-5" aria-hidden="true" />
+      )}
+      <StatusIcon
+        size={15}
+        className={clsx("justify-self-center", statusTone.iconClass)}
+      />
+      <div className="min-w-0 truncate text-sm font-semibold text-primary">
+        {actionTitle}
+      </div>
+      <span
+        className={clsx(
+          "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
+          statusTone.badge,
+        )}
+      >
+        {statusTone.label}
+      </span>
+    </div>
+  );
+
+  if (disabled && !expanded) {
+    return (
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        className={clsx(
+          cardShell,
+          "block text-left",
+          statusTone.card,
+        )}
+      >
+        {renderHeader(true)}
+      </button>
+    );
+  }
 
   return (
     <div
       className={clsx(
-        "mt-1 max-w-3xl rounded-md border px-3 py-3 shadow-sm",
+        cardShell,
         statusTone.card,
       )}
     >
-      {bubble.actionReason || bubble.actionCommand ? (
-        <div className="mb-3 space-y-2">
-          <div className="flex items-center gap-2">
-            <StatusIcon size={15} className={clsx("shrink-0", statusTone.iconClass)} />
-            <div className="min-w-0 flex-1 truncate text-sm font-semibold text-primary">
-              {bubble.actionTitle ?? "Permission required"}
-            </div>
-            <span
-              className={clsx(
-                "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
-                statusTone.badge,
-              )}
-            >
-              {statusTone.label}
-            </span>
-          </div>
+      {renderHeader(false)}
+      {hasStructuredBody ? (
+        <div className={clsx(bodyShell, "space-y-2")}>
           {bubble.actionReason && (
             <div className="text-sm text-secondary">
               <div className="mb-0.5 text-[11px] font-semibold uppercase text-muted">
@@ -382,53 +439,46 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
               </code>
             </div>
           )}
+          {bubble.actionRawInput && (
+            <div>
+              <div className="mb-1 text-[11px] font-semibold uppercase text-muted">
+                Raw input
+              </div>
+              <code className="block overflow-x-auto whitespace-pre rounded bg-elevated/80 px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
+                {bubble.actionRawInput}
+              </code>
+            </div>
+          )}
         </div>
       ) : (
-        <div className="mb-3">
-          <div className="mb-1 flex items-center gap-2">
-            <StatusIcon size={15} className={clsx("shrink-0", statusTone.iconClass)} />
-            <span className="text-sm font-semibold text-primary">
-              {bubble.actionTitle ?? "Action requested"}
-            </span>
-            <span
-              className={clsx(
-                "ml-auto shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
-                statusTone.badge,
-              )}
-            >
-              {statusTone.label}
-            </span>
-          </div>
+        <div className={bodyShell}>
           <div className="text-sm text-primary whitespace-pre-wrap">
             {bubble.text}
           </div>
         </div>
       )}
-      <div className="flex flex-wrap gap-2">
-        {choices.map((c) => {
-          const isDecline = /reject|decline|cancel|abort|no/i.test(c.label);
-          return (
-            <button
-              key={c.id}
-              disabled={disabled}
-              onClick={() =>
-                void respond(c.id, isDecline ? "declined" : "accepted")
-              }
-              className={clsx(
-                "rounded px-3 py-1 text-xs font-medium",
-                isDecline
-                  ? "bg-elevated text-secondary hover:bg-hover"
-                  : "bg-accent text-accent-contrast hover:bg-accent-hover",
-                disabled && "opacity-50",
-              )}
-            >
-              {c.label}
-            </button>
-          );
-        })}
-      </div>
-      {disabled && (
-        <div className="mt-2 text-[11px] text-muted">answered</div>
+      {!disabled && (
+        <div className="flex flex-wrap gap-2 px-3 pb-3">
+          {choices.map((c) => {
+            const isDecline = /reject|decline|cancel|abort|no/i.test(c.label);
+            return (
+              <button
+                key={c.id}
+                onClick={() =>
+                  void respond(c.id, isDecline ? "declined" : "accepted")
+                }
+                className={clsx(
+                  "rounded px-3 py-1 text-xs font-medium",
+                  isDecline
+                    ? "bg-elevated text-secondary hover:bg-hover"
+                    : "bg-accent text-accent-contrast hover:bg-accent-hover",
+                )}
+              >
+                {c.label}
+              </button>
+            );
+          })}
+        </div>
       )}
     </div>
   );

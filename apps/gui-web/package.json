@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "lint": "tsc -b --noEmit"
+    "lint": "tsc --noEmit --project tsconfig.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

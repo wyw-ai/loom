@@ -500,7 +500,7 @@ fn truncate_for_summary(s: &str) -> String {
         s.trim().to_string()
     } else {
         let mut t = s[..MAX].trim().to_string();
-        t.push_str("…");
+        t.push('…');
         t
     }
 }

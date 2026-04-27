@@ -5,6 +5,8 @@ export interface ActionRequestSummary {
   description: string;
   reason?: string;
   command?: string;
+  rawInput?: string;
+  requestId?: string;
   choices: ActionChoice[];
 }
 
@@ -13,6 +15,7 @@ export function summarizeActionRequest(
 ): ActionRequestSummary {
   const title = asString(payload.title) || "(action)";
   const description = asString(payload.description);
+  const requestId = asString(payload.requestId) || asString(payload.actionId);
   const choices = Array.isArray(payload.choices)
     ? (payload.choices as ActionChoice[])
     : [];
@@ -21,6 +24,7 @@ export function summarizeActionRequest(
   const rawInput = asRecord(toolCall?.rawInput) ?? asRecord(payload.rawInput);
   const reason = asString(rawInput?.reason);
   const command = extractCommand(rawInput) ?? extractCommand(asRecord(toolCall));
+  const toolKind = asString(toolCall?.kind);
 
   if (reason || command) {
     return {
@@ -30,6 +34,18 @@ export function summarizeActionRequest(
       description: compactDescription(reason, command),
       reason,
       command,
+      requestId,
+      choices,
+    };
+  }
+
+  if (toolKind === "other" && rawInput) {
+    const rawInputText = formatRawInput(rawInput);
+    return {
+      title: asString(toolCall?.title) || stripPermissionPrefix(title),
+      description: rawInputText,
+      rawInput: rawInputText,
+      requestId,
       choices,
     };
   }
@@ -37,8 +53,21 @@ export function summarizeActionRequest(
   return {
     title,
     description,
+    requestId,
     choices,
   };
+}
+
+function stripPermissionPrefix(title: string) {
+  return title.replace(/^Permission required:\s*/i, "") || title;
+}
+
+function formatRawInput(rawInput: Record<string, unknown>) {
+  try {
+    return JSON.stringify(rawInput, null, 2);
+  } catch {
+    return String(rawInput);
+  }
 }
 
 function parseToolCall(

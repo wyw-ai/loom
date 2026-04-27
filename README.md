@@ -42,10 +42,40 @@ cargo build
 cargo test --workspace
 ```
 
-## 出包（多平台）
+## 构建 CLI / Server 二进制
 
-所有交叉编译走 `Makefile`。产物落在 `dist/<profile>/<triple>/{joi,joi-server}`，
-`dist/` 已在 `.gitignore` 里。
+`joi agent serve` 不是单独的二进制；它是 `joi` CLI 里的子命令。部署 agent
+host 时只需要把 `joi` 放到目标机器的 PATH，`joi agent serve` 就已经包含在里面。
+顶层 workspace 的默认构建不包含 Tauri GUI，所以 CLI / server 出包不会拉 GUI
+原生依赖。
+
+```sh
+# 同时构建 CLI + server
+cargo build -p joi-cli -p joi-server --release
+
+# 只构建 agent host / 人类终端 CLI
+cargo build -p joi-cli --release
+
+# 只构建 WebSocket server
+cargo build -p joi-server --release
+```
+
+产物位置：
+
+| crate | 二进制 | release 产物 |
+| --- | --- | --- |
+| `joi-cli` | `joi` | `target/release/joi` |
+| `joi-server` | `joi-server` | `target/release/joi-server` |
+
+如果要装到本机 PATH，可以用：
+
+```sh
+install -m 0755 target/release/joi /usr/local/bin/joi
+install -m 0755 target/release/joi-server /usr/local/bin/joi-server
+```
+
+多平台 CLI / server 出包统一走 `Makefile`。跨平台产物落在
+`dist/<profile>/<triple>/{joi,joi-server}`，`dist/` 已在 `.gitignore` 里。
 
 ```sh
 make help                 # 列所有 target
@@ -93,30 +123,103 @@ export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 其他常用 Make 目标：`make test` / `make fmt` / `make lint` / `make clean`
 （仅清 `dist/`）/ `make distclean`（连 `cargo clean` 也做掉）。
 
+## 本地 GUI 打包
+
+`joi-gui` 是 Tauri 2 桌面壳，前端在 `apps/gui-web/`。GUI 只是客户端，不内嵌
+`joi-server`，也不负责托管 agent；使用 GUI 前仍要启动 server，agent 能力仍由
+独立的 `joi agent serve` 进程提供。
+
+一次性准备：
+
+```sh
+pnpm --dir apps/gui-web install
+cargo install tauri-cli --version ^2
+```
+
+本地开发窗口：
+
+```sh
+make gui-dev
+```
+
+本地打包：
+
+```sh
+make gui-release
+```
+
+`make gui-release` 会在 `crates/gui/` 下执行 `cargo tauri build`；Tauri 的
+`beforeBuildCommand` 会先在 `apps/gui-web/` 里跑 `pnpm build`，再把
+`apps/gui-web/dist` 打进桌面应用。最终产物在：
+
+```text
+crates/gui/target/release/bundle/
+```
+
+在 macOS 上通常会看到 `.app` 和 `.dmg`；Linux / Windows 产物取决于当前平台和
+Tauri bundle target。GUI 打包跟上面的 CLI / server 多平台出包是两套流程；需要
+哪个桌面平台的安装包，就在对应平台或 CI runner 上跑 `make gui-release`。
+
+清理 GUI 构建缓存：
+
+```sh
+make gui-clean
+```
+
 ## 部署模式
 
 `joi-server` 只负责 WebSocket JSON-RPC、journal、artifact 和事件 fanout。
 Agent runtime 一律由独立的 `joi agent serve` 进程托管，通过 WebSocket 跟 server
 通信。每个被管理的 agent 在 server 上是一条独立连接。
 
+最小拓扑是三个进程：
+
+| 进程 | 部署在哪 | 作用 |
+| --- | --- | --- |
+| `joi-server` | 一台共享机器或本机 | 维护 journal、artifact、channel/thread 状态，提供 `ws://.../rpc` |
+| `joi agent serve` | 每台需要跑 agent 的机器 | 读取本机 agent spec，为每个 agent 建立一条到 server 的 WebSocket 连接 |
+| `joi chat` / `joi say` / GUI | 人类使用的机器 | 作为 human actor 连接 server，创建 channel/thread 并 handoff |
+
 ```sh
-# 终端 1：启 server
-cargo run -p joi-server -- \
+# 1. 启 server。多人/多机访问时把 bind 改成内网地址或 0.0.0.0。
+joi-server \
     --bind 127.0.0.1:7878 \
     --data-dir ./data
 
-# 终端 2：装一个 agent 到 ~/.config/joi/agents
-cargo run -p joi-cli -- agent install claude-acp \
+# 2. 在运行 agent host 的机器上配置 server URL。
+export JOI_SERVER=ws://127.0.0.1:7878/rpc
+
+# 3. 装一个 agent 到 ~/.config/joi/agents。
+joi agent install claude-acp \
     --actor-id actor_claude --name "Claude"
 
-# 终端 3：启 agent client；它会为每个 spec 起一条到 server 的连接
-cargo run -p joi-cli -- agent serve
+# 4. 启 agent client；它会为每个 spec 起一条到 server 的连接。
+joi agent serve
 
-# 终端 4：照常用 chat
-cargo run -p joi-cli -- channel create --title "Demo"
-cargo run -p joi-cli -- thread create --channel <channel_id> --title "Kickoff"
-cargo run -p joi-cli -- chat --in <thread_id>
+# 如果这台机器只允许托管部分 agent：
+joi agent serve --allow-actors actor_claude,actor_codex
+
+# 5. 人类侧照常使用 CLI 或 GUI。
+joi channel create --title "Demo"
+joi thread create --channel <channel_id> --title "Kickoff"
+joi chat --in <thread_id>
 ```
+
+开发期也可以不用安装二进制，直接用 `cargo run -p joi-server -- ...` 和
+`cargo run -p joi-cli -- agent serve`。生产或长驻部署时建议使用 release 产物，
+并让进程管理器分别守护 `joi-server` 与每台 agent host 上的 `joi agent serve`。
+
+`joi agent serve` 的运行约束：
+
+- agent spec 默认从 `~/.config/joi/agents/*.json` 读取，`--specs <dir>` 可覆盖。
+- spec 只在进程启动时读取；新增、删除或修改 spec 后需要重启 `joi agent serve`。
+- 每个 agent spec 里的命令（例如 `claude-acp`、`codex-acp`、`claude`）必须在
+  运行 `joi agent serve` 的机器上可执行。
+- 子进程会自动收到 `JOI_SERVER` 和 `JOI_ACTOR`，所以 agent 可以反向调用
+  `joi --json ...` 读取历史和 actor 列表。
+
+`joi-server` 当前无认证、无签名，channel ACL 只按 actor id 过滤。不要把 server
+直接暴露到公网；跨机器部署时放在可信内网或自行加反向代理、访问控制。
 
 详细设计与 phase 切分见
 [docs/architecture-v1-agent-client.md](docs/architecture-v1-agent-client.md)。
@@ -200,12 +303,13 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 | Actor 持久状态 | `~/.agentx/agents/<id>/{profile,bundles}` |
 | Agent workspace 模板变量 | `~/.agentx/channels/<channel-id>/agents/<id>/{workspace,logs}` |
 | Command transport session 簿记 | `~/.agentx/sessions/<actor_id>/<scope_id>.json` |
-| CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） |
+| CLI 用户配置 | `~/.config/joi-apps/cli.toml`（`server_url` / `actor_id` / `display_name`） |
+| GUI workspace 配置 | `~/.config/joi-apps/desktop.toml` |
 
 ## 配置 agent
 
-三种添加方式——结果都是写一份 spec JSON 到 spec 目录（模式 A 是 `agents/`，
-模式 B 是 `~/.config/joi/agents/`）。
+三种添加方式——结果都是写一份 spec JSON 到 `~/.config/joi/agents/`。运行
+`joi agent serve --specs <dir>` 时可以改为读取其它目录。
 
 ### 1. 从内置 marketplace 装（推荐）
 
@@ -377,4 +481,4 @@ marketplace install 和 `joi agent add` 现在默认**两条都开**。手写老
 - 无认证、无签名（channel ACL 仅按 actor id 信任过滤，无 RBAC 角色分级）
 - 仅 WebSocket，没有 HTTP/SSE 传输
 - artifact 入口仅 `inline_text`
-- 无 GUI、无 federation、无 SQLite、无完整自动化测试集
+- 无 federation、无 SQLite、无完整自动化测试集

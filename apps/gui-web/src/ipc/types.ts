@@ -142,6 +142,8 @@ export interface Bubble {
   actionTitle?: string;
   actionReason?: string;
   actionCommand?: string;
+  actionRawInput?: string;
+  actionRequestId?: string;
   actionStatus?: ActionStatus;
   choices?: ActionChoice[];
   acknowledged?: boolean;

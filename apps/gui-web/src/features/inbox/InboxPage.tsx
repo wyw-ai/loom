@@ -2,9 +2,8 @@ import { useEffect } from "react";
 import { AlertTriangle, CheckCircle2, ExternalLink, XCircle } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import { useChannels } from "@/store/channels";
+import { openScope as openChatScope } from "@/features/chat/scopeActions";
 import { useInbox } from "@/store/inbox";
-import { useMessages } from "@/store/messages";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 
@@ -12,10 +11,6 @@ export function InboxPage() {
   const items = useInbox((s) => s.items);
   const remove = useInbox((s) => s.remove);
   const markAllSeen = useInbox((s) => s.markAllSeen);
-  const setScope = useChannels((s) => s.setCurrentScope);
-  const ensureScope = useMessages((s) => s.ensureScope);
-  const ingestBackfill = useMessages((s) => s.ingestBackfill);
-  const setView = useUI((s) => s.setView);
   const pushToast = useUI((s) => s.pushToast);
   const selfId = useSession((s) => s.workspace?.actorId);
 
@@ -28,14 +23,20 @@ export function InboxPage() {
     scope: { kind: "channel" | "thread"; id: string },
     optionId: string,
     kind: "accepted" | "declined",
+    actionRequestId?: string,
   ) => {
     if (!selfId) return;
     try {
+      await openChatScope(scope);
       await ipc.eventAppend({
         type: "action.response",
         actorId: selfId,
         scope,
-        payload: { optionId, kind },
+        payload: {
+          optionId,
+          kind,
+          ...(actionRequestId ? { requestId: actionRequestId } : {}),
+        },
         relations: [{ kind: "responds_to", target: { kind: "event", id: eventId } }],
       });
       remove(eventId);
@@ -44,19 +45,6 @@ export function InboxPage() {
         "error",
         `action.response failed: ${e instanceof Error ? e.message : String(e)}`,
       );
-    }
-  };
-
-  const openScope = async (scope: { kind: "channel" | "thread"; id: string }) => {
-    setScope(scope);
-    ensureScope(scope);
-    setView("chat");
-    try {
-      await ipc.scopeSubscribe(scope);
-      const r = await ipc.scopeRead(scope, 100);
-      ingestBackfill(scope, r.events);
-    } catch {
-      /* ignore */
     }
   };
 
@@ -93,7 +81,7 @@ export function InboxPage() {
                 <div className="mb-2 text-sm font-medium text-primary">
                   {it.title}
                 </div>
-                {it.reason || it.command ? (
+                {it.reason || it.command || it.rawInput ? (
                   <div className="mb-3 space-y-2">
                     {it.reason && (
                       <div className="text-sm text-secondary">
@@ -110,6 +98,16 @@ export function InboxPage() {
                         </div>
                         <code className="block overflow-x-auto rounded bg-main px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
                           {it.command}
+                        </code>
+                      </div>
+                    )}
+                    {it.rawInput && (
+                      <div>
+                        <div className="mb-1 text-[11px] font-semibold uppercase text-muted">
+                          Raw input
+                        </div>
+                        <code className="block overflow-x-auto whitespace-pre rounded bg-main px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
+                          {it.rawInput}
                         </code>
                       </div>
                     )}
@@ -138,6 +136,7 @@ export function InboxPage() {
                             it.scope,
                             c.id,
                             isDecline ? "declined" : "accepted",
+                            it.actionRequestId,
                           )
                         }
                         className={
@@ -152,7 +151,7 @@ export function InboxPage() {
                     );
                   })}
                   <button
-                    onClick={() => void openScope(it.scope)}
+                    onClick={() => void openChatScope(it.scope)}
                     className="ml-auto inline-flex items-center gap-1 rounded px-3 py-1 text-xs text-secondary hover:text-primary"
                   >
                     <ExternalLink size={12} />

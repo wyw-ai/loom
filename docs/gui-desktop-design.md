@@ -145,13 +145,13 @@ JOI WORKSPACE                 ⚙
 3. **Message list**：
    - 按时间升序；相邻同 actor 且间隔 < 5 分钟的 bubble 合并成「消息组」（仅首条显示头像 + 名字 + 时间）。
    - 气泡类型（直接映射 `history::BubbleKind`）：
-     - `Stream`：正常消息。流式时尾部跟一个 2px 竖条闪烁光标（`bubble.streaming=true`）。
+     - `Stream`：正常 `content.add` 消息；同 actor 同 turn 的连续内容可合并。
      - `Static`：handoff、action.response 之类。
      - `ActionRequest`：黄色左 border + 标题 + 选项按钮；首次到达吹气（pulse）一次。
      - `System`：灰色斜体、居中。
    - 每条气泡 hover 显示工具条：`Reply` · `Copy` · `Copy id` · 对 `ActionRequest` 显示各 choice 按钮。
    - **Reply quote line**：有 `reply_to_event_id` 时头部挂一条 `↩ @target: preview…`（TUI history.rs 已有同款概念）。
-   - **Handoff line**：有 `handoff_target` 时用 `→ handoff → @target: …` 样式，右侧小 badge 显示目标 agent 状态（agent/list 来的 `agent_statuses`）。
+   - **Handoff line**：有 `handoff_target` 时用 `→ handoff → @target: …` 样式，右侧小 badge 显示目标 agent 状态（从 `actor/list` 过滤 agent）。
 4. **Streaming status bar**（position: sticky; bottom）：展示当前 scope 内所有 open turn（`open_turns_in_scope`）。点击 ✕ 触发 `turn/close(status=cancelled)`。
 5. **Prompt**（固定底部，参考 Discord 输入框）：
    - 多行可伸缩 textarea，`Enter` 发送，`Shift+Enter` 换行。
@@ -253,7 +253,7 @@ Inbox                                                       [Mark all read]
 | `AnnouncementBanner` | 顶部 pin 面板（折叠） | `chat/announcement.rs` |
 | `MessageList` | 虚拟滚动的 bubble 列 | `chat/history.rs` + `chat/ui.rs` |
 | `Bubble.Stream` / `Static` / `ActionRequest` / `System` | 四种 bubble 渲染器 | `BubbleKind` |
-| `StreamingStatusBar` | 当前 scope open turns + cancel | `ui.rs` streaming 区 |
+| `InFlightStatusBar` | 当前 scope open turns + cancel | `ui.rs` in-flight 区 |
 | `Prompt` | textarea + chip + placeholder | `chat/prompt.rs` |
 | `SlashPalette` | `/` 触发的浮层菜单 | `app::slash_menu` |
 | `MentionPalette` | `@` 触发的浮层菜单 | `app::at_menu` |
@@ -305,7 +305,6 @@ type Bubble = {
   text: string
   ts: ISOString
   replyToEventId?: string
-  streaming: boolean
   delivery: 'na' | 'pending' | 'delivered'
   handoffTarget?: string
   // action.request 专用：
@@ -332,9 +331,7 @@ type Bubble = {
 - `action.request` → `ActionRequest` bubble + `pendingActionIds += id`。
 - `action.response` → 从 relations[RespondsTo] 取 request id，`pendingActionIds.delete(id)`，可选 push static。
 - `announcement.set` / `.clear` → 改 `announcement`。
-- `turn.close` 且 `status=cancelled` → 把对应 streaming bubble 的 `streaming=false`，push system 行。
-
-`turn/stream.update` 通知：如果最后一条 bubble 是同 turn/actor 的 stream bubble，拼 `delta_text`；否则新建一条（`streaming=true`）。
+- `turn.close` 且 `status=cancelled` → push system 行。
 
 ### 6.4 `inbox` store
 
@@ -405,7 +402,6 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 | --- | --- |
 | `joi://stream` | `{ kind: string, scope, data }`（原 `stream/update` 镜像） |
 | `joi://trace` | `TurnTraceUpdate`（agent 行）—— GUI 首版不展示，但埋好 |
-| `joi://stream-delta` | `TurnStreamUpdate`（流式 delta） |
 | `joi://connection` | `{ state: 'open'|'closed'|'error', detail? }` |
 
 前端在 `ipc/bridge.ts` 注册 listener，分发到对应 store。
@@ -427,7 +423,6 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 | `stream/update{event.created, announcement.set/clear}` | messages.setAnnouncement | AnnouncementBanner 出现/消失 |
 | `stream/update{turn.opened}` | openTurns[id] = ... | 状态条显示 "agent X typing…" |
 | `stream/update{turn.closed}` | openTurns delete; 流式 bubble 结束 | 光标消失、状态条移除 |
-| `turn/stream.update` | mergeStreamDelta | 气泡文本增量增长 |
 | `stream/update{channel.invited}` | channels.addOrPatch + toast "you were added to #x" | Sidebar 出现新 channel |
 | `stream/update{channel.revoked}` | channels.remove + 当前 scope 若在其中则回 Home | Sidebar 该 channel 消失 |
 | `stream/update{thread.created}` | threadsByChannel[ch].append | Sidebar 展开 channel 时可见 |
@@ -463,7 +458,7 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 | `/handoff [@agent] [msg]` | 带 message → 直接发 `content.add` + HandsOffTo；不带 → 打开 Handoff picker |
 | `/reply` | 打开 Reply picker（历史中可回复的气泡） |
 | `/action` | 打开本 scope 的 pending action picker |
-| `/agents` | 在 main 区弹出 agents 列表（agent/list 调用） |
+| `/agents` | 在 main 区弹出 agents 列表（`actor/list` 过滤 agent） |
 | `/cancel [@agent]` | 取消本 scope 的 open turn（多选时弹 picker） |
 | `/invite` | 打开 Invite actor modal |
 | `/members` | 打开 MembersRail（若已开则滚到顶） |
@@ -486,7 +481,7 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 ### M2 · 核心聊天闭环（本轮目标收口）
 
 - Sidebar：列 channels、点击切 scope、基本 thread 列表。
-- Main：`scope/read` 冷启 + `turn/stream.update` 流式 + 发送。
+- Main：`scope/read` 冷启 + open turn 状态 + 发送。
 - Bell：本 scope action.request 弹黄框 + cross-scope 写 inbox。
 - Prompt：textarea + slash/at palette 基础项（`/handoff`、`@agent`）。
 
@@ -506,7 +501,7 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 **未落（M4 再做）：**
 - `⌘K` 全局快捷键绑定（需要 `@tauri-apps/plugin-global-shortcut` 或 DOM 级 keydown bridge）。
 - 指数退避自动重连（现在只有手动 Retry 按钮）。
-- agent status 徽标（需要 poll `agent/list` 或服务器端 push）。
+- agent status 徽标（需要基于 `actor/list` / connection 状态或服务器端 push）。
 
 ### M4 · GUI 独有能力
 

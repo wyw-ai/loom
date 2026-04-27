@@ -144,11 +144,9 @@ pub fn save(path: &Path, map: &ThreadMap) -> Result<()> {
     fs::create_dir_all(parent)?;
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_string_pretty(map).context("serialize thread map")?;
-    fs::write(&tmp, body)
-        .with_context(|| format!("write tmp thread map {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| {
-        format!("rename {} -> {}", tmp.display(), path.display())
-    })?;
+    fs::write(&tmp, body).with_context(|| format!("write tmp thread map {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -200,10 +198,8 @@ mod tests {
     use serde_json::json;
 
     fn temp_dir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "joi-am-scope-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("joi-am-scope-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&p).unwrap();
         p
     }

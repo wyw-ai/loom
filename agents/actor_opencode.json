@@ -11,8 +11,7 @@
     "args": [
       "acp"
     ],
-    "env": {},
-    "cwd": "{agent.workspace}"
+    "env": {}
   },
   "autostart": false
 }

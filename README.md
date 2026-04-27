@@ -20,13 +20,13 @@ v0 的目标很小：人在 CLI / GUI 里打开一个 thread，把一个或多�
 ```
 crates/proto           协议类型 + JSON-RPC 信封
 crates/agent-runtime   Adapter trait + AcpAdapter / CommandAdapter 实现
-crates/server          joi-server 二进制（WebSocket + 嵌入式 supervisor）
-crates/cli             joi 二进制（人类终端 + v1 agent 客户端）
+crates/server          joi-server 二进制（WebSocket 消息枢纽）
+crates/cli             joi 二进制（人类终端 + agent 客户端）
 crates/gui             joi-gui 桌面壳（Tauri 2，复用 proto+WS 客户端）
 apps/gui-web           joi-gui 前端（React + TS + Tailwind，Discord-风格 UI）
 agents/                示例 agent JSON spec
 assets/marketplace.json  内置 marketplace 编目
-data/                  运行时生成（journal + artifacts + agent workspace）
+data/                  server 运行时生成（journal + artifacts）
 docs/                  协议规范 + 架构文档
 ```
 
@@ -95,47 +95,26 @@ export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 
 ## 部署模式
 
-joi-apps 当前支持两种拓扑，由 server 端的 `JOI_DISABLE_EMBEDDED_RUNTIME`
-环境变量切换。两者**不可同时运行**——会在 `turn/open` 上互相抢占。
-
-### 模式 A：v0 嵌入式（默认，最省事）
-
-server 内嵌 agent supervisor，启动时扫描 `--agents-dir` 下的 `*.json` spec、
-按需 spawn ACP 子进程。
+`joi-server` 只负责 WebSocket JSON-RPC、journal、artifact 和事件 fanout。
+Agent runtime 一律由独立的 `joi agent serve` 进程托管，通过 WebSocket 跟 server
+通信。每个被管理的 agent 在 server 上是一条独立连接。
 
 ```sh
 # 终端 1：启 server
 cargo run -p joi-server -- \
     --bind 127.0.0.1:7878 \
-    --data-dir ./data \
-    --agents-dir ./agents
+    --data-dir ./data
 
-# 终端 2：装一个 agent + 开 chat
+# 终端 2：装一个 agent 到 ~/.config/joi/agents
 cargo run -p joi-cli -- agent install claude-acp \
     --actor-id actor_claude --name "Claude"
-cargo run -p joi-cli -- channel create --title "Demo"
-cargo run -p joi-cli -- thread create --channel <channel_id> --title "Kickoff"
-cargo run -p joi-cli -- chat --in <thread_id>
-```
-
-### 模式 B：v1 拆分式（外置 agent 客户端）
-
-server 退化为纯消息枢纽；agent runtime 由独立的 `joi agent serve` 进程托管，
-通过 WebSocket 跟 server 通信。每个被管理的 agent 在 server 上是一条独立连接。
-适合：多机部署、异构 agent 接入（命令行 + ACP 混用）、想 ship 第三方 adapter。
-
-```sh
-# 终端 1：启 server，关掉嵌入 supervisor
-JOI_DISABLE_EMBEDDED_RUNTIME=1 cargo run -p joi-server
-
-# 终端 2：把 agent spec 放到 agent-client 配置目录
-mkdir -p ~/.config/joi/agents
-cp agents/*.json ~/.config/joi/agents/
 
 # 终端 3：启 agent client；它会为每个 spec 起一条到 server 的连接
 cargo run -p joi-cli -- agent serve
 
 # 终端 4：照常用 chat
+cargo run -p joi-cli -- channel create --title "Demo"
+cargo run -p joi-cli -- thread create --channel <channel_id> --title "Kickoff"
 cargo run -p joi-cli -- chat --in <thread_id>
 ```
 
@@ -214,13 +193,14 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 
 ## 配置文件路径
 
-| 内容 | 模式 A（v0） | 模式 B（v1） |
-| --- | --- | --- |
-| Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） | 同左 |
-| Agent spec | `--agents-dir`（默认 `./agents`） | `~/.config/joi/agents/`（`--specs <dir>` 可覆盖） |
-| Agent workspace 模板变量 | `<data-dir>/agents/<id>/{workspace,profile,logs,bundles}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,profile,logs,bundles}`（`{agent.home}` = `{agent.root}`） |
-| Command transport session 簿记 | （仅 v1 用到） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
-| CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） | 同左 |
+| 内容 | 路径 |
+| --- | --- |
+| Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） |
+| Agent spec | `~/.config/joi/agents/`（`joi agent serve --specs <dir>` 可覆盖） |
+| Actor 持久状态 | `~/.agentx/agents/<id>/{profile,bundles}` |
+| Agent workspace 模板变量 | `~/.agentx/channels/<channel-id>/agents/<id>/{workspace,logs}` |
+| Command transport session 簿记 | `~/.agentx/sessions/<actor_id>/<scope_id>.json` |
+| CLI 用户配置 | `~/.config/joi/config.toml`（`server` / `actor` / `display`） |
 
 ## 配置 agent
 
@@ -261,7 +241,6 @@ joi agent add
     "command": "my-acp-binary",
     "args": [],
     "env": {},
-    "cwd": "{agent.workspace}",
     "authMethod": null
   },
   "autostart": false
@@ -273,27 +252,29 @@ joi agent add
 完整 schema、`first_run_capture` 规则、`output_format` 翻译表与 worked example 见
 [docs/command-transport-v0.md](docs/command-transport-v0.md)。
 
-保存为 `agents/<actor-id>.json`，或运行时注册：`joi agent register <path>`。
+保存为 `~/.config/joi/agents/<actor-id>.json`，或运行：
+`joi agent register <path>`。
 
-模板变量（`cwd` / `env`，以及 command transport 的
+Agent 的默认 cwd 由 runtime 根据 `channelId + actorId` 计算，不在 spec 里配置。
+
+模板变量（`env`，以及 command transport 的 `args` /
 `session.first_run_capture` / `session.resume_args` 里可用）：
 `{agent.workspace}` / `{agent.profile}` / `{agent.logs}` / `{agent.root}` /
-`{agent.home}` / `{agent.bundle_root}` / `{agent.bundle}` / `{actor.id}` /
-`{scope.id}`。
+`{agent.bundle_root}` / `{agent.bundle}` / `{actor.id}` /
+`{scope.id}` / `{channel.root}` / `{channel.shared}` / `{channel.sharedArtifacts}`。
 
 `{agent.profile}` 是该 actor 的**持久化状态**目录（per-actor、跨 thread 共享），
 适合放 identity、memory、MCP 配置等 actor 自己维护的状态。runtime 管理的版本化
 skills / toolchains / model assets 则放在和 `profile/` 平级的 `bundles/` 下，通过
-`{agent.bundle_root}` / `{agent.bundle}` 访问。`{agent.home}` 只是 `{agent.root}`
-的别名。**注意**这不是 agent 子进程看到的 `$HOME`——OAuth token / CLI 配置（如
+`{agent.bundle_root}` / `{agent.bundle}` 访问。**注意**`{agent.root}` 不是 agent 子进程看到的 `$HOME`——OAuth token / CLI 配置（如
 `~/.claude/`）等用户级状态仍由 agent 自己写入用户 HOME，joi 不接管。
 
 ## Agent 子进程能反向调 joi 读历史
 
-server 或 agent client 在 spawn agent 子进程时会自动注入两个环境变量
+`joi agent serve` 在 spawn agent 子进程时会自动注入两个环境变量
 （前提是 spec 自己没设）：
 
-- `JOI_SERVER` → server 的 WebSocket URL
+- `JOI_SERVER` → server 的 WebSocket URL（本机可达时会优先注入 loopback 地址；`JOI_AGENT_SERVER` 可显式覆盖）
 - `JOI_ACTOR`  → 该 agent 自己的 actor id
 
 所以子进程可以直接：

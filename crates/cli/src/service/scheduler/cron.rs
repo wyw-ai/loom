@@ -22,7 +22,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Timelike, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Timelike, Utc, Weekday,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
@@ -56,10 +58,7 @@ pub enum CronError {
         max: u32,
     },
     #[error("field {field}: malformed token `{value}`")]
-    Malformed {
-        field: &'static str,
-        value: String,
-    },
+    Malformed { field: &'static str, value: String },
 }
 
 impl Schedule {
@@ -247,7 +246,8 @@ fn advance_to_next_month(t: DateTime<Utc>) -> Option<DateTime<Utc>> {
 
 fn next_day_midnight(t: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let next_day = t.date_naive().succ_opt()?;
-    Utc.from_local_datetime(&next_day.and_hms_opt(0, 0, 0)?).single()
+    Utc.from_local_datetime(&next_day.and_hms_opt(0, 0, 0)?)
+        .single()
 }
 
 fn next_hour_top(t: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -417,16 +417,31 @@ mod tests {
     fn ranges_and_steps_compose() {
         // 9, 12, 15, 18 (every 3 hours from 9 to 18, top of hour).
         let s = Schedule::parse("0 9-18/3 * * *").unwrap();
-        assert_eq!(s.next_after(dt(2026, 4, 24, 8, 0)), Some(dt(2026, 4, 24, 9, 0)));
-        assert_eq!(s.next_after(dt(2026, 4, 24, 9, 0)), Some(dt(2026, 4, 24, 12, 0)));
-        assert_eq!(s.next_after(dt(2026, 4, 24, 18, 0)), Some(dt(2026, 4, 25, 9, 0)));
+        assert_eq!(
+            s.next_after(dt(2026, 4, 24, 8, 0)),
+            Some(dt(2026, 4, 24, 9, 0))
+        );
+        assert_eq!(
+            s.next_after(dt(2026, 4, 24, 9, 0)),
+            Some(dt(2026, 4, 24, 12, 0))
+        );
+        assert_eq!(
+            s.next_after(dt(2026, 4, 24, 18, 0)),
+            Some(dt(2026, 4, 25, 9, 0))
+        );
     }
 
     #[test]
     fn list_field() {
         let s = Schedule::parse("0,30 * * * *").unwrap();
-        assert_eq!(s.next_after(dt(2026, 4, 24, 10, 0)), Some(dt(2026, 4, 24, 10, 30)));
-        assert_eq!(s.next_after(dt(2026, 4, 24, 10, 30)), Some(dt(2026, 4, 24, 11, 0)));
+        assert_eq!(
+            s.next_after(dt(2026, 4, 24, 10, 0)),
+            Some(dt(2026, 4, 24, 10, 30))
+        );
+        assert_eq!(
+            s.next_after(dt(2026, 4, 24, 10, 30)),
+            Some(dt(2026, 4, 24, 11, 0))
+        );
     }
 
     #[test]

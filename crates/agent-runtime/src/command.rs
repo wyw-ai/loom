@@ -6,7 +6,7 @@
 //! delegating to the underlying CLI's own session/resume mechanism (`claude
 //! --resume <id>`, `codex resume`, etc.); joi only bookkeeps the
 //! `(actor_id, scope_id) -> session_id` mapping in
-//! `~/.local/share/joi/agent-client/sessions/<actor>/<scope_id>.json`.
+//! `<agent-client-data>/sessions/<actor>/<scope_id>.json`.
 //!
 //! E2 scope (initial implementation):
 //!   * `output_format`: `Text`, `NdjsonLines`, `ClaudeStreamJson`. CodexStreamJson
@@ -37,7 +37,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use super::adapter::{Adapter, AdapterEvent, AdapterStartInfo};
+use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 
 /// Per-scope handle to an in-flight subprocess. The PID is set after spawn
 /// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
@@ -49,10 +49,9 @@ struct InFlight {
     cancel_requested: bool,
 }
 
-/// Snapshot of the bits of `AgentTransport` the command adapter cares about,
-/// pre-expanded with template variables that don't depend on the per-prompt
-/// scope (env / cwd / static args). Per-prompt expansion (scope.id, session_id,
-/// prompt) happens later in `send_prompt`.
+/// Snapshot of the bits of `AgentTransport` the command adapter cares about.
+/// Templates are expanded per prompt because scope and channel paths are
+/// dispatch-specific.
 #[derive(Debug, Clone)]
 pub struct CommandConfig {
     pub actor_id: String,
@@ -60,7 +59,6 @@ pub struct CommandConfig {
     /// First-run argv (template — `{prompt}` may appear when `prompt_via=args`).
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    pub cwd: PathBuf,
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
     pub output_format: CommandOutputFormat,
@@ -79,7 +77,6 @@ impl CommandConfig {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
-        cwd: PathBuf,
         spec: &proto::methods::AgentTransport,
         sessions_dir: PathBuf,
     ) -> Self {
@@ -96,7 +93,6 @@ impl CommandConfig {
             command,
             args,
             env,
-            cwd,
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
             output_format: spec.output_format.unwrap_or_default(),
@@ -105,22 +101,6 @@ impl CommandConfig {
             command_signature,
         }
     }
-}
-
-pub fn expand_session_templates<F>(
-    session: Option<&proto::methods::CommandSession>,
-    mut expand: F,
-) -> Option<proto::methods::CommandSession>
-where
-    F: FnMut(&str) -> String,
-{
-    session.map(|session| proto::methods::CommandSession {
-        first_run_capture: session.first_run_capture.as_deref().map(&mut expand),
-        resume_args: session
-            .resume_args
-            .as_ref()
-            .map(|args| args.iter().map(|arg| expand(arg)).collect()),
-    })
 }
 
 pub struct CommandAdapter {
@@ -183,14 +163,14 @@ impl Adapter for CommandAdapter {
         })
     }
 
-    async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String> {
-        if prompt.is_empty() {
+    async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String> {
+        if prompt.content.is_empty() {
             let _ = self.sender()?.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
+                scope: Some(prompt.scope.clone()),
                 message: "empty prompt".into(),
             });
             let _ = self.sender()?.send(AdapterEvent::Finished {
-                scope: Some(scope),
+                scope: Some(prompt.scope),
                 success: false,
                 summary: "empty prompt".into(),
             });
@@ -198,11 +178,11 @@ impl Adapter for CommandAdapter {
         }
         let sender = self.sender()?;
         let cfg = self.cfg.clone();
-        let slot = self.slot_for(&scope.id);
+        let slot = self.slot_for(&prompt.scope.id);
         // Reset cancel flag for this scope's new prompt; old PID is already
         // gone (cleared after the previous wait).
         slot.lock().cancel_requested = false;
-        tokio::task::spawn_blocking(move || run_prompt(cfg, scope, prompt, sender, slot))
+        tokio::task::spawn_blocking(move || run_prompt(cfg, prompt, sender, slot))
             .await
             .map_err(|e| e.to_string())?
     }
@@ -274,11 +254,12 @@ fn signal_child(_pid: u32) -> Result<(), String> {
 
 fn run_prompt(
     cfg: CommandConfig,
-    scope: ScopeRef,
-    prompt: String,
+    prompt: AdapterPrompt,
     sender: mpsc::UnboundedSender<AdapterEvent>,
     slot: Arc<Mutex<InFlight>>,
 ) -> Result<(), String> {
+    let scope = prompt.scope.clone();
+    let content = prompt.content.clone();
     let session = load_session(&cfg, &scope.id);
     let resume_session_id = session
         .as_ref()
@@ -290,13 +271,13 @@ fn run_prompt(
     // argv from `args`.
     let (argv, is_first_run) = match (resume_session_id.as_deref(), cfg.resume_args.as_ref()) {
         (Some(sid), Some(template)) => (
-            expand_argv(template, &cfg, &scope, Some(sid), &prompt),
+            expand_argv(template, &cfg, &prompt, Some(sid), &content),
             false,
         ),
-        _ => (expand_first_run_argv(&cfg, &scope, &prompt), true),
+        _ => (expand_first_run_argv(&cfg, &prompt, &content), true),
     };
 
-    let result = spawn_and_collect(&cfg, &scope, &prompt, &argv, &sender, &slot);
+    let result = spawn_and_collect(&cfg, &prompt, &argv, &sender, &slot);
     let outcome = match result {
         Ok(o) => o,
         Err(e) => {
@@ -316,7 +297,7 @@ fn run_prompt(
     // First-run capture: try once, save to disk on success.
     if is_first_run {
         if let Some(rule) = cfg.first_run_capture.as_ref() {
-            match capture_session_id(rule, &outcome, &cfg, &scope) {
+            match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
                     if let Err(e) = save_session(&cfg, &scope.id, &sid) {
                         tracing::warn!(actor = %cfg.actor_id, %e, "failed to save command session");
@@ -355,30 +336,29 @@ struct SpawnOutcome {
 
 fn spawn_and_collect(
     cfg: &CommandConfig,
-    scope: &ScopeRef,
-    prompt: &str,
+    prompt: &AdapterPrompt,
     argv: &[String],
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     slot: &Arc<Mutex<InFlight>>,
 ) -> Result<SpawnOutcome, String> {
-    std::fs::create_dir_all(&cfg.cwd).map_err(|e| {
+    std::fs::create_dir_all(&prompt.cwd).map_err(|e| {
         format!(
             "failed to create command cwd `{}`: {}",
-            cfg.cwd.display(),
+            prompt.cwd.display(),
             e
         )
     })?;
     let mut cmd = Command::new(&cfg.command);
     cmd.args(argv)
-        .current_dir(&cfg.cwd)
+        .current_dir(&prompt.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in &cfg.env {
+    for (k, v) in expanded_env(cfg, prompt) {
         cmd.env(k, v);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
-        cmd.env("JOI_PROMPT", prompt);
+        cmd.env("JOI_PROMPT", &prompt.content);
     }
     let mut child = cmd
         .spawn()
@@ -399,7 +379,7 @@ fn spawn_and_collect(
     if matches!(cfg.prompt_via, PromptVia::Stdin) {
         if let Some(mut stdin) = child.stdin.take() {
             stdin
-                .write_all(prompt.as_bytes())
+                .write_all(prompt.content.as_bytes())
                 .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
         }
     }
@@ -429,7 +409,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_ndjson_line(&line, scope, sender);
+                translate_ndjson_line(&line, &prompt.scope, sender);
             }
         }
         CommandOutputFormat::ClaudeStreamJson => {
@@ -437,7 +417,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_claude_stream_line(&line, scope, sender);
+                translate_claude_stream_line(&line, &prompt.scope, sender);
             }
         }
         CommandOutputFormat::CodexStreamJson => {
@@ -445,7 +425,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_codex_stream_line(&line, scope, sender);
+                translate_codex_stream_line(&line, &prompt.scope, sender);
             }
         }
     }
@@ -484,7 +464,7 @@ fn spawn_and_collect(
         CommandOutputFormat::Text => {
             if !collected_stdout.is_empty() {
                 let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(scope.clone()),
+                    scope: Some(prompt.scope.clone()),
                     content: collected_stdout.clone(),
                     is_partial: false,
                 });
@@ -495,14 +475,14 @@ fn spawn_and_collect(
             // is_partial=false Text frame; the runtime's `take_text_buffer`
             // will turn whatever was accumulated into a single content.add.
             let _ = sender.send(AdapterEvent::Text {
-                scope: Some(scope.clone()),
+                scope: Some(prompt.scope.clone()),
                 content: String::new(),
                 is_partial: false,
             });
         }
     }
     let _ = sender.send(AdapterEvent::Finished {
-        scope: Some(scope.clone()),
+        scope: Some(prompt.scope.clone()),
         success,
         summary,
     });
@@ -751,7 +731,7 @@ fn capture_session_id(
     rule: &str,
     outcome: &SpawnOutcome,
     cfg: &CommandConfig,
-    scope: &ScopeRef,
+    prompt: &AdapterPrompt,
 ) -> Result<Option<String>, String> {
     if let Some(path) = rule.strip_prefix("stdout_json:") {
         return Ok(extract_json_path(&outcome.stdout, path));
@@ -760,7 +740,7 @@ fn capture_session_id(
         return Err("stderr_regex first_run_capture not yet implemented".into());
     }
     if let Some(path) = rule.strip_prefix("file:") {
-        let expanded = expand_template(path, cfg, scope, None, "");
+        let expanded = expand_template(path, cfg, prompt, None, "");
         let text = std::fs::read_to_string(&expanded)
             .map_err(|e| format!("failed to read capture file `{expanded}`: {e}"))?;
         let trimmed = text.trim();
@@ -838,11 +818,15 @@ fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
 
 // ---------------- argv & template expansion ----------------
 
-fn expand_first_run_argv(cfg: &CommandConfig, scope: &ScopeRef, prompt: &str) -> Vec<String> {
+fn expand_first_run_argv(
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    prompt: &str,
+) -> Vec<String> {
     let mut argv: Vec<String> = cfg
         .args
         .iter()
-        .map(|a| expand_template(a, cfg, scope, None, prompt))
+        .map(|a| expand_template(a, cfg, request, None, prompt))
         .collect();
     if matches!(cfg.prompt_via, PromptVia::Args) {
         // Only append when the template didn't already place {prompt} itself.
@@ -857,13 +841,13 @@ fn expand_first_run_argv(cfg: &CommandConfig, scope: &ScopeRef, prompt: &str) ->
 fn expand_argv(
     template: &[String],
     cfg: &CommandConfig,
-    scope: &ScopeRef,
+    request: &AdapterPrompt,
     session_id: Option<&str>,
     prompt: &str,
 ) -> Vec<String> {
     let mut argv: Vec<String> = template
         .iter()
-        .map(|a| expand_template(a, cfg, scope, session_id, prompt))
+        .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
     if matches!(cfg.prompt_via, PromptVia::Args) {
         let already = template.iter().any(|a| a.contains("{prompt}"));
@@ -877,23 +861,38 @@ fn expand_argv(
 fn expand_template(
     input: &str,
     cfg: &CommandConfig,
-    scope: &ScopeRef,
+    request: &AdapterPrompt,
     session_id: Option<&str>,
     prompt: &str,
 ) -> String {
-    let scope_kind = match scope.kind {
+    let scope_kind = match request.scope.kind {
         proto::types::ScopeKind::Thread => "thread",
         proto::types::ScopeKind::Channel => "channel",
     };
     let mut out = input
         .replace("{actor.id}", &cfg.actor_id)
-        .replace("{scope.id}", &scope.id)
+        .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{prompt}", prompt);
     if let Some(sid) = session_id {
         out = out.replace("{session_id}", sid);
     }
+    for (key, value) in &request.template_vars {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
     out
+}
+
+fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = cfg
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), expand_template(v, cfg, request, None, "")))
+        .collect();
+    for (k, v) in &request.env {
+        env.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    env
 }
 
 // Silences the `Arc` import in modules that wrap CommandAdapter behind
@@ -912,7 +911,6 @@ mod tests {
             command: "echo".into(),
             args: vec!["-n".into()],
             env: BTreeMap::new(),
-            cwd: PathBuf::from("/tmp"),
             first_run_capture: None,
             resume_args: None,
             output_format: CommandOutputFormat::Text,
@@ -926,6 +924,16 @@ mod tests {
         ScopeRef {
             kind: ScopeKind::Thread,
             id: "thr_xyz".into(),
+        }
+    }
+
+    fn prompt(content: &str) -> AdapterPrompt {
+        AdapterPrompt {
+            scope: scope(),
+            content: content.into(),
+            cwd: PathBuf::from("/tmp"),
+            env: BTreeMap::new(),
+            template_vars: BTreeMap::new(),
         }
     }
 
@@ -961,11 +969,11 @@ mod tests {
     #[test]
     fn template_expands_scope_and_session_and_prompt() {
         let cfg = cfg();
-        let scope = scope();
+        let request = prompt("hello world");
         let out = expand_template(
             "--resume {session_id} --scope {scope.id} -- {prompt}",
             &cfg,
-            &scope,
+            &request,
             Some("sid_42"),
             "hello world",
         );
@@ -975,8 +983,8 @@ mod tests {
     #[test]
     fn first_run_argv_appends_prompt_when_args_mode() {
         let cfg = cfg();
-        let scope = scope();
-        let argv = expand_first_run_argv(&cfg, &scope, "what time is it");
+        let request = prompt("what time is it");
+        let argv = expand_first_run_argv(&cfg, &request, "what time is it");
         assert_eq!(argv, vec!["-n", "what time is it"]);
     }
 
@@ -984,7 +992,8 @@ mod tests {
     fn first_run_argv_does_not_double_append_when_template_has_prompt() {
         let mut cfg = cfg();
         cfg.args = vec!["--input".into(), "{prompt}".into()];
-        let argv = expand_first_run_argv(&cfg, &scope(), "hi");
+        let request = prompt("hi");
+        let argv = expand_first_run_argv(&cfg, &request, "hi");
         assert_eq!(argv, vec!["--input", "hi"]);
     }
 
@@ -996,26 +1005,56 @@ mod tests {
     }
 
     #[test]
-    fn expand_session_templates_rewrites_capture_and_resume_args() {
-        let session = proto::methods::CommandSession {
-            first_run_capture: Some("file:{agent.bundle}/sid".into()),
-            resume_args: Some(vec!["--resume".into(), "{agent.home}/run".into()]),
-        };
-
-        let expanded = expand_session_templates(Some(&session), |input| {
-            input
-                .replace("{agent.bundle}", "/tmp/bundles/current")
-                .replace("{agent.home}", "/tmp/actor")
-        })
-        .expect("session should expand");
-
-        assert_eq!(
-            expanded.first_run_capture.as_deref(),
-            Some("file:/tmp/bundles/current/sid")
+    fn template_expands_request_vars_late() {
+        let cfg = cfg();
+        let mut request = prompt("hello");
+        request.template_vars.insert(
+            "agent.workspace".into(),
+            "/tmp/channel/actor/workspace".into(),
+        );
+        request
+            .template_vars
+            .insert("agent.bundle".into(), "/tmp/actor/bundles/current".into());
+        let out = expand_template(
+            "{agent.workspace}:{agent.bundle}:{scope.id}",
+            &cfg,
+            &request,
+            None,
+            "",
         );
         assert_eq!(
-            expanded.resume_args,
-            Some(vec!["--resume".into(), "/tmp/actor/run".into()])
+            out,
+            "/tmp/channel/actor/workspace:/tmp/actor/bundles/current:thr_xyz"
+        );
+    }
+
+    #[test]
+    fn expanded_env_keeps_spec_values_and_adds_request_defaults() {
+        let mut cfg = cfg();
+        cfg.env.insert("JOI_SERVER".into(), "ws://spec".into());
+        cfg.env
+            .insert("WORKSPACE".into(), "{agent.workspace}".into());
+        let mut request = prompt("hello");
+        request
+            .env
+            .insert("JOI_SERVER".into(), "ws://runtime".into());
+        request
+            .env
+            .insert("AGENTX_CHANNEL_ID".into(), "channel_1".into());
+        request
+            .template_vars
+            .insert("agent.workspace".into(), "/tmp/channel/workspace".into());
+
+        let env = expanded_env(&cfg, &request);
+
+        assert_eq!(env.get("JOI_SERVER").map(String::as_str), Some("ws://spec"));
+        assert_eq!(
+            env.get("WORKSPACE").map(String::as_str),
+            Some("/tmp/channel/workspace")
+        );
+        assert_eq!(
+            env.get("AGENTX_CHANNEL_ID").map(String::as_str),
+            Some("channel_1")
         );
     }
 
@@ -1039,9 +1078,8 @@ mod tests {
         let scope = scope();
         let send = {
             let adapter = adapter.clone();
-            let scope = scope.clone();
             tokio::spawn(async move {
-                adapter.send_prompt(scope, "ignored".into()).await.unwrap();
+                adapter.send_prompt(prompt("ignored")).await.unwrap();
             })
         };
 

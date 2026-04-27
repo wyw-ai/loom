@@ -329,16 +329,6 @@ pub async fn actor_list(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(stringify)
 }
 
-#[tauri::command]
-pub async fn agent_list(state: State<'_, AppState>) -> Result<Value, String> {
-    state
-        .client()
-        .await?
-        .call_raw(method::AGENT_LIST, None)
-        .await
-        .map_err(stringify)
-}
-
 fn stringify(e: anyhow::Error) -> String {
     deep_stringify(e)
 }

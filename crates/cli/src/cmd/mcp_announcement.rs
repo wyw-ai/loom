@@ -141,7 +141,10 @@ async fn handle_tool_call(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing tool name".to_string())?;
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     match name {
         "announcement.set" => announcement_set(actor_id, client, &args).await,
         "announcement.clear" => announcement_clear(actor_id, client, &args).await,
@@ -237,7 +240,9 @@ fn require_scope_kind(args: &Value) -> Result<String, String> {
     let raw = require_str(args, "scopeKind")?;
     match raw.as_str() {
         "channel" | "thread" => Ok(raw),
-        other => Err(format!("`scopeKind` must be channel or thread, got `{other}`")),
+        other => Err(format!(
+            "`scopeKind` must be channel or thread, got `{other}`"
+        )),
     }
 }
 

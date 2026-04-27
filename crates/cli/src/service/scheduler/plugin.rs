@@ -26,8 +26,8 @@
 //! agent cannot stack a queue of pending fires (§8.5).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -43,9 +43,7 @@ use crate::service::runtime::ServiceRuntime;
 
 use super::cron::Schedule;
 use super::source::exec_source;
-use super::spec::{
-    CursorBy, DedupeBy, JobSpec, SchedulerConfig, ScopeBinding, ScopeKind, Source,
-};
+use super::spec::{CursorBy, DedupeBy, JobSpec, SchedulerConfig, ScopeBinding, ScopeKind, Source};
 
 /// Plugin-kind discriminator used by [`crate::service::ServiceHost`].
 pub const KIND: &str = "scheduler";
@@ -60,13 +58,12 @@ impl ServicePlugin for SchedulerPlugin {
     }
 
     async fn run(&self, ctx: ServiceContext) -> Result<()> {
-        let config: SchedulerConfig =
-            if ctx.spec.config.is_null() || ctx.spec.config == json!({}) {
-                SchedulerConfig::default()
-            } else {
-                serde_json::from_value(ctx.spec.config.clone())
-                    .context("parse spec.config as SchedulerConfig")?
-            };
+        let config: SchedulerConfig = if ctx.spec.config.is_null() || ctx.spec.config == json!({}) {
+            SchedulerConfig::default()
+        } else {
+            serde_json::from_value(ctx.spec.config.clone())
+                .context("parse spec.config as SchedulerConfig")?
+        };
         config.validate().context("validate scheduler config")?;
 
         let runtime = ctx.runtime.clone();
@@ -170,9 +167,7 @@ async fn run_job_loop(
         // §8.5: single_in_flight default true. We swap the gate before
         // entering the fire — a second tick that lands while the first
         // is still in flight loses the race and skips with a warning.
-        if state.spec.single_in_flight
-            && state.in_flight.swap(true, Ordering::AcqRel)
-        {
+        if state.spec.single_in_flight && state.in_flight.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 job = %state.spec.id,
                 fire_time_utc = %next.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -357,10 +352,7 @@ fn build_meta(job: &JobSpec, fire_time: DateTime<Utc>, body_hash: &str) -> Meta 
         Value::String(fire_time.to_rfc3339_opts(SecondsFormat::Secs, true)),
     );
     if matches!(job.cursor_by, CursorBy::BodyHash) {
-        m.insert(
-            "sourceCursor".into(),
-            Value::String(body_hash.to_string()),
-        );
+        m.insert("sourceCursor".into(), Value::String(body_hash.to_string()));
     }
     // Source kind helps downstream consumers (and humans reading the
     // event) understand where the body came from without re-fetching.
@@ -406,7 +398,7 @@ mod tests {
 
     use chrono::TimeZone;
 
-    use super::super::spec::{Source, ScopeBinding};
+    use super::super::spec::{ScopeBinding, Source};
 
     fn job(id: &str) -> JobSpec {
         JobSpec {

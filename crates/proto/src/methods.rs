@@ -28,12 +28,6 @@ pub mod method {
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
-    /// Outbound notification: scope-broadcast partial text from an in-flight
-    /// agent turn. Unlike `TURN_TRACE_UPDATE` (owner-only) this fans out to
-    /// every scope subscriber so other channel members can watch the agent
-    /// type. Carries `TurnStreamUpdate`. Never journaled — the canonical
-    /// record is the `content.add` event written when the turn closes.
-    pub const TURN_STREAM_UPDATE: &str = "turn/stream.update";
     pub const EVENT_APPEND: &str = "event/append";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
@@ -45,16 +39,6 @@ pub mod method {
     pub const DELIVERY_LIST: &str = "delivery/list";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
-
-    // local extensions
-    pub const AGENT_LIST: &str = "agent/list";
-    pub const AGENT_REGISTER: &str = "agent/register";
-    pub const AGENT_UNREGISTER: &str = "agent/unregister";
-    pub const AGENT_START: &str = "agent/start";
-    pub const AGENT_STOP: &str = "agent/stop";
-    pub const AGENT_LOG: &str = "agent/log";
-    pub const AGENT_INSTALL: &str = "agent/install";
-    pub const AGENT_LIST_MARKETPLACE: &str = "agent/listMarketplace";
 
     // outbound notification
     pub const STREAM_UPDATE: &str = "stream/update";
@@ -414,22 +398,6 @@ pub struct TurnTraceUpdate {
     pub frame: crate::types::trace::TraceFrame,
 }
 
-// ---- turn/stream.update notification ----
-
-/// Scope-broadcast partial text from an in-flight agent turn. `seq` is
-/// monotonic per-turn and lets clients detect dropped frames; ordering
-/// across turns is not defined. Never persisted — the final `content.add`
-/// event written at turn close is canonical.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnStreamUpdate {
-    pub turn_id: String,
-    pub scope: ScopeRef,
-    pub actor_id: String,
-    pub seq: u64,
-    pub delta_text: String,
-}
-
 // ---- event/append ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,8 +582,6 @@ pub struct AgentTransport {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "authMethod")]
     pub auth_method: Option<String>,
@@ -1019,7 +985,9 @@ pub struct ServiceSpec {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ServiceSpecError {
-    #[error("ServiceSpec `{spec_id}`: actor `{actor_id}` must declare kind = service, got {got:?}")]
+    #[error(
+        "ServiceSpec `{spec_id}`: actor `{actor_id}` must declare kind = service, got {got:?}"
+    )]
     WrongActorKind {
         spec_id: String,
         actor_id: String,
@@ -1071,71 +1039,6 @@ pub struct AgentInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentListResult {
     pub agents: Vec<AgentInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentRegisterParams {
-    pub spec: AgentSpec,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentRegisterResult {
-    pub agent: AgentInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentByIdParams {
-    pub actor_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSimpleResult {
-    pub agent: AgentInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentOkResult {
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentLogParams {
-    pub actor_id: String,
-    #[serde(default = "default_tail")]
-    pub tail: u32,
-}
-
-fn default_tail() -> u32 {
-    100
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentLogResult {
-    pub lines: Vec<String>,
-}
-
-// ---- agent/install + agent/listMarketplace ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentInstallParams {
-    pub marketplace_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_actor_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    /// Optional preference: "auto" (default), "npx", "uvx", or "binary".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefer: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentInstallResult {
-    pub agent: AgentInfo,
-    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1208,7 +1111,13 @@ mod service_spec_tests {
         let mut spec = base_spec();
         spec.actor.kind = ActorKind::Human;
         let err = spec.validate().expect_err("human kind must fail");
-        assert!(matches!(err, ServiceSpecError::WrongActorKind { got: ActorKind::Human, .. }));
+        assert!(matches!(
+            err,
+            ServiceSpecError::WrongActorKind {
+                got: ActorKind::Human,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1219,7 +1128,13 @@ mod service_spec_tests {
         let mut spec = base_spec();
         spec.actor.kind = ActorKind::Agent;
         let err = spec.validate().expect_err("agent kind must fail");
-        assert!(matches!(err, ServiceSpecError::WrongActorKind { got: ActorKind::Agent, .. }));
+        assert!(matches!(
+            err,
+            ServiceSpecError::WrongActorKind {
+                got: ActorKind::Agent,
+                ..
+            }
+        ));
     }
 
     #[test]

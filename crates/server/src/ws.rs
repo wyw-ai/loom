@@ -123,35 +123,6 @@ pub fn spawn_stream_broadcaster(state: AppState) {
 fn fanout(state: &AppState, ev: StoreEvent) {
     use proto::methods::stream_kind as sk;
 
-    // Partial-text deltas: scope-broadcast (gated by ACL like normal events)
-    // as `turn/stream.update`. Never journaled, so this branch handles its
-    // own send and returns — no need to fall through to the StoreEvent
-    // dispatch below.
-    if let StoreEvent::TurnStreamDelta {
-        turn_id,
-        scope,
-        actor_id,
-        seq,
-        delta,
-    } = &ev
-    {
-        let payload = json!({
-            "turnId": turn_id,
-            "scope": scope,
-            "actorId": actor_id,
-            "seq": seq,
-            "deltaText": delta,
-        });
-        if let Some(filter) = scope_acl_filter(state, scope) {
-            broadcast_filtered(state, scope, method::TURN_STREAM_UPDATE, &payload, &filter);
-        } else {
-            state
-                .subscriptions
-                .broadcast_to_scope(scope, method::TURN_STREAM_UPDATE, payload);
-        }
-        return;
-    }
-
     // Trace frames are turn-owner-private; route them by owner actor and
     // never broadcast on a scope subscription.
     if let StoreEvent::TraceAppended(frame) = &ev {
@@ -240,7 +211,6 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::ChannelGranted { .. } | StoreEvent::ChannelRevoked { .. } => {
             unreachable!("channel grant/revoke handled above")
         }
-        StoreEvent::TurnStreamDelta { .. } => unreachable!("stream delta handled above"),
     };
     let Some(scope) = scope else {
         return;

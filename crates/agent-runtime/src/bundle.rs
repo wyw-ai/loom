@@ -56,7 +56,6 @@ pub fn prepare_bundle_install(
 
 pub fn validate_bundle_current(
     actor_root: &Path,
-    workspace: &Path,
     profile: &Path,
     logs: &Path,
     bundle_root: &Path,
@@ -87,11 +86,7 @@ pub fn validate_bundle_current(
         ));
     }
 
-    for (label, protected) in [
-        ("workspace", workspace),
-        ("profile", profile),
-        ("logs", logs),
-    ] {
+    for (label, protected) in [("profile", profile), ("logs", logs)] {
         let protected = resolve_path_within(actor_root, protected, label)?;
         if resolved_current.starts_with(&protected) || protected.starts_with(&resolved_current) {
             return Err(io::Error::new(
@@ -271,23 +266,16 @@ mod tests {
     #[test]
     fn validate_bundle_current_rejects_profile_subtree() {
         let root = temp_path("current-profile");
-        let workspace = root.join("workspace");
         let profile = root.join("profile");
         let logs = root.join("logs");
         let bundle_root = root.join("bundles");
-        for dir in [&workspace, &profile, &logs, &bundle_root] {
+        for dir in [&profile, &logs, &bundle_root] {
             std::fs::create_dir_all(dir).expect("create actor dir");
         }
 
-        let err = validate_bundle_current(
-            &root,
-            &workspace,
-            &profile,
-            &logs,
-            &bundle_root,
-            &profile.join("live"),
-        )
-        .expect_err("must reject profile subtree");
+        let err =
+            validate_bundle_current(&root, &profile, &logs, &bundle_root, &profile.join("live"))
+                .expect_err("must reject profile subtree");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         std::fs::remove_dir_all(root).ok();
@@ -296,23 +284,16 @@ mod tests {
     #[test]
     fn validate_bundle_current_rejects_bundle_root_ancestor() {
         let root = temp_path("current-ancestor");
-        let workspace = root.join("workspace");
         let profile = root.join("profile");
         let logs = root.join("logs");
         let bundle_root = root.join("runtime").join("bundles");
-        for dir in [&workspace, &profile, &logs, &bundle_root] {
+        for dir in [&profile, &logs, &bundle_root] {
             std::fs::create_dir_all(dir).expect("create actor dir");
         }
 
-        let err = validate_bundle_current(
-            &root,
-            &workspace,
-            &profile,
-            &logs,
-            &bundle_root,
-            &root.join("runtime"),
-        )
-        .expect_err("must reject current containing bundle root");
+        let err =
+            validate_bundle_current(&root, &profile, &logs, &bundle_root, &root.join("runtime"))
+                .expect_err("must reject current containing bundle root");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         std::fs::remove_dir_all(root).ok();
@@ -321,12 +302,11 @@ mod tests {
     #[test]
     fn validate_bundle_current_allows_dedicated_runtime_path() {
         let root = temp_path("current-valid");
-        let workspace = root.join("workspace");
         let profile = root.join("profile");
         let logs = root.join("logs");
         let bundle_root = root.join("runtime").join("bundles");
         let current = root.join("runtime").join("live");
-        for dir in [&workspace, &profile, &logs, &bundle_root] {
+        for dir in [&profile, &logs, &bundle_root] {
             std::fs::create_dir_all(dir).expect("create actor dir");
         }
         let expected = std::fs::canonicalize(&root)
@@ -334,9 +314,8 @@ mod tests {
             .join("runtime")
             .join("live");
 
-        let resolved =
-            validate_bundle_current(&root, &workspace, &profile, &logs, &bundle_root, &current)
-                .expect("current should be valid");
+        let resolved = validate_bundle_current(&root, &profile, &logs, &bundle_root, &current)
+            .expect("current should be valid");
 
         assert_eq!(resolved, expected);
         std::fs::remove_dir_all(root).ok();

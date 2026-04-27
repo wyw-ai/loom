@@ -18,8 +18,9 @@ pub mod envelope;
 pub mod mcp_servers;
 pub mod memory;
 pub mod profile;
+pub mod server_url;
 
-pub use adapter::{ActionChoice, Adapter, AdapterEvent, AdapterStartInfo};
+pub use adapter::{ActionChoice, Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 pub use agents_md::ensure_agents_md;
 pub use bundle::{
     prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,
@@ -27,3 +28,4 @@ pub use bundle::{
 pub use envelope::{compose_prompt, EnvelopeInput, PromptSection};
 pub use mcp_servers::build_mcp_servers;
 pub use profile::{ensure_profile_scaffold, ProfileScaffold};
+pub use server_url::{agent_child_server_url, local_agent_child_server_url};

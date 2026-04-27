@@ -282,7 +282,10 @@ mod tests {
         subs.add_connection(make_conn("conn_new"));
 
         subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service);
-        assert_eq!(subs.inbox_owner("svc_am_bridge").as_deref(), Some("conn_old"));
+        assert_eq!(
+            subs.inbox_owner("svc_am_bridge").as_deref(),
+            Some("conn_old")
+        );
 
         subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Service);
         assert_eq!(
@@ -324,6 +327,9 @@ mod tests {
 
         subs.add_connection(make_conn("conn_new"));
         subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Human);
-        assert_eq!(subs.inbox_owner("svc_am_bridge").as_deref(), Some("conn_new"));
+        assert_eq!(
+            subs.inbox_owner("svc_am_bridge").as_deref(),
+            Some("conn_new")
+        );
     }
 }

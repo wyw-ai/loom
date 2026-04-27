@@ -14,6 +14,8 @@
 use async_trait::async_trait;
 use proto::types::ScopeRef;
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 #[async_trait]
@@ -28,9 +30,9 @@ pub trait Adapter: Send + Sync {
 
     /// Forward a single prompt to the agent in the given scope. Each distinct
     /// `scope` is conceptually its own conversation: ACP allocates one
-    /// `session/new` per scope; command transport keys per-scope resume tokens
-    /// at `~/.local/share/joi/agent-client/sessions/<actor>/<scope>.json`.
-    async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String>;
+    /// `session/new` per scope with the supplied `cwd`; command transport
+    /// starts its one-shot subprocess in the supplied `cwd`.
+    async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String>;
 
     /// Reply to an `AdapterEvent::ActionRequest` previously emitted by the agent.
     /// Transports without permission prompts (e.g. command/v0) may treat this as
@@ -46,6 +48,15 @@ pub trait Adapter: Send + Sync {
 
     /// Stop the agent. Implementations should be idempotent.
     async fn stop(&self) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterPrompt {
+    pub scope: ScopeRef,
+    pub content: String,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub template_vars: BTreeMap<String, String>,
 }
 
 /// Emitted by every adapter back into the runtime.

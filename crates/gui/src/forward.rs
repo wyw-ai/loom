@@ -31,14 +31,9 @@ pub fn spawn(app: AppHandle, client: Arc<Client>) {
                 method::STREAM_UPDATE => {
                     app.emit("joi://stream", n.params.unwrap_or(serde_json::Value::Null))
                 }
-                method::TURN_STREAM_UPDATE => app.emit(
-                    "joi://stream-delta",
-                    n.params.unwrap_or(serde_json::Value::Null),
-                ),
-                method::TURN_TRACE_UPDATE => app.emit(
-                    "joi://trace",
-                    n.params.unwrap_or(serde_json::Value::Null),
-                ),
+                method::TURN_TRACE_UPDATE => {
+                    app.emit("joi://trace", n.params.unwrap_or(serde_json::Value::Null))
+                }
                 other => {
                     // Unknown notifications are surfaced under a catch-all so
                     // we can see them in devtools without silently dropping.

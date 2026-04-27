@@ -1,8 +1,8 @@
 //! Markdown → ratatui spans for chat bubble bodies.
 //!
-//! Chat messages are typically short and arrive incrementally during streaming,
-//! so we keep the renderer cheap: parse with `pulldown-cmark`, walk the event
-//! stream, accumulate styled spans into rows, and emit one row per visual line.
+//! Chat messages are typically short, so we keep the renderer cheap: parse
+//! with `pulldown-cmark`, walk the event stream, accumulate styled spans into
+//! rows, and emit one row per visual line.
 //!
 //! The renderer is line-based — callers wrap the returned rows themselves
 //! (matching the existing `Paragraph::wrap` machinery in the chat history pane).

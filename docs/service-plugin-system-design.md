@@ -439,10 +439,8 @@ Job 触发后是否等 agent 回复：
 - 失去这条关系，service 只能 polling `event/list` 猜回答，即 `am` 现状。
 - 拥有这条关系，§6.3 的 `await_responds_to` 才能基于 actor-inbox push 工作。
 
-两条 runtime 路径现在都满足该不变量：
-
-- 外置 `joi agent serve`：`crates/cli/src/cmd/agent_serve.rs::flush_text` 写 `RespondsTo`。
-- 嵌入 runtime：`crates/server/src/runtime/wakeup.rs::flush_text_as_event` 从 `Turn.trigger_event_id` 反查并写入；缺 trigger（agent 主动开口）时与外置实现一致地降级为空 relations。
+`joi agent serve` 的 `flush_text` 会写 `RespondsTo`；缺 trigger（agent 主动开口）时
+降级为空 relations。
 
 ### 9.2 Durable actor inbox
 

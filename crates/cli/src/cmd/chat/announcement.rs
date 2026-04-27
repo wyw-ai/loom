@@ -44,10 +44,11 @@ pub fn render(
     }
 
     // Body: markdown rows + a footer line "— @actor 04/24 14:30".
-    let mut lines: Vec<Line<'static>> = markdown::render_to_rows(&announcement.text, Style::default())
-        .into_iter()
-        .map(Line::from)
-        .collect();
+    let mut lines: Vec<Line<'static>> =
+        markdown::render_to_rows(&announcement.text, Style::default())
+            .into_iter()
+            .map(Line::from)
+            .collect();
 
     if !lines.is_empty() {
         lines.push(Line::from(Span::raw("")));
@@ -58,15 +59,11 @@ pub fn render(
     f.render_widget(body, inner);
 }
 
-fn footer_line(
-    a: &Announcement,
-    display_for: &dyn Fn(&str) -> String,
-) -> Line<'static> {
-    let stamp = a
-        .ts
-        .with_timezone(&Local)
-        .format("%-m/%-d %H:%M")
-        .to_string();
+fn footer_line(a: &Announcement, display_for: &dyn Fn(&str) -> String) -> Line<'static> {
+    let stamp =
+        a.ts.with_timezone(&Local)
+            .format("%-m/%-d %H:%M")
+            .to_string();
     Line::from(vec![Span::styled(
         format!("— @{} {}", display_for(&a.actor_id), stamp),
         Style::default().fg(Color::DarkGray),
@@ -100,13 +97,18 @@ mod tests {
                 width: PANEL_WIDTH,
                 height: 6,
             };
-            render(f, &a, &|id| {
-                if id == "actor_human_self" {
-                    "bojun".into()
-                } else {
-                    id.into()
-                }
-            }, area);
+            render(
+                f,
+                &a,
+                &|id| {
+                    if id == "actor_human_self" {
+                        "bojun".into()
+                    } else {
+                        id.into()
+                    }
+                },
+                area,
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -117,7 +119,10 @@ mod tests {
             }
             joined.push('\n');
         }
-        assert!(joined.contains("Announcement"), "title missing in:\n{joined}");
+        assert!(
+            joined.contains("Announcement"),
+            "title missing in:\n{joined}"
+        );
         assert!(joined.contains("hello world"), "body missing in:\n{joined}");
         assert!(joined.contains("@bojun"), "footer missing in:\n{joined}");
     }

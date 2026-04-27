@@ -167,10 +167,7 @@ fn run_am_with_retry(cfg: &AmSendConfig, args: &[String], label: &str) -> Result
         }
         cmd.args(args);
         let output = cmd.output().with_context(|| {
-            format!(
-                "spawn `{}` (attempt {}/{})",
-                cfg.am_bin, attempt, attempts
-            )
+            format!("spawn `{}` (attempt {}/{})", cfg.am_bin, attempt, attempts)
         })?;
         if output.status.success() {
             if attempt > 1 {
@@ -355,8 +352,7 @@ mod tests {
         let event = json!({});
         let line = callback_line(&event, "hi");
         let parsed: Value = serde_json::from_str(&line).unwrap();
-        let inner: Value =
-            serde_json::from_str(parsed["msgParam"].as_str().unwrap()).unwrap();
+        let inner: Value = serde_json::from_str(parsed["msgParam"].as_str().unwrap()).unwrap();
         assert_eq!(inner["content"], "hi");
         assert!(inner.get("senderStaffId").is_none());
         assert!(inner.get("conversationId").is_none());

@@ -12,8 +12,6 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use proto::methods::method;
 use proto::{Notification, Request, Response, RpcEnvelope};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -121,16 +119,6 @@ impl Client {
             ));
         }
         Ok(resp.result.unwrap_or(Value::Null))
-    }
-
-    pub async fn call<P: Serialize, R: DeserializeOwned>(
-        &self,
-        method: &str,
-        params: P,
-    ) -> Result<R> {
-        let value = serde_json::to_value(params)?;
-        let result = self.call_raw(method, Some(value)).await?;
-        Ok(serde_json::from_value(result)?)
     }
 
     pub async fn initialize(&self, client_name: &str, client_version: &str) -> Result<()> {

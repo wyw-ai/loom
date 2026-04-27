@@ -7,7 +7,6 @@ use proto::{ErrorCode, ErrorObject};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::runtime::wakeup;
 use crate::state::AppState;
 use crate::store::StoreError;
 
@@ -69,14 +68,6 @@ pub async fn dispatch(
         method::DELIVERY_LIST => delivery_list(state, connection_id, params),
         method::ACTOR_LIST => actor_list(state),
         method::ACTOR_UPSERT => actor_upsert(state, params),
-        method::AGENT_LIST => agent_list(state),
-        method::AGENT_REGISTER => agent_register(state, params),
-        method::AGENT_UNREGISTER => agent_unregister(state, params),
-        method::AGENT_START => agent_start(state, params).await,
-        method::AGENT_STOP => agent_stop(state, params).await,
-        method::AGENT_LOG => agent_log(state, params),
-        method::AGENT_LIST_MARKETPLACE => agent_list_marketplace(),
-        method::AGENT_INSTALL => agent_install(state, params),
         other => Err(ErrorObject::new(
             ErrorCode::METHOD_NOT_FOUND,
             format!("unknown method `{}`", other),
@@ -500,10 +491,9 @@ fn turn_open(state: &AppState, params: Option<Value>) -> HandlerResult {
 async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: TurnCloseParams = parse_params(params)?;
 
-    // Non-cancel paths: keep the v0 behavior — just write to store. Closing a
-    // turn this way is the agent's own internal lifecycle event (the embedded
-    // wakeup translator does this directly via store), or an external `joi
-    // agent serve` reporting completion. No adapter side-effects.
+    // Non-cancel paths: just write to store. Closing a turn this way is the
+    // actor's own lifecycle report, typically from an external `joi agent
+    // serve` worker. No adapter side-effects live in the server.
     if !matches!(p.status, TurnStatus::Cancelled) {
         let turn = state
             .store
@@ -533,40 +523,10 @@ async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>
         ));
     }
 
-    // Best-effort: nudge the adapter to stop. The eventual `Finished
-    // {success:false, summary:"cancelled"}` echo is no-oped below by the
-    // active-turn clearance — the journal write here is what other
-    // subscribers see.
-    if let Some(adapter) = state.runtime.adapter_for(&turn.actor_id) {
-        if let Err(e) = adapter.cancel(turn.scope.clone()).await {
-            tracing::warn!(actor = %turn.actor_id, %e, "adapter cancel failed");
-        }
-    }
-
-    // Flush any partial text the agent had already produced into a final
-    // `content.add` carrying `_meta.cancelled: true`. Preserves the work so
-    // the user can read what got typed before they stopped it.
-    if let Some(text) = state.runtime.take_text_buffer(&turn.actor_id, &p.turn_id) {
-        let payload = json!({
-            "contentType": "text/markdown",
-            "text": text,
-            "_meta": { "cancelled": true },
-        });
-        if let Err(e) = state.store.append_event(
-            "content.add".into(),
-            turn.actor_id.clone(),
-            turn.scope.clone(),
-            Some(p.turn_id.clone()),
-            payload,
-            vec![],
-            None,
-        ) {
-            tracing::warn!(turn = %p.turn_id, %e, "failed to flush cancelled text buffer");
-        }
-    }
-
     // Journal the cancel as a `turn.close` event so channel members render a
-    // system divider. `_meta.cancelledBy` lets clients show who pressed stop.
+    // system divider. The event is handed to the agent actor so external
+    // `joi agent serve` can cancel the actual adapter process; server itself
+    // stays transport-agnostic.
     let close_payload = json!({
         "status": "cancelled",
         "stopReason": "user_cancelled",
@@ -574,11 +534,19 @@ async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>
     });
     if let Err(e) = state.store.append_event(
         "turn.close".into(),
-        turn.actor_id.clone(),
+        caller.clone(),
         turn.scope.clone(),
         Some(p.turn_id.clone()),
         close_payload,
-        vec![],
+        vec![Relation {
+            kind: RelationKind::HandsOffTo,
+            target: Ref {
+                kind: RefKind::Actor,
+                id: turn.actor_id.clone(),
+                _meta: None,
+            },
+            _meta: None,
+        }],
         None,
     ) {
         tracing::warn!(turn = %p.turn_id, %e, "failed to write turn.close cancellation event");
@@ -588,23 +556,6 @@ async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>
         .store
         .close_turn(&p.turn_id, TurnStatus::Cancelled)
         .map_err(map_store_err)?;
-
-    // Clear runtime state so (a) the late ACP `Finished` echo is a no-op
-    // (its `let Some(tid) = active_turn ...` guard fails) and (b) the next
-    // FIFO trigger for this scope gets dispatched. Mirrors the wakeup path
-    // at wakeup.rs:426.
-    if let Some(next) = state
-        .runtime
-        .clear_active_turn(&turn.actor_id, &turn.scope.id)
-    {
-        let mgr = state.runtime.clone();
-        let actor = turn.actor_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = wakeup::dispatch_trigger(mgr, actor.clone(), next).await {
-                tracing::warn!(actor = %actor, %e, "post-cancel queued trigger dispatch failed");
-            }
-        });
-    }
 
     ok(TurnCloseResult { turn: closed })
 }
@@ -689,15 +640,6 @@ async fn event_append(state: &AppState, params: Option<Value>) -> HandlerResult 
         )
         .map_err(map_store_err)?;
 
-    // If this is an action.response, forward it to the originating ACP child.
-    if event.kind == "action.response" {
-        let runtime = state.runtime.clone();
-        let store = state.store.clone();
-        let ev = event.clone();
-        tokio::spawn(async move {
-            wakeup::forward_action_response(&runtime, &store, &ev).await;
-        });
-    }
     ok(EventAppendResult { event })
 }
 
@@ -802,7 +744,11 @@ fn delivery_list(state: &AppState, connection_id: &str, params: Option<Value>) -
         ));
     }
     let limit = p.limit.unwrap_or(50).clamp(1, 200) as usize;
-    let after = p.cursor.as_deref().map(decode_delivery_cursor).transpose()?;
+    let after = p
+        .cursor
+        .as_deref()
+        .map(decode_delivery_cursor)
+        .transpose()?;
     // Fetch one extra row to detect whether a follow-up page exists.
     let mut rows = state
         .store
@@ -850,166 +796,6 @@ fn actor_upsert(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(ActorUpsertResult { actor })
 }
 
-fn agent_list(state: &AppState) -> HandlerResult {
-    ok(AgentListResult {
-        agents: state.runtime.list(),
-    })
-}
-
-fn agent_register(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: AgentRegisterParams = parse_params(params)?;
-    let info = state
-        .runtime
-        .register(p.spec)
-        .map_err(|e| ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, e.to_string()))?;
-    ok(AgentRegisterResult { agent: info })
-}
-
-fn agent_unregister(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: AgentByIdParams = parse_params(params)?;
-    state
-        .runtime
-        .unregister(&p.actor_id)
-        .map_err(|e| ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, e.to_string()))?;
-    ok(AgentOkResult { ok: true })
-}
-
-async fn agent_start(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: AgentByIdParams = parse_params(params)?;
-    let runtime = state.runtime.clone();
-    runtime
-        .ensure_started(&p.actor_id)
-        .await
-        .map_err(|e| ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, e.to_string()))?;
-    let info = runtime
-        .get_info(&p.actor_id)
-        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "agent"))?;
-    ok(AgentSimpleResult { agent: info })
-}
-
-async fn agent_stop(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: AgentByIdParams = parse_params(params)?;
-    state
-        .runtime
-        .stop(&p.actor_id)
-        .await
-        .map_err(|e| ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, e.to_string()))?;
-    ok(AgentOkResult { ok: true })
-}
-
-fn agent_log(state: &AppState, params: Option<Value>) -> HandlerResult {
-    let p: AgentLogParams = parse_params(params)?;
-    let lines = state
-        .runtime
-        .log(&p.actor_id, p.tail)
-        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "agent"))?;
-    ok(AgentLogResult { lines })
-}
-
-// ---- agent/listMarketplace + agent/install ----
-
-fn agent_list_marketplace() -> HandlerResult {
-    ok(AgentMarketplaceListResult {
-        entries: proto::marketplace::list_all(),
-    })
-}
-
-fn agent_install(state: &AppState, params: Option<Value>) -> HandlerResult {
-    use proto::marketplace::{lookup, resolve, Preference};
-
-    let p: AgentInstallParams = parse_params(params)?;
-    let entry = lookup(&p.marketplace_id).ok_or_else(|| {
-        ErrorObject::new(
-            ErrorCode::APP_NOT_FOUND,
-            format!("marketplace entry `{}` not found", p.marketplace_id),
-        )
-    })?;
-    let prefer = match p.prefer.as_deref().unwrap_or("auto") {
-        "npx" => Preference::Npx,
-        "uvx" => Preference::Uvx,
-        "binary" => Preference::Binary,
-        _ => Preference::Auto,
-    };
-    let resolved = resolve(&entry, prefer, |bin| path_lookup_via_env(bin))
-        .map_err(|e| ErrorObject::new(ErrorCode::APP_INVALID_STATE, e.to_string()))?;
-
-    let local_id = p
-        .local_actor_id
-        .clone()
-        .unwrap_or_else(|| format!("actor_{}", entry.id.replace('-', "_")));
-    let display = p.display_name.clone().unwrap_or_else(|| entry.name.clone());
-
-    let spec = AgentSpec {
-        actor: Actor {
-            id: local_id.clone(),
-            kind: ActorKind::Agent,
-            display_name: display,
-            capabilities: None,
-            _meta: None,
-        },
-        transport: AgentTransport {
-            kind: "acp_stdio".into(),
-            command: resolved.command.clone(),
-            args: resolved.args.clone(),
-            env: resolved.env.clone(),
-            cwd: "{agent.workspace}".into(),
-            auth_method: None,
-            session: None,
-            output_format: None,
-            prompt_via: proto::methods::PromptVia::default(),
-        },
-        autostart: false,
-        bundle: None,
-        // Marketplace install gets persona + memory on by default: identity
-        // files scaffold from the marketplace description, memory prompt /
-        // MCP delivery are enabled so `memory.query` is reachable from the
-        // first turn. Old hand-written specs that skip these fields get
-        // `None` via serde default — behavior preserved.
-        identity: Some(proto::methods::IdentitySpec::default()),
-        memory: Some(proto::methods::MemorySpec {
-            delivery: proto::methods::MemoryDeliverySpec {
-                prompt: true,
-                mcp: true,
-            },
-            ..Default::default()
-        }),
-        announcement: None,
-    };
-
-    let info = state
-        .runtime
-        .register(spec)
-        .map_err(|e| ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, e.to_string()))?;
-    ok(AgentInstallResult {
-        agent: info,
-        source: resolved.source,
-    })
-}
-
-fn path_lookup_via_env(bin: &str) -> bool {
-    let path = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return false,
-    };
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return true;
-        }
-        // Windows: also try with .exe / .cmd
-        if cfg!(windows) {
-            for ext in ["exe", "cmd", "bat"] {
-                let mut c = candidate.clone();
-                c.set_extension(ext);
-                if c.is_file() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 #[allow(dead_code)]
 pub fn _ensure_arc<T>(x: Arc<T>) -> Arc<T> {
     x
@@ -1020,7 +806,6 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::journal::Journal;
-    use crate::runtime::RuntimeManager;
     use crate::store::Store;
     use crate::subscribe::{Connection, Subscriptions};
     use std::path::PathBuf;
@@ -1048,17 +833,9 @@ mod tests {
             ArtifactStore::new(root.join("artifacts"), root.join("workspaces"))
                 .expect("artifact store"),
         );
-        let runtime = RuntimeManager::new(
-            root.join("data"),
-            root.join("agents"),
-            store.clone(),
-            "ws://127.0.0.1:0/rpc".into(),
-        )
-        .expect("runtime");
         AppState {
             store,
             subscriptions,
-            runtime,
             artifacts,
         }
     }
@@ -1186,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_create_refuses_non_member_in_private_channel() {
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let channel = state
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
@@ -1208,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_create_allows_member() {
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let channel = state
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
@@ -1231,7 +1008,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_list_filters_to_visible_channels() {
-        let state = fresh_state();
+        let state = fresh_state("auto");
         // alice is in private_a; intruder is not. private_b is invisible to both.
         let private_a = state
             .store
@@ -1264,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_delete_refuses_non_member() {
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let channel = state
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
@@ -1290,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_update_refuses_non_member() {
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let channel = state
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
@@ -1352,9 +1129,12 @@ mod tests {
         // Baseline: an event with hands_off_to writes a Pending delivery row
         // for the target. The bound caller can list it back, and the result
         // includes the inline event payload (no follow-up scope/read needed).
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let ch = state.store.create_channel("c".into(), None).expect("ch");
-        state.store.grant_channel(&ch.id, "svc_writer").expect("g w");
+        state
+            .store
+            .grant_channel(&ch.id, "svc_writer")
+            .expect("g w");
         state
             .store
             .grant_channel(&ch.id, "actor_target")
@@ -1387,7 +1167,7 @@ mod tests {
         // record_receipt advances Pending -> Delivered. After that the
         // pending filter must drop the row, and the delivered filter picks
         // it up. Proves state is a real index, not a noop.
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let ch = state.store.create_channel("c".into(), None).expect("ch");
         state.store.grant_channel(&ch.id, "svc_writer").expect("gw");
         state
@@ -1397,7 +1177,11 @@ mod tests {
         let event_id = append_handoff(&state, &ch.id, "svc_writer", "actor_target");
         state
             .store
-            .record_receipt(event_id.clone(), "actor_target".into(), ReceiptKind::Completed)
+            .record_receipt(
+                event_id.clone(),
+                "actor_target".into(),
+                ReceiptKind::Completed,
+            )
             .expect("ack");
         open_conn(&state, "conn_t", "actor_target").await;
 
@@ -1438,7 +1222,7 @@ mod tests {
         // page returns the remaining 1 with no cursor. Together they cover
         // every event id exactly once — order-independent so the test is
         // resilient to clock-resolution ties (sort tiebreak is uuid event_id).
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let ch = state.store.create_channel("c".into(), None).expect("ch");
         state.store.grant_channel(&ch.id, "svc_writer").expect("gw");
         state
@@ -1496,7 +1280,7 @@ mod tests {
         // Reading another actor's inbox would let any connected client snoop
         // every directed event in the system. The handler refuses with the
         // same error class as "no bound actor".
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let ch = state.store.create_channel("c".into(), None).expect("ch");
         state.store.grant_channel(&ch.id, "svc_writer").expect("gw");
         state
@@ -1526,7 +1310,7 @@ mod tests {
     async fn delivery_list_requires_bound_actor() {
         // A connection that never called connection/open has no actor
         // identity; delivery/list cannot pick a default and must refuse.
-        let state = fresh_state();
+        let state = fresh_state("auto");
         let (tx, _rx) = mpsc::unbounded_channel();
         state.subscriptions.add_connection(Connection {
             id: "conn_anon".into(),

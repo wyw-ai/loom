@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::artifacts::ArtifactStore;
-use crate::runtime::RuntimeManager;
 use crate::store::Store;
 use crate::subscribe::Subscriptions;
 
@@ -9,6 +8,5 @@ use crate::subscribe::Subscriptions;
 pub struct AppState {
     pub store: Arc<Store>,
     pub subscriptions: Arc<Subscriptions>,
-    pub runtime: Arc<RuntimeManager>,
     pub artifacts: Arc<ArtifactStore>,
 }

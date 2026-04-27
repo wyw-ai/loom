@@ -26,14 +26,14 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterStartInfo};
+use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    pub cwd: PathBuf,
+    pub process_cwd: PathBuf,
     pub auth_method: Option<String>,
     /// Passed verbatim as `mcpServers` in every `session/new`. Callers
     /// synthesize this (e.g. from `memory.delivery.mcp = true` + the joi
@@ -76,9 +76,6 @@ struct AcpShared {
     /// `AdapterEvent` with the originating scope.
     sessions_by_id: Mutex<HashMap<String, ScopeRef>>,
     action_namespace: String,
-    /// Fixed cwd passed to every `session/new`. v0's behavior — every scope
-    /// shares the agent's workspace dir.
-    workdir: PathBuf,
     /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
     /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
     mcp_servers: Vec<Value>,
@@ -126,7 +123,8 @@ impl AcpAdapter {
             })
     }
 
-    async fn send_prompt_internal(&self, scope: ScopeRef, content: String) -> Result<(), String> {
+    async fn send_prompt_internal(&self, prompt: AdapterPrompt) -> Result<(), String> {
+        let scope = prompt.scope.clone();
         // Snapshot what we need under the parking_lot guard, then drop it
         // before any spawn_blocking / await.
         let (shared, existing_sid) = {
@@ -144,11 +142,19 @@ impl AcpAdapter {
                 let scope_for_new = scope.clone();
                 let shared_for_new = shared.clone();
                 let mcp_servers = shared.mcp_servers.clone();
+                let cwd = prompt.cwd.clone();
                 let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                    std::fs::create_dir_all(&cwd).map_err(|e| {
+                        format!(
+                            "Failed to create ACP session cwd `{}`: {}",
+                            cwd.display(),
+                            e
+                        )
+                    })?;
                     let res = shared_for_new.request_and_wait(
                         "session/new",
                         json!({
-                            "cwd": shared_for_new.workdir.to_string_lossy(),
+                            "cwd": cwd.to_string_lossy(),
                             "mcpServers": mcp_servers,
                         }),
                         Duration::from_secs(30),
@@ -175,6 +181,7 @@ impl AcpAdapter {
         };
 
         let scope_for_prompt = scope.clone();
+        let content = prompt.content;
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let request_id = shared.next_request_id_string();
             shared
@@ -320,8 +327,8 @@ impl Adapter for AcpAdapter {
         })
     }
 
-    async fn send_prompt(&self, scope: ScopeRef, prompt: String) -> Result<(), String> {
-        self.send_prompt_internal(scope, prompt).await
+    async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String> {
+        self.send_prompt_internal(prompt).await
     }
 
     async fn respond_action(&self, request_id: String, option_id: String) -> Result<(), String> {
@@ -342,23 +349,23 @@ fn start_blocking(
     cfg: AcpConfig,
     event_sender: mpsc::UnboundedSender<AdapterEvent>,
 ) -> Result<(AcpStartInfo, Child, Arc<AcpShared>), String> {
-    let workdir = if cfg.cwd.is_absolute() {
-        cfg.cwd.clone()
+    let process_cwd = if cfg.process_cwd.is_absolute() {
+        cfg.process_cwd.clone()
     } else {
         std::env::current_dir()
             .map_err(|e| e.to_string())?
-            .join(&cfg.cwd)
+            .join(&cfg.process_cwd)
     };
-    std::fs::create_dir_all(&workdir).map_err(|e| {
+    std::fs::create_dir_all(&process_cwd).map_err(|e| {
         format!(
             "Failed to create ACP workdir `{}`: {}",
-            workdir.display(),
+            process_cwd.display(),
             e
         )
     })?;
     let mut cmd = Command::new(&cfg.command);
     cmd.args(&cfg.args)
-        .current_dir(&workdir)
+        .current_dir(&process_cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -369,7 +376,7 @@ fn start_blocking(
         format!(
             "Failed to start ACP command `{}` in `{}`: {}",
             cfg.command,
-            workdir.display(),
+            process_cwd.display(),
             e
         )
     })?;
@@ -384,7 +391,6 @@ fn start_blocking(
         pending_permissions: Mutex::new(HashMap::new()),
         sessions_by_id: Mutex::new(HashMap::new()),
         action_namespace: Uuid::new_v4().to_string(),
-        workdir: workdir.clone(),
         mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
     });

@@ -4,6 +4,7 @@ mod draft;
 mod events;
 mod history;
 mod markdown;
+mod notify;
 mod picker;
 mod prompt;
 mod sidebar;

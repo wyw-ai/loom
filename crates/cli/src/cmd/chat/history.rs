@@ -34,8 +34,13 @@ pub struct Bubble {
 pub enum BubbleKind {
     /// content.add (streamed); subsequent same-actor/turn chunks append in place
     Stream,
-    /// non-streaming events (handoff, action.request/response, system)
+    /// non-streaming events (handoff, action.response, etc.)
     Static,
+    /// `action.request` events targeting the human. Rendered with extra
+    /// prominence so the operator notices that the agent is parked waiting
+    /// for a decision; counted by `pending_action_requests` until an
+    /// `action.response` matches the trailing event id.
+    ActionRequest,
     /// system / informational lines (server hints, errors)
     System,
 }
@@ -72,6 +77,12 @@ pub struct History {
     /// new `announcement.set`; cold-start `scope/read` replays naturally
     /// converge on the latest.
     pub current_announcement: Option<Announcement>,
+    /// Event ids of `action.request` events that have already been answered
+    /// in this scope. Populated from the `RespondsTo` relation on incoming
+    /// `action.response` events. Stored as a side set because the response
+    /// and request live in different bubbles and their own event ids differ
+    /// — comparing `trailing_event_id` directly never matches.
+    acked_request_ids: HashSet<String>,
 }
 
 pub struct RenderedHistory {
@@ -99,8 +110,13 @@ impl History {
                 self.push_handoff(ev, target, msg);
             }
             "content.add" => self.append_stream(ev),
-            "action.request" => self.push_static(ev, format_action_request(ev)),
-            "action.response" => self.push_static(ev, format_action_response(ev)),
+            "action.request" => self.push_action_request(ev, format_action_request(ev)),
+            "action.response" => {
+                if let Some(target) = responds_to_target(ev) {
+                    self.acked_request_ids.insert(target);
+                }
+                self.push_static(ev, format_action_response(ev));
+            }
             // Pinned announcement updates: render in the right-side panel
             // rather than as a chat bubble. We still want them to flow
             // through `push_event` so cold-start `scope/read` replays
@@ -340,6 +356,21 @@ impl History {
         });
     }
 
+    fn push_action_request(&mut self, ev: &Event, text: String) {
+        self.bubbles.push(Bubble {
+            actor_id: ev.actor_id.clone(),
+            turn_id: ev.turn_id.clone(),
+            kind: BubbleKind::ActionRequest,
+            text,
+            ts: ev.occurred_at,
+            reply_to_event_id: reply_target(ev),
+            trailing_event_id: Some(ev.id.clone()),
+            delivery: DeliveryState::NotApplicable,
+            streaming: false,
+            handoff_target: None,
+        });
+    }
+
     /// Static bubble for an explicit handoff. Stores only the message body
     /// in `text` and stashes the target id on the bubble; the renderer
     /// formats `|-> handoff -> {display(target)} ({short_id}): {text}` so
@@ -360,19 +391,11 @@ impl History {
     }
 
     pub fn pending_action_requests(&self) -> Vec<(String, String)> {
-        let mut acks: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for b in &self.bubbles {
-            if b.text.starts_with("✓ action.response → ") {
-                if let Some(eid) = b.trailing_event_id.as_ref() {
-                    acks.insert(eid.clone());
-                }
-            }
-        }
         let mut out = Vec::new();
         for b in &self.bubbles {
-            if b.text.starts_with("⌗ action.request") {
+            if b.kind == BubbleKind::ActionRequest {
                 if let Some(eid) = b.trailing_event_id.as_ref() {
-                    if !acks.contains(eid) {
+                    if !self.acked_request_ids.contains(eid) {
                         out.push((eid.clone(), b.text.clone()));
                     }
                 }
@@ -489,6 +512,7 @@ impl History {
             let actor_color = match b.kind {
                 BubbleKind::Stream => Color::Cyan,
                 BubbleKind::Static => Color::Yellow,
+                BubbleKind::ActionRequest => Color::Magenta,
                 BubbleKind::System => Color::DarkGray, // unreachable — handled above
             };
             let actor_style = if selected {
@@ -650,6 +674,15 @@ fn display_text(text: &str) -> &str {
 fn bubble_body_rows(bubble: &Bubble) -> Vec<Vec<Span<'static>>> {
     let rows = match bubble.kind {
         BubbleKind::Stream => markdown::render_to_rows(display_text(&bubble.text), Style::default()),
+        BubbleKind::ActionRequest => {
+            let style = Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD);
+            display_text(&bubble.text)
+                .split('\n')
+                .map(|line| vec![Span::styled(line.to_string(), style)])
+                .collect()
+        }
         _ => display_text(&bubble.text)
             .split('\n')
             .map(|line| vec![Span::raw(line.to_string())])
@@ -694,6 +727,16 @@ fn reply_target(ev: &Event) -> Option<String> {
     ev.relations
         .iter()
         .find(|r| matches!(r.kind, RelationKind::RepliesTo))
+        .map(|r| r.target.id.clone())
+}
+
+/// Event id this event responds to, e.g. an `action.response` pointing back
+/// at the `action.request` it answers. Used to retire the request from the
+/// pending set in `pending_action_requests`.
+fn responds_to_target(ev: &Event) -> Option<String> {
+    ev.relations
+        .iter()
+        .find(|r| matches!(r.kind, RelationKind::RespondsTo))
         .map(|r| r.target.id.clone())
 }
 
@@ -753,7 +796,7 @@ fn format_action_request(ev: &Event) -> String {
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("(action)");
-    let mut s = format!("⌗ action.request {} — {}", short_id(&ev.id), title);
+    let mut s = format!("⚠ action.request {} — {}", short_id(&ev.id), title);
     if let Some(arr) = ev.payload.get("choices").and_then(|v| v.as_array()) {
         for choice in arr {
             let cid = choice.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -864,6 +907,74 @@ mod tests {
             _meta: None,
         };
         assert_eq!(reply_target(&event).as_deref(), Some("evt_1"));
+    }
+
+    #[test]
+    fn pending_action_requests_after_variant_switch_finds_unacknowledged_bubble() {
+        let mut history = History::default();
+        let req = Event {
+            id: "evt_action_1".into(),
+            kind: "action.request".into(),
+            actor_id: "actor_agent_opencode".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            turn_id: Some("turn_1".into()),
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({
+                "title": "Approve write to /etc/passwd?",
+                "choices": [
+                    { "id": "allow", "label": "Allow once" },
+                    { "id": "deny", "label": "Deny" },
+                ],
+            }),
+            relations: vec![Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: "actor_human_current".into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            _meta: None,
+        };
+        history.push_event(&req);
+
+        let pending = history.pending_action_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "evt_action_1");
+        assert_eq!(
+            history.bubbles.last().map(|b| b.kind.clone()),
+            Some(BubbleKind::ActionRequest)
+        );
+
+        // An action.response carrying the same trailing event id (pushed via
+        // push_static through the normal `action.response` path) clears it.
+        let resp = Event {
+            id: "evt_action_1".into(),
+            kind: "action.response".into(),
+            actor_id: "actor_human_current".into(),
+            scope: req.scope.clone(),
+            turn_id: None,
+            seq: 2,
+            occurred_at: Utc::now(),
+            payload: json!({ "optionId": "allow", "kind": "accepted" }),
+            relations: vec![Relation {
+                kind: RelationKind::RespondsTo,
+                target: Ref {
+                    kind: RefKind::Event,
+                    id: "evt_action_1".into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            _meta: None,
+        };
+        history.push_event(&resp);
+        assert!(history.pending_action_requests().is_empty());
     }
 
     #[test]

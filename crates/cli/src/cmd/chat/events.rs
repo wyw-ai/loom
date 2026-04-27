@@ -362,19 +362,47 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         }
         _ => {}
     }
-    let n_scope = params.get("scope").cloned();
-    if let Some(s) = n_scope {
-        if let Ok(parsed) = serde_json::from_value::<ScopeRef>(s) {
-            if &parsed != scope {
-                return;
-            }
+    // Parse the embedded scope and (for EVENT_CREATED) the embedded event up
+    // front so we can recognize an `action.request` aimed at us BEFORE the
+    // scope filter — the server pushes that frame to our connection directly
+    // (ws.rs actor-inbox fanout for HandsOffTo targets) even when we're bound
+    // to a different scope, and dropping it on the floor is the bug that
+    // leaves humans unable to intervene.
+    let parsed_scope: Option<ScopeRef> = params
+        .get("scope")
+        .cloned()
+        .and_then(|s| serde_json::from_value::<ScopeRef>(s).ok());
+    let parsed_event: Option<Event> = if kind == stream_kind::EVENT_CREATED {
+        data.get("event")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Event>(v).ok())
+    } else {
+        None
+    };
+    let in_scope = parsed_scope.as_ref().map_or(true, |p| p == scope);
+    let action_for_me = parsed_event
+        .as_ref()
+        .map(|ev| ev.kind == "action.request" && local_is_handoff_target(ev, &app.actor_id))
+        .unwrap_or(false);
+
+    // Cross-scope action.request inbox push: surface a banner + bell + desktop
+    // notification, but don't ingest into the current scope's history.
+    if action_for_me && !in_scope {
+        if let (Some(ev), Some(parsed)) = (parsed_event.as_ref(), parsed_scope.as_ref()) {
+            apply_cross_scope_action_request(app, parsed, ev);
         }
+        return;
+    }
+
+    if !in_scope {
+        return;
     }
     match kind.as_str() {
         stream_kind::EVENT_CREATED => {
-            if let Some(ev_value) = data.get("event").cloned() {
-                if let Ok(ev) = serde_json::from_value::<Event>(ev_value) {
-                    app.ingest_event(&ev);
+            if let Some(ev) = parsed_event.as_ref() {
+                app.ingest_event(ev);
+                if action_for_me {
+                    apply_in_scope_action_request(app, ev);
                 }
             }
         }
@@ -394,6 +422,63 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         }
         _ => {}
     }
+}
+
+/// True when `ev` carries a `HandsOffTo` Relation pointing at the local actor.
+/// Used to decide whether a fresh `action.request` is one we owe a response to
+/// (server-side wakeup.rs sets this relation to the turn's trigger actor).
+fn local_is_handoff_target(ev: &Event, local: &str) -> bool {
+    use proto::types::{RefKind, RelationKind};
+    ev.relations.iter().any(|r| {
+        matches!(r.kind, RelationKind::HandsOffTo)
+            && r.target.kind == RefKind::Actor
+            && r.target.id == local
+    })
+}
+
+/// Same-scope action.request for the local actor: fire the bell + desktop
+/// notification and, when the chat is idle (no picker, no prompt, no sidebar
+/// modal), auto-open the action picker so the human is presented with the
+/// choice immediately. Suppress auto-pop while another modal is up so we
+/// don't clobber draft state — the highlighted bubble + status-bar counter
+/// will still draw the operator in.
+fn apply_in_scope_action_request(app: &mut App, ev: &Event) {
+    let title = ev
+        .payload
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(action)");
+    super::notify::ring_terminal_bell();
+    super::notify::desktop_notify("Joi · action requested", title);
+    let idle = matches!(app.mode, Mode::Normal) && app.prompt.is_none() && app.picker.is_none();
+    if idle {
+        app.open_action_picker();
+    }
+}
+
+/// Cross-scope action.request landed via the actor-inbox push: don't pollute
+/// the current scope's history with a foreign event, but tell the operator
+/// (banner + bell + desktop notification) so they can switch and respond.
+fn apply_cross_scope_action_request(app: &mut App, scope: &ScopeRef, ev: &Event) {
+    let title = ev
+        .payload
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(action)");
+    let scope_label = match scope.kind {
+        ScopeKind::Channel => format!("#{}", scope.id),
+        ScopeKind::Thread => format!("thread {}", scope.id),
+    };
+    app.history.push_system(format!(
+        "⚠ pending action.request in {} — switch and /action ({})",
+        scope_label, title
+    ));
+    app.set_status(format!("⚠ action.request waiting in {}", scope_label));
+    super::notify::ring_terminal_bell();
+    super::notify::desktop_notify(
+        "Joi · action requested",
+        &format!("{} — in {}", title, scope_label),
+    );
 }
 
 /// Register a freshly opened turn so cancel and the streaming bar know about

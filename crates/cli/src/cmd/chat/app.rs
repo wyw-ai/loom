@@ -453,6 +453,14 @@ impl App {
         self.mode = Mode::Picker(PickerKind::HandoffTarget);
     }
 
+    /// Number of `action.request` events the local actor still owes a
+    /// response to. Sourced from `History::pending_action_requests`; surfaced
+    /// in the status bar so the operator always sees there's something to
+    /// resolve, even when scrolled away from the bubble.
+    pub fn pending_action_count(&self) -> usize {
+        self.history.pending_action_requests().len()
+    }
+
     pub fn open_action_picker(&mut self) {
         let pending = self.history.pending_action_requests();
         if pending.is_empty() {

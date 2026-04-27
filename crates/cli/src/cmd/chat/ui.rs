@@ -355,11 +355,22 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = Line::from(vec![Span::styled(
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let pending = app.pending_action_count();
+    if pending > 0 {
+        spans.push(Span::styled(
+            format!(" ⚠ {} pending action(s) — /action ", pending),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
         format!(" {}", app.status),
         Style::default().fg(Color::DarkGray),
-    )]);
-    f.render_widget(Paragraph::new(line), area);
+    ));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn input_height(app: &App, width: u16) -> u16 {

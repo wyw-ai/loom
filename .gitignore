@@ -7,3 +7,13 @@
 /.claude/
 /.am/
 __pycache__/
+
+# Desktop GUI (apps/gui-web + Tauri build artifacts)
+/apps/gui-web/node_modules/
+/apps/gui-web/dist/
+/apps/gui-web/.vite/
+/apps/gui-web/*.tsbuildinfo
+/apps/gui-web/vite.config.d.ts
+/apps/gui-web/vite.config.js
+/crates/gui/gen/
+/crates/gui/target/

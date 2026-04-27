@@ -1,0 +1,30 @@
+/* Design tokens — source of truth: docs/gui-desktop-design.md §4. */
+
+:root {
+  --bg-servers: #1a1b1e;
+  --bg-sidebar: #23252a;
+  --bg-main: #2b2d31;
+  --bg-elevated: #1e1f22;
+  --bg-hover: #34363c;
+  --bg-active: #404249;
+  --bg-mention: rgba(255, 196, 0, 0.08);
+
+  --border: #1f2023;
+
+  --text-primary: #f2f3f5;
+  --text-secondary: #b5bac1;
+  --text-muted: #80848e;
+
+  --accent: #5865f2;
+  --accent-hover: #4752c4;
+  --accent-contrast: #ffffff;
+
+  --success: #3ba55d;
+  --warning: #f2b14a;
+  --danger: #ed4245;
+
+  --role-human: #b794f4;
+  --role-agent: #22d3ee;
+  --role-service: #a1a1aa;
+  --role-self: var(--text-primary);
+}

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"]
+members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui"]
+# joi-gui pulls a sizable native dep tree (Tauri + system webkit on macOS, webkit2gtk
+# on Linux). Keep it out of the default `cargo build` the CI uses by excluding it
+# from `default-members`; developers opt in via `make gui-dev` / `cargo tauri dev`.
+default-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"

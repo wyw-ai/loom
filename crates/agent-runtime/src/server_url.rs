@@ -32,10 +32,10 @@ fn child_server_url(server_url: &str, assume_local: bool) -> String {
         return server_url.to_string();
     };
 
-    if assume_local || matches!(host.as_str(), "0.0.0.0" | "::") || loopback_accepts(port) {
-        if parsed.set_host(Some("127.0.0.1")).is_ok() {
-            return parsed.to_string();
-        }
+    if (assume_local || matches!(host.as_str(), "0.0.0.0" | "::") || loopback_accepts(port))
+        && parsed.set_host(Some("127.0.0.1")).is_ok()
+    {
+        return parsed.to_string();
     }
     server_url.to_string()
 }

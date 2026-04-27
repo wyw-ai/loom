@@ -147,6 +147,8 @@ export function App() {
             description: p.description,
             reason: p.reason,
             command: p.command,
+            rawInput: p.rawInput,
+            actionRequestId: p.requestId,
             choices: p.choices,
             arrivedAt: ev.occurredAt,
             seen: false,

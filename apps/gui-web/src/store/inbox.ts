@@ -9,6 +9,8 @@ export interface InboxItem {
   description: string;
   reason?: string;
   command?: string;
+  rawInput?: string;
+  actionRequestId?: string;
   choices: ActionChoice[];
   arrivedAt: string;
   seen: boolean;

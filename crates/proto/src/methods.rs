@@ -621,10 +621,11 @@ pub struct CommandSession {
     pub resume_args: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandOutputFormat {
     /// Whole stdout collected → single `content.add` event at process exit.
+    #[default]
     Text,
     /// Anthropic Claude Code `--output-format stream-json` framing.
     ClaudeStreamJson,
@@ -634,27 +635,16 @@ pub enum CommandOutputFormat {
     NdjsonLines,
 }
 
-impl Default for CommandOutputFormat {
-    fn default() -> Self {
-        Self::Text
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptVia {
     /// Append prompt as the final argv token (default). Safe — no shell parse.
+    #[default]
     Args,
     /// Write prompt to subprocess stdin, then close stdin.
     Stdin,
     /// Inject prompt as the env var `JOI_PROMPT`.
     Env,
-}
-
-impl Default for PromptVia {
-    fn default() -> Self {
-        Self::Args
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

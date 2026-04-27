@@ -19,10 +19,8 @@ pub async fn ws_upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
 }
 
 async fn handle_socket(state: AppState, socket: WebSocket) {
-    let connection_id = format!(
-        "conn_{}",
-        Uuid::new_v4().simple().to_string()[..12].to_string()
-    );
+    let suffix = Uuid::new_v4().simple().to_string();
+    let connection_id = format!("conn_{}", &suffix[..12]);
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
@@ -252,23 +250,37 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         // RespondsTo reverse-target (the actor whose event is being replied
         // to). Reverse-delivery makes service plugins reachable without
         // subscribing to every scope they touch — see store.rs append_event.
-        let mut targets: Vec<(String, &'static str)> = Vec::new();
+        let mut targets: Vec<(String, &'static str, bool)> = Vec::new();
         for r in &e.relations {
             match r.kind {
                 RelationKind::HandsOffTo if r.target.kind == RefKind::Actor => {
-                    targets.push((r.target.id.clone(), "hands_off_to"));
+                    targets.push((r.target.id.clone(), "hands_off_to", false));
                 }
                 RelationKind::RespondsTo if r.target.kind == RefKind::Event => {
                     if let Some(orig) = state.store.get_event(&r.target.id) {
-                        targets.push((orig.actor_id, "responds_to"));
+                        // Usually self-responses are deliberately ignored by
+                        // the actor-inbox path. Permission approvals are the
+                        // exception: a GUI may be misconfigured with the same
+                        // actor id as the agent runtime, but the response must
+                        // still reach the long-lived `joi agent serve`
+                        // connection so it can unblock the ACP child.
+                        let force_self = e.kind == "action.response"
+                            && orig.kind == "action.request"
+                            && orig.actor_id == e.actor_id;
+                        targets.push((orig.actor_id, "responds_to", force_self));
                     }
                 }
                 _ => {}
             }
         }
 
-        for (target_id, reason) in targets {
-            if !already_sent.insert(target_id.clone()) {
+        for (target_id, reason, force_self) in targets {
+            let dedupe_key = if force_self && target_id == e.actor_id {
+                format!("{target_id}:forced_action_response")
+            } else {
+                target_id.clone()
+            };
+            if !already_sent.insert(dedupe_key) {
                 continue;
             }
             // ACL gate the actor-inbox push: an outsider being mentioned

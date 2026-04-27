@@ -506,7 +506,7 @@ impl Store {
         // Validate turn exists. We do not require it to be Open: callers may
         // emit a final trace frame as part of the same handler that closes
         // the turn (order is best-effort; the frame is owner-private anyway).
-        if self.inner.read().turns.get(turn_id).is_none() {
+        if !self.inner.read().turns.contains_key(turn_id) {
             return Err(StoreError::NotFound(format!("turn {turn_id}")));
         }
 
@@ -547,7 +547,7 @@ impl Store {
         limit: u32,
         before_seq: Option<u64>,
     ) -> StoreResult<(Vec<TraceFrame>, bool)> {
-        if self.inner.read().turns.get(turn_id).is_none() {
+        if !self.inner.read().turns.contains_key(turn_id) {
             return Err(StoreError::NotFound(format!("turn {turn_id}")));
         }
         let inner = self.inner.read();
@@ -572,6 +572,7 @@ impl Store {
 
     /// Append an event. Implicit-turn behavior: if `turn_id` is None, an implicit Turn
     /// is opened+closed around this single event.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_event(
         &self,
         kind: String,
@@ -691,7 +692,13 @@ impl Store {
                 let Some(orig) = inner.events.get(&r.target.id) else {
                     continue;
                 };
-                if orig.actor_id == actor_id {
+                // Permission responses must be reverse-delivered even when
+                // the responder uses the same actor id as the action.request
+                // author. That can happen when a GUI workspace is configured
+                // with the agent actor id; the long-lived agent connection
+                // still owns the actor inbox and needs the response.
+                let force_self = event.kind == "action.response" && orig.kind == "action.request";
+                if orig.actor_id == actor_id && !force_self {
                     continue;
                 }
                 if reverse_targets.contains(&orig.actor_id) {
@@ -795,7 +802,7 @@ impl Store {
             .deliveries
             .values()
             .filter(|d| d.actor_id == actor_id)
-            .filter(|d| state_filter.map_or(true, |s| d.state == s))
+            .filter(|d| state_filter.is_none_or(|s| d.state == s))
             .filter(|d| match &after {
                 None => true,
                 Some((ts, eid)) => {
@@ -1400,8 +1407,38 @@ mod tests {
 
         let key = (second_id, "agent_qa".to_string());
         assert!(
-            store.inner.read().deliveries.get(&key).is_none(),
+            !store.inner.read().deliveries.contains_key(&key),
             "self-response must not write a delivery row",
+        );
+    }
+
+    #[test]
+    fn action_response_to_own_action_request_keeps_reverse_delivery() {
+        // GUI misconfiguration can make the human workspace use the same actor
+        // id as the agent runtime. For permission prompts that still needs to
+        // route back to the long-lived `joi agent serve` inbox.
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        store.grant_channel(&ch.id, "agent_qa").unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: ch.id.clone(),
+        };
+
+        let request_id =
+            append_with_relations(&store, "action.request", "agent_qa", scope.clone(), vec![]);
+        let response_id = append_with_relations(
+            &store,
+            "action.response",
+            "agent_qa",
+            scope,
+            vec![responds_to(&request_id)],
+        );
+
+        let key = (response_id, "agent_qa".to_string());
+        assert!(
+            store.inner.read().deliveries.contains_key(&key),
+            "action.response to action.request must reverse-deliver even for same actor id",
         );
     }
 
@@ -1438,7 +1475,7 @@ mod tests {
         let store2 = Store::open(journal).unwrap();
         let key = (reply_id, "svc_am_bridge".to_string());
         assert!(
-            store2.inner.read().deliveries.get(&key).is_some(),
+            store2.inner.read().deliveries.contains_key(&key),
             "reverse delivery row must replay from journal",
         );
     }

@@ -205,6 +205,8 @@ function applyEvent(state: ScopeState, ev: JoiEvent): ScopeState {
           actionTitle: summary.title,
           actionReason: summary.reason,
           actionCommand: summary.command,
+          actionRawInput: summary.rawInput,
+          actionRequestId: summary.requestId,
           actionStatus: "pending",
           choices: summary.choices,
         }),

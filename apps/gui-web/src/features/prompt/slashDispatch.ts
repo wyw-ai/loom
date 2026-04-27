@@ -145,7 +145,11 @@ function openActionPicker({ scope }: DispatchCtx) {
               type: "action.response",
               actorId: useSession.getState().workspace!.actorId,
               scope,
-              payload: { optionId, kind: declined ? "declined" : "accepted" },
+              payload: {
+                optionId,
+                kind: declined ? "declined" : "accepted",
+                ...(b.actionRequestId ? { requestId: b.actionRequestId } : {}),
+              },
               relations: [
                 { kind: "responds_to", target: { kind: "event", id: eventId } },
               ],

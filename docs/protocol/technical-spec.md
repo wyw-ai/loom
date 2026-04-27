@@ -411,7 +411,7 @@ runtime:
     env:                             # 额外环境变量
       ANTHROPIC_API_KEY: sk-xxx
     authMethod: ""                   # 认证方式（如 "cursor_login"）
-    workdir: "{agent.workspace}"     # 工作目录模板（{channel.workspace} 兼容映射到同一路径）
+    workdir: "{agent.workspace}"     # 工作目录模板，按 channel + agent 解析
 
 tools:
   policyFile: ./tools.yaml           # 工具策略文件路径
@@ -1820,7 +1820,6 @@ Agent 可用，出现在 AgentList 中
 │       ├── agents/
 │       │   └── <agent-id>/
 │       │       ├── workspace/      # Agent 私有工作区（默认 cwd）
-│       │       ├── cache/
 │       │       └── logs/
 │       ├── threads/
 │       │   └── <thread-id>/
@@ -1829,7 +1828,6 @@ Agent 可用，出现在 AgentList 中
 │       │           ├── decisions.yaml
 │       │           ├── open_loops.yaml
 │       │           └── handoff.md
-│       └── workspace/              # 兼容目录；不再作为所有 Agent 的默认共享 cwd
 ├── registries/
 │   └── official-acp/
 │       └── registry.json           # Marketplace 注册表缓存

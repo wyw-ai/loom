@@ -51,15 +51,7 @@ pub async fn run(
 
 async fn pick_target(client: &Client) -> Result<String> {
     let actors: ActorListResult = client.call(method::ACTOR_LIST, json!({})).await?;
-    let agents: AgentListResult = client.call(method::AGENT_LIST, json!({})).await?;
     let mut rows: Vec<PickRow> = actors.actors.into_iter().map(PickRow::from_actor).collect();
-    for a in agents.agents {
-        if !rows.iter().any(|r| r.id == a.spec.actor.id) {
-            rows.push(PickRow::from_agent(a.spec.actor, a.status));
-        } else if let Some(r) = rows.iter_mut().find(|r| r.id == a.spec.actor.id) {
-            r.status = Some(a.status);
-        }
-    }
     if rows.is_empty() {
         return Err(anyhow!(
             "no actors known to the server (try `joi agent install <id>` first)"
@@ -88,7 +80,6 @@ struct PickRow {
     id: String,
     display: String,
     kind: ActorKind,
-    status: Option<String>,
 }
 
 impl PickRow {
@@ -97,15 +88,6 @@ impl PickRow {
             id: a.id,
             display: a.display_name,
             kind: a.kind,
-            status: None,
-        }
-    }
-    fn from_agent(a: Actor, status: String) -> Self {
-        Self {
-            id: a.id,
-            display: a.display_name,
-            kind: ActorKind::Agent,
-            status: Some(status),
         }
     }
     fn kind_order(&self) -> u8 {
@@ -124,9 +106,6 @@ impl std::fmt::Display for PickRow {
             ActorKind::Human => "human",
             ActorKind::Service => "service",
         };
-        match &self.status {
-            Some(s) => write!(f, "{}\t{} ({}, {})", self.id, self.display, kind, s),
-            None => write!(f, "{}\t{} ({})", self.id, self.display, kind),
-        }
+        write!(f, "{}\t{} ({})", self.id, self.display, kind)
     }
 }

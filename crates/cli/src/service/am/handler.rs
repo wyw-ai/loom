@@ -43,8 +43,8 @@ use super::{extract, reply, scope, AmConfig};
 pub fn load_spec(dir: &Path, service_id: &str) -> Result<ServiceSpec> {
     let direct = dir.join(format!("{service_id}.json"));
     if direct.exists() {
-        let text = fs::read_to_string(&direct)
-            .with_context(|| format!("read {}", direct.display()))?;
+        let text =
+            fs::read_to_string(&direct).with_context(|| format!("read {}", direct.display()))?;
         let spec: ServiceSpec = serde_json::from_str(&text)
             .with_context(|| format!("parse {} as ServiceSpec", direct.display()))?;
         spec.validate()?;
@@ -281,8 +281,7 @@ fn spawn_async_reply(
         "scopeKind": scope_kind,
         "scopeId": scope_id,
     });
-    let binary = std::env::current_exe()
-        .context("locate current binary for async-reply spawn")?;
+    let binary = std::env::current_exe().context("locate current binary for async-reply spawn")?;
     let log_path = am_cfg.async_log_path.clone().unwrap_or_else(|| {
         state::default_data_root()
             .join("services")
@@ -365,10 +364,7 @@ async fn run_normal(
     let state_dir = state::state_dir(data_root, runtime.service_id());
     let mut wrote_callback = false;
     for event in events {
-        let raw_text = event
-            .get("_raw")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let raw_text = event.get("_raw").and_then(|v| v.as_str()).unwrap_or("");
         let user_text = extract::extract_text(&event, raw_text);
         if user_text.is_empty() {
             tracing::warn!("am-joi: skipping empty message");
@@ -477,8 +473,7 @@ async fn run_async_reply(
         .await?;
     let runtime = ServiceRuntime::start(spec.id.clone(), actor_id, client, data_root)?;
 
-    let answer =
-        wait_for_answer(&runtime, &payload.trigger_id, am_cfg.reply_timeout_secs).await?;
+    let answer = wait_for_answer(&runtime, &payload.trigger_id, am_cfg.reply_timeout_secs).await?;
     reply::send_via_am(&am_cfg.am_send_config(), &payload.source_event, &answer)?;
     Ok(())
 }
@@ -632,10 +627,8 @@ mod tests {
 
     #[test]
     fn load_spec_finds_by_filename() {
-        let dir = std::env::temp_dir().join(format!(
-            "joi-am-handler-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("joi-am-handler-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("am1.json");
         std::fs::write(
@@ -649,10 +642,8 @@ mod tests {
 
     #[test]
     fn load_spec_rejects_id_filename_mismatch() {
-        let dir = std::env::temp_dir().join(format!(
-            "joi-am-handler-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("joi-am-handler-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("renamed.json");
         std::fs::write(

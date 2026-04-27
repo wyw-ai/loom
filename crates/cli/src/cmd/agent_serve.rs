@@ -3,7 +3,7 @@
 //! Loads `AgentSpec` JSON files from `~/.config/joi/agents/` (override with
 //! `--specs`), and for each spec opens a dedicated WebSocket to the joi server
 //! and supervises that one agent through the same `agent-runtime` adapter trait
-//! the embedded supervisor uses.
+//! used by ACP/command transports.
 //!
 //! Architecture (per docs/architecture-v1-agent-client.md §6):
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
@@ -15,22 +15,15 @@
 //!     opening / tracking a turn through `turn/open` + `turn/close`
 //!   * a translator task drains `AdapterEvent`s and re-emits them as
 //!     `event/append` (public content) + `turn/trace.append` (owner-only trace)
-//!     RPCs — mirroring v0's `runtime::wakeup::translate_event` translation
-//!     table 1:1, just with RPC instead of in-process store calls
-//!
-//! Pair this with the server flag `JOI_DISABLE_EMBEDDED_RUNTIME=1` to opt the
-//! server out of embedded supervision so v1 is the only path. Without that flag
-//! both the embedded supervisor AND `joi agent serve` will try to drive the same
-//! agent — racing on `turn/open` and double-flushing text.
+//!     RPCs.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
-    method, stream_kind, AgentBundleSpec, AgentSpec, BundleInstallMode, EventAppendResult,
-    TurnOpenResult,
+    method, stream_kind, AgentSpec, BundleInstallMode, EventAppendResult, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus};
@@ -39,9 +32,10 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
-use agent_runtime::command::{expand_session_templates, CommandAdapter, CommandConfig};
+use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::{
-    prepare_bundle_install, resolved_bundle_version, validate_bundle_current, Adapter, AdapterEvent,
+    agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterPrompt,
 };
 
 use crate::client::Client;
@@ -140,9 +134,9 @@ fn default_specs_dir() -> PathBuf {
 }
 
 fn default_data_root() -> PathBuf {
-    dirs::data_local_dir()
-        .map(|d| d.join("joi").join("agent-client"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agent-client"))
+    dirs::home_dir()
+        .map(|d| d.join(".agentx"))
+        .unwrap_or_else(|| PathBuf::from(".agentx"))
 }
 
 fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
@@ -165,16 +159,25 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
     Ok(out)
 }
 
-/// Per-agent paths under the agent-client data root. Keeps templating
-/// (`{agent.workspace}` etc.) consistent between embedded and external mode.
+/// Actor-level state plus channel-scoped workspaces under the AgentX root.
+#[derive(Clone)]
 struct AgentPaths {
-    workspace: PathBuf,
     profile: PathBuf,
-    logs: PathBuf,
     root: PathBuf,
     bundle_root: PathBuf,
     bundle_current: PathBuf,
     sessions: PathBuf,
+    data_root: PathBuf,
+}
+
+#[derive(Clone)]
+struct ScopePaths {
+    channel_root: PathBuf,
+    channel_shared: PathBuf,
+    channel_artifacts: PathBuf,
+    agent_root: PathBuf,
+    workspace: PathBuf,
+    logs: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -185,16 +188,30 @@ struct BundlePaths {
 }
 
 impl AgentPaths {
-    fn new(root: &Path, actor_id: &str) -> Self {
-        let agent_root = root.join("agents").join(actor_id);
+    fn new(data_root: &Path, actor_id: &str) -> Self {
+        let agent_root = data_root.join("agents").join(actor_id);
         Self {
-            workspace: agent_root.join("workspace"),
             profile: agent_root.join("profile"),
-            logs: agent_root.join("logs"),
             bundle_root: agent_root.join("bundles"),
             bundle_current: agent_root.join("bundles").join("current"),
             root: agent_root,
-            sessions: root.join("sessions"),
+            sessions: data_root.join("sessions"),
+            data_root: data_root.to_path_buf(),
+        }
+    }
+
+    fn scope(&self, actor_id: &str, channel_id: &str) -> ScopePaths {
+        let channel_root = self.data_root.join("channels").join(channel_id);
+        let channel_shared = channel_root.join("shared");
+        let channel_artifacts = channel_shared.join("artifacts");
+        let agent_root = channel_root.join("agents").join(actor_id);
+        ScopePaths {
+            channel_root,
+            channel_shared,
+            channel_artifacts,
+            workspace: agent_root.join("workspace"),
+            logs: agent_root.join("logs"),
+            agent_root,
         }
     }
 
@@ -204,14 +221,9 @@ impl AgentPaths {
         spec: &AgentSpec,
         bundle_paths: &BundlePaths,
     ) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.workspace)?;
         std::fs::create_dir_all(&self.profile)?;
-        std::fs::create_dir_all(&self.logs)?;
         std::fs::create_dir_all(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
-        if let Err(e) = agent_runtime::ensure_agents_md(&self.workspace, actor_id) {
-            tracing::warn!(actor = %actor_id, %e, "failed to write AGENTS.md");
-        }
         if spec.identity.is_some() || spec.memory.is_some() {
             let identity_file = spec
                 .identity
@@ -247,11 +259,8 @@ impl AgentPaths {
 
     fn expand_base(&self, input: &str) -> String {
         input
-            .replace("{agent.workspace}", &self.workspace.display().to_string())
             .replace("{agent.profile}", &self.profile.display().to_string())
-            .replace("{agent.logs}", &self.logs.display().to_string())
             .replace("{agent.root}", &self.root.display().to_string())
-            .replace("{agent.home}", &self.root.display().to_string())
     }
 
     fn bundle_paths(&self, spec: &AgentSpec) -> BundlePaths {
@@ -285,6 +294,91 @@ impl AgentPaths {
         base.replace("{agent.bundle_root}", &bundle_root)
             .replace("{agent.bundle}", &bundle_current)
     }
+
+    fn ensure_scope(&self, actor_id: &str, channel_id: &str) -> std::io::Result<ScopePaths> {
+        let scope = self.scope(actor_id, channel_id);
+        std::fs::create_dir_all(&scope.workspace)?;
+        std::fs::create_dir_all(&scope.logs)?;
+        std::fs::create_dir_all(&scope.channel_artifacts)?;
+        agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
+        Ok(scope)
+    }
+
+    fn template_vars(&self, actor_id: &str, channel_id: &str) -> BTreeMap<String, String> {
+        let scope = self.scope(actor_id, channel_id);
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "agent.workspace".into(),
+            scope.workspace.display().to_string(),
+        );
+        vars.insert("agent.root".into(), scope.agent_root.display().to_string());
+        vars.insert("agent.profile".into(), self.profile.display().to_string());
+        vars.insert("agent.logs".into(), scope.logs.display().to_string());
+        vars.insert(
+            "agent.bundle_root".into(),
+            self.bundle_root.display().to_string(),
+        );
+        vars.insert(
+            "agent.bundle".into(),
+            self.bundle_current.display().to_string(),
+        );
+        vars.insert(
+            "channel.root".into(),
+            scope.channel_root.display().to_string(),
+        );
+        vars.insert(
+            "channel.shared".into(),
+            scope.channel_shared.display().to_string(),
+        );
+        vars.insert(
+            "channel.sharedArtifacts".into(),
+            scope.channel_artifacts.display().to_string(),
+        );
+        vars
+    }
+
+    fn scope_env(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        server_url: &str,
+    ) -> BTreeMap<String, String> {
+        let scope = self.scope(actor_id, channel_id);
+        let mut env = BTreeMap::new();
+        env.insert("JOI_SERVER".into(), server_url.to_string());
+        env.insert("JOI_ACTOR".into(), actor_id.to_string());
+        env.insert(
+            "JOI_AGENT_PROFILE".into(),
+            self.profile.display().to_string(),
+        );
+        env.insert(
+            "JOI_AGENT_BUNDLE_DIR".into(),
+            self.bundle_current.display().to_string(),
+        );
+        env.insert("AGENTX_CHANNEL_ID".into(), channel_id.to_string());
+        env.insert(
+            "AGENTX_CHANNEL_ROOT".into(),
+            scope.channel_root.display().to_string(),
+        );
+        env.insert(
+            "AGENTX_CHANNEL_SHARED".into(),
+            scope.channel_shared.display().to_string(),
+        );
+        env.insert(
+            "AGENTX_CHANNEL_SHARED_ARTIFACTS".into(),
+            scope.channel_artifacts.display().to_string(),
+        );
+        env.insert(
+            "AGENTX_AGENT_ROOT".into(),
+            scope.agent_root.display().to_string(),
+        );
+        env.insert(
+            "AGENTX_AGENT_WORKSPACE".into(),
+            scope.workspace.display().to_string(),
+        );
+        env.insert("AGENTX_AGENT_LOGS".into(), scope.logs.display().to_string());
+        env
+    }
 }
 
 fn ensure_bundle(
@@ -296,9 +390,8 @@ fn ensure_bundle(
     std::fs::create_dir_all(&paths.root)?;
     let current = validate_bundle_current(
         &agent_paths.root,
-        &agent_paths.workspace,
         &agent_paths.profile,
-        &agent_paths.logs,
+        &agent_paths.root.join("logs"),
         &paths.root,
         &paths.current,
     )?;
@@ -406,6 +499,8 @@ struct WorkerState {
     /// here so prompt-envelope code can read identity/soul/memory without
     /// threading `paths` through every call.
     profile_dir: PathBuf,
+    paths: AgentPaths,
+    agent_server_url: String,
     /// In-flight turn per scope. Same agent in multiple channels => multiple
     /// concurrent turns, one per scope.id; same scope back-to-back is enforced
     /// to be FIFO via `pending_triggers` below.
@@ -423,6 +518,8 @@ struct WorkerState {
     /// `thread/list` RPC and reused from then on. Channel scopes don't need
     /// resolution (scope.id IS the channel id) so those don't populate it.
     scope_channel_cache: Mutex<HashMap<String, String>>,
+    /// action.request event id → underlying ACP request id.
+    action_map: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -436,16 +533,25 @@ struct ActiveTurn {
 }
 
 impl WorkerState {
-    fn new(actor_id: String, spec: AgentSpec, profile_dir: PathBuf) -> Self {
+    fn new(
+        actor_id: String,
+        spec: AgentSpec,
+        profile_dir: PathBuf,
+        paths: AgentPaths,
+        agent_server_url: String,
+    ) -> Self {
         Self {
             actor_id,
             spec,
             profile_dir,
+            paths,
+            agent_server_url,
             active_turns: Mutex::new(HashMap::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
+            action_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -512,6 +618,20 @@ impl WorkerState {
             .expect("seeded poisoned")
             .insert(scope_id.to_string())
     }
+
+    fn record_action_request(&self, event_id: String, request_id: String) {
+        self.action_map
+            .lock()
+            .expect("action_map poisoned")
+            .insert(event_id, request_id);
+    }
+
+    fn take_action_request(&self, event_id: &str) -> Option<String> {
+        self.action_map
+            .lock()
+            .expect("action_map poisoned")
+            .remove(event_id)
+    }
 }
 
 async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
@@ -541,13 +661,22 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         .await?;
     eprintln!("[{actor_id}] connected to {server_url} as agent");
 
+    let agent_server_url = agent_child_server_url(&server_url);
+    if agent_server_url != server_url {
+        eprintln!(
+            "[{actor_id}] injecting JOI_SERVER={} for child agents (agent-client connected via {})",
+            agent_server_url, server_url
+        );
+    }
     let state = Arc::new(WorkerState::new(
         actor_id.clone(),
         spec.clone(),
         paths.profile.clone(),
+        paths.clone(),
+        agent_server_url.clone(),
     ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
-    let adapter = build_adapter(&spec, &paths, &bundle_paths, &server_url)?;
+    let adapter = build_adapter(&spec, &paths, &bundle_paths, &agent_server_url)?;
 
     // Translator: AdapterEvent → server RPC. Drains until adapter drops the
     // sender (worker exit) — at which point the loop falls out and the task
@@ -572,43 +701,52 @@ fn build_adapter(
     bundle_paths: &BundlePaths,
     server_url: &str,
 ) -> Result<Arc<dyn Adapter>> {
-    let workdir = if spec.transport.cwd.is_empty() {
-        paths.workspace.clone()
-    } else {
-        PathBuf::from(paths.expand(&spec.transport.cwd, Some(bundle_paths)))
-    };
-    let mut env: std::collections::BTreeMap<String, String> = spec
+    let mut process_env: BTreeMap<String, String> = spec
         .transport
         .env
         .iter()
         .map(|(k, v)| (k.clone(), paths.expand(v, Some(bundle_paths))))
         .collect();
-    // Mirror the embedded runtime's auto-injection so an agent that shells
-    // out to `joi --json ...` from inside a tool call always knows where the
-    // server lives and which actor it speaks as.
-    env.entry("JOI_SERVER".into())
+    let mut command_env = spec.transport.env.clone();
+    process_env
+        .entry("JOI_SERVER".into())
         .or_insert_with(|| server_url.to_string());
-    env.entry("JOI_ACTOR".into())
+    command_env
+        .entry("JOI_SERVER".into())
+        .or_insert_with(|| server_url.to_string());
+    process_env
+        .entry("JOI_ACTOR".into())
         .or_insert_with(|| spec.actor.id.clone());
-    env.entry("JOI_AGENT_ROOT".into())
-        .or_insert_with(|| paths.root.display().to_string());
-    env.entry("JOI_ACTOR_HOME".into())
-        .or_insert_with(|| paths.root.display().to_string());
-    env.entry("JOI_AGENT_WORKSPACE".into())
-        .or_insert_with(|| paths.workspace.display().to_string());
-    env.entry("JOI_AGENT_PROFILE".into())
+    command_env
+        .entry("JOI_ACTOR".into())
+        .or_insert_with(|| spec.actor.id.clone());
+    process_env
+        .entry("JOI_AGENT_PROFILE".into())
         .or_insert_with(|| paths.profile.display().to_string());
-    env.entry("JOI_AGENT_LOGS".into())
-        .or_insert_with(|| paths.logs.display().to_string());
-    env.entry("JOI_AGENT_BUNDLE_ROOT".into())
+    command_env
+        .entry("JOI_AGENT_PROFILE".into())
+        .or_insert_with(|| paths.profile.display().to_string());
+    process_env
+        .entry("JOI_AGENT_BUNDLE_ROOT".into())
         .or_insert_with(|| bundle_paths.root.display().to_string());
-    env.entry("JOI_AGENT_BUNDLE_DIR".into())
+    command_env
+        .entry("JOI_AGENT_BUNDLE_ROOT".into())
+        .or_insert_with(|| bundle_paths.root.display().to_string());
+    process_env
+        .entry("JOI_AGENT_BUNDLE_DIR".into())
+        .or_insert_with(|| bundle_paths.current.display().to_string());
+    command_env
+        .entry("JOI_AGENT_BUNDLE_DIR".into())
         .or_insert_with(|| bundle_paths.current.display().to_string());
     if !bundle_paths.version.is_empty() {
-        env.entry("JOI_AGENT_BUNDLE_VERSION".into())
+        process_env
+            .entry("JOI_AGENT_BUNDLE_VERSION".into())
+            .or_insert_with(|| bundle_paths.version.clone());
+        command_env
+            .entry("JOI_AGENT_BUNDLE_VERSION".into())
             .or_insert_with(|| bundle_paths.version.clone());
     }
-    let args: Vec<String> = spec
+    let process_args: Vec<String> = spec
         .transport
         .args
         .iter()
@@ -616,7 +754,7 @@ fn build_adapter(
         .collect();
 
     match spec.transport.kind.as_str() {
-        "acp_stdio" | "" => {
+        "acp_stdio" => {
             let joi_binary = current_joi_binary();
             let mcp_servers = agent_runtime::build_mcp_servers(
                 joi_binary.as_deref(),
@@ -628,26 +766,21 @@ fn build_adapter(
             );
             let cfg = AcpConfig {
                 command: spec.transport.command.clone(),
-                args,
-                env,
-                cwd: workdir,
+                args: process_args,
+                env: process_env,
+                process_cwd: paths.root.clone(),
                 auth_method: spec.transport.auth_method.clone(),
                 mcp_servers,
             };
             Ok(Arc::new(AcpAdapter::new(cfg)))
         }
         "command" => {
-            let mut transport = spec.transport.clone();
-            transport.session = expand_session_templates(spec.transport.session.as_ref(), |s| {
-                paths.expand(s, Some(bundle_paths))
-            });
             let cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
-                transport.command.clone(),
-                args,
-                env,
-                workdir,
-                &transport,
+                spec.transport.command.clone(),
+                spec.transport.args.clone(),
+                command_env,
+                &spec.transport,
                 paths.sessions.clone(),
             );
             Ok(Arc::new(CommandAdapter::new(cfg)))
@@ -694,12 +827,23 @@ async fn notification_loop(
         let Ok(event) = serde_json::from_value::<Event>(event_value) else {
             continue;
         };
+        if event.kind == "action.response" {
+            if let Err(e) = handle_action_response(&state, &adapter, &event).await {
+                eprintln!("[{actor_id}] failed to handle action.response: {e}");
+            }
+            continue;
+        }
+        if event.kind == "turn.close" && is_for_us(&event, actor_id) {
+            if let Err(e) = handle_turn_close(&client, &state, &adapter, &event).await {
+                eprintln!("[{actor_id}] failed to handle turn.close: {e}");
+            }
+            continue;
+        }
         if !is_for_us(&event, actor_id) {
             continue;
         }
 
-        // Lazy start the adapter on first hands_off_to event. Same shape as the
-        // embedded `RuntimeManager::ensure_started` lifecycle.
+        // Lazy start the adapter on first hands_off_to event.
         if !started {
             eprintln!(
                 "[{actor_id}] starting adapter (first hand-off; ACP cold-start \
@@ -717,6 +861,87 @@ async fn notification_loop(
             eprintln!("[{actor_id}] failed to handle handoff: {e}");
         }
     }
+}
+
+async fn handle_action_response(
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event: &Event,
+) -> Result<()> {
+    for relation in &event.relations {
+        if !matches!(relation.kind, RelationKind::RespondsTo)
+            || relation.target.kind != RefKind::Event
+        {
+            continue;
+        }
+        let Some(request_id) = state.take_action_request(&relation.target.id) else {
+            continue;
+        };
+        let option_id = event
+            .payload
+            .get("optionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        adapter
+            .respond_action(request_id, option_id)
+            .await
+            .map_err(|e| anyhow!("adapter respond_action failed: {e}"))?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn handle_turn_close(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event: &Event,
+) -> Result<()> {
+    if event.payload.get("status").and_then(|v| v.as_str()) != Some("cancelled") {
+        return Ok(());
+    }
+    let Some(turn_id) = event.turn_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(active) = state.current_turn(&event.scope.id) else {
+        return Ok(());
+    };
+    if active.id != turn_id {
+        return Ok(());
+    }
+
+    if let Err(e) = adapter.cancel(active.scope.clone()).await {
+        tracing::warn!(
+            actor = %state.actor_id,
+            turn = %active.id,
+            scope = %active.scope.id,
+            %e,
+            "adapter cancel failed",
+        );
+    }
+    if let Some(text) = state.take_text(&active.id) {
+        append_event(
+            client,
+            "content.add",
+            &state.actor_id,
+            &active.scope,
+            Some(&active.id),
+            json!({
+                "contentType": "text/markdown",
+                "text": text,
+                "_meta": { "cancelled": true },
+            }),
+            vec![],
+        )
+        .await?;
+    }
+
+    let next_trigger = state.clear_turn(&active.scope.id);
+    if let Some(next) = next_trigger {
+        dispatch_handoff(client, state, adapter, next).await?;
+    }
+    Ok(())
 }
 
 fn is_for_us(event: &Event, actor_id: &str) -> bool {
@@ -777,8 +1002,21 @@ async fn dispatch_handoff(
 
         let user_text = render_prompt(&trigger);
         let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
+        let channel_id = resolve_channel_for_scope(client, state, &trigger.scope)
+            .await
+            .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", trigger.scope.id))?;
+        let scope_paths = state.paths.ensure_scope(&state.actor_id, &channel_id)?;
+        let adapter_prompt = AdapterPrompt {
+            scope: trigger.scope.clone(),
+            content: prompt,
+            cwd: scope_paths.workspace,
+            env: state
+                .paths
+                .scope_env(&state.actor_id, &channel_id, &state.agent_server_url),
+            template_vars: state.paths.template_vars(&state.actor_id, &channel_id),
+        };
 
-        match adapter.send_prompt(trigger.scope.clone(), prompt).await {
+        match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let _ = close_turn(client, &active.id, TurnStatus::Failed).await;
@@ -1019,7 +1257,7 @@ async fn translate_one(
         }
         AdapterEvent::ActionRequest {
             scope: _,
-            id: _,
+            id,
             request_type,
             title,
             description,
@@ -1029,11 +1267,10 @@ async fn translate_one(
                 tracing::warn!(actor = %actor_id, "ActionRequest event without matching active turn; dropping");
                 return Ok(());
             };
-            // For v1 MVP we surface the request to the trigger actor (so they
-            // can `joi action accept/decline`), but the response routing back
-            // into the adapter is not yet wired — `respond_action` plumbing
-            // requires a separate channel from the server's action.response
-            // handler back to this worker. Track as a known gap.
+            // Surface the request to the trigger actor (so they can
+            // `joi action accept/decline`) and remember the ACP request id.
+            // The server reverse-delivers the eventual action.response back
+            // to this agent connection through actor-inbox fanout.
             let payload = json!({
                 "requestType": request_type,
                 "title": title,
@@ -1052,7 +1289,7 @@ async fn translate_one(
                 },
                 _meta: None,
             }];
-            append_event(
+            let appended = append_event(
                 client,
                 "action.request",
                 actor_id,
@@ -1062,6 +1299,7 @@ async fn translate_one(
                 relations,
             )
             .await?;
+            state.record_action_request(appended.event.id, id);
         }
         AdapterEvent::StatusChange { scope: _, status } => {
             // If the event is scope-tagged AND that scope has a live turn,
@@ -1260,7 +1498,7 @@ async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::methods::AgentTransport;
+    use proto::methods::{AgentBundleSpec, AgentTransport};
     use proto::types::{Actor, ActorKind};
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
@@ -1277,7 +1515,6 @@ mod tests {
                 command: "echo".into(),
                 args: Vec::new(),
                 env: std::collections::BTreeMap::new(),
-                cwd: "{agent.workspace}".into(),
                 auth_method: None,
                 session: None,
                 output_format: None,
@@ -1332,9 +1569,9 @@ mod tests {
         let root = temp_path("bundle-cleanup");
         let paths = AgentPaths::new(&root, "actor_demo");
         std::fs::create_dir_all(&paths.bundle_root).expect("create bundle root");
-        std::fs::create_dir_all(&paths.workspace).expect("create workspace");
+        std::fs::create_dir_all(paths.root.join("workspace")).expect("create workspace");
         std::fs::create_dir_all(&paths.profile).expect("create profile");
-        std::fs::create_dir_all(&paths.logs).expect("create logs");
+        std::fs::create_dir_all(paths.root.join("logs")).expect("create logs");
         let old_target = paths.root.join("old-bundle");
         std::fs::create_dir_all(&old_target).expect("create old target");
         symlink_path(&old_target, &paths.bundle_current).expect("seed stale symlink");
@@ -1355,9 +1592,9 @@ mod tests {
     fn ensure_bundle_rejects_current_inside_profile() {
         let root = temp_path("bundle-current-profile");
         let paths = AgentPaths::new(&root, "actor_demo");
-        std::fs::create_dir_all(&paths.workspace).expect("create workspace");
+        std::fs::create_dir_all(paths.root.join("workspace")).expect("create workspace");
         std::fs::create_dir_all(&paths.profile).expect("create profile");
-        std::fs::create_dir_all(&paths.logs).expect("create logs");
+        std::fs::create_dir_all(paths.root.join("logs")).expect("create logs");
         let spec = sample_spec(Some(AgentBundleSpec {
             current: "{agent.profile}/live".into(),
             ..Default::default()

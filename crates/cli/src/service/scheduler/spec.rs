@@ -340,10 +340,18 @@ mod tests {
         cfg.validate().expect("valid");
         let job = &cfg.jobs[0];
         match &job.source {
-            Source::Http { url, method, headers, .. } => {
+            Source::Http {
+                url,
+                method,
+                headers,
+                ..
+            } => {
                 assert_eq!(url, "https://example.com/api/ci");
                 assert_eq!(method, "GET");
-                assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer x"));
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer x")
+                );
             }
             _ => panic!("wrong source kind"),
         }

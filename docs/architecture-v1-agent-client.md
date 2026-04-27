@@ -1,11 +1,7 @@
 # 架构 v1：Agent Client 拆分 + Adapter 模型
 
-> **状态**：phase E1–E3 已落代码（`refactor: extract trait Adapter`、
-> `feat(server): add CommandAdapter`、`refactor: extract agent-runtime crate`、
-> `feat(server): hooks for external agent client`、
-> `feat(cli): joi agent serve external runtime client`）。E4（删除 server 内嵌
-> runtime）延后——v0 嵌入路径与 v1 外置路径目前并存，由
-> `JOI_DISABLE_EMBEDDED_RUNTIME=1` 环境变量在 server 端切换。
+> **状态**：server 内嵌 runtime 已删除。`joi-server` 只负责消息枢纽职责；
+> agent runtime 由 `joi agent serve` 托管，adapter 代码在 `crates/agent-runtime/`。
 > 配套规范见 [docs/command-transport-v0.md](command-transport-v0.md)。
 > v0 当前实现见 [docs/architecture.md](architecture.md) 与
 > [docs/current-app-implementation.md](current-app-implementation.md)。
@@ -13,12 +9,11 @@
 ## TL;DR — v1 部署快速上手
 
 ```bash
-# 终端 1：启动 server，关掉嵌入 supervisor
-JOI_DISABLE_EMBEDDED_RUNTIME=1 cargo run -p joi-server
+# 终端 1：启动 server
+cargo run -p joi-server
 
-# 终端 2：把 v0 的 agent spec 拷到 client 配置目录
-mkdir -p ~/.config/joi/agents
-cp data/agents/*.json ~/.config/joi/agents/
+# 终端 2：安装或注册 agent spec
+cargo run -p joi-cli -- agent install claude-acp --actor-id actor_claude
 
 # 终端 3：跑 agent client；它会为每个 spec 起一条 ws 连接
 cargo run -p joi-cli -- agent serve
@@ -27,9 +22,7 @@ cargo run -p joi-cli -- agent serve
 cargo run -p joi-cli -- chat --in <thread_id>
 ```
 
-不设 `JOI_DISABLE_EMBEDDED_RUNTIME` 时 server 仍然内嵌 supervisor，跟 v0 行为一
-致；同时跑 `joi agent serve` 会和内嵌 supervisor 竞争 `turn/open`，所以两者只能
-二选一。
+server 不再读取 agent spec，也不会 spawn agent 子进程。
 
 ---
 
@@ -37,19 +30,16 @@ cargo run -p joi-cli -- chat --in <thread_id>
 
 ### 1.1 v0 的耦合点
 
-当前 `joi-server` 同时承担两个角色：
+拆分前 `joi-server` 同时承担两个角色：
 
 1. **消息枢纽**：维护 `Channel` / `Thread` / `Event` / `Relation` 这套协议对象，做
    scope routing、subscription、journal 持久化。
-2. **Agent supervisor**：内嵌一整套 ACP runtime（`crates/server/src/runtime/`），
+2. **Agent supervisor**：内嵌一整套 ACP runtime，
    按需 spawn ACP 子进程、把 `hands_off_to` 事件翻译成 `session/prompt`、再把 ACP
    流回的 `session/update` 翻译成 `content.add` / `action.request` / trace 帧。
 
-这两个职责通过 [`RuntimeManager`](../crates/server/src/runtime/mod.rs#L85-L469)
-+ [`spawn_supervisor`](../crates/server/src/runtime/wakeup.rs#L21-L34) 共享同一个
-内存对象图：server 启动时 `load_disk_specs()` 直接读 `agents/*.json`、
-`spawn_supervisor` 直接 `store.subscribe()`、`adapter.send_prompt` 直接走进程内
-mpsc channel。
+这两个职责共享同一个内存对象图：server 启动时直接读 `agents/*.json`，supervisor
+直接订阅 store，adapter 调用直接走进程内 mpsc channel。
 
 ### 1.2 这套耦合带来的问题
 
@@ -192,9 +182,10 @@ id 与 `actor.kind = "agent"`）。这样 server 端 `subscribe::bind_actor` 的
 | 内容 | v0 位置 | v1 位置（已实现） |
 | --- | --- | --- |
 | Agent spec（`*.json`） | `<server-data>/agents/` 由 server 扫描 | `~/.config/joi/agents/` 由 agent client 扫描；`--specs <dir>` 可覆盖 |
-| Marketplace catalog | server `assets/marketplace.json`（编译进二进制） | 暂未搬迁；仍由 server 暴露 `agent/marketplace`，`joi agent install` 走 server RPC（E4 之后再搬） |
-| Agent workspace（`{agent.workspace}` 等模板变量） | `<server-data>/agents/<id>/{workspace,cache,logs}` | `~/.local/share/joi/agent-client/agents/<id>/{workspace,cache,logs}` |
-| Command session 簿记 | （v0 没有 command transport） | `~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json` |
+| Marketplace catalog | 无 server 归属 | 由 CLI 读取内置 catalog；`joi agent install` 直接写本地 spec |
+| Actor 持久状态 | `<server-data>/agents/<id>/{profile,bundles,logs}` | `~/.agentx/agents/<id>/{profile,bundles}` |
+| Agent workspace（`{agent.workspace}` 等模板变量） | `<server-data>/channels/<channel-id>/agents/<id>/{workspace,logs}` | `~/.agentx/channels/<channel-id>/agents/<id>/{workspace,logs}` |
+| Command session 簿记 | （v0 没有 command transport） | `~/.agentx/sessions/<actor_id>/<scope_id>.json` |
 
 > **迁移工具**：尚未提供专门的 `migrate-from-server` 命令；当前用法是手工
 > `cp <server-data>/agents/*.json ~/.config/joi/agents/`，因为 spec 文件结构本身没变。
@@ -236,7 +227,7 @@ pub struct AdapterContext {
     pub workspace: PathBuf,   // {agent.workspace}
     pub profile: PathBuf,     // {agent.profile}
     pub logs: PathBuf,        // {agent.logs}
-    pub server_url: String,   // JOI_SERVER
+    pub server_url: String,   // child-facing JOI_SERVER, loopback-rewritten when possible
     /// agent 自己回头要 shell 出 joi 时，PATH 上带的 cli 目录
     pub cli_dir: Option<PathBuf>,
 }
@@ -244,9 +235,7 @@ pub struct AdapterContext {
 
 ### 4.2 `AdapterEvent`：跨 transport 的统一事件
 
-直接复用 v0
-[`AgentEvent`](../crates/server/src/runtime/acp.rs#L40-L66) 的七变体，重命名为
-`AdapterEvent`：
+`AdapterEvent` 是跨 transport 的统一事件：
 
 ```rust
 pub enum AdapterEvent {
@@ -266,8 +255,7 @@ pub enum AdapterEvent {
 ```
 
 每个 adapter 实现自己内部到 `AdapterEvent` 的翻译；`AdapterRegistry` 收到
-`AdapterEvent` 之后跑统一翻译层（直接挪用 v0
-[`translate_event`](../crates/server/src/runtime/wakeup.rs#L174-L339)），把它们
+`AdapterEvent` 之后跑统一翻译层，把它们
 变成 `event/append` / `turn/trace.update` / `turn/close` RPC 调用发回 server。
 
 不同 transport 的保真度差异通过填充 `AdapterEvent` 子集来表达：
@@ -334,7 +322,7 @@ gRPC agent 服务），不需要修改 joi 的代码。
 
 | 值 | 对应 adapter | 说明 |
 | --- | --- | --- |
-| `"acp_stdio"` | `AcpAdapter` | v0 的实现，行为不变 |
+| `"acp_stdio"` | `AcpAdapter` | 长驻 ACP 子进程；每个 dispatch 的 `session/new.cwd` 由 runtime 按 channel 计算 |
 | `"command"` | `CommandAdapter` | v1 新增，详见 [docs/command-transport-v0.md](command-transport-v0.md) |
 
 后续可继续追加（`"mcp_stdio"`、`"http_sse"` 等）。Agent client 启动时按
@@ -346,11 +334,8 @@ gRPC agent 服务），不需要修改 joi 的代码。
 
 ### 5.1 v0 的归属
 
-Server boot 时调用
-[`RuntimeManager::load_disk_specs`](../crates/server/src/runtime/mod.rs#L127-L144)
-扫描 `agents/`，每个 spec → `register_loaded` 写进 `Mutex<HashMap>` →
-`store.upsert_actor`。前端通过 `agent/list` / `agent/get` / `agent/save` 等 RPC
-访问这张表。
+拆分前 server boot 会扫描 `agents/`，每个 spec 写进内存 registry 并
+`store.upsert_actor`。前端通过 `agent/*` RPC 访问这张表。
 
 ### 5.2 v1 的归属
 
@@ -369,24 +354,15 @@ flowchart TD
   上线。Server 端
   [`subscriptions.bind_actor`](../crates/server/src/handlers/mod.rs#L98-L135)
   自动建立 actor↔connection 映射。
-- Server 端 `agent/*` RPC（`list`/`get`/`save`/`start`/`stop`/`log`/`install`/
-  `marketplace`）大致两条出路：
-  1. **彻底删掉**（最干净）。前端要列 agent，调 `actor/list` 过滤
-     `kind == "agent"` 即可；要管理 agent 配置，连 agent client 自己暴露的本地
-     管理接口（见下）。
-  2. **退化为只读视图**。`agent/list` 仍然存在，但实现改成"扫 server.actors 中
-     `kind=agent` 的项 + 关联 connection 是否在线"，不再持有任何 spec。安装/启
-     停操作迁到 agent client。
-
-倾向方案 2：保留只读 `agent/list` 给 GUI 展示用，写操作（install/start/stop）走
-agent client 本地接口。
+- Server 端 `agent/*` runtime RPC 已删除。前端要列 agent，调 `actor/list` 过滤
+  `kind == "agent"`；agent 配置管理走 CLI 本地 spec 文件。
 
 ### 5.3 Agent client 本地管理面
 
 `joi agent serve` 进程之外，仍然要让用户能 `joi agent install foo` /
 `joi agent stop bar`。两条选择：
 
-- **a)** agent client 在 `~/.local/share/joi/agent-client.sock` 起 unix socket，
+- **a)** agent client 在 `~/.agentx/joi-agent.sock` 起 unix socket，
   `joi agent <op>` 命令通过它管理本地 registry。
 - **b)** 不起 socket，`joi agent install` 直接写 `~/.config/joi/agents/foo.json`，
   agent client 监听文件目录变更（notify crate）做 hot reload。
@@ -446,9 +422,8 @@ sequenceDiagram
     end
 ```
 
-判断哪些事件触发哪个 actor，逻辑直接挪用 v0
-[`handle_store_event`](../crates/server/src/runtime/wakeup.rs#L36-L60)：只看
-`relations[].kind == HandsOffTo` 且 target 是该 client 管理的 actor 之一。
+判断哪些事件触发哪个 actor，只看 `relations[].kind == HandsOffTo` 且 target 是该
+client 管理的 actor 之一。
 
 ### 6.3 与 v0 的关键差别
 
@@ -472,13 +447,12 @@ sequenceDiagram
 
 提交：`refactor: extract trait Adapter`。
 
-- ~~在 `crates/server/src/runtime/` 下新增 `adapter.rs`，定义 `trait Adapter` 与
-  `AdapterEvent`（即 v0 `AgentEvent` 改名）。~~
+- ~~定义 `trait Adapter` 与 `AdapterEvent`。~~
 - ~~把现有 `AcpAdapter` 套上 trait。~~
-- ~~`RuntimeManager` 从 `Option<Arc<AcpAdapter>>` 改成 `Option<Arc<dyn Adapter>>`。~~
+- ~~server 侧 runtime 改成 `Arc<dyn Adapter>`。~~
 
 实际落点：trait 与 `AdapterEvent` 现在在 `crates/agent-runtime` crate 中，
-`AcpAdapter` 实现了它；server 端 `RuntimeManager` 通过 `Arc<dyn Adapter>` 持有。
+`AcpAdapter` 实现了它；server 不再依赖这个 crate。
 
 ### Phase E2：实现 `CommandAdapter` ✅ 已合
 
@@ -492,34 +466,22 @@ sequenceDiagram
 ### Phase E3：搬出去 ✅ 已合（分三步）
 
 - **E3a**（`refactor: extract agent-runtime crate`）：把
-  `runtime/{adapter,acp,command}` 整体提取到独立 crate `crates/agent-runtime/`，
-  让 server 与 cli 都能依赖。
-- **E3b**（`feat(server): hooks for external agent client`）：server 端加
-  `JOI_DISABLE_EMBEDDED_RUNTIME` 环境变量（`true|1|yes` 时跳过 supervisor 启动），
-  允许外部 client 接管 actor 上线。
+  adapter/acp/command 提取到独立 crate `crates/agent-runtime/`。
+- **E3b**：外部 client 通过 `connection/open(actor_id, kind=agent)` 接管 actor
+  上线。
 - **E3c**（`feat(cli): joi agent serve external runtime client`）：新增
   [`crates/cli/src/cmd/agent_serve.rs`](../crates/cli/src/cmd/agent_serve.rs)
   实现 `joi agent serve [--specs <dir>]`：扫 `~/.config/joi/agents/`，每个 spec 起
   一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
   `hands_off_to` 翻译成 `turn/open` + `send_prompt` + 流式 trace + `turn/close`。
 
-### Phase E4：清理 server ⏳ 延后
+### Phase E4：清理 server ✅ 已合
 
-提交：尚未落地，**v0 嵌入路径与 v1 外置路径目前并存**。切换方式：在 server 端
-设置 `JOI_DISABLE_EMBEDDED_RUNTIME=1` 即让 server 退化为纯消息枢纽，由
-`joi agent serve` 接管 supervisor。两者**不能同时运行**——会在 `turn/open`
-上抢占。
-
-后续 E4 真正落地时要做：
-
-- 默认部署不再启用嵌入 supervisor，删除 `crates/server/src/runtime/`（或缩成
-  feature flag `legacy-runtime` 并默认 off）。
-- `agent/*` RPC 退化为只读（基于 connection 视图），或彻底移除。
-- `crates/proto/src/methods.rs` 中 `AgentSpec` / `AgentTransport` 移到独立 mod
-  表明它们不属于 server 协议。
-
-延后理由：当前 GUI / 旧 CLI 仍然有路径走 `agent/list` `agent/install` 等 RPC，
-彻底删除会断掉 marketplace 流程；先让两路并存，等 v1 deploy 跑稳再清理。
+- 删除 `crates/server/src/runtime/`，server 不再依赖 `agent-runtime`。
+- 删除 server 侧 `agent/*` runtime RPC；agent spec 安装/注册/删除改为 CLI 本地写
+  `~/.config/joi/agents/`。
+- 后续可把 `AgentSpec` / `AgentTransport` 从 `methods.rs` 移到独立 mod，进一步
+  表明它们不属于 server runtime 协议。
 
 每个 phase 都满足"可灰度"：E1/E2 没有协议变更；E3 让 server 同时能跑两种部署模
 式；E4 才是 breaking change。
@@ -571,18 +533,15 @@ sequenceDiagram
 
 | 概念 | 现有位置 | 在 v1 中的对应 |
 | --- | --- | --- |
-| `AgentEvent` 七变体 | [crates/server/src/runtime/acp.rs:40-66](../crates/server/src/runtime/acp.rs#L40-L66) | `AdapterEvent`（重命名，跨 transport 共用） |
-| `RuntimeManager` 状态机 | [crates/server/src/runtime/mod.rs:85-469](../crates/server/src/runtime/mod.rs#L85-L469) | client 侧 `AdapterRegistry`（去掉 disk-spec 加载，加上 connection 管理） |
-| `AcpAdapter` 实现 | [crates/server/src/runtime/acp.rs:89-…](../crates/server/src/runtime/acp.rs#L89) | E1 阶段套上 trait，实现层不动 |
-| `spawn_supervisor` / `wake_agent` | [crates/server/src/runtime/wakeup.rs:21-98](../crates/server/src/runtime/wakeup.rs#L21-L98) | 移到 agent client；`store.subscribe()` 换成 `scope/subscribe` 流 |
-| `translate_event` | [crates/server/src/runtime/wakeup.rs:174-339](../crates/server/src/runtime/wakeup.rs#L174-L339) | 整段挪过去；`store.append_*` 换成 RPC 调用 |
-| `seed_manifest`（首次 prompt 注入的 cli 提示） | [crates/server/src/runtime/wakeup.rs:117-156](../crates/server/src/runtime/wakeup.rs#L117-L156) | 移到 agent client；逻辑不变 |
-| `forward_action_response` | [crates/server/src/runtime/wakeup.rs:380-411](../crates/server/src/runtime/wakeup.rs#L380-L411) | 客户端订阅自身相关 `action.response` 事件后调 `adapter.respond_action` |
-| `AgentSpec` / `AgentTransport` schema | [crates/proto/src/methods.rs:393-414](../crates/proto/src/methods.rs#L393-L414) | `transport.kind` 增加 `"command"`；其余字段保留 |
+| `AdapterEvent` 七变体 | [crates/agent-runtime/src/adapter.rs](../crates/agent-runtime/src/adapter.rs) | 跨 transport 共用 |
+| Agent 状态机 | [crates/cli/src/cmd/agent_serve.rs](../crates/cli/src/cmd/agent_serve.rs) | client 侧管理 adapter、turn 和 queue |
+| `AcpAdapter` 实现 | [crates/agent-runtime/src/acp.rs](../crates/agent-runtime/src/acp.rs) | ACP stdio transport |
+| `CommandAdapter` 实现 | [crates/agent-runtime/src/command.rs](../crates/agent-runtime/src/command.rs) | 一次性 CLI transport |
+| `action.response` 路由 | [crates/cli/src/cmd/agent_serve.rs](../crates/cli/src/cmd/agent_serve.rs) | agent client 调 `adapter.respond_action` |
+| `AgentSpec` / `AgentTransport` schema | [crates/proto/src/methods.rs:393-414](../crates/proto/src/methods.rs#L393-L414) | `transport.kind` 增加 `"command"`；`cwd` 从 spec 中移除，由 runtime 统一按 channel 计算 |
 | 现有 spec 范例 | [agents/actor_opencode.json](../agents/actor_opencode.json) | E3 阶段迁到 `~/.config/joi/agents/` |
 | Marketplace 编目 | [assets/marketplace.json](../assets/marketplace.json) | 编目格式不变；`joi agent install` 改由 cli 写本地文件 |
 | `connection/open` handler | [crates/server/src/handlers/mod.rs:98-135](../crates/server/src/handlers/mod.rs#L98-L135) | 不变；agent client 用同一接口上线每个被管理的 actor |
-| `agent/*` handler 集合 | [crates/server/src/handlers/mod.rs:397-461](../crates/server/src/handlers/mod.rs#L397-L461) | E4 阶段退化为只读视图或彻底移除 |
 
 ---
 

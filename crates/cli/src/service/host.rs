@@ -93,8 +93,7 @@ impl ServiceHost {
             let shutdown_rx = shutdown_rx.clone();
             let spec_id = spec.id.clone();
             handles.push(tokio::spawn(async move {
-                if let Err(e) =
-                    run_one_spec(spec, plugin, server_url, data_root, shutdown_rx).await
+                if let Err(e) = run_one_spec(spec, plugin, server_url, data_root, shutdown_rx).await
                 {
                     tracing::error!(spec_id = %spec_id, error = ?e, "plugin task failed");
                 }

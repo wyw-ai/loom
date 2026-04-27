@@ -233,6 +233,7 @@ impl DraftInput {
         }
     }
 
+    #[cfg(test)]
     pub fn submission_text(&self) -> String {
         self.submission().text
     }

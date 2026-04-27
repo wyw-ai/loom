@@ -140,12 +140,10 @@ pub struct Turn {
 #[serde(rename_all = "snake_case")]
 pub enum RelationKind {
     RepliesTo,
-    /// "X is meant for actor Y." Used for both explicit handoffs (`/handoff`,
-    /// `@mention`) and reply-induced targeting. The legacy distinction
-    /// between `targets` (soft @ mention) and `hands_off_to` (must respond)
-    /// collapsed once the policy became "@ always implies handoff" — old
-    /// journals using the `"targets"` discriminator still load via the
-    /// serde alias.
+    /// "X is meant for actor Y." Machine-routing semantics only exist when a
+    /// binding explicitly writes this relation; raw `@handle` text has no
+    /// protocol meaning by itself. The `targets` alias only keeps old journals
+    /// readable.
     #[serde(alias = "targets")]
     HandsOffTo,
     RespondsTo,

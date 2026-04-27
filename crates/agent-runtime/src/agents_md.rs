@@ -99,6 +99,10 @@ id verbatim when you pass `--in <scope_id>` below.\n\
 Shell out to `joi --json ...` for server state. `--json` returns machine-\n\
 readable output; drop it for pretty output.\n\
 \n\
+Joi does not execute arbitrary assistant-side tool calls such as `Skill`.\n\
+Use your own built-in tools or shell commands, and use `joi` / `a1` CLI\n\
+commands directly for server or Aone state.\n\
+\n\
 ```\n\
 joi --json event list --in <scope_id>                  # thread scope (default)\n\
 joi --json event list --in <scope_id> --channel        # channel scope\n\

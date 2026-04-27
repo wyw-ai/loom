@@ -52,7 +52,6 @@ fn main() {
             ipc::event_append,
             ipc::turn_close,
             ipc::actor_list,
-            ipc::agent_list,
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -65,4 +64,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("tauri app failed to start");
 }
-

@@ -37,10 +37,7 @@ pub struct ReplyTarget {
 }
 
 /// Light snapshot of an open turn the client has observed via `turn.opened`
-/// and not yet seen `turn.closed` for. Independent of the chat history's
-/// "streaming bubble" concept: an agent can be working on a turn before
-/// emitting any `turn/stream.update` deltas, so we need a separate registry
-/// to know what's cancelable.
+/// and not yet seen `turn.closed` for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTurn {
     pub turn_id: String,
@@ -76,17 +73,15 @@ pub struct App {
     /// Best-effort kind ("agent" / "human" / "service") per actor id; used
     /// only as a hint label in the @-mention picker.
     pub actor_kinds: HashMap<String, String>,
-    /// Registered agents from `agent/list`. `@...` is a fast handoff shortcut
-    /// and should not surface every historical human actor.
+    /// Agent actors from `actor/list`. `@...` is a fast handoff shortcut and
+    /// should not surface every historical human actor.
     pub agent_ids: HashSet<String>,
-    /// Runtime status per registered agent, sourced from `agent/list`.
+    /// Runtime status per agent when a future source provides it.
     pub agent_statuses: HashMap<String, String>,
     pub reply_target: Option<ReplyTarget>,
     /// Turns the server has told us are open and not yet closed. Keyed by
     /// turn id; populated from `turn.opened` / `turn.closed` notifications.
-    /// Used by Esc-cancel and the streaming status bar so cancellability
-    /// doesn't depend on whether the agent has emitted `turn/stream.update`
-    /// deltas yet.
+    /// Used by Esc-cancel and the in-flight status bar.
     pub open_turns: HashMap<String, OpenTurn>,
     pub selected_history_idx: Option<usize>,
     pub expanded_history: HashSet<usize>,
@@ -227,7 +222,7 @@ impl App {
     }
 
     /// Open turns currently registered for `scope`, sorted by open time so the
-    /// most recent is last (matches the streaming-bubble convention).
+    /// most recent is last.
     pub fn open_turns_in_scope(&self, scope: &ScopeRef) -> Vec<&OpenTurn> {
         let mut v: Vec<&OpenTurn> = self
             .open_turns
@@ -849,7 +844,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         app.history.bubbles.push(Bubble {
@@ -861,7 +855,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: None,
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         app.history.bubbles.push(Bubble {
@@ -873,7 +866,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_2".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 

@@ -271,7 +271,7 @@ async fn bootstrap_display_name(client: &Client, actor_id: &str) -> String {
 }
 
 async fn refresh_actor_directory(client: &Client, app: &mut App) {
-    use proto::methods::{ActorListResult, AgentListResult};
+    use proto::methods::ActorListResult;
     app.agent_ids.clear();
     app.agent_statuses.clear();
     if let Ok(list) = client
@@ -289,35 +289,11 @@ async fn refresh_actor_directory(client: &Client, app: &mut App) {
                 proto::types::ActorKind::Agent => "agent",
                 proto::types::ActorKind::Service => "service",
             };
-            // In v1 mode the server's `agent/list` is empty (the registry lives
-            // in the external `joi agent serve` process). Promote any
-            // kind=Agent actor we see in `actor/list` so handoff/@-mention
-            // pickers still find them. v0 mode stays correct because
-            // `agent/list` below re-inserts the same ids idempotently.
             if matches!(a.kind, proto::types::ActorKind::Agent) {
                 app.agent_ids.insert(a.id.clone());
             }
             app.actor_kinds.insert(a.id.clone(), kind.to_string());
             app.display_for.insert(a.id, name);
-        }
-    }
-    if let Ok(list) = client
-        .call::<_, AgentListResult>(method::AGENT_LIST, json!({}))
-        .await
-    {
-        for ai in list.agents {
-            let actor = ai.spec.actor;
-            let name = if actor.display_name.is_empty() {
-                actor.id.clone()
-            } else {
-                actor.display_name.clone()
-            };
-            app.agent_ids.insert(actor.id.clone());
-            app.agent_statuses
-                .insert(actor.id.clone(), ai.status.clone());
-            app.actor_kinds
-                .insert(actor.id.clone(), "agent".to_string());
-            app.display_for.insert(actor.id, name);
         }
     }
 }
@@ -326,12 +302,6 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
     if n.method == method::TURN_TRACE_UPDATE {
         if let Some(params) = n.params {
             handle_trace_update(app, &params);
-        }
-        return;
-    }
-    if n.method == method::TURN_STREAM_UPDATE {
-        if let Some(params) = n.params {
-            handle_stream_update(app, scope, &params);
         }
         return;
     }
@@ -481,11 +451,10 @@ fn apply_cross_scope_action_request(app: &mut App, scope: &ScopeRef, ev: &Event)
     );
 }
 
-/// Register a freshly opened turn so cancel and the streaming bar know about
-/// it even before the agent emits its first `turn/stream.update` delta. Skip
-/// turns we ourselves own — humans don't run agent-style turns through this
-/// chat, and even if they did, cancel would be a no-op against the same
-/// connection.
+/// Register a freshly opened turn so cancel and the in-flight bar know about
+/// it. Skip turns we ourselves own — humans don't run agent-style turns
+/// through this chat, and even if they did, cancel would be a no-op against
+/// the same connection.
 fn apply_turn_opened(app: &mut App, t: Turn) {
     if t.actor_id == app.actor_id {
         return;
@@ -618,39 +587,6 @@ fn apply_channel_revoked(app: &mut App, data: &serde_json::Value) {
             .cloned()
             .unwrap_or_else(|| actor_id.clone());
         app.set_status(format!("{} left #{}", display, title));
-    }
-}
-
-/// Turn/trace.update is owner-only; the server has already verified that this
-/// connection is bound to the turn's actor before pushing the frame. We surface
-/// it on the status line so the operator can see the agent's internal cursor
-/// (tool starts, status transitions) without polluting history.
-/// Apply a `turn/stream.update` notification: append a partial-text delta
-/// into the streaming bubble for `(actorId, turnId)`. Drops frames whose
-/// scope doesn't match the user's current scope; that bubble would belong
-/// to a different room and the server still routed it to us because we're
-/// also a subscriber there.
-fn handle_stream_update(app: &mut App, scope: &ScopeRef, params: &serde_json::Value) {
-    if let Some(s) = params.get("scope").cloned() {
-        if let Ok(parsed) = serde_json::from_value::<ScopeRef>(s) {
-            if &parsed != scope {
-                return;
-            }
-        }
-    }
-    let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
-    let actor_id = params.get("actorId").and_then(|v| v.as_str()).unwrap_or("");
-    let delta = params
-        .get("deltaText")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if turn_id.is_empty() || actor_id.is_empty() || delta.is_empty() {
-        return;
-    }
-    app.history
-        .append_stream_delta(actor_id, turn_id, delta, chrono::Utc::now());
-    if app.auto_follow {
-        app.jump_to_bottom();
     }
 }
 
@@ -2052,22 +1988,8 @@ fn print_members_into_history(app: &mut App, channel_id: &str) {
 }
 
 async fn open_handoff_picker(client: &Arc<Client>, app: &mut App) {
-    use proto::methods::{ActorListResult, AgentListResult};
+    use proto::methods::ActorListResult;
     let mut items: Vec<PickerItem> = Vec::new();
-    if let Ok(list) = client
-        .call::<_, AgentListResult>(method::AGENT_LIST, json!({}))
-        .await
-    {
-        for ai in list.agents {
-            let actor = ai.spec.actor;
-            let label = if actor.display_name.is_empty() {
-                actor.id.clone()
-            } else {
-                format!("{} (agent)", actor.display_name)
-            };
-            items.push(PickerItem::new(actor.id, label).with_status(ai.status));
-        }
-    }
     if let Ok(list) = client
         .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
         .await
@@ -2134,12 +2056,7 @@ async fn do_handoff_with_message(
     }
 }
 
-async fn do_announce(
-    client: &Arc<Client>,
-    app: &mut App,
-    scope: &ScopeRef,
-    text: Option<String>,
-) {
+async fn do_announce(client: &Arc<Client>, app: &mut App, scope: &ScopeRef, text: Option<String>) {
     use proto::methods::EventAppendResult;
     if !app.has_scope() {
         app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
@@ -2212,22 +2129,12 @@ async fn do_action_response(
 }
 
 async fn list_agents(client: &Arc<Client>, app: &mut App) {
-    use proto::methods::{ActorListResult, AgentListResult};
+    use proto::methods::ActorListResult;
     use std::collections::BTreeMap;
 
-    // (id, display, status). v0 path fills status from agent/list; v1 path
-    // (where the registry lives in `joi agent serve`) leaves status empty.
+    // (id, display, status). The server exposes actors; runtime status is not
+    // a server-side concern.
     let mut rows: BTreeMap<String, (String, String)> = BTreeMap::new();
-
-    if let Ok(list) = client
-        .call::<_, AgentListResult>(method::AGENT_LIST, json!({}))
-        .await
-    {
-        for ai in list.agents {
-            let actor = ai.spec.actor;
-            rows.insert(actor.id.clone(), (actor.display_name, ai.status));
-        }
-    }
     if let Ok(list) = client
         .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
         .await
@@ -2486,8 +2393,7 @@ async fn send_message(
 
 /// True when the current scope has at least one open turn that's cancellable.
 /// Source of truth is the `open_turns` registry (driven by `turn.opened` /
-/// `turn.closed` notifications), not the chat history's streaming-bubble
-/// state — agents may take a turn without ever emitting a stream delta.
+/// `turn.closed` notifications).
 fn has_open_turn(app: &App, scope: &ScopeRef) -> bool {
     !app.open_turns_in_scope(scope).is_empty()
 }
@@ -2615,7 +2521,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
@@ -2649,7 +2554,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
@@ -2695,7 +2599,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         app.selected_history_idx = Some(0);
@@ -2741,8 +2644,6 @@ mod tests {
         );
         let scope = test_scope();
         for (a, t) in actors_and_turns {
-            // Mirror real flow: register the open turn AND push a streaming
-            // bubble. The bubble lets us exercise the selection-aware branch.
             app.open_turns.insert(
                 (*t).into(),
                 OpenTurn {
@@ -2752,8 +2653,17 @@ mod tests {
                     opened_at: chrono::Utc::now(),
                 },
             );
-            app.history
-                .append_stream_delta(a, t, "live", chrono::Utc::now());
+            app.history.bubbles.push(Bubble {
+                actor_id: (*a).into(),
+                turn_id: Some((*t).into()),
+                kind: BubbleKind::Stream,
+                text: "working".into(),
+                ts: chrono::Utc::now(),
+                reply_to_event_id: None,
+                trailing_event_id: None,
+                delivery: DeliveryState::NotApplicable,
+                handoff_target: None,
+            });
         }
         app
     }
@@ -2806,9 +2716,9 @@ mod tests {
     }
 
     #[test]
-    fn pick_cancel_target_works_without_streaming_bubbles() {
-        // The whole point of the fix: an agent that hasn't emitted any
-        // `turn/stream.update` deltas yet should still be cancellable.
+    fn pick_cancel_target_works_without_history_bubbles() {
+        // The open-turn registry is sufficient; the agent does not need to
+        // have produced any visible message yet.
         use crate::cmd::chat::app::OpenTurn;
         let mut app = App::new(
             "actor_human_current".into(),
@@ -2825,7 +2735,7 @@ mod tests {
                 opened_at: chrono::Utc::now(),
             },
         );
-        // No streaming bubbles, no history at all — used to error before fix.
+        // No history at all.
         let (a, t) = pick_cancel_target(&app, &test_scope(), None).unwrap();
         assert_eq!(a, "Coder");
         assert_eq!(t, "turn_silent");

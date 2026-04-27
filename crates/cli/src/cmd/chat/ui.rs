@@ -19,13 +19,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let want_announcement = app.history.current_announcement.is_some();
     let sidebar_w: u16 = if app.sidebar.is_some() { 28 } else { 0 };
     let chat_min: u16 = 40;
-    let announce_w: u16 = if want_announcement
-        && area.width >= sidebar_w + chat_min + announcement::PANEL_WIDTH
-    {
-        announcement::PANEL_WIDTH
-    } else {
-        0
-    };
+    let announce_w: u16 =
+        if want_announcement && area.width >= sidebar_w + chat_min + announcement::PANEL_WIDTH {
+            announcement::PANEL_WIDTH
+        } else {
+            0
+        };
 
     let mut h_constraints: Vec<Constraint> = Vec::new();
     if sidebar_w > 0 {
@@ -71,24 +70,21 @@ pub fn render(f: &mut Frame, app: &mut App) {
     };
 
     // In-flight status: 1 dim row above the input, only when at least one
-    // agent has an open turn in this scope. Sourced from `open_turns` (driven
-    // by `turn.opened` / `turn.closed`) so the bar appears even before the
-    // agent has emitted a single `turn/stream.update` delta — that's the
-    // window during which Esc-cancel needs to be discoverable.
-    let streaming_bubbles = app.history.streaming_turns();
+    // agent has an open turn in this scope. Sourced from `open_turns` so
+    // Esc-cancel is discoverable before the final `content.add` arrives.
     let in_flight = if let Some(scope) = app.current_scope() {
-        in_flight_turns(app, &scope, &streaming_bubbles)
+        in_flight_turns(app, &scope)
     } else {
         Vec::new()
     };
-    let streaming_h: u16 = if in_flight.is_empty() { 0 } else { 1 };
+    let in_flight_h: u16 = if in_flight.is_empty() { 0 } else { 1 };
 
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(1), // title
         Constraint::Min(3),    // history
     ];
-    if streaming_h > 0 {
-        constraints.push(Constraint::Length(streaming_h));
+    if in_flight_h > 0 {
+        constraints.push(Constraint::Length(in_flight_h));
     }
     if dropdown_h > 0 {
         constraints.push(Constraint::Length(dropdown_h));
@@ -105,8 +101,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_history(f, app, outer[1]);
 
     let mut idx = 2usize;
-    if streaming_h > 0 {
-        render_streaming_bar(f, app, outer[idx], &in_flight);
+    if in_flight_h > 0 {
+        render_in_flight_bar(f, app, outer[idx], &in_flight);
         idx += 1;
     }
     if dropdown_h > 0 {
@@ -240,7 +236,7 @@ fn render_history(f: &mut Frame, app: &mut App, area: Rect) {
 /// Single-row dim bar that lists every agent with an open turn in scope.
 /// Hint at the end tells the user how to stop them: Esc cancels the only
 /// one (or the selected bubble), `/cancel @agent` for explicit.
-fn render_streaming_bar(f: &mut Frame, app: &App, area: Rect, in_flight: &[InFlightRow]) {
+fn render_in_flight_bar(f: &mut Frame, app: &App, area: Rect, in_flight: &[InFlightRow]) {
     let now = chrono::Utc::now();
     // Frame is a function of wall time so any redraw advances it (the chat
     // event loop wakes every ~100ms via `poll`, which is the spinner cadence).
@@ -261,9 +257,8 @@ fn render_streaming_bar(f: &mut Frame, app: &App, area: Rect, in_flight: &[InFli
         first = false;
         let elapsed = (now - row.started).num_seconds().max(0);
         let display = app.display_name_for(&row.actor);
-        let suffix = if row.streaming { "" } else { " (waiting)" };
         spans.push(Span::styled(
-            format!("@{display} · {elapsed}s{suffix}"),
+            format!("@{display} · {elapsed}s"),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -278,40 +273,20 @@ fn render_streaming_bar(f: &mut Frame, app: &App, area: Rect, in_flight: &[InFli
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// One row in the in-flight bar. `streaming=true` when the agent has emitted
-/// at least one stream delta (so we know it's actively producing output);
-/// `false` when only `turn.opened` has fired (queued or thinking, no output yet).
+/// One row in the in-flight bar.
 pub(super) struct InFlightRow {
     pub actor: String,
     pub started: chrono::DateTime<chrono::Utc>,
-    pub streaming: bool,
 }
 
-/// Merge open-turn registry entries with streaming-bubble metadata into the
-/// rows the in-flight bar renders. Open turns without a corresponding
-/// streaming bubble still surface — that's the whole point of this fix —
-/// but get a `(waiting)` suffix so the operator knows the agent hasn't
-/// started typing yet.
-pub(super) fn in_flight_turns(
-    app: &App,
-    scope: &proto::types::ScopeRef,
-    streaming_bubbles: &[(String, String, chrono::DateTime<chrono::Utc>)],
-) -> Vec<InFlightRow> {
-    use std::collections::HashMap;
-    let stream_by_turn: HashMap<&str, &chrono::DateTime<chrono::Utc>> = streaming_bubbles
-        .iter()
-        .map(|(_, turn_id, started)| (turn_id.as_str(), started))
-        .collect();
+/// Convert open-turn registry entries into the rows the in-flight bar renders.
+pub(super) fn in_flight_turns(app: &App, scope: &proto::types::ScopeRef) -> Vec<InFlightRow> {
     let mut rows: Vec<InFlightRow> = app
         .open_turns_in_scope(scope)
         .into_iter()
         .map(|t| InFlightRow {
             actor: t.actor_id.clone(),
-            started: stream_by_turn
-                .get(t.turn_id.as_str())
-                .map(|&&dt| dt)
-                .unwrap_or(t.opened_at),
-            streaming: stream_by_turn.contains_key(t.turn_id.as_str()),
+            started: t.opened_at,
         })
         .collect();
     rows.sort_by_key(|r| r.started);
@@ -441,8 +416,7 @@ fn visible_input_window(input: &str, cursor_char_idx: usize, max_width: usize) -
     if input.width() <= max_width {
         return InputWindow {
             text: input.to_string(),
-            cursor_x: width_of_chars(input, cursor_char_idx)
-                .min(u16::MAX as usize) as u16,
+            cursor_x: width_of_chars(input, cursor_char_idx).min(u16::MAX as usize) as u16,
         };
     }
 
@@ -476,9 +450,7 @@ fn visible_input_window(input: &str, cursor_char_idx: usize, max_width: usize) -
     while end_char < total && cumulative[end_char + 1] - cumulative[start_char] <= budget {
         end_char += 1;
     }
-    while end_char == total
-        && start_char > 0
-        && total_width - cumulative[start_char - 1] <= budget
+    while end_char == total && start_char > 0 && total_width - cumulative[start_char - 1] <= budget
     {
         start_char -= 1;
     }
@@ -578,11 +550,7 @@ fn wrap_input_rows(input: &str, cursor_char_idx: usize, row_width: usize) -> Wra
 }
 
 fn width_of_chars(input: &str, char_count: usize) -> usize {
-    input
-        .chars()
-        .take(char_count)
-        .map(char_display_width)
-        .sum()
+    input.chars().take(char_count).map(char_display_width).sum()
 }
 
 fn char_display_width(ch: char) -> usize {

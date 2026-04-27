@@ -141,9 +141,7 @@ enum ServiceCmd {
     },
     /// Validate a single ServiceSpec JSON file. Exits 0 on success and
     /// non-zero with the parsing/validation error otherwise.
-    Validate {
-        path: PathBuf,
-    },
+    Validate { path: PathBuf },
     /// Per-message AM bridge handler. Spawned by `am listen --script
     /// "joi service am-handler --service-id <id>"` once per DingTalk
     /// message. Replaces `examples/am-joi-channel-bridge.py`.
@@ -350,8 +348,7 @@ enum AgentCmd {
     },
     /// Run as the v1 external agent client: load every AgentSpec under
     /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
-    /// over its own server connection. Pair with `JOI_DISABLE_EMBEDDED_RUNTIME=1`
-    /// on the server to disable in-process supervision.
+    /// over its own server connection.
     Serve {
         /// Override the directory of AgentSpec JSON files.
         #[arg(long)]
@@ -408,16 +405,38 @@ async fn main() -> Result<()> {
         return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
     }
 
+    // Agent registry management is local to `joi agent serve`; the server is
+    // only the message bus.
+    if let Cmd::Agent { sub } = args.cmd {
+        match sub {
+            AgentCmd::List => cmd::agent::list()?,
+            AgentCmd::Marketplace => cmd::agent::marketplace()?,
+            AgentCmd::Install {
+                marketplace_id,
+                local_actor_id,
+                display_name,
+                prefer,
+            } => cmd::agent::install(marketplace_id, local_actor_id, display_name, prefer)?,
+            AgentCmd::Add => cmd::agent::add()?,
+            AgentCmd::Register { path } => cmd::agent::register(path)?,
+            AgentCmd::Remove { actor_id } => cmd::agent::remove(actor_id)?,
+            AgentCmd::Start { actor_id } => cmd::agent::start(actor_id)?,
+            AgentCmd::Stop { actor_id } => cmd::agent::stop(actor_id)?,
+            AgentCmd::Log { actor_id, tail } => cmd::agent::log(actor_id, tail)?,
+            AgentCmd::Serve { .. } => unreachable!("handled above"),
+        }
+        return Ok(());
+    }
+
     // `service serve` follows the same shape as `agent serve`: it opens
     // its own per-service connections (one per ServiceSpec, bound to the
     // service actor) and must not pollute the actor table with a human
     // entry. Same early-exit pattern.
     if let Cmd::Service {
-        sub:
-            ServiceCmd::Serve {
-                specs,
-                allow_services,
-            },
+        sub: ServiceCmd::Serve {
+            specs,
+            allow_services,
+        },
     } = args.cmd
     {
         return cmd::service::serve(specs, cfg.server_url, allow_services).await;
@@ -523,26 +542,7 @@ async fn main() -> Result<()> {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, false).await?
             }
         },
-        Cmd::Agent { sub } => match sub {
-            AgentCmd::List => cmd::agent::list(client).await?,
-            AgentCmd::Marketplace => cmd::agent::marketplace(client).await?,
-            AgentCmd::Install {
-                marketplace_id,
-                local_actor_id,
-                display_name,
-                prefer,
-            } => {
-                cmd::agent::install(client, marketplace_id, local_actor_id, display_name, prefer)
-                    .await?
-            }
-            AgentCmd::Add => cmd::agent::add(client).await?,
-            AgentCmd::Register { path } => cmd::agent::register(client, path).await?,
-            AgentCmd::Remove { actor_id } => cmd::agent::remove(client, actor_id).await?,
-            AgentCmd::Start { actor_id } => cmd::agent::start(client, actor_id).await?,
-            AgentCmd::Stop { actor_id } => cmd::agent::stop(client, actor_id).await?,
-            AgentCmd::Log { actor_id, tail } => cmd::agent::log(client, actor_id, tail).await?,
-            AgentCmd::Serve { .. } => unreachable!("handled before client setup"),
-        },
+        Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Event { sub } => match sub {
             EventCmd::List {

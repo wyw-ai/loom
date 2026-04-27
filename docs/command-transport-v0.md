@@ -62,7 +62,6 @@ pub struct AgentTransport {
     pub command: String,
     #[serde(default)] pub args: Vec<String>,
     #[serde(default)] pub env: BTreeMap<String, String>,
-    #[serde(default)] pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "authMethod")]
     pub auth_method: Option<String>,
@@ -124,7 +123,6 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
     "env": {
       "ANTHROPIC_API_KEY": "{env.ANTHROPIC_API_KEY}"
     },
-    "cwd": "{agent.workspace}",
     "session": {
       "first_run_capture": "stdout_json:.session_id",
       "resume_args": ["--resume", "{session_id}", "-p"]
@@ -136,9 +134,10 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
 }
 ```
 
-模板变量与 v0 一致：`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` /
-`{agent.root}`。其中 `{agent.home}` 只是 `{agent.root}` 的别名，用来兼容
-“actor home” 这层说法，不表示 `{agent.profile}`，也不表示进程级 `$HOME`。
+模板变量：`{agent.workspace}` / `{agent.profile}` / `{agent.logs}` /
+`{agent.root}` / `{channel.root}` / `{channel.shared}` /
+`{channel.sharedArtifacts}`。`{agent.root}` 不表示 `{agent.profile}`，
+也不表示进程级 `$HOME`。
 `{agent.profile}` 仍然专指 identity / memory / MCP 配置等 actor 持久状态目录。
 
 bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示 runtime
@@ -161,7 +160,7 @@ bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示
 ### 3.1 数据结构
 
 ```text
-~/.local/share/joi/agent-client/sessions/<actor_id>/<scope_id>.json
+~/.agentx/sessions/<actor_id>/<scope_id>.json
 ```
 
 每个文件：
@@ -258,21 +257,24 @@ first_run_capture: "file:{agent.profile}/last_session_id"
 
 ### 4.4 模板变量
 
-`first_run_capture` 与 `resume_args` / `args` / `env` / `cwd` 共享同一套变量替
-换，在 spec 加载时不展开（因为部分变量依赖 scope），运行时按需展开：
+`first_run_capture` 与 `resume_args` / `args` / `env` 共享同一套变量替换，在
+spec 加载时不展开（因为部分变量依赖 scope），运行时按需展开。进程 cwd 不在
+spec 里配置，由 runtime 固定设为当前 channel 下该 actor 的 workspace：
 
 | 变量 | 来源 |
 | --- | --- |
 | `{actor.id}` | 当前 actor id |
 | `{scope.id}` | 当前 scope id（trigger event 的 scope） |
 | `{scope.kind}` | `"thread"` 或 `"channel"` |
-| `{agent.workspace}` | `~/.local/share/joi/agents/<actor>/workspace` |
-| `{agent.profile}` | 同上的 `profile/`（per-actor 持久化状态：identity / memory / MCP 配置等） |
-| `{agent.logs}` | 同上的 `logs/` |
-| `{agent.root}` | 同上的根目录 |
-| `{agent.home}` | `{agent.root}` 的别名 |
-| `{agent.bundle_root}` | 同上的 `bundles/`（runtime 管理的版本化 bundle 根目录） |
+| `{agent.workspace}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>/workspace` |
+| `{agent.profile}` | `~/.agentx/agents/<actor-id>/profile`（per-actor 持久化状态：identity / memory / MCP 配置等） |
+| `{agent.logs}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>/logs` |
+| `{agent.root}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>` |
+| `{agent.bundle_root}` | `~/.agentx/agents/<actor-id>/bundles`（runtime 管理的版本化 bundle 根目录） |
 | `{agent.bundle}` | 当前激活 bundle 的目录（通常是 `bundles/current` 指向的版本目录） |
+| `{channel.root}` | `~/.agentx/channels/<channel-id>` |
+| `{channel.shared}` | `~/.agentx/channels/<channel-id>/shared` |
+| `{channel.sharedArtifacts}` | `~/.agentx/channels/<channel-id>/shared/artifacts` |
 | `{env.NAME}` | agent client 进程的 env var |
 | `{session_id}` | 仅 `resume_args` 可用 |
 | `{prompt}` | 仅 `resume_args` / `args`（当 `prompt_via=args`）可用 |
@@ -300,9 +302,9 @@ first_run_capture: "file:{agent.profile}/last_session_id"
 
 ### 5.2 空 prompt 的处理
 
-不应该出现"hand-off 事件没带文本"的情况——v0
-[`render_prompt`](../crates/server/src/runtime/wakeup.rs#L100-L111) 已经用 fallback
-（`text` → `message` → 整个 payload JSON）保证非空。但 adapter 要做防御性检查：
+不应该出现"hand-off 事件没带文本"的情况——`joi agent serve` 的
+`render_prompt` 会用 fallback（`text` → `message` → 整个 payload JSON）保证非空。
+但 adapter 要做防御性检查：
 
 - prompt 为空字符串时，发 `AdapterEvent::Error{ message: "empty prompt" }` 并跳
   过 spawn——不假装跑了一次。
@@ -352,11 +354,9 @@ Anthropic Claude Code `--output-format stream-json` 输出长这样（每行一�
 | `type=result, subtype=success` | 流末尾再补 `Text { is_partial: false }`（空字符串）触发 flush；然后 `Finished { success: true, summary: total_cost_usd }` |
 | `type=result, subtype=error_*` | `Finished { success: false, summary: error_message }` |
 
-注意：v0
-[`AgentEvent::Text`](../crates/server/src/runtime/acp.rs#L40-L66) 的 `is_partial`
-语义是"非 partial 即 flush 信号"。stream-json 没有显式 flush，所以约定"`type=result`
-之前所有的 text 都按 partial 累积，遇到 result 时 emit 一次 `is_partial=false`
-的空 text 强制 flush"。
+注意：`AdapterEvent::Text` 的 `is_partial` 语义是"非 partial 即 flush 信号"。
+stream-json 没有显式 flush，所以约定"`type=result` 之前所有的 text 都按 partial
+累积，遇到 result 时 emit 一次 `is_partial=false` 的空 text 强制 flush"。
 
 ### 6.3 `codex_stream_json`
 
@@ -424,7 +424,6 @@ session_id。
     "command": "claude",
     "args": ["-p", "--output-format", "stream-json", "--verbose"],
     "env": {},
-    "cwd": "{agent.workspace}",
     "session": {
       "first_run_capture": "stdout_json:.session_id",
       "resume_args": ["--resume", "{session_id}", "-p", "--output-format", "stream-json", "--verbose"]
@@ -440,7 +439,7 @@ session_id。
 
 人在 thread `thr_abc` 里发 `content.add` + `hands_off_to=actor_claude_cmd`。
 
-Agent client 查 `~/.local/share/joi/agent-client/sessions/actor_claude_cmd/thr_abc.json`：
+Agent client 查 `~/.agentx/sessions/actor_claude_cmd/thr_abc.json`：
 **不存在**。
 
 走 first run 路径：
@@ -524,7 +523,6 @@ echo "{\"type\":\"done\",\"ok\":true}"
     "command": "/Users/me/agents/echo-back.sh",
     "args": [],
     "env": {},
-    "cwd": "{agent.workspace}",
     "output_format": "ndjson_lines",
     "prompt_via": "args"
   },
@@ -540,22 +538,24 @@ echo "{\"type\":\"done\",\"ok\":true}"
 
 ### 8.3 注入给脚本的 env vars
 
-不论 spec 是否在 `env` 里写了，agent client 会自动注入：
+Runtime 会为 command 子进程补齐以下默认环境变量。spec 里的同名 `env` 值优先；
+`JOI_SERVER` 默认会尽量改写为 loopback 地址，避免本机 agent sandbox 不能访问网卡
+IP。也可以用 `JOI_AGENT_SERVER` 显式覆盖。
 
 | 环境变量 | 值 |
 | --- | --- |
-| `JOI_SERVER` | agent client 连接 server 用的 WS URL |
+| `JOI_SERVER` | 子进程 shell out 回 joi 时使用的 WS URL |
 | `JOI_ACTOR` | 当前 agent 的 actor id |
-| `JOI_SCOPE_ID` | trigger event 的 scope id |
-| `JOI_SCOPE_KIND` | `"thread"` 或 `"channel"` |
-| `JOI_TRIGGER_EVENT_ID` | 触发该次 prompt 的 event id |
-| `JOI_TURN_ID` | 这次调用对应的 turn id（agent client 已经 `turn/open` 拿到的） |
-| `PATH` | 加上 `joi` cli 所在目录，让脚本能直接 `joi --json event list ...` |
-
-这套环境变量与 v0 ACP child 的注入对齐
-（[`ensure_started`](../crates/server/src/runtime/mod.rs#L383-L444) 里只注 `JOI_SERVER`
-+ `JOI_ACTOR` + `PATH`），v1 加了 `JOI_SCOPE_*` / `JOI_TURN_ID` / `JOI_TRIGGER_EVENT_ID`
-让 command 脚本能在没有 ACP "seed manifest" 的情况下也知道当前上下文。
+| `JOI_AGENT_PROFILE` | per-actor profile 目录 |
+| `JOI_AGENT_BUNDLE_DIR` | 当前 bundle 目录 |
+| `AGENTX_CHANNEL_ID` | 当前 channel id |
+| `AGENTX_CHANNEL_ROOT` | 当前 channel 根目录 |
+| `AGENTX_CHANNEL_SHARED` | 当前 channel shared 目录 |
+| `AGENTX_CHANNEL_SHARED_ARTIFACTS` | 当前 channel artifacts 目录 |
+| `AGENTX_AGENT_ROOT` | 当前 channel 下该 agent 的私有根目录 |
+| `AGENTX_AGENT_WORKSPACE` | 当前 channel 下该 agent 的默认 workspace |
+| `AGENTX_AGENT_LOGS` | 当前 channel 下该 agent 的日志目录 |
+| `PATH` | 继承 `joi agent serve` 进程的 PATH |
 
 ### 8.4 脚本里 shell out 回 joi
 

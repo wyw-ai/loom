@@ -1,234 +1,156 @@
 # 架构说明
 
-> **架构演进说明**
->
-> 本文档描述 **v0 拓扑**：`joi-server` 内嵌 agent runtime，`joi-cli` 仅服务人。
-> 该形态目前**仍是默认部署**——不设环境变量启动 server 即此拓扑。
->
-> **v1 拓扑**（agent runtime 拆为独立 `joi agent serve` 进程、adapter 抽象支持
-> ACP + command transport）的代码已落（phase E1–E3），通过
-> `JOI_DISABLE_EMBEDDED_RUNTIME=1` 在 server 端打开。设计与部署指南见
-> [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md)。
->
-> Command transport 的详细 schema 与 worked example 见
-> [docs/command-transport-v0.md](command-transport-v0.md)。
+本文档描述当前 Rust 实现的职责边界。结论很简单：
 
-## 1. 当前结论
+- `joi-server` 是纯消息枢纽。
+- `joi agent serve` 是 agent runtime supervisor。
+- GUI / CLI / agent client 都通过同一套 WebSocket JSON-RPC 协议连接 server。
 
-这套东西已经不是“能不能做”的问题了，而是已经落成了一版可联调的 runtime + server + GUI。
+旧的 server-hosted runtime、server 侧 agent registry、`agent/*` runtime RPC 已删除。
 
-核心判断：
+## 1. 进程边界
 
-1. 协议文档里的领域模型是稳定的，适合做 server-first 的实现。
-2. `joi` 里已经有足够成熟的 ACP/runtime 经验，可以直接借思路。
-3. 本机已经安装了真实 ACP adapter，所以这里不需要把 mock 当主路径。
+### 1.1 joi-server
 
-## 2. 实现边界
+`joi-server` 只负责协作协议层：
 
-当前 `joi-apps` 负责两部分：
+- WebSocket JSON-RPC 连接管理
+- actor 上线登记
+- channel / thread / turn / event / relation 持久化
+- scope 订阅与事件 fanout
+- directed delivery 与 pending delivery
+- receipt / action request 记录
+- artifact 元数据与文件存储
+- turn trace 读写与 owner-only 访问控制
 
-### 2.1 Server
+server 不读取 agent spec，不安装 agent，不 spawn agent 子进程，也不链接
+`agent-runtime` crate。任何 adapter 生命周期都不应该进入 `crates/server`。
 
-负责：
+### 1.2 joi agent serve
 
-- 协议对象持久化
-- 事件追加与关系建模
-- scope 实时流绑定、directed delivery 与 membership 维护
-- pending delivery 补发
-- artifact 存储
-- action request / receipt
-- 本地 agent registry
-- 本地 ACP runtime 托管
+`joi agent serve` 是本机 agent client / supervisor：
 
-### 2.2 GUI
+- 读取本地 agent spec：默认 `~/.config/joi/agents/*.json`
+- 为每个启用的 agent 建立一条到 server 的 WebSocket 连接
+- 使用 `connection/open(actorKind=agent)` 把 agent 注册为普通 actor
+- 订阅 agent 所属 scope，接收 handoff / directed delivery
+- 打开 turn，调用 adapter，把 adapter 输出翻译为协议 event
+- 处理 `action.request` / `action.response`
+- 处理取消：收到 server fanout 的 `turn.close(cancelled)` 后取消本地 adapter
 
-负责：
+runtime 代码集中在：
 
-- 人类 actor 打开 GUI session
-- 浏览 `Channel` / `Thread`
-- 观察 timeline
-- 对 agent 发任务与显式 handoff
-- 把 `@handle` 作为普通文本引用显示，而不是机器路由
-- 回应 `action.request`
-- 在设置抽屉里安装 / 编辑 / 启停 agent
-- 观察 runtime 状态和日志
+- `crates/agent-runtime/`
+- `crates/cli/src/cmd/agent_serve.rs`
 
-## 3. 和 joi 的映射关系
+### 1.3 GUI / chat CLI
 
-| 协议对象 | 这次实现 | joi 对应概念 |
+人类客户端只负责交互：
+
+- 打开或订阅 channel / thread
+- 追加消息 event
+- 通过 `HandsOffTo` relation 显式把任务交给 agent
+- 渲染 timeline、turn、trace、receipt、artifact
+- 响应 agent 发出的 `action.request`
+
+列出 agent 时使用 `actor/list` 并过滤 `ActorKind::Agent`，不再调用 server 侧
+`agent/list`。
+
+## 2. 数据归属
+
+| 数据 | 归属 | 默认位置 |
 | --- | --- | --- |
-| `Actor` | `actors` 表 | user / agent / system sender |
-| `Channel` | `channels` 表 | channel（长期承载） |
-| `Thread` | `threads` 表 | thread（短期任务） |
-| `Turn` | `turns` 表 | 一次 agent 执行回合 |
-| `Event` | `events` 表 | message + runtime event stream |
-| `Relation` | `relations` 表 | reply / target / handoff / artifact link |
-| `Artifact` | `artifacts` 表 + 文件目录 | shared artifacts |
-| `Membership` | `memberships` 表 | scope 上的持续上下文归属 |
-| `Delivery` | `deliveries` 表 | 事件投递状态 |
-| `Receipt` | `receipts` 表 | action request 处理状态 |
+| 协作 journal / actors / channels / events / turns | `joi-server` | server `--data-dir` |
+| artifact 文件 | `joi-server` | `<data-dir>/artifacts` |
+| agent spec | `joi agent serve` / CLI 本地管理 | `~/.config/joi/agents` |
+| actor-private profile / bundles | `joi agent serve` | `~/.agentx/agents/<actor_id>` |
+| channel-scoped workspace / logs | `joi agent serve` | `~/.agentx/channels/<channel_id>/agents/<actor_id>` |
+| shared channel artifacts for runtime | `joi agent serve` | `~/.agentx/channels/<channel_id>/shared/artifacts` |
 
-## 4. Server 设计
+workspace 不再是 actor-private 的单一目录。每次 prompt 会按 channel + actor 计算
+cwd，ACP 的 `session/new.cwd` 与 command transport 的 `current_dir` 都使用这个
+scope-aware workspace。
 
-### 4.1 存储
+## 3. 协议模型
 
-- SQLite：`data/protocol.sqlite`
-- Artifact 文件：`data/artifacts/<artifact-id>/...`
-- Agent 文档：`data/agents/*.json`
-- Runtime 日志：`data/runtime-logs/*.log`
+核心对象仍然是协议层对象：
 
-### 4.2 接口
+| 对象 | 作用 |
+| --- | --- |
+| `Actor` | 人、agent、service、system 的统一身份 |
+| `Channel` | 长期协作空间 |
+| `Thread` | channel 内的短期任务分支 |
+| `Turn` | 某个 actor 的一次执行回合 |
+| `Event` | timeline 中不可变事实 |
+| `Relation` | reply / mention / handoff / artifact link |
+| `Artifact` | 可共享产物 |
+| `Delivery` | directed event 的投递状态 |
+| `Receipt` | action request 的处理结果 |
 
-HTTP 入口：
+server 只理解这些协议对象，不理解 ACP 会话、command 子进程、workspace 模板等
+adapter 细节。
 
-- `POST /api/rpc`
-- `GET /api/stream?session_id=...`
-- `GET /api/bootstrap`
-- `GET /api/action-requests`
-- `GET /api/artifacts/:id/content`
+## 4. Agent 调度闭环
 
-RPC 方法除了协议本身，还增加了本地 runtime 所需的 registry / runtime 操作：
+1. 人类客户端向 scope 追加 `message` event。
+2. 如果 event 有 `HandsOffTo(actor_agent_x)` relation，server 写入 directed
+   delivery 并 fanout 给订阅者。
+3. `joi agent serve` 的对应 worker 收到 event。
+4. worker 打开 turn，并构造 `AdapterPrompt`：
+   - `scope`
+   - `content`
+   - channel-aware `cwd`
+   - scope-aware env / template vars
+5. ACP transport 使用该 cwd 创建 `session/new`。
+6. command transport 使用该 cwd 作为 subprocess `current_dir`。
+7. adapter 输出被 worker 写回 server：
+   - `content.add`
+   - `action.request`
+   - `turn/trace.append`
+   - `turn.close`
 
-- `agent.list`
-- `agent.template.list`
-- `agent.get`
-- `agent.save`
-- `agent.delete`
-- `runtime.list`
-- `runtime.start`
-- `runtime.stop`
-- `runtime.log.read`
+server 在整个过程中只做 journal、fanout、ACL 与持久化。
 
-当前 app 的本地 RPC binding 使用 dot 形式方法名，例如 `scope.read`、`event.append`。
-协议文档中的 canonical 名称仍使用 slash 形式。
+## 5. 取消模型
 
-### 4.3 投递模型
+取消由人类客户端调用 `turn/close(status=cancelled)` 发起。
 
-事件入库后会按显式定向接收者写 `deliveries`：
+server 做两件事：
 
-1. relation 里被 `hands_off_to` 指向的 actor
+1. 校验调用者是 turn 所在 channel 的 member。
+2. 写入一个 `turn.close` event，并通过 `HandsOffTo(turn.actor_id)` fanout 给
+   agent actor。
 
-`scope.subscribe` 只决定哪个连接接收实时流，不决定谁属于 scope 的持续上下文。
-持续上下文由 `memberships` 表示，离线 actor 的 directed event 才会进入 `pending`。
+`joi agent serve` 收到该 event 后取消本地 adapter。server 不持有 adapter handle，
+也不会直接 kill 子进程。
 
-## 5. Runtime 设计
+## 6. Agent 管理命令
 
-### 5.1 真实 ACP adapter
+agent 管理现在是本地 CLI 行为：
 
-`server/acp.js` 现在已经是一个真正的 ACP stdio adapter，不再是 HTTP/SSE mock runtime：
+- `joi agent install`
+- `joi agent add`
+- `joi agent register`
+- `joi agent remove`
+- `joi agent list`
+- `joi agent marketplace`
 
-- 启动子进程
-- `initialize`
-- 可选 `authenticate`
-- `session/new`
-- `session/prompt`
-- `session/request_permission`
-- `session/update`
-- `session/cancel`
+这些命令读写 `~/.config/joi/agents`，不需要连接 server。
 
-它的行为对齐 `joi` Rust `acp.rs` 的基本模式：
+`joi agent start` / `joi agent stop` / `joi agent log` 不再代表 server runtime RPC。
+运行和停止 runtime 应通过常驻的 `joi agent serve` 进程管理。
 
-- 行分隔 JSON-RPC
-- ACP permission request 转成 GUI 可见的 `action.request`
-- ACP message chunk / tool call 转成协议 event
+## 7. 代码边界
 
-### 5.2 Agent registry
+| 模块 | 职责 |
+| --- | --- |
+| `crates/server` | 协议 server、store、WS fanout、artifact |
+| `crates/proto` | wire schema、RPC method 名、共享类型 |
+| `crates/client` | WebSocket JSON-RPC client |
+| `crates/agent-runtime` | ACP / command adapter 与 runtime helper |
+| `crates/cli/src/cmd/agent_serve.rs` | agent client supervisor |
+| `crates/cli/src/cmd/agent.rs` | 本地 agent spec 管理 |
+| `crates/gui` | Tauri GUI |
 
-Registry 会扫描两套来源：
-
-1. `data/agents/*.json`
-2. `~/.agentx/agents/*/spec.yaml`
-
-第二套不是直接运行文档，而是当作“可安装模板”。
-
-默认 seeded persona 会优先绑定本机已安装的真实 ACP：
-
-- `actor_agent_planner` 优先选择 `claude-acp`
-- `actor_agent_builder` 优先选择 `codex-acp`
-
-如果本地旧文档还是早期 `joi-http-v1` / `examples/runtime-agent.js` 形式，会自动迁移为 ACP transport。
-
-### 5.3 Runtime manager
-
-`server/runtime.js` 负责：
-
-- 按需启动 agent
-- 维护 runtime 状态
-- 为每个 agent 分配独立 `/tmp` 工作目录
-- 把 targeted event 排队给对应 agent
-- 打开 `Turn`
-- 把 ACP 输出映射成：
-  - `content.add`（按 turn 聚合，partial chunk 不直接广播）
-  - `action.request`
-  - `turn.close`
-  - 工具调用 / 状态变化 / 内部错误 / partial chunk → turn 私有 trace（`turn/trace.update`，仅推 owner）
-- 把 runtime status / runtime log 推给 GUI
-
-### 5.4 Workspace
-
-每个 agent 启动时都会生成新的 session root：
-
-```text
-/tmp/joi-agent-<actor-id>-xxxxxx/
-  workspace/
-  profile/
-  logs/
-```
-
-支持的模板变量：
-
-- `{agent.workspace}`
-- `{agent.profile}`
-- `{agent.logs}`
-- `{agent.root}`
-- `{channel.workspace}`
-- `{channel.cache}`
-- `{channel.logs}`
-- `{channel.root}`
-- `{session.root}`
-
-## 6. GUI 设计
-
-GUI 已经换成协作平台式布局，而不是早期“控制台按钮墙”。
-
-### 6.1 主界面
-
-主界面只保留人真正高频的动作：
-
-- scope 导航
-- timeline
-- compose / dispatch
-- pending approval
-- runtime 摘要
-
-### 6.2 设置抽屉
-
-所有 runtime / agent 运维操作都移到设置抽屉：
-
-- agent roster
-- agent 编辑
-- start / stop
-- adapter catalog
-- runtime detail
-- runtime log
-
-这符合你要求的“像 joi / Discord 一样，主页面不要堆满按钮”。
-
-## 7. 已知真实问题
-
-这里记录的是实际联调时遇到的约束。
-
-1. 某些 ACP adapter 启动依赖家目录写权限，例如 Cursor 会写 `~/.cursor`。
-2. 某些 ACP adapter 启动依赖外部网络或自己的远程服务，例如 OpenCode 会探测 models 服务。
-3. 所以“真实 ACP 能否成功启动”不只取决于本框架，也取决于 adapter 本机环境。
-
-这些都不是协议层或本框架的 mock 问题，而是 runtime 自身环境要求。
-
-## 8. 后续如果继续收口
-
-如果还要往 `joi` 正式产品的完成度继续收，下一批最值得补的是：
-
-1. thread context 文件化，比如 `summary.md` / `handoff.md`
-2. turn trace 的 owner-only 可视化视图（折叠/展开、按 tool 名分组）
-3. adapter 安装 / 更新 / 健康检查的完整设置流
-4. 更强的 permission trace / delivery trace / audit trace
+新的 runtime 能力只能放进 `crates/agent-runtime` 或 agent client；新的协议能力才进入
+server。

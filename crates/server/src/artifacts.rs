@@ -75,7 +75,10 @@ impl ArtifactStore {
                 meta.insert("workspaceEntryId".into(), json!(workspace.entry_id));
                 meta.insert("workspaceFilename".into(), json!(workspace.filename));
                 meta.insert("workspacePath".into(), json!(workspace.path));
-                meta.insert("workspaceScopeKind".into(), json!(scope_kind_name(workspace.kind)));
+                meta.insert(
+                    "workspaceScopeKind".into(),
+                    json!(scope_kind_name(workspace.kind)),
+                );
                 meta.insert("workspaceScopeId".into(), json!(workspace.scope_id));
                 meta
             }),

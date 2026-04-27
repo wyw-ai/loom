@@ -25,7 +25,12 @@ fn default_specs_dir() -> PathBuf {
     }
     dirs::config_dir()
         .map(|p| p.join("joi").join("services"))
-        .unwrap_or_else(|| PathBuf::from(".").join(".config").join("joi").join("services"))
+        .unwrap_or_else(|| {
+            PathBuf::from(".")
+                .join(".config")
+                .join("joi")
+                .join("services")
+        })
 }
 
 /// Load every `*.json` under `dir` and parse as `ServiceSpec`. Malformed
@@ -42,8 +47,8 @@ fn load_specs(dir: &Path) -> Result<Vec<ServiceSpec>> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("read spec {}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("read spec {}", path.display()))?;
         match serde_json::from_str::<ServiceSpec>(&text) {
             Ok(spec) => out.push(spec),
             Err(e) => {
@@ -73,8 +78,8 @@ pub async fn serve(
     allow_services: Vec<String>,
 ) -> Result<()> {
     let dir = specs_dir.unwrap_or_else(default_specs_dir);
-    let mut specs = load_specs(&dir)
-        .with_context(|| format!("load ServiceSpecs from {}", dir.display()))?;
+    let mut specs =
+        load_specs(&dir).with_context(|| format!("load ServiceSpecs from {}", dir.display()))?;
     if !allow_services.is_empty() {
         let allow: HashSet<&str> = allow_services.iter().map(String::as_str).collect();
         specs.retain(|s| allow.contains(s.id.as_str()));
@@ -118,8 +123,7 @@ pub async fn am_handler(
 /// run `ServiceSpec::validate()`, exit 0 on success, propagate the
 /// error otherwise. Useful in CI / pre-deploy hooks.
 pub fn validate(path: PathBuf) -> Result<()> {
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let spec: ServiceSpec = serde_json::from_str(&text)
         .with_context(|| format!("parse {} as ServiceSpec", path.display()))?;
     spec.validate()

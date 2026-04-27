@@ -35,10 +35,7 @@ pub async fn exec_source(source: &Source) -> Result<Vec<u8>> {
     let timeout = source.effective_timeout();
     match source {
         Source::Command {
-            command,
-            args,
-            env,
-            ..
+            command, args, env, ..
         } => exec_command(command, args, env, timeout).await,
         Source::Http {
             url,
@@ -66,9 +63,7 @@ async fn exec_command(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("spawn `{command}`"))?;
+    let child = cmd.spawn().with_context(|| format!("spawn `{command}`"))?;
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(r) => r.with_context(|| format!("wait `{command}`"))?,
         Err(_) => {
@@ -109,8 +104,8 @@ async fn exec_http(
     for (k, v) in headers {
         let name = HeaderName::from_bytes(k.as_bytes())
             .with_context(|| format!("invalid header name `{k}`"))?;
-        let val = HeaderValue::from_str(v)
-            .with_context(|| format!("invalid header value for `{k}`"))?;
+        let val =
+            HeaderValue::from_str(v).with_context(|| format!("invalid header value for `{k}`"))?;
         header_map.insert(name, val);
     }
     // A new client per call is fine for the tick-rate the scheduler
@@ -171,7 +166,9 @@ mod tests {
 
     #[tokio::test]
     async fn command_returns_stdout() {
-        let body = exec_source(&cmd("echo", &["hello", "world"])).await.unwrap();
+        let body = exec_source(&cmd("echo", &["hello", "world"]))
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8(body).unwrap().trim(), "hello world");
     }
 

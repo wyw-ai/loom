@@ -182,9 +182,7 @@ impl PromptModal {
                 if let PromptKind::CascadeDeleteChannel { expected_title, .. } = kind {
                     body_lines.push(Line::from(vec![Span::styled(
                         format!("Type '{expected_title}' to confirm cascade delete:"),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     )]));
                     body_lines.push(Line::from(Span::raw("")));
                 }

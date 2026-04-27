@@ -11,7 +11,7 @@ The fix is to keep a shared channel namespace while separating private scratch s
 - Keep agents equal in capability and access shape.
 - Prevent one agent's in-progress workspace changes from polluting another agent's work.
 - Preserve a channel-level filesystem root for shared assets and channel context.
-- Keep migration simple for existing agents and specs.
+- Keep workspace ownership obvious from the path.
 
 ## Core Model
 
@@ -33,9 +33,7 @@ Directory layout:
   agents/
     <agent-id>/
       workspace/
-      cache/
       logs/
-  workspace/            # legacy compatibility directory, no longer the default live cwd
   runtime/
   logs/
   cache/
@@ -50,7 +48,8 @@ Default agent `cwd` is now:
 ~/.agentx/channels/<channel-id>/agents/<agent-id>/workspace
 ```
 
-Relative workdir values are resolved under the agent's private workspace.
+The cwd is not configurable in `AgentTransport`; Joi computes it from the
+current channel and actor for every dispatch.
 
 Supported templates:
 
@@ -61,24 +60,20 @@ Supported templates:
 - `{channel.root}`: the channel root
 - `{channel.shared}`: the channel shared directory
 - `{channel.sharedArtifacts}`: the shared artifact directory
-- `{channel.workspace}`: compatibility alias to `{agent.workspace}`
-
-`{channel.workspace}` stays accepted so existing specs continue to work, but its meaning changes to the agent-private workspace under the new model.
 
 ## Runtime Environment Variables
 
-Joi injects the following environment variables for ACP runtimes:
+Command transport subprocesses receive the following channel-scoped environment
+variables. ACP transports receive the channel workspace through
+`session/new.cwd`; the long-lived ACP process itself only gets actor-level
+environment variables.
 
 - `AGENTX_CHANNEL_ROOT`
 - `AGENTX_CHANNEL_SHARED`
 - `AGENTX_CHANNEL_SHARED_ARTIFACTS`
-- `AGENTX_CHANNEL_WORKSPACE`
 - `AGENTX_AGENT_ROOT`
 - `AGENTX_AGENT_WORKSPACE`
-- `AGENTX_AGENT_CACHE`
 - `AGENTX_AGENT_LOGS`
-
-`AGENTX_CHANNEL_WORKSPACE` is a compatibility alias that resolves to the same path as `AGENTX_AGENT_WORKSPACE`.
 
 ## Sharing Model
 
@@ -114,7 +109,6 @@ Phase 1 implemented in code:
 - create per-agent private workspace directories under each channel
 - resolve default workdir to the private workspace
 - keep channel-level shared directories
-- preserve compatibility for older `{channel.workspace}` specs
 
 Phase 2 implemented:
 

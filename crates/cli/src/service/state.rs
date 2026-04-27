@@ -43,8 +43,7 @@ pub fn state_dir(root: &Path, service_id: &str) -> PathBuf {
 /// can write without each creating their own paths. Idempotent.
 pub fn ensure_state_dir(root: &Path, service_id: &str) -> Result<PathBuf> {
     let dir = state_dir(root, service_id);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create service dir at {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create service dir at {}", dir.display()))?;
     fs::create_dir_all(dir.join("cursors"))?;
     fs::create_dir_all(dir.join("logs"))?;
     Ok(dir)
@@ -78,11 +77,7 @@ impl DedupeStore {
                     continue;
                 }
                 let v: serde_json::Value = serde_json::from_str(trimmed).with_context(|| {
-                    format!(
-                        "parse dedupe line {} in {}",
-                        lineno + 1,
-                        path.display()
-                    )
+                    format!("parse dedupe line {} in {}", lineno + 1, path.display())
                 })?;
                 if let Some(k) = v.get("key").and_then(|v| v.as_str()) {
                     seen.insert(k.to_string());
@@ -129,10 +124,10 @@ pub fn cursor_load(service_dir: &Path, name: &str) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read cursor {}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse cursor {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("read cursor {}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse cursor {}", path.display()))?;
     Ok(v.get("value")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
@@ -162,10 +157,7 @@ mod tests {
     use super::*;
 
     fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "joi-svc-state-{}",
-            uuid::Uuid::new_v4().simple()
-        ))
+        std::env::temp_dir().join(format!("joi-svc-state-{}", uuid::Uuid::new_v4().simple()))
     }
 
     #[test]
@@ -213,7 +205,10 @@ mod tests {
 
         // Overwrite must replace, not append.
         cursor_save(&dir, "ci", "run_43").expect("overwrite");
-        assert_eq!(cursor_load(&dir, "ci").expect("load2"), Some("run_43".into()));
+        assert_eq!(
+            cursor_load(&dir, "ci").expect("load2"),
+            Some("run_43".into())
+        );
     }
 
     #[test]

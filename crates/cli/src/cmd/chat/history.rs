@@ -18,10 +18,6 @@ pub struct Bubble {
     pub reply_to_event_id: Option<String>,
     pub trailing_event_id: Option<String>,
     pub delivery: DeliveryState,
-    /// True while this bubble is being filled by `turn/stream.update`
-    /// notifications. Flipped to `false` when the canonical `content.add`
-    /// event for the same turn arrives. Renders a live cursor while true.
-    pub streaming: bool,
     /// Target actor id when this bubble represents an explicit handoff
     /// (`/handoff @x` or `@x msg`). The body line is rendered as
     /// `|-> handoff -> {display(target)} ({short_id}): {text}` instead of
@@ -32,9 +28,9 @@ pub struct Bubble {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BubbleKind {
-    /// content.add (streamed); subsequent same-actor/turn chunks append in place
+    /// content.add; subsequent same-actor/turn chunks append in place
     Stream,
-    /// non-streaming events (handoff, action.response, etc.)
+    /// Non-content events (handoff, action.response, etc.)
     Static,
     /// `action.request` events targeting the human. Rendered with extra
     /// prominence so the operator notices that the agent is parked waiting
@@ -123,12 +119,9 @@ impl History {
             // converge naturally on the latest value.
             "announcement.set" => self.apply_announcement_set(ev),
             "announcement.clear" => self.current_announcement = None,
-            // turn.close is normally suppressed (delivery state on the
-            // outgoing bubble already conveys "the server saw it" and the
-            // closing chunk arrives as a normal content.add event).
-            // Cancelled turns are the exception — finalize any still-streaming
-            // bubble and surface a system divider so other channel members
-            // see who pulled the plug.
+            // turn.close is normally suppressed; the closing content arrives
+            // as a normal content.add event. Cancelled turns are the exception
+            // because other channel members should see who pulled the plug.
             "turn.close" => {
                 let is_cancelled = ev
                     .payload
@@ -137,18 +130,6 @@ impl History {
                     .map(|s| s.eq_ignore_ascii_case("cancelled"))
                     .unwrap_or(false);
                 if is_cancelled {
-                    if let Some(turn) = ev.turn_id.as_deref() {
-                        for b in self.bubbles.iter_mut().rev() {
-                            if b.streaming
-                                && b.kind == BubbleKind::Stream
-                                && b.actor_id == ev.actor_id
-                                && b.turn_id.as_deref() == Some(turn)
-                            {
-                                b.streaming = false;
-                                break;
-                            }
-                        }
-                    }
                     let by = ev
                         .payload
                         .get("_meta")
@@ -172,7 +153,6 @@ impl History {
             reply_to_event_id: None,
             trailing_event_id: None,
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
     }
@@ -197,7 +177,6 @@ impl History {
             reply_to_event_id,
             trailing_event_id: Some(event_id.to_string()),
             delivery: DeliveryState::Pending,
-            streaming: false,
             handoff_target: None,
         });
     }
@@ -209,29 +188,6 @@ impl History {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // If we have a streaming bubble for this turn (built up live from
-        // turn/stream.update notifications), finalize it: replace its text
-        // with the canonical event text (authoritative — handles dropped
-        // deltas) and stamp the event id. We scan from the back since
-        // streaming bubbles are usually the most recent ones.
-        if let Some(turn) = ev.turn_id.as_deref() {
-            for b in self.bubbles.iter_mut().rev() {
-                if b.streaming
-                    && b.kind == BubbleKind::Stream
-                    && b.actor_id == ev.actor_id
-                    && b.turn_id.as_deref() == Some(turn)
-                {
-                    b.text = text;
-                    b.streaming = false;
-                    b.trailing_event_id = Some(ev.id.clone());
-                    b.ts = ev.occurred_at;
-                    if b.reply_to_event_id.is_none() {
-                        b.reply_to_event_id = reply_target(ev);
-                    }
-                    return;
-                }
-            }
-        }
         // If this is our own outgoing bubble we already pushed locally, just
         // flip to Delivered and skip — we'd otherwise duplicate the text.
         // Scan back across all bubbles so a stray notification arriving
@@ -264,60 +220,8 @@ impl History {
             reply_to_event_id: reply_target(ev),
             trailing_event_id: Some(ev.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
-    }
-
-    /// Append a partial-text chunk from a `turn/stream.update` notification
-    /// into the streaming bubble for `(actor_id, turn_id)`, creating the
-    /// bubble on first delta. The bubble flips to non-streaming when the
-    /// canonical `content.add` event for this turn arrives via
-    /// `append_stream`.
-    pub fn append_stream_delta(
-        &mut self,
-        actor_id: &str,
-        turn_id: &str,
-        delta: &str,
-        ts: DateTime<Utc>,
-    ) {
-        for b in self.bubbles.iter_mut().rev() {
-            if b.streaming
-                && b.kind == BubbleKind::Stream
-                && b.actor_id == actor_id
-                && b.turn_id.as_deref() == Some(turn_id)
-            {
-                b.text.push_str(delta);
-                b.ts = ts;
-                return;
-            }
-        }
-        self.bubbles.push(Bubble {
-            actor_id: actor_id.to_string(),
-            turn_id: Some(turn_id.to_string()),
-            kind: BubbleKind::Stream,
-            text: delta.to_string(),
-            ts,
-            reply_to_event_id: None,
-            trailing_event_id: None,
-            delivery: DeliveryState::NotApplicable,
-            streaming: true,
-            handoff_target: None,
-        });
-    }
-
-    /// Iterator over `(actor_id, turn_id, started_at)` for every streaming
-    /// bubble currently in history. Used by the chat TUI to render an
-    /// in-flight status bar above the input area.
-    pub fn streaming_turns(&self) -> Vec<(String, String, DateTime<Utc>)> {
-        self.bubbles
-            .iter()
-            .filter(|b| b.streaming)
-            .filter_map(|b| {
-                let turn_id = b.turn_id.clone()?;
-                Some((b.actor_id.clone(), turn_id, b.ts))
-            })
-            .collect()
     }
 
     /// Reduce an `announcement.set` event into `current_announcement`.
@@ -351,7 +255,6 @@ impl History {
             reply_to_event_id: reply_target(ev),
             trailing_event_id: Some(ev.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
     }
@@ -366,7 +269,6 @@ impl History {
             reply_to_event_id: reply_target(ev),
             trailing_event_id: Some(ev.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
     }
@@ -385,7 +287,6 @@ impl History {
             reply_to_event_id: reply_target(ev),
             trailing_event_id: Some(ev.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: Some(target),
         });
     }
@@ -583,13 +484,9 @@ impl History {
             } else {
                 body_row_count
             };
-            let last_idx = visible_body_rows.saturating_sub(1);
-            for (line_idx, row_spans) in body_rows.into_iter().take(visible_body_rows).enumerate() {
+            for row_spans in body_rows.into_iter().take(visible_body_rows) {
                 let mut spans = vec![gutter.clone()];
                 spans.extend(row_spans);
-                if b.streaming && line_idx == last_idx {
-                    spans.push(Span::styled("▍", Style::default().fg(Color::Cyan)));
-                }
                 let line = Line::from(spans);
                 total_rows = total_rows.saturating_add(wrapped_rows(&line, width));
                 out.push(line);
@@ -673,7 +570,9 @@ fn display_text(text: &str) -> &str {
 
 fn bubble_body_rows(bubble: &Bubble) -> Vec<Vec<Span<'static>>> {
     let rows = match bubble.kind {
-        BubbleKind::Stream => markdown::render_to_rows(display_text(&bubble.text), Style::default()),
+        BubbleKind::Stream => {
+            markdown::render_to_rows(display_text(&bubble.text), Style::default())
+        }
         BubbleKind::ActionRequest => {
             let style = Style::default()
                 .fg(Color::Magenta)
@@ -989,7 +888,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 
@@ -1013,7 +911,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         history.push_system("system");
@@ -1026,7 +923,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_2".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 
@@ -1049,17 +945,13 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 
-        let rendered = history.render_lines(
-            80,
-            Some(0),
-            &HashSet::new(),
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(80, Some(0), &HashSet::new(), &|id| id.to_string(), &|_| {
+                None
+            });
 
         // Header row + 2 body rows ("hello", "world").
         assert_eq!(rendered.lines.len(), 3);
@@ -1078,17 +970,13 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 
-        let rendered = history.render_lines(
-            16,
-            Some(0),
-            &HashSet::new(),
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(16, Some(0), &HashSet::new(), &|id| id.to_string(), &|_| {
+                None
+            });
         let expected = Paragraph::new(rendered.lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(16) as u16;
@@ -1111,7 +999,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_parent".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         history.bubbles.push(Bubble {
@@ -1123,7 +1010,6 @@ mod tests {
             reply_to_event_id: Some("evt_parent".into()),
             trailing_event_id: Some("evt_reply".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         history
@@ -1140,7 +1026,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_abc123def456".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         };
         let (id, label) = reply_target_label(&bubble, &|id| id.to_string()).unwrap();
@@ -1152,13 +1037,8 @@ mod tests {
     #[test]
     fn render_lines_emits_quote_line_above_reply() {
         let history = parent_and_reply();
-        let rendered = history.render_lines(
-            80,
-            None,
-            &HashSet::new(),
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(80, None, &HashSet::new(), &|id| id.to_string(), &|_| None);
         // parent (header + body) + spacer + quote + reply (header + body) = 6 rows.
         assert_eq!(rendered.lines.len(), 6);
         let quote = line_text(&rendered.lines[3]);
@@ -1192,16 +1072,10 @@ mod tests {
             reply_to_event_id: Some("evt_long_gone".into()),
             trailing_event_id: Some("evt_reply".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
-        let rendered = history.render_lines(
-            80,
-            None,
-            &HashSet::new(),
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(80, None, &HashSet::new(), &|id| id.to_string(), &|_| None);
         // quote + header + body = 3 rows.
         assert_eq!(rendered.lines.len(), 3);
         let quote = line_text(&rendered.lines[0]);
@@ -1215,13 +1089,10 @@ mod tests {
         // Layout: parent header (0), parent body (1), spacer (2), quote (3),
         // reply header (4), reply body (5). Selecting the reply (index 1)
         // covers the quote + header + body but NOT the spacer.
-        let rendered = history.render_lines(
-            80,
-            Some(1),
-            &HashSet::new(),
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(80, Some(1), &HashSet::new(), &|id| id.to_string(), &|_| {
+                None
+            });
         assert_eq!(rendered.selected_row_range, Some((3, 5)));
     }
 
@@ -1237,7 +1108,6 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_x".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
         let rendered = history.render_lines(
@@ -1300,8 +1170,7 @@ mod tests {
             "actor_agent_opencode" => "Coder".to_string(),
             other => other.to_string(),
         };
-        let rendered =
-            history.render_lines(120, None, &HashSet::new(), &display_for, &|_| None);
+        let rendered = history.render_lines(120, None, &HashSet::new(), &display_for, &|_| None);
         // header + body
         assert_eq!(rendered.lines.len(), 2);
         let body = line_text(&rendered.lines[1]);
@@ -1323,17 +1192,13 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_long".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 
-        let rendered = history.render_lines(
-            80,
-            Some(0),
-            &HashSet::new(),
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(80, Some(0), &HashSet::new(), &|id| id.to_string(), &|_| {
+                None
+            });
 
         assert!(history.bubble_is_collapsible(0));
         // Header (1) + 5 visible body rows + hint (1) = 7.
@@ -1354,19 +1219,13 @@ mod tests {
             reply_to_event_id: None,
             trailing_event_id: Some("evt_long".into()),
             delivery: DeliveryState::NotApplicable,
-            streaming: false,
             handoff_target: None,
         });
 
         let mut expanded = HashSet::new();
         expanded.insert(0);
-        let rendered = history.render_lines(
-            80,
-            Some(0),
-            &expanded,
-            &|id| id.to_string(),
-            &|_| None,
-        );
+        let rendered =
+            history.render_lines(80, Some(0), &expanded, &|id| id.to_string(), &|_| None);
 
         // Header (1) + 7 body rows = 8.
         assert_eq!(rendered.lines.len(), 8);
@@ -1374,76 +1233,9 @@ mod tests {
         assert!(last.contains('7'));
     }
 
-    fn make_event(id: &str, actor: &str, turn: Option<&str>, text: &str) -> Event {
-        Event {
-            id: id.into(),
-            kind: "content.add".into(),
-            actor_id: actor.into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Thread,
-                id: "thread_x".into(),
-            },
-            turn_id: turn.map(|t| t.into()),
-            seq: 1,
-            occurred_at: Utc::now(),
-            payload: json!({ "text": text }),
-            relations: vec![],
-            _meta: None,
-        }
-    }
-
-    #[test]
-    fn append_stream_delta_creates_streaming_bubble() {
-        let mut history = History::default();
-        history.append_stream_delta("Coder", "turn_1", "Hel", Utc::now());
-        assert_eq!(history.bubbles.len(), 1);
-        let b = &history.bubbles[0];
-        assert!(b.streaming);
-        assert_eq!(b.actor_id, "Coder");
-        assert_eq!(b.turn_id.as_deref(), Some("turn_1"));
-        assert_eq!(b.text, "Hel");
-    }
-
-    #[test]
-    fn append_stream_delta_appends_to_matching_turn() {
-        let mut history = History::default();
-        history.append_stream_delta("Coder", "turn_1", "Hel", Utc::now());
-        history.append_stream_delta("Coder", "turn_1", "lo", Utc::now());
-        assert_eq!(history.bubbles.len(), 1);
-        assert_eq!(history.bubbles[0].text, "Hello");
-    }
-
-    #[test]
-    fn append_stream_delta_keeps_separate_bubble_per_turn() {
-        let mut history = History::default();
-        history.append_stream_delta("Coder", "turn_1", "first", Utc::now());
-        history.append_stream_delta("Coder", "turn_2", "second", Utc::now());
-        assert_eq!(history.bubbles.len(), 2);
-        assert_eq!(history.bubbles[0].text, "first");
-        assert_eq!(history.bubbles[1].text, "second");
-    }
-
-    #[test]
-    fn content_add_event_finalizes_streaming_bubble() {
-        let mut history = History::default();
-        history.append_stream_delta("Coder", "turn_1", "partial...", Utc::now());
-        // Authoritative event arrives with the full text. The streaming bubble
-        // should flip to non-streaming and adopt the canonical text + event id.
-        let ev = make_event("evt_99", "Coder", Some("turn_1"), "Hello world");
-        history.push_event(&ev);
-        assert_eq!(history.bubbles.len(), 1);
-        let b = &history.bubbles[0];
-        assert!(!b.streaming);
-        assert_eq!(b.text, "Hello world");
-        assert_eq!(b.trailing_event_id.as_deref(), Some("evt_99"));
-    }
-
     #[test]
     fn cancelled_turn_close_renders_system_divider() {
         let mut history = History::default();
-        history.append_stream_delta("Coder", "turn_1", "in flight", Utc::now());
-        // turn.close with status=cancelled should: (a) flip the streaming
-        // bubble off, (b) push a system divider naming who cancelled.
         let close = Event {
             id: "evt_close".into(),
             kind: "turn.close".into(),
@@ -1464,9 +1256,8 @@ mod tests {
             _meta: None,
         };
         history.push_event(&close);
-        assert_eq!(history.bubbles.len(), 2);
-        assert!(!history.bubbles[0].streaming);
-        let divider = &history.bubbles[1];
+        assert_eq!(history.bubbles.len(), 1);
+        let divider = &history.bubbles[0];
         assert_eq!(divider.kind, BubbleKind::System);
         assert!(divider.text.contains("cancelled by @bojun.cbj"));
     }
@@ -1600,29 +1391,6 @@ mod tests {
             .any(|b| b.text.starts_with("↪ handoff")));
     }
 
-    #[test]
-    fn streaming_turns_lists_in_flight_bubbles_only() {
-        let mut history = History::default();
-        history.append_stream_delta("Coder", "turn_1", "live", Utc::now());
-        // Add a non-streaming bubble — should not appear in the list.
-        history.bubbles.push(Bubble {
-            actor_id: "OpenCode".into(),
-            turn_id: Some("turn_old".into()),
-            kind: BubbleKind::Stream,
-            text: "done".into(),
-            ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_done".into()),
-            delivery: DeliveryState::NotApplicable,
-            streaming: false,
-            handoff_target: None,
-        });
-        let live = history.streaming_turns();
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].0, "Coder");
-        assert_eq!(live[0].1, "turn_1");
-    }
-
     fn announcement_event(id: &str, actor: &str, text: &str, kind: &str) -> Event {
         Event {
             id: id.into(),
@@ -1647,8 +1415,14 @@ mod tests {
         let ev = announcement_event("evt_a1", "actor_human", "release notes", "announcement.set");
         history.push_event(&ev);
 
-        assert!(history.bubbles.is_empty(), "announcement must not pollute bubbles");
-        let a = history.current_announcement.as_ref().expect("announcement set");
+        assert!(
+            history.bubbles.is_empty(),
+            "announcement must not pollute bubbles"
+        );
+        let a = history
+            .current_announcement
+            .as_ref()
+            .expect("announcement set");
         assert_eq!(a.text, "release notes");
         assert_eq!(a.actor_id, "actor_human");
     }
@@ -1656,9 +1430,22 @@ mod tests {
     #[test]
     fn announcement_set_replaces_previous() {
         let mut history = History::default();
-        history.push_event(&announcement_event("evt_a1", "a", "first", "announcement.set"));
-        history.push_event(&announcement_event("evt_a2", "b", "second", "announcement.set"));
-        let a = history.current_announcement.as_ref().expect("announcement set");
+        history.push_event(&announcement_event(
+            "evt_a1",
+            "a",
+            "first",
+            "announcement.set",
+        ));
+        history.push_event(&announcement_event(
+            "evt_a2",
+            "b",
+            "second",
+            "announcement.set",
+        ));
+        let a = history
+            .current_announcement
+            .as_ref()
+            .expect("announcement set");
         assert_eq!(a.text, "second");
         assert_eq!(a.actor_id, "b");
     }
@@ -1666,7 +1453,12 @@ mod tests {
     #[test]
     fn announcement_clear_drops_current() {
         let mut history = History::default();
-        history.push_event(&announcement_event("evt_a1", "a", "first", "announcement.set"));
+        history.push_event(&announcement_event(
+            "evt_a1",
+            "a",
+            "first",
+            "announcement.set",
+        ));
         history.push_event(&announcement_event("evt_a2", "a", "", "announcement.clear"));
         assert!(history.current_announcement.is_none());
         assert!(history.bubbles.is_empty());
@@ -1677,8 +1469,18 @@ mod tests {
         // Empty `text` on a `.set` is treated as a clear so callers can pick
         // either spelling without us caring which.
         let mut history = History::default();
-        history.push_event(&announcement_event("evt_a1", "a", "first", "announcement.set"));
-        history.push_event(&announcement_event("evt_a2", "a", "   ", "announcement.set"));
+        history.push_event(&announcement_event(
+            "evt_a1",
+            "a",
+            "first",
+            "announcement.set",
+        ));
+        history.push_event(&announcement_event(
+            "evt_a2",
+            "a",
+            "   ",
+            "announcement.set",
+        ));
         assert!(history.current_announcement.is_none());
     }
 }

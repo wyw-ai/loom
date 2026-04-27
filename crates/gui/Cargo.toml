@@ -1,0 +1,29 @@
+[package]
+name = "joi-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Joi desktop GUI client (Tauri)."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }
+
+[features]
+# Tauri 2 capability to open devtools, opt-in in dev builds.
+devtools = ["tauri/devtools"]

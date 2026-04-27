@@ -179,3 +179,32 @@ clean:
 
 distclean: clean
 	$(CARGO) clean
+
+# ---- Desktop GUI (Tauri) -------------------------------------------------
+#
+# Prerequisites (one-time):
+#   pnpm --dir apps/gui-web install
+#   cargo install tauri-cli --version ^2
+# Then:
+#   make gui-dev       # launches vite dev server + tauri window
+#   make gui-release   # builds a signed/unsigned bundle into crates/gui/target/
+#
+# The joi-gui crate is excluded from workspace default-members, so normal
+# `cargo build` doesn't pay its compile cost. Invoke through these targets
+# or directly with `cargo tauri dev|build` from crates/gui/.
+
+PNPM ?= pnpm
+
+.PHONY: gui-deps gui-dev gui-release gui-clean
+
+gui-deps:
+	$(PNPM) --dir apps/gui-web install
+
+gui-dev:
+	cd crates/gui && $(CARGO) tauri dev
+
+gui-release:
+	cd crates/gui && $(CARGO) tauri build
+
+gui-clean:
+	rm -rf apps/gui-web/node_modules apps/gui-web/dist crates/gui/gen

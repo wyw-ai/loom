@@ -5,11 +5,15 @@
 
 - Rust **server**（`joi-server`）：基于 WebSocket 的 JSON-RPC 2.0 消息枢纽。
 - Rust **CLI**（`joi`）：人类用的终端客户端，也可作为 v1 模式下的 agent 客户端常驻进程。
+- Rust + React **Desktop GUI**（`joi-gui`，Tauri 2）：与 TUI 并行的桌面客户端，
+  Discord-风格四栏布局。设计文档见
+  [docs/gui-desktop-design.md](docs/gui-desktop-design.md)。
+  `make gui-dev` 启动（前置：`pnpm --dir apps/gui-web install` + `cargo install tauri-cli --version ^2`）。
 - 可插拔 **agent runtime**：支持 ACP 协议子进程（如 `claude-acp`、`codex-acp`）以及
   一次性 CLI（`claude -p`、`codex` 等）两类 transport。
 
-v0 的目标很小：人在 CLI 里打开一个 thread，把一个或多个配置好的 agent `handoff`
-进来，看它们以协议事件的形式流回。无认证、无 GUI、无数据库。
+v0 的目标很小：人在 CLI / GUI 里打开一个 thread，把一个或多个配置好的 agent
+`handoff` 进来，看它们以协议事件的形式流回。无认证、无数据库。
 
 ## 仓库结构
 
@@ -18,6 +22,8 @@ crates/proto           协议类型 + JSON-RPC 信封
 crates/agent-runtime   Adapter trait + AcpAdapter / CommandAdapter 实现
 crates/server          joi-server 二进制（WebSocket + 嵌入式 supervisor）
 crates/cli             joi 二进制（人类终端 + v1 agent 客户端）
+crates/gui             joi-gui 桌面壳（Tauri 2，复用 proto+WS 客户端）
+apps/gui-web           joi-gui 前端（React + TS + Tailwind，Discord-风格 UI）
 agents/                示例 agent JSON spec
 assets/marketplace.json  内置 marketplace 编目
 data/                  运行时生成（journal + artifacts + agent workspace）

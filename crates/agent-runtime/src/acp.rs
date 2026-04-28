@@ -30,6 +30,7 @@ use uuid::Uuid;
 use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 
 const SHELL_ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
+const TERMINAL_AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
@@ -64,12 +65,28 @@ struct PendingPermission {
     scope: ScopeRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpAuthMethod {
+    id: String,
+    terminal_auth: Option<TerminalAuthCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalAuthCommand {
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    label: Option<String>,
+}
+
 struct AcpShared {
     stdin: Mutex<ChildStdin>,
     next_request_id: AtomicU64,
     response_waiters: Mutex<HashMap<String, std::sync::mpsc::Sender<Result<Value, String>>>>,
-    auth_method: Mutex<Option<String>>,
+    auth_method: Mutex<Option<AcpAuthMethod>>,
     auth_attempted: Mutex<bool>,
+    process_cwd: PathBuf,
+    process_env: BTreeMap<String, String>,
     /// Outstanding `session/prompt` requests we are waiting on. Maps request id
     /// → originating scope so the asynchronous `Finished` event can be tagged
     /// with the right scope when the response comes back.
@@ -379,6 +396,7 @@ fn start_blocking(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut path_for_error = std::env::var("PATH").unwrap_or_default();
+    let mut process_env = BTreeMap::new();
     if should_capture_shell_env() {
         match capture_login_shell_env(&process_cwd, SHELL_ENV_CAPTURE_TIMEOUT) {
             Ok(env) => {
@@ -389,7 +407,7 @@ fn start_blocking(
                 if let Some(path) = env.get("PATH") {
                     path_for_error = path.clone();
                 }
-                cmd.envs(env);
+                process_env.extend(env);
             }
             Err(err) => {
                 eprintln!("[joi:acp] login shell env capture skipped: {err}");
@@ -400,8 +418,9 @@ fn start_blocking(
         if k == "PATH" {
             path_for_error = v.clone();
         }
-        cmd.env(k, v);
+        process_env.insert(k.clone(), v.clone());
     }
+    cmd.envs(&process_env);
     let mut child = cmd
         .spawn()
         .map_err(|e| spawn_error_message(&cfg.command, &process_cwd, &path_for_error, e))?;
@@ -414,6 +433,8 @@ fn start_blocking(
         response_waiters: Mutex::new(HashMap::new()),
         auth_method: Mutex::new(None),
         auth_attempted: Mutex::new(false),
+        process_cwd: process_cwd.clone(),
+        process_env,
         in_flight_prompts: Mutex::new(HashMap::new()),
         pending_permissions: Mutex::new(HashMap::new()),
         sessions_by_id: Mutex::new(HashMap::new()),
@@ -440,21 +461,27 @@ fn start_blocking(
             "clientCapabilities": {
                 "fs": { "readTextFile": false, "writeTextFile": false },
                 "terminal": false,
+                "auth": { "terminal": true },
+                "_meta": { "terminal-auth": true },
             },
         }),
         Duration::from_secs(60),
     )?;
 
-    let auth_method = cfg
+    let configured_auth_method = cfg
         .auth_method
-        .as_ref()
-        .filter(|method| !method.trim().is_empty())
-        .cloned()
-        .or_else(|| single_initialize_auth_method(&initialize));
+        .as_deref()
+        .filter(|method| !method.trim().is_empty());
+    let auth_method = select_initialize_auth_method(&initialize, configured_auth_method);
     *shared.auth_method.lock() = auth_method.clone();
 
-    if let Some(method) = cfg.auth_method.as_deref() {
-        if !method.trim().is_empty() {
+    if let Some(method) = configured_auth_method {
+        if let Some(auth_method) = auth_method
+            .as_ref()
+            .filter(|method| method.terminal_auth.is_some())
+        {
+            run_terminal_auth(&shared, auth_method)?;
+        } else {
             *shared.auth_attempted.lock() = true;
             shared.request_and_wait(
                 "authenticate",
@@ -505,11 +532,30 @@ fn request_new_session_with_auth_retry(
                 *attempted = true;
             }
             eprintln!(
-                "[joi:acp] session/new requires authentication; trying auth method `{method}`"
+                "[joi:acp] session/new requires authentication; trying auth method `{}`",
+                method.id
             );
+            if method.terminal_auth.is_some() {
+                run_terminal_auth(shared, &method)?;
+                match shared.request_and_wait(
+                    "session/new",
+                    params.clone(),
+                    Duration::from_secs(30),
+                ) {
+                    Ok(value) => return Ok(value),
+                    Err(retry_err) if is_auth_required_error(&retry_err) => {
+                        eprintln!(
+                            "[joi:acp] terminal auth completed but session/new still requires \
+                             authentication; trying ACP authenticate `{}`",
+                            method.id
+                        );
+                    }
+                    Err(retry_err) => return Err(retry_err),
+                }
+            }
             shared.request_and_wait(
                 "authenticate",
-                json!({ "methodId": method }),
+                json!({ "methodId": method.id }),
                 Duration::from_secs(30),
             )?;
             shared.request_and_wait("session/new", params, Duration::from_secs(30))
@@ -518,15 +564,113 @@ fn request_new_session_with_auth_retry(
     }
 }
 
-fn single_initialize_auth_method(initialize: &Value) -> Option<String> {
+fn select_initialize_auth_method(
+    initialize: &Value,
+    configured: Option<&str>,
+) -> Option<AcpAuthMethod> {
     let auth_methods = initialize.get("authMethods")?.as_array()?;
+    if let Some(configured) = configured {
+        return auth_methods
+            .iter()
+            .find_map(|method| {
+                let parsed = parse_auth_method(method)?;
+                (parsed.id == configured).then_some(parsed)
+            })
+            .or_else(|| {
+                Some(AcpAuthMethod {
+                    id: configured.to_string(),
+                    terminal_auth: None,
+                })
+            });
+    }
     if auth_methods.len() != 1 {
         return None;
     }
-    auth_methods[0]
-        .get("id")
-        .and_then(|id| id.as_str())
-        .map(ToString::to_string)
+    parse_auth_method(&auth_methods[0])
+}
+
+fn parse_auth_method(method: &Value) -> Option<AcpAuthMethod> {
+    let id = method.get("id").and_then(|id| id.as_str())?.to_string();
+    Some(AcpAuthMethod {
+        id,
+        terminal_auth: parse_terminal_auth_command(method),
+    })
+}
+
+fn parse_terminal_auth_command(method: &Value) -> Option<TerminalAuthCommand> {
+    let terminal_auth = method.get("_meta")?.get("terminal-auth")?;
+    let command = terminal_auth.get("command")?.as_str()?.to_string();
+    let args = terminal_auth
+        .get("args")
+        .and_then(|args| args.as_array())
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let env = terminal_auth
+        .get("env")
+        .and_then(|env| env.as_object())
+        .map(|env| {
+            env.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let label = terminal_auth
+        .get("label")
+        .and_then(|label| label.as_str())
+        .map(ToString::to_string);
+    Some(TerminalAuthCommand {
+        command,
+        args,
+        env,
+        label,
+    })
+}
+
+fn run_terminal_auth(shared: &AcpShared, method: &AcpAuthMethod) -> Result<(), String> {
+    let terminal = method
+        .terminal_auth
+        .as_ref()
+        .ok_or_else(|| format!("auth method `{}` does not provide terminal auth", method.id))?;
+    eprintln!(
+        "[joi:acp] running terminal auth command `{}`{}",
+        terminal.command,
+        terminal
+            .label
+            .as_deref()
+            .map(|label| format!(" ({label})"))
+            .unwrap_or_default()
+    );
+    let mut cmd = Command::new(&terminal.command);
+    cmd.args(&terminal.args)
+        .current_dir(&shared.process_cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(&shared.process_env)
+        .envs(&terminal.env);
+    let child = cmd.spawn().map_err(|err| {
+        format!(
+            "failed to start terminal auth command `{}`: {err}",
+            terminal.command
+        )
+    })?;
+    let output = wait_with_timeout(child, TERMINAL_AUTH_TIMEOUT)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "terminal auth command `{}` exited with {}; stdout: {}; stderr: {}",
+        terminal.command,
+        output.status,
+        truncate_for_log(&String::from_utf8_lossy(&output.stdout), 500),
+        truncate_for_log(&String::from_utf8_lossy(&output.stderr), 500)
+    ))
 }
 
 fn is_auth_required_error(err: &str) -> bool {
@@ -1128,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn single_initialize_auth_method_reads_only_unambiguous_method() {
+    fn select_initialize_auth_method_reads_only_unambiguous_method() {
         let initialize = json!({
             "authMethods": [
                 { "id": "qodercli-login", "name": "Login" }
@@ -1136,8 +1280,8 @@ mod tests {
         });
 
         assert_eq!(
-            single_initialize_auth_method(&initialize).as_deref(),
-            Some("qodercli-login")
+            select_initialize_auth_method(&initialize, None).map(|method| method.id),
+            Some("qodercli-login".to_string())
         );
 
         let ambiguous = json!({
@@ -1146,7 +1290,51 @@ mod tests {
                 { "id": "two" }
             ]
         });
-        assert_eq!(single_initialize_auth_method(&ambiguous), None);
+        assert_eq!(select_initialize_auth_method(&ambiguous, None), None);
+    }
+
+    #[test]
+    fn select_initialize_auth_method_parses_terminal_auth_meta() {
+        let initialize = json!({
+            "authMethods": [
+                {
+                    "id": "qodercli-login",
+                    "name": "Log in",
+                    "_meta": {
+                        "terminal-auth": {
+                            "label": "Qoder CLI Login",
+                            "command": "/tmp/qodercli",
+                            "args": ["--login"],
+                            "env": { "QODER_HOME": "/tmp/qoder" }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let method =
+            select_initialize_auth_method(&initialize, None).expect("select single auth method");
+
+        assert_eq!(method.id, "qodercli-login");
+        let terminal = method.terminal_auth.expect("terminal auth");
+        assert_eq!(terminal.command, "/tmp/qodercli");
+        assert_eq!(terminal.args, vec!["--login"]);
+        assert_eq!(
+            terminal.env.get("QODER_HOME").map(String::as_str),
+            Some("/tmp/qoder")
+        );
+        assert_eq!(terminal.label.as_deref(), Some("Qoder CLI Login"));
+    }
+
+    #[test]
+    fn select_initialize_auth_method_keeps_configured_id_when_not_advertised() {
+        let initialize = json!({ "authMethods": [] });
+
+        let method = select_initialize_auth_method(&initialize, Some("manual-login"))
+            .expect("configured auth method");
+
+        assert_eq!(method.id, "manual-login");
+        assert_eq!(method.terminal_auth, None);
     }
 
     #[test]

@@ -11,9 +11,15 @@
 | [`actor_opencode.json`](actor_opencode.json) | `opencode acp` | 需要本机已装 `opencode` CLI |
 | [`actor_qoder.json`](actor_qoder.json) | `npx -y @qoder-ai/qodercli --acp` | Qoder ACP 模式 |
 
+Qoder 的 spec 不要 pin 旧版 `@qoder-ai/qodercli@0.1.36` 这类版本号。旧版
+`npx` 二进制可能读不到你本机 `~/.qoder/bin/qodercli` 写入的新登录缓存，
+表现为本地 `qodercli /login` 已登录，但 ACP 仍然打开浏览器重新登录。
+保持 `@qoder-ai/qodercli` 不带版本，或直接把 `command` 改成本机
+`qodercli`，更容易复用已有登录态。
+
 Qoder 会根据客户端声明的 terminal auth 能力返回登录命令。Joi 会优先执行
-Qoder 返回的 `_meta.terminal-auth` 命令，这样 `npx` 方式也能复用它自己的
-登录入口；如果登录态失效，按日志提示重新登录后重试。
+Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志提示重新
+登录后重试。
 
 每份 spec 的 `env` 都留空了。如果你的网络环境需要走代理，自己加
 `http_proxy` / `https_proxy` / `all_proxy` 即可，例如：

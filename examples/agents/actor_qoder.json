@@ -10,7 +10,7 @@
     "command": "npx",
     "args": [
       "-y",
-      "@qoder-ai/qodercli@0.1.36",
+      "@qoder-ai/qodercli",
       "--acp"
     ],
     "env": {}

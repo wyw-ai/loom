@@ -107,6 +107,7 @@ pub fn install(
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        models: None,
         bundle: None,
         identity: Some(proto::methods::IdentitySpec::default()),
         memory: Some(proto::methods::MemorySpec {
@@ -180,6 +181,7 @@ pub fn add() -> Result<()> {
             prompt_via: proto::methods::PromptVia::default(),
         },
         autostart: false,
+        models: None,
         bundle: None,
         identity: Some(proto::methods::IdentitySpec::default()),
         memory: Some(proto::methods::MemorySpec {

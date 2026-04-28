@@ -653,6 +653,11 @@ pub struct AgentSpec {
     pub transport: AgentTransport,
     #[serde(default)]
     pub autostart: bool,
+    /// Optional model menu for this actor. Joi treats these as runtime-level
+    /// model ids: `joi agent serve` can surface them through `/models` and
+    /// pass the selected id to transports that support model selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelSpec>,
     /// Optional actor-local bundle configuration. When present, the runtime
     /// ensures a skill / tool bundle is available under the actor home before
     /// the transport is started, then exposes its resolved paths through
@@ -677,6 +682,32 @@ pub struct AgentSpec {
     /// the right-side panel of any chat client subscribed to the scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announcement: Option<AnnouncementSpec>,
+}
+
+// ---- models ----
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelSpec {
+    /// Actor-level default model id. Used when no local selection has been
+    /// persisted yet. If `choices` is empty this still acts as a single
+    /// selectable model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// User-facing menu. `id` is what gets sent to the runtime; `label` is only
+    /// display text and may be omitted.
+    #[serde(default)]
+    pub choices: Vec<AgentModelChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelChoice {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 // ---- announcement ----

@@ -54,6 +54,7 @@ pub trait Adapter: Send + Sync {
 pub struct AdapterPrompt {
     pub scope: ScopeRef,
     pub content: String,
+    pub model: Option<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub template_vars: BTreeMap<String, String>,

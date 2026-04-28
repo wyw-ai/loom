@@ -13,11 +13,23 @@ import { tryHandleSlash } from "./slashDispatch";
 
 const IME_ENTER_GUARD_MS = 80;
 
+type DraftRelation = {
+  kind: "hands_off_to" | "replies_to";
+  target: { kind: "actor" | "event"; id: string };
+};
+
+interface MentionTrigger {
+  start: number;
+  end: number;
+  filter: string;
+}
+
 export function Prompt({ scope }: { scope: ScopeRef }) {
   const currentScopeKey = scopeKey(scope);
   const selfId = useSession((s) => s.workspace?.actorId);
   const drafts = useUI((s) => s.drafts);
   const setDraft = useUI((s) => s.setDraft);
+  const actorsById = useActors((s) => s.byId);
   const reply = useUI((s) => s.replyTargets[currentScopeKey] ?? null);
   const replyAuthor = useActors((s) =>
     reply ? s.byId[reply.actorId] : undefined,
@@ -27,6 +39,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
 
   const text = drafts[currentScopeKey] ?? "";
   const [sending, setSending] = useState(false);
+  const [caret, setCaret] = useState(0);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const slashRef = useRef<SlashPaletteHandle>(null);
   const mentionRef = useRef<MentionPaletteHandle>(null);
@@ -35,7 +48,11 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
 
   const trimmed = text.trimStart();
   const slashOpen = trimmed.startsWith("/") && !trimmed.includes(" ");
-  const atOpen = trimmed.startsWith("@") && !trimmed.includes(" ");
+  const mentionTrigger = useMemo(
+    () => findMentionTrigger(text, Math.min(caret, text.length)),
+    [text, caret],
+  );
+  const atOpen = mentionTrigger !== null;
 
   const placeholder = useMemo(
     () =>
@@ -73,25 +90,29 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
 
       // `/handoff @x msg` shortcut — keep parity with TUI slash command.
       let payloadText = body;
-      const relations: Array<{
-        kind: "hands_off_to" | "replies_to";
-        target: { kind: "actor" | "event"; id: string };
-      }> = [];
+      const relations: DraftRelation[] = [];
+      const handoffTargets = new Set<string>();
+      const addHandoff = (actorId: string) => {
+        if (handoffTargets.has(actorId)) return;
+        handoffTargets.add(actorId);
+        relations.push({
+          kind: "hands_off_to",
+          target: { kind: "actor", id: actorId },
+        });
+      };
 
       const handoff = body.match(/^\/handoff\s+@(\S+)\s*(.*)$/s);
       const atMention = body.match(/^@(\S+)\s+(.+)$/s);
       if (handoff) {
-        relations.push({
-          kind: "hands_off_to",
-          target: { kind: "actor", id: handoff[1] },
-        });
+        addHandoff(handoff[1]);
         payloadText = handoff[2];
       } else if (atMention) {
-        relations.push({
-          kind: "hands_off_to",
-          target: { kind: "actor", id: atMention[1] },
-        });
+        addHandoff(atMention[1]);
         payloadText = atMention[2];
+      }
+
+      for (const actorId of mentionTargets(payloadText, actorsById)) {
+        if (actorId !== selfId && actorId !== "system") addHandoff(actorId);
       }
 
       if (reply?.eventId) {
@@ -103,20 +124,14 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         // isn't self or "system", attach `hands_off_to` so the target
         // agent actually wakes up. Skip if the user already put their own
         // @mention in the text — don't double up.
-        const alreadyHandsOff = relations.some(
-          (r) => r.kind === "hands_off_to",
-        );
         const replyHandoffActor = reply.handoffTarget ?? reply.actorId;
         if (
-          !alreadyHandsOff &&
           replyHandoffActor &&
           replyHandoffActor !== selfId &&
-          replyHandoffActor !== "system"
+          replyHandoffActor !== "system" &&
+          handoffTargets.size === 0
         ) {
-          relations.push({
-            kind: "hands_off_to",
-            target: { kind: "actor", id: replyHandoffActor },
-          });
+          addHandoff(replyHandoffActor);
         }
       }
 
@@ -134,6 +149,10 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
     } finally {
       setSending(false);
     }
+  };
+
+  const updateCaret = (el: HTMLTextAreaElement) => {
+    setCaret(el.selectionStart ?? el.value.length);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -194,6 +213,26 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
     taRef.current?.focus();
   };
 
+  const replaceMentionToken = (actorId: string) => {
+    const active = mentionTrigger;
+    if (!active) {
+      replaceLeadingToken(`@${actorId}`);
+      return;
+    }
+    const token = `@${actorId}`;
+    const before = text.slice(0, active.start);
+    const after = text.slice(active.end);
+    const spacer = after.length === 0 || !/^\s/.test(after) ? " " : "";
+    const next = `${before}${token}${spacer}${after}`;
+    const nextCaret = before.length + token.length + spacer.length;
+    setDraft(scope, next);
+    window.requestAnimationFrame(() => {
+      taRef.current?.focus();
+      taRef.current?.setSelectionRange(nextCaret, nextCaret);
+      setCaret(nextCaret);
+    });
+  };
+
   return (
     <div className="relative border-t border-border bg-main px-4 py-3">
       {slashOpen && (
@@ -206,8 +245,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
       {atOpen && (
         <MentionPalette
           ref={mentionRef}
-          filter={trimmed.slice(1)}
-          onPick={(actorId) => replaceLeadingToken(`@${actorId}`)}
+          filter={mentionTrigger.filter}
+          onPick={replaceMentionToken}
         />
       )}
 
@@ -235,7 +274,13 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
           ref={taRef}
           value={text}
           placeholder={placeholder}
-          onChange={(e) => setDraft(scope, e.target.value)}
+          onChange={(e) => {
+            setDraft(scope, e.target.value);
+            updateCaret(e.target);
+          }}
+          onSelect={(e) => updateCaret(e.currentTarget)}
+          onClick={(e) => updateCaret(e.currentTarget)}
+          onKeyUp={(e) => updateCaret(e.currentTarget)}
           onCompositionStart={onCompositionStart}
           onCompositionEnd={onCompositionEnd}
           onKeyDown={onKeyDown}
@@ -249,4 +294,37 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
       </div>
     </div>
   );
+}
+
+function findMentionTrigger(text: string, caret: number): MentionTrigger | null {
+  const before = text.slice(0, caret);
+  const match = before.match(/@([A-Za-z0-9._-]*)$/);
+  if (!match) return null;
+  const filter = match[1] ?? "";
+  const start = before.length - filter.length - 1;
+  if (isMentionWordChar(before[start - 1])) return null;
+  return {
+    start,
+    end: caret,
+    filter,
+  };
+}
+
+function mentionTargets(
+  text: string,
+  actorsById: Record<string, unknown>,
+): string[] {
+  const targets = new Set<string>();
+  const re = /@([A-Za-z0-9._-]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    if (isMentionWordChar(text[match.index - 1])) continue;
+    const actorId = match[1];
+    if (actorId && actorsById[actorId]) targets.add(actorId);
+  }
+  return [...targets];
+}
+
+function isMentionWordChar(ch: string | undefined): boolean {
+  return !!ch && /[A-Za-z0-9._-]/.test(ch);
 }

@@ -26,10 +26,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
-    method, stream_kind, AgentSpec, BundleInstallMode, EventAppendResult, TurnOpenResult,
+    method, stream_kind, AgentModelChoice, AgentSpec, BundleInstallMode, EventAppendResult,
+    TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -576,6 +578,11 @@ struct WorkerState {
     seen_events: Mutex<HashSet<String>>,
     /// action.request event id → underlying ACP request id.
     action_map: Mutex<HashMap<String, String>>,
+    /// action.request event id for Joi-owned model selection prompts.
+    model_action_map: Mutex<HashSet<String>>,
+    /// Currently selected model id for this actor. Loaded from profile state
+    /// first, then from `spec.models.default`.
+    selected_model: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -593,6 +600,12 @@ struct ActiveTurn {
     cancel_requested: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStateFile {
+    model: String,
+}
+
 impl WorkerState {
     fn new(
         actor_id: String,
@@ -601,6 +614,9 @@ impl WorkerState {
         paths: AgentPaths,
         agent_server_url: String,
     ) -> Self {
+        let selected_model = load_model_state(&profile_dir)
+            .filter(|model| model_is_allowed(&spec, model))
+            .or_else(|| default_model_for_spec(&spec));
         Self {
             actor_id,
             spec,
@@ -614,6 +630,8 @@ impl WorkerState {
             scope_channel_cache: Mutex::new(HashMap::new()),
             seen_events: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
+            model_action_map: Mutex::new(HashSet::new()),
+            selected_model: Mutex::new(selected_model),
         }
     }
 
@@ -714,11 +732,152 @@ impl WorkerState {
             .remove(event_id);
     }
 
+    fn current_model(&self) -> Option<String> {
+        self.selected_model
+            .lock()
+            .expect("selected_model poisoned")
+            .clone()
+    }
+
+    fn model_choices(&self) -> Vec<AgentModelChoice> {
+        model_choices_for_spec(&self.spec)
+    }
+
+    fn model_choice(&self, id: &str) -> Option<AgentModelChoice> {
+        self.model_choices().into_iter().find(|choice| choice.id == id)
+    }
+
+    fn set_current_model(&self, model: String) -> Result<()> {
+        if !model_is_allowed(&self.spec, &model) {
+            return Err(anyhow!("model `{model}` is not configured for {}", self.actor_id));
+        }
+        persist_model_state(&self.profile_dir, &model)?;
+        *self
+            .selected_model
+            .lock()
+            .expect("selected_model poisoned") = Some(model);
+        Ok(())
+    }
+
+    fn record_model_action_request(&self, event_id: String) {
+        self.model_action_map
+            .lock()
+            .expect("model_action_map poisoned")
+            .insert(event_id);
+    }
+
+    fn is_model_action_request(&self, event_id: &str) -> bool {
+        self.model_action_map
+            .lock()
+            .expect("model_action_map poisoned")
+            .contains(event_id)
+    }
+
+    fn forget_model_action_request(&self, event_id: &str) {
+        let _ = self
+            .model_action_map
+            .lock()
+            .expect("model_action_map poisoned")
+            .remove(event_id);
+    }
+
     fn remember_event(&self, event_id: &str) -> bool {
         self.seen_events
             .lock()
             .expect("seen_events poisoned")
             .insert(event_id.to_string())
+    }
+}
+
+fn model_state_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("model.json")
+}
+
+fn load_model_state(profile_dir: &Path) -> Option<String> {
+    let path = model_state_path(profile_dir);
+    let text = std::fs::read_to_string(path).ok()?;
+    let state: ModelStateFile = serde_json::from_str(&text).ok()?;
+    let model = state.model.trim();
+    if model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
+    }
+}
+
+fn persist_model_state(profile_dir: &Path, model: &str) -> Result<()> {
+    std::fs::create_dir_all(profile_dir)
+        .with_context(|| format!("create profile dir {}", profile_dir.display()))?;
+    let path = model_state_path(profile_dir);
+    let text = serde_json::to_string_pretty(&ModelStateFile {
+        model: model.to_string(),
+    })?;
+    std::fs::write(&path, format!("{text}\n"))
+        .with_context(|| format!("write model state {}", path.display()))?;
+    Ok(())
+}
+
+fn default_model_for_spec(spec: &AgentSpec) -> Option<String> {
+    spec.models
+        .as_ref()
+        .and_then(|models| models.default.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+        .filter(|model| model_is_allowed(spec, model))
+        .or_else(|| model_choices_for_spec(spec).into_iter().next().map(|c| c.id))
+}
+
+fn model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    model_choices_for_spec(spec)
+        .iter()
+        .any(|choice| choice.id == model)
+}
+
+fn model_choices_for_spec(spec: &AgentSpec) -> Vec<AgentModelChoice> {
+    let Some(models) = spec.models.as_ref() else {
+        return Vec::new();
+    };
+    let mut choices = Vec::new();
+    let mut seen = HashSet::new();
+    for choice in &models.choices {
+        let id = choice.id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let mut choice = choice.clone();
+        choice.id = id.to_string();
+        choices.push(choice);
+    }
+    if let Some(default) = models
+        .default
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if seen.insert(default.to_string()) {
+            choices.insert(
+                0,
+                AgentModelChoice {
+                    id: default.to_string(),
+                    label: default.to_string(),
+                    description: None,
+                },
+            );
+        }
+    }
+    choices
+}
+
+fn model_choice_label(choice: &AgentModelChoice) -> &str {
+    if choice.label.trim().is_empty() {
+        choice.id.as_str()
+    } else {
+        choice.label.as_str()
     }
 }
 
@@ -919,7 +1078,7 @@ async fn notification_loop(
             continue;
         }
         if event.kind == "action.response" {
-            if let Err(e) = handle_action_response(&state, &adapter, &event).await {
+            if let Err(e) = handle_action_response(&client, &state, &adapter, &event).await {
                 eprintln!("[{actor_id}] failed to handle action.response: {e}");
             }
             continue;
@@ -932,6 +1091,15 @@ async fn notification_loop(
         }
         if !is_for_us(&event, actor_id) {
             continue;
+        }
+
+        match handle_control_command(&client, &state, &event).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("[{actor_id}] failed to handle control command: {e}");
+                continue;
+            }
         }
 
         // Lazy start the adapter on first hands_off_to event.
@@ -955,6 +1123,7 @@ async fn notification_loop(
 }
 
 async fn handle_action_response(
+    client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
     event: &Event,
@@ -968,9 +1137,18 @@ async fn handle_action_response(
         }
         saw_response_relation = true;
         let request_event_id = relation.target.id.as_str();
+        let echoed_request_id = action_request_id_from_response(event);
+        if state.is_model_action_request(request_event_id)
+            || echoed_request_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("joi:model:"))
+        {
+            handle_model_action_response(client, state, event, request_event_id).await?;
+            return Ok(());
+        }
         let request_id = match state.lookup_action_request(request_event_id) {
             Some(id) => id,
-            None => match action_request_id_from_response(event) {
+            None => match echoed_request_id {
                 Some(id) => {
                     eprintln!(
                         "[{}] action.response {} used echoed ACP request id for {}",
@@ -1031,6 +1209,59 @@ fn action_request_id_from_response(event: &Event) -> Option<String> {
         .map(ToString::to_string)
 }
 
+async fn handle_model_action_response(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    event: &Event,
+    request_event_id: &str,
+) -> Result<()> {
+    let option_id = event
+        .payload
+        .get("optionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if option_id.is_empty() {
+        eprintln!(
+            "[{}] model action.response {} ignored: missing payload.optionId",
+            state.actor_id, event.id
+        );
+        return Ok(());
+    }
+
+    let Some(choice) = state.model_choice(&option_id) else {
+        eprintln!(
+            "[{}] model action.response {} ignored: unknown model `{}`",
+            state.actor_id, event.id, option_id
+        );
+        state.forget_model_action_request(request_event_id);
+        return Ok(());
+    };
+    state.set_current_model(option_id.clone())?;
+    state.forget_model_action_request(request_event_id);
+
+    let label = model_choice_label(&choice);
+    append_event(
+        client,
+        "content.add",
+        &state.actor_id,
+        &event.scope,
+        None,
+        json!({
+            "contentType": "text/markdown",
+            "text": format!("Model set to `{label}`. New ACP sessions for this agent will use `{option_id}`.")
+        }),
+        vec![responds_to(&event.id)],
+    )
+    .await?;
+    eprintln!(
+        "[{}] selected model `{}` via {}",
+        state.actor_id, option_id, event.id
+    );
+    Ok(())
+}
+
 async fn handle_turn_close(
     _client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -1082,6 +1313,105 @@ fn is_for_us(event: &Event, actor_id: &str) -> bool {
             && r.target.kind == RefKind::Actor
             && r.target.id == actor_id
     })
+}
+
+async fn handle_control_command(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    trigger: &Event,
+) -> Result<bool> {
+    match render_prompt(trigger).trim() {
+        "/model" | "/models" => {
+            open_model_picker(client, state, trigger).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn open_model_picker(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    trigger: &Event,
+) -> Result<()> {
+    let choices = state.model_choices();
+    if choices.is_empty() {
+        append_event(
+            client,
+            "content.add",
+            &state.actor_id,
+            &trigger.scope,
+            None,
+            json!({
+                "contentType": "text/markdown",
+                "text": "No model choices are configured for this agent. Add `models.choices` to the agent spec, then restart `joi agent serve`."
+            }),
+            vec![responds_to(&trigger.id)],
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let current = state.current_model();
+    let payload_choices = choices
+        .iter()
+        .map(|choice| {
+            let mut label = model_choice_label(choice).to_string();
+            if current.as_deref() == Some(choice.id.as_str()) {
+                label.push_str(" (current)");
+            }
+            json!({ "id": choice.id.clone(), "label": label })
+        })
+        .collect::<Vec<_>>();
+    let current_label = current.as_deref().unwrap_or("(none)");
+    let payload = json!({
+        "requestId": format!("joi:model:{}", trigger.id),
+        "requestType": "joi.model.select",
+        "title": format!("Choose model for @{}", state.actor_id),
+        "description": format!(
+            "Current model: {current_label}\n\nThe selected model is saved for this agent and used when Joi creates ACP sessions."
+        ),
+        "choices": payload_choices,
+    });
+    let appended = append_event(
+        client,
+        "action.request",
+        &state.actor_id,
+        &trigger.scope,
+        None,
+        payload,
+        vec![
+            responds_to(&trigger.id),
+            Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: trigger.actor_id.clone(),
+                    _meta: None,
+                },
+                _meta: None,
+            },
+        ],
+    )
+    .await?;
+    state.record_model_action_request(appended.event.id.clone());
+    eprintln!(
+        "[{}] opened model picker {} for {}",
+        state.actor_id, appended.event.id, trigger.actor_id
+    );
+    Ok(())
+}
+
+fn responds_to(event_id: &str) -> Relation {
+    Relation {
+        kind: RelationKind::RespondsTo,
+        target: Ref {
+            kind: RefKind::Event,
+            id: event_id.to_string(),
+            _meta: None,
+        },
+        _meta: None,
+    }
 }
 
 async fn handle_handoff(
@@ -1140,6 +1470,7 @@ async fn dispatch_handoff(
         let adapter_prompt = AdapterPrompt {
             scope: trigger.scope.clone(),
             content: prompt,
+            model: state.current_model(),
             cwd: scope_paths.workspace,
             env: state
                 .paths
@@ -1667,7 +1998,7 @@ async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::methods::{AgentBundleSpec, AgentTransport};
+    use proto::methods::{AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport};
     use proto::types::{Actor, ActorKind};
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
@@ -1690,6 +2021,7 @@ mod tests {
                 prompt_via: proto::methods::PromptVia::default(),
             },
             autostart: false,
+            models: None,
             bundle,
             identity: None,
             memory: None,
@@ -1826,6 +2158,64 @@ mod tests {
         assert!(marked.cancel_requested);
         assert!(state.current_turn(&scope.id).unwrap().cancel_requested);
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn model_choices_include_default_and_dedupe() {
+        let mut spec = sample_spec(None);
+        spec.models = Some(AgentModelSpec {
+            default: Some("model_default".into()),
+            choices: vec![
+                AgentModelChoice {
+                    id: "model_fast".into(),
+                    label: "Fast".into(),
+                    description: None,
+                },
+                AgentModelChoice {
+                    id: "model_fast".into(),
+                    label: "Fast duplicate".into(),
+                    description: None,
+                },
+            ],
+        });
+
+        let choices = model_choices_for_spec(&spec);
+
+        assert_eq!(
+            choices.iter().map(|choice| choice.id.as_str()).collect::<Vec<_>>(),
+            vec!["model_default", "model_fast"]
+        );
+        assert_eq!(default_model_for_spec(&spec).as_deref(), Some("model_default"));
+        assert!(model_is_allowed(&spec, "model_fast"));
+        assert!(!model_is_allowed(&spec, "model_missing"));
+    }
+
+    #[test]
+    fn worker_state_loads_persisted_model_over_default() {
+        let root = temp_path("model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "model_fast").expect("persist model");
+        let mut spec = sample_spec(None);
+        spec.models = Some(AgentModelSpec {
+            default: Some("model_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "model_fast".into(),
+                label: "Fast".into(),
+                description: None,
+            }],
+        });
+
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("model_fast"));
         std::fs::remove_dir_all(root).ok();
     }
 }

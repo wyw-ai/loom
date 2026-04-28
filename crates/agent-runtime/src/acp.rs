@@ -115,7 +115,13 @@ struct AcpInner {
     child: Option<Child>,
     shared: Option<Arc<AcpShared>>,
     /// scope.id → ACP session id. Built up lazily by `send_prompt`.
-    sessions: HashMap<String, String>,
+    sessions: HashMap<String, AcpSession>,
+}
+
+#[derive(Debug, Clone)]
+struct AcpSession {
+    id: String,
+    model: Option<String>,
 }
 
 impl AcpAdapter {
@@ -151,22 +157,34 @@ impl AcpAdapter {
         let scope = prompt.scope.clone();
         // Snapshot what we need under the parking_lot guard, then drop it
         // before any spawn_blocking / await.
-        let (shared, existing_sid) = {
+        let requested_model = prompt
+            .model
+            .as_ref()
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty())
+            .map(ToOwned::to_owned);
+        let (shared, existing_session) = {
             let inner = self.inner.lock();
             let shared = inner.shared.clone().ok_or("ACP agent not running")?;
-            (shared, inner.sessions.get(&scope.id).cloned())
+            let session = inner
+                .sessions
+                .get(&scope.id)
+                .filter(|s| s.model == requested_model)
+                .cloned();
+            (shared, session)
         };
 
         // Lazy session/new for this scope. The runtime layer serializes prompts
         // per scope, so we shouldn't see two concurrent send_prompt calls for
         // the same scope racing on this allocation.
-        let session_id = match existing_sid {
-            Some(sid) => sid,
+        let session_id = match existing_session {
+            Some(session) => session.id,
             None => {
                 let scope_for_new = scope.clone();
                 let shared_for_new = shared.clone();
                 let mcp_servers = shared.mcp_servers.clone();
                 let cwd = prompt.cwd.clone();
+                let model = requested_model.clone();
                 let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
                     std::fs::create_dir_all(&cwd).map_err(|e| {
                         format!(
@@ -175,8 +193,12 @@ impl AcpAdapter {
                             e
                         )
                     })?;
-                    let res =
-                        request_new_session_with_auth_retry(&shared_for_new, &cwd, &mcp_servers)?;
+                    let res = request_new_session_with_auth_retry(
+                        &shared_for_new,
+                        &cwd,
+                        &mcp_servers,
+                        model.as_deref(),
+                    )?;
                     let sid = res
                         .get("sessionId")
                         .and_then(|v| v.as_str())
@@ -190,10 +212,13 @@ impl AcpAdapter {
                 })
                 .await
                 .map_err(|e| e.to_string())??;
-                self.inner
-                    .lock()
-                    .sessions
-                    .insert(scope.id.clone(), new_sid.clone());
+                self.inner.lock().sessions.insert(
+                    scope.id.clone(),
+                    AcpSession {
+                        id: new_sid.clone(),
+                        model: requested_model.clone(),
+                    },
+                );
                 new_sid
             }
         };
@@ -288,10 +313,10 @@ impl AcpAdapter {
             let Some(shared) = inner.shared.clone() else {
                 return Ok(());
             };
-            let Some(sid) = inner.sessions.get(&scope.id).cloned() else {
+            let Some(session) = inner.sessions.get(&scope.id).cloned() else {
                 return Ok(());
             };
-            (shared, sid)
+            (shared, session.id)
         };
         // Fire-and-forget: the agent's pending session/prompt response will
         // come back with stopReason="cancelled" and run through the existing
@@ -310,7 +335,8 @@ impl AcpAdapter {
     async fn stop_internal(&self) -> Result<(), String> {
         let (shared, session_ids, mut child) = {
             let mut inner = self.inner.lock();
-            let session_ids: Vec<String> = inner.sessions.values().cloned().collect();
+            let session_ids: Vec<String> =
+                inner.sessions.values().map(|session| session.id.clone()).collect();
             inner.sessions.clear();
             (inner.shared.take(), session_ids, inner.child.take())
         };
@@ -511,11 +537,15 @@ fn request_new_session_with_auth_retry(
     shared: &Arc<AcpShared>,
     cwd: &Path,
     mcp_servers: &[Value],
+    model: Option<&str>,
 ) -> Result<Value, String> {
-    let params = json!({
+    let mut params = json!({
         "cwd": cwd.to_string_lossy(),
         "mcpServers": mcp_servers,
     });
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        params["model"] = json!(model);
+    }
     match shared.request_and_wait("session/new", params.clone(), Duration::from_secs(30)) {
         Ok(value) => Ok(value),
         Err(err) if is_auth_required_error(&err) => {

@@ -260,10 +260,11 @@ fn run_prompt(
 ) -> Result<(), String> {
     let scope = prompt.scope.clone();
     let content = prompt.content.clone();
+    let command_signature = command_signature_for_prompt(&cfg, &prompt);
     let session = load_session(&cfg, &scope.id);
     let resume_session_id = session
         .as_ref()
-        .filter(|s| s.command_signature == cfg.command_signature)
+        .filter(|s| s.command_signature == command_signature)
         .map(|s| s.session_id.clone());
 
     // First-run vs resume: if a usable session is on disk AND the spec supports
@@ -299,7 +300,7 @@ fn run_prompt(
         if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
-                    if let Err(e) = save_session(&cfg, &scope.id, &sid) {
+                    if let Err(e) = save_session(&cfg, &scope.id, &sid, &command_signature) {
                         tracing::warn!(actor = %cfg.actor_id, %e, "failed to save command session");
                     }
                 }
@@ -683,7 +684,12 @@ fn load_session(cfg: &CommandConfig, scope_id: &str) -> Option<SessionRecord> {
     serde_json::from_str(&text).ok()
 }
 
-fn save_session(cfg: &CommandConfig, scope_id: &str, session_id: &str) -> std::io::Result<()> {
+fn save_session(
+    cfg: &CommandConfig,
+    scope_id: &str,
+    session_id: &str,
+    command_signature: &str,
+) -> std::io::Result<()> {
     let path = session_path(cfg, scope_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -704,10 +710,21 @@ fn save_session(cfg: &CommandConfig, scope_id: &str, session_id: &str) -> std::i
             .map(|e| e.created_at)
             .unwrap_or_else(|| now.clone()),
         last_used_at: now,
-        command_signature: cfg.command_signature.clone(),
+        command_signature: command_signature.to_string(),
     };
     let json = serde_json::to_string_pretty(&record)?;
     std::fs::write(path, json)
+}
+
+fn command_signature_for_prompt(cfg: &CommandConfig, request: &AdapterPrompt) -> String {
+    let Some(model) = request.model.as_ref().filter(|m| !m.trim().is_empty()) else {
+        return cfg.command_signature.clone();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(cfg.command_signature.as_bytes());
+    hasher.update(b"\x00model\x00");
+    hasher.update(model.trim().as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn delete_session(cfg: &CommandConfig, scope_id: &str) -> std::io::Result<()> {
@@ -892,6 +909,10 @@ fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String
     for (k, v) in &request.env {
         env.entry(k.clone()).or_insert_with(|| v.clone());
     }
+    if let Some(model) = request.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        env.entry("JOI_AGENT_MODEL".into())
+            .or_insert_with(|| model.clone());
+    }
     env
 }
 
@@ -931,10 +952,26 @@ mod tests {
         AdapterPrompt {
             scope: scope(),
             content: content.into(),
+            model: None,
             cwd: PathBuf::from("/tmp"),
             env: BTreeMap::new(),
             template_vars: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn command_signature_includes_prompt_model() {
+        let cfg = cfg();
+        let mut request = prompt("hello");
+        assert_eq!(command_signature_for_prompt(&cfg, &request), cfg.command_signature);
+
+        request.model = Some("model_a".into());
+        let model_a = command_signature_for_prompt(&cfg, &request);
+        request.model = Some("model_b".into());
+        let model_b = command_signature_for_prompt(&cfg, &request);
+
+        assert_ne!(model_a, cfg.command_signature);
+        assert_ne!(model_a, model_b);
     }
 
     #[test]

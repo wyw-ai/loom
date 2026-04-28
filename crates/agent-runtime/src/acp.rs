@@ -12,9 +12,10 @@
 //! `session_id` existed per child.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +28,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+
+const SHELL_ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
@@ -379,17 +382,33 @@ fn start_blocking(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let mut path_for_error = std::env::var("PATH").unwrap_or_default();
+    if should_capture_shell_env() {
+        match capture_login_shell_env(&process_cwd, SHELL_ENV_CAPTURE_TIMEOUT) {
+            Ok(env) => {
+                eprintln!(
+                    "[joi:acp] captured {} env vars from login shell for ACP child",
+                    env.len()
+                );
+                if let Some(path) = env.get("PATH") {
+                    path_for_error = path.clone();
+                }
+                cmd.envs(env);
+            }
+            Err(err) => {
+                eprintln!("[joi:acp] login shell env capture skipped: {err}");
+            }
+        }
+    }
     for (k, v) in &cfg.env {
+        if k == "PATH" {
+            path_for_error = v.clone();
+        }
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().map_err(|e| {
-        format!(
-            "Failed to start ACP command `{}` in `{}`: {}",
-            cfg.command,
-            process_cwd.display(),
-            e
-        )
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| spawn_error_message(&cfg.command, &process_cwd, &path_for_error, e))?;
     let stdin = child.stdin.take().ok_or("Failed to open agent stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to open agent stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to open agent stderr")?;
@@ -450,6 +469,179 @@ fn start_blocking(
         agent_capabilities: initialize.get("agentCapabilities").cloned(),
     };
     Ok((info, child, shared))
+}
+
+fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {
+    if err.kind() == ErrorKind::NotFound {
+        return format!(
+            "Failed to start ACP command `{command}`: command not found on PATH \
+             (cwd `{}`, PATH `{}`)",
+            cwd.display(),
+            truncate_for_log(&path, 500),
+        );
+    }
+    format!(
+        "Failed to start ACP command `{command}` in `{}`: {err}",
+        cwd.display()
+    )
+}
+
+fn should_capture_shell_env() -> bool {
+    match std::env::var("JOI_ACP_SHELL_ENV") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn capture_login_shell_env(
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<BTreeMap<String, String>, String> {
+    let shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let start = format!("__JOI_ACP_ENV_START_{}__", Uuid::new_v4().simple());
+    let end = format!("__JOI_ACP_ENV_END_{}__", Uuid::new_v4().simple());
+    let cwd = cwd.to_string_lossy();
+    let command = format!(
+        "cd {}; printf '{}\\n'; env -0; printf '\\n{}\\n'",
+        shell_quote(&cwd),
+        start,
+        end
+    );
+
+    let child = Command::new(&shell)
+        .arg("-l")
+        .arg("-i")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start `{}`: {e}", shell.display()))?;
+
+    let output = wait_with_timeout(child, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{}` exited with {}; stderr: {}",
+            shell.display(),
+            output.status,
+            truncate_for_log(&String::from_utf8_lossy(&output.stderr), 300)
+        ));
+    }
+
+    parse_env_output(&output.stdout, &start, &end)
+}
+
+#[cfg(not(unix))]
+fn capture_login_shell_env(
+    _cwd: &Path,
+    _timeout: Duration,
+) -> Result<BTreeMap<String, String>, String> {
+    Err("login shell env capture is only implemented on Unix".into())
+}
+
+fn wait_with_timeout(child: Child, timeout: Duration) -> Result<Output, String> {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(format!("failed to read shell env output: {err}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_process(pid);
+            Err(format!("timed out after {}s", timeout.as_secs()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("shell env capture worker disconnected".into())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process(_pid: u32) {}
+
+fn parse_env_output(
+    stdout: &[u8],
+    start: &str,
+    end: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let start_pos = find_bytes(stdout, start.as_bytes())
+        .ok_or_else(|| "login shell env output did not contain start marker".to_string())?;
+    let mut body_start = start_pos + start.len();
+    if stdout.get(body_start) == Some(&b'\r') {
+        body_start += 1;
+    }
+    if stdout.get(body_start) == Some(&b'\n') {
+        body_start += 1;
+    }
+    let end_rel = find_bytes(&stdout[body_start..], end.as_bytes())
+        .ok_or_else(|| "login shell env output did not contain end marker".to_string())?;
+    let mut body_end = body_start + end_rel;
+    while body_end > body_start && matches!(stdout[body_end - 1], b'\n' | b'\r') {
+        body_end -= 1;
+    }
+
+    let mut env = BTreeMap::new();
+    for raw in stdout[body_start..body_end].split(|b| *b == 0) {
+        let raw = trim_ascii_newlines(raw);
+        if raw.is_empty() {
+            continue;
+        }
+        let Some(eq) = raw.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        if eq == 0 {
+            continue;
+        }
+        let key = String::from_utf8_lossy(&raw[..eq]).into_owned();
+        let value = String::from_utf8_lossy(&raw[eq + 1..]).into_owned();
+        env.insert(key, value);
+    }
+    if env.is_empty() {
+        return Err("login shell env output contained no KEY=VALUE entries".into());
+    }
+    Ok(env)
+}
+
+fn trim_ascii_newlines(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && matches!(bytes[start], b'\n' | b'\r') {
+        start += 1;
+    }
+    while end > start && matches!(bytes[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 impl AcpShared {
@@ -831,4 +1023,36 @@ fn json_value_to_string(value: &Value) -> String {
         .as_str()
         .map(ToString::to_string)
         .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_env_output_ignores_shell_noise_and_reads_nul_records() {
+        let stdout =
+            b"hello from shell\n__START__\nHOME=/Users/joi\0PATH=/opt/bin:/usr/bin\0\n__END__\n";
+
+        let env = parse_env_output(stdout, "__START__", "__END__").expect("parse env");
+
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/Users/joi"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn parse_env_output_rejects_missing_markers() {
+        let err = parse_env_output(b"HOME=/Users/joi\0", "__START__", "__END__")
+            .expect_err("must reject missing markers");
+
+        assert!(err.contains("start marker"));
+    }
+
+    #[test]
+    fn shell_quote_handles_single_quotes() {
+        assert_eq!(shell_quote("/tmp/it's fine"), "'/tmp/it'\\''s fine'");
+    }
 }

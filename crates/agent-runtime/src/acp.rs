@@ -68,6 +68,8 @@ struct AcpShared {
     stdin: Mutex<ChildStdin>,
     next_request_id: AtomicU64,
     response_waiters: Mutex<HashMap<String, std::sync::mpsc::Sender<Result<Value, String>>>>,
+    auth_method: Mutex<Option<String>>,
+    auth_attempted: Mutex<bool>,
     /// Outstanding `session/prompt` requests we are waiting on. Maps request id
     /// → originating scope so the asynchronous `Finished` event can be tagged
     /// with the right scope when the response comes back.
@@ -154,14 +156,8 @@ impl AcpAdapter {
                             e
                         )
                     })?;
-                    let res = shared_for_new.request_and_wait(
-                        "session/new",
-                        json!({
-                            "cwd": cwd.to_string_lossy(),
-                            "mcpServers": mcp_servers,
-                        }),
-                        Duration::from_secs(30),
-                    )?;
+                    let res =
+                        request_new_session_with_auth_retry(&shared_for_new, &cwd, &mcp_servers)?;
                     let sid = res
                         .get("sessionId")
                         .and_then(|v| v.as_str())
@@ -416,6 +412,8 @@ fn start_blocking(
         stdin: Mutex::new(stdin),
         next_request_id: AtomicU64::new(1),
         response_waiters: Mutex::new(HashMap::new()),
+        auth_method: Mutex::new(None),
+        auth_attempted: Mutex::new(false),
         in_flight_prompts: Mutex::new(HashMap::new()),
         pending_permissions: Mutex::new(HashMap::new()),
         sessions_by_id: Mutex::new(HashMap::new()),
@@ -447,8 +445,17 @@ fn start_blocking(
         Duration::from_secs(60),
     )?;
 
+    let auth_method = cfg
+        .auth_method
+        .as_ref()
+        .filter(|method| !method.trim().is_empty())
+        .cloned()
+        .or_else(|| single_initialize_auth_method(&initialize));
+    *shared.auth_method.lock() = auth_method.clone();
+
     if let Some(method) = cfg.auth_method.as_deref() {
         if !method.trim().is_empty() {
+            *shared.auth_attempted.lock() = true;
             shared.request_and_wait(
                 "authenticate",
                 json!({ "methodId": method }),
@@ -469,6 +476,70 @@ fn start_blocking(
         agent_capabilities: initialize.get("agentCapabilities").cloned(),
     };
     Ok((info, child, shared))
+}
+
+fn request_new_session_with_auth_retry(
+    shared: &Arc<AcpShared>,
+    cwd: &Path,
+    mcp_servers: &[Value],
+) -> Result<Value, String> {
+    let params = json!({
+        "cwd": cwd.to_string_lossy(),
+        "mcpServers": mcp_servers,
+    });
+    match shared.request_and_wait("session/new", params.clone(), Duration::from_secs(30)) {
+        Ok(value) => Ok(value),
+        Err(err) if is_auth_required_error(&err) => {
+            let method = shared.auth_method.lock().clone();
+            let Some(method) = method else {
+                return Err(format!(
+                    "{err}; agent requires authentication but did not advertise a single \
+                     auth method. Set transport.authMethod in the agent spec."
+                ));
+            };
+            {
+                let mut attempted = shared.auth_attempted.lock();
+                if *attempted {
+                    return Err(err);
+                }
+                *attempted = true;
+            }
+            eprintln!(
+                "[joi:acp] session/new requires authentication; trying auth method `{method}`"
+            );
+            shared.request_and_wait(
+                "authenticate",
+                json!({ "methodId": method }),
+                Duration::from_secs(30),
+            )?;
+            shared.request_and_wait("session/new", params, Duration::from_secs(30))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn single_initialize_auth_method(initialize: &Value) -> Option<String> {
+    let auth_methods = initialize.get("authMethods")?.as_array()?;
+    if auth_methods.len() != 1 {
+        return None;
+    }
+    auth_methods[0]
+        .get("id")
+        .and_then(|id| id.as_str())
+        .map(ToString::to_string)
+}
+
+fn is_auth_required_error(err: &str) -> bool {
+    if err.contains("Authentication required") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(err) else {
+        return false;
+    };
+    value
+        .get("message")
+        .and_then(|message| message.as_str())
+        .is_some_and(|message| message == "Authentication required")
 }
 
 fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {
@@ -1054,5 +1125,38 @@ mod tests {
     #[test]
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("/tmp/it's fine"), "'/tmp/it'\\''s fine'");
+    }
+
+    #[test]
+    fn single_initialize_auth_method_reads_only_unambiguous_method() {
+        let initialize = json!({
+            "authMethods": [
+                { "id": "qodercli-login", "name": "Login" }
+            ]
+        });
+
+        assert_eq!(
+            single_initialize_auth_method(&initialize).as_deref(),
+            Some("qodercli-login")
+        );
+
+        let ambiguous = json!({
+            "authMethods": [
+                { "id": "one" },
+                { "id": "two" }
+            ]
+        });
+        assert_eq!(single_initialize_auth_method(&ambiguous), None);
+    }
+
+    #[test]
+    fn auth_required_error_matches_qoder_shape() {
+        assert!(is_auth_required_error(
+            r#"{"code":-32000,"message":"Authentication required"}"#
+        ));
+        assert!(is_auth_required_error("Authentication required"));
+        assert!(!is_auth_required_error(
+            r#"{"code":-32000,"message":"different"}"#
+        ));
     }
 }

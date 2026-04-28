@@ -11,6 +11,10 @@
 | [`actor_opencode.json`](actor_opencode.json) | `opencode acp` | 需要本机已装 `opencode` CLI |
 | [`actor_qoder.json`](actor_qoder.json) | `npx -y @qoder-ai/qodercli --acp` | Qoder ACP 模式 |
 
+Qoder 会根据客户端声明的 terminal auth 能力返回登录命令。Joi 会优先执行
+Qoder 返回的 `_meta.terminal-auth` 命令，这样 `npx` 方式也能复用它自己的
+登录入口；如果登录态失效，按日志提示重新登录后重试。
+
 每份 spec 的 `env` 都留空了。如果你的网络环境需要走代理，自己加
 `http_proxy` / `https_proxy` / `all_proxy` 即可，例如：
 

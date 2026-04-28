@@ -13,8 +13,7 @@
       "@qoder-ai/qodercli@0.1.36",
       "--acp"
     ],
-    "env": {},
-    "cwd": "{agent.workspace}"
+    "env": {}
   },
   "autostart": false
 }

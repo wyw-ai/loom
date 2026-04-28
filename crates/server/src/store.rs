@@ -31,6 +31,7 @@ pub enum StoreEvent {
     TurnOpened(Turn),
     TurnClosed(Turn),
     ThreadCreated(Thread),
+    ChannelCreated(Channel),
     ArtifactPublished(Artifact),
     ReceiptRecorded(Receipt),
     DeliveryUpdated(Delivery),
@@ -72,6 +73,9 @@ impl StoreEvent {
             // fanout routes them via `send_to_actor`, not scope subs.
             StoreEvent::ChannelGranted { .. } => None,
             StoreEvent::ChannelRevoked { .. } => None,
+            // ChannelCreated is fanned out to all connections (public) or
+            // to the creator only (private) — routed in ws::fanout.
+            StoreEvent::ChannelCreated(_) => None,
         }
     }
 }
@@ -182,6 +186,7 @@ impl Store {
             .write()
             .channels
             .insert(channel.id.clone(), channel.clone());
+        self.emit(StoreEvent::ChannelCreated(channel.clone()));
         Ok(channel)
     }
 

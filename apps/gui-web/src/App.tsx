@@ -123,6 +123,18 @@ export function App() {
     const me = useSession.getState().workspace?.actorId;
 
     switch (u.kind) {
+      case "channel.created": {
+        const channel = u.data.channel as
+          | {
+              id: string;
+              title: string;
+              visibility: "public" | "private";
+              members: string[];
+            }
+          | undefined;
+        if (channel) channels.upsertChannel(channel);
+        return;
+      }
       case "event.created": {
         const ev = u.data.event as JoiEvent | undefined;
         if (!ev) return;

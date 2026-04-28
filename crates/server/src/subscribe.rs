@@ -200,6 +200,23 @@ impl Subscriptions {
         }
     }
 
+    /// Send a JSON-RPC notification to every connected client, regardless
+    /// of scope subscriptions. Used for global announcements like
+    /// `channel.created` for public channels.
+    pub fn broadcast_to_all(&self, method: &str, payload: Value) {
+        let frame = match serde_json::to_string(&proto::Notification::new(method, Some(payload))) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "failed to serialize broadcast_to_all notification");
+                return;
+            }
+        };
+        let inner = self.inner.read();
+        for c in inner.connections.values() {
+            let _ = c.tx.send(frame.clone());
+        }
+    }
+
     /// Send a JSON-RPC notification (or any text frame) to a single connection.
     pub fn send_to_connection(&self, connection_id: &str, frame: String) -> bool {
         let inner = self.inner.read();

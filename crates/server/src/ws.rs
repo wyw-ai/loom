@@ -192,6 +192,45 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
+    // ChannelCreated: public channels → broadcast to all connections;
+    // private channels → only to the creator (sole initial member).
+    if let StoreEvent::ChannelCreated(channel) = &ev {
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let payload = json!({
+            "kind": sk::CHANNEL_CREATED,
+            "scope": scope,
+            "data": { "channel": channel },
+        });
+        match channel.visibility {
+            ChannelVisibility::Public => {
+                state
+                    .subscriptions
+                    .broadcast_to_all(method::STREAM_UPDATE, payload);
+                tracing::debug!(
+                    channel = %channel.id,
+                    "channel.created broadcast to all",
+                );
+            }
+            ChannelVisibility::Private => {
+                if let Some(creator) = channel.members.first() {
+                    let delivered = state
+                        .subscriptions
+                        .send_to_actor(creator, method::STREAM_UPDATE, payload);
+                    tracing::debug!(
+                        channel = %channel.id,
+                        creator = %creator,
+                        delivered,
+                        "channel.created actor-inbox push (private)",
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::EventCreated(e) => (sk::EVENT_CREATED, json!({ "event": e })),
@@ -202,8 +241,10 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::ReceiptRecorded(r) => (sk::RECEIPT_RECORDED, json!({ "receipt": r })),
         StoreEvent::DeliveryUpdated(d) => (sk::DELIVERY_UPDATED, json!({ "delivery": d })),
         StoreEvent::TraceAppended(_) => unreachable!("trace handled above"),
-        StoreEvent::ChannelGranted { .. } | StoreEvent::ChannelRevoked { .. } => {
-            unreachable!("channel grant/revoke handled above")
+        StoreEvent::ChannelGranted { .. }
+        | StoreEvent::ChannelRevoked { .. }
+        | StoreEvent::ChannelCreated(_) => {
+            unreachable!("channel grant/revoke/created handled above")
         }
     };
     let Some(scope) = scope else {

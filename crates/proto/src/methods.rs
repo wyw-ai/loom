@@ -1048,6 +1048,9 @@ pub struct StreamUpdate {
 
 pub mod stream_kind {
     pub const THREAD_CREATED: &str = "thread.created";
+    /// Broadcast when a new channel is created. Public channels go to
+    /// all connections; private channels go to the creator only.
+    pub const CHANNEL_CREATED: &str = "channel.created";
     pub const TURN_OPENED: &str = "turn.opened";
     pub const TURN_CLOSED: &str = "turn.closed";
     pub const EVENT_CREATED: &str = "event.created";

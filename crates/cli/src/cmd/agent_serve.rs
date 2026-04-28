@@ -192,19 +192,20 @@ fn warn_deprecated_transport_fields(text: &str, path: &Path) {
     let command = transport
         .and_then(|transport| transport.get("command"))
         .and_then(|command| command.as_str());
-    let pins_qodercli = transport
+    const ZED_QODERCLI_ACP_VERSION: &str = "0.1.48";
+    let qodercli_pin = transport
         .and_then(|transport| transport.get("args"))
         .and_then(|args| args.as_array())
         .into_iter()
         .flatten()
         .filter_map(|arg| arg.as_str())
-        .any(|arg| arg.starts_with("@qoder-ai/qodercli@"));
-    if command == Some("npx") && pins_qodercli {
+        .find_map(|arg| arg.strip_prefix("@qoder-ai/qodercli@"));
+    if command == Some("npx") && qodercli_pin.is_some_and(|pin| pin != ZED_QODERCLI_ACP_VERSION) {
         eprintln!(
-            "[warn] {}: pinned @qoder-ai/qodercli versions may not reuse the \
-             login cache from your installed qodercli; prefer `@qoder-ai/qodercli` \
-             without a version or use local `qodercli --acp`",
-            path.display()
+            "[warn] {}: pinned @qoder-ai/qodercli version differs from Zed \
+             registry ({ZED_QODERCLI_ACP_VERSION}); Qoder ACP auth may fail \
+             even when Zed works",
+            path.display(),
         );
     }
 }

@@ -11,6 +11,8 @@ import { SlashPalette, type SlashPaletteHandle } from "./SlashPalette";
 import { MentionPalette, type MentionPaletteHandle } from "./MentionPalette";
 import { tryHandleSlash } from "./slashDispatch";
 
+const IME_ENTER_GUARD_MS = 80;
+
 export function Prompt({ scope }: { scope: ScopeRef }) {
   const currentScopeKey = scopeKey(scope);
   const selfId = useSession((s) => s.workspace?.actorId);
@@ -28,6 +30,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const slashRef = useRef<SlashPaletteHandle>(null);
   const mentionRef = useRef<MentionPaletteHandle>(null);
+  const composingRef = useRef(false);
+  const ignoreEnterUntilRef = useRef(0);
 
   const trimmed = text.trimStart();
   const slashOpen = trimmed.startsWith("/") && !trimmed.includes(" ");
@@ -132,7 +136,21 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+    const nativeEvent = e.nativeEvent;
+    const nativeComposing =
+      nativeEvent.isComposing || nativeEvent.keyCode === 229;
+    const isImeEnter =
+      composingRef.current ||
+      nativeComposing ||
+      Date.now() < ignoreEnterUntilRef.current;
+
+    if (e.key === "Enter" && !e.shiftKey) {
+      if (isImeEnter) {
+        if (!composingRef.current && !nativeComposing) {
+          e.preventDefault();
+        }
+        return;
+      }
       // If a palette is open, Enter commits the first match instead of
       // sending. This matches Discord and fixes the "@agent<Enter> sent
       // the literal text" bug.
@@ -154,6 +172,18 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         e.preventDefault();
       }
     }
+  };
+
+  const onCompositionStart = () => {
+    composingRef.current = true;
+    ignoreEnterUntilRef.current = 0;
+  };
+
+  const onCompositionEnd = () => {
+    composingRef.current = false;
+    // Some IMEs clear `isComposing` before the Enter keydown that confirms
+    // the candidate/raw English text. Keep a short guard for that key event.
+    ignoreEnterUntilRef.current = Date.now() + IME_ENTER_GUARD_MS;
   };
 
   const replaceLeadingToken = (token: string) => {
@@ -205,6 +235,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
           value={text}
           placeholder={placeholder}
           onChange={(e) => setDraft(scope, e.target.value)}
+          onCompositionStart={onCompositionStart}
+          onCompositionEnd={onCompositionEnd}
           onKeyDown={onKeyDown}
           rows={Math.min(10, Math.max(3, text.split("\n").length + 1))}
           className="flex-1 resize-none bg-transparent text-sm leading-6 outline-none placeholder:text-muted"

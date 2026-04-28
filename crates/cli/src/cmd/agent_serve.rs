@@ -137,6 +137,13 @@ fn default_specs_dir() -> PathBuf {
 }
 
 fn default_data_root() -> PathBuf {
+    for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            if !value.is_empty() {
+                return PathBuf::from(value);
+            }
+        }
+    }
     dirs::home_dir()
         .map(|d| d.join(".agentx"))
         .unwrap_or_else(|| PathBuf::from(".agentx"))
@@ -154,12 +161,30 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
         }
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        warn_deprecated_transport_fields(&text, &path);
         match serde_json::from_str::<AgentSpec>(&text) {
             Ok(spec) => out.push(spec),
             Err(e) => eprintln!("[warn] skipping {}: {}", path.display(), e),
         }
     }
     Ok(out)
+}
+
+fn warn_deprecated_transport_fields(text: &str, path: &Path) {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    if value
+        .get("transport")
+        .and_then(|transport| transport.get("cwd"))
+        .is_some()
+    {
+        eprintln!(
+            "[warn] {}: transport.cwd is ignored; Joi computes ACP session cwd \
+             from the target channel/thread workspace",
+            path.display()
+        );
+    }
 }
 
 /// Actor-level state plus channel-scoped workspaces under the AgentX root.

@@ -185,6 +185,28 @@ fn warn_deprecated_transport_fields(text: &str, path: &Path) {
             path.display()
         );
     }
+
+    let transport = value
+        .get("transport")
+        .and_then(|transport| transport.as_object());
+    let command = transport
+        .and_then(|transport| transport.get("command"))
+        .and_then(|command| command.as_str());
+    let pins_qodercli = transport
+        .and_then(|transport| transport.get("args"))
+        .and_then(|args| args.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|arg| arg.as_str())
+        .any(|arg| arg.starts_with("@qoder-ai/qodercli@"));
+    if command == Some("npx") && pins_qodercli {
+        eprintln!(
+            "[warn] {}: pinned @qoder-ai/qodercli versions may not reuse the \
+             login cache from your installed qodercli; prefer `@qoder-ai/qodercli` \
+             without a version or use local `qodercli --acp`",
+            path.display()
+        );
+    }
 }
 
 /// Actor-level state plus channel-scoped workspaces under the AgentX root.

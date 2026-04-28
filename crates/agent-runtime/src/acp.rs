@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::process::{
+    Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -639,7 +641,7 @@ fn run_terminal_auth(shared: &AcpShared, method: &AcpAuthMethod) -> Result<(), S
         .ok_or_else(|| format!("auth method `{}` does not provide terminal auth", method.id))?;
     eprintln!(
         "[joi:acp] running terminal auth command `{}`{}",
-        terminal.command,
+        format_terminal_auth_command(terminal),
         terminal
             .label
             .as_deref()
@@ -649,28 +651,32 @@ fn run_terminal_auth(shared: &AcpShared, method: &AcpAuthMethod) -> Result<(), S
     let mut cmd = Command::new(&terminal.command);
     cmd.args(&terminal.args)
         .current_dir(&shared.process_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .envs(&shared.process_env)
         .envs(&terminal.env);
     let child = cmd.spawn().map_err(|err| {
         format!(
             "failed to start terminal auth command `{}`: {err}",
-            terminal.command
+            format_terminal_auth_command(terminal)
         )
     })?;
-    let output = wait_with_timeout(child, TERMINAL_AUTH_TIMEOUT)?;
-    if output.status.success() {
+    let status = wait_status_with_timeout(child, TERMINAL_AUTH_TIMEOUT)?;
+    if status.success() {
         return Ok(());
     }
     Err(format!(
-        "terminal auth command `{}` exited with {}; stdout: {}; stderr: {}",
-        terminal.command,
-        output.status,
-        truncate_for_log(&String::from_utf8_lossy(&output.stdout), 500),
-        truncate_for_log(&String::from_utf8_lossy(&output.stderr), 500)
+        "terminal auth command `{}` exited with {}",
+        format_terminal_auth_command(terminal),
+        status,
     ))
+}
+
+fn format_terminal_auth_command(terminal: &TerminalAuthCommand) -> String {
+    let mut parts = vec![shell_quote(&terminal.command)];
+    parts.extend(terminal.args.iter().map(|arg| shell_quote(arg)));
+    parts.join(" ")
 }
 
 fn is_auth_required_error(err: &str) -> bool {
@@ -777,6 +783,26 @@ fn wait_with_timeout(child: Child, timeout: Duration) -> Result<Output, String> 
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err("shell env capture worker disconnected".into())
+        }
+    }
+}
+
+fn wait_status_with_timeout(mut child: Child, timeout: Duration) -> Result<ExitStatus, String> {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(err)) => Err(format!("failed to wait for process: {err}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_process(pid);
+            Err(format!("timed out after {}s", timeout.as_secs()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("process wait worker disconnected".into())
         }
     }
 }

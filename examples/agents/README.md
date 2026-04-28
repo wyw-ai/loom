@@ -31,6 +31,21 @@ Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志
 }
 ```
 
+如果一个 agent runtime 支持在 ACP `session/new` 中指定模型，可以在 spec
+里声明模型菜单。之后在聊天框发送 `@actor_id /models`，Joi 会弹出选择卡片，
+并把选择结果保存到该 actor 的 profile，下次创建 ACP session 时带上选中的
+`model`：
+
+```json
+"models": {
+  "default": "provider/model-id",
+  "choices": [
+    { "id": "provider/model-id", "label": "Default model" },
+    { "id": "provider/fast-model-id", "label": "Fast model" }
+  ]
+}
+```
+
 `cwd` / `env` 里可以用的模板变量（`{agent.workspace}` 等）见根目录 README
 「配置 agent」一节。Command transport（`claude -p` 这种一次性 CLI）的写法
 见 [`docs/command-transport-v0.md`](../../docs/command-transport-v0.md)。

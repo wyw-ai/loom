@@ -69,6 +69,7 @@ export function Bubble({
       eventId: bubble.id,
       actorId: bubble.actorId,
       preview: previewText(bubble.text, bubble.handoffTarget),
+      handoffTarget: bubble.handoffTarget,
     });
     window.dispatchEvent(
       new CustomEvent("joi:focus-prompt", {

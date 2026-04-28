@@ -252,6 +252,48 @@ impl Subscriptions {
         true
     }
 
+    /// Send a JSON-RPC notification to every live connection currently bound
+    /// to `actor_id`. This is for human-facing inbox events, where multiple
+    /// GUI/TUI clients for the same person should all learn about invites and
+    /// cross-scope requests. Agent/service delivery must keep using
+    /// `send_to_actor` so a restarted runtime's old connection cannot receive
+    /// duplicate work.
+    pub fn send_to_actor_connections(&self, actor_id: &str, method: &str, payload: Value) -> usize {
+        let frame = match serde_json::to_string(&proto::Notification::new(method, Some(payload))) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, %method, "failed to serialize actor notification");
+                return 0;
+            }
+        };
+        let inner = self.inner.read();
+        let mut delivered = 0;
+        for c in inner
+            .connections
+            .values()
+            .filter(|c| c.actor_id.as_deref() == Some(actor_id))
+        {
+            if c.tx.send(frame.clone()).is_ok() {
+                delivered += 1;
+            } else {
+                tracing::warn!(
+                    actor = %actor_id,
+                    conn = %c.id,
+                    %method,
+                    "actor-inbox send dropped: writer channel closed (WS dead?)",
+                );
+            }
+        }
+        if delivered == 0 {
+            tracing::warn!(
+                actor = %actor_id,
+                %method,
+                "actor-inbox send dropped: no connection bound to actor",
+            );
+        }
+        delivered
+    }
+
     #[cfg(test)]
     fn inbox_owner(&self, actor_id: &str) -> Option<String> {
         self.inner.read().actor_conn.get(actor_id).cloned()
@@ -331,5 +373,43 @@ mod tests {
             subs.inbox_owner("svc_am_bridge").as_deref(),
             Some("conn_new")
         );
+    }
+
+    #[test]
+    fn actor_connections_sends_to_every_bound_connection() {
+        let subs = Subscriptions::new();
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_other, mut rx_other) = mpsc::unbounded_channel();
+
+        subs.add_connection(Connection {
+            id: "conn_a".into(),
+            actor_id: None,
+            tx: tx_a,
+        });
+        subs.add_connection(Connection {
+            id: "conn_b".into(),
+            actor_id: None,
+            tx: tx_b,
+        });
+        subs.add_connection(Connection {
+            id: "conn_other".into(),
+            actor_id: None,
+            tx: tx_other,
+        });
+        subs.bind_actor("conn_a", "actor_alice".into(), ActorKind::Human);
+        subs.bind_actor("conn_b", "actor_alice".into(), ActorKind::Human);
+        subs.bind_actor("conn_other", "actor_bob".into(), ActorKind::Human);
+
+        let delivered = subs.send_to_actor_connections(
+            "actor_alice",
+            "stream/update",
+            serde_json::json!({ "kind": "channel.invited" }),
+        );
+
+        assert_eq!(delivered, 2);
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_ok());
+        assert!(rx_other.try_recv().is_err());
     }
 }

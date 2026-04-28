@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use proto::methods::method;
-use proto::types::{ChannelVisibility, ScopeKind, ScopeRef};
+use proto::types::{ActorKind, ChannelVisibility, ScopeKind, ScopeRef};
 use proto::{ErrorCode, ErrorObject, RpcEnvelope};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -156,9 +156,7 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                 "channel": channel,
             },
         });
-        let delivered = state
-            .subscriptions
-            .send_to_actor(actor_id, method::STREAM_UPDATE, payload);
+        let delivered = send_actor_inbox(state, actor_id, method::STREAM_UPDATE, payload);
         tracing::debug!(
             channel = %channel.id,
             actor = %actor_id,
@@ -184,9 +182,7 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                 "actorId": actor_id,
             },
         });
-        let delivered = state
-            .subscriptions
-            .send_to_actor(actor_id, method::STREAM_UPDATE, payload);
+        let delivered = send_actor_inbox(state, actor_id, method::STREAM_UPDATE, payload);
         tracing::debug!(
             channel = %channel_id,
             actor = %actor_id,
@@ -301,11 +297,8 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                 );
                 continue;
             }
-            let delivered = state.subscriptions.send_to_actor(
-                &target_id,
-                method::STREAM_UPDATE,
-                payload.clone(),
-            );
+            let delivered =
+                send_actor_inbox(state, &target_id, method::STREAM_UPDATE, payload.clone());
             tracing::debug!(
                 event = %e.id,
                 kind = %e.kind,
@@ -316,6 +309,15 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                 "actor-inbox fanout",
             );
         }
+    }
+}
+
+fn send_actor_inbox(state: &AppState, actor_id: &str, method: &str, payload: Value) -> usize {
+    match state.store.get_actor(actor_id).map(|a| a.kind) {
+        Some(ActorKind::Human) => state
+            .subscriptions
+            .send_to_actor_connections(actor_id, method, payload),
+        _ => usize::from(state.subscriptions.send_to_actor(actor_id, method, payload)),
     }
 }
 

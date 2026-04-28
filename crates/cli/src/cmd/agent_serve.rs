@@ -586,6 +586,11 @@ struct ActiveTurn {
     /// Actor that triggered the current turn — needed when emitting a
     /// `action.request` so we can hand the choice back to them.
     trigger_actor: String,
+    /// Set after a human cancels the turn. The server has already closed the
+    /// turn, but we keep this slot occupied until the adapter's eventual
+    /// Finished(cancelled) arrives so that stale completion cannot close the
+    /// next turn in the same scope.
+    cancel_requested: bool,
 }
 
 impl WorkerState {
@@ -625,6 +630,16 @@ impl WorkerState {
             .lock()
             .expect("active_turns poisoned")
             .insert(turn.scope.id.clone(), turn);
+    }
+
+    fn mark_cancel_requested(&self, scope_id: &str, turn_id: &str) -> Option<ActiveTurn> {
+        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let turn = active.get_mut(scope_id)?;
+        if turn.id != turn_id {
+            return None;
+        }
+        turn.cancel_requested = true;
+        Some(turn.clone())
     }
 
     /// Drop the active turn for `scope_id` and atomically pop the next queued
@@ -1017,7 +1032,7 @@ fn action_request_id_from_response(event: &Event) -> Option<String> {
 }
 
 async fn handle_turn_close(
-    client: &Arc<Client>,
+    _client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
     event: &Event,
@@ -1034,6 +1049,9 @@ async fn handle_turn_close(
     if active.id != turn_id {
         return Ok(());
     }
+    let active = state
+        .mark_cancel_requested(&event.scope.id, turn_id)
+        .unwrap_or(active);
 
     if let Err(e) = adapter.cancel(active.scope.clone()).await {
         tracing::warn!(
@@ -1044,26 +1062,13 @@ async fn handle_turn_close(
             "adapter cancel failed",
         );
     }
-    if let Some(text) = state.take_text(&active.id) {
-        append_event(
-            client,
-            "content.add",
-            &state.actor_id,
-            &active.scope,
-            Some(&active.id),
-            json!({
-                "contentType": "text/markdown",
-                "text": text,
-                "_meta": { "cancelled": true },
-            }),
-            vec![],
-        )
-        .await?;
-    }
-
-    let next_trigger = state.clear_turn(&active.scope.id);
-    if let Some(next) = next_trigger {
-        dispatch_handoff(client, state, adapter, next).await?;
+    if state.take_text(&active.id).is_some() {
+        tracing::debug!(
+            actor = %state.actor_id,
+            turn = %active.id,
+            scope = %active.scope.id,
+            "discarding buffered text from cancelled turn"
+        );
     }
     Ok(())
 }
@@ -1122,6 +1127,7 @@ async fn dispatch_handoff(
             scope: trigger.scope.clone(),
             trigger_event_id: trigger.id.clone(),
             trigger_actor: trigger.actor_id.clone(),
+            cancel_requested: false,
         };
         state.set_turn(active.clone());
 
@@ -1358,6 +1364,9 @@ async fn translate_one(
                 tracing::warn!(actor = %actor_id, "Text event without matching active turn; dropping");
                 return Ok(());
             };
+            if active.cancel_requested {
+                return Ok(());
+            }
             state.push_text(&active.id, &content);
             append_trace(
                 client,
@@ -1389,6 +1398,9 @@ async fn translate_one(
                 tracing::warn!(actor = %actor_id, "ToolUse event without matching active turn; dropping");
                 return Ok(());
             };
+            if active.cancel_requested {
+                return Ok(());
+            }
             append_trace(
                 client,
                 &active.id,
@@ -1409,6 +1421,9 @@ async fn translate_one(
                 tracing::warn!(actor = %actor_id, "ActionRequest event without matching active turn; dropping");
                 return Ok(());
             };
+            if active.cancel_requested {
+                return Ok(());
+            }
             // Surface the request to the trigger actor (so they can
             // `joi action accept/decline`) and remember the ACP request id.
             // The server reverse-delivers the eventual action.response back
@@ -1452,6 +1467,9 @@ async fn translate_one(
             // If the event is scope-tagged AND that scope has a live turn,
             // surface as a Status trace; otherwise just log it.
             if let Some(active) = active {
+                if active.cancel_requested {
+                    return Ok(());
+                }
                 append_trace(
                     client,
                     &active.id,
@@ -1476,7 +1494,9 @@ async fn translate_one(
                 );
                 return Ok(());
             };
-            if let Some(text) = state.take_text(&active.id) {
+            if active.cancel_requested {
+                let _ = state.take_text(&active.id);
+            } else if let Some(text) = state.take_text(&active.id) {
                 flush_text(
                     client,
                     actor_id,
@@ -1487,32 +1507,34 @@ async fn translate_one(
                 )
                 .await?;
             }
-            let status = if success {
-                TurnStatus::Closed
-            } else {
-                TurnStatus::Failed
-            };
-            let _ = append_event(
-                client,
-                "turn.close",
-                actor_id,
-                &active.scope,
-                Some(&active.id),
-                json!({
-                    "status": format!("{:?}", status).to_lowercase(),
-                    "stopReason": summary,
-                }),
-                vec![],
-            )
-            .await;
-            if let Err(e) = close_turn(client, &active.id, status).await {
-                tracing::warn!(
-                    actor = %actor_id,
-                    turn = %active.id,
-                    scope = %active.scope.id,
-                    %e,
-                    "close_turn RPC failed; clearing slot anyway so the queue can drain"
-                );
+            if !active.cancel_requested {
+                let status = if success {
+                    TurnStatus::Closed
+                } else {
+                    TurnStatus::Failed
+                };
+                let _ = append_event(
+                    client,
+                    "turn.close",
+                    actor_id,
+                    &active.scope,
+                    Some(&active.id),
+                    json!({
+                        "status": format!("{:?}", status).to_lowercase(),
+                        "stopReason": summary,
+                    }),
+                    vec![],
+                )
+                .await;
+                if let Err(e) = close_turn(client, &active.id, status).await {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        turn = %active.id,
+                        scope = %active.scope.id,
+                        %e,
+                        "close_turn RPC failed; clearing slot anyway so the queue can drain"
+                    );
+                }
             }
             // Drop the active slot for this scope and pick up the next queued
             // trigger (if any). Clear unconditionally — if close_turn failed
@@ -1767,6 +1789,43 @@ mod tests {
         let bundle_paths = paths.bundle_paths(&spec);
 
         assert_eq!(bundle_paths.version, "demo-bundle");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mark_cancel_requested_only_marks_matching_active_turn() {
+        let root = temp_path("cancel-mark");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+        state.set_turn(ActiveTurn {
+            id: "turn_1".into(),
+            scope: scope.clone(),
+            trigger_event_id: "evt_1".into(),
+            trigger_actor: "actor_human".into(),
+            cancel_requested: false,
+        });
+
+        assert!(state
+            .mark_cancel_requested(&scope.id, "turn_other")
+            .is_none());
+        assert!(!state.current_turn(&scope.id).unwrap().cancel_requested);
+
+        let marked = state
+            .mark_cancel_requested(&scope.id, "turn_1")
+            .expect("matching turn should be marked");
+        assert!(marked.cancel_requested);
+        assert!(state.current_turn(&scope.id).unwrap().cancel_requested);
+
         std::fs::remove_dir_all(root).ok();
     }
 }

@@ -54,12 +54,19 @@ interface UIState {
   sidebarVisible: boolean;
   membersVisible: boolean;
   drafts: Record<string, string>;
-  // `actorId` is the author of the target event — the Prompt needs it to
-  // auto-attach a `hands_off_to` relation when replying to anyone who isn't
-  // self or system, mirroring crates/cli chat `message_relations`.
+  // `actorId` is the author of the target event. `handoffTarget`, when
+  // present, is the explicit actor target of that event. The Prompt uses
+  // `handoffTarget ?? actorId` to auto-attach a `hands_off_to` relation when
+  // replying, mirroring crates/cli chat `message_relations` while preserving
+  // replies to handoff bubbles.
   replyTargets: Record<
     string,
-    { eventId: string; actorId: string; preview: string } | null
+    {
+      eventId: string;
+      actorId: string;
+      preview: string;
+      handoffTarget?: string;
+    } | null
   >;
   toast?: { level: "info" | "warn" | "error"; message: string; id: number };
   modal: ModalSpec | null;
@@ -71,7 +78,12 @@ interface UIState {
   setDraft: (scope: ScopeRef, text: string) => void;
   setReplyTarget: (
     scope: ScopeRef,
-    target: { eventId: string; actorId: string; preview: string } | null,
+    target: {
+      eventId: string;
+      actorId: string;
+      preview: string;
+      handoffTarget?: string;
+    } | null,
   ) => void;
   pushToast: (level: "info" | "warn" | "error", message: string) => void;
   clearToast: () => void;

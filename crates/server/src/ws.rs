@@ -216,9 +216,12 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             }
             ChannelVisibility::Private => {
                 if let Some(creator) = channel.members.first() {
-                    let delivered = state
-                        .subscriptions
-                        .send_to_actor(creator, method::STREAM_UPDATE, payload);
+                    let delivered = send_actor_inbox(
+                        state,
+                        creator,
+                        method::STREAM_UPDATE,
+                        payload,
+                    );
                     tracing::debug!(
                         channel = %channel.id,
                         creator = %creator,

@@ -106,15 +106,16 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         const alreadyHandsOff = relations.some(
           (r) => r.kind === "hands_off_to",
         );
+        const replyHandoffActor = reply.handoffTarget ?? reply.actorId;
         if (
           !alreadyHandsOff &&
-          reply.actorId &&
-          reply.actorId !== selfId &&
-          reply.actorId !== "system"
+          replyHandoffActor &&
+          replyHandoffActor !== selfId &&
+          replyHandoffActor !== "system"
         ) {
           relations.push({
             kind: "hands_off_to",
-            target: { kind: "actor", id: reply.actorId },
+            target: { kind: "actor", id: replyHandoffActor },
           });
         }
       }

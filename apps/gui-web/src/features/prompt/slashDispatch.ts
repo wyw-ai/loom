@@ -99,6 +99,7 @@ function openReplyPicker({ scope }: DispatchCtx) {
         eventId,
         actorId: b.actorId,
         preview: preview(b.text),
+        handoffTarget: b.handoffTarget,
       });
     },
   });

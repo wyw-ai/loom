@@ -24,6 +24,7 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             inner: Arc::new(Mutex::new(None)),
         })

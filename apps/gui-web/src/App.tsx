@@ -21,6 +21,7 @@ import { ContextMenuHost } from "@/features/common/ContextMenu";
 import { DisconnectedOverlay } from "@/features/common/DisconnectedOverlay";
 import { AddWorkspaceHost } from "@/features/workspaces/AddWorkspaceModal";
 import { summarizeActionRequest } from "@/features/chat/actionRequestSummary";
+import { notifyDesktop } from "@/features/notifications/desktop";
 
 export function App() {
   const view = useUI((s) => s.view);
@@ -156,6 +157,10 @@ export function App() {
           useUI
             .getState()
             .pushToast("warn", `action.request waiting in #${ev.scope.id}`);
+          void notifyDesktop(
+            "Action request waiting",
+            `${p.title} in #${ev.scope.id}`,
+          );
           return;
         }
 
@@ -196,6 +201,15 @@ export function App() {
           | undefined;
         if (!channel) return;
         channels.upsertChannel(channel);
+        if (u.data.actorId === me) {
+          useUI
+            .getState()
+            .pushToast("info", `you were added to #${channel.title}`);
+          void notifyDesktop(
+            "Added to channel",
+            `You can now read and send messages in #${channel.title}.`,
+          );
+        }
         // If the MembersRail has already rendered this channel once, its
         // cached Actor[] no longer matches reality — refetch so the new
         // member shows up without requiring the user to reopen the rail.

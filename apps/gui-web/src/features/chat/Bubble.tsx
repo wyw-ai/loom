@@ -14,6 +14,16 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import * as ipc from "@/ipc/bridge";
+
+function formatChatTime(ts: string | number): string {
+  const d = new Date(ts);
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (d.toDateString() === now.toDateString()) {
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 import { scopeKey, type Bubble as BubbleT } from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
@@ -158,10 +168,7 @@ export function Bubble({
               {displayName}
             </button>
             <span className="text-[11px] text-muted">
-              {new Date(bubble.ts).toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-              })}
+              {formatChatTime(bubble.ts)}
             </span>
             {bubble.delivery === "pending" && (
               <span className="text-[11px] text-muted">sending…</span>

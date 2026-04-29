@@ -11,7 +11,7 @@ import { SlashPalette, type SlashPaletteHandle } from "./SlashPalette";
 import { MentionPalette, type MentionPaletteHandle } from "./MentionPalette";
 import { tryHandleSlash } from "./slashDispatch";
 
-const IME_ENTER_GUARD_MS = 80;
+const IME_ENTER_GUARD_MS = 300;
 
 type DraftRelation = {
   kind: "hands_off_to" | "replies_to";
@@ -162,13 +162,12 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
     const isImeEnter =
       composingRef.current ||
       nativeComposing ||
+      e.isComposing ||
       Date.now() < ignoreEnterUntilRef.current;
 
     if (e.key === "Enter" && !e.shiftKey) {
       if (isImeEnter) {
-        if (!composingRef.current && !nativeComposing) {
-          e.preventDefault();
-        }
+        e.preventDefault();
         return;
       }
       // If a palette is open, Enter commits the first match instead of

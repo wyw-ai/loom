@@ -21,7 +21,10 @@ pub mod memory;
 pub mod profile;
 pub mod server_url;
 
-pub use adapter::{ActionChoice, Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+pub use adapter::{
+    ActionChoice, Adapter, AdapterEvent, AdapterModelChoice, AdapterModelOptions, AdapterPrompt,
+    AdapterStartInfo,
+};
 pub use agents_md::ensure_agents_md;
 pub use bundle::{
     prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,

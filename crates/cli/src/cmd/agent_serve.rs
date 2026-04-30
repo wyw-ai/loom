@@ -44,7 +44,7 @@ use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
-    validate_bundle_current, Adapter, AdapterEvent, AdapterPrompt,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
 };
 
 use crate::client::Client;
@@ -664,8 +664,8 @@ struct WorkerState {
     seen_events: Mutex<HashSet<String>>,
     /// action.request event id → underlying ACP request id.
     action_map: Mutex<HashMap<String, String>>,
-    /// action.request event id for Joi-owned model selection prompts.
-    model_action_map: Mutex<HashSet<String>>,
+    /// action.request event id → metadata for Joi-owned model selection prompts.
+    model_action_map: Mutex<HashMap<String, ModelActionRequest>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
@@ -686,6 +686,18 @@ struct ActiveTurn {
     cancel_requested: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ModelActionRequest {
+    source: ModelActionSource,
+    choices: Vec<AgentModelChoice>,
+}
+
+#[derive(Debug, Clone)]
+enum ModelActionSource {
+    Spec,
+    Adapter { config_id: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelStateFile {
@@ -701,7 +713,7 @@ impl WorkerState {
         agent_server_url: String,
     ) -> Self {
         let selected_model = load_model_state(&profile_dir)
-            .filter(|model| model_is_allowed(&spec, model))
+            .filter(|model| persisted_model_is_allowed(&spec, model))
             .or_else(|| default_model_for_spec(&spec));
         Self {
             actor_id,
@@ -716,7 +728,7 @@ impl WorkerState {
             scope_channel_cache: Mutex::new(HashMap::new()),
             seen_events: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
-            model_action_map: Mutex::new(HashSet::new()),
+            model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
         }
     }
@@ -842,23 +854,39 @@ impl WorkerState {
                 self.actor_id
             ));
         }
+        self.set_current_model_unchecked(model)
+    }
+
+    fn set_current_model_unchecked(&self, model: String) -> Result<()> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err(anyhow!("model cannot be empty for {}", self.actor_id));
+        }
         persist_model_state(&self.profile_dir, &model)?;
         *self.selected_model.lock().expect("selected_model poisoned") = Some(model);
         Ok(())
     }
 
-    fn record_model_action_request(&self, event_id: String) {
+    fn record_model_action_request(&self, event_id: String, request: ModelActionRequest) {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .insert(event_id);
+            .insert(event_id, request);
+    }
+
+    fn lookup_model_action_request(&self, event_id: &str) -> Option<ModelActionRequest> {
+        self.model_action_map
+            .lock()
+            .expect("model_action_map poisoned")
+            .get(event_id)
+            .cloned()
     }
 
     fn is_model_action_request(&self, event_id: &str) -> bool {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .contains(event_id)
+            .contains_key(event_id)
     }
 
     fn forget_model_action_request(&self, event_id: &str) {
@@ -929,6 +957,25 @@ fn model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
     model_choices_for_spec(spec)
         .iter()
         .any(|choice| choice.id == model)
+}
+
+fn persisted_model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    if transport_supports_runtime_model_options(spec) {
+        return true;
+    }
+    let choices = model_choices_for_spec(spec);
+    if choices.is_empty() {
+        return true;
+    }
+    choices.iter().any(|choice| choice.id == model)
+}
+
+fn transport_supports_runtime_model_options(spec: &AgentSpec) -> bool {
+    spec.transport.kind == "acp_stdio"
 }
 
 fn model_choices_for_spec(spec: &AgentSpec) -> Vec<AgentModelChoice> {
@@ -1218,7 +1265,9 @@ async fn notification_loop(
             continue;
         }
 
-        match handle_control_command(&client, &state, &event).await {
+        match handle_control_command(&client, &state, &adapter, &event_tx, &mut started, &event)
+            .await
+        {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
@@ -1268,7 +1317,7 @@ async fn handle_action_response(
                 .as_deref()
                 .is_some_and(|id| id.starts_with("joi:model:"))
         {
-            handle_model_action_response(client, state, event, request_event_id).await?;
+            handle_model_action_response(client, state, adapter, event, request_event_id).await?;
             return Ok(());
         }
         let request_id = match state.lookup_action_request(request_event_id) {
@@ -1337,6 +1386,7 @@ fn action_request_id_from_response(event: &Event) -> Option<String> {
 async fn handle_model_action_response(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
     event: &Event,
     request_event_id: &str,
 ) -> Result<()> {
@@ -1355,7 +1405,21 @@ async fn handle_model_action_response(
         return Ok(());
     }
 
-    let Some(choice) = state.model_choice(&option_id) else {
+    let request = state
+        .lookup_model_action_request(request_event_id)
+        .unwrap_or_else(|| ModelActionRequest {
+            source: ModelActionSource::Spec,
+            choices: state.model_choices(),
+        });
+
+    let choice = request
+        .choices
+        .iter()
+        .find(|choice| choice.id == option_id)
+        .cloned()
+        .or_else(|| state.model_choice(&option_id));
+
+    let Some(choice) = choice else {
         eprintln!(
             "[{}] model action.response {} ignored: unknown model `{}`",
             state.actor_id, event.id, option_id
@@ -1363,10 +1427,22 @@ async fn handle_model_action_response(
         state.forget_model_action_request(request_event_id);
         return Ok(());
     };
-    state.set_current_model(option_id.clone())?;
+
+    if let Err(err) =
+        apply_model_selection(state, adapter, event, &request.source, &option_id).await
+    {
+        state.forget_model_action_request(request_event_id);
+        append_model_selection_failure(client, state, event, &choice, &option_id, &err).await?;
+        eprintln!(
+            "[{}] failed to select model `{}` via {}: {}",
+            state.actor_id, option_id, event.id, err
+        );
+        return Ok(());
+    }
     state.forget_model_action_request(request_event_id);
 
     let label = model_choice_label(&choice);
+    let text = model_selection_success_text(&request.source, label, &option_id);
     append_event(
         client,
         "content.add",
@@ -1375,7 +1451,7 @@ async fn handle_model_action_response(
         None,
         json!({
             "contentType": "text/markdown",
-            "text": format!("Model set to `{label}`. New ACP sessions for this agent will use `{option_id}`.")
+            "text": text
         }),
         vec![responds_to(&event.id)],
     )
@@ -1384,6 +1460,72 @@ async fn handle_model_action_response(
         "[{}] selected model `{}` via {}",
         state.actor_id, option_id, event.id
     );
+    Ok(())
+}
+
+fn model_selection_success_text(
+    source: &ModelActionSource,
+    label: &str,
+    option_id: &str,
+) -> String {
+    match source {
+        ModelActionSource::Adapter { .. } => format!(
+            "Model set to `{label}` (`{option_id}`). It has been applied to the current ACP session and saved for future sessions."
+        ),
+        ModelActionSource::Spec => format!(
+            "Model set to `{label}` (`{option_id}`). It is saved for this agent and will be used when Joi creates a new ACP session."
+        ),
+    }
+}
+
+async fn apply_model_selection(
+    state: &WorkerState,
+    adapter: &Arc<dyn Adapter>,
+    event: &Event,
+    source: &ModelActionSource,
+    option_id: &str,
+) -> Result<()> {
+    match source {
+        ModelActionSource::Spec => {
+            state.set_current_model(option_id.to_string())?;
+        }
+        ModelActionSource::Adapter { config_id } => {
+            adapter
+                .set_model_option(
+                    event.scope.clone(),
+                    config_id.clone(),
+                    option_id.to_string(),
+                )
+                .await
+                .map_err(|err| anyhow!("ACP session/set_config_option failed: {err}"))?;
+            state.set_current_model_unchecked(option_id.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn append_model_selection_failure(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    event: &Event,
+    choice: &AgentModelChoice,
+    option_id: &str,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let label = model_choice_label(choice);
+    append_event(
+        client,
+        "content.add",
+        &state.actor_id,
+        &event.scope,
+        None,
+        json!({
+            "contentType": "text/markdown",
+            "text": format!("Failed to set model `{label}` (`{option_id}`): `{err}`.")
+        }),
+        vec![responds_to(&event.id)],
+    )
+    .await?;
     Ok(())
 }
 
@@ -1443,24 +1585,87 @@ fn is_for_us(event: &Event, actor_id: &str) -> bool {
 async fn handle_control_command(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
     trigger: &Event,
 ) -> Result<bool> {
     match render_prompt(trigger).trim() {
         "/model" | "/models" => {
-            open_model_picker(client, state, trigger).await?;
+            let adapter_start_error =
+                try_ensure_adapter_started(state, adapter, event_tx, started).await;
+            open_model_picker(client, state, adapter, trigger, adapter_start_error).await?;
             Ok(true)
         }
         _ => Ok(false),
     }
 }
 
+async fn try_ensure_adapter_started(
+    state: &WorkerState,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
+) -> Option<String> {
+    if *started {
+        return None;
+    }
+    eprintln!(
+        "[{}] starting adapter for control command (ACP cold-start can take 30-60s)…",
+        state.actor_id
+    );
+    match adapter.start(event_tx.clone()).await {
+        Ok(_) => {
+            *started = true;
+            eprintln!("[{}] adapter ready", state.actor_id);
+            None
+        }
+        Err(err) => {
+            eprintln!(
+                "[{}] adapter start failed for control command: {}",
+                state.actor_id, err
+            );
+            Some(err)
+        }
+    }
+}
+
 async fn open_model_picker(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
     trigger: &Event,
+    adapter_start_error: Option<String>,
 ) -> Result<()> {
-    let choices = state.model_choices();
+    let mut adapter_error = adapter_start_error;
+    let adapter_options = if adapter_error.is_none() {
+        match build_adapter_prompt(client, state, &trigger.scope, String::new()).await {
+            Ok(prompt) => match adapter.list_model_options(prompt).await {
+                Ok(options) => options,
+                Err(err) => {
+                    eprintln!(
+                        "[{}] failed to load ACP model options: {}",
+                        state.actor_id, err
+                    );
+                    adapter_error = Some(err);
+                    None
+                }
+            },
+            Err(err) => {
+                adapter_error = Some(err.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (choices, current, source, source_description) =
+        model_picker_choices(state, adapter_options);
     if choices.is_empty() {
+        let mut text = "No model choices are available. The ACP runtime did not return model config options, and this agent spec does not define `models.choices`.".to_string();
+        if let Some(err) = adapter_error {
+            text.push_str(&format!("\n\nACP model lookup failed: `{err}`"));
+        }
         append_event(
             client,
             "content.add",
@@ -1469,7 +1674,7 @@ async fn open_model_picker(
             None,
             json!({
                 "contentType": "text/markdown",
-                "text": "No model choices are configured for this agent. Add `models.choices` to the agent spec, then restart `joi agent serve`."
+                "text": text
             }),
             vec![responds_to(&trigger.id)],
         )
@@ -1477,7 +1682,6 @@ async fn open_model_picker(
         return Ok(());
     }
 
-    let current = state.current_model();
     let payload_choices = choices
         .iter()
         .map(|choice| {
@@ -1494,7 +1698,7 @@ async fn open_model_picker(
         "requestType": "joi.model.select",
         "title": format!("Choose model for @{}", state.actor_id),
         "description": format!(
-            "Current model: {current_label}\n\nThe selected model is saved for this agent and used when Joi creates ACP sessions."
+            "Current model: {current_label}\n\n{source_description}"
         ),
         "choices": payload_choices,
     });
@@ -1519,12 +1723,52 @@ async fn open_model_picker(
         ],
     )
     .await?;
-    state.record_model_action_request(appended.event.id.clone());
+    state.record_model_action_request(
+        appended.event.id.clone(),
+        ModelActionRequest { source, choices },
+    );
     eprintln!(
         "[{}] opened model picker {} for {}",
         state.actor_id, appended.event.id, trigger.actor_id
     );
     Ok(())
+}
+
+fn model_picker_choices(
+    state: &WorkerState,
+    adapter_options: Option<AdapterModelOptions>,
+) -> (
+    Vec<AgentModelChoice>,
+    Option<String>,
+    ModelActionSource,
+    &'static str,
+) {
+    if let Some(options) = adapter_options.filter(|options| !options.choices.is_empty()) {
+        let choices = options
+            .choices
+            .into_iter()
+            .map(|choice| AgentModelChoice {
+                id: choice.id,
+                label: choice.label,
+                description: choice.description,
+            })
+            .collect();
+        return (
+            choices,
+            options.current_value.or_else(|| state.current_model()),
+            ModelActionSource::Adapter {
+                config_id: options.config_id,
+            },
+            "These choices came from the ACP runtime for this session. The selected model is saved locally and applied to the current ACP session.",
+        );
+    }
+
+    (
+        state.model_choices(),
+        state.current_model(),
+        ModelActionSource::Spec,
+        "These choices came from the agent spec. The selected model is saved for this agent and used when Joi creates ACP sessions.",
+    )
 }
 
 fn responds_to(event_id: &str) -> Relation {
@@ -1588,27 +1832,7 @@ async fn dispatch_handoff(
 
         let user_text = render_prompt(&trigger);
         let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
-        let channel_id = resolve_channel_for_scope(client, state, &trigger.scope)
-            .await
-            .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", trigger.scope.id))?;
-        let scope_paths = state
-            .paths
-            .ensure_scope(&state.actor_id, &channel_id, &trigger.scope)?;
-        let adapter_prompt = AdapterPrompt {
-            scope: trigger.scope.clone(),
-            content: prompt,
-            model: state.current_model(),
-            cwd: scope_paths.workspace,
-            env: state.paths.scope_env(
-                &state.actor_id,
-                &channel_id,
-                &trigger.scope,
-                &state.agent_server_url,
-            ),
-            template_vars: state
-                .paths
-                .template_vars(&state.actor_id, &channel_id, &trigger.scope),
-        };
+        let adapter_prompt = build_adapter_prompt(client, state, &trigger.scope, prompt).await?;
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
@@ -1630,6 +1854,32 @@ async fn dispatch_handoff(
             }
         }
     }
+}
+
+async fn build_adapter_prompt(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+    content: String,
+) -> Result<AdapterPrompt> {
+    let channel_id = resolve_channel_for_scope(client, state, scope)
+        .await
+        .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
+    let scope_paths = state
+        .paths
+        .ensure_scope(&state.actor_id, &channel_id, scope)?;
+    Ok(AdapterPrompt {
+        scope: scope.clone(),
+        content,
+        model: state.current_model(),
+        cwd: scope_paths.workspace,
+        env: state
+            .paths
+            .scope_env(&state.actor_id, &channel_id, scope, &state.agent_server_url),
+        template_vars: state
+            .paths
+            .template_vars(&state.actor_id, &channel_id, scope),
+    })
 }
 
 async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &ScopeRef) {
@@ -2366,6 +2616,123 @@ mod tests {
         );
         assert!(model_is_allowed(&spec, "model_fast"));
         assert!(!model_is_allowed(&spec, "model_missing"));
+    }
+
+    #[test]
+    fn model_picker_prefers_adapter_choices_over_spec_choices() {
+        let mut spec = sample_spec(None);
+        spec.models = Some(AgentModelSpec {
+            default: Some("spec_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "spec_fast".into(),
+                label: "Spec Fast".into(),
+                description: None,
+            }],
+        });
+        let root = temp_path("model-picker-adapter");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let (choices, current, source, _) = model_picker_choices(
+            &state,
+            Some(AdapterModelOptions {
+                config_id: "model".into(),
+                current_value: Some("runtime_sonnet".into()),
+                choices: vec![agent_runtime::AdapterModelChoice {
+                    id: "runtime_sonnet".into(),
+                    label: "Runtime Sonnet".into(),
+                    description: None,
+                }],
+            }),
+        );
+
+        assert_eq!(
+            choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["runtime_sonnet"]
+        );
+        assert_eq!(current.as_deref(), Some("runtime_sonnet"));
+        assert!(matches!(source, ModelActionSource::Adapter { .. }));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persisted_model_loads_when_static_choices_are_absent() {
+        let root = temp_path("dynamic-model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("runtime_sonnet"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn acp_persisted_runtime_model_survives_static_choices() {
+        let root = temp_path("acp-dynamic-model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
+        let mut spec = sample_spec(None);
+        spec.transport.kind = "acp_stdio".into();
+        spec.models = Some(AgentModelSpec {
+            default: Some("spec_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "spec_fast".into(),
+                label: "Spec Fast".into(),
+                description: None,
+            }],
+        });
+
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("runtime_sonnet"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_persisted_model_still_respects_static_choices() {
+        let root = temp_path("command-static-model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
+        let mut spec = sample_spec(None);
+        spec.models = Some(AgentModelSpec {
+            default: Some("spec_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "spec_fast".into(),
+                label: "Spec Fast".into(),
+                description: None,
+            }],
+        });
+
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("spec_default"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

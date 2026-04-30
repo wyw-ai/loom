@@ -162,7 +162,6 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
     const isImeEnter =
       composingRef.current ||
       nativeComposing ||
-      e.isComposing ||
       Date.now() < ignoreEnterUntilRef.current;
 
     if (e.key === "Enter" && !e.shiftKey) {

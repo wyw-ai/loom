@@ -963,7 +963,10 @@ mod tests {
     fn command_signature_includes_prompt_model() {
         let cfg = cfg();
         let mut request = prompt("hello");
-        assert_eq!(command_signature_for_prompt(&cfg, &request), cfg.command_signature);
+        assert_eq!(
+            command_signature_for_prompt(&cfg, &request),
+            cfg.command_signature
+        );
 
         request.model = Some("model_a".into());
         let model_a = command_signature_for_prompt(&cfg, &request);

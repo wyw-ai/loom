@@ -7,6 +7,7 @@ use proto::types::{ActorKind, ChannelVisibility, ScopeKind, ScopeRef};
 use proto::{ErrorCode, ErrorObject, RpcEnvelope};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::handlers;
@@ -40,30 +41,34 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         let _ = sink.send(Message::Close(None)).await;
     });
 
-    // Inbound reader.
-    let reader_state = state.clone();
-    let reader_conn = connection_id.clone();
-    let reader_tx = tx.clone();
-    let reader = tokio::spawn(async move {
-        while let Some(msg) = stream.next().await {
-            let Ok(msg) = msg else {
-                break;
-            };
-            let text = match msg {
-                Message::Text(t) => t,
-                Message::Binary(b) => match String::from_utf8(b) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                },
-                Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => break,
-            };
-            handle_text_frame(&reader_state, &reader_conn, &reader_tx, text).await;
-        }
-    });
+    while let Some(msg) = stream.next().await {
+        let Ok(msg) = msg else {
+            break;
+        };
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Binary(b) => match String::from_utf8(b) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => break,
+        };
+        handle_text_frame(&state, &connection_id, &tx, text).await;
+    }
 
-    let _ = tokio::join!(writer, reader);
-    state.subscriptions.remove_connection(&connection_id);
+    cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;
+}
+
+async fn cleanup_connection(
+    subscriptions: &crate::subscribe::Subscriptions,
+    connection_id: &str,
+    tx: mpsc::UnboundedSender<String>,
+    writer: JoinHandle<()>,
+) {
+    subscriptions.remove_connection(connection_id);
+    drop(tx);
+    let _ = writer.await;
 }
 
 async fn handle_text_frame(
@@ -216,12 +221,8 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             }
             ChannelVisibility::Private => {
                 if let Some(creator) = channel.members.first() {
-                    let delivered = send_actor_inbox(
-                        state,
-                        creator,
-                        method::STREAM_UPDATE,
-                        payload,
-                    );
+                    let delivered =
+                        send_actor_inbox(state, creator, method::STREAM_UPDATE, payload);
                     tracing::debug!(
                         channel = %channel.id,
                         creator = %creator,
@@ -427,5 +428,39 @@ fn broadcast_filtered(
         state
             .subscriptions
             .send_to_connection(&conn_id, frame.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cleanup_connection_releases_writer_after_registry_removal() {
+        let subscriptions = crate::subscribe::Subscriptions::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        subscriptions.add_connection(Connection {
+            id: "conn_test".into(),
+            actor_id: None,
+            tx: tx.clone(),
+        });
+
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let writer = tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+            let _ = closed_tx.send(());
+        });
+
+        cleanup_connection(subscriptions.as_ref(), "conn_test", tx, writer).await;
+
+        tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            .await
+            .expect("writer should exit once the last sender is dropped")
+            .expect("writer close signal should be delivered");
+        assert!(!subscriptions.send_to_connection("conn_test", "frame".into()));
     }
 }

@@ -478,6 +478,29 @@ pub fn log(actor_id: String, _tail: u32) -> Result<()> {
     )
 }
 
+/// Bump the per-actor reload-epoch marker so a running `joi agent serve`
+/// host re-reads the AgentSpec + bundle and respawns the worker. See
+/// design §7.1.
+pub fn reload(actor_id: String) -> Result<()> {
+    let data_root = super::agent_serve::default_data_root_pub();
+    let path = super::reload::agent_marker_path(&data_root, &actor_id);
+    let epoch = super::reload::bump(&path)?;
+    if crate::render::is_json() {
+        crate::render::print_json(&serde_json::json!({
+            "actor_id": actor_id,
+            "marker": path.display().to_string(),
+            "epoch_ms": epoch,
+        }));
+    } else {
+        println!(
+            "reload requested  actor={actor_id}  epoch_ms={epoch}\n  marker={}",
+            path.display()
+        );
+        println!("(host will respawn on next poll cycle; if no `joi agent serve` is running this is a no-op)");
+    }
+    Ok(())
+}
+
 pub(crate) fn default_specs_dir() -> PathBuf {
     if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
         if !s.is_empty() {

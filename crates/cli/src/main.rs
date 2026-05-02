@@ -278,6 +278,12 @@ enum ServiceCmd {
         #[arg(long = "async-reply", hide = true)]
         async_reply: Option<String>,
     },
+    /// Bump the reload-epoch marker for `service_id` so a running
+    /// `joi service serve` host re-reads the ServiceSpec and respawns
+    /// the supervised plugin instance(s). See design §7.1.
+    Reload {
+        service_id: String,
+    },
     /// Inspect ServiceSpec JSON files on disk (no server contact).
     Spec {
         #[command(subcommand)]
@@ -547,6 +553,12 @@ enum AgentCmd {
         #[arg(long, default_value_t = 50)]
         tail: u32,
     },
+    /// Bump the reload-epoch marker for `actor_id` so a running
+    /// `joi agent serve` host re-reads the AgentSpec + bundle and
+    /// respawns the worker. See design §7.1.
+    Reload {
+        actor_id: String,
+    },
     /// Run as the v1 external agent client: load every AgentSpec under
     /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
     /// over its own server connection.
@@ -662,6 +674,7 @@ async fn main() -> Result<()> {
             AgentCmd::Start { actor_id } => cmd::agent::start(actor_id)?,
             AgentCmd::Stop { actor_id } => cmd::agent::stop(actor_id)?,
             AgentCmd::Log { actor_id, tail } => cmd::agent::log(actor_id, tail)?,
+            AgentCmd::Reload { actor_id } => cmd::agent::reload(actor_id)?,
             AgentCmd::Serve { .. } => unreachable!("handled above"),
             AgentCmd::Spec { sub } => match sub {
                 AgentSpecCmd::List => cmd::spec::agent_list()?,
@@ -698,6 +711,15 @@ async fn main() -> Result<()> {
     } = &args.cmd
     {
         return cmd::service::validate(path.clone());
+    }
+
+    // `service reload` is local-only — it bumps an on-disk marker that
+    // the supervising `joi service serve` host polls. No server contact.
+    if let Cmd::Service {
+        sub: ServiceCmd::Reload { service_id },
+    } = &args.cmd
+    {
+        return cmd::service::reload(service_id.clone());
     }
 
     // `service am-handler` opens its own connection bound to the AM

@@ -19,7 +19,7 @@ Inventory shipped in Phase 3:
 | `classmaster`       | claude   | `/classmaster`         | channel  | `task-goal.json`, `definition-of-done.json` |
 | `teacher`           | claude   | `/teacher`             | channel/thread | `lesson-plan.md`, `validation-report.json` |
 | `lesson-designer`   | claude   | `/lesson-designer`     | channel  | `lesson-plan.md` |
-| `router`            | copilot  | `/router`              | channel  | dispatches to discovery/teacher/delivery |
+| `router`            | claude   | `/router`              | channel  | dispatches to discovery/teacher/delivery |
 | `discovery`         | claude   | `/discovery`           | channel/thread | `clone-manifest.json`, repo notes |
 | `delivery`          | claude   | `/delivery`            | thread   | code changes, MR, `validation-report.json` |
 | `feedback-fix-orchestrator` | claude | `/feedback-fix-orchestrator` | channel/thread | dispatches feedback fixes |

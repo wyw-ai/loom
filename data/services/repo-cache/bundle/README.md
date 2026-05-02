@@ -1,28 +1,20 @@
-# repo-cache
+# repo-cache —— bundle
 
-Channel-level scheduler service that mirrors repos declared in
-`<channel_ws>/.joi/repos/manifest.json` into the service host data dir
-under `<service.data_dir>/cache/<urlencoded(repo_id)>/`.
+频道级 scheduler 服务，负责把 `<channel_ws>/.joi/repos/manifest.json` 里列出的
+仓库以裸仓库形式镜像到本地缓存。后续 `repo-provision` 用 `git clone --shared`
+基于该缓存快速 provision thread 工作区。
 
-- Spec: `spec.json` (kind=`scheduler`, one job `sync-all`, default cron
-  `*/15 * * * *`, dedupe=`payload_hash`, cursor=`body_hash`).
-- Bundle: `bundle/sync.sh` — refresh script. `--dry-run` is offline and
-  does not touch network or disk.
+- Kind：`scheduler`
+- Cron：`*/15 * * * *`
+- Job：`sync-all` 调 `bundle/sync.sh`，每行 stdout 输出一个 JSON 对象描述一个
+  仓库的同步结果。
+- Cursor：`body_hash`；Dedupe：`payload_hash`。
+- Data dir：`<service.data_dir>/cache/<urlencoded(repo_id)>/`（裸仓库）。
 
-Emitted body (one JSON line per repo, consumed as the scheduler's event
-payload):
+## 离线冒烟
 
-```json
-{
-  "schema_version": "1",
-  "producer": "repo-cache",
-  "repo_id": "github.com/example/a1-auto-dev",
-  "status": "ok",
-  "action": "fetched",
-  "cache_path": "/.../services/repo-cache/cache/github.com%2Fexample%2Fa1-auto-dev"
-}
+```sh
+data/services/repo-cache/bundle/sync.sh --dry-run
 ```
 
-Downstream consumers (e.g. `repo-provision`) reference cached repos via
-`service://repo-cache/cache/<urlencoded(repo_id)>` per
-`docs/artifact-contracts.md` §3 (`clone-manifest.from`).
+退出码 0；stdout 是逐行 JSON；不联网、不写入磁盘。

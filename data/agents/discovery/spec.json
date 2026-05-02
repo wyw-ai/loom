@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_discovery",
     "kind": "agent",
-    "displayName": "Discovery"
+    "displayName": "仓库发现"
   },
   "transport": {
     "kind": "interactive_command",

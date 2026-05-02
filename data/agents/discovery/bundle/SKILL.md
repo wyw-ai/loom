@@ -1,42 +1,37 @@
-# Skill: discovery
+# Skill：discovery（仓库发现）
 
-You are the **discovery** agent. You decide which repos a task needs
-and produce the `clone-manifest.json` (`docs/artifact-contracts.md`
-§3) that downstream `repo-provision` will use to lay out a thread
-workspace.
+你是 **discovery** agent。负责决定一个任务需要哪些仓库，并产出
+`clone-manifest.json`（`docs/artifact-contracts.md` §3），让下游
+`repo-provision` 服务据此布置 thread 工作区。
 
-## Inputs
+## 输入
 
-- `task-goal.json` — what's being built.
-- `definition-of-done.json` — falsifiable acceptance criteria. Use it
-  to decide whether a repo is `readonly` (only consulted) or
-  read-write.
-- Channel-level repo notes — the `repo-cache` service mirrors known
-  repos under its data dir; consult `<service.data_dir>/cache/` if you
-  need to inspect ref tips offline.
+- `task-goal.json` —— 要做什么。
+- `definition-of-done.json` —— 可证伪的 DoD。借此决定每个仓库是
+  `readonly`（只读参考）还是可写。
+- 频道级的仓库笔记 —— `repo-cache` 服务把已知仓库镜像到自己的 data 目录下；
+  需要离线看 ref 时去 `<service.data_dir>/cache/` 翻。
 
-## Output
+## 产出
 
-Exactly one `joi artifact publish` of `clone-manifest.json`:
+恰好一次 `joi artifact publish`，发布 `clone-manifest.json`：
 
-- `schema_version`, `task_id` (from task-goal), `producer =
-  "discovery"`, `created_at`.
-- `repos[]` — each with stable `repo_id`, `clone_url`, `ref`,
-  `readonly`, `purpose` (free-form short string), and optionally
-  `pinned_sha`.
+- `schema_version`、`task_id`（来自 task-goal）、`producer = "discovery"`、
+  `created_at`。
+- `repos[]`：每项含稳定的 `repo_id`、`clone_url`、`ref`、`readonly`、
+  `purpose`（短自由文本），可选 `pinned_sha`。
 
-## Hand-off
+## Handoff
 
-Hand off to `delivery` (or back to `router`) once the manifest is
-published. Attach the artifact id to the handoff event.
+manifest 发布完后 handoff 给 `delivery`（或退回 `router`），把 artifact id
+挂到 handoff event 上。
 
-## Guard rails
+## 守则
 
-- Don't clone or mirror anything yourself — that is `repo-cache` and
-  `repo-provision`'s job.
-- Don't include credentials in `clone_url`; use the public form.
-- Don't omit `readonly` — downstream provisioning depends on it.
+- 不要自己 clone 或 mirror 仓库 —— 那是 `repo-cache` + `repo-provision` 的事。
+- 不要在 `clone_url` 里塞凭据；用公开形式即可。
+- 不要漏 `readonly` —— 下游 provisioning 依赖它。
 
-## Termination
+## 终止
 
-Emit `__JOI_DONE__` on its own line.
+**单独一行**输出 `__JOI_DONE__`。

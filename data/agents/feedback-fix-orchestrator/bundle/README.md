@@ -1,15 +1,12 @@
-# feedback-fix-orchestrator — bundle
+# feedback-fix-orchestrator —— bundle
 
-Channel-scoped supervisor that triages recent product feedback,
-spawns one thread per accepted item, and dispatches each to
-`delivery`. Does not author code itself.
+频道级监督者。负责把最近的产品反馈拢成队列，按条派发给 `delivery`
+（每条一个独立 thread）。本身不写代码。
 
-- Consumes: human trigger, channel-configured feedback source,
-  per-thread MR events relayed back via the handoff bus.
-- Produces: per-thread `delivery` handoffs, channel-level status
-  summaries, and (optionally) a `feedback-batch.json` artifact for
-  reporting.
-- Hands off to: `delivery` (per item, in a fresh thread). Falls back
-  to `router` for ambiguous items.
+- 消费：用户触发、频道里配置的反馈源，以及通过 handoff 总线回流的各 thread
+  MR 事件。
+- 产出：每条反馈一次 `delivery` handoff、频道级状态汇总，必要时一份
+  `feedback-batch.json` artifact 用作统计。
+- Handoff 去向：`delivery`（按条，独立 thread）；模糊条目退回 `router`。
 
-Provider: `claude` via `interactive_command`. Standard envelope.
+Provider：`claude`，走 `interactive_command`，envelope 同其它 actor。

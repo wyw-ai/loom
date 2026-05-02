@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_feedback_fix_orchestrator",
     "kind": "agent",
-    "displayName": "Feedback Fix Orchestrator"
+    "displayName": "反馈修复编排"
   },
   "transport": {
     "kind": "interactive_command",

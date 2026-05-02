@@ -76,7 +76,26 @@ ScopeRef =
 
 agent 进程仍由 `joi agent serve` 托管。`interactive_command` 只是在 agent runtime 里新增一种 adapter。
 
-### 2.3 完成信号必须显式
+### 2.3 Scope skills 是 workspace 能力，不是 provider session 状态
+
+为了兼容 classroom / 多 agent 场景，Joi server 可以把 channel 成员 actor 的已发布 bundle 投影到 scope 级 `skills/` 目录：
+
+```text
+data/workspaces/channel/{channel_id}/skills/{actor_id} -> data/agents/{actor_id}/bundle source
+data/workspaces/thread/{thread_id}/skills/{actor_id}  -> data/agents/{actor_id}/bundle source
+```
+
+当前实现采用 file-backed 方案：server 读取 `data/agents/{actor_id}/bundle-release.json` 的 `source` 字段作为 symlink target。这个数据源被隔离在 actor skill source 解析层，未来可以扩展为 agent serve 通过 RPC 上报的 registry-backed 方案，而不需要重写 scope projection 规则。
+
+`joi agent serve` 在创建 scope workspace 时会把对应 scope skills 桥接进 agent 当前工作目录：
+
+```text
+{agent workspace}/skills -> {scope workspaces root}/{scope.kind}/{scope.id}/skills
+```
+
+默认 `{scope workspaces root}` 是 `JOI_AGENT_DATA_ROOT/workspaces`。当 `joi-server --data-dir` 和 `JOI_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `JOI_SCOPE_WORKSPACES_ROOT` 显式指向 server 的 `data/workspaces`。这保证 `interactive_command` provider 从 `cwd` 看见的是当前 scope 的 skills，而 provider session record 仍按 `(actor, scope)` 独立管理。
+
+### 2.4 完成信号必须显式
 
 不能只靠 idle timeout 判断完成。慢模型输出、工具调用等待、网络抖动、等待用户输入，都可能表现为“暂时没输出”。
 

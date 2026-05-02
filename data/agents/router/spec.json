@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_router",
     "kind": "agent",
-    "displayName": "Router"
+    "displayName": "路由"
   },
   "transport": {
     "kind": "interactive_command",

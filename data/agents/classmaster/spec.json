@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_classmaster",
     "kind": "agent",
-    "displayName": "Classmaster"
+    "displayName": "班主任"
   },
   "transport": {
     "kind": "interactive_command",

@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_delivery",
     "kind": "agent",
-    "displayName": "Delivery"
+    "displayName": "交付"
   },
   "transport": {
     "kind": "interactive_command",

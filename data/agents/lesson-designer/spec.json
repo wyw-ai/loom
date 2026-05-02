@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_lesson_designer",
     "kind": "agent",
-    "displayName": "Lesson Designer"
+    "displayName": "教研员"
   },
   "transport": {
     "kind": "interactive_command",

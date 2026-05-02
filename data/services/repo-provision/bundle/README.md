@@ -1,43 +1,22 @@
-# repo-provision
+# repo-provision —— bundle
 
-Channel-level command service that runs as the **thread bootstrap hook**
-for `joi thread create --bootstrap-artifact <clone-manifest.json>`
-(`docs/remove-dev-helper-migration-design.md` §4.7.2).
+Thread-bootstrap 触发的 `command` 服务。读 `clone-manifest.json`
+（`docs/artifact-contracts.md` §3），用 `git clone --shared` 从 `repo-cache`
+的缓存里把每个仓库布置到 `{thread_ws}/repos/<repo_id>/`，并产出
+`repo-provision-receipt.json` + 发布 `thread.bootstrapped` 事件让上层 agent
+继续。
 
-- Spec: `spec.json` (kind=`command`, autostart=false — invoked on demand
-  by the thread create flow).
-- Bundle: `bundle/provision.sh` — consumes a `clone-manifest.json`
-  artifact and writes worktrees / `git clone --shared` mounts under
-  `<thread_workspace>/repos/<basename>/`.
+- Kind：`command`
+- Autostart：`false`
+- Trigger：`thread.bootstrap`
+- 输入：clone manifest（artifact id 由调用方注入）。
+- 输出：单一 JSON 对象（receipt），字段含每个仓库的
+  `repo_id/ref/from/to/readonly/purpose/sha/status`。
 
-`--dry-run` is offline: no git operations, no FS mutations. The script
-still emits a structurally valid `repo-provision-receipt.json` (with
-`status="planned"` per repo) so downstream tooling can be tested.
+## 离线冒烟
 
-Output (single JSON object on stdout):
-
-```json
-{
-  "schema_version": "1",
-  "producer": "repo-provision",
-  "task_id": "task-…",
-  "manifest": "/path/to/clone-manifest.json",
-  "thread_workspace": "/path/to/.joi-workspaces/thread/…",
-  "repos": [
-    {
-      "repo_id": "github.com/example/a1-auto-dev",
-      "ref": "main",
-      "from": "service://repo-cache/cache/github.com%2Fexample%2Fa1-auto-dev",
-      "to": "repos/a1-auto-dev",
-      "readonly": false,
-      "purpose": "primary",
-      "sha": "0a1b2c3d…",
-      "status": "provisioned"
-    }
-  ],
-  "captured_at": "2024-04-12T03:21:00Z"
-}
+```sh
+data/services/repo-provision/bundle/provision.sh --dry-run
 ```
 
-The receipt is published as `repo-provision-receipt.json` and announced
-via `thread.bootstrapped` per the spec's `emits` block.
+退出码 0；stdout 一个 JSON 对象；不联网、不创建任何真实仓库目录。

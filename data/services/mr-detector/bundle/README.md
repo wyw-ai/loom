@@ -1,28 +1,26 @@
-# mr-detector
+# mr-detector —— bundle
 
-Thread-bound scheduler service. One instance per delivery thread,
-polling a single MR URL until it merges or closes, then self-completes
-(`docs/remove-dev-helper-migration-design.md` §4.7.3).
+**Thread-bound** scheduler 服务。每个 thread 实例独立轮询一组 MR 状态，将
+变化以 `mr-event-*.json`（`docs/artifact-contracts.md` §6）的形式 publish。
+当所有目标 MR 都 `merged` 或 `closed` 时实例自我完成，host 会停掉它并释放
+thread 常驻资源。
 
-- Spec: `spec.json` (kind=`scheduler`, `lifecycle=thread-bound`,
-  `bind.scope=thread`, `auto_stop_on=[thread.closed, service.self_complete]`).
-  Started via `joi service start --spec mr-detector --in <thread> --params '{"mr_url":"…"}'`.
-- Bundle: `bundle/poll.sh` — single tick. Emits one `mr-event-*` JSON
-  per *new* transition (matches `docs/artifact-contracts.md` §6).
+- Kind：`scheduler`
+- Lifecycle：`thread-bound`（设计文档 §4.7、Phase 4c）
+- Bind：`scope = thread`；`auto_stop_on = ["thread.closed", "service.self_complete"]`
+- Params schema：thread instantiate 时由调用方提供 `mrs[]`、可选 `poll_interval_s`。
+- Poll backend：`MR_DETECTOR_FETCH_CMD` 环境变量可换成任意命令，方便对接
+  GitLab / GitHub / 自研 server。默认 fixture 仅在 `--dry-run` 中使用。
+- 自我完成协议：终态轮的 stdout 末尾输出
+  `{"service.self_complete":true,"reason":"merged"|"closed"}`。
 
-Persisted state: `<instance.data_dir>/state.json` —
-`{seen:{labels, ci_status, head_sha, state}, merged_emitted, closed_emitted}`.
-On restart the file dedupes already-emitted terminal events.
+事件 fingerprint：`raw_event_fingerprint = "sha256:" + sha256(canonical_payload)`，
+保证去重。
 
-Offline contract: `--dry-run` skips all network calls and prints a
-single `op="poll"` line with `status="planned"`. Real fetch can be
-swapped via `MR_DETECTOR_FETCH_CMD=<cmd>` (the command receives the MR
-URL and must print canonical JSON to stdout); unset, the script uses a
-stub payload that exercises the emit path without a remote.
+## 离线冒烟
 
-The script writes `{"service.self_complete": true, "reason": "merged"|"closed"}`
-as its **last** stdout line on terminal transitions; the service host
-treats that as the auto-stop signal in §4.7.3.
+```sh
+data/services/mr-detector/bundle/poll.sh --dry-run
+```
 
-`raw_event_fingerprint = "sha256:" + sha256(canonical_payload)` is
-included on every emitted event for the migration tool's verify pass.
+退出码 0；stdout 逐行 JSON；不联网、不写入磁盘。

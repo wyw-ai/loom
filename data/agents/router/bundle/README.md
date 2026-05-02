@@ -1,12 +1,10 @@
-# router — bundle
+# router —— bundle
 
-Channel-level dispatcher. Reads a trigger, decides the next actor,
-hands off. Stateless across turns aside from reading existing
-artifacts on the channel.
+频道级派发器。接到一次 trigger，决定下一个 actor，然后 handoff。本身基本无状态，
+最多读一下频道上已有的 artifact。
 
-- Consumes: the trigger event + any existing channel artifacts.
-- Produces: a single `joi event append --handoff <actor_id>` (or a
-  direct reply for trivial questions).
-- Never produces business artifacts itself.
+- 消费：trigger event + 频道上已有的 artifact。
+- 产出：单次 `joi event append --handoff <actor_id>`（或者对琐碎问题直接回复）。
+- 不产出业务 artifact。
 
-Provider: `claude` via `interactive_command`. Standard envelope.
+Provider：`claude`，走 `interactive_command`，envelope 同其它 actor。

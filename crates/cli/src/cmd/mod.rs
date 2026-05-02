@@ -9,6 +9,7 @@ pub mod event;
 pub mod handoff;
 pub mod mcp_announcement;
 pub mod mcp_memory;
+pub mod reload;
 pub mod say;
 pub mod service;
 pub mod spec;

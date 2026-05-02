@@ -115,24 +115,96 @@ pub async fn run(
         let server = server_url.clone();
         let root = data_root.clone();
         let actor = spec.actor.id.clone();
+        let specs_dir_for_task = specs_dir.clone();
+        let initial_spec = spec.clone();
         handles.push(tokio::spawn(async move {
             let mut attempt = 0u32;
+            // Local-fs reload marker — bumped by `joi agent reload`.
+            // We snapshot the epoch before each worker spawn and a
+            // dedicated watcher aborts the worker when the file
+            // advances past that snapshot. Next loop iter then
+            // re-loads the spec from disk before respawning.
+            let marker = crate::cmd::reload::agent_marker_path(&root, &actor);
+            let mut last_spec = initial_spec;
             loop {
                 attempt = attempt.saturating_add(1);
                 let delay = reconnect_delay(attempt);
-                match run_agent_worker(spec.clone(), server.clone(), root.clone()).await {
-                    Ok(()) => {
+                // Re-read spec before each spawn so a `reload` picks
+                // up edits to <specs_dir>/<actor>.json without a host
+                // restart. On parse error fall back to the last good
+                // spec — operators shouldn't lose a running worker
+                // because of a typo.
+                let spec_for_run = match reload_spec(&specs_dir_for_task, &actor) {
+                    Ok(Some(s)) => {
+                        last_spec = s;
+                        last_spec.clone()
+                    }
+                    Ok(None) => last_spec.clone(),
+                    Err(e) => {
+                        eprintln!(
+                            "[{actor}] failed to re-read spec ({e}); continuing with last-known spec"
+                        );
+                        last_spec.clone()
+                    }
+                };
+                let baseline_epoch = crate::cmd::reload::read_epoch(&marker);
+
+                let server_clone = server.clone();
+                let root_clone = root.clone();
+                let worker = tokio::spawn(run_agent_worker(
+                    spec_for_run,
+                    server_clone,
+                    root_clone,
+                ));
+
+                let watcher_marker = marker.clone();
+                let worker_abort = worker.abort_handle();
+                let actor_for_watch = actor.clone();
+                let watcher = tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_millis(1000)).await;
+                        let cur = crate::cmd::reload::read_epoch(&watcher_marker);
+                        if cur > baseline_epoch {
+                            eprintln!(
+                                "[{actor_for_watch}] reload requested (epoch_ms={cur}); restarting worker"
+                            );
+                            worker_abort.abort();
+                            return;
+                        }
+                    }
+                });
+
+                let join_result = worker.await;
+                watcher.abort();
+                let _ = watcher.await;
+
+                match join_result {
+                    Ok(Ok(())) => {
                         attempt = 0;
                         eprintln!(
                             "[{actor}] worker disconnected; reconnecting in {}s",
                             delay.as_secs()
                         );
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         eprintln!(
                             "[{actor}] worker exited with error: {e}; reconnecting in {}s",
                             delay.as_secs()
                         );
+                    }
+                    Err(join_err) => {
+                        if join_err.is_cancelled() {
+                            // Cancelled by the reload watcher — no
+                            // backoff, respawn promptly.
+                            attempt = 0;
+                            eprintln!("[{actor}] worker aborted for reload; respawning");
+                            continue;
+                        } else {
+                            eprintln!(
+                                "[{actor}] worker task panicked: {join_err}; reconnecting in {}s",
+                                delay.as_secs()
+                            );
+                        }
                     }
                 }
                 sleep(delay).await;
@@ -181,6 +253,13 @@ fn default_data_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".agentx"))
 }
 
+/// Crate-public alias for `default_data_root`. Other `cmd::` modules
+/// (e.g. `cmd::agent::reload`) need to resolve the same path so the
+/// reload marker lands where this host will look for it.
+pub(crate) fn default_data_root_pub() -> PathBuf {
+    default_data_root()
+}
+
 fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
     let mut out = Vec::new();
     for entry in
@@ -200,6 +279,25 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
         }
     }
     Ok(out)
+}
+
+/// Re-read `<specs_dir>/<actor_id>.json` and return the parsed
+/// AgentSpec. `Ok(None)` if the file is missing (deleted between
+/// startup and a reload — the supervisor should keep using the last
+/// known good spec rather than crash). `Err` only on real I/O or
+/// parse errors. Used by the per-actor supervision loop after a
+/// `joi agent reload`.
+fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
+    let path = specs_dir.join(format!("{actor_id}.json"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+    };
+    warn_deprecated_transport_fields(&text, &path);
+    let spec: AgentSpec = serde_json::from_str(&text)
+        .with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(spec))
 }
 
 fn warn_deprecated_transport_fields(text: &str, path: &Path) {

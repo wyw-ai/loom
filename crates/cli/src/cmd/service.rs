@@ -106,6 +106,30 @@ pub async fn serve(
     host.serve(specs).await
 }
 
+/// `joi service reload <service_id>` — bump the per-service reload
+/// marker so a running `joi service serve` host re-reads the
+/// ServiceSpec and respawns the supervised plugin instance(s) for
+/// that id. See design §7.1.
+pub fn reload(service_id: String) -> Result<()> {
+    let data_root = state::default_data_root();
+    let path = super::reload::service_marker_path(&data_root, &service_id);
+    let epoch = super::reload::bump(&path)?;
+    if crate::render::is_json() {
+        crate::render::print_json(&serde_json::json!({
+            "service_id": service_id,
+            "marker": path.display().to_string(),
+            "epoch_ms": epoch,
+        }));
+    } else {
+        println!(
+            "reload requested  service={service_id}  epoch_ms={epoch}\n  marker={}",
+            path.display()
+        );
+        println!("(host will respawn on next poll cycle; if no `joi service serve` is running this is a no-op)");
+    }
+    Ok(())
+}
+
 /// `joi service am-handler --service-id <id>` — per-message AM bridge
 /// handler. Stage 4 wires the CLI; the orchestrator + plugin logic
 /// lives in `crate::service::am::handler` (S2).

@@ -335,8 +335,11 @@ impl AcpAdapter {
     async fn stop_internal(&self) -> Result<(), String> {
         let (shared, session_ids, mut child) = {
             let mut inner = self.inner.lock();
-            let session_ids: Vec<String> =
-                inner.sessions.values().map(|session| session.id.clone()).collect();
+            let session_ids: Vec<String> = inner
+                .sessions
+                .values()
+                .map(|session| session.id.clone())
+                .collect();
             inner.sessions.clear();
             (inner.shared.take(), session_ids, inner.child.take())
         };

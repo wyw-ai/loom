@@ -50,7 +50,10 @@ pub(crate) fn load_specs(dir: &Path) -> Result<Vec<ServiceSpec>> {
         let text =
             fs::read_to_string(&path).with_context(|| format!("read spec {}", path.display()))?;
         match serde_json::from_str::<ServiceSpec>(&text) {
-            Ok(spec) => out.push(spec),
+            Ok(mut spec) => {
+                spec.normalize();
+                out.push(spec);
+            }
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -148,8 +151,9 @@ pub async fn am_handler(
 /// error otherwise. Useful in CI / pre-deploy hooks.
 pub fn validate(path: PathBuf) -> Result<()> {
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let spec: ServiceSpec = serde_json::from_str(&text)
+    let mut spec: ServiceSpec = serde_json::from_str(&text)
         .with_context(|| format!("parse {} as ServiceSpec", path.display()))?;
+    spec.normalize();
     spec.validate()
         .with_context(|| format!("validate ServiceSpec `{}`", spec.id))?;
     println!(

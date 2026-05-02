@@ -1924,8 +1924,7 @@ async fn dispatch_handoff(
         };
         state.set_turn(active.clone());
 
-        let user_text = render_prompt(&trigger);
-        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
+        let raw_user_text = render_prompt(&trigger);
         let channel_id = resolve_channel_for_scope(client, state, &trigger.scope)
             .await
             .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", trigger.scope.id))?;
@@ -1935,11 +1934,38 @@ async fn dispatch_handoff(
                 .paths
                 .ensure_scope(&state.actor_id, &channel_id, &trigger.scope, Some(&bundle_paths))?
         };
+        // First-turn-per-scope is computed *before* compose_envelope_prompt
+        // because both the seed manifest and prompt_template.firstTurnPrefix
+        // need to fire on the same first turn. We piggy-back on the same
+        // `seeded` set: take_seed_slot returns true exactly once per scope.
+        let first_turn_for_scope = state.take_seed_slot(&trigger.scope.id);
+        let user_text = apply_handoff_trigger_prefix(
+            &state.spec,
+            &trigger,
+            &raw_user_text,
+            first_turn_for_scope,
+        );
+        let inner_prompt = compose_envelope_prompt(
+            client,
+            state,
+            &trigger.scope,
+            &user_text,
+            first_turn_for_scope,
+        )
+        .await;
+        let prompt = apply_prompt_template(
+            &state.spec,
+            &trigger,
+            &channel_id,
+            &scope_paths,
+            &inner_prompt,
+            first_turn_for_scope,
+        );
         let adapter_prompt = AdapterPrompt {
             scope: trigger.scope.clone(),
             content: prompt,
             model: state.current_model(),
-            cwd: scope_paths.workspace,
+            cwd: scope_paths.workspace.clone(),
             env: state.paths.scope_env(
                 &state.actor_id,
                 &channel_id,
@@ -2000,6 +2026,157 @@ fn render_prompt(trigger: &Event) -> String {
     serde_json::to_string(&trigger.payload).unwrap_or_default()
 }
 
+/// Apply `AgentSpec.handoff.triggerPromptPrefix` (design §5.0). The prefix
+/// is callee-defined: when *anyone* hands off to this agent, the runtime
+/// silently glues the configured slash-command prefix onto the front of
+/// the user message side, so callers don't have to know e.g. that
+/// delivery activates via `/delivery`.
+fn apply_handoff_trigger_prefix(
+    spec: &proto::methods::AgentSpec,
+    trigger: &Event,
+    user_text: &str,
+    first_turn_for_scope: bool,
+) -> String {
+    let Some(handoff) = spec.handoff.as_ref() else {
+        return user_text.to_string();
+    };
+    if handoff.trigger_prompt_prefix.is_empty() {
+        return user_text.to_string();
+    }
+    // Only apply when *this* event is actually a handoff to us. A normal
+    // content.add from a human in the same scope shouldn't get a slash
+    // command stuffed into it.
+    if !is_handoff_targeting(trigger, &spec.actor.id) {
+        return user_text.to_string();
+    }
+    match handoff.apply_on {
+        proto::methods::HandoffApplyOn::FirstTurn if !first_turn_for_scope => {
+            return user_text.to_string()
+        }
+        _ => {}
+    }
+    format!("{}{}", handoff.trigger_prompt_prefix, user_text)
+}
+
+fn is_handoff_targeting(event: &Event, actor_id: &str) -> bool {
+    event.relations.iter().any(|rel| {
+        matches!(rel.kind, RelationKind::HandsOffTo)
+            && matches!(rel.target.kind, RefKind::Actor)
+            && rel.target.id == actor_id
+    })
+}
+
+/// Apply `AgentSpec.promptTemplate` (design §5). Lines from
+/// `everyTurnPrefix` / `firstTurnPrefix` (first turn for this scope only)
+/// are joined with newlines, prepended; `everyTurnSuffix` is appended.
+/// Each line goes through template-var substitution. Variables not bound
+/// here (or in `vars`) are left as literal `{name}` so missing values
+/// never collapse the prompt.
+fn apply_prompt_template(
+    spec: &proto::methods::AgentSpec,
+    trigger: &Event,
+    channel_id: &str,
+    scope_paths: &ScopePaths,
+    inner_prompt: &str,
+    first_turn_for_scope: bool,
+) -> String {
+    let Some(tmpl) = spec.prompt_template.as_ref() else {
+        return inner_prompt.to_string();
+    };
+    let vars = build_template_vars(spec, trigger, channel_id, scope_paths, tmpl);
+    let render = |lines: &[String]| -> String {
+        lines
+            .iter()
+            .map(|line| substitute_vars(line, &vars))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut sections: Vec<String> = Vec::new();
+    if !tmpl.every_turn_prefix.is_empty() {
+        sections.push(render(&tmpl.every_turn_prefix));
+    }
+    if first_turn_for_scope && !tmpl.first_turn_prefix.is_empty() {
+        sections.push(render(&tmpl.first_turn_prefix));
+    }
+    sections.push(inner_prompt.to_string());
+    if !tmpl.every_turn_suffix.is_empty() {
+        sections.push(render(&tmpl.every_turn_suffix));
+    }
+    sections.join("\n\n")
+}
+
+fn build_template_vars(
+    spec: &proto::methods::AgentSpec,
+    trigger: &Event,
+    channel_id: &str,
+    scope_paths: &ScopePaths,
+    tmpl: &proto::methods::PromptTemplateSpec,
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut vars: HashMap<String, String> = HashMap::new();
+    vars.insert("actor.id".into(), spec.actor.id.clone());
+    vars.insert(
+        "scope.kind".into(),
+        match trigger.scope.kind {
+            ScopeKind::Channel => "channel".into(),
+            ScopeKind::Thread => "thread".into(),
+        },
+    );
+    vars.insert("scope.id".into(), trigger.scope.id.clone());
+    vars.insert("trigger.id".into(), trigger.id.clone());
+    vars.insert("trigger.actor_id".into(), trigger.actor_id.clone());
+    vars.insert("channel.id".into(), channel_id.to_string());
+    if matches!(trigger.scope.kind, ScopeKind::Thread) {
+        vars.insert("thread.id".into(), trigger.scope.id.clone());
+    } else {
+        vars.insert("thread.id".into(), String::new());
+    }
+    vars.insert(
+        "workspace.dir".into(),
+        scope_paths.workspace.display().to_string(),
+    );
+    vars.insert(
+        "scope.skills".into(),
+        scope_paths.skills.display().to_string(),
+    );
+    vars.insert(
+        "agent.actor_skills".into(),
+        scope_paths.actor_skills.display().to_string(),
+    );
+    if let Some(skill) = &tmpl.active_skill {
+        vars.insert("prompt.activeSkill".into(), skill.clone());
+    }
+    for (k, v) in &tmpl.vars {
+        vars.insert(format!("vars.{k}"), v.clone());
+    }
+    vars
+}
+
+fn substitute_vars(
+    line: &str,
+    vars: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(close) = line[i + 1..].find('}') {
+                let key = &line[i + 1..i + 1 + close];
+                if let Some(value) = vars.get(key) {
+                    out.push_str(value);
+                    i += close + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
 /// configure identity / memory fall back to the pre-envelope shape.
@@ -2008,8 +2185,9 @@ async fn compose_envelope_prompt(
     state: &Arc<WorkerState>,
     scope: &ScopeRef,
     user_text: &str,
+    first_turn_for_scope: bool,
 ) -> String {
-    let scope_bootstrap = if state.take_seed_slot(&scope.id) {
+    let scope_bootstrap = if first_turn_for_scope {
         seed_manifest(&state.actor_id, scope)
     } else {
         String::new()
@@ -2502,6 +2680,8 @@ mod tests {
             identity: None,
             memory: None,
             announcement: None,
+            handoff: None,
+            prompt_template: None,
         }
     }
 
@@ -2677,6 +2857,154 @@ mod tests {
             std::fs::read_link(&scope_paths.actor_skills).expect("actor skills link");
         assert_eq!(actor_skill_link, bundle_skills);
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn handoff_event_to(actor: &str, scope: &ScopeRef) -> Event {
+        Event {
+            id: "evt_demo".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_caller".into(),
+            scope: scope.clone(),
+            turn_id: None,
+            seq: 1,
+            occurred_at: chrono::Utc::now(),
+            payload: serde_json::json!({"text": "go fix this"}),
+            relations: vec![Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: actor.into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            _meta: None,
+        }
+    }
+
+    #[test]
+    fn handoff_trigger_prefix_only_when_targeted_and_applies_per_policy() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "t1".into(),
+        };
+        let mut spec = sample_spec(None);
+        spec.handoff = Some(proto::methods::HandoffSpec {
+            trigger_prompt_prefix: "/delivery\n".into(),
+            apply_on: proto::methods::HandoffApplyOn::EveryTurn,
+        });
+        let trigger_for_us = handoff_event_to(&spec.actor.id, &scope);
+        assert_eq!(
+            apply_handoff_trigger_prefix(&spec, &trigger_for_us, "go", false),
+            "/delivery\ngo"
+        );
+
+        // Different target — no prefix.
+        let trigger_for_other = handoff_event_to("actor_other", &scope);
+        assert_eq!(
+            apply_handoff_trigger_prefix(&spec, &trigger_for_other, "go", false),
+            "go"
+        );
+
+        // first-turn only policy + first_turn=false → no prefix.
+        spec.handoff.as_mut().unwrap().apply_on = proto::methods::HandoffApplyOn::FirstTurn;
+        assert_eq!(
+            apply_handoff_trigger_prefix(&spec, &trigger_for_us, "go", false),
+            "go"
+        );
+        assert_eq!(
+            apply_handoff_trigger_prefix(&spec, &trigger_for_us, "go", true),
+            "/delivery\ngo"
+        );
+    }
+
+    #[test]
+    fn prompt_template_renders_with_vars_and_first_turn_section() {
+        let root = temp_path("prompt-tmpl");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let scope_paths = paths
+            .ensure_scope("actor_demo", "chan_demo", &scope, None)
+            .unwrap();
+
+        let mut spec = sample_spec(None);
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("project".into(), "joi".into());
+        spec.prompt_template = Some(proto::methods::PromptTemplateSpec {
+            active_skill: Some("delivery".into()),
+            every_turn_prefix: vec![
+                "actor: {actor.id}".into(),
+                "scope: {scope.kind}/{scope.id}".into(),
+                "trig: {trigger.id} from {trigger.actor_id}".into(),
+                "ws: {workspace.dir}".into(),
+                "skill: {prompt.activeSkill} project={vars.project}".into(),
+            ],
+            first_turn_prefix: vec!["FIRST".into()],
+            every_turn_suffix: vec!["END".into()],
+            vars,
+        });
+        let trigger = handoff_event_to(&spec.actor.id, &scope);
+
+        let out_first = apply_prompt_template(
+            &spec,
+            &trigger,
+            "chan_demo",
+            &scope_paths,
+            "USER MESSAGE",
+            true,
+        );
+        assert!(out_first.contains("actor: actor_demo"));
+        assert!(out_first.contains("scope: thread/thread_demo"));
+        assert!(out_first.contains("trig: evt_demo from actor_caller"));
+        assert!(out_first.contains("skill: delivery project=joi"));
+        assert!(out_first.contains("FIRST"));
+        assert!(out_first.contains("USER MESSAGE"));
+        assert!(out_first.trim_end().ends_with("END"));
+
+        // Subsequent turn omits firstTurnPrefix.
+        let out_next = apply_prompt_template(
+            &spec,
+            &trigger,
+            "chan_demo",
+            &scope_paths,
+            "USER MESSAGE",
+            false,
+        );
+        assert!(!out_next.contains("FIRST"));
+
+        // Unknown var stays as literal `{...}`.
+        spec.prompt_template
+            .as_mut()
+            .unwrap()
+            .every_turn_prefix
+            .push("missing: {nope.value}".into());
+        let out_missing = apply_prompt_template(
+            &spec,
+            &trigger,
+            "chan_demo",
+            &scope_paths,
+            "USER MESSAGE",
+            true,
+        );
+        assert!(out_missing.contains("missing: {nope.value}"));
+
+        // No template configured → passthrough.
+        spec.prompt_template = None;
+        assert_eq!(
+            apply_prompt_template(
+                &spec,
+                &trigger,
+                "chan_demo",
+                &scope_paths,
+                "RAW",
+                true
+            ),
+            "RAW"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

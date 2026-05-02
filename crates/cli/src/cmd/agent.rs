@@ -121,6 +121,8 @@ pub fn install(
             ..Default::default()
         }),
         announcement: None,
+        handoff: None,
+        prompt_template: None,
     };
     let path = write_spec(&spec)?;
     println!(
@@ -198,6 +200,8 @@ pub fn add() -> Result<()> {
             ..Default::default()
         }),
         announcement: None,
+        handoff: None,
+        prompt_template: None,
     };
     let path = write_spec(&spec)?;
     println!("registered {} at {}", spec.actor.id, path.display());

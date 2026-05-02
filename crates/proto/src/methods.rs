@@ -1038,6 +1038,70 @@ pub struct AgentSpec {
     /// the right-side panel of any chat client subscribed to the scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announcement: Option<AnnouncementSpec>,
+    /// Optional callee-described handoff metadata (design §5.0). Lets the
+    /// agent declare a slash-command prefix that the runtime auto-injects
+    /// into trigger event content when *anyone* hands off to it, so
+    /// callers don't have to know about skill-activation conventions like
+    /// `/delivery` or `/discovery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffSpec>,
+    /// Optional per-actor prompt template (design §5). Wraps the trigger
+    /// event content with `everyTurnPrefix`, `firstTurnPrefix` (first
+    /// turn per scope only), and `everyTurnSuffix` lines, with template
+    /// variable substitution. When absent the runtime falls back to the
+    /// bare envelope shape used before the migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_template: Option<PromptTemplateSpec>,
+}
+
+/// Callee-described handoff metadata. See `AgentSpec.handoff`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffSpec {
+    /// Text prepended to the trigger event content (the user message side
+    /// of the prompt). Typically a slash command like `"/delivery\n"` so
+    /// the underlying provider activates the right skill.
+    #[serde(default)]
+    pub trigger_prompt_prefix: String,
+    /// Whether the prefix applies on the first turn of a scope only or
+    /// on every handoff. Default: `every-turn`.
+    #[serde(default)]
+    pub apply_on: HandoffApplyOn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffApplyOn {
+    FirstTurn,
+    #[default]
+    EveryTurn,
+}
+
+/// Per-actor prompt template (design §5). All three lists are joined with
+/// newlines after template-variable substitution. Variables not bound by
+/// the runtime are left as literal `{var}` text (so missing vars never
+/// collapse the prompt).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptTemplateSpec {
+    /// Optional active-skill marker. Reserved for future use; runtime
+    /// currently only echoes it back as `{prompt.activeSkill}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_skill: Option<String>,
+    /// Lines prepended to *every* turn's prompt.
+    #[serde(default)]
+    pub every_turn_prefix: Vec<String>,
+    /// Lines prepended only on the first turn per scope (after
+    /// `everyTurnPrefix`, before the user message).
+    #[serde(default)]
+    pub first_turn_prefix: Vec<String>,
+    /// Lines appended to *every* turn's prompt (after the user message).
+    #[serde(default)]
+    pub every_turn_suffix: Vec<String>,
+    /// Extra variables surfaced as `{vars.<key>}`. Static per-actor
+    /// constants the spec author wants without polluting global names.
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 // ---- models ----

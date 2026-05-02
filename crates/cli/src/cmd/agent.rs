@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
@@ -474,7 +474,12 @@ pub fn log(actor_id: String, _tail: u32) -> Result<()> {
     )
 }
 
-fn default_specs_dir() -> PathBuf {
+pub(crate) fn default_specs_dir() -> PathBuf {
+    if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
+        }
+    }
     dirs::config_dir()
         .map(|d| d.join("joi").join("agents"))
         .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
@@ -482,6 +487,26 @@ fn default_specs_dir() -> PathBuf {
 
 fn spec_path(actor_id: &str) -> PathBuf {
     default_specs_dir().join(format!("{actor_id}.json"))
+}
+
+pub(crate) fn load_specs_at(dir: &Path) -> Result<Vec<AgentSpec>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read agent spec {}", path.display()))?;
+        let spec: AgentSpec = serde_json::from_str(&text)
+            .with_context(|| format!("parse agent spec {}", path.display()))?;
+        out.push(spec);
+    }
+    out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
+    Ok(out)
 }
 
 fn write_spec(spec: &AgentSpec) -> Result<PathBuf> {
@@ -495,24 +520,7 @@ fn write_spec(spec: &AgentSpec) -> Result<PathBuf> {
 }
 
 fn load_specs() -> Result<Vec<AgentSpec>> {
-    let dir = default_specs_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read agent spec {}", path.display()))?;
-        let spec: AgentSpec = serde_json::from_str(&text)
-            .with_context(|| format!("parse agent spec {}", path.display()))?;
-        out.push(spec);
-    }
-    out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
-    Ok(out)
+    load_specs_at(&default_specs_dir())
 }
 
 fn path_lookup_via_env(bin: &str) -> bool {

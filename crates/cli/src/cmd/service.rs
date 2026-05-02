@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::service::scheduler::SchedulerPlugin;
 use crate::service::{state, ServiceHost};
 
-fn default_specs_dir() -> PathBuf {
+pub(crate) fn default_specs_dir() -> PathBuf {
     if let Ok(s) = std::env::var("JOI_SERVICE_SPECS") {
         return PathBuf::from(s);
     }
@@ -36,7 +36,7 @@ fn default_specs_dir() -> PathBuf {
 /// Load every `*.json` under `dir` and parse as `ServiceSpec`. Malformed
 /// files are logged and skipped (matches `agent_serve::load_specs`
 /// behavior — one bad spec must not block the rest of the fleet).
-fn load_specs(dir: &Path) -> Result<Vec<ServiceSpec>> {
+pub(crate) fn load_specs(dir: &Path) -> Result<Vec<ServiceSpec>> {
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);

@@ -121,6 +121,126 @@ enum Cmd {
         #[command(subcommand)]
         sub: ServiceCmd,
     },
+    /// Read/write files under a scope's workspace directory. Local-only —
+    /// no server contact. See `docs/remove-dev-helper-migration-design.md`
+    /// §4.1.
+    Workspace {
+        #[command(subcommand)]
+        sub: WorkspaceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCmd {
+    /// Print the resolved absolute path of the workspace (or a sub-path).
+    Path {
+        #[command(flatten)]
+        target: WsTarget,
+        /// Optional sub-path inside the workspace.
+        sub: Option<String>,
+    },
+    /// Show metadata about the workspace (kind, ids, path, exists).
+    Info {
+        #[command(flatten)]
+        target: WsTarget,
+    },
+    /// List entries in the workspace (or a sub-directory).
+    List {
+        #[command(flatten)]
+        target: WsTarget,
+        sub: Option<String>,
+        /// List recursively (relative paths only).
+        #[arg(long, short = 'r')]
+        recursive: bool,
+    },
+    /// Read a file from the workspace to stdout.
+    Read {
+        #[command(flatten)]
+        target: WsTarget,
+        path: String,
+        /// Cap the read at N bytes (default 4 MiB).
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+    /// Write a file into the workspace. Body comes from --text, --file,
+    /// or stdin (in that priority).
+    Write {
+        #[command(flatten)]
+        target: WsTarget,
+        path: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Append to an existing file instead of replacing.
+        #[arg(long)]
+        append: bool,
+    },
+    /// Remove a file (or directory with --recursive).
+    Rm {
+        #[command(flatten)]
+        target: WsTarget,
+        path: String,
+        #[arg(long, short = 'r')]
+        recursive: bool,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct WsTarget {
+    /// Channel id. Required for channel-shared, and for actor workspaces.
+    #[arg(long)]
+    channel: Option<String>,
+    /// Thread id. Required for thread-shared workspaces.
+    #[arg(long = "in")]
+    thread: Option<String>,
+    /// Actor id (defaults to JOI_ACTOR / current actor). Use --actor to
+    /// explicitly target a per-actor workspace.
+    #[arg(long, env = "JOI_ACTOR")]
+    actor: Option<String>,
+    /// Target the channel-shared area (`channels/<cid>/shared/`).
+    #[arg(long, conflicts_with_all = ["thread_shared", "actor_ws"])]
+    channel_shared: bool,
+    /// Target the thread-shared area (`channels/<cid>/threads/<tid>/shared/`).
+    #[arg(long, conflicts_with_all = ["channel_shared", "actor_ws"])]
+    thread_shared: bool,
+    /// Target the per-actor workspace (default if --actor given).
+    #[arg(long = "actor-ws", conflicts_with_all = ["channel_shared", "thread_shared"])]
+    actor_ws: bool,
+}
+
+impl WsTarget {
+    fn into_ref(self, default_actor: &str) -> Result<cmd::workspace::WsRef> {
+        use cmd::workspace::{WsKind, WsRef};
+        let kind = if self.channel_shared {
+            WsKind::Channel
+        } else if self.thread_shared {
+            WsKind::Thread
+        } else {
+            // Default: actor workspace.
+            WsKind::Actor
+        };
+        let channel_id = match (&self.channel, &self.thread, kind) {
+            (Some(c), _, _) => c.clone(),
+            (None, Some(_t), WsKind::Thread) => {
+                anyhow::bail!("--in <tid> requires --channel <cid> too (thread workspaces are nested under their channel)");
+            }
+            _ => anyhow::bail!("--channel <cid> is required"),
+        };
+        let actor_id = self.actor.clone().or_else(|| {
+            if matches!(kind, WsKind::Actor) {
+                Some(default_actor.to_string())
+            } else {
+                None
+            }
+        });
+        Ok(WsRef {
+            kind,
+            channel_id,
+            thread_id: self.thread.clone(),
+            actor_id,
+        })
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -157,6 +277,23 @@ enum ServiceCmd {
         /// the JSON payload `{sourceEvent, triggerId, scopeKind, scopeId}`.
         #[arg(long = "async-reply", hide = true)]
         async_reply: Option<String>,
+    },
+    /// Inspect ServiceSpec JSON files on disk (no server contact).
+    Spec {
+        #[command(subcommand)]
+        sub: ServiceSpecCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceSpecCmd {
+    /// List every ServiceSpec under the specs directory.
+    List,
+    /// Print one ServiceSpec by id (secrets redacted unless --raw).
+    Get {
+        service_id: String,
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -361,6 +498,43 @@ enum AgentCmd {
         #[arg(long = "allow-actors", value_delimiter = ',')]
         allow_actors: Vec<String>,
     },
+    /// Inspect AgentSpec JSON files on disk (no server contact).
+    Spec {
+        #[command(subcommand)]
+        sub: AgentSpecCmd,
+    },
+    /// Inspect an installed agent's bundle directory (skills/, tools/, ...).
+    Bundle {
+        #[command(subcommand)]
+        sub: AgentBundleCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentSpecCmd {
+    /// List every AgentSpec under the specs directory.
+    List,
+    /// Print one AgentSpec by actor id (secrets redacted unless --raw).
+    Get {
+        actor_id: String,
+        /// Print the raw JSON without redacting token/secret/password fields.
+        #[arg(long)]
+        raw: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentBundleCmd {
+    /// Show bundle dir + optionally list/read a file inside it.
+    Get {
+        actor_id: String,
+        /// Read this file (relative to the bundle dir) and print to stdout.
+        #[arg(long)]
+        file: Option<String>,
+        /// List bundle contents (recursive) instead of just printing the dir.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[tokio::main]
@@ -428,6 +602,17 @@ async fn main() -> Result<()> {
             AgentCmd::Stop { actor_id } => cmd::agent::stop(actor_id)?,
             AgentCmd::Log { actor_id, tail } => cmd::agent::log(actor_id, tail)?,
             AgentCmd::Serve { .. } => unreachable!("handled above"),
+            AgentCmd::Spec { sub } => match sub {
+                AgentSpecCmd::List => cmd::spec::agent_list()?,
+                AgentSpecCmd::Get { actor_id, raw } => cmd::spec::agent_get(actor_id, raw)?,
+            },
+            AgentCmd::Bundle { sub } => match sub {
+                AgentBundleCmd::Get {
+                    actor_id,
+                    file,
+                    list,
+                } => cmd::spec::bundle_get(actor_id, file, list)?,
+            },
         }
         return Ok(());
     }
@@ -468,6 +653,71 @@ async fn main() -> Result<()> {
     } = args.cmd
     {
         return cmd::service::am_handler(cfg.server_url, service_id, specs, async_reply).await;
+    }
+
+    // `agent spec` / `agent bundle` / `service spec` are local-only —
+    // they read AgentSpec/ServiceSpec JSON files and bundle directories
+    // off the operator's disk. Short-circuit before the websocket dance
+    // so they work even when no joi-server is running.
+    if let Cmd::Service {
+        sub: ServiceCmd::Spec { sub },
+    } = args.cmd
+    {
+        return match sub {
+            ServiceSpecCmd::List => cmd::spec::service_list(),
+            ServiceSpecCmd::Get { service_id, raw } => cmd::spec::service_get(service_id, raw),
+        };
+    }
+
+    // Workspace commands operate purely on the local filesystem layout
+    // shared with `agent serve` (see `cmd::workspace`). Never contact the
+    // server.
+    if let Cmd::Workspace { sub } = args.cmd {
+        let actor_default = cfg.actor_id.clone();
+        return match sub {
+            WorkspaceCmd::Path { target, sub } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::path(ws, sub)
+            }
+            WorkspaceCmd::Info { target } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::info(ws)
+            }
+            WorkspaceCmd::List {
+                target,
+                sub,
+                recursive,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::list(ws, sub, recursive)
+            }
+            WorkspaceCmd::Read {
+                target,
+                path,
+                max_bytes,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::read(ws, path, max_bytes)
+            }
+            WorkspaceCmd::Write {
+                target,
+                path,
+                text,
+                file,
+                append,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::write(ws, path, text, file, append)
+            }
+            WorkspaceCmd::Rm {
+                target,
+                path,
+                recursive,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::rm(ws, path, recursive)
+            }
+        };
     }
 
     // `mcp memory` never talks to the joi server — it's spawned by the ACP
@@ -586,6 +836,7 @@ async fn main() -> Result<()> {
             cmd::chat::run(client, cfg.actor_id, scope_id, scope_kind).await?
         }
         Cmd::Service { .. } => unreachable!("handled before client setup"),
+        Cmd::Workspace { .. } => unreachable!("handled before client setup"),
     }
     Ok(())
 }

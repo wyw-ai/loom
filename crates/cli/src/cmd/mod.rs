@@ -11,4 +11,6 @@ pub mod mcp_announcement;
 pub mod mcp_memory;
 pub mod say;
 pub mod service;
+pub mod spec;
 pub mod thread;
+pub mod workspace;

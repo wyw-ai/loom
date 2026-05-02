@@ -363,6 +363,17 @@ enum ThreadCmd {
         channel: String,
         #[arg(long, default_value = "Untitled")]
         title: String,
+        /// Record this thread under `resident_threads.<role>` in the
+        /// channel-shared scope.json so a router can address it by role.
+        /// See design §4.7.1.
+        #[arg(long = "resident-as")]
+        resident_as: Option<String>,
+        /// Read the artifact (id or `artifact://...` URI), derive a
+        /// `mounts[]` array, and write it to the thread-shared
+        /// scope.json so per-actor workspaces seed mounts on first
+        /// dispatch. See design §4.7.2.
+        #[arg(long = "bootstrap-artifact")]
+        bootstrap_artifact: Option<String>,
     },
     List {
         #[arg(long)]
@@ -821,8 +832,14 @@ async fn main() -> Result<()> {
             ChannelCmd::Members { channel_id } => cmd::channel::members(client, channel_id).await?,
         },
         Cmd::Thread { sub } => match sub {
-            ThreadCmd::Create { channel, title } => {
-                cmd::thread::create(client, channel, title).await?
+            ThreadCmd::Create {
+                channel,
+                title,
+                resident_as,
+                bootstrap_artifact,
+            } => {
+                cmd::thread::create(client, channel, title, resident_as, bootstrap_artifact)
+                    .await?
             }
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
         },

@@ -38,6 +38,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
+use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
     validate_bundle_current, Adapter, AdapterEvent, AdapterPrompt,
@@ -744,18 +745,20 @@ impl WorkerState {
     }
 
     fn model_choice(&self, id: &str) -> Option<AgentModelChoice> {
-        self.model_choices().into_iter().find(|choice| choice.id == id)
+        self.model_choices()
+            .into_iter()
+            .find(|choice| choice.id == id)
     }
 
     fn set_current_model(&self, model: String) -> Result<()> {
         if !model_is_allowed(&self.spec, &model) {
-            return Err(anyhow!("model `{model}` is not configured for {}", self.actor_id));
+            return Err(anyhow!(
+                "model `{model}` is not configured for {}",
+                self.actor_id
+            ));
         }
         persist_model_state(&self.profile_dir, &model)?;
-        *self
-            .selected_model
-            .lock()
-            .expect("selected_model poisoned") = Some(model);
+        *self.selected_model.lock().expect("selected_model poisoned") = Some(model);
         Ok(())
     }
 
@@ -825,7 +828,12 @@ fn default_model_for_spec(spec: &AgentSpec) -> Option<String> {
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned)
         .filter(|model| model_is_allowed(spec, model))
-        .or_else(|| model_choices_for_spec(spec).into_iter().next().map(|c| c.id))
+        .or_else(|| {
+            model_choices_for_spec(spec)
+                .into_iter()
+                .next()
+                .map(|c| c.id)
+        })
 }
 
 fn model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
@@ -1031,6 +1039,26 @@ fn build_adapter(
                 paths.sessions.clone(),
             );
             Ok(Arc::new(CommandAdapter::new(cfg)))
+        }
+        "interactive_command" => {
+            let interactive = spec.transport.interactive.clone().unwrap_or_default();
+            let model = spec
+                .transport
+                .model
+                .clone()
+                .or_else(|| spec.models.as_ref().and_then(|m| m.default.clone()));
+            let cfg = InteractiveCommandConfig::new(
+                spec.actor.id.clone(),
+                spec.transport.command.clone(),
+                &spec.transport.args,
+                command_env,
+                model,
+                interactive,
+                spec.transport.provider.clone(),
+                paths.sessions.clone(),
+                paths.profile.clone(),
+            );
+            Ok(Arc::new(InteractiveCommandAdapter::new(cfg)))
         }
         other => Err(anyhow!(
             "unknown transport kind `{other}` for agent {}",
@@ -2016,9 +2044,12 @@ mod tests {
                 args: Vec::new(),
                 env: std::collections::BTreeMap::new(),
                 auth_method: None,
+                model: None,
                 session: None,
                 output_format: None,
                 prompt_via: proto::methods::PromptVia::default(),
+                interactive: None,
+                provider: None,
             },
             autostart: false,
             models: None,
@@ -2183,10 +2214,16 @@ mod tests {
         let choices = model_choices_for_spec(&spec);
 
         assert_eq!(
-            choices.iter().map(|choice| choice.id.as_str()).collect::<Vec<_>>(),
+            choices
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["model_default", "model_fast"]
         );
-        assert_eq!(default_model_for_spec(&spec).as_deref(), Some("model_default"));
+        assert_eq!(
+            default_model_for_spec(&spec).as_deref(),
+            Some("model_default")
+        );
         assert!(model_is_allowed(&spec, "model_fast"));
         assert!(!model_is_allowed(&spec, "model_missing"));
     }

@@ -3,6 +3,7 @@
 /data/artifacts/
 /data/agents/
 /dist/
+.idea
 .DS_Store
 /.claude/
 /.am/

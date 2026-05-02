@@ -622,10 +622,19 @@ fn ensure_actor_skills_link(actor_skills: &Path, bundle_paths: Option<&BundlePat
 /// the operator declared.
 ///
 /// The function preserves `mounts` and `resident_threads` arrays/objects
-/// from any existing scope.json on disk — those keys are written by
-/// thread bootstrap / discovery / artifact triggers (see design §4.2.1
-/// + §4.7), and `ensure_scope` runs every turn, so we must not clobber
-/// them. The canonical fields (actor_id, channel_id, scope, paths) are
+/// from any existing per-actor scope.json on disk — those keys are
+/// written by thread bootstrap / discovery / artifact triggers (see
+/// design §4.2.1 + §4.7), and `ensure_scope` runs every turn, so we
+/// must not clobber them. When the per-actor file does not yet declare
+/// them, we *seed* from the canonical files written by
+/// `joi thread create --resident-as / --bootstrap-artifact`:
+///
+/// * `mounts` come from the thread-shared scope.json
+///   (`channels/<cid>/threads/<tid>/shared/.joi/state/scope.json`).
+/// * `resident_threads` come from the channel-shared scope.json
+///   (`channels/<cid>/shared/.joi/state/scope.json`).
+///
+/// The canonical fields (actor_id, channel_id, scope, paths) are
 /// always rewritten from the current inputs.
 fn write_scope_json(
     scope: &ScopePaths,
@@ -635,7 +644,7 @@ fn write_scope_json(
 ) -> std::io::Result<()> {
     use serde_json::{json, Value};
     let path = scope.state_dir.join("scope.json");
-    let (mounts, resident_threads) = match std::fs::read_to_string(&path) {
+    let (mut mounts, mut resident_threads) = match std::fs::read_to_string(&path) {
         Ok(prev) => match serde_json::from_str::<Value>(&prev) {
             Ok(v) => (
                 v.get("mounts").cloned().unwrap_or_else(|| Value::Array(vec![])),
@@ -647,6 +656,44 @@ fn write_scope_json(
         },
         Err(_) => (Value::Array(vec![]), Value::Object(serde_json::Map::new())),
     };
+    // Seed mounts from the thread-shared scope.json on first ensure.
+    if matches!(scope_ref.kind, ScopeKind::Thread)
+        && mounts.as_array().map(|a| a.is_empty()).unwrap_or(true)
+    {
+        if let Some(thread_shared) = scope.thread_shared.as_ref() {
+            let canonical = thread_shared.join(".joi").join("state").join("scope.json");
+            if let Ok(body) = std::fs::read_to_string(&canonical) {
+                if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                    if let Some(arr) = v.get("mounts").cloned() {
+                        if arr.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                            mounts = arr;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Seed resident_threads from the channel-shared scope.json.
+    if resident_threads
+        .as_object()
+        .map(|o| o.is_empty())
+        .unwrap_or(true)
+    {
+        let canonical = scope
+            .channel_shared
+            .join(".joi")
+            .join("state")
+            .join("scope.json");
+        if let Ok(body) = std::fs::read_to_string(&canonical) {
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                if let Some(rt) = v.get("resident_threads").cloned() {
+                    if rt.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+                        resident_threads = rt;
+                    }
+                }
+            }
+        }
+    }
     let payload = json!({
         "actor_id": actor_id,
         "channel_id": channel_id,

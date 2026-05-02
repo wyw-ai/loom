@@ -1,6 +1,7 @@
 mod artifacts;
 mod handlers;
 mod journal;
+mod scope_skills;
 mod state;
 mod store;
 mod subscribe;
@@ -16,6 +17,7 @@ use clap::Parser;
 
 use crate::artifacts::ArtifactStore;
 use crate::journal::Journal;
+use crate::scope_skills::ScopeSkills;
 use crate::state::AppState;
 use crate::store::Store;
 use crate::subscribe::Subscriptions;
@@ -48,11 +50,17 @@ async fn main() -> Result<()> {
         args.data_dir.join("artifacts"),
         args.data_dir.join("workspaces"),
     )?);
+    let scope_skills = Arc::new(ScopeSkills::new(
+        args.data_dir.join("workspaces"),
+        args.data_dir.join("agents"),
+    )?);
+    scope_skills.reconcile(&store)?;
 
     let state = AppState {
         store: store.clone(),
         subscriptions,
         artifacts,
+        scope_skills,
     };
 
     // Stream broadcaster (store events -> stream/update notifications).

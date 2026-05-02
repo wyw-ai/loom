@@ -30,11 +30,14 @@ use proto::methods::{
     TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
-use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus};
+use proto::types::{
+    ActorKind, Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::time::{sleep, Duration};
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -45,6 +48,9 @@ use agent_runtime::{
 };
 
 use crate::client::Client;
+
+const RECONNECT_BASE_DELAY_SECS: u64 = 2;
+const RECONNECT_MAX_DELAY_SECS: u64 = 30;
 
 pub async fn run(
     specs_dir_opt: Option<PathBuf>,
@@ -110,8 +116,26 @@ pub async fn run(
         let root = data_root.clone();
         let actor = spec.actor.id.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = run_agent_worker(spec, server, root).await {
-                eprintln!("[{actor}] worker exited with error: {e}");
+            let mut attempt = 0u32;
+            loop {
+                attempt = attempt.saturating_add(1);
+                let delay = reconnect_delay(attempt);
+                match run_agent_worker(spec.clone(), server.clone(), root.clone()).await {
+                    Ok(()) => {
+                        attempt = 0;
+                        eprintln!(
+                            "[{actor}] worker disconnected; reconnecting in {}s",
+                            delay.as_secs()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[{actor}] worker exited with error: {e}; reconnecting in {}s",
+                            delay.as_secs()
+                        );
+                    }
+                }
+                sleep(delay).await;
             }
         }));
     }
@@ -122,6 +146,11 @@ pub async fn run(
         h.abort();
     }
     Ok(())
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    Duration::from_secs((RECONNECT_BASE_DELAY_SECS << shift).min(RECONNECT_MAX_DELAY_SECS))
 }
 
 /// The path to *this* joi binary. Used as the `command` for the
@@ -221,6 +250,7 @@ struct AgentPaths {
     bundle_root: PathBuf,
     bundle_current: PathBuf,
     sessions: PathBuf,
+    scope_workspaces_root: PathBuf,
     data_root: PathBuf,
 }
 
@@ -231,6 +261,7 @@ struct ScopePaths {
     channel_artifacts: PathBuf,
     agent_root: PathBuf,
     workspace: PathBuf,
+    skills: PathBuf,
     logs: PathBuf,
 }
 
@@ -244,17 +275,22 @@ struct BundlePaths {
 impl AgentPaths {
     fn new(data_root: &Path, actor_id: &str) -> Self {
         let agent_root = data_root.join("agents").join(actor_id);
+        let scope_workspaces_root = std::env::var_os("JOI_SCOPE_WORKSPACES_ROOT")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_root.join("workspaces"));
         Self {
             profile: agent_root.join("profile"),
             bundle_root: agent_root.join("bundles"),
             bundle_current: agent_root.join("bundles").join("current"),
             root: agent_root,
             sessions: data_root.join("sessions"),
+            scope_workspaces_root,
             data_root: data_root.to_path_buf(),
         }
     }
 
-    fn scope(&self, actor_id: &str, channel_id: &str) -> ScopePaths {
+    fn scope(&self, actor_id: &str, channel_id: &str, scope_ref: &ScopeRef) -> ScopePaths {
         let channel_root = self.data_root.join("channels").join(channel_id);
         let channel_shared = channel_root.join("shared");
         let channel_artifacts = channel_shared.join("artifacts");
@@ -263,6 +299,7 @@ impl AgentPaths {
             channel_root,
             channel_shared,
             channel_artifacts,
+            skills: self.scope_skills_dir(scope_ref),
             workspace: agent_root.join("workspace"),
             logs: agent_root.join("logs"),
             agent_root,
@@ -349,17 +386,28 @@ impl AgentPaths {
             .replace("{agent.bundle}", &bundle_current)
     }
 
-    fn ensure_scope(&self, actor_id: &str, channel_id: &str) -> std::io::Result<ScopePaths> {
-        let scope = self.scope(actor_id, channel_id);
+    fn ensure_scope(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+    ) -> std::io::Result<ScopePaths> {
+        let scope = self.scope(actor_id, channel_id, scope_ref);
         std::fs::create_dir_all(&scope.workspace)?;
         std::fs::create_dir_all(&scope.logs)?;
         std::fs::create_dir_all(&scope.channel_artifacts)?;
+        ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
         agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
         Ok(scope)
     }
 
-    fn template_vars(&self, actor_id: &str, channel_id: &str) -> BTreeMap<String, String> {
-        let scope = self.scope(actor_id, channel_id);
+    fn template_vars(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+    ) -> BTreeMap<String, String> {
+        let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut vars = BTreeMap::new();
         vars.insert(
             "agent.workspace".into(),
@@ -368,6 +416,8 @@ impl AgentPaths {
         vars.insert("agent.root".into(), scope.agent_root.display().to_string());
         vars.insert("agent.profile".into(), self.profile.display().to_string());
         vars.insert("agent.logs".into(), scope.logs.display().to_string());
+        vars.insert("agent.skills".into(), scope.skills.display().to_string());
+        vars.insert("scope.skills".into(), scope.skills.display().to_string());
         vars.insert(
             "agent.bundle_root".into(),
             self.bundle_root.display().to_string(),
@@ -395,9 +445,10 @@ impl AgentPaths {
         &self,
         actor_id: &str,
         channel_id: &str,
+        scope_ref: &ScopeRef,
         server_url: &str,
     ) -> BTreeMap<String, String> {
-        let scope = self.scope(actor_id, channel_id);
+        let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut env = BTreeMap::new();
         env.insert("JOI_SERVER".into(), server_url.to_string());
         env.insert("JOI_ACTOR".into(), actor_id.to_string());
@@ -431,8 +482,42 @@ impl AgentPaths {
             scope.workspace.display().to_string(),
         );
         env.insert("AGENTX_AGENT_LOGS".into(), scope.logs.display().to_string());
+        env.insert(
+            "AGENTX_SCOPE_SKILLS".into(),
+            scope.skills.display().to_string(),
+        );
+        env.insert(
+            "JOI_SCOPE_SKILLS_DIR".into(),
+            scope.skills.display().to_string(),
+        );
         env
     }
+
+    fn scope_skills_dir(&self, scope_ref: &ScopeRef) -> PathBuf {
+        self.scope_workspaces_root
+            .join(scope_kind_name(scope_ref.kind))
+            .join(&scope_ref.id)
+            .join("skills")
+    }
+}
+
+fn scope_kind_name(kind: ScopeKind) -> &'static str {
+    match kind {
+        ScopeKind::Channel => "channel",
+        ScopeKind::Thread => "thread",
+    }
+}
+
+fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(skills_target)?;
+    let link_path = workspace.join("skills");
+    match std::fs::read_link(&link_path) {
+        Ok(existing) if existing == skills_target => return Ok(()),
+        Ok(_) => remove_path_if_exists(&link_path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => remove_path_if_exists(&link_path)?,
+    }
+    symlink_path(skills_target, &link_path)
 }
 
 fn ensure_bundle(
@@ -911,10 +996,18 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         .call(method::ACTOR_UPSERT, json!({ "actor": spec.actor }))
         .await
         .with_context(|| format!("actor/upsert for {}", actor_id))?;
+    let actor_kind = match spec.actor.kind {
+        ActorKind::Human => "human",
+        ActorKind::Agent => "agent",
+        ActorKind::Service => "service",
+    };
     client
-        .open_connection_as(&actor_id, "agent", Some(&display_name))
+        .open_connection_as(&actor_id, actor_kind, Some(&display_name))
         .await?;
-    eprintln!("[{actor_id}] connected to {server_url} as agent");
+    eprintln!(
+        "[{actor_id}] connected to {server_url} as {:?}",
+        spec.actor.kind
+    );
 
     let agent_server_url = agent_child_server_url(&server_url);
     if agent_server_url != server_url {
@@ -947,7 +1040,11 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         });
     }
 
-    notification_loop(client, state, adapter, event_tx, &actor_id).await
+    let result = notification_loop(client, state, adapter.clone(), event_tx, &actor_id).await;
+    if let Err(e) = adapter.stop().await {
+        tracing::warn!(actor = %actor_id, %e, "adapter stop failed before reconnect");
+    }
+    result
 }
 
 fn build_adapter(
@@ -1494,16 +1591,23 @@ async fn dispatch_handoff(
         let channel_id = resolve_channel_for_scope(client, state, &trigger.scope)
             .await
             .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", trigger.scope.id))?;
-        let scope_paths = state.paths.ensure_scope(&state.actor_id, &channel_id)?;
+        let scope_paths = state
+            .paths
+            .ensure_scope(&state.actor_id, &channel_id, &trigger.scope)?;
         let adapter_prompt = AdapterPrompt {
             scope: trigger.scope.clone(),
             content: prompt,
             model: state.current_model(),
             cwd: scope_paths.workspace,
-            env: state
+            env: state.paths.scope_env(
+                &state.actor_id,
+                &channel_id,
+                &trigger.scope,
+                &state.agent_server_url,
+            ),
+            template_vars: state
                 .paths
-                .scope_env(&state.actor_id, &channel_id, &state.agent_server_url),
-            template_vars: state.paths.template_vars(&state.actor_id, &channel_id),
+                .template_vars(&state.actor_id, &channel_id, &trigger.scope),
         };
 
         match adapter.send_prompt(adapter_prompt).await {
@@ -2153,6 +2257,42 @@ mod tests {
 
         assert_eq!(bundle_paths.version, "demo-bundle");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ensure_scope_links_scope_specific_skills_into_workspace() {
+        let root = temp_path("scope-skills-link");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+
+        let scope_paths = paths
+            .ensure_scope("actor_demo", "chan_demo", &scope)
+            .expect("ensure scope");
+
+        assert_eq!(
+            std::fs::read_link(scope_paths.workspace.join("skills")).expect("skills link"),
+            root.join("workspaces")
+                .join("thread")
+                .join("thread_demo")
+                .join("skills")
+        );
+        assert!(scope_paths.skills.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reconnect_delay_grows_and_caps() {
+        assert_eq!(reconnect_delay(0), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(4));
+        assert_eq!(reconnect_delay(3), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(16));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(99), Duration::from_secs(30));
     }
 
     #[test]

@@ -75,7 +75,8 @@ enum Cmd {
         #[command(subcommand)]
         sub: ActionCmd,
     },
-    /// Manage agents.
+    /// Manage agents. Run `joi agent example` for AgentSpec examples covering
+    /// acp_stdio, command, and interactive_command transports.
     Agent {
         #[command(subcommand)]
         sub: AgentCmd,
@@ -327,6 +328,8 @@ enum AgentCmd {
     },
     /// Add a custom agent interactively.
     Add,
+    /// Show AgentSpec examples for acp_stdio, command, and interactive_command transports.
+    Example,
     /// Register an agent from a local JSON spec file.
     Register {
         path: PathBuf,
@@ -418,6 +421,7 @@ async fn main() -> Result<()> {
                 prefer,
             } => cmd::agent::install(marketplace_id, local_actor_id, display_name, prefer)?,
             AgentCmd::Add => cmd::agent::add()?,
+            AgentCmd::Example => cmd::agent::example(),
             AgentCmd::Register { path } => cmd::agent::register(path)?,
             AgentCmd::Remove { actor_id } => cmd::agent::remove(actor_id)?,
             AgentCmd::Start { actor_id } => cmd::agent::start(actor_id)?,

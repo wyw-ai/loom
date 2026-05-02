@@ -204,6 +204,236 @@ pub fn add() -> Result<()> {
     Ok(())
 }
 
+pub fn example() {
+    println!(
+        "{}",
+        r#"Joi AgentSpec examples
+======================
+
+`joi agent serve` loads AgentSpec JSON files from `~/.config/joi/agents/` by
+default. You can also point at another directory:
+
+  joi agent serve --specs ./agents
+  joi agent serve --specs ./agents --allow-actors actor_claude,actor_copilot
+
+Each file describes one actor and one transport. Register a single file with:
+
+  joi agent register ./agents/actor_example.json
+
+Common fields
+-------------
+
+- `actor.id`: stable actor id, usually `actor_*`.
+- `actor.kind`: use `agent` for normal agents.
+- `transport.kind`: one of `acp_stdio`, `command`, or `interactive_command`.
+- `transport.command`: executable to spawn.
+- `transport.args`: argv passed to the executable. Use arrays, not shell strings.
+- `transport.env`: environment variables for the provider process.
+- `models.default`: optional default model. For `interactive_command`, Joi appends
+  `--model=<model>` to the final argv when a model is active.
+- `bundle`: optional local skills/bundle source. When published into server data,
+  scope skills can expose these bundles under the current workspace's `skills/`.
+
+1. acp_stdio
+------------
+
+Use this when the provider speaks Agent Client Protocol over stdio. Completion,
+streaming, tool calls, and session lifecycle are handled by ACP frames.
+
+Example:
+
+{
+  "actor": {
+    "id": "actor_acp_demo",
+    "kind": "agent",
+    "displayName": "ACP Demo",
+    "capabilities": {}
+  },
+  "transport": {
+    "kind": "acp_stdio",
+    "command": "npx",
+    "args": ["-y", "@example/acp-agent"],
+    "env": {
+      "EXAMPLE_API_KEY": "${EXAMPLE_API_KEY}"
+    }
+  },
+  "autostart": false,
+  "identity": {},
+  "memory": {
+    "delivery": {
+      "prompt": true,
+      "mcp": true
+    }
+  }
+}
+
+Notes:
+- Prefer `acp_stdio` when the provider supports ACP natively.
+- The child process is long-lived.
+- Joi does not need a sentinel because ACP supplies completion events.
+
+2. command
+----------
+
+Use this for one-shot commands where process exit means the turn is complete.
+Joi can pass the prompt by argv or stdin depending on `promptVia`.
+
+Example:
+
+{
+  "actor": {
+    "id": "actor_command_demo",
+    "kind": "agent",
+    "displayName": "Command Demo",
+    "capabilities": {}
+  },
+  "transport": {
+    "kind": "command",
+    "command": "python3",
+    "args": ["./scripts/answer_once.py", "{prompt}"],
+    "env": {
+      "JOI_MODE": "command"
+    },
+    "promptVia": {
+      "kind": "args"
+    },
+    "outputFormat": {
+      "kind": "text"
+    },
+    "session": {
+      "idStrategy": "extract",
+      "extract": {
+        "from": "stdout",
+        "regex": "SESSION_ID=([A-Za-z0-9_-]+)"
+      }
+    }
+  },
+  "autostart": false
+}
+
+Notes:
+- Use `command` only when the provider exits after each prompt.
+- stdout becomes the user-visible response unless a structured output format is configured.
+- If the provider supports resume, configure `transport.session`; otherwise omit it.
+
+3. interactive_command
+----------------------
+
+Use this for Claude/Copilot-style CLIs that accept a prompt plus a session id,
+but do not expose ACP frames and may not use process exit as the logical turn
+boundary. Joi owns one provider session per `(actor, scope.kind, scope.id)` and
+uses an explicit completion sentinel, default `__JOI_DONE__`.
+
+Claude example:
+
+{
+  "actor": {
+    "id": "actor_claude",
+    "kind": "agent",
+    "displayName": "Claude Interactive",
+    "capabilities": {}
+  },
+  "transport": {
+    "kind": "interactive_command",
+    "command": "claude",
+    "model": "sonnet",
+    "interactive": {
+      "session": {
+        "newArgs": ["{prompt}", "--session-id", "{session_id}"],
+        "resumeArgs": ["{prompt}", "--resume", "{session_id}"]
+      },
+      "prompt": {
+        "completionContract": {
+          "sentinel": "__JOI_DONE__"
+        }
+      },
+      "completion": {
+        "maxTurnMs": 120000
+      },
+      "output": {
+        "stripSentinel": true,
+        "stripAnsi": true
+      },
+      "kill": {
+        "onComplete": { "action": "sigterm", "graceMs": 0, "fallback": "sigkill" },
+        "onCancel": { "action": "sigterm", "graceMs": 0, "fallback": "sigkill" },
+        "onTimeout": { "action": "sigkill" }
+      }
+    },
+    "provider": {
+      "kind": "claude",
+      "settings": {
+        "mode": "actor_profile"
+      }
+    }
+  },
+  "models": {
+    "default": "sonnet",
+    "choices": [
+      { "id": "sonnet", "label": "Claude Sonnet" },
+      { "id": "opus", "label": "Claude Opus" }
+    ]
+  },
+  "autostart": false,
+  "identity": {},
+  "memory": {
+    "delivery": {
+      "prompt": true,
+      "mcp": true
+    }
+  }
+}
+
+Claude settings modes:
+- `global`: omit `--settings`.
+- `actor_profile`: pass `--settings {agent.profile}/claude/settings.json`.
+- `custom`: pass `--settings <path>` from `provider.settings.path`.
+
+Copilot example:
+
+{
+  "actor": {
+    "id": "actor_copilot",
+    "kind": "agent",
+    "displayName": "Copilot Interactive",
+    "capabilities": {}
+  },
+  "transport": {
+    "kind": "interactive_command",
+    "command": "copilot",
+    "interactive": {
+      "session": {
+        "newArgs": ["--interactive", "{prompt}", "--resume", "{session_id}", "--silent", "--no-color"],
+        "resumeArgs": ["--interactive", "{prompt}", "--resume", "{session_id}", "--silent", "--no-color"]
+      },
+      "completion": {
+        "maxTurnMs": 120000
+      },
+      "kill": {
+        "onComplete": { "action": "sigterm", "graceMs": 0, "fallback": "sigkill" },
+        "onCancel": { "action": "sigterm", "graceMs": 0, "fallback": "sigkill" },
+        "onTimeout": { "action": "sigkill" }
+      }
+    }
+  },
+  "autostart": false
+}
+
+interactive_command notes:
+- `{prompt}` is the Joi envelope plus the completion contract and the new user message.
+- `{session_id}` is a Joi-owned UUID for first use, then the saved provider session id.
+- The default session boundary is one provider session per actor per thread, and one
+  separate provider session per actor per channel common area.
+- A successful turn requires detecting the sentinel, flushing final text, saving/updating
+  the session record, applying the completion kill policy, and emitting a successful finish.
+- Process exit without the sentinel is treated as a failed turn.
+- If a model is active, Joi appends exactly one argv token: `--model=<model>`.
+- The provider runs from the current scope workspace. If scope skills are enabled, the
+  workspace contains `skills/` pointing at the current thread or channel skills.
+"#
+    );
+}
+
 pub fn register(path: PathBuf) -> Result<()> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read agent spec {}", path.display()))?;

@@ -21,6 +21,10 @@ fn map_store_err(err: StoreError) -> ErrorObject {
     }
 }
 
+fn map_runtime_err(err: impl std::fmt::Display) -> ErrorObject {
+    ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, err.to_string())
+}
+
 fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorObject> {
     let v = params.unwrap_or(Value::Null);
     serde_json::from_value(v)
@@ -255,6 +259,12 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .create_channel(p.title, creator)
         .map_err(map_store_err)?;
+    if let Some(actor_id) = channel.members.first() {
+        state
+            .scope_skills
+            .sync_actor_channel_membership(&state.store, &channel.id, actor_id)
+            .map_err(map_runtime_err)?;
+    }
     ok(ChannelCreateResult { channel })
 }
 
@@ -294,6 +304,10 @@ fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .grant_channel(&p.channel_id, &p.actor_id)
         .map_err(map_store_err)?;
+    state
+        .scope_skills
+        .sync_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
+        .map_err(map_runtime_err)?;
     ok(ChannelInviteResult { channel })
 }
 
@@ -325,6 +339,10 @@ fn channel_revoke(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .revoke_channel(&p.channel_id, &p.actor_id)
         .map_err(map_store_err)?;
+    state
+        .scope_skills
+        .remove_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
+        .map_err(map_runtime_err)?;
     ok(ChannelRevokeResult { channel })
 }
 
@@ -371,10 +389,22 @@ fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) 
             format!("actor {caller} cannot delete channel {}", p.channel_id),
         ));
     }
+    let thread_ids = state
+        .store
+        .list_threads(Some(&p.channel_id))
+        .into_iter()
+        .map(|thread| thread.id)
+        .collect::<Vec<_>>();
     let (deleted, deleted_threads) = state
         .store
         .delete_channel(&p.channel_id, p.cascade)
         .map_err(map_store_err)?;
+    if deleted {
+        state
+            .scope_skills
+            .remove_channel_scope(&p.channel_id, &thread_ids)
+            .map_err(map_runtime_err)?;
+    }
     ok(ChannelDeleteResult {
         deleted,
         deleted_threads,
@@ -403,6 +433,10 @@ fn thread_create(state: &AppState, connection_id: &str, params: Option<Value>) -
         .store
         .create_thread(p.channel_id, p.title, p.root_event_id)
         .map_err(map_store_err)?;
+    state
+        .scope_skills
+        .sync_thread_channel_memberships(&state.store, &thread)
+        .map_err(map_runtime_err)?;
     ok(ThreadCreateResult { thread })
 }
 
@@ -474,6 +508,12 @@ fn thread_delete(state: &AppState, connection_id: &str, params: Option<Value>) -
         .store
         .delete_thread(&p.thread_id)
         .map_err(map_store_err)?;
+    if deleted {
+        state
+            .scope_skills
+            .remove_thread_scope(&p.thread_id)
+            .map_err(map_runtime_err)?;
+    }
     ok(ThreadDeleteResult { deleted })
 }
 
@@ -806,6 +846,7 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::journal::Journal;
+    use crate::scope_skills::ScopeSkills;
     use crate::store::Store;
     use crate::subscribe::{Connection, Subscriptions};
     use std::path::PathBuf;
@@ -833,10 +874,14 @@ mod tests {
             ArtifactStore::new(root.join("artifacts"), root.join("workspaces"))
                 .expect("artifact store"),
         );
+        let scope_skills = Arc::new(
+            ScopeSkills::new(root.join("workspaces"), root.join("agents")).expect("scope skills"),
+        );
         AppState {
             store,
             subscriptions,
             artifacts,
+            scope_skills,
         }
     }
 

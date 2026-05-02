@@ -1,7 +1,6 @@
 /target
 /data/journal.jsonl
 /data/artifacts/
-/data/agents/
 /dist/
 .idea
 .DS_Store

@@ -1,0 +1,52 @@
+{
+  "id": "mr-detector",
+  "kind": "scheduler",
+  "actor": {
+    "id": "svc_mr_detector",
+    "kind": "service",
+    "displayName": "MR Detector (thread-bound)"
+  },
+  "autostart": false,
+  "config": {
+    "lifecycle": "thread-bound",
+    "bind": {
+      "scope": "thread",
+      "auto_stop_on": ["thread.closed", "service.self_complete"]
+    },
+    "params_schema": {
+      "required": ["mr_url"],
+      "properties": {
+        "mr_url": { "type": "string" }
+      }
+    },
+    "jobs": [
+      {
+        "id": "poll",
+        "schedule": "*/2 * * * *",
+        "source": {
+          "kind": "command",
+          "command": "bash",
+          "args": [
+            "{spec.dir}/bundle/poll.sh",
+            "--mr-url",
+            "{params.mr_url}",
+            "--state-dir",
+            "{instance.data_dir}"
+          ],
+          "timeoutMs": 60000
+        },
+        "scope": {
+          "kind": "thread",
+          "id": "{thread.id}",
+          "channelId": "{channel.id}"
+        },
+        "dedupeBy": "source_event_id",
+        "cursorBy": "body_hash",
+        "singleInFlight": true
+      }
+    ],
+    "self_complete_on": {
+      "event_kind": ["merged", "closed"]
+    }
+  }
+}

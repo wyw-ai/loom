@@ -433,6 +433,7 @@ impl AgentPaths {
         ensure_actor_skills_link(&scope.actor_skills, bundle_paths)?;
         agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
         write_scope_json(&scope, actor_id, channel_id, scope_ref)?;
+        project_mounts(&scope)?;
         Ok(scope)
     }
 
@@ -618,15 +619,34 @@ fn ensure_actor_skills_link(actor_skills: &Path, bundle_paths: Option<&BundlePat
 /// Write `<workspace>/.joi/state/scope.json` describing the actor's view
 /// of the current scope. Skills and external observers can read this to
 /// learn who they are, what scope they're mounted into, and which mounts
-/// the operator declared. The file is rewritten on every `ensure_scope`
-/// (cheap, content is canonical from spec/scope inputs).
+/// the operator declared.
+///
+/// The function preserves `mounts` and `resident_threads` arrays/objects
+/// from any existing scope.json on disk — those keys are written by
+/// thread bootstrap / discovery / artifact triggers (see design §4.2.1
+/// + §4.7), and `ensure_scope` runs every turn, so we must not clobber
+/// them. The canonical fields (actor_id, channel_id, scope, paths) are
+/// always rewritten from the current inputs.
 fn write_scope_json(
     scope: &ScopePaths,
     actor_id: &str,
     channel_id: &str,
     scope_ref: &ScopeRef,
 ) -> std::io::Result<()> {
-    use serde_json::json;
+    use serde_json::{json, Value};
+    let path = scope.state_dir.join("scope.json");
+    let (mounts, resident_threads) = match std::fs::read_to_string(&path) {
+        Ok(prev) => match serde_json::from_str::<Value>(&prev) {
+            Ok(v) => (
+                v.get("mounts").cloned().unwrap_or_else(|| Value::Array(vec![])),
+                v.get("resident_threads")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            ),
+            Err(_) => (Value::Array(vec![]), Value::Object(serde_json::Map::new())),
+        },
+        Err(_) => (Value::Array(vec![]), Value::Object(serde_json::Map::new())),
+    };
     let payload = json!({
         "actor_id": actor_id,
         "channel_id": channel_id,
@@ -642,13 +662,200 @@ fn write_scope_json(
             "actor_skills": scope.actor_skills.display().to_string(),
             "logs": scope.logs.display().to_string(),
         },
-        "mounts": [],
-        "resident_threads": {},
+        "mounts": mounts,
+        "resident_threads": resident_threads,
     });
-    let path = scope.state_dir.join("scope.json");
     let body = serde_json::to_string_pretty(&payload)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     std::fs::write(&path, body)
+}
+
+/// Mount declaration parsed out of scope.json. See design §4.2.1.
+#[derive(Debug, Clone)]
+struct MountDecl {
+    name: String,
+    from: String,
+    to: String,
+    #[allow(dead_code)] // honored by callers that want to refuse writes; runtime defaults to symlink.
+    readonly: bool,
+}
+
+/// Project every mount listed in `<workspace>/.joi/state/scope.json` into
+/// the scope workspace as a symlink. Best-effort: a single broken mount
+/// logs a warning but does not fail the worker, so a stale clone manifest
+/// can never lock an actor out of its scope.
+fn project_mounts(scope: &ScopePaths) -> std::io::Result<()> {
+    let path = scope.state_dir.join("scope.json");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(%err, "scope.json is not valid JSON; skipping mount projection");
+            return Ok(());
+        }
+    };
+    let Some(arr) = parsed.get("mounts").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for entry in arr {
+        let mount = match parse_mount(entry) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(%err, ?entry, "invalid mount entry; skipping");
+                continue;
+            }
+        };
+        if let Err(err) = apply_mount(&scope.workspace, &scope.channel_shared, &mount) {
+            tracing::warn!(%err, name = %mount.name, from = %mount.from, to = %mount.to, "failed to apply mount");
+        }
+    }
+    Ok(())
+}
+
+fn parse_mount(value: &serde_json::Value) -> Result<MountDecl, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "mount entry must be an object".to_string())?;
+    let name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "mount.name missing".to_string())?
+        .to_string();
+    let from = obj
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "mount.from missing".to_string())?
+        .to_string();
+    let to = obj
+        .get("to")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "mount.to missing".to_string())?
+        .to_string();
+    let readonly = obj
+        .get("readonly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(MountDecl {
+        name,
+        from,
+        to,
+        readonly,
+    })
+}
+
+fn apply_mount(workspace: &Path, channel_shared: &Path, mount: &MountDecl) -> std::io::Result<()> {
+    let dest = sanitize_workspace_relative(workspace, &mount.to)?;
+    let source = resolve_mount_source(&mount.from, channel_shared)?;
+    if !source.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("mount source `{}` does not exist", source.display()),
+        ));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::read_link(&dest) {
+        Ok(existing) if existing == source => return Ok(()),
+        Ok(_) => remove_path_if_exists(&dest)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => remove_path_if_exists(&dest)?,
+    }
+    symlink_path(&source, &dest)
+}
+
+fn sanitize_workspace_relative(workspace: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("mount.to must be relative to workspace, got `{rel}`"),
+        ));
+    }
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mount.to must not contain `..`: `{rel}`"),
+                ));
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mount.to must be a relative path: `{rel}`"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(workspace.join(p))
+}
+
+fn resolve_mount_source(uri: &str, channel_shared: &Path) -> std::io::Result<PathBuf> {
+    if let Some(rest) = uri.strip_prefix("channel://") {
+        return Ok(channel_shared.join(strip_leading_slash(rest)));
+    }
+    if let Some(rest) = uri.strip_prefix("thread://") {
+        // Cross-thread mounts require ACL plumbing not yet implemented.
+        let _ = rest;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "thread:// mounts require ACL approval (not yet implemented)",
+        ));
+    }
+    if let Some(rest) = uri.strip_prefix("service://") {
+        let (service_id, sub) = match rest.split_once('/') {
+            Some((s, r)) => (s, r),
+            None => (rest, ""),
+        };
+        if service_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("service:// mount missing service id: `{uri}`"),
+            ));
+        }
+        let decoded_service = percent_decode_path_component(service_id);
+        let data_root = crate::service::state::default_data_root();
+        return Ok(crate::service::state::state_dir(&data_root, &decoded_service)
+            .join(percent_decode_path_component(sub).as_str()));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("mount.from must use channel:// service:// or thread:// scheme: `{uri}`"),
+    ))
+}
+
+fn strip_leading_slash(s: &str) -> &str {
+    s.strip_prefix('/').unwrap_or(s)
+}
+
+/// Naive percent-decode for path segments. Accepts the small set of
+/// characters that appear in our service ids / repo slugs (e.g. `/`,
+/// `%2F`). Invalid escapes fall through verbatim.
+fn percent_decode_path_component(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 fn ensure_bundle(
@@ -2469,6 +2676,89 @@ mod tests {
         let actor_skill_link =
             std::fs::read_link(&scope_paths.actor_skills).expect("actor skills link");
         assert_eq!(actor_skill_link, bundle_skills);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn project_mounts_creates_symlink_for_channel_uri() {
+        let root = temp_path("mount-channel");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let scope_paths = paths
+            .ensure_scope("actor_demo", "chan_demo", &scope, None)
+            .expect("ensure scope");
+
+        // Seed a real path under channel.shared so the mount resolves.
+        let target = scope_paths.channel_shared.join("repos").join("cache");
+        std::fs::create_dir_all(&target).expect("seed channel target");
+
+        // Rewrite scope.json with a mount declaration, then re-run
+        // ensure_scope to trigger projection.
+        let mut current: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(scope_paths.state_dir.join("scope.json"))
+                .expect("read scope.json"),
+        )
+        .expect("parse scope.json");
+        current["mounts"] = serde_json::json!([
+            {
+                "name": "shared-repos",
+                "from": "channel:///repos/cache",
+                "to": "shared/repos",
+                "readonly": true
+            }
+        ]);
+        std::fs::write(
+            scope_paths.state_dir.join("scope.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .expect("write scope.json");
+
+        let scope_paths = paths
+            .ensure_scope("actor_demo", "chan_demo", &scope, None)
+            .expect("re-ensure scope");
+
+        let link = scope_paths.workspace.join("shared").join("repos");
+        let resolved = std::fs::read_link(&link).expect("mount link");
+        assert_eq!(resolved, target);
+
+        // Mount survived the rewrite (preserved across ensure_scope calls).
+        let body = std::fs::read_to_string(scope_paths.state_dir.join("scope.json"))
+            .expect("read scope.json again");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["mounts"][0]["name"], "shared-repos");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn project_mounts_rejects_dotdot_and_absolute_to() {
+        let root = temp_path("mount-bad");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+        let scope_paths = paths
+            .ensure_scope("actor_demo", "chan_demo", &scope, None)
+            .expect("ensure scope");
+        std::fs::create_dir_all(scope_paths.channel_shared.join("seed")).expect("seed");
+
+        for bad in &["../escape", "/abs/dest"] {
+            let mount = MountDecl {
+                name: "bad".into(),
+                from: "channel:///seed".into(),
+                to: (*bad).into(),
+                readonly: false,
+            };
+            let err =
+                apply_mount(&scope_paths.workspace, &scope_paths.channel_shared, &mount)
+                    .expect_err("must reject");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
 
         std::fs::remove_dir_all(root).ok();
     }

@@ -368,6 +368,60 @@ pub struct TurnTraceReadResult {
     pub page_info: PageInfo,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_transport_deserializes_without_interactive_fields() {
+        let transport: AgentTransport = serde_json::from_str(
+            r#"{
+                "kind": "acp_stdio",
+                "command": "claude-acp",
+                "args": [],
+                "env": {}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(transport.kind, "acp_stdio");
+        assert!(transport.model.is_none());
+        assert!(transport.interactive.is_none());
+        assert!(transport.provider.is_none());
+    }
+
+    #[test]
+    fn interactive_transport_deserializes_model_and_claude_settings() {
+        let transport: AgentTransport = serde_json::from_str(
+            r#"{
+                "kind": "interactive_command",
+                "command": "claude",
+                "model": "claude-sonnet-4.6",
+                "interactive": {
+                    "session": {
+                        "newArgs": ["{prompt}", "--session-id", "{session_id}"],
+                        "resumeArgs": ["{prompt}", "--resume", "{session_id}"]
+                    }
+                },
+                "provider": {
+                    "kind": "claude",
+                    "settings": { "mode": "actor_profile" }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(transport.kind, "interactive_command");
+        assert_eq!(transport.model.as_deref(), Some("claude-sonnet-4.6"));
+        let interactive = transport.interactive.unwrap();
+        assert_eq!(interactive.session.new_args.len(), 3);
+        let provider = transport.provider.unwrap();
+        assert_eq!(provider.kind, "claude");
+        assert_eq!(
+            provider.settings.unwrap().mode,
+            ClaudeSettingsMode::ActorProfile
+        );
+    }
+}
+
 // ---- turn/trace.append (external client → server) ----
 
 /// Append a turn-private trace frame from an external agent client. v0 wrote
@@ -586,7 +640,13 @@ pub struct AgentTransport {
     #[serde(rename = "authMethod")]
     pub auth_method: Option<String>,
 
-    // ---- command transport only; ignored when kind != "command" ----
+    // ---- command / interactive command transport only ----
+    /// Optional default model for transports that expose a CLI-level model flag.
+    /// `joi agent serve` may override this with the actor's selected runtime
+    /// model; when an interactive command has an active model, the runtime
+    /// appends `--model=<model>` to the provider argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// How to capture and re-use the underlying CLI's session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<CommandSession>,
@@ -602,6 +662,12 @@ pub struct AgentTransport {
     /// (appended after `args` as the final argv token).
     #[serde(default, rename = "promptVia")]
     pub prompt_via: PromptVia,
+
+    // ---- interactive_command only; ignored by other transports ----
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<InteractiveCommandSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<InteractiveProviderSpec>,
 }
 
 /// Bookkeeping rules for `transport.kind = "command"`. Both fields together let
@@ -619,6 +685,296 @@ pub struct CommandSession {
     /// `{prompt}`. `None` means resume is not supported (each call is a first run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveCommandSpec {
+    #[serde(default)]
+    pub session: InteractiveSessionSpec,
+    #[serde(default)]
+    pub prompt: InteractivePromptSpec,
+    #[serde(default)]
+    pub completion: InteractiveCompletionSpec,
+    #[serde(default)]
+    pub output: InteractiveOutputSpec,
+    #[serde(default)]
+    pub kill: InteractiveKillSpec,
+}
+
+impl Default for InteractiveCommandSpec {
+    fn default() -> Self {
+        Self {
+            session: InteractiveSessionSpec::default(),
+            prompt: InteractivePromptSpec::default(),
+            completion: InteractiveCompletionSpec::default(),
+            output: InteractiveOutputSpec::default(),
+            kill: InteractiveKillSpec::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveSessionSpec {
+    #[serde(default)]
+    pub id_strategy: InteractiveSessionIdStrategy,
+    #[serde(default)]
+    pub new_args: Vec<String>,
+    #[serde(default)]
+    pub resume_args: Vec<String>,
+    #[serde(default)]
+    pub on_missing: InteractiveSessionMissingPolicy,
+    #[serde(default)]
+    pub on_signature_changed: InteractiveSignatureChangedPolicy,
+    #[serde(default)]
+    pub on_resume_failed: InteractiveResumeFailedPolicy,
+}
+
+impl Default for InteractiveSessionSpec {
+    fn default() -> Self {
+        Self {
+            id_strategy: InteractiveSessionIdStrategy::default(),
+            new_args: Vec::new(),
+            resume_args: Vec::new(),
+            on_missing: InteractiveSessionMissingPolicy::default(),
+            on_signature_changed: InteractiveSignatureChangedPolicy::default(),
+            on_resume_failed: InteractiveResumeFailedPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveSessionIdStrategy {
+    #[default]
+    JoiUuidPerScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveSessionMissingPolicy {
+    #[default]
+    Create,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveSignatureChangedPolicy {
+    #[default]
+    Create,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveResumeFailedPolicy {
+    #[default]
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractivePromptSpec {
+    #[serde(default = "default_interactive_prompt_template")]
+    pub template: String,
+    #[serde(default)]
+    pub completion_contract: InteractiveCompletionContractSpec,
+}
+
+impl Default for InteractivePromptSpec {
+    fn default() -> Self {
+        Self {
+            template: default_interactive_prompt_template(),
+            completion_contract: InteractiveCompletionContractSpec::default(),
+        }
+    }
+}
+
+fn default_interactive_prompt_template() -> String {
+    "{joi_envelope}".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveCompletionContractSpec {
+    #[serde(default = "default_interactive_sentinel")]
+    pub sentinel: String,
+    #[serde(default = "default_interactive_instruction")]
+    pub instruction: String,
+}
+
+impl Default for InteractiveCompletionContractSpec {
+    fn default() -> Self {
+        Self {
+            sentinel: default_interactive_sentinel(),
+            instruction: default_interactive_instruction(),
+        }
+    }
+}
+
+fn default_interactive_sentinel() -> String {
+    "__JOI_DONE__".into()
+}
+
+fn default_interactive_instruction() -> String {
+    "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it.".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveCompletionSpec {
+    #[serde(default)]
+    pub detect: InteractiveCompletionDetector,
+    #[serde(default = "default_true")]
+    pub strip_sentinel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default = "default_interactive_max_turn_ms")]
+    pub max_turn_ms: u64,
+}
+
+impl Default for InteractiveCompletionSpec {
+    fn default() -> Self {
+        Self {
+            detect: InteractiveCompletionDetector::default(),
+            strip_sentinel: true,
+            idle_timeout_ms: None,
+            max_turn_ms: default_interactive_max_turn_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveCompletionDetector {
+    #[default]
+    Sentinel,
+}
+
+fn default_interactive_max_turn_ms() -> u64 {
+    900_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveOutputSpec {
+    #[serde(default = "default_true")]
+    pub strip_ansi: bool,
+    #[serde(default)]
+    pub stderr: InteractiveStderrPolicy,
+    #[serde(default = "default_true")]
+    pub stream_partial: bool,
+}
+
+impl Default for InteractiveOutputSpec {
+    fn default() -> Self {
+        Self {
+            strip_ansi: true,
+            stderr: InteractiveStderrPolicy::default(),
+            stream_partial: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveStderrPolicy {
+    #[default]
+    Trace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveKillSpec {
+    #[serde(default = "default_complete_kill")]
+    pub on_complete: InteractiveKillAction,
+    #[serde(default = "default_cancel_kill")]
+    pub on_cancel: InteractiveKillAction,
+    #[serde(default = "default_timeout_kill")]
+    pub on_timeout: InteractiveKillAction,
+}
+
+impl Default for InteractiveKillSpec {
+    fn default() -> Self {
+        Self {
+            on_complete: default_complete_kill(),
+            on_cancel: default_cancel_kill(),
+            on_timeout: default_timeout_kill(),
+        }
+    }
+}
+
+fn default_complete_kill() -> InteractiveKillAction {
+    InteractiveKillAction {
+        action: InteractiveKillKind::Sigterm,
+        grace_ms: Some(3000),
+        fallback: Some(InteractiveKillKind::Sigkill),
+    }
+}
+
+fn default_cancel_kill() -> InteractiveKillAction {
+    InteractiveKillAction {
+        action: InteractiveKillKind::Sigterm,
+        grace_ms: Some(1000),
+        fallback: Some(InteractiveKillKind::Sigkill),
+    }
+}
+
+fn default_timeout_kill() -> InteractiveKillAction {
+    InteractiveKillAction {
+        action: InteractiveKillKind::Sigkill,
+        grace_ms: None,
+        fallback: None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveKillAction {
+    #[serde(default)]
+    pub action: InteractiveKillKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<InteractiveKillKind>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveKillKind {
+    StdinEof,
+    CtrlD,
+    CtrlC,
+    #[default]
+    Sigterm,
+    Sigkill,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveProviderSpec {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<ClaudeSettingsSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeSettingsSpec {
+    #[serde(default)]
+    pub mode: ClaudeSettingsMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeSettingsMode {
+    #[default]
+    Global,
+    ActorProfile,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

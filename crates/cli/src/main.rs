@@ -386,6 +386,56 @@ enum EventCmd {
         #[arg(long)]
         before: Option<String>,
     },
+    /// Alias for `event list` — kept for parity with the design doc and
+    /// for the migrated services that prefer the `query` verb.
+    Query {
+        #[arg(long)]
+        r#in: String,
+        #[arg(long)]
+        channel: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Append an arbitrary event to a scope. Use --reply / --handoff /
+    /// --artifact-link to attach the corresponding relations; use --text
+    /// / --file / --stdin to provide the payload body. `joi say` /
+    /// `joi handoff` remain as ergonomic shortcuts for content.add.
+    Append {
+        /// Scope id (thread id by default; pass --channel to write into a channel scope).
+        #[arg(long)]
+        r#in: String,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Event type discriminator (e.g. content.add, status.update).
+        #[arg(long = "type", default_value = "content.add")]
+        event_type: String,
+        /// payload.contentType. Defaults to text/markdown to match
+        /// content.add's convention; ignored if no body is supplied.
+        #[arg(long = "content-type", default_value = "text/markdown")]
+        content_type: String,
+        /// Event body as inline text.
+        #[arg(long)]
+        text: Option<String>,
+        /// Event body read from this file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Event body read from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Add a `replies_to` relation pointing at this event id.
+        #[arg(long = "reply")]
+        reply: Option<String>,
+        /// Add a `hands_off_to` relation pointing at this actor id.
+        #[arg(long = "handoff")]
+        handoff: Option<String>,
+        /// Add one or more `links` relations targeting an artifact
+        /// (`art_…` or `artifact://…`). May be repeated.
+        #[arg(long = "artifact-link")]
+        artifact_link: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -805,6 +855,42 @@ async fn main() -> Result<()> {
                 limit,
                 before,
             } => cmd::event::list(client, r#in, channel, limit, before).await?,
+            EventCmd::Query {
+                r#in,
+                channel,
+                limit,
+                before,
+            } => cmd::event::list(client, r#in, channel, limit, before).await?,
+            EventCmd::Append {
+                r#in,
+                channel,
+                event_type,
+                content_type,
+                text,
+                file,
+                stdin,
+                reply,
+                handoff,
+                artifact_link,
+            } => {
+                cmd::event::append(
+                    client,
+                    cmd::event::AppendArgs {
+                        actor_id: cfg.actor_id,
+                        scope_id: r#in,
+                        is_channel: channel,
+                        event_type,
+                        content_type,
+                        text,
+                        file,
+                        stdin,
+                        reply_to: reply,
+                        handoff_to: handoff,
+                        artifact_links: artifact_link,
+                    },
+                )
+                .await?
+            }
         },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,

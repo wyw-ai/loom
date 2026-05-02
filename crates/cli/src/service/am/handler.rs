@@ -45,8 +45,9 @@ pub fn load_spec(dir: &Path, service_id: &str) -> Result<ServiceSpec> {
     if direct.exists() {
         let text =
             fs::read_to_string(&direct).with_context(|| format!("read {}", direct.display()))?;
-        let spec: ServiceSpec = serde_json::from_str(&text)
+        let mut spec: ServiceSpec = serde_json::from_str(&text)
             .with_context(|| format!("parse {} as ServiceSpec", direct.display()))?;
+        spec.normalize();
         spec.validate()?;
         if spec.id != service_id {
             // The file was named after `service_id` but holds a spec
@@ -74,10 +75,11 @@ pub fn load_spec(dir: &Path, service_id: &str) -> Result<ServiceSpec> {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(spec) = serde_json::from_str::<ServiceSpec>(&text) else {
+        let Ok(mut spec) = serde_json::from_str::<ServiceSpec>(&text) else {
             continue;
         };
         if spec.id == service_id {
+            spec.normalize();
             spec.validate()
                 .with_context(|| format!("validate {}", path.display()))?;
             return Ok(spec);
@@ -581,6 +583,9 @@ mod tests {
             autostart: true,
             channel_id: None,
             target_agent: None,
+            lifecycle: proto::methods::ServiceLifecycle::ChannelSingleton,
+            bind: None,
+            params_schema: None,
             config: Value::Null,
         };
         let cfg = parse_am_config(&spec).expect("ok");
@@ -604,6 +609,9 @@ mod tests {
             autostart: true,
             channel_id: None,
             target_agent: None,
+            lifecycle: proto::methods::ServiceLifecycle::ChannelSingleton,
+            bind: None,
+            params_schema: None,
             config: json!({
                 "amBin": "/usr/local/bin/am",
                 "scope": "channel",

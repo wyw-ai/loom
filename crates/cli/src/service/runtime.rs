@@ -35,6 +35,7 @@ use super::state::{self, DedupeStore};
 pub struct ServiceRuntime {
     service_id: String,
     actor_id: String,
+    instance_id: Option<String>,
     client: Arc<Client>,
     state_dir: PathBuf,
     dedupe: DedupeStore,
@@ -56,6 +57,30 @@ impl ServiceRuntime {
         Ok(Arc::new(Self {
             service_id,
             actor_id,
+            instance_id: None,
+            client,
+            state_dir,
+            dedupe,
+        }))
+    }
+
+    /// Variant of [`Self::start`] that scopes state to a single instance
+    /// (`<data_root>/services/<service_id>/instances/<instance_id>/`).
+    /// Used by `lifecycle = thread_bound` services so multiple instances
+    /// of the same spec can coexist with disjoint cursor/dedupe state.
+    pub fn start_instance(
+        service_id: String,
+        actor_id: String,
+        instance_id: String,
+        client: Arc<Client>,
+        data_root: &Path,
+    ) -> Result<Arc<Self>> {
+        let state_dir = state::ensure_instance_state_dir(data_root, &service_id, &instance_id)?;
+        let dedupe = DedupeStore::open(&state_dir)?;
+        Ok(Arc::new(Self {
+            service_id,
+            actor_id,
+            instance_id: Some(instance_id),
             client,
             state_dir,
             dedupe,
@@ -68,6 +93,14 @@ impl ServiceRuntime {
 
     pub fn actor_id(&self) -> &str {
         &self.actor_id
+    }
+
+    /// `Some(thread_id)` for thread-bound instances, `None` for the
+    /// channel-level singleton. Plugins that need to interpolate the
+    /// bound scope (e.g., scheduler's `{thread.id}` placeholder) read
+    /// this.
+    pub fn instance_id(&self) -> Option<&str> {
+        self.instance_id.as_deref()
     }
 
     pub fn state_dir(&self) -> &Path {

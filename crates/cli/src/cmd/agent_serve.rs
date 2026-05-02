@@ -259,9 +259,24 @@ struct ScopePaths {
     channel_root: PathBuf,
     channel_shared: PathBuf,
     channel_artifacts: PathBuf,
+    /// `channels/<cid>/threads/<tid>/shared/` — only meaningful when the
+    /// scope kind is Thread. For Channel scopes this still resolves so
+    /// callers can compute it, but agent_serve does not auto-provision it.
+    thread_shared: Option<PathBuf>,
     agent_root: PathBuf,
     workspace: PathBuf,
+    /// Shared (per-scope) skills directory: `workspaces/<kind>/<id>/skills/`.
+    /// All actors mounted into the same scope project this same dir into
+    /// their own workspace as `<workspace>/skills`.
     skills: PathBuf,
+    /// Per-actor skill projection root inside the actor workspace:
+    /// `<workspace>/.joi/skills/<actor_id>/`. The agent's own bundle
+    /// `skills/` dir is symlinked here so that when the actor is moved
+    /// between workspaces (e.g. handed off into a thread) its private
+    /// skills travel with it without polluting the shared scope dir.
+    actor_skills: PathBuf,
+    /// `<workspace>/.joi/state/` — scope.json + cursors live here.
+    state_dir: PathBuf,
     logs: PathBuf,
 }
 
@@ -295,12 +310,25 @@ impl AgentPaths {
         let channel_shared = channel_root.join("shared");
         let channel_artifacts = channel_shared.join("artifacts");
         let agent_root = channel_root.join("agents").join(actor_id);
+        let workspace = agent_root.join("workspace");
+        let thread_shared = match scope_ref.kind {
+            ScopeKind::Thread => Some(
+                channel_root
+                    .join("threads")
+                    .join(&scope_ref.id)
+                    .join("shared"),
+            ),
+            ScopeKind::Channel => None,
+        };
         ScopePaths {
             channel_root,
             channel_shared,
             channel_artifacts,
+            thread_shared,
             skills: self.scope_skills_dir(scope_ref),
-            workspace: agent_root.join("workspace"),
+            actor_skills: workspace.join(".joi").join("skills").join(actor_id),
+            state_dir: workspace.join(".joi").join("state"),
+            workspace,
             logs: agent_root.join("logs"),
             agent_root,
         }
@@ -391,13 +419,20 @@ impl AgentPaths {
         actor_id: &str,
         channel_id: &str,
         scope_ref: &ScopeRef,
+        bundle_paths: Option<&BundlePaths>,
     ) -> std::io::Result<ScopePaths> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         std::fs::create_dir_all(&scope.workspace)?;
         std::fs::create_dir_all(&scope.logs)?;
         std::fs::create_dir_all(&scope.channel_artifacts)?;
+        if let Some(thread_shared) = scope.thread_shared.as_ref() {
+            std::fs::create_dir_all(thread_shared)?;
+        }
+        std::fs::create_dir_all(&scope.state_dir)?;
         ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
+        ensure_actor_skills_link(&scope.actor_skills, bundle_paths)?;
         agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
+        write_scope_json(&scope, actor_id, channel_id, scope_ref)?;
         Ok(scope)
     }
 
@@ -438,6 +473,11 @@ impl AgentPaths {
             "channel.sharedArtifacts".into(),
             scope.channel_artifacts.display().to_string(),
         );
+        if let Some(thread_shared) = scope.thread_shared.as_ref() {
+            vars.insert("thread.shared".into(), thread_shared.display().to_string());
+        }
+        vars.insert("agent.actorSkills".into(), scope.actor_skills.display().to_string());
+        vars.insert("agent.stateDir".into(), scope.state_dir.display().to_string());
         vars
     }
 
@@ -490,6 +530,28 @@ impl AgentPaths {
             "JOI_SCOPE_SKILLS_DIR".into(),
             scope.skills.display().to_string(),
         );
+        env.insert(
+            "JOI_AGENT_SKILLS_DIR".into(),
+            scope.actor_skills.display().to_string(),
+        );
+        env.insert(
+            "JOI_SCOPE_WORKSPACE_DIR".into(),
+            scope.workspace.display().to_string(),
+        );
+        env.insert(
+            "JOI_CHANNEL_WORKSPACE_DIR".into(),
+            scope.channel_shared.display().to_string(),
+        );
+        if let Some(thread_shared) = scope.thread_shared.as_ref() {
+            env.insert(
+                "JOI_THREAD_WORKSPACE_DIR".into(),
+                thread_shared.display().to_string(),
+            );
+        }
+        env.insert("JOI_CHANNEL_ID".into(), channel_id.to_string());
+        env.insert("JOI_SCOPE_KIND".into(), scope_kind_name(scope_ref.kind).to_string());
+        env.insert("JOI_SCOPE_ID".into(), scope_ref.id.clone());
+        env.insert("JOI_SCOPE_STATE_DIR".into(), scope.state_dir.display().to_string());
         env
     }
 
@@ -518,6 +580,75 @@ fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::
         Err(_) => remove_path_if_exists(&link_path)?,
     }
     symlink_path(skills_target, &link_path)
+}
+
+/// Project the agent's own bundle `skills/` directory under
+/// `<workspace>/.joi/skills/<actor_id>/`. When the bundle has no skills
+/// directory we still ensure the parent dir exists so callers can drop a
+/// note there explaining why the projection is empty.
+fn ensure_actor_skills_link(actor_skills: &Path, bundle_paths: Option<&BundlePaths>) -> std::io::Result<()> {
+    if let Some(parent) = actor_skills.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let Some(bundle) = bundle_paths else {
+        // No bundle declared — clear any stale link so we don't point at a
+        // path that no longer exists, but leave the parent dir behind.
+        if actor_skills.exists() || std::fs::read_link(actor_skills).is_ok() {
+            remove_path_if_exists(actor_skills)?;
+        }
+        return Ok(());
+    };
+    let target = bundle.current.join("skills");
+    if !target.exists() {
+        // Bundle is installed but ships no skills/ subdir: nothing to project.
+        if std::fs::read_link(actor_skills).is_ok() {
+            remove_path_if_exists(actor_skills)?;
+        }
+        return Ok(());
+    }
+    match std::fs::read_link(actor_skills) {
+        Ok(existing) if existing == target => return Ok(()),
+        Ok(_) => remove_path_if_exists(actor_skills)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => remove_path_if_exists(actor_skills)?,
+    }
+    symlink_path(&target, actor_skills)
+}
+
+/// Write `<workspace>/.joi/state/scope.json` describing the actor's view
+/// of the current scope. Skills and external observers can read this to
+/// learn who they are, what scope they're mounted into, and which mounts
+/// the operator declared. The file is rewritten on every `ensure_scope`
+/// (cheap, content is canonical from spec/scope inputs).
+fn write_scope_json(
+    scope: &ScopePaths,
+    actor_id: &str,
+    channel_id: &str,
+    scope_ref: &ScopeRef,
+) -> std::io::Result<()> {
+    use serde_json::json;
+    let payload = json!({
+        "actor_id": actor_id,
+        "channel_id": channel_id,
+        "scope": {
+            "kind": scope_kind_name(scope_ref.kind),
+            "id": scope_ref.id,
+        },
+        "paths": {
+            "workspace": scope.workspace.display().to_string(),
+            "channel_shared": scope.channel_shared.display().to_string(),
+            "thread_shared": scope.thread_shared.as_ref().map(|p| p.display().to_string()),
+            "scope_skills": scope.skills.display().to_string(),
+            "actor_skills": scope.actor_skills.display().to_string(),
+            "logs": scope.logs.display().to_string(),
+        },
+        "mounts": [],
+        "resident_threads": {},
+    });
+    let path = scope.state_dir.join("scope.json");
+    let body = serde_json::to_string_pretty(&payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&path, body)
 }
 
 fn ensure_bundle(
@@ -1591,9 +1722,12 @@ async fn dispatch_handoff(
         let channel_id = resolve_channel_for_scope(client, state, &trigger.scope)
             .await
             .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", trigger.scope.id))?;
-        let scope_paths = state
-            .paths
-            .ensure_scope(&state.actor_id, &channel_id, &trigger.scope)?;
+        let scope_paths = {
+            let bundle_paths = state.paths.bundle_paths(&state.spec);
+            state
+                .paths
+                .ensure_scope(&state.actor_id, &channel_id, &trigger.scope, Some(&bundle_paths))?
+        };
         let adapter_prompt = AdapterPrompt {
             scope: trigger.scope.clone(),
             content: prompt,
@@ -2269,7 +2403,7 @@ mod tests {
         };
 
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope)
+            .ensure_scope("actor_demo", "chan_demo", &scope, None)
             .expect("ensure scope");
 
         assert_eq!(
@@ -2280,6 +2414,61 @@ mod tests {
                 .join("skills")
         );
         assert!(scope_paths.skills.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ensure_scope_provisions_thread_shared_state_and_actor_skills() {
+        let root = temp_path("scope-bootstrap");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+
+        // Seed a fake bundle skills dir so the actor-skill projection has
+        // a real target to link to.
+        let bundle_skills = paths.bundle_current.join("skills");
+        std::fs::create_dir_all(&bundle_skills).expect("seed bundle skills");
+        let bundle_paths = BundlePaths {
+            root: paths.bundle_root.clone(),
+            current: paths.bundle_current.clone(),
+            version: "test".into(),
+        };
+
+        let scope_paths = paths
+            .ensure_scope("actor_demo", "chan_demo", &scope, Some(&bundle_paths))
+            .expect("ensure scope");
+
+        // Thread-shared dir provisioned for thread scopes.
+        let thread_shared = scope_paths.thread_shared.clone().expect("thread shared");
+        assert!(thread_shared.is_dir());
+        assert_eq!(
+            thread_shared,
+            root.join("channels")
+                .join("chan_demo")
+                .join("threads")
+                .join("thread_demo")
+                .join("shared")
+        );
+
+        // .joi/state/scope.json bootstrapped with canonical fields.
+        let scope_json = scope_paths.state_dir.join("scope.json");
+        assert!(scope_json.is_file());
+        let body = std::fs::read_to_string(&scope_json).expect("read scope.json");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse scope.json");
+        assert_eq!(parsed["actor_id"], "actor_demo");
+        assert_eq!(parsed["channel_id"], "chan_demo");
+        assert_eq!(parsed["scope"]["kind"], "thread");
+        assert_eq!(parsed["scope"]["id"], "thread_demo");
+        assert!(parsed["mounts"].is_array());
+
+        // Per-actor skill projection symlinks the bundle's skills/ dir
+        // into <workspace>/.joi/skills/<actor_id>/.
+        let actor_skill_link =
+            std::fs::read_link(&scope_paths.actor_skills).expect("actor skills link");
+        assert_eq!(actor_skill_link, bundle_skills);
 
         std::fs::remove_dir_all(root).ok();
     }

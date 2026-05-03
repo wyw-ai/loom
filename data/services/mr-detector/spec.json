@@ -49,9 +49,6 @@
           "statusEventType": "status.update"
         }
       }
-    ],
-    "self_complete_on": {
-      "event_kind": ["merged", "closed"]
-    }
+    ]
   }
 }

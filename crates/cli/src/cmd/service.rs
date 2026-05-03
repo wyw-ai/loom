@@ -218,6 +218,10 @@ pub fn start(
             .with_context(|| format!("--params must be valid JSON: {s}"))?,
         None => serde_json::json!({}),
     };
+    if let Some(schema) = spec.params_schema.as_ref() {
+        validate_params(&params_value, schema)
+            .with_context(|| format!("--params failed ServiceSpec.params_schema for `{}`", spec.id))?;
+    }
     let req = crate::service::instance::InstanceRequest {
         version: 1,
         spec_id: spec.id.clone(),
@@ -321,4 +325,119 @@ pub fn status(spec_id: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate `--params` JSON against a `ServiceSpec.params_schema` value.
+///
+/// Supports the subset that ServiceSpec uses in this repo:
+///   - top-level must be an object
+///   - schema.required: [str]   -> every name must be present
+///   - schema.properties.<k>.type: "string"|"number"|"integer"|"boolean"|"array"|"object"
+///     -> per-key shallow type check (only when the key is present)
+///
+/// Anything outside that subset is ignored — we deliberately don't pull
+/// in a full JSON-schema crate for a 5-field guard.
+fn validate_params(params: &serde_json::Value, schema: &serde_json::Value) -> Result<()> {
+    let obj = params
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("--params must be a JSON object"))?;
+
+    if let Some(req) = schema.get("required").and_then(|v| v.as_array()) {
+        let missing: Vec<String> = req
+            .iter()
+            .filter_map(|n| n.as_str().map(|s| s.to_string()))
+            .filter(|n| !obj.contains_key(n))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!("missing required params: {}", missing.join(", "));
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        for (key, decl) in props {
+            let Some(value) = obj.get(key) else { continue };
+            let Some(want) = decl.get("type").and_then(|v| v.as_str()) else { continue };
+            let ok = match want {
+                "string" => value.is_string(),
+                "number" => value.is_f64() || value.is_i64() || value.is_u64(),
+                "integer" => value.is_i64() || value.is_u64(),
+                "boolean" => value.is_boolean(),
+                "array" => value.is_array(),
+                "object" => value.is_object(),
+                _ => true,
+            };
+            if !ok {
+                anyhow::bail!(
+                    "param `{key}` has wrong type: expected {want}, got {}",
+                    type_label(value)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn type_label(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod params_schema_tests {
+    use super::validate_params;
+    use serde_json::json;
+
+    #[test]
+    fn ok_when_required_present_and_types_match() {
+        let schema = json!({
+            "required": ["mr_url"],
+            "properties": { "mr_url": { "type": "string" } }
+        });
+        validate_params(&json!({"mr_url": "https://x/y/z"}), &schema).unwrap();
+    }
+
+    #[test]
+    fn err_when_required_missing() {
+        let schema = json!({"required": ["mr_url"]});
+        let err = validate_params(&json!({}), &schema).unwrap_err().to_string();
+        assert!(err.contains("missing required"), "{err}");
+        assert!(err.contains("mr_url"), "{err}");
+    }
+
+    #[test]
+    fn err_when_type_mismatch() {
+        let schema = json!({
+            "properties": { "mr_url": { "type": "string" } }
+        });
+        let err = validate_params(&json!({"mr_url": 42}), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wrong type"), "{err}");
+        assert!(err.contains("mr_url"), "{err}");
+    }
+
+    #[test]
+    fn ignores_unknown_keywords() {
+        let schema = json!({
+            "title": "ignored",
+            "additionalProperties": false,
+            "required": ["a"],
+            "properties": {"a": {"type": "string"}}
+        });
+        validate_params(&json!({"a": "x"}), &schema).unwrap();
+    }
+
+    #[test]
+    fn err_when_params_not_object() {
+        let schema = json!({});
+        let err = validate_params(&json!([1, 2]), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a JSON object"), "{err}");
+    }
 }

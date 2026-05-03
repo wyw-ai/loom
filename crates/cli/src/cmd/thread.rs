@@ -110,6 +110,59 @@ pub async fn delete(client: Arc<Client>, thread_id: String) -> Result<()> {
     Ok(())
 }
 
+/// `joi thread bootstrap --in <thread_id> --channel <chan> --bootstrap-artifact <uri>`.
+///
+/// Bootstrap an *existing* thread from a clone-manifest / mounts artifact.
+/// Used when a thread already exists (e.g. a bug-fix loop reuses its bugfix
+/// thread as the delivery thread) and the caller wants to add target /
+/// reference repo worktrees without creating a fresh thread. The CLI:
+///
+/// 1. Verifies the thread exists and belongs to the given channel via
+///    `thread/get`. This catches typos and prevents writing scope.json
+///    for an unrelated thread.
+/// 2. Fetches the artifact, derives `mounts[]` (clone-manifest or explicit).
+/// 3. Writes `scope.json.mounts` on the thread-shared scope.
+///
+/// Per-actor `agent serve` instances pick up the new mounts on the next
+/// ensure_scope (i.e. next handoff into the thread).
+pub async fn bootstrap(
+    client: Arc<Client>,
+    channel_id: String,
+    thread_id: String,
+    bootstrap_artifact: String,
+) -> Result<()> {
+    let res: ThreadListResult = client
+        .call(
+            method::THREAD_LIST,
+            json!({ "channelId": channel_id }),
+        )
+        .await
+        .with_context(|| format!("thread/list channel={channel_id}"))?;
+    if !res.threads.iter().any(|t| t.id == thread_id) {
+        anyhow::bail!(
+            "thread {} not found in channel {}",
+            thread_id,
+            channel_id
+        );
+    }
+    let mounts = fetch_bootstrap_mounts(client.clone(), &bootstrap_artifact).await?;
+    let count = mounts.len();
+    let data_root = data_root();
+    write_thread_mounts(&data_root, &channel_id, &thread_id, &mounts)?;
+    if render::is_json() {
+        render::print_json(&json!({
+            "threadId": thread_id,
+            "channelId": channel_id,
+            "bootstrap_artifact": bootstrap_artifact,
+            "bootstrap_mounts": count,
+        }));
+    } else {
+        println!("bootstrapped thread {thread_id}  channel={channel_id}  mounts={count}  artifact={bootstrap_artifact}");
+    }
+    Ok(())
+}
+
+
 fn data_root() -> PathBuf {
     for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
         if let Some(v) = std::env::var_os(key) {

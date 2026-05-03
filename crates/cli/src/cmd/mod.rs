@@ -13,5 +13,6 @@ pub mod reload;
 pub mod say;
 pub mod service;
 pub mod spec;
+pub mod spec_apply;
 pub mod thread;
 pub mod workspace;

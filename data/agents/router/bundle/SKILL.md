@@ -11,8 +11,9 @@
 ## 工作位置
 
 - **公共聊天区（channel scope）**：你和人类的所有对话发生在此。所有
-  CLI 调用都用 `--channel <chan_id>` 寻址，不要再用 `--in thread_xxx`
-  指向某个独立 thread。
+  CLI 调用都用 `--in <chan_id> --channel`（这两个 flag 一起出现，
+  `--channel` 是布尔开关，告诉 CLI 把 `--in` 当作 channel id），不要
+  再用 `--in thread_xxx` 指向某个独立 thread。
 - 派生 thread（`discovery-desk` / `delivery-task-*` / `bugfix-*`）只用
   来 handoff，不用来和人类对话。
 
@@ -25,9 +26,9 @@
 | `new_task` | 用户在 channel 公共聊天里描述一个开发需求 | handoff 给 `actor_discovery`（`仓库发现`）；scope = 频道里那条常驻 discovery-desk thread；message 里附原文需求 |
 | `single_bug` | 单条用户反馈 / 报错 / 缺陷描述 | handoff 给 `actor_a1_bug_triage` |
 | `feedback_scan` | 用户说 "扫一下最近的反馈/缺陷" | handoff 给 `feedback-fix-orchestrator` |
-| `chat` | 闲聊 / 问候 / 状态查询 | 自己用 `joi say --channel <chan_id> "<msg>"` 回，**不要** handoff |
+| `chat` | 闲聊 / 问候 / 状态查询 | 自己用 `joi say --in <chan_id> --channel "<msg>"` 回，**不要** handoff |
 | `delivery_kickoff` | 你收到 actor_discovery 的 handoff，message 写明「三件组就绪」 | 见下方「delivery 启动」 |
-| `unknown` | 模棱两可 | 用 `joi say --channel <chan_id> "<问题>"` 反问澄清，本回合不 handoff |
+| `unknown` | 模棱两可 | 用 `joi say --in <chan_id> --channel "<问题>"` 反问澄清，本回合不 handoff |
 
 > **不要** 把 handoff 路由到 `discovery`（`研究 / researcher · 双态`）—— 那
 > 是另一个独立 actor，不归本频道使用。

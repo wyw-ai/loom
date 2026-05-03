@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use proto::methods::ServiceSpec;
 use tokio::sync::watch;
 
+use super::instance::InstanceRequest;
 use super::runtime::ServiceRuntime;
 
 /// Cancellation signal carried by the host. `true` means "shut down
@@ -38,6 +39,11 @@ pub struct ServiceContext {
     /// Cancellation signal from the host. Plugins observe it to exit
     /// cleanly on shutdown.
     pub shutdown: ShutdownSignal,
+    /// Per-instance request payload, present iff the host dispatched
+    /// this run as a `lifecycle = thread_bound` instance (§4.7.3).
+    /// `None` for the channel-level singleton path. Plugins that
+    /// honor `params` / `scope.thread_id` placeholders read it here.
+    pub instance: Option<InstanceRequest>,
 }
 
 #[async_trait]

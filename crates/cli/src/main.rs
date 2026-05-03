@@ -512,7 +512,7 @@ enum EventCmd {
         /// Add a `hands_off_to` relation pointing at this actor id.
         #[arg(long = "handoff")]
         handoff: Option<String>,
-        /// Add one or more `links` relations targeting an artifact
+        /// Add one or more `attaches_artifact` relations targeting an artifact
         /// (`art_…` or `artifact://…`). May be repeated.
         #[arg(long = "artifact-link")]
         artifact_link: Vec<String>,
@@ -983,7 +983,7 @@ async fn main() -> Result<()> {
             SpecCmd::Apply {
                 action_event_id,
                 dry_run,
-            } => cmd::spec_apply::run(client, action_event_id, dry_run).await?,
+            } => cmd::spec_apply::run(client, cfg.actor_id.clone(), action_event_id, dry_run).await?,
         },
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),

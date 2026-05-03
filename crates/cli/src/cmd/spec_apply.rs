@@ -51,7 +51,7 @@ use crate::client::Client;
 const REQUEST_TYPE: &str = "approval.spec_apply";
 
 /// Entry point for `joi spec apply --action <event_id>`.
-pub async fn run(client: Arc<Client>, action_event_id: String, dry_run: bool) -> Result<()> {
+pub async fn run(client: Arc<Client>, actor_id: String, action_event_id: String, dry_run: bool) -> Result<()> {
     let response = find_event(&client, &action_event_id)
         .await?
         .ok_or_else(|| anyhow!("event {action_event_id} not found in any thread"))?;
@@ -148,7 +148,6 @@ pub async fn run(client: Arc<Client>, action_event_id: String, dry_run: bool) ->
     });
     let receipt_text = serde_json::to_string_pretty(&receipt)?;
     let receipt_name = format!("runtime-receipt-{}.json", action_event_id);
-    let actor_id = std::env::var("JOI_ACTOR").unwrap_or_else(|_| "joi-cli".into());
 
     let publish_params = ArtifactPublishParams {
         ingress: ArtifactIngress::InlineText(InlineTextIngress {

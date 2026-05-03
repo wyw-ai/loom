@@ -83,7 +83,7 @@ pub async fn append(client: Arc<Client>, args: AppendArgs) -> Result<()> {
     }
     for uri in &args.artifact_links {
         relations.push(json!({
-            "kind": "links",
+            "kind": "attaches_artifact",
             "target": { "kind": "artifact", "id": uri }
         }));
     }
@@ -98,12 +98,30 @@ pub async fn append(client: Arc<Client>, args: AppendArgs) -> Result<()> {
         },
         id: args.scope_id,
     };
+    // For `application/json` bodies, parse and use the JSON as the
+    // payload directly so consumers can read structured fields like
+    // `payload.requestType` (e.g. action.request, action.response).
+    // Falls back to the contentType/text envelope on parse failure or
+    // any non-json content type, matching the v1 content.add convention.
+    let payload_value = if args.content_type == "application/json" && !body.is_empty() {
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(anyhow!(
+                    "--content-type application/json but body is not valid JSON: {e}"
+                ))
+            }
+        }
+    } else {
+        json!({ "contentType": args.content_type, "text": body })
+    };
+
     let payload = json!({
         "event": {
             "type": args.event_type,
             "actorId": args.actor_id,
             "scope": scope,
-            "payload": { "contentType": args.content_type, "text": body },
+            "payload": payload_value,
             "relations": relations,
         }
     });

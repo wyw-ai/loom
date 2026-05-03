@@ -80,12 +80,7 @@ fail=0
 [ "$saw_status" = 1 ]               || { echo "FAIL: no status.update event"; fail=1; }
 [ "$saw_artifact" = 1 ]             || { echo "FAIL: no event with attaches_artifact relation"; fail=1; }
 [ "$saw_self_complete_event" = 1 ]  || { echo "FAIL: no service.self_complete event"; fail=1; }
-# Auto-stop (request.json removal on self_complete) is a documented
-# but un-implemented teardown step — see TODO in service/host.rs:432-440
-# describing scheduler self_complete deleting the file. Tracked as a
-# separate gap; we emit a warning rather than failing the M3 smoke.
-[ "$saw_request_removed" = 1 ] || \
-  echo "WARN: request.json still present (host doesn't reap on self_complete; tracked separately as instance auto-stop gap)"
+[ "$saw_request_removed" = 1 ]      || { echo "FAIL: request.json still present after self_complete (host should reap)"; fail=1; }
 
 if [ $fail -ne 0 ]; then
   echo "--- service-host log tail ---"

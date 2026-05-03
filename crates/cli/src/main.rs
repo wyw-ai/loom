@@ -115,6 +115,13 @@ enum Cmd {
         #[command(subcommand)]
         sub: McpCmd,
     },
+    /// Apply a lesson-plan to an on-disk AgentSpec / ServiceSpec
+    /// after `approval.spec_apply` has been accepted. See
+    /// `docs/remove-dev-helper-migration-design.md` §4.4 / §7.1.
+    Spec {
+        #[command(subcommand)]
+        sub: SpecCmd,
+    },
     /// Manage the long-lived service host (am bridge, scheduler, ...). See
     /// `docs/service-plugin-system-design.md` §11.
     Service {
@@ -127,6 +134,23 @@ enum Cmd {
     Workspace {
         #[command(subcommand)]
         sub: WorkspaceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SpecCmd {
+    /// Apply the lesson-plan attached to the action.request that was
+    /// accepted by the given `action.response` event. See
+    /// `crates/cli/src/cmd/spec_apply.rs` for the frontmatter contract.
+    Apply {
+        /// Event id of the `action.response` (kind = accepted) that
+        /// approved the lesson-plan.
+        #[arg(long = "action")]
+        action_event_id: String,
+        /// Don't write spec/bundle files or bump the reload epoch.
+        /// Prints the planned changes and exits.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -954,6 +978,12 @@ async fn main() -> Result<()> {
             ActionCmd::Decline { event_id, option } => {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, false).await?
             }
+        },
+        Cmd::Spec { sub } => match sub {
+            SpecCmd::Apply {
+                action_event_id,
+                dry_run,
+            } => cmd::spec_apply::run(client, action_event_id, dry_run).await?,
         },
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),

@@ -172,6 +172,53 @@ A consumer that needs only the metadata MUST parse the first ```` ```json ````
 fenced block at the top of the file. Producers MUST place exactly one such
 block as the first non-blank content.
 
+#### Optional `spec_apply` block (classroom 教学循环收口)
+
+Lesson-plans destined for the `approval.spec_apply` action gate
+(`docs/remove-dev-helper-migration-design.md` §4.4) MAY include a
+machine-actionable `spec_apply` block in the frontmatter. `joi spec
+apply --action <event_id>` reads it after the human approves and
+applies the changes to the on-disk AgentSpec / ServiceSpec, then bumps
+the reload-epoch marker so the running host re-spawns the worker.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "teacher",
+  "task_id": "task-2024-04-12-classroom-delivery-tweak",
+  "skills": ["a1.delivery.handoff-template"],
+  "spec_apply": {
+    "target": { "kind": "agent", "id": "delivery" },
+    "spec_patch": {
+      "promptTemplate": "...new system prompt..."
+    },
+    "bundle_writes": [
+      { "path": "snippets/handoff.md", "contents": "## Handoff\n..." }
+    ]
+  }
+}
+```
+
+`spec_apply` semantics:
+
+- `target.kind` ∈ `{"agent", "service"}`. `target.id` matches the
+  on-disk `<id>/spec.json` (preferred) or `<id>.json` (legacy flat
+  layout).
+- `spec_patch` is JSON deep-merged onto the current spec. Object keys
+  recurse; arrays / scalars replace.
+- `bundle_writes[].path` is relative to the spec's `bundle/` sibling
+  (rejects absolute paths and `..`).
+- The previous `spec.json` and any overwritten bundle file are copied
+  into `<spec-dir>/.backups/<utc-timestamp>/` before the new contents
+  are written.
+- After writing, the reload epoch for the target is bumped; a host
+  running `joi {agent,service} serve` respawns the worker on the next
+  poll cycle.
+- A `runtime_receipt` artifact (JSON) and a `status.update` event with
+  `responds_to` the action.response and `attaches_artifact` the
+  receipt are appended to the original action.request scope so the
+  decision is replayable from timeline alone.
+
 ---
 
 ## 5. `validation-report.json`

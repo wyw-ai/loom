@@ -33,9 +33,15 @@ pub(crate) fn default_specs_dir() -> PathBuf {
         })
 }
 
-/// Load every `*.json` under `dir` and parse as `ServiceSpec`. Malformed
-/// files are logged and skipped (matches `agent_serve::load_specs`
-/// behavior — one bad spec must not block the rest of the fleet).
+/// Load every ServiceSpec under `dir`. Accepts two layouts:
+///
+/// * **Flat** — `<dir>/<id>.json` (legacy; used by `joi service register`
+///   when ops drop a single file under `~/.config/joi/services/`).
+/// * **Nested** — `<dir>/<id>/spec.json` (used by the workspace
+///   `data/services/` tree so each spec can ship a `bundle/` sibling).
+///
+/// Malformed files are logged and skipped — one bad spec must not block
+/// the rest of the fleet (matches `agent_serve::load_specs` behavior).
 pub(crate) fn load_specs(dir: &Path) -> Result<Vec<ServiceSpec>> {
     let mut out = Vec::new();
     if !dir.exists() {
@@ -44,26 +50,41 @@ pub(crate) fn load_specs(dir: &Path) -> Result<Vec<ServiceSpec>> {
     for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("read spec {}", path.display()))?;
-        match serde_json::from_str::<ServiceSpec>(&text) {
-            Ok(mut spec) => {
-                spec.normalize();
-                out.push(spec);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            let nested = path.join("spec.json");
+            if !nested.exists() {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "skipping malformed ServiceSpec",
-                );
-            }
+            push_spec(&nested, &mut out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            push_spec(&path, &mut out);
         }
     }
     Ok(out)
+}
+
+fn push_spec(path: &Path, out: &mut Vec<ServiceSpec>) {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "skipping unreadable ServiceSpec");
+            return;
+        }
+    };
+    match serde_json::from_str::<ServiceSpec>(&text) {
+        Ok(mut spec) => {
+            spec.normalize();
+            out.push(spec);
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "skipping malformed ServiceSpec",
+            );
+        }
+    }
 }
 
 /// Run the service host: load every spec under `--specs` (default

@@ -267,28 +267,44 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        let file_type = entry.file_type()?;
+        let target = if file_type.is_dir() {
+            let nested = path.join("spec.json");
+            if !nested.exists() {
+                continue;
+            }
+            nested
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            path
+        } else {
             continue;
-        }
-        let text =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        warn_deprecated_transport_fields(&text, &path);
+        };
+        let text = std::fs::read_to_string(&target)
+            .with_context(|| format!("read {}", target.display()))?;
+        warn_deprecated_transport_fields(&text, &target);
         match serde_json::from_str::<AgentSpec>(&text) {
             Ok(spec) => out.push(spec),
-            Err(e) => eprintln!("[warn] skipping {}: {}", path.display(), e),
+            Err(e) => eprintln!("[warn] skipping {}: {}", target.display(), e),
         }
     }
     Ok(out)
 }
 
-/// Re-read `<specs_dir>/<actor_id>.json` and return the parsed
-/// AgentSpec. `Ok(None)` if the file is missing (deleted between
-/// startup and a reload — the supervisor should keep using the last
-/// known good spec rather than crash). `Err` only on real I/O or
-/// parse errors. Used by the per-actor supervision loop after a
-/// `joi agent reload`.
+/// Re-read an AgentSpec for `actor_id` from `specs_dir`. Tries the
+/// nested layout `<dir>/<actor_id>/spec.json` first, falling back to
+/// the legacy flat `<dir>/<actor_id>.json`. `Ok(None)` if neither
+/// exists (deleted between startup and reload — supervisor keeps the
+/// last known good spec). `Err` on real I/O or parse errors.
 fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
-    let path = specs_dir.join(format!("{actor_id}.json"));
+    let nested = specs_dir.join(actor_id).join("spec.json");
+    let flat = specs_dir.join(format!("{actor_id}.json"));
+    let path = if nested.exists() {
+        nested
+    } else if flat.exists() {
+        flat
+    } else {
+        return Ok(None);
+    };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

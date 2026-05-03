@@ -189,6 +189,13 @@ fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
         "{instance.data_dir}".to_string(),
         ctx.runtime.state_dir().display().to_string(),
     );
+    if let Some(path) = ctx.spec_path.as_ref() {
+        if let Some(dir) = path.parent() {
+            let dir_str = dir.display().to_string();
+            subs.insert("{spec.dir}".to_string(), dir_str.clone());
+            subs.insert("{bundle.dir}".to_string(), format!("{dir_str}/bundle"));
+        }
+    }
     if let Some(inst) = &ctx.instance {
         subs.insert("{thread.id}".to_string(), inst.scope.id.clone());
         if let Some(channel) = &inst.scope.channel_id {

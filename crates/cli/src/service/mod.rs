@@ -23,6 +23,7 @@
 
 pub mod am;
 pub mod host;
+pub mod instance;
 pub mod plugin;
 pub mod runtime;
 pub mod scheduler;

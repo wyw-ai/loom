@@ -158,6 +158,8 @@ ready.
   export JOI_SERVER=ws://127.0.0.1:$PORT/rpc
   export JOI_AGENT_DATA_ROOT=$ROOT/agent-data
   export JOI_SERVICE_HOST_DATA=$ROOT/service-data
+  export JOI_AGENT_SPECS=$ROOT/agent-specs
+  export JOI_SERVICE_SPECS=$ROOT/service-specs
 specs:  $ROOT/agent-specs  $ROOT/service-specs
 fixtures: $ROOT/fixtures/repo.git (bare); MR_DETECTOR_FETCH_CMD=$MR_DETECTOR_FETCH_CMD
 logs:   $ROOT/logs/

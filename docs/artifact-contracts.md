@@ -295,6 +295,57 @@ event-kind dependent (e.g. `merged_at` only on `event_kind == "merged"`).
 
 ---
 
+## 7. `bug-triage.v1`
+
+Producer: `a1-bug-triage`. Consumer: `router` (a1-dev-canfeng), and the
+`a1-feedback-scanner` service when aggregating per-feedback verdicts.
+
+Emitted once per inbound feedback item to record the triage verdict. The
+contract is intentionally narrow: triage classifies, it does not plan.
+Planning (rough plan / DoD / repos) is delegated downstream to discovery
+via the existing `task-goal.json` + `definition-of-done.json` +
+`clone-manifest.json` triplet.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "a1-bug-triage",
+  "feedback_id": "fbk-2024-04-15-9911",
+  "category": "existing_bug",
+  "severity": "major",
+  "certainty": "high",
+  "suspected_module": "router/handoff",
+  "next_actor": "router",
+  "summary": "Single-line restatement of the user's report.",
+  "evidence_refs": [
+    { "kind": "feedback", "id": "fbk-2024-04-15-9911" },
+    { "kind": "thread", "id": "thread_2a6d3b569aa6" }
+  ],
+  "captured_at": "2024-04-15T08:21:33Z"
+}
+```
+
+Allowed values:
+- `category`: `"existing_bug"` | `"new_request"` | `"unclear"` | `"duplicate"` | `"not_actionable"`.
+- `severity`: `"blocker"` | `"major"` | `"minor"` | `"trivial"`.
+- `certainty`: `"high"` | `"medium"` | `"low"`.
+- `next_actor`: any AgentSpec actor id (typically `"router"` for actionable
+  items, omitted or `"none"` for `not_actionable` / `unclear`).
+
+Required: `schema_version`, `producer`, `feedback_id`, `category`,
+`severity`, `certainty`, `summary`, `captured_at`.
+
+`evidence_refs` is required-but-may-be-empty. `suspected_module` is
+optional and free-form (kebab-case path or symbol fragment).
+
+The triage artifact is the **input** to the bug-fix loop: the loop reads
+`category == "existing_bug"` items from the latest `feedback-scan.bugs.v1`
+report and dispatches them serially through router → discovery → delivery.
+Items in any other category are forwarded to the human-decision report
+(`feedback-scan.others.v1`) instead.
+
+---
+
 ## Versioning
 
 Add new optional fields at any time without bumping `schema_version`.

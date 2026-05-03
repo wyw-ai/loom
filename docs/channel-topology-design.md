@@ -320,11 +320,21 @@ chan_4a634872b6f8 (classroom)
 
 ## 4. 关键 artifact 契约（新增 / 已有）
 
+> **实施修订（2024-Q2）**：原计划新增 `task-brief.v1` 单一聚合 schema 承
+> 载「四件套」，实施时改为复用已有的 `task-goal.json` + `definition-of-done.json`
+> + `clone-manifest.json` 三件组——五项内容（标题 / 粗方案 / DoD /
+> 待改仓库 / 参考仓库）已被三件组完整覆盖（标题+narrative→task-goal，
+> DoD→definition-of-done，repos→clone-manifest）。下表中 `task-brief.v1`
+> 行因此作废，本文其它处仍出现的 “task-brief” 字样请按「task-goal +
+> DoD + clone-manifest 三件组」理解；不再新增独立 schema。
+
 | schema | 已有 / 待加 | 生产者 | 消费者 |
 | --- | --- | --- | --- |
-| `clone_manifest.v1` | ✅ | discovery | thread create bootstrap |
-| `task-brief.v1` | 待加 | discovery | router / delivery |
-| `bug-triage.v1` | 待加（已在 a1-bug-triage skill 内描述，需补 §3 schema） | a1-bug-triage | router / feedback-scanner |
+| `task-goal.json` | ✅ | discovery / router / classmaster | delivery / teacher |
+| `definition-of-done.json` | ✅ | discovery / classmaster | delivery / teacher |
+| `clone-manifest.json` | ✅ | discovery | thread create / bootstrap |
+| ~~`task-brief.v1`~~ | 作废（见上方修订说明） | — | — |
+| `bug-triage.v1` | ✅（artifact-contracts.md §7） | a1-bug-triage | router / feedback-scanner |
 | `feedback-scan.bugs.v1` | 待加 | feedback-scanner | bug-fix-loop |
 | `feedback-scan.others.v1` | 待加 | feedback-scanner | 人类（公共聊天） |
 | `mr-status-diff.v1` | 待加（mr-detector 当前发 turn 内 message） | mr-detector | delivery |
@@ -335,6 +345,7 @@ chan_4a634872b6f8 (classroom)
 | `lesson-plan.v1`（含 spec_apply） | ✅（在 §4.4 已设计） | teacher | spec apply runtime |
 
 > 所有 schema 集中写到 `docs/artifact-contracts.md`，本文只列“为什么需要”。
+
 
 ---
 

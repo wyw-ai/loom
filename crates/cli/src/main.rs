@@ -289,6 +289,46 @@ enum ServiceCmd {
         #[command(subcommand)]
         sub: ServiceSpecCmd,
     },
+    /// Start a `lifecycle = thread_bound` instance by writing a
+    /// per-instance `request.json`. A running `joi service serve`
+    /// host watches the spec's `instances/` directory and dispatches
+    /// the plugin task on observation. See design §4.7.3.
+    Start {
+        /// ServiceSpec id (must declare `lifecycle = thread_bound`).
+        #[arg(long = "spec")]
+        spec_id: String,
+        /// Thread id to bind the instance to. v1's only supported
+        /// `bind.scope` is `thread`, so this becomes the instance id.
+        #[arg(long = "in")]
+        thread: String,
+        /// Optional channel id of the thread. Recorded in the request
+        /// so the host can resolve `{channel.id}` placeholders.
+        #[arg(long = "channel")]
+        channel: Option<String>,
+        /// JSON object validated against the spec's `params_schema`.
+        /// Defaults to `{}`.
+        #[arg(long = "params")]
+        params: Option<String>,
+        /// Override the specs directory (used to look up the spec for
+        /// validation). Defaults to `~/.config/joi/services/`.
+        #[arg(long)]
+        specs: Option<PathBuf>,
+    },
+    /// Stop a thread-bound instance by removing its `request.json`.
+    /// The host watcher tears down the plugin task on the next poll.
+    Stop {
+        #[arg(long = "spec")]
+        spec_id: String,
+        #[arg(long = "in")]
+        thread: String,
+    },
+    /// List active thread-bound instances. With `--spec`, scopes the
+    /// listing to a single ServiceSpec; without it, every spec under
+    /// the host data root is walked.
+    Status {
+        #[arg(long = "spec")]
+        spec_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -750,6 +790,36 @@ async fn main() -> Result<()> {
             ServiceSpecCmd::List => cmd::spec::service_list(),
             ServiceSpecCmd::Get { service_id, raw } => cmd::spec::service_get(service_id, raw),
         };
+    }
+
+    // `service start/stop/status` are local-only file-IO commands —
+    // they read/write/list per-instance `request.json` files under the
+    // host data root. The running `joi service serve` host is the
+    // observer; these commands themselves never touch the server.
+    if let Cmd::Service {
+        sub:
+            ServiceCmd::Start {
+                spec_id,
+                thread,
+                channel,
+                params,
+                specs,
+            },
+    } = args.cmd
+    {
+        return cmd::service::start(spec_id, thread, channel, params, specs);
+    }
+    if let Cmd::Service {
+        sub: ServiceCmd::Stop { spec_id, thread },
+    } = &args.cmd
+    {
+        return cmd::service::stop(spec_id.clone(), thread.clone());
+    }
+    if let Cmd::Service {
+        sub: ServiceCmd::Status { spec_id },
+    } = &args.cmd
+    {
+        return cmd::service::status(spec_id.clone());
     }
 
     // Workspace commands operate purely on the local filesystem layout

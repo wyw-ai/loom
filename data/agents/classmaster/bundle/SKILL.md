@@ -12,7 +12,7 @@
 
 - **classroom 频道公共聊天区（channel scope）**：你和人类沟通"要训练
   谁、训练什么、达到什么标准"。所有面向人类的对话用
-  `joi say --channel <classroom_chan_id>` / `joi handoff --channel ...`，
+  `joi say --in <classroom_chan_id> --channel` / `joi handoff <actor> --in <chan_id> --channel ...`，
   不要自己开 thread 跟人类对话。
 - **派生 training thread**（`training-<actor.id>-<topic>`）：训练真正发
   生的地方。在这里把目标 actor 邀请进来，handoff 给 `actor_teacher` 做
@@ -24,7 +24,7 @@
 | --- | --- |
 | 用户描述要"改 / 训练 / 升级"某个 actor 的行为（SKILL.md / 提示词 / bundle 内容） | 进入「需求澄清」阶段 |
 | 已经澄清完毕，用户给出 OK | 进入「开训」阶段 |
-| 闲聊 / 状态查询 | 用 `joi say --channel <chan>` 直接回，不 handoff |
+| 闲聊 / 状态查询 | 用 `joi say --in <chan> --channel` 直接回，不 handoff |
 | 模糊不清 | 反问澄清，本回合不 handoff |
 
 ## 阶段 A — 需求澄清（公共聊天区）
@@ -86,7 +86,7 @@
 | `pass` | `publish` | 发起 `approval.spec_apply`，让 human 拍板上线（见下） |
 | `needs_revision` | `revise_skill_md` | handoff 回 `actor_teacher`，附 grading report 中的失败项摘要，要求改 SKILL 后再出一轮 homework |
 | `needs_revision` | `redo_homework` | handoff 回 `actor_teacher`，message 写"扩大覆盖再考一次" |
-| `fail` | 任意 | `joi say --channel <classroom_chan_id>` 汇报失败，**不自动回滚**；handoff 回人类决策 |
+| `fail` | 任意 | `joi say --in <classroom_chan_id> --channel` 汇报失败，**不自动回滚**；handoff 回人类决策 |
 
 `approval.spec_apply` 的发起方式（沿用 `actor_teacher` 阶段 C 的协议，
 但由 classmaster 触发；候选 bundle 路径来自 lesson-plan 中的 spec_apply
@@ -105,7 +105,7 @@ joi --json event append \
 human 通过后，runtime 的 `joi spec apply` 会执行 deep-merge 并 bump
 reload-epoch；你只需要：
 
-1. `joi say --channel <classroom_chan_id> "<target_actor> <ver> 已发布。"`
+1. `joi say --in <classroom_chan_id> --channel "<target_actor> <ver> 已发布。"`
 2. handoff 回 `actor_router`（如果有外部调用方在等）或就地结束。
 
 ## 守则

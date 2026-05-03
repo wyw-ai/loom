@@ -151,6 +151,7 @@ impl ServiceHost {
                             server_url,
                             data_root,
                             shutdown_rx,
+                            specs_dir,
                         )
                         .await
                         {
@@ -184,7 +185,7 @@ async fn supervise_spec(
     specs_dir: Option<PathBuf>,
 ) -> Result<()> {
     let Some(dir) = specs_dir else {
-        return run_one_spec(initial_spec, plugin, server_url, data_root, shutdown).await;
+        return run_one_spec(initial_spec, plugin, server_url, data_root, shutdown, None).await;
     };
 
     let spec_id = initial_spec.id.clone();
@@ -202,6 +203,7 @@ async fn supervise_spec(
         let data_clone = data_root.clone();
         let shutdown_clone = shutdown.clone();
         let spec_for_run = current_spec.clone();
+        let spec_path = resolve_spec_path(Some(&dir), &spec_id);
         let worker = tokio::spawn(async move {
             run_one_spec(
                 spec_for_run,
@@ -209,6 +211,7 @@ async fn supervise_spec(
                 server_clone,
                 data_clone,
                 shutdown_clone,
+                spec_path,
             )
             .await
         });
@@ -279,10 +282,15 @@ async fn supervise_spec(
 /// `Ok(None)` if the file is absent (operator deleted the spec —
 /// supervisor keeps running the cached one until host restart).
 fn reload_one_spec(dir: &Path, spec_id: &str) -> Result<Option<ServiceSpec>> {
-    let path = dir.join(format!("{spec_id}.json"));
-    if !path.exists() {
+    let nested = dir.join(spec_id).join("spec.json");
+    let flat = dir.join(format!("{spec_id}.json"));
+    let path = if nested.exists() {
+        nested
+    } else if flat.exists() {
+        flat
+    } else {
         return Ok(None);
-    }
+    };
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read spec {}", path.display()))?;
     let mut spec: ServiceSpec = serde_json::from_str(&text)
@@ -301,12 +309,30 @@ fn reload_one_spec(dir: &Path, spec_id: &str) -> Result<Option<ServiceSpec>> {
     Ok(Some(spec))
 }
 
+/// Resolve a spec's source path under `specs_dir`. Tries the legacy
+/// flat layout `<dir>/<id>.json` first, then the recursive layout
+/// `<dir>/<id>/spec.json`. Returns `None` when neither exists or
+/// `specs_dir` itself is `None`.
+fn resolve_spec_path(specs_dir: Option<&Path>, spec_id: &str) -> Option<PathBuf> {
+    let dir = specs_dir?;
+    let flat = dir.join(format!("{spec_id}.json"));
+    if flat.exists() {
+        return Some(flat);
+    }
+    let nested = dir.join(spec_id).join("spec.json");
+    if nested.exists() {
+        return Some(nested);
+    }
+    None
+}
+
 async fn run_one_spec(
     spec: ServiceSpec,
     plugin: Arc<dyn ServicePlugin>,
     server_url: String,
     data_root: PathBuf,
     shutdown: ShutdownSignal,
+    spec_path: Option<PathBuf>,
 ) -> Result<()> {
     let actor_id = spec.actor.id.clone();
     let display = spec.actor.display_name.clone();
@@ -337,6 +363,7 @@ async fn run_one_spec(
     plugin
         .run(ServiceContext {
             spec,
+            spec_path,
             runtime,
             shutdown,
             instance: None,
@@ -355,6 +382,7 @@ async fn run_one_instance(
     data_root: PathBuf,
     shutdown: ShutdownSignal,
     request: super::instance::InstanceRequest,
+    spec_path: Option<PathBuf>,
 ) -> Result<()> {
     let actor_id = spec.actor.id.clone();
     let instance_id = request.scope.id.clone();
@@ -389,6 +417,7 @@ async fn run_one_instance(
     plugin
         .run(ServiceContext {
             spec,
+            spec_path,
             runtime,
             shutdown,
             instance: Some(request),
@@ -418,6 +447,7 @@ async fn supervise_instances(
     server_url: String,
     data_root: PathBuf,
     mut shutdown: ShutdownSignal,
+    specs_dir: Option<PathBuf>,
 ) -> Result<()> {
     let mut active: HashMap<String, AbortHandle> = HashMap::new();
     let spec_id = spec.id.clone();
@@ -486,9 +516,10 @@ async fn supervise_instances(
             let spec_c = spec.clone();
             let inst_for_log = instance_id.clone();
             let spec_for_log = spec_id.clone();
+            let spec_path_c = resolve_spec_path(specs_dir.as_deref(), &spec_id);
             let join = tokio::spawn(async move {
                 if let Err(e) = run_one_instance(
-                    spec_c, plugin_c, server_c, data_c, shutdown_c, request,
+                    spec_c, plugin_c, server_c, data_c, shutdown_c, request, spec_path_c,
                 )
                 .await
                 {

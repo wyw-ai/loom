@@ -34,6 +34,12 @@ pub struct ServiceContext {
     /// Validated spec for this plugin instance. `spec.kind` matches
     /// [`ServicePlugin::kind`].
     pub spec: ServiceSpec,
+    /// Filesystem path of the spec file this run was loaded from
+    /// (`<specs_dir>/<id>.json` or `<specs_dir>/<id>/spec.json`).
+    /// `None` for in-memory specs (programmatic [`ServiceHost::add_spec`]
+    /// without a source path). Plugins that resolve `{spec.dir}` /
+    /// `{bundle.dir}` placeholders look at the parent of this path.
+    pub spec_path: Option<std::path::PathBuf>,
     /// Substrate for talking to joi-server. See [`ServiceRuntime`].
     pub runtime: Arc<ServiceRuntime>,
     /// Cancellation signal from the host. Plugins observe it to exit

@@ -240,16 +240,25 @@ thread.workspace/
 
 ### 2.7 a1-dev-canfeng 整体 thread 蓝图
 
+> **修订（实施反馈）**：router 不再有独立的「办公桌」thread，**router 的工作
+> 位置是 channel public chat**（人类 ↔ router 全在公共聊天区进行）。原来
+> 187 上预建的 `thread_router-desk` 留作历史 thread，不再使用。
+
 ```
 chan_31f8fa85d909 (a1-dev-canfeng)
-├── public chat (channel scope, no thread)              ← 人类 ↔ router 入口
-├── thread_router-desk     [resident, router]            ← router 的「办公桌」
-├── thread_discovery-desk  [resident, discovery]         ← 调研常驻
-├── thread_feedback-scan   [resident, feedback-scanner]  ← 定时扫 feedback
-├── thread_bug-fix-queue   [resident, bug-fix-loop]      ← bug 修复总控（loop 自身）
-├── thread_deliver-<task>  [transient]                   ← 每个开发任务一个
-└── thread_bugfix-<fb>     [transient, 兼 deliver]       ← 每条存量 bug 一个
+├── public chat (channel scope, no thread)              ← 人类 ↔ router 入口（router 在此活动）
+├── thread_discovery-desk  [resident, actor_discovery]  ← 调研常驻
+├── thread_feedback-scan   [resident, feedback-scanner] ← 定时扫 feedback
+├── thread_bug-fix-queue   [resident, bug-fix-loop]     ← bug 修复总控（loop 自身）
+├── thread_deliver-<task>  [transient]                  ← 每个开发任务一个
+└── thread_bugfix-<fb>     [transient, 兼 deliver]      ← 每条存量 bug 一个
 ```
+
+> **AgentSpec id 约束**：所有 handoff target 一律使用带 `actor_` 前缀的
+> 规范 id（`actor_router` / `actor_discovery` / `actor_delivery` /
+> `actor_a1_bug_triage` / `actor_classmaster` / `actor_teacher`）。
+> 历史上存在不带前缀的同名 actor（`discovery` 是 researcher 双态、不归本
+> channel 用），handoff 不要派给它们。
 
 ---
 
@@ -526,9 +535,9 @@ chan_4a634872b6f8 (classroom)
 
 | channel | thread | actor | 状态 |
 | --- | --- | --- | --- |
-| a1-dev-canfeng | (channel public) | router / canfeng | ✅ smoke 绿 |
-| a1-dev-canfeng | router-desk (resident) | router | ✅ |
-| a1-dev-canfeng | discovery-desk (resident) | discovery | ✅ smoke 绿；待补四件套 skill |
+| a1-dev-canfeng | (channel public) | actor_router / canfeng | ✅ Phase A smoke 绿 |
+| a1-dev-canfeng | router-desk (legacy, retired) | — | 保留历史，新流程不再使用 |
+| a1-dev-canfeng | discovery-desk (resident) | actor_discovery | ✅ Phase A smoke 绿；三件组 publish 由 SKILL 落地 |
 | a1-dev-canfeng | feedback-scan (resident) | feedback-scanner | ❌ 待落地（§6.1 #5） |
 | a1-dev-canfeng | bug-fix-queue (resident) | bug-fix-loop | ❌ 待落地（§6.1 #6） |
 | a1-dev-canfeng | deliver-`<task>` (transient) | delivery + mr-detector | ⚠️ 单步可跑，artifact 化未做（§6.1 #7） |

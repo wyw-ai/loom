@@ -1050,7 +1050,7 @@ pub struct AgentSpec {
     /// turn per scope only), and `everyTurnSuffix` lines, with template
     /// variable substitution. When absent the runtime falls back to the
     /// bare envelope shape used before the migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "promptTemplate")]
     pub prompt_template: Option<PromptTemplateSpec>,
 }
 

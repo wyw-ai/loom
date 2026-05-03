@@ -101,7 +101,7 @@ pub async fn serve(
         "starting service host",
     );
     let data_root = state::default_data_root();
-    let mut host = ServiceHost::new(server_url, data_root);
+    let mut host = ServiceHost::new(server_url, data_root).with_specs_dir(dir.clone());
     // S3: scheduler is the first long-process plugin under the host.
     // AM stays a short-lived `am-handler` subprocess (S2) and isn't
     // registered here.

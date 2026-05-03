@@ -33,9 +33,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use proto::methods::ServiceLifecycle;
 use proto::types::{Meta, ScopeRef};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::service::plugin::{ServiceContext, ServicePlugin, ShutdownSignal};
@@ -68,6 +71,20 @@ impl ServicePlugin for SchedulerPlugin {
 
         let runtime = ctx.runtime.clone();
         let shutdown = ctx.shutdown.clone();
+
+        // §4.7.3: thread-bound services tear down their instance when
+        // any event in `bind.auto_stop_on` is observed. Today the
+        // self_complete sentinel is the only signal scheduler raises;
+        // future expansions (e.g., listening for `thread.closed` on
+        // delivery_list) reuse the same Notify.
+        let stop_on_self_complete = matches!(ctx.spec.lifecycle, ServiceLifecycle::ThreadBound)
+            && ctx
+                .spec
+                .bind
+                .as_ref()
+                .map(|b| b.auto_stop_on.iter().any(|k| k == "service.self_complete"))
+                .unwrap_or(false);
+        let self_complete = Arc::new(Notify::new());
 
         // Pre-flight: make sure the actor can reach every scope channel.
         // best-effort; channel/invite is idempotent on the server.
@@ -102,9 +119,12 @@ impl ServicePlugin for SchedulerPlugin {
         for job in config.jobs {
             let runtime = runtime.clone();
             let shutdown = shutdown.clone();
+            let self_complete = self_complete.clone();
             let job = Arc::new(job);
             joinset.spawn(async move {
-                if let Err(e) = run_job_loop(job.clone(), runtime, shutdown).await {
+                if let Err(e) =
+                    run_job_loop(job.clone(), runtime, shutdown, self_complete).await
+                {
                     tracing::error!(
                         job = %job.id,
                         error = ?e,
@@ -113,10 +133,27 @@ impl ServicePlugin for SchedulerPlugin {
                 }
             });
         }
-        // Wait for either every job loop to exit (shutdown) or the
-        // shutdown signal directly. The per-job loops observe shutdown
-        // themselves; this just keeps `run` alive until they're done.
-        while joinset.join_next().await.is_some() {}
+        // Wait for either every job loop to exit (shutdown) or, for a
+        // thread-bound spec opted into `service.self_complete`, the
+        // first time a job emits the sentinel. In the latter case we
+        // cancel the remaining jobs so the scheduler instance can
+        // unwind cleanly and the host's per-instance task ends.
+        if stop_on_self_complete {
+            tokio::select! {
+                _ = async { while joinset.join_next().await.is_some() {} } => {}
+                _ = self_complete.notified() => {
+                    tracing::info!(
+                        service = %runtime.service_id(),
+                        instance = ?runtime.instance_id(),
+                        "service.self_complete observed; aborting remaining jobs",
+                    );
+                    joinset.abort_all();
+                    while joinset.join_next().await.is_some() {}
+                }
+            }
+        } else {
+            while joinset.join_next().await.is_some() {}
+        }
         Ok(())
     }
 }
@@ -132,6 +169,7 @@ async fn run_job_loop(
     job: Arc<JobSpec>,
     runtime: Arc<ServiceRuntime>,
     mut shutdown: ShutdownSignal,
+    self_complete: Arc<Notify>,
 ) -> Result<()> {
     let schedule = Schedule::parse(&job.schedule)
         .with_context(|| format!("re-parse cron `{}`", job.schedule))?;
@@ -177,10 +215,11 @@ async fn run_job_loop(
         }
         let runtime = runtime.clone();
         let state_clone = state.clone();
+        let self_complete = self_complete.clone();
         // Spawn the actual fire so the loop can sleep for the next tick
         // promptly; the gate is released at the end of the fire task.
         tokio::spawn(async move {
-            let res = fire_once(state_clone.clone(), runtime, next).await;
+            let res = fire_once(state_clone.clone(), runtime, next, self_complete).await;
             if state_clone.spec.single_in_flight {
                 state_clone.in_flight.store(false, Ordering::Release);
             }
@@ -207,9 +246,10 @@ async fn fire_once(
     state: Arc<JobState>,
     runtime: Arc<ServiceRuntime>,
     fire_time: DateTime<Utc>,
+    self_complete: Arc<Notify>,
 ) -> Result<()> {
     let job = &state.spec;
-    let body = match exec_source(&job.source).await {
+    let raw_body = match exec_source(&job.source).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
@@ -220,86 +260,144 @@ async fn fire_once(
             return Ok(());
         }
     };
-    let body_hash = sha256_hex(&body);
-
-    // Cursor diff (§8.3): `body_hash` skips when unchanged. cursor_save
-    // happens *after* successful append so the next tick's diff still
-    // sees the prior value if append fails.
-    let cursor_name = job.id.clone();
-    if matches!(job.cursor_by, CursorBy::BodyHash) {
-        if let Some(prev) = runtime.cursor_load(&cursor_name)? {
-            if prev == body_hash {
-                tracing::debug!(
-                    job = %job.id,
-                    fire_time_utc = %fire_time.to_rfc3339_opts(SecondsFormat::Secs, true),
-                    "body unchanged; skipping",
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    // Dedupe (§8.4) — must run *before* the append.
-    let dedupe_key = build_dedupe_key(runtime.service_id(), job, fire_time, &body_hash);
-    if let Some(key) = dedupe_key.as_deref() {
-        if !runtime.dedupe_once(key)? {
-            tracing::debug!(job = %job.id, key = %key, "dedupe hit; skipping");
-            return Ok(());
-        }
-    }
+    // §4.7.3: a service plugin (e.g., mr-detector bundle) may signal
+    // "this instance is done" by writing a sentinel JSON object as the
+    // last line of stdout. We strip the sentinel from the body so it
+    // doesn't leak into the user-visible event, then publish a separate
+    // `service.self_complete` event and notify the run() loop so the
+    // scheduler can tear the instance down when `auto_stop_on` opts in.
+    let (body_vec, self_complete_signal) = strip_self_complete(&raw_body);
+    let body = body_vec.as_slice();
+    let body_hash = sha256_hex(body);
 
     let scope = scope_ref(&job.scope);
-    let body_text = stringify_body(&body);
-    let meta = build_meta(job, fire_time, &body_hash);
-    let event_id = if let Some(target) = job.target_agent.as_deref() {
-        runtime
-            .handoff(target, scope.clone(), body_text.clone(), Some(meta))
-            .await
-            .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
-    } else {
-        runtime
-            .append_content(scope.clone(), body_text.clone(), Vec::new(), Some(meta))
-            .await
-            .with_context(|| format!("scheduler append for job `{}`", job.id))?
-    };
+    let mut event_id: Option<String> = None;
 
-    // Cursor save after success.
-    if matches!(job.cursor_by, CursorBy::BodyHash) {
-        if let Err(e) = runtime.cursor_save(&cursor_name, &body_hash) {
-            tracing::warn!(
-                job = %job.id,
-                error = ?e,
-                "cursor_save failed (will re-fire on next tick)",
-            );
+    // If the body is empty after stripping the sentinel, skip the
+    // regular content event (a self_complete-only tick has nothing
+    // user-visible to log). Otherwise run the cursor diff / dedupe /
+    // append / await chain like a normal tick.
+    if !body.is_empty() {
+        // Cursor diff (§8.3): `body_hash` skips when unchanged.
+        // cursor_save happens *after* successful append so the next
+        // tick's diff still sees the prior value if append fails.
+        let mut cursor_skip = false;
+        let cursor_name = job.id.clone();
+        if matches!(job.cursor_by, CursorBy::BodyHash) {
+            if let Some(prev) = runtime.cursor_load(&cursor_name)? {
+                if prev == body_hash {
+                    tracing::debug!(
+                        job = %job.id,
+                        fire_time_utc = %fire_time.to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "body unchanged; skipping",
+                    );
+                    cursor_skip = true;
+                }
+            }
+        }
+
+        if !cursor_skip {
+            // Dedupe (§8.4) — must run *before* the append.
+            let dedupe_key = build_dedupe_key(runtime.service_id(), job, fire_time, &body_hash);
+            let dedupe_skip = if let Some(key) = dedupe_key.as_deref() {
+                if !runtime.dedupe_once(key)? {
+                    tracing::debug!(job = %job.id, key = %key, "dedupe hit; skipping");
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !dedupe_skip {
+                let body_text = stringify_body(body);
+                let meta = build_meta(job, fire_time, &body_hash);
+                let id = if let Some(target) = job.target_agent.as_deref() {
+                    runtime
+                        .handoff(target, scope.clone(), body_text.clone(), Some(meta))
+                        .await
+                        .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
+                } else {
+                    runtime
+                        .append_content(scope.clone(), body_text.clone(), Vec::new(), Some(meta))
+                        .await
+                        .with_context(|| format!("scheduler append for job `{}`", job.id))?
+                };
+                event_id = Some(id);
+
+                // Cursor save after success.
+                if matches!(job.cursor_by, CursorBy::BodyHash) {
+                    if let Err(e) = runtime.cursor_save(&cursor_name, &body_hash) {
+                        tracing::warn!(
+                            job = %job.id,
+                            error = ?e,
+                            "cursor_save failed (will re-fire on next tick)",
+                        );
+                    }
+                }
+            }
         }
     }
 
-    // Awaited mode: block until the agent answers (or timeout).
-    if job.await_reply {
-        let timeout = Duration::from_secs(job.await_timeout_secs);
-        match runtime.await_responds_to(&event_id, timeout).await {
-            Ok(events) if !events.is_empty() => {
+    // §4.7.3: emit the self_complete event regardless of cursor /
+    // dedupe outcome — the bundle saying "I'm done" is itself the
+    // event that matters, and a stuck cursor must not silence it.
+    if let Some(signal) = self_complete_signal {
+        match runtime
+            .publish_self_complete(scope.clone(), signal.reason.clone())
+            .await
+        {
+            Ok(id) => {
                 tracing::info!(
                     job = %job.id,
-                    trigger = %event_id,
-                    replies = events.len(),
-                    "scheduler awaited reply received",
-                );
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    job = %job.id,
-                    trigger = %event_id,
-                    timeout_secs = job.await_timeout_secs,
-                    "scheduler awaited reply timed out",
+                    instance = ?runtime.instance_id(),
+                    reason = %signal.reason,
+                    event_id = %id,
+                    "service.self_complete published",
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     job = %job.id,
                     error = ?e,
-                    "await_responds_to error",
+                    "publish_self_complete failed (continuing)",
                 );
+            }
+        }
+        // Wake up `run()`'s select; a no-op when no one is waiting.
+        self_complete.notify_waiters();
+    }
+
+    // Awaited mode: block until the agent answers (or timeout). Only
+    // meaningful when the tick actually emitted an event.
+    if let Some(event_id) = event_id.as_deref() {
+        if job.await_reply {
+            let timeout = Duration::from_secs(job.await_timeout_secs);
+            match runtime.await_responds_to(event_id, timeout).await {
+                Ok(events) if !events.is_empty() => {
+                    tracing::info!(
+                        job = %job.id,
+                        trigger = %event_id,
+                        replies = events.len(),
+                        "scheduler awaited reply received",
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        job = %job.id,
+                        trigger = %event_id,
+                        timeout_secs = job.await_timeout_secs,
+                        "scheduler awaited reply timed out",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job = %job.id,
+                        error = ?e,
+                        "await_responds_to error",
+                    );
+                }
             }
         }
     }
@@ -375,6 +473,59 @@ fn stringify_body(body: &[u8]) -> String {
     // conversion preserves whatever the source emitted — non-text APIs
     // belong outside scheduler's scope (§8.2).
     String::from_utf8_lossy(body).into_owned()
+}
+
+/// Sentinel parsed off the last line of a tick's stdout. See §4.7.3.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct SelfCompleteSentinel {
+    #[serde(rename = "service.self_complete")]
+    service_self_complete: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfCompleteSignal {
+    reason: String,
+}
+
+/// If the last non-empty line of `body` parses as `{"service.self_complete":
+/// true, "reason": "..."}`, return the rest of the body (sentinel
+/// stripped, with any trailing blank lines trimmed) plus the parsed
+/// signal. Otherwise return `body` unchanged. Tolerates JSON whose
+/// `reason` is omitted; rejects sentinels whose flag is false or whose
+/// JSON shape doesn't match — those are passed through as ordinary
+/// stdout so the operator sees them.
+fn strip_self_complete(body: &[u8]) -> (Vec<u8>, Option<SelfCompleteSignal>) {
+    let text = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return (body.to_vec(), None),
+    };
+    // Walk lines from the end skipping pure whitespace; the first
+    // non-empty line is the candidate.
+    let trimmed_end = text.trim_end_matches(['\n', '\r', ' ', '\t']);
+    let last_newline = trimmed_end.rfind('\n');
+    let (head, last_line) = match last_newline {
+        Some(i) => (&trimmed_end[..i], trimmed_end[i + 1..].trim()),
+        None => ("", trimmed_end.trim()),
+    };
+    if last_line.is_empty() || !last_line.starts_with('{') {
+        return (body.to_vec(), None);
+    }
+    let parsed: SelfCompleteSentinel = match serde_json::from_str::<SelfCompleteSentinel>(last_line) {
+        Ok(p) if p.service_self_complete => p,
+        _ => return (body.to_vec(), None),
+    };
+    let reason = if parsed.reason.is_empty() {
+        "unspecified".to_string()
+    } else {
+        parsed.reason
+    };
+    let mut head_bytes = head.trim_end_matches(['\n', '\r']).as_bytes().to_vec();
+    if !head_bytes.is_empty() {
+        head_bytes.push(b'\n');
+    }
+    (head_bytes, Some(SelfCompleteSignal { reason }))
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -504,5 +655,57 @@ mod tests {
         // Should not panic on non-UTF-8 — replacement char.
         let s = stringify_body(&[0xFFu8, 0xFE, b'a']);
         assert!(s.contains('a'));
+    }
+
+    #[test]
+    fn strip_self_complete_detects_sentinel_only_body() {
+        let body = b"{\"service.self_complete\":true,\"reason\":\"merged\"}\n";
+        let (rest, sig) = strip_self_complete(body);
+        assert!(rest.is_empty(), "sentinel-only body strips to empty");
+        let sig = sig.expect("signal parsed");
+        assert_eq!(sig.reason, "merged");
+    }
+
+    #[test]
+    fn strip_self_complete_keeps_preceding_stdout() {
+        // Real bundle shape: emit one tick event line then the sentinel
+        // as the trailing line. The tick event must survive untouched.
+        let body = b"{\"event\":\"opened\",\"raw_event_fingerprint\":\"sha256:abc\"}\n{\"service.self_complete\":true,\"reason\":\"closed\"}\n";
+        let (rest, sig) = strip_self_complete(body);
+        let rest_str = String::from_utf8(rest).unwrap();
+        assert!(rest_str.contains("\"event\":\"opened\""));
+        assert!(!rest_str.contains("self_complete"));
+        assert_eq!(sig.unwrap().reason, "closed");
+    }
+
+    #[test]
+    fn strip_self_complete_passes_through_when_absent() {
+        let body = b"hello world\n";
+        let (rest, sig) = strip_self_complete(body);
+        assert_eq!(rest, body);
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn strip_self_complete_ignores_false_flag() {
+        let body = b"{\"service.self_complete\":false,\"reason\":\"x\"}\n";
+        let (rest, sig) = strip_self_complete(body);
+        assert_eq!(rest, body);
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn strip_self_complete_defaults_reason_when_missing() {
+        let body = b"{\"service.self_complete\":true}\n";
+        let (_rest, sig) = strip_self_complete(body);
+        assert_eq!(sig.unwrap().reason, "unspecified");
+    }
+
+    #[test]
+    fn strip_self_complete_tolerates_non_utf8_input() {
+        let body = &[0xFF, 0xFE, b'\n'][..];
+        let (rest, sig) = strip_self_complete(body);
+        assert_eq!(rest, body.to_vec());
+        assert!(sig.is_none());
     }
 }

@@ -184,6 +184,39 @@ impl ServiceRuntime {
         self.append_content(scope, text, relations, meta).await
     }
 
+    /// Publish a `service.self_complete` event into `scope` carrying the
+    /// originating service id and a free-form `reason`. Used by service
+    /// plugins (e.g., scheduler running a thread-bound bundle) when the
+    /// underlying source signals "this instance is done — auto_stop_on
+    /// owners should tear me down". The event is informational; the
+    /// actual stop decision belongs to whoever observes `auto_stop_on`.
+    pub async fn publish_self_complete(
+        &self,
+        scope: ScopeRef,
+        reason: impl Into<String>,
+    ) -> Result<String> {
+        let payload = json!({
+            "service_id": self.service_id,
+            "instance_id": self.instance_id,
+            "reason": reason.into(),
+        });
+        let event = EventAppendInput {
+            kind: "service.self_complete".into(),
+            actor_id: self.actor_id.clone(),
+            scope,
+            turn_id: None,
+            payload,
+            relations: Vec::new(),
+            _meta: None,
+        };
+        let res: EventAppendResult = self
+            .client
+            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .await
+            .context("event/append service.self_complete")?;
+        Ok(res.event.id)
+    }
+
     /// Make sure this runtime's actor is a member of `channel_id`.
     /// Idempotent on the server (re-inviting an existing member is a
     /// no-op). Returns Err only on transport failure or when the caller

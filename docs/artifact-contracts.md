@@ -295,6 +295,8 @@ event-kind dependent (e.g. `merged_at` only on `event_kind == "merged"`).
 
 ---
 
+---
+
 ## 7. `bug-triage.v1`
 
 Producer: `a1-bug-triage`. Consumer: `router` (a1-dev-canfeng), and the
@@ -343,6 +345,294 @@ The triage artifact is the **input** to the bug-fix loop: the loop reads
 report and dispatches them serially through router → discovery → delivery.
 Items in any other category are forwarded to the human-decision report
 (`feedback-scan.others.v1`) instead.
+
+---
+
+## 8. `feedback-scan.bugs.v1`
+
+Producer: `service_a1_feedback_scanner`. Consumer:
+`service_a1_bug_fix_loop` (subscribes), human (read-only review).
+
+Emitted once per scanner tick when there is at least one feedback item
+classified as `category == "existing_bug"`. The artifact aggregates all
+existing-bug verdicts since the previous scan into a single report so
+the bug-fix loop can iterate them serially. Each entry quotes the
+verbatim `bug-triage.v1` produced for that feedback.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "service_a1_feedback_scanner",
+  "scan_id": "scan-2024-04-15T08:00Z",
+  "scanned_at": "2024-04-15T08:00:00Z",
+  "window": { "since": "2024-04-14T08:00:00Z", "until": "2024-04-15T08:00:00Z" },
+  "items": [
+    {
+      "feedback_id": "fbk-2024-04-15-9911",
+      "feedback_url": "https://a1.example.com/feedback/9911",
+      "title": "MR label sync 回退到上一次状态",
+      "triage_artifact_uri": "joi://artifact/<sha256>",
+      "severity": "major",
+      "summary": "用户报告 MR label 在 sync 后又回到旧值。",
+      "fix_status": "pending"
+    }
+  ]
+}
+```
+
+`fix_status` ∈ `{ "pending", "in_progress", "fixed", "dropped" }`. The
+scanner emits `pending` for newly-seen items and updates the same field
+to `in_progress` / `fixed` / `dropped` on the next scan based on
+existing thread / mr-merged signals (the loop annotates state by
+publishing a follow-up `feedback-scan.bugs.v1` with adjusted statuses;
+consumers always read the latest artifact in the thread).
+
+Required: `schema_version`, `producer`, `scan_id`, `scanned_at`,
+`window`, `items`. `items` may be empty (then the artifact is still
+published so consumers can confirm the scan ran).
+
+---
+
+## 9. `feedback-scan.others.v1`
+
+Producer: `service_a1_feedback_scanner`. Consumer: human (channel
+public chat readers).
+
+Companion to §8 covering everything that is **not** an existing-bug.
+Designed to be human-skimmable and to support diff-against-previous-scan
+display in the channel public chat.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "service_a1_feedback_scanner",
+  "scan_id": "scan-2024-04-15T08:00Z",
+  "scanned_at": "2024-04-15T08:00:00Z",
+  "window": { "since": "2024-04-14T08:00:00Z", "until": "2024-04-15T08:00:00Z" },
+  "buckets": {
+    "new_request": [ { "feedback_id": "fbk-…", "title": "…", "summary": "…" } ],
+    "unclear":     [],
+    "duplicate":   [],
+    "not_actionable": []
+  },
+  "diff_vs_previous_scan": {
+    "previous_scan_id": "scan-2024-04-14T08:00Z",
+    "added":   [ { "feedback_id": "fbk-…", "bucket": "new_request" } ],
+    "removed": [ { "feedback_id": "fbk-…", "bucket": "unclear" } ]
+  }
+}
+```
+
+When a scan has no diff and no items in any bucket the scanner still
+publishes the artifact but skips the channel-public-chat announcement
+(noise threshold). Required: `schema_version`, `producer`, `scan_id`,
+`scanned_at`, `window`, `buckets`. `diff_vs_previous_scan` is omitted on
+the very first scan.
+
+---
+
+## 10. `mr-status-diff.v1`
+
+Producer: `svc_mr_detector` (replaces inline `status.update` payloads).
+Consumer: `actor_delivery` (the bound delivery thread re-activates on
+this artifact), `service_a1_bug_fix_loop`.
+
+Emitted on each MR transition that is not "merged" / "closed". Replaces
+the freeform `status.update` message previously used by mr-detector so
+downstream loops can subscribe declaratively.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "svc_mr_detector",
+  "mr_id": "https://gitlab.alibaba-inc.com/aone/joi-apps/merge_requests/4271",
+  "captured_at": "2024-04-15T09:14:02Z",
+  "previous_state": {
+    "ci_status": "running",
+    "labels": ["wip"],
+    "head_sha": "0a1b…",
+    "open_comments": 0,
+    "behind_target": false
+  },
+  "current_state": {
+    "ci_status": "failed",
+    "labels": ["wip", "ci-broken"],
+    "head_sha": "0a1b…",
+    "open_comments": 2,
+    "behind_target": true
+  },
+  "delta": {
+    "ci_status_changed": true,
+    "ci_failed": true,
+    "new_comments": 2,
+    "behind_target_changed": true,
+    "labels_added": ["ci-broken"],
+    "labels_removed": []
+  },
+  "actionable_summary": "CI 红了；落后 origin/master，需要 rebase；2 条新评论",
+  "raw_event_fingerprint": "sha256:…"
+}
+```
+
+Required: `schema_version`, `producer`, `mr_id`, `captured_at`,
+`current_state`, `delta`, `raw_event_fingerprint`. `previous_state` is
+omitted on the first artifact for an MR. `actionable_summary` is a
+short Chinese summary suitable for a `joi handoff` message body.
+
+---
+
+## 11. `mr-merged.v1`
+
+Producer: `svc_mr_detector`. Consumer:
+`service_a1_bug_fix_loop` (closes the loop iteration), `actor_router`
+(announce to channel), human.
+
+Terminal artifact: emitted exactly once per MR when the upstream state
+transitions to `merged`. mr-detector also writes
+`{"service.self_complete":true}` after this artifact so the
+thread-bound service host stops the instance.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "svc_mr_detector",
+  "mr_id": "https://gitlab.alibaba-inc.com/aone/joi-apps/merge_requests/4271",
+  "title": "fix: off-by-one in MR label sync",
+  "head_sha": "0a1b…",
+  "base_sha": "9f8e…",
+  "author": "octocat",
+  "labels": ["bugfix", "release-blocker"],
+  "merged_at": "2024-04-15T09:31:15Z",
+  "captured_at": "2024-04-15T09:31:16Z",
+  "linked_feedback_ids": ["fbk-2024-04-15-9911"],
+  "raw_event_fingerprint": "sha256:…"
+}
+```
+
+Required: `schema_version`, `producer`, `mr_id`, `merged_at`,
+`captured_at`, `raw_event_fingerprint`. `linked_feedback_ids` is
+populated when the bound thread carried a `bug-triage.v1` referencing
+specific feedback ids; otherwise omitted.
+
+---
+
+## 12. `training-plan.v1`
+
+Producer: `actor_classmaster`. Consumer: `actor_teacher`.
+
+Emitted in classroom when the human and classmaster have agreed on
+which actor to train and what the target behavior is. The plan names
+the actor under training, the success criteria (delegated to a regular
+`definition-of-done.json`), and the expected lesson sequence.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "actor_classmaster",
+  "training_id": "training-2024-04-15-router-intake-v2",
+  "target_actor": "actor_router",
+  "target_bundle_version": "v2-draft",
+  "summary": "router 入流分类对中英混合输入鲁棒性",
+  "lesson_sequence": [
+    "review 当前 SKILL.md",
+    "出 5 道入流分类作业（中文/英文/中英混合各 2/2/1）",
+    "teacher 评分；不通过则修订 SKILL.md 再出一轮",
+    "通过后发布新 bundle"
+  ],
+  "dod_artifact_uri": "joi://artifact/<sha256>",
+  "captured_at": "2024-04-15T10:00:00Z"
+}
+```
+
+Required: `schema_version`, `producer`, `training_id`, `target_actor`,
+`target_bundle_version`, `summary`, `lesson_sequence`, `captured_at`.
+`dod_artifact_uri` is required-to-link if a separate
+`definition-of-done.json` exists for the training; if the DoD is
+inline-only it may be omitted.
+
+---
+
+## 13. `homework.v1`
+
+Producer: `actor_teacher`. Consumer: `actor_teacher` (self, for
+grading), human reviewer (read-only).
+
+A homework set is one batch of test prompts that exercise the actor
+under training. Each prompt is run against the candidate bundle and
+the actor's reply is captured for grading. Homework is the input to
+`grading-report.v1`.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "actor_teacher",
+  "homework_id": "hw-training-2024-04-15-router-intake-v2-r1",
+  "training_id": "training-2024-04-15-router-intake-v2",
+  "target_actor": "actor_router",
+  "candidate_bundle_uri": "joi://bundle/actor_router/v2-draft",
+  "items": [
+    {
+      "prompt_id": "p1",
+      "input": "我要做一个新功能：把 router 拆成…（用户原文）",
+      "expected_classification": "new_task",
+      "actor_reply": "（teacher 在 dry-run 时填）",
+      "actor_handoff_target": "actor_discovery"
+    }
+  ],
+  "captured_at": "2024-04-15T10:30:00Z"
+}
+```
+
+Required: `schema_version`, `producer`, `homework_id`, `training_id`,
+`target_actor`, `candidate_bundle_uri`, `items`, `captured_at`.
+`actor_reply` and `actor_handoff_target` are filled in by the teacher
+after running the candidate bundle against each prompt.
+
+---
+
+## 14. `grading-report.v1`
+
+Producer: `actor_teacher`. Consumer: `actor_classmaster` (decides
+publish-or-revise), human.
+
+Emitted once per homework run. Each item is graded `pass` / `fail` /
+`partial` against `definition-of-done.json`. The report carries an
+overall verdict that classmaster uses to gate `approval.spec_apply`.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "actor_teacher",
+  "report_id": "grade-hw-training-…-r1",
+  "homework_id": "hw-training-2024-04-15-router-intake-v2-r1",
+  "training_id": "training-2024-04-15-router-intake-v2",
+  "verdict": "pass",
+  "score": { "pass": 4, "partial": 1, "fail": 0, "total": 5 },
+  "items": [
+    {
+      "prompt_id": "p1",
+      "result": "pass",
+      "reason": "正确分类为 new_task 并 handoff 给 actor_discovery"
+    }
+  ],
+  "recommendation": "publish",
+  "captured_at": "2024-04-15T11:00:00Z"
+}
+```
+
+Allowed values:
+- `verdict`: `"pass"` | `"fail"` | `"needs_revision"`.
+- `result` (per item): `"pass"` | `"partial"` | `"fail"`.
+- `recommendation`: `"publish"` | `"revise_skill_md"` | `"redo_homework"`.
+
+Required: `schema_version`, `producer`, `report_id`, `homework_id`,
+`training_id`, `verdict`, `score`, `items`, `recommendation`,
+`captured_at`.
+
+When `recommendation == "publish"`, classmaster MAY emit
+`approval.spec_apply` to install the new bundle as `current` for the
+target actor. When `verdict == "needs_revision"`, classmaster hands
+off to teacher with the reason for the next iteration.
 
 ---
 

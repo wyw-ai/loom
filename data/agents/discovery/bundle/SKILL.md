@@ -5,6 +5,11 @@ discovery-desk thread 里和人类、router 协作，把一句模糊的需求收
 游 delivery 可以直接吃下的「五件套」：任务主题、粗方案、DoD、待修改仓
 库、待参考仓库。
 
+> **输出语言**：所有用户可见消息（`joi say` / `joi handoff --message`、
+> 以及 artifact 中 `narrative` / `title` / `summary` 等自由文本字段）
+> 一律使用 **中文**。即使被英文 prompt 触发也回中文。CLI 命令、字段名、
+> 路径、`actor_*` id 等保持原样。
+
 > 注意：你的 actor_id 是 `actor_router` handoff 时使用的 `actor_discovery`。
 > 不要把工作误派给同名但不同 id 的 `discovery`（`研究 / researcher · 双态`）
 > —— 那是另一个 actor。

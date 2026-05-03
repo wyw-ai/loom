@@ -2392,6 +2392,14 @@ fn build_template_vars(
     if let Some(skill) = &tmpl.active_skill {
         vars.insert("prompt.activeSkill".into(), skill.clone());
     }
+    let bundle_current = scope_paths.agent_root.join("bundles").join("current");
+    vars.insert(
+        "agent.bundle".into(),
+        bundle_current.display().to_string(),
+    );
+    let skill_body = std::fs::read_to_string(bundle_current.join("SKILL.md"))
+        .unwrap_or_default();
+    vars.insert("agent.skillBody".into(), skill_body);
     for (k, v) in &tmpl.vars {
         vars.insert(format!("vars.{k}"), v.clone());
     }

@@ -5,7 +5,9 @@
 #   server-data/        joi-server's --data-dir
 #   agent-specs/        per-actor AgentSpec files (linked from data/agents/)
 #   service-specs/      per-service ServiceSpec files (linked from data/services/)
-#   profiles/<actor>/   actor profile dirs (claude/settings.json -> ~/.claude/settings-glm.json)
+#   agent-data/         JOI_AGENT_DATA_ROOT — agents/<id>/profile/claude/settings.json
+#                       lives here (linked to ~/.claude/settings-glm.json by default)
+#   service-data/       JOI_SERVICE_HOST_DATA
 #   pids/               PID files for joi-server / joi agent serve / joi service serve
 #   logs/               stdout/stderr capture
 #
@@ -18,8 +20,8 @@
 #
 # After `start`, set:
 #   export JOI_SERVER=ws://127.0.0.1:${JOI_E2E_PORT:-7900}/rpc
-#   export JOI_AGENT_SPECS=$JOI_E2E_ROOT/agent-specs
-#   export JOI_SERVICE_SPECS=$JOI_E2E_ROOT/service-specs
+#   export JOI_AGENT_DATA_ROOT=$JOI_E2E_ROOT/agent-data
+#   export JOI_SERVICE_HOST_DATA=$JOI_E2E_ROOT/service-data
 
 set -euo pipefail
 
@@ -38,7 +40,7 @@ cmd_build() {
 }
 
 prepare_dirs() {
-  mkdir -p "$ROOT"/{server-data,agent-specs,service-specs,profiles,pids,logs,fixtures}
+  mkdir -p "$ROOT"/{server-data,agent-specs,service-specs,agent-data,service-data,pids,logs,fixtures}
 }
 
 link_specs() {
@@ -69,8 +71,9 @@ link_specs() {
 }
 
 prepare_profiles() {
-  # Each agent gets a profile dir with claude/settings.json -> ~/.claude/settings-glm.json.
-  # GLM is the cheapest, picked as the e2e default. Override via JOI_E2E_CLAUDE_SETTINGS.
+  # AgentPaths::profile = $JOI_AGENT_DATA_ROOT/agents/<actor_id>/profile.
+  # We pre-create that path and link claude/settings.json so actor_profile
+  # provider mode finds it on first turn.
   src="${JOI_E2E_CLAUDE_SETTINGS:-$HOME/.claude/settings-glm.json}"
   if [ ! -f "$src" ]; then
     echo "WARN: $src not found; agents using actor_profile mode will fail." >&2
@@ -78,7 +81,9 @@ prepare_profiles() {
   for d in "$ROOT"/agent-specs/*/; do
     [ -d "$d" ] || continue
     id="$(basename "$d")"
-    pdir="$ROOT/profiles/$id/claude"
+    actor="$(awk -F'"' '/"id"/ {print $4; exit}' "$d/spec.json")"
+    [ -n "$actor" ] || actor="$id"
+    pdir="$ROOT/agent-data/agents/$actor/profile/claude"
     mkdir -p "$pdir"
     if [ -f "$src" ] && [ ! -e "$pdir/settings.json" ]; then
       ln -sf "$src" "$pdir/settings.json"
@@ -106,9 +111,7 @@ start_agent_host() {
   fi
   nohup env \
     JOI_SERVER="ws://127.0.0.1:$PORT/rpc" \
-    JOI_AGENT_SPECS="$ROOT/agent-specs" \
-    JOI_AGENT_DATA="$ROOT/agent-data" \
-    JOI_AGENT_PROFILES="$ROOT/profiles" \
+    JOI_AGENT_DATA_ROOT="$ROOT/agent-data" \
     "$BIN_JOI" agent serve --specs "$ROOT/agent-specs" \
     >"$ROOT/logs/agent-host.log" 2>&1 &
   echo $! > "$ROOT/pids/agent-host.pid"
@@ -125,8 +128,7 @@ start_service_host() {
   fi
   nohup env \
     JOI_SERVER="ws://127.0.0.1:$PORT/rpc" \
-    JOI_SERVICE_SPECS="$ROOT/service-specs" \
-    JOI_SERVICE_DATA="$ROOT/service-data" \
+    JOI_SERVICE_HOST_DATA="$ROOT/service-data" \
     "$BIN_JOI" service serve --specs "$ROOT/service-specs" \
     >"$ROOT/logs/service-host.log" 2>&1 &
   echo $! > "$ROOT/pids/service-host.pid"
@@ -147,9 +149,10 @@ cmd_start() {
   cat <<EOF
 ready.
   export JOI_SERVER=ws://127.0.0.1:$PORT/rpc
-  export JOI_AGENT_SPECS=$ROOT/agent-specs
-  export JOI_SERVICE_SPECS=$ROOT/service-specs
-logs: $ROOT/logs/
+  export JOI_AGENT_DATA_ROOT=$ROOT/agent-data
+  export JOI_SERVICE_HOST_DATA=$ROOT/service-data
+specs:  $ROOT/agent-specs  $ROOT/service-specs
+logs:   $ROOT/logs/
 EOF
 }
 

@@ -42,7 +42,12 @@
         },
         "dedupeBy": "source_event_id",
         "cursorBy": "body_hash",
-        "singleInFlight": true
+        "singleInFlight": true,
+        "emit": {
+          "mode": "artifact_per_json_line",
+          "artifactNameTemplate": "mr-event-{event_kind}-{mr_id}.json",
+          "statusEventType": "status.update"
+        }
       }
     ],
     "self_complete_on": {

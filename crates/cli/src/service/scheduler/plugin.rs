@@ -46,7 +46,10 @@ use crate::service::runtime::ServiceRuntime;
 
 use super::cron::Schedule;
 use super::source::exec_source;
-use super::spec::{CursorBy, DedupeBy, JobSpec, SchedulerConfig, ScopeBinding, ScopeKind, Source};
+use super::spec::{
+    CursorBy, DedupeBy, EmitConfig, EmitMode, JobSpec, SchedulerConfig, ScopeBinding, ScopeKind,
+    Source,
+};
 
 /// Plugin-kind discriminator used by [`crate::service::ServiceHost`].
 pub const KIND: &str = "scheduler";
@@ -395,18 +398,24 @@ async fn fire_once(
             };
 
             if !dedupe_skip {
-                let body_text = stringify_body(body);
-                let meta = build_meta(job, fire_time, &body_hash);
-                let id = if let Some(target) = job.target_agent.as_deref() {
-                    runtime
-                        .handoff(target, scope.clone(), body_text.clone(), Some(meta))
+                let id = if let Some(emit) = job.emit.as_ref() {
+                    emit_per_line(emit, body, &runtime, scope.clone(), job, fire_time, &body_hash)
                         .await
-                        .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
+                        .with_context(|| format!("scheduler emit-per-line for job `{}`", job.id))?
                 } else {
-                    runtime
-                        .append_content(scope.clone(), body_text.clone(), Vec::new(), Some(meta))
-                        .await
-                        .with_context(|| format!("scheduler append for job `{}`", job.id))?
+                    let body_text = stringify_body(body);
+                    let meta = build_meta(job, fire_time, &body_hash);
+                    if let Some(target) = job.target_agent.as_deref() {
+                        runtime
+                            .handoff(target, scope.clone(), body_text.clone(), Some(meta))
+                            .await
+                            .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
+                    } else {
+                        runtime
+                            .append_content(scope.clone(), body_text.clone(), Vec::new(), Some(meta))
+                            .await
+                            .with_context(|| format!("scheduler append for job `{}`", job.id))?
+                    }
                 };
                 event_id = Some(id);
 
@@ -559,6 +568,139 @@ fn stringify_body(body: &[u8]) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
+/// Emit one artifact + one `status.update` event per non-empty JSON
+/// line in `body`. Returns the id of the *last* event appended so the
+/// caller can drive the regular cursor / await_responds_to bookkeeping.
+/// A line that fails JSON parse is logged and skipped — one bad line
+/// must not block subsequent transitions in the same tick. When zero
+/// lines are emittable, returns the body-hash-stamped no-op event id
+/// to preserve cursor invariants.
+async fn emit_per_line(
+    emit: &EmitConfig,
+    body: &[u8],
+    runtime: &ServiceRuntime,
+    scope: ScopeRef,
+    job: &JobSpec,
+    fire_time: DateTime<Utc>,
+    body_hash: &str,
+) -> Result<String> {
+    if !matches!(emit.mode, EmitMode::ArtifactPerJsonLine) {
+        // Defensive: future EmitMode variants must extend this.
+        anyhow::bail!("unsupported emit mode for job `{}`", job.id);
+    }
+    let text = String::from_utf8_lossy(body);
+    let mut last_event_id: Option<String> = None;
+    let template = emit
+        .artifact_name_template
+        .clone()
+        .unwrap_or_else(|| format!("{}-{{event_kind}}.json", job.id));
+    let mut emitted = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let payload: Value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                tracing::warn!(
+                    job = %job.id,
+                    "emit-per-line: skipping non-object JSON line",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    job = %job.id,
+                    error = %e,
+                    "emit-per-line: skipping unparseable line",
+                );
+                continue;
+            }
+        };
+        let name = render_artifact_name(&template, &payload);
+        let body_text = serde_json::to_string(&payload)
+            .with_context(|| "serialize artifact body")?;
+        let (artifact_id, _uri) = runtime
+            .publish_artifact(scope.clone(), name.clone(), Some("application/json".into()), body_text)
+            .await
+            .with_context(|| format!("publish_artifact for job `{}`", job.id))?;
+        let mut meta = build_meta(job, fire_time, body_hash);
+        meta.insert(
+            "artifactName".into(),
+            Value::String(name.clone()),
+        );
+        let event_id = runtime
+            .append_status(
+                scope.clone(),
+                emit.status_event_type.clone(),
+                payload,
+                Some(&artifact_id),
+                Some(meta),
+            )
+            .await
+            .with_context(|| format!("append_status for job `{}`", job.id))?;
+        last_event_id = Some(event_id);
+        emitted += 1;
+    }
+    if emitted == 0 {
+        // No usable lines — fall back to a single empty status.update so
+        // cursor / await_responds_to plumbing remains coherent.
+        let meta = build_meta(job, fire_time, body_hash);
+        let id = runtime
+            .append_status(
+                scope,
+                emit.status_event_type.clone(),
+                json!({"empty": true}),
+                None,
+                Some(meta),
+            )
+            .await?;
+        return Ok(id);
+    }
+    Ok(last_event_id.expect("emitted > 0 implies last_event_id set"))
+}
+
+/// Substitute `{key}` tokens in `template` with the matching top-level
+/// string field from `payload`. Missing or non-string fields render as
+/// the literal placeholder so the artifact name flags the gap rather
+/// than silently coalescing distinct events.
+fn render_artifact_name(template: &str, payload: &Value) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(close) = template[i..].find('}') {
+                let key = &template[i + 1..i + close];
+                let replacement = payload
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(sanitize_name_segment)
+                    .unwrap_or_else(|| format!("{{{key}}}"));
+                out.push_str(&replacement);
+                i += close + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn sanitize_name_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Sentinel parsed off the last line of a tick's stdout. See §4.7.3.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct SelfCompleteSentinel {
@@ -656,7 +798,30 @@ mod tests {
             single_in_flight: true,
             await_reply: false,
             await_timeout_secs: 60,
+            emit: None,
         }
+    }
+
+    #[test]
+    fn render_artifact_name_substitutes_top_level_fields() {
+        let payload = json!({"event_kind": "merged", "mr_id": 42});
+        let out = render_artifact_name("mr-event-{event_kind}-{mr_id}.json", &payload);
+        // mr_id is a number, not a string, so it's left as the literal placeholder.
+        assert_eq!(out, "mr-event-merged-{mr_id}.json");
+    }
+
+    #[test]
+    fn render_artifact_name_sanitizes_unsafe_chars() {
+        let payload = json!({"event_kind": "build/passed?", "mr_id": "12"});
+        let out = render_artifact_name("mr-{event_kind}-{mr_id}.json", &payload);
+        assert_eq!(out, "mr-build_passed_-12.json");
+    }
+
+    #[test]
+    fn render_artifact_name_keeps_unknown_placeholders() {
+        let payload = json!({"event_kind": "merged"});
+        let out = render_artifact_name("mr-{event_kind}-{missing}.json", &payload);
+        assert_eq!(out, "mr-merged-{missing}.json");
     }
 
     #[test]

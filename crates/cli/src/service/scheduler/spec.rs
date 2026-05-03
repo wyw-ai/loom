@@ -62,6 +62,43 @@ pub struct JobSpec {
     /// Default 60s; only consulted when `await_reply = true`.
     #[serde(default = "default_await_timeout_secs")]
     pub await_timeout_secs: u64,
+    /// Optional output mode. When unset (`None`), the scheduler emits a
+    /// single `content.add` event per tick whose body is the entire
+    /// stdout (legacy behavior). When set to
+    /// `EmitMode::ArtifactPerJsonLine`, each non-empty stdout line is
+    /// parsed as a JSON object, published as its own artifact, and
+    /// announced via a `status.update` event with an `attaches_artifact`
+    /// relation. See `docs/artifact-contracts.md` §6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emit: Option<EmitConfig>,
+}
+
+/// How the scheduler turns one fire's stdout into Joi events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmitConfig {
+    /// Mode discriminator. Currently only `artifact_per_json_line` adds
+    /// behavior beyond the default content-event path.
+    pub mode: EmitMode,
+    /// Template for the artifact name. Placeholders inside `{}` are
+    /// substituted from each parsed JSON line's top-level keys
+    /// (e.g. `{event_kind}` reads `payload.event_kind`). Plain text
+    /// outside `{}` is used verbatim.
+    #[serde(default)]
+    pub artifact_name_template: Option<String>,
+    /// Event kind to emit for each artifact. Defaults to `status.update`.
+    #[serde(default = "default_status_event_type")]
+    pub status_event_type: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmitMode {
+    ArtifactPerJsonLine,
+}
+
+fn default_status_event_type() -> String {
+    "status.update".to_string()
 }
 
 /// `command` or `http`. Tagged on `kind` to keep specs human-readable.
@@ -284,6 +321,7 @@ mod tests {
             single_in_flight: true,
             await_reply: false,
             await_timeout_secs: 60,
+            emit: None,
         }
     }
 

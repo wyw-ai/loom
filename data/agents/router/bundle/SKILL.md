@@ -16,6 +16,7 @@ handoff 给 `classmaster` 做任务定型。
 | 需要新写或更新 lesson plan | `teacher` |
 | 仓库 bootstrap / 仓库发现缺失 | `discovery` |
 | Lesson plan 已就位、有活要干 | `delivery` |
+| 单条用户反馈 / 报错 / 缺陷分流 | `actor_a1_bug_triage` |
 | 用户说 "扫一下最近的反馈/缺陷" | `feedback-fix-orchestrator` |
 | 单纯的状态/问候性问题 | 自己用 `joi event append` 回 |
 

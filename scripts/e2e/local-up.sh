@@ -97,7 +97,8 @@ start_server() {
   if pgrep -f "joi-server.*--bind 127.0.0.1:$PORT" >/dev/null 2>&1; then
     echo "joi-server already running on $PORT"; return
   fi
-  nohup "$BIN_SERVER" --bind "127.0.0.1:$PORT" --data-dir "$ROOT/server-data" \
+  nohup env PATH="$REPO_ROOT/target/release:$PATH" \
+    "$BIN_SERVER" --bind "127.0.0.1:$PORT" --data-dir "$ROOT/server-data" \
     >"$ROOT/logs/server.log" 2>&1 &
   echo $! > "$ROOT/pids/server.pid"
   sleep 1
@@ -112,6 +113,7 @@ start_agent_host() {
     echo "joi agent serve already running"; return
   fi
   nohup env \
+    PATH="$REPO_ROOT/target/release:$PATH" \
     JOI_SERVER="ws://127.0.0.1:$PORT/rpc" \
     JOI_AGENT_DATA_ROOT="$ROOT/agent-data" \
     "$BIN_JOI" agent serve --specs "$ROOT/agent-specs" \
@@ -133,6 +135,7 @@ start_service_host() {
   # may override before invoking poll directly.
   : "${MR_DETECTOR_FETCH_CMD:=$REPO_ROOT/tests/e2e/fixtures/mr-fetch-merged.sh}"
   nohup env \
+    PATH="$REPO_ROOT/target/release:$PATH" \
     JOI_SERVER="ws://127.0.0.1:$PORT/rpc" \
     JOI_SERVICE_HOST_DATA="$ROOT/service-data" \
     MR_DETECTOR_FETCH_CMD="$MR_DETECTOR_FETCH_CMD" \

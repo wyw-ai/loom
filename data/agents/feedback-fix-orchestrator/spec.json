@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_feedback_fix_orchestrator",
     "kind": "agent",
-    "displayName": "反馈修复编排"
+    "displayName": "\u53cd\u9988\u4fee\u590d\u7f16\u6392"
   },
   "transport": {
     "kind": "interactive_command",
@@ -10,40 +10,68 @@
     "args": [],
     "env": {},
     "model": "claude-sonnet-4.6",
-    "session": {
-      "idStrategy": "joi_uuid_per_scope",
-      "newArgs": ["{prompt}", "--session-id", "{session_id}"],
-      "resumeArgs": ["{prompt}", "--resume", "{session_id}"],
-      "onMissing": "create",
-      "onSignatureChanged": "create",
-      "onResumeFailed": "fail"
-    },
-    "prompt": {
-      "template": "{joi_envelope}",
-      "completionContract": {
-        "sentinel": "__JOI_DONE__",
-        "instruction": "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it."
-      }
-    },
-    "completion": {
-      "detect": "sentinel",
-      "stripSentinel": true,
-      "idleTimeoutMs": 30000,
-      "maxTurnMs": 1800000
-    },
-    "output": {
-      "stripAnsi": true,
-      "stderr": "trace",
-      "streamPartial": true
-    },
-    "kill": {
-      "onComplete": { "action": "sigterm", "graceMs": 3000, "fallback": "sigkill" },
-      "onCancel": { "action": "sigterm", "graceMs": 1000, "fallback": "sigkill" },
-      "onTimeout": { "action": "sigkill" }
-    },
     "provider": {
       "kind": "claude",
-      "settings": { "mode": "actor_profile" }
+      "settings": {
+        "mode": "actor_profile"
+      }
+    },
+    "interactive": {
+      "session": {
+        "idStrategy": "joi_uuid_per_scope",
+        "newArgs": [
+          "--print",
+          "--permission-mode",
+          "bypassPermissions",
+          "{prompt}",
+          "--session-id",
+          "{session_id}"
+        ],
+        "resumeArgs": [
+          "--print",
+          "--permission-mode",
+          "bypassPermissions",
+          "{prompt}",
+          "--resume",
+          "{session_id}"
+        ],
+        "onMissing": "create",
+        "onSignatureChanged": "create",
+        "onResumeFailed": "fail"
+      },
+      "prompt": {
+        "template": "{joi_envelope}",
+        "completionContract": {
+          "sentinel": "__JOI_DONE__",
+          "instruction": "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it."
+        }
+      },
+      "completion": {
+        "detect": "sentinel",
+        "stripSentinel": true,
+        "idleTimeoutMs": 30000,
+        "maxTurnMs": 1800000
+      },
+      "output": {
+        "stripAnsi": true,
+        "stderr": "trace",
+        "streamPartial": true
+      },
+      "kill": {
+        "onComplete": {
+          "action": "sigterm",
+          "graceMs": 3000,
+          "fallback": "sigkill"
+        },
+        "onCancel": {
+          "action": "sigterm",
+          "graceMs": 1000,
+          "fallback": "sigkill"
+        },
+        "onTimeout": {
+          "action": "sigkill"
+        }
+      }
     }
   },
   "autostart": false,

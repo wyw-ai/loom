@@ -41,6 +41,8 @@ cmd_build() {
 
 prepare_dirs() {
   mkdir -p "$ROOT"/{server-data,agent-specs,service-specs,agent-data,service-data,pids,logs,fixtures}
+  # Pre-bake a bare repo for mount projection. Re-runs are no-ops.
+  "$REPO_ROOT/tests/e2e/fixtures/make-bare-repo.sh" "$ROOT/fixtures/repo.git" >/dev/null
 }
 
 link_specs() {
@@ -126,9 +128,14 @@ start_service_host() {
   if [ -f "$ROOT/pids/service-host.pid" ] && kill -0 "$(cat "$ROOT/pids/service-host.pid")" 2>/dev/null; then
     echo "joi service serve already running"; return
   fi
+  # Default mr-detector to the merged fixture so the local "thread close"
+  # path exercises end-to-end without a real MR backend. Driver scripts
+  # may override before invoking poll directly.
+  : "${MR_DETECTOR_FETCH_CMD:=$REPO_ROOT/tests/e2e/fixtures/mr-fetch-merged.sh}"
   nohup env \
     JOI_SERVER="ws://127.0.0.1:$PORT/rpc" \
     JOI_SERVICE_HOST_DATA="$ROOT/service-data" \
+    MR_DETECTOR_FETCH_CMD="$MR_DETECTOR_FETCH_CMD" \
     "$BIN_JOI" service serve --specs "$ROOT/service-specs" \
     >"$ROOT/logs/service-host.log" 2>&1 &
   echo $! > "$ROOT/pids/service-host.pid"
@@ -152,6 +159,7 @@ ready.
   export JOI_AGENT_DATA_ROOT=$ROOT/agent-data
   export JOI_SERVICE_HOST_DATA=$ROOT/service-data
 specs:  $ROOT/agent-specs  $ROOT/service-specs
+fixtures: $ROOT/fixtures/repo.git (bare); MR_DETECTOR_FETCH_CMD=$MR_DETECTOR_FETCH_CMD
 logs:   $ROOT/logs/
 EOF
 }

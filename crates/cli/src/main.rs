@@ -449,6 +449,12 @@ enum ThreadCmd {
         #[arg(long)]
         channel: Option<String>,
     },
+    /// Delete a thread by id. Thread-bound services watching this
+    /// thread (`bind.auto_stop_on=["thread.closed"]`, §4.7.3) reap
+    /// their instances on the next watcher tick.
+    Delete {
+        thread_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -958,6 +964,7 @@ async fn main() -> Result<()> {
                     .await?
             }
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
+            ThreadCmd::Delete { thread_id } => cmd::thread::delete(client, thread_id).await?,
         },
         Cmd::Say {
             text,

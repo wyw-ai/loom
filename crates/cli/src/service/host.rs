@@ -440,6 +440,11 @@ async fn run_one_instance(
 /// * For each `active` entry whose request file has disappeared
 ///   without the task finishing (`joi service stop` removed it
 ///   externally), aborts the task and drops it.
+/// * **If `bind.auto_stop_on` contains `"thread.closed"`**: each
+///   tick lists threads visible to the spec's service actor; any
+///   active instance whose `instance_id` (= bound thread id) is no
+///   longer in that list is treated as closed → reap (delete
+///   request.json + drop the join handle), per §4.7.3.
 /// * On `shutdown` notification, aborts every active task and exits.
 ///
 /// The watcher itself is panic-free: per-instance failures are
@@ -455,8 +460,23 @@ async fn supervise_instances(
 ) -> Result<()> {
     let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
     let spec_id = spec.id.clone();
+    let actor_id = spec.actor.id.clone();
+    let watch_thread_closed = spec
+        .bind
+        .as_ref()
+        .map(|b| b.auto_stop_on.iter().any(|e| e == "thread.closed"))
+        .unwrap_or(false);
 
-    tracing::info!(spec_id = %spec_id, "thread-bound instance watcher started");
+    // Long-lived client used only for thread/list visibility checks
+    // when auto_stop_on contains "thread.closed". Lazy-initialised so
+    // specs without that opt-in don't pay the connection cost.
+    let mut visibility: Option<Arc<crate::client::Client>> = None;
+
+    tracing::info!(
+        spec_id = %spec_id,
+        watch_thread_closed,
+        "thread-bound instance watcher started"
+    );
 
     loop {
         if *shutdown.borrow() {
@@ -491,6 +511,60 @@ async fn supervise_instances(
                     error = ?e,
                     "instance task finished but request.json delete failed",
                 ),
+            }
+        }
+
+        // 1b. If `auto_stop_on` contains `thread.closed`, ask the
+        //     server which threads still exist and reap any active
+        //     instance whose bound thread id is no longer visible.
+        //     Skips silently on transient RPC errors so the watcher
+        //     stays panic-free.
+        if watch_thread_closed && !active.is_empty() {
+            let visible = match thread_visibility_check(
+                &mut visibility,
+                &server_url,
+                &actor_id,
+                &spec_id,
+            )
+            .await
+            {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        spec_id = %spec_id,
+                        error = ?e,
+                        "thread visibility check failed; deferring auto_stop_on=thread.closed",
+                    );
+                    None
+                }
+            };
+            if let Some(visible_set) = visible {
+                let closed: Vec<String> = active
+                    .keys()
+                    .filter(|k| !visible_set.contains(*k))
+                    .cloned()
+                    .collect();
+                for instance_id in closed {
+                    if let Some(handle) = active.remove(&instance_id) {
+                        tracing::info!(
+                            spec_id = %spec_id,
+                            instance_id = %instance_id,
+                            "bound thread no longer visible; reaping (auto_stop_on=thread.closed)",
+                        );
+                        handle.abort();
+                        match super::instance::delete_request(
+                            &data_root, &spec_id, &instance_id,
+                        ) {
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                spec_id = %spec_id,
+                                instance_id = %instance_id,
+                                error = ?e,
+                                "delete_request after thread.closed failed",
+                            ),
+                        }
+                    }
+                }
             }
         }
 
@@ -584,6 +658,49 @@ async fn supervise_instances(
     Ok(())
 }
 
+/// Open (lazily) a watcher-side WS client and ask the server which
+/// threads the spec's service actor can see. Returns the set of
+/// thread ids; the caller treats any active instance whose
+/// `instance_id` is missing from this set as "thread closed".
+///
+/// On the first call, opens a fresh connection as `actor_id` and
+/// caches it in `slot`. Subsequent calls reuse the cached client. If
+/// the cached client has gone bad (e.g. server restarted), the caller
+/// sees the error, logs it, and we drop the slot so the next tick
+/// reconnects.
+async fn thread_visibility_check(
+    slot: &mut Option<Arc<crate::client::Client>>,
+    server_url: &str,
+    actor_id: &str,
+    spec_id: &str,
+) -> Result<HashSet<String>> {
+    use proto::methods::{method, ThreadListResult};
+    use serde_json::json;
+
+    if slot.is_none() {
+        let client = crate::client::Client::connect(server_url)
+            .await
+            .with_context(|| format!("watcher ws connect {server_url}"))?;
+        client
+            .open_connection_as(actor_id, "service", None)
+            .await
+            .with_context(|| format!("watcher connection/open as {actor_id}"))?;
+        *slot = Some(client);
+    }
+    let client = slot.as_ref().expect("just initialised");
+
+    let res: ThreadListResult = match client.call(method::THREAD_LIST, json!({})).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Drop the (possibly broken) client so next tick reconnects.
+            *slot = None;
+            return Err(anyhow::anyhow!(
+                "thread/list rpc failed for spec `{spec_id}`: {e}"
+            ));
+        }
+    };
+    Ok(res.threads.into_iter().map(|t| t.id).collect())
+}
 /// Pure helper: given the set of currently-listed instance ids and
 /// the currently-active set, return `(to_spawn, to_drop)`. Extracted
 /// so the watcher's diff logic is unit-testable without a tokio

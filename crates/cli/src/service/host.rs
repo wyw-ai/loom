@@ -16,14 +16,15 @@
 //! useful in S1 for end-to-end wiring tests: register a no-op plugin,
 //! call `serve`, prove the connection lifecycle works.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use proto::methods::ServiceSpec;
+use proto::methods::{ServiceLifecycle, ServiceSpec};
 use tokio::sync::watch;
+use tokio::task::AbortHandle;
 use tokio::time::sleep;
 
 use crate::client::Client;
@@ -106,29 +107,62 @@ impl ServiceHost {
                 );
                 continue;
             };
-            if !spec.autostart {
-                tracing::info!(spec_id = %spec.id, "autostart=false; skipping spec");
-                continue;
-            }
             let server_url = self.server_url.clone();
             let data_root = self.data_root.clone();
             let shutdown_rx = shutdown_rx.clone();
             let spec_id = spec.id.clone();
             let specs_dir = self.specs_dir.clone();
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = supervise_spec(
-                    spec,
-                    plugin,
-                    server_url,
-                    data_root,
-                    shutdown_rx,
-                    specs_dir,
-                )
-                .await
-                {
-                    tracing::error!(spec_id = %spec_id, error = ?e, "plugin task failed");
+            match spec.lifecycle {
+                ServiceLifecycle::ChannelSingleton => {
+                    if !spec.autostart {
+                        tracing::info!(
+                            spec_id = %spec.id,
+                            "autostart=false; skipping channel-singleton spec",
+                        );
+                        continue;
+                    }
+                    handles.push(tokio::spawn(async move {
+                        if let Err(e) = supervise_spec(
+                            spec,
+                            plugin,
+                            server_url,
+                            data_root,
+                            shutdown_rx,
+                            specs_dir,
+                        )
+                        .await
+                        {
+                            tracing::error!(spec_id = %spec_id, error = ?e, "plugin task failed");
+                        }
+                    }));
                 }
-            }));
+                ServiceLifecycle::ThreadBound => {
+                    // Thread-bound specs ignore `autostart` at the
+                    // host level — the watcher always runs so that a
+                    // later `joi service start --in <thread>` writes
+                    // a request file and is picked up. `autostart`
+                    // semantics for thread-bound are reserved for a
+                    // future "auto-spawn one instance per existing
+                    // thread" mode.
+                    handles.push(tokio::spawn(async move {
+                        if let Err(e) = supervise_instances(
+                            spec,
+                            plugin,
+                            server_url,
+                            data_root,
+                            shutdown_rx,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                spec_id = %spec_id,
+                                error = ?e,
+                                "instance watcher failed",
+                            );
+                        }
+                    }));
+                }
+            }
         }
         for h in handles {
             let _ = h.await;
@@ -305,8 +339,205 @@ async fn run_one_spec(
             spec,
             runtime,
             shutdown,
+            instance: None,
         })
         .await
+}
+
+/// Per-instance plugin task for a `lifecycle = thread_bound` spec.
+/// Mirrors [`run_one_spec`] but binds the [`ServiceRuntime`] to a
+/// thread-scoped state dir and carries the [`InstanceRequest`] into
+/// the plugin's [`ServiceContext`].
+async fn run_one_instance(
+    spec: ServiceSpec,
+    plugin: Arc<dyn ServicePlugin>,
+    server_url: String,
+    data_root: PathBuf,
+    shutdown: ShutdownSignal,
+    request: super::instance::InstanceRequest,
+) -> Result<()> {
+    let actor_id = spec.actor.id.clone();
+    let instance_id = request.scope.id.clone();
+    let display = spec.actor.display_name.clone();
+    let display_opt = if display.is_empty() {
+        None
+    } else {
+        Some(display.as_str())
+    };
+
+    let client = Client::connect(&server_url)
+        .await
+        .with_context(|| format!("ws connect {server_url}"))?;
+    client.initialize().await.context("rpc initialize")?;
+    client
+        .open_connection_as(&actor_id, "service", display_opt)
+        .await
+        .with_context(|| format!("connection/open as {actor_id}"))?;
+
+    let runtime = ServiceRuntime::start_instance(
+        spec.id.clone(),
+        actor_id.clone(),
+        instance_id,
+        client,
+        &data_root,
+    )?;
+    runtime
+        .actor_upsert(spec.actor.clone())
+        .await
+        .with_context(|| format!("actor/upsert for {actor_id}"))?;
+
+    plugin
+        .run(ServiceContext {
+            spec,
+            runtime,
+            shutdown,
+            instance: Some(request),
+        })
+        .await
+}
+
+/// Watcher loop for `lifecycle = thread_bound` specs (§4.7.3).
+///
+/// Polls `<data_root>/services/<spec.id>/instances/` once per second:
+///
+/// * For each `<thread_id>/request.json` not in `active`, reads the
+///   request and spawns [`run_one_instance`] with an [`AbortHandle`]
+///   stored under the thread id.
+/// * For each `active` entry whose request file has disappeared,
+///   aborts the task and drops it. Disappearance is the canonical
+///   stop signal (`joi service stop` or scheduler self_complete both
+///   delete the file).
+/// * On `shutdown` notification, aborts every active task and exits.
+///
+/// The watcher itself is panic-free: per-instance failures are
+/// logged and do not unwind the loop. Returning `Ok(())` is the only
+/// non-panic outcome.
+async fn supervise_instances(
+    spec: ServiceSpec,
+    plugin: Arc<dyn ServicePlugin>,
+    server_url: String,
+    data_root: PathBuf,
+    mut shutdown: ShutdownSignal,
+) -> Result<()> {
+    let mut active: HashMap<String, AbortHandle> = HashMap::new();
+    let spec_id = spec.id.clone();
+
+    tracing::info!(spec_id = %spec_id, "thread-bound instance watcher started");
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        // Diff filesystem state vs in-memory active map.
+        let listed = match super::instance::list_instances(&data_root, &spec_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(spec_id = %spec_id, error = ?e, "list_instances failed");
+                Vec::new()
+            }
+        };
+        let listed_set: HashSet<String> = listed.iter().cloned().collect();
+
+        // Stop instances whose request files have been removed.
+        let to_drop: Vec<String> = active
+            .keys()
+            .filter(|k| !listed_set.contains(*k))
+            .cloned()
+            .collect();
+        for instance_id in to_drop {
+            if let Some(handle) = active.remove(&instance_id) {
+                tracing::info!(
+                    spec_id = %spec_id,
+                    instance_id = %instance_id,
+                    "request file gone; aborting instance task",
+                );
+                handle.abort();
+            }
+        }
+
+        // Spawn instances that appeared since the last tick.
+        for instance_id in listed {
+            if active.contains_key(&instance_id) {
+                continue;
+            }
+            let request = match super::instance::read_request(&data_root, &spec_id, &instance_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        spec_id = %spec_id,
+                        instance_id = %instance_id,
+                        error = ?e,
+                        "read_request failed; skipping",
+                    );
+                    continue;
+                }
+            };
+            tracing::info!(
+                spec_id = %spec_id,
+                instance_id = %instance_id,
+                "spawning instance task",
+            );
+            let plugin_c = plugin.clone();
+            let server_c = server_url.clone();
+            let data_c = data_root.clone();
+            let shutdown_c = shutdown.clone();
+            let spec_c = spec.clone();
+            let inst_for_log = instance_id.clone();
+            let spec_for_log = spec_id.clone();
+            let join = tokio::spawn(async move {
+                if let Err(e) = run_one_instance(
+                    spec_c, plugin_c, server_c, data_c, shutdown_c, request,
+                )
+                .await
+                {
+                    tracing::error!(
+                        spec_id = %spec_for_log,
+                        instance_id = %inst_for_log,
+                        error = ?e,
+                        "instance task failed",
+                    );
+                }
+            });
+            active.insert(instance_id, join.abort_handle());
+        }
+
+        // Wait either for next tick or shutdown.
+        tokio::select! {
+            _ = sleep(Duration::from_millis(1000)) => {}
+            _ = shutdown.changed() => {}
+        }
+    }
+
+    tracing::info!(spec_id = %spec_id, "thread-bound watcher shutting down");
+    for (_, handle) in active.drain() {
+        handle.abort();
+    }
+    Ok(())
+}
+
+/// Pure helper: given the set of currently-listed instance ids and
+/// the currently-active set, return `(to_spawn, to_drop)`. Extracted
+/// so the watcher's diff logic is unit-testable without a tokio
+/// runtime or filesystem.
+#[cfg(test)]
+fn diff_instances(
+    listed: &[String],
+    active: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let listed_set: HashSet<&str> = listed.iter().map(String::as_str).collect();
+    let to_spawn: Vec<String> = listed
+        .iter()
+        .filter(|id| !active.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let to_drop: Vec<String> = active
+        .iter()
+        .filter(|id| !listed_set.contains(id.as_str()))
+        .cloned()
+        .collect();
+    (to_spawn, to_drop)
 }
 
 #[cfg(test)]
@@ -407,5 +638,32 @@ mod tests {
             "unexpected error: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn diff_instances_spawns_new_and_drops_gone() {
+        let listed = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+        let mut active: HashSet<String> = HashSet::new();
+        active.insert("t2".to_string());
+        active.insert("t9".to_string());
+
+        let (mut to_spawn, mut to_drop) = diff_instances(&listed, &active);
+        to_spawn.sort();
+        to_drop.sort();
+
+        assert_eq!(to_spawn, vec!["t1".to_string(), "t3".to_string()]);
+        assert_eq!(to_drop, vec!["t9".to_string()]);
+    }
+
+    #[test]
+    fn diff_instances_no_change_returns_empty() {
+        let listed = vec!["t1".to_string(), "t2".to_string()];
+        let mut active: HashSet<String> = HashSet::new();
+        active.insert("t1".to_string());
+        active.insert("t2".to_string());
+
+        let (to_spawn, to_drop) = diff_instances(&listed, &active);
+        assert!(to_spawn.is_empty());
+        assert!(to_drop.is_empty());
     }
 }

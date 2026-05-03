@@ -36,6 +36,54 @@
   §4）。
 - Validation report 必须在 `dod_artifact` 字段里引用 DoD artifact 的 id。
 
+## 阶段 C —— spec_apply 教学收口（可选）
+
+如果这次教学 **要直接修改另一个 actor 的 spec**（例如把它的 prompt
+模板换掉、给 bundle 塞一段新 SKILL 片段），按 `docs/artifact-contracts.md` §4
+的 `spec_apply` 协议走，**不要**自己去写 `data/agents/<id>/spec.json`：
+
+1. lesson-plan.md 的第一段 `json` 围栏里加 `spec_apply` 块。**target.id
+   是 spec 目录名**（不是 actor.id）；`spec_patch` 是 deep-merge JSON；
+   `bundle_writes[].path` 相对 `<spec-dir>/bundle/`（禁止绝对路径或
+   `..`）：
+
+   ```json
+   {
+     "schema_version": "1",
+     "producer": "teacher",
+     "task_id": "task-...",
+     "skills": [],
+     "spec_apply": {
+       "target": { "kind": "agent", "id": "lesson-target" },
+       "spec_patch": { "actor": { "displayName": "after-via-llm" } },
+       "bundle_writes": [
+         { "path": "NOTE.md", "contents": "# updated by teacher\n" }
+       ]
+     }
+   }
+   ```
+
+2. 紧接着用 `joi event append --type action.request` 把这份
+   lesson-plan 顶给 human。**没有** `joi action request` 子命令。
+
+   ```bash
+   payload='{"requestType":"approval.spec_apply","title":"Apply lesson-plan","choices":[{"id":"approve","label":"Approve"},{"id":"reject","label":"Reject"}]}'
+   joi --json event append \
+     --in "$thread_id" \
+     --type action.request \
+     --content-type application/json \
+     --text "$payload" \
+     --artifact-link "$lesson_plan_artifact_id"
+   ```
+
+   Payload 字段必须是 `requestType` / `title` / `choices`（camelCase），
+   `requestType` 固定为 `approval.spec_apply`。
+
+3. **不要**自己跑 `joi spec apply`——那是 human 拍板后的动作。你的责任
+   到 `action.request` 为止；之后 `joi spec apply --action <resp_event_id>`
+   会读出 `spec_apply` 块、deep-merge spec、写 bundle、bump reload-epoch、
+   发 runtime_receipt artifact + `status.update` `spec_apply.completed`。
+
 ## 终止
 
 用户可见回复 + artifact 发布都完成后，**单独一行**输出 `__JOI_DONE__`。

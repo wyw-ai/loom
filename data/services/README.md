@@ -16,8 +16,13 @@ Phase 3 交付的服务清单：
 | --- | --- | --- | --- | --- |
 | `repo-cache`      | scheduler   | channel-level | cron `*/15 * * * *` | 仓库镜像（本地缓存） |
 | `repo-notes`      | command     | channel-level | 手动子命令           | a1 kbase 仓库笔记 |
-| `repo-provision`  | command     | thread-bound  | `thread.bootstrap`   | `repo-provision-receipt.json` + `thread.bootstrapped` |
 | `mr-detector`     | scheduler   | thread-bound  | cron + 自我完成      | `mr-event-*.json`（artifact-contracts §6） |
+
+> Thread bootstrap（按 clone-manifest 准备 thread workspace 仓库目录）由
+> `joi thread create --bootstrap-artifact` 通过 §4.2.1 mounts 投影完成；
+> 不再需要单独的 `repo-provision` ServiceSpec。`repo-cache` 暴露的裸仓库
+> 缓存通过 `service://repo-cache/cache/<repo_id>` URI 直接被 thread
+> workspace mount 读到。
 
 ## 约定
 
@@ -50,7 +55,6 @@ data/services/mr-detector/bundle/poll.sh --dry-run
 data/services/repo-notes/bundle/pull.sh --dry-run
 data/services/repo-notes/bundle/push.sh --dry-run
 data/services/repo-notes/bundle/verify.sh --dry-run
-data/services/repo-provision/bundle/provision.sh --dry-run
 ```
 
 每条命令都应该退出码 0、stdout 是合法 JSON、不创建任何真实文件。

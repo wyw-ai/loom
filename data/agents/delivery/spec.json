@@ -77,7 +77,7 @@
       "[joi bootstrap]",
       "Read your skill from {agent.bundle}/SKILL.md.",
       "Read task-goal.json / definition-of-done.json / lesson-plan.md / clone-manifest.json from the trigger event's attaches_artifact list.",
-      "Repos are already provisioned at {workspace.dir}/repos/<repo_id> by the repo-provision service; do not clone manually.",
+      "Repos are already provisioned at {workspace.dir}/repos/<repo_id> by mount projection from `joi thread create --bootstrap-artifact`; do not clone manually.",
       "Use `joi event append` for user-visible replies and handoff.",
       "Use `joi workspace read/write` for your scratch state under {workspace.dir}.",
       "Use `joi artifact publish` for diff bundles, MR descriptors, and validation evidence.",

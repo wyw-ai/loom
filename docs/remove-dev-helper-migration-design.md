@@ -608,10 +608,10 @@ joi thread create --in <channel> \
 执行流程：
 
 1. runtime 创建 thread + thread workspace + 写 `.joi/state/scope.json`。
-2. 按部署声明的 bootstrap hook（一个 ServiceSpec，例如 `repo-provision`）把 `clone_manifest` artifact 内容投影成 thread workspace mounts（参见 §4.2.1）；底层用 `git worktree add` 或 `git clone --shared` 复用 channel `.joi/repos/cache/<repo_id>`。
-3. bootstrap 完成后，runtime 发 `thread.bootstrapped` event 并附 `repo_provision_receipt` artifact；handoff 给下游 agent（如 delivery）时通过 receipt 校验仓库就位。
+2. 把 `clone_manifest` artifact（schema 见 `docs/artifact-contracts.md` §3）解析成 §4.2.1 的 mounts 数组，写入 thread `scope.json.mounts`。每条 repo 默认 `from = service://repo-cache/cache/<urlencoded(repo_id)>`、`to = repos/<basename(repo_id)>`，调用方传 `mounts[]` override 时按顺序覆盖。
+3. agent serve 在 `ensure_scope` 时按 mount 声明做 symlink / `git worktree add`；底层复用 channel `.joi/repos/cache/<repo_id>` 缓存。runtime 发 `thread.bootstrapped` event，body 复述 mount 摘要供下游 agent 校验仓库就位（无独立 receipt artifact——mounts 本身就是声明，clone_manifest 是证据）。
 
-bootstrap hook 是 ServiceSpec，按 artifact 触发；不引入新协议。clone manifest 本身已是 §4.3.1 跨 agent 契约清单内的 artifact。
+bootstrap 不需要新的 ServiceSpec：mounts 是 §4.2.1 已有的 workspace 声明，clone_manifest 是 §4.3.1 已有的跨 agent 契约。整条链路只复用 thread / workspace / artifact 三个元语，不新增 protocol 概念。
 
 #### 4.7.3 Thread-bound service 实例（per-thread MR detector）
 
@@ -842,7 +842,7 @@ ServiceSpec 继续作为 deployment artifact，字段形态按现有 service plu
 | triage-writer 一次性写入/重试 | command service `once` + retry/log rotation |
 | repo-cache sync | service plugin，缓存放 host data dir，manifest/索引可写 workspace |
 | repo-notes sync/verify | service plugin 或 command service，外部系统仍是 a1 kbase |
-| repo-provision（新增） | thread bootstrap hook，按 clone_manifest artifact 给 thread workspace 准备 worktree mounts |
+| thread bootstrap（按 clone_manifest 准备 thread workspace） | `joi thread create --bootstrap-artifact` 写 thread `scope.json.mounts`，agent serve 在 ensure_scope 时按 mount 投影（§4.2.1 / §4.7.2）；不再单独的 ServiceSpec |
 | mr-detector（新增） | thread-bound service 实例，监听单个 task 的 MR 状态，自检完成或 thread 关闭时自停 |
 
 ServiceSpec 是 deployment artifact，不是完全可移植定义。远端这种单部署场景可以在 spec 中写死 channel/thread id；如果未来需要多部署，再在 config 层做间接寻址，不在本次迁移里新增抽象。
@@ -950,7 +950,7 @@ bootstrap-channel -> workspace bootstrap
 
 ### Phase 3：迁移 interactive agents
 
-1. Phase 3.0：上线 repo-cache、repo-notes、repo-provision service，完成 readonly-repos / repo-stg-* 的 dry-run 与切换；channel `.joi/repos/cache` 可被 thread workspace mount。
+1. Phase 3.0：上线 repo-cache、repo-notes service，完成 readonly-repos / repo-stg-* 的 dry-run 与切换；channel `.joi/repos/cache` 可被 thread workspace 通过 §4.2.1 mounts 直接 mount（无需单独的 provision ServiceSpec）。
 2. Phase 3.1：定义 cross-agent artifact 契约清单（task goal、DoD、clone manifest、lesson plan、validation report、receipt 等）。
 3. Phase 3a：classmaster / teacher / sensai / bug-triage 先迁，保留普通 event 文本确认 fallback；teacher 走通"横向比对其它 channel + 读 spec/bundle"路径。
 4. Phase 3b：router / discovery / delivery / feedback-fix-orchestrator 迁移；router 写入 channel `resident_threads.discovery`；delivery thread 通过 `--bootstrap-artifact <clone_manifest>` 自动准备仓库 worktree；delivery / discovery 在 AgentSpec 上声明 `handoff.triggerPromptPrefix`。
@@ -1012,7 +1012,7 @@ bootstrap-channel -> workspace bootstrap
 6. **证据可审计**：task goal、DoD、clone manifest、validation、release、runtime receipt 等跨 agent 契约和最终证据发布为 artifact，并由 event 引用。
 7. **Action 路径可用但非阻塞**：提供 action.request / action.response 协议路径，并至少有一个 agent skill 演示用法；普通 event 文本确认仍可作为 fallback。
 8. **Agent 可恢复**：Copilot/Claude provider session 按 actor/scope resume，model/settings hash 变更能创建新 session。
-9. **Repo cache / provision 可用**：router/discovery 可通过 repo-cache service 读源码；delivery 首轮可根据 clone manifest artifact 自动 clone、初始化 OpenSpec、校验 repo notes。
+9. **Repo cache 可用 + thread workspace `repos/` 可访问**：router/discovery 可通过 repo-cache service 读源码；delivery thread 通过 `joi thread create --bootstrap-artifact <clone_manifest>` 写 mounts、agent serve 投影后，在 thread workspace 内的 `repos/<repo_id>` 直接可见（mount 由 symlink / worktree 实现，无独立 provision service）。
 10. **Service 可监督**：a1-e2e、mr-watcher、feedback-triage 等 service 有 start/stop/status/once/reload、pid、log、single-instance；ServiceSpec `lifecycle: thread-bound` 可创建多实例，每实例 state 独立。
 11. **Workspace 可复盘**：channel/thread workspace 下能看到 skill 业务状态、进度、计划、报告；runtime 私有 cursor/session 不污染 workspace；声明的 mounts（channel 公共仓库 / 仓库 worktree）可在 thread workspace 内直接访问。
 12. **远端稳定运行**：7878 `joi-server`、agent host、service host 均用最新 Joi 原生逻辑运行。
@@ -1039,7 +1039,7 @@ bootstrap-channel -> workspace bootstrap
 | feedback-triage retry 行为变化 | retry 配置等价：max=2、delay=1s、emit retrying status |
 | context-share 下线过早 | 所有 stg key 迁移并完成双写校验后再停 |
 | 跨 scope 只读 CLI 暴露敏感内容 | spec / bundle 加载阶段做脱敏标记；`spec get` 输出过滤 secret 字段；`event query` 沿用 server 现有访问控制 |
-| thread bootstrap mounts 与磁盘占用 | repo-provision 优先 `git worktree add` 复用 channel cache；多 thread 并行时按 service host data dir quota 监控 |
+| thread bootstrap mounts 与磁盘占用 | agent serve 投影 mount 时优先 `git worktree add` 复用 channel cache；多 thread 并行时按 service host data dir quota 监控 |
 | 教案误改导致 actor 失能 | spec_apply action 写入前自动做 spec 备份；reload 失败时回滚到上一版本并发 status event |
 | thread-bound 实例资源占用 | mr-detector 实例必须声明自停条件；service host 提供 instance ttl 兜底 |
 

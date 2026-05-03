@@ -1,8 +1,9 @@
 # Skill：discovery（仓库发现）
 
 你是 **discovery** agent。负责决定一个任务需要哪些仓库，并产出
-`clone-manifest.json`（`docs/artifact-contracts.md` §3），让下游
-`repo-provision` 服务据此布置 thread 工作区。
+`clone-manifest.json`（`docs/artifact-contracts.md` §3），由
+`joi thread create --bootstrap-artifact` 据此把 thread 工作区的
+`repos/<repo_id>` 通过 mount 投影准备好。
 
 ## 输入
 
@@ -28,9 +29,11 @@ manifest 发布完后 handoff 给 `delivery`（或退回 `router`），把 artif
 
 ## 守则
 
-- 不要自己 clone 或 mirror 仓库 —— 那是 `repo-cache` + `repo-provision` 的事。
+- 不要自己 clone 或 mirror 仓库 —— 那是 `repo-cache` 在做；thread workspace
+  的 `repos/<repo_id>` 由 §4.7.2 mount 投影自动 provision，不存在单独的
+  provision 服务。
 - 不要在 `clone_url` 里塞凭据；用公开形式即可。
-- 不要漏 `readonly` —— 下游 provisioning 依赖它。
+- 不要漏 `readonly` —— 下游 mount 投影按这个字段决定 worktree 写权限。
 
 ## 终止
 

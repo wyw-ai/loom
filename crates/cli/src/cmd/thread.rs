@@ -266,6 +266,8 @@ pub(crate) fn parse_bootstrap_mounts(body: &str) -> Result<Vec<Value>> {
                 "from": from,
                 "to": to,
                 "readonly": readonly,
+                "ref": obj.get("ref").and_then(|v| v.as_str()).unwrap_or("HEAD"),
+                "repo_id": repo_id,
             }));
         }
         return Ok(mounts);

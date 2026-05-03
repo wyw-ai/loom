@@ -16,14 +16,52 @@ prod 启用 dev-helper 替代后的目标 channel，以及备份清理观察项�
 
 ## 3b prod 新 channel 拓扑
 
-187 上 `joi agent serve --allow-actors` 扩展为
-`classmaster,teacher,router,discovery,delivery,bug-triage`（6/13 specs 加载）。
-6 个 agent 全部 `[connected to ws://127.0.0.1:7878/rpc as Agent]`。
+> 修订（commit 后续）：上一轮 3b 仅完成了二进制 cutover，agent spec 仍是
+> 老的 `transport.kind=command` + `dev-helper-bridge/run-agent.sh`，actor.id
+> 也是 bare `router`/`discovery`。本节给出真正的 spec cutover 状态。
+
+### 3b.1 Spec cutover
+
+- `~/.config/joi/agents/` 下 6 个旧 spec（`router`/`discovery`/`delivery`/
+  `classmaster`/`teacher`/`bug-triage`.json）整体备份到
+  `~/.config/joi/agents.cutover-spec-20260503-235409/`，原位删除。
+- 安装 6 份分支 Joi 原生 spec（`actor_router.json` 等），`bundle.source`
+  通过 `jq` 改写为 `~/joi-apps-e2e/data/agents/<name>/bundle` 的绝对路径；
+  `transport.kind=interactive_command` + `claude` + `provider.kind=claude`
+  (`mode=actor_profile`)。
+- `joi agent serve --allow-actors actor_router,actor_discovery,actor_delivery,
+  actor_classmaster,actor_teacher,actor_a1_bug_triage` 重启，6/13 spec 加载，
+  6 个 connection 全部上线（PATH 显式带 `~/.local/bin`，否则 claude 找不到）。
+- 给每个 actor profile 补 claude settings：
+  `~/.agentx/agents/<actor.id>/profile/claude/settings.json`
+  → 软链 `~/.claude/settings.json`（GLM 配置）。`provider.settings.mode`
+  =`actor_profile` 仅创建父目录，settings 文件本身需运维侧落地——这是迁移
+  设计的隐式前提。
+
+### 3b.2 Channel topology（spec cutover 后重建）
 
 | channel id | title | member actors | resident threads |
 | --- | --- | --- | --- |
-| `chan_31f8fa85d909` | a1-dev-canfeng | canfeng (`actor_human_0240d58e`), router, discovery, delivery, bug-triage | `thread_9233aa879002` resident_as=router；`thread_d7351e218562` resident_as=discovery |
-| `chan_4a634872b6f8` | classroom | canfeng, classmaster, teacher | `thread_ac96f52872ce` (greeting) |
+| `chan_31f8fa85d909` | a1-dev-canfeng | canfeng (`actor_human_0240d58e`), `actor_router`, `actor_discovery`, `actor_delivery`, `actor_a1_bug_triage` | `thread_00dec3971ca5` resident_as=router；`thread_2a6d3b569aa6` resident_as=discovery |
+| `chan_4a634872b6f8` | classroom | canfeng, `actor_classmaster`, `actor_teacher` | `thread_eae8326cd10e` (greeting) |
+
+旧 bare-name actor 成员从两个 channel 全部 revoke，旧 resident thread 删除并
+以新 actor 身份重建——两条 channel 与历史 actor 已彻底解耦。
+
+### 3b.3 Smoke evidence（真 LLM）
+
+```
+[00:13:54] handoff → actor_router: ping…__JOI_DONE__
+[00:14:00] actor_router: pong.
+[00:14:00] actor_router · turn closed (closed)
+
+[00:15:40] handoff → actor_classmaster: smoke ping…__JOI_DONE__
+[00:16:08] actor_classmaster: Smoke ping received successfully.
+[00:16:08] actor_classmaster · turn closed (closed)
+```
+
+完整 LLM 回路（router 真启动 claude → 收到 sentinel → 关 turn）已在 187 跑通，
+不是 binary-only 误判。
 
 设计意图：
 

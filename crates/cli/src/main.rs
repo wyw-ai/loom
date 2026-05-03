@@ -455,6 +455,25 @@ enum ThreadCmd {
     Delete {
         thread_id: String,
     },
+    /// Bootstrap an *existing* thread from a clone-manifest (or explicit
+    /// mounts) artifact. Used when an already-open thread (e.g. a
+    /// bug-fix loop's bugfix thread) needs target/reference repo
+    /// worktrees added without creating a new thread. Writes
+    /// `scope.json.mounts` on the thread-shared scope so per-actor
+    /// `agent serve` workspaces seed mounts on next ensure_scope.
+    Bootstrap {
+        /// Thread id to bootstrap.
+        #[arg(long = "in")]
+        thread_id: String,
+        /// Channel id the thread belongs to. Required for resolving the
+        /// channel-rooted scope.json path on disk.
+        #[arg(long)]
+        channel: String,
+        /// Artifact id or `artifact://...` URI carrying the clone-manifest
+        /// or an explicit `mounts[]` payload.
+        #[arg(long = "bootstrap-artifact")]
+        bootstrap_artifact: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -965,6 +984,11 @@ async fn main() -> Result<()> {
             }
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
             ThreadCmd::Delete { thread_id } => cmd::thread::delete(client, thread_id).await?,
+            ThreadCmd::Bootstrap {
+                thread_id,
+                channel,
+                bootstrap_artifact,
+            } => cmd::thread::bootstrap(client, channel, thread_id, bootstrap_artifact).await?,
         },
         Cmd::Say {
             text,

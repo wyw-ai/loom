@@ -2179,6 +2179,7 @@ async fn dispatch_handoff(
                 .paths
                 .ensure_scope(&state.actor_id, &channel_id, &trigger.scope, Some(&bundle_paths))?
         };
+        let bundle_current_path = state.paths.bundle_paths(&state.spec).current;
         // First-turn-per-scope is computed *before* compose_envelope_prompt
         // because both the seed manifest and prompt_template.firstTurnPrefix
         // need to fire on the same first turn. We piggy-back on the same
@@ -2203,6 +2204,7 @@ async fn dispatch_handoff(
             &trigger,
             &channel_id,
             &scope_paths,
+            &bundle_current_path,
             &inner_prompt,
             first_turn_for_scope,
         );
@@ -2322,13 +2324,14 @@ fn apply_prompt_template(
     trigger: &Event,
     channel_id: &str,
     scope_paths: &ScopePaths,
+    bundle_current: &Path,
     inner_prompt: &str,
     first_turn_for_scope: bool,
 ) -> String {
     let Some(tmpl) = spec.prompt_template.as_ref() else {
         return inner_prompt.to_string();
     };
-    let vars = build_template_vars(spec, trigger, channel_id, scope_paths, tmpl);
+    let vars = build_template_vars(spec, trigger, channel_id, scope_paths, bundle_current, tmpl);
     let render = |lines: &[String]| -> String {
         lines
             .iter()
@@ -2356,6 +2359,7 @@ fn build_template_vars(
     trigger: &Event,
     channel_id: &str,
     scope_paths: &ScopePaths,
+    bundle_current: &Path,
     tmpl: &proto::methods::PromptTemplateSpec,
 ) -> std::collections::HashMap<String, String> {
     use std::collections::HashMap;
@@ -2392,7 +2396,7 @@ fn build_template_vars(
     if let Some(skill) = &tmpl.active_skill {
         vars.insert("prompt.activeSkill".into(), skill.clone());
     }
-    let bundle_current = scope_paths.agent_root.join("bundles").join("current");
+    let bundle_current = bundle_current.to_path_buf();
     vars.insert(
         "agent.bundle".into(),
         bundle_current.display().to_string(),
@@ -3201,12 +3205,14 @@ mod tests {
             vars,
         });
         let trigger = handoff_event_to(&spec.actor.id, &scope);
+        let bundle_dummy = root.join("bundle_dummy");
 
         let out_first = apply_prompt_template(
             &spec,
             &trigger,
             "chan_demo",
             &scope_paths,
+            &bundle_dummy,
             "USER MESSAGE",
             true,
         );
@@ -3224,6 +3230,7 @@ mod tests {
             &trigger,
             "chan_demo",
             &scope_paths,
+            &bundle_dummy,
             "USER MESSAGE",
             false,
         );
@@ -3240,6 +3247,7 @@ mod tests {
             &trigger,
             "chan_demo",
             &scope_paths,
+            &bundle_dummy,
             "USER MESSAGE",
             true,
         );
@@ -3253,6 +3261,7 @@ mod tests {
                 &trigger,
                 "chan_demo",
                 &scope_paths,
+                &bundle_dummy,
                 "RAW",
                 true
             ),

@@ -88,6 +88,28 @@ pub async fn list(client: Arc<Client>, channel_id: Option<String>) -> Result<()>
     Ok(())
 }
 
+/// `joi thread delete <thread_id>`.
+///
+/// Calls `thread/delete` on the server, which removes the thread plus
+/// its scope skills. Thread-bound services watching that thread (per
+/// `bind.auto_stop_on=["thread.closed"]`, §4.7.3) reap their
+/// instances on the next watcher tick. The CLI does not rewrite the
+/// channel-local `resident_threads.<role>` map — callers who used
+/// `--resident-as` must update it themselves.
+pub async fn delete(client: Arc<Client>, thread_id: String) -> Result<()> {
+    let res: ThreadDeleteResult = client
+        .call(method::THREAD_DELETE, json!({ "threadId": thread_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.deleted {
+        println!("deleted thread {thread_id}");
+    } else {
+        println!("thread {thread_id} was already gone");
+    }
+    Ok(())
+}
+
 fn data_root() -> PathBuf {
     for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
         if let Some(v) = std::env::var_os(key) {

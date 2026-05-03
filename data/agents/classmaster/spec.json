@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_classmaster",
     "kind": "agent",
-    "displayName": "\u73ed\u4e3b\u4efb"
+    "displayName": "班主任"
   },
   "transport": {
     "kind": "interactive_command",
@@ -103,11 +103,12 @@
     ],
     "firstTurnPrefix": [
       "[joi bootstrap]",
-      "Read your skill from {agent.bundle}/SKILL.md.",
-      "Use `joi event append` for user-visible replies and handoff.",
-      "Use `joi workspace read/write` for your mutable working state.",
-      "Use `joi artifact publish` for cross-agent outputs (task-goal.json, definition-of-done.json).",
-      "Use `joi action request` for approvals and choices when human confirmation is required.",
+      "你的技能定义如下，请严格遵守：",
+      "----- BEGIN SKILL -----",
+      "{agent.skillBody}",
+      "----- END SKILL -----",
+      "Use `joi event append` (or `joi say` / `joi handoff`) for user-visible replies and handoff.",
+      "Do not embed the callee's slash command in your reply text; runtime injects it.",
       "[/joi bootstrap]"
     ],
     "everyTurnSuffix": [

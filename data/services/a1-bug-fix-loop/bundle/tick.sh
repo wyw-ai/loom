@@ -62,32 +62,55 @@ TICK_AT=$(now_iso)
 joi_avail() { command -v joi >/dev/null 2>&1; }
 a1_avail()  { command -v a1  >/dev/null 2>&1; }
 
-# Try to read newest feedback-scan.bugs.v1 from the scanner thread.
-# In dev/offline we just produce an empty list so the loop is a no-op.
-fetch_bugs() {
+# Helper: scan recent events in a scope, surface the most recent artifact
+# whose body has the requested $kind (schema_version/producer/etc.). Echoes
+# the artifact body JSON or empty string.
+fetch_latest_artifact_body() {
+    local scope="$1" kind="$2" channel_flag="${3:-}"
     if [[ "$DRY_RUN" -eq 1 ]] || ! joi_avail; then
-        printf '[]'
-        return
+        return 0
     fi
-    if ! out=$(joi artifact list --in "$SCANNER_TID" --kind feedback-scan.bugs.v1 --latest --json 2>/dev/null); then
-        printf '[]'
-        return
+    local list
+    if [[ "$channel_flag" == "--channel" ]]; then
+        list=$(joi event list --in "$scope" --channel --limit 100 --json 2>/dev/null) || return 0
+    else
+        list=$(joi event list --in "$scope" --limit 100 --json 2>/dev/null) || return 0
     fi
-    jq -c '.items // []' <<<"$out" 2>/dev/null || printf '[]'
+    # Pull artifact ids from any event relations of kind attaches_artifact;
+    # newest-first iteration since the list is reverse-chronological.
+    local ids
+    ids=$(jq -r '
+        (.events // .items // .) | reverse |
+        .[] | (.relations // []) | .[] |
+        select((.kind // .type) == "attaches_artifact") |
+        (.target_id // .target // .id // empty)
+    ' <<<"$list" 2>/dev/null) || return 0
+    while IFS= read -r aid; do
+        [[ -z "$aid" ]] && continue
+        meta=$(joi artifact get "$aid" --json 2>/dev/null) || continue
+        akind=$(jq -r '.kind // .schema // ""' <<<"$meta")
+        if [[ "$akind" == "$kind" ]]; then
+            joi artifact read "$aid" 2>/dev/null
+            return 0
+        fi
+    done <<<"$ids"
 }
 
-# Try to read mr-merged.v1 in a bugfix thread. Returns "true"/"false".
-mr_is_merged() {
-    local tid="$1"
-    if [[ "$DRY_RUN" -eq 1 ]] || ! joi_avail; then
-        printf 'false'
+fetch_bugs() {
+    local body
+    body=$(fetch_latest_artifact_body "$SCANNER_TID" "feedback-scan.bugs.v1") || true
+    if [[ -z "$body" ]]; then
+        printf '[]'
         return
     fi
-    if joi artifact list --in "$tid" --kind mr-merged.v1 --json 2>/dev/null | jq -e '.items | length > 0' >/dev/null 2>&1; then
-        printf 'true'
-    else
-        printf 'false'
-    fi
+    jq -c '.bugs // .items // []' <<<"$body" 2>/dev/null || printf '[]'
+}
+
+mr_is_merged() {
+    local tid="$1"
+    local body
+    body=$(fetch_latest_artifact_body "$tid" "mr-merged.v1") || true
+    if [[ -n "$body" ]]; then printf 'true'; else printf 'false'; fi
 }
 
 bugs=$(fetch_bugs)
@@ -108,7 +131,7 @@ for fid in $(jq -r 'keys[]' <<<"$tracking"); do
             a1 feedback resolve "$fid" --note "随下次发布更新（自动）" >/dev/null 2>&1 || true
         fi
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            joi say --channel "$CHANNEL_ID" "[bug-fix-loop] feedback $fid 已修复，等待下次发布。" >/dev/null 2>&1 || true
+            joi say --in "$CHANNEL_ID" --channel "[bug-fix-loop] feedback $fid 已修复，等待下次发布。" >/dev/null 2>&1 || true
         fi
     fi
 done
@@ -133,7 +156,7 @@ if [[ $budget -gt 0 ]]; then
 
         bf_tid="(dry-run-thread)"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            if out=$(joi thread create --channel "$CHANNEL_ID" --topic "bugfix-$fid" --json 2>/dev/null); then
+            if out=$(joi thread create --channel "$CHANNEL_ID" --title "bugfix-$fid" --json 2>/dev/null); then
                 bf_tid=$(jq -r '.thread_id // .id // ""' <<<"$out")
             fi
             if [[ -n "$bf_tid" && "$bf_tid" != "(dry-run-thread)" ]]; then

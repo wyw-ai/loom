@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_discovery",
     "kind": "agent",
-    "displayName": "\u4ed3\u5e93\u53d1\u73b0"
+    "displayName": "仓库发现"
   },
   "transport": {
     "kind": "interactive_command",
@@ -103,12 +103,12 @@
     ],
     "firstTurnPrefix": [
       "[joi bootstrap]",
-      "Read your skill from {agent.bundle}/SKILL.md.",
-      "Read upstream task-goal.json / definition-of-done.json from the trigger event's attaches_artifact list.",
-      "Use `joi event append` for user-visible replies and handoff.",
-      "Use `joi workspace read/write` for your mutable working state.",
-      "Use `joi artifact publish` for clone-manifest.json and any companion repo notes.",
-      "Use `joi action request` when the human must approve a repo set.",
+      "你的技能定义如下，请严格遵守：",
+      "----- BEGIN SKILL -----",
+      "{agent.skillBody}",
+      "----- END SKILL -----",
+      "Use `joi event append` (or `joi say` / `joi handoff`) for user-visible replies and handoff.",
+      "Do not embed the callee's slash command in your reply text; runtime injects it.",
       "[/joi bootstrap]"
     ],
     "everyTurnSuffix": [

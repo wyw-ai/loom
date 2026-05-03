@@ -576,6 +576,12 @@ impl AgentPaths {
             "agent.bundle".into(),
             self.bundle_current.display().to_string(),
         );
+        let skill_path = self.bundle_current.join("SKILL.md");
+        if let Ok(skill_body) = std::fs::read_to_string(&skill_path) {
+            vars.insert("agent.skillBody".into(), skill_body);
+        } else {
+            vars.insert("agent.skillBody".into(), String::new());
+        }
         vars.insert(
             "channel.root".into(),
             scope.channel_root.display().to_string(),

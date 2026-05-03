@@ -2,7 +2,7 @@
   "actor": {
     "id": "actor_delivery",
     "kind": "agent",
-    "displayName": "\u4ea4\u4ed8"
+    "displayName": "交付"
   },
   "transport": {
     "kind": "interactive_command",
@@ -103,14 +103,12 @@
     ],
     "firstTurnPrefix": [
       "[joi bootstrap]",
-      "Read your skill from {agent.bundle}/SKILL.md.",
-      "Read task-goal.json / definition-of-done.json / lesson-plan.md / clone-manifest.json from the trigger event's attaches_artifact list.",
-      "Repos are already provisioned at {workspace.dir}/repos/<repo_id> by mount projection from `joi thread create --bootstrap-artifact`; do not clone manually.",
-      "Use `joi event append` for user-visible replies and handoff.",
-      "Use `joi workspace read/write` for your scratch state under {workspace.dir}.",
-      "Use `joi artifact publish` for diff bundles, MR descriptors, and validation evidence.",
-      "Use `joi action request` for any human approval (publishing an MR, mutating production data, etc.).",
-      "Listen for mr-event-*.json artifacts emitted by the mr-detector service before finalising the turn.",
+      "你的技能定义如下，请严格遵守：",
+      "----- BEGIN SKILL -----",
+      "{agent.skillBody}",
+      "----- END SKILL -----",
+      "Use `joi event append` (or `joi say` / `joi handoff`) for user-visible replies and handoff.",
+      "Do not embed the callee's slash command in your reply text; runtime injects it.",
       "[/joi bootstrap]"
     ],
     "everyTurnSuffix": [

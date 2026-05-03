@@ -25,7 +25,7 @@
 //! the gate is held across the whole fire, so a slow source or a slow
 //! agent cannot stack a queue of pending fires (§8.5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,10 +61,21 @@ impl ServicePlugin for SchedulerPlugin {
     }
 
     async fn run(&self, ctx: ServiceContext) -> Result<()> {
-        let config: SchedulerConfig = if ctx.spec.config.is_null() || ctx.spec.config == json!({}) {
+        // §4.7.3 placeholder substitution. For thread-bound instances
+        // (and harmlessly for channel-singletons too) interpolate
+        // `{thread.id}` / `{channel.id}` / `{params.X}` /
+        // `{instance.data_dir}` everywhere inside spec.config so jobs
+        // can reference the per-instance binding without the host
+        // having to teach every plugin a separate templating layer.
+        let subs = build_substitutions(&ctx);
+        let mut config_json = ctx.spec.config.clone();
+        if !subs.is_empty() {
+            substitute_in_value(&mut config_json, &subs);
+        }
+        let config: SchedulerConfig = if config_json.is_null() || config_json == json!({}) {
             SchedulerConfig::default()
         } else {
-            serde_json::from_value(ctx.spec.config.clone())
+            serde_json::from_value(config_json)
                 .context("parse spec.config as SchedulerConfig")?
         };
         config.validate().context("validate scheduler config")?;
@@ -155,6 +166,72 @@ impl ServicePlugin for SchedulerPlugin {
             while joinset.join_next().await.is_some() {}
         }
         Ok(())
+    }
+}
+
+/// Build the §4.7.3 substitution map from a [`ServiceContext`].
+///
+/// Keys are the literal placeholder strings (`{thread.id}`,
+/// `{channel.id}`, `{instance.data_dir}`, `{params.<name>}`); values
+/// are their concrete replacements pulled from
+/// `ctx.instance` / `ctx.runtime`. For non-thread-bound runs the
+/// instance-keyed entries simply aren't inserted, so unrelated
+/// placeholders are left intact for the next layer (or, more usually,
+/// don't appear at all).
+///
+/// `params` are flattened one level deep — a top-level object keyed
+/// by name, value rendered as: strings used verbatim, everything
+/// else `to_string()` (so booleans become "true"/"false", numbers
+/// their decimal form, nested objects/arrays their compact JSON).
+fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
+    let mut subs: HashMap<String, String> = HashMap::new();
+    subs.insert(
+        "{instance.data_dir}".to_string(),
+        ctx.runtime.state_dir().display().to_string(),
+    );
+    if let Some(inst) = &ctx.instance {
+        subs.insert("{thread.id}".to_string(), inst.scope.id.clone());
+        if let Some(channel) = &inst.scope.channel_id {
+            subs.insert("{channel.id}".to_string(), channel.clone());
+        }
+        if let Some(params) = inst.params.as_object() {
+            for (k, v) in params {
+                let rendered = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                subs.insert(format!("{{params.{k}}}"), rendered);
+            }
+        }
+    }
+    subs
+}
+
+/// Apply the substitution map to every string within `v`, recursing
+/// into arrays and objects in place. O(N · M) where N = total bytes
+/// of strings, M = number of placeholders; both are tiny (<10 each
+/// in practice) so the plain `String::contains` + `String::replace`
+/// pair beats a regex/aho-corasick build cost here.
+fn substitute_in_value(v: &mut Value, subs: &HashMap<String, String>) {
+    match v {
+        Value::String(s) => {
+            for (placeholder, replacement) in subs {
+                if s.contains(placeholder) {
+                    *s = s.replace(placeholder, replacement);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                substitute_in_value(item, subs);
+            }
+        }
+        Value::Object(obj) => {
+            for (_, val) in obj.iter_mut() {
+                substitute_in_value(val, subs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -707,5 +784,48 @@ mod tests {
         let (rest, sig) = strip_self_complete(body);
         assert_eq!(rest, body.to_vec());
         assert!(sig.is_none());
+    }
+
+    #[test]
+    fn substitute_replaces_thread_and_params_in_strings() {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        subs.insert("{thread.id}".into(), "thr_42".into());
+        subs.insert("{params.mr_url}".into(), "https://x/y".into());
+
+        let mut v = json!({
+            "scope": { "id": "{thread.id}" },
+            "command": "fetch {params.mr_url} into {thread.id}",
+            "args": ["{thread.id}", "literal", "{params.mr_url}/path"],
+        });
+        substitute_in_value(&mut v, &subs);
+
+        assert_eq!(v["scope"]["id"], json!("thr_42"));
+        assert_eq!(v["command"], json!("fetch https://x/y into thr_42"));
+        assert_eq!(v["args"][0], json!("thr_42"));
+        assert_eq!(v["args"][1], json!("literal"));
+        assert_eq!(v["args"][2], json!("https://x/y/path"));
+    }
+
+    #[test]
+    fn substitute_leaves_unmatched_placeholders_untouched() {
+        let subs: HashMap<String, String> = HashMap::new();
+        let mut v = json!({ "x": "{thread.id} stays" });
+        substitute_in_value(&mut v, &subs);
+        assert_eq!(v["x"], json!("{thread.id} stays"));
+    }
+
+    #[test]
+    fn substitute_renders_non_string_param_values() {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        // Mirror what build_substitutions does for non-string values.
+        subs.insert("{params.flag}".into(), Value::Bool(true).to_string());
+        subs.insert("{params.n}".into(), Value::from(7).to_string());
+
+        let mut v = json!({
+            "args": ["--flag={params.flag}", "--n={params.n}"],
+        });
+        substitute_in_value(&mut v, &subs);
+        assert_eq!(v["args"][0], json!("--flag=true"));
+        assert_eq!(v["args"][1], json!("--n=7"));
     }
 }

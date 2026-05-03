@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use proto::methods::{
-    method, ActorUpsertParams, ActorUpsertResult, DeliveryListParams, DeliveryListResult,
-    EventAppendInput, EventAppendParams, EventAppendResult, ThreadCreateParams, ThreadCreateResult,
+    method, ActorUpsertParams, ActorUpsertResult, ArtifactIngress, ArtifactPublishParams,
+    ArtifactPublishResult, DeliveryListParams, DeliveryListResult, EventAppendInput,
+    EventAppendParams, EventAppendResult, InlineTextIngress, ThreadCreateParams,
+    ThreadCreateResult,
 };
 use proto::types::{
     Actor, DeliveryState, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeRef, Thread,
@@ -182,6 +184,75 @@ impl ServiceRuntime {
             _meta: None,
         }];
         self.append_content(scope, text, relations, meta).await
+    }
+
+    /// Publish an artifact whose body is rendered verbatim from `text`
+    /// under `name`. `media_type` defaults to `application/json` to match
+    /// the §6 cross-agent contract artifacts (caller may override).
+    /// Returns `(artifact_id, artifact_uri)`.
+    pub async fn publish_artifact(
+        &self,
+        scope: ScopeRef,
+        name: impl Into<String>,
+        media_type: Option<String>,
+        text: impl Into<String>,
+    ) -> Result<(String, String)> {
+        let params = ArtifactPublishParams {
+            ingress: ArtifactIngress::InlineText(InlineTextIngress {
+                name: name.into(),
+                media_type: media_type.unwrap_or_else(|| "application/json".into()),
+                text: text.into(),
+            }),
+            created_by: self.actor_id.clone(),
+            scope: Some(scope),
+        };
+        let res: ArtifactPublishResult = self
+            .client
+            .call(method::ARTIFACT_PUBLISH, params)
+            .await
+            .context("artifact/publish")?;
+        Ok((res.artifact.id, res.artifact.uri))
+    }
+
+    /// Append an arbitrary-kind event whose payload is the given JSON
+    /// value, with optional `attaches_artifact` relation pointing at the
+    /// just-published artifact id. Used by §6 status.update + artifact
+    /// pairs (mr-detector, validation reports, etc.).
+    pub async fn append_status(
+        &self,
+        scope: ScopeRef,
+        kind: impl Into<String>,
+        payload: serde_json::Value,
+        artifact_id: Option<&str>,
+        meta: Option<Meta>,
+    ) -> Result<String> {
+        let relations = match artifact_id {
+            Some(id) => vec![Relation {
+                kind: RelationKind::AttachesArtifact,
+                target: Ref {
+                    kind: RefKind::Artifact,
+                    id: id.into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            None => Vec::new(),
+        };
+        let event = EventAppendInput {
+            kind: kind.into(),
+            actor_id: self.actor_id.clone(),
+            scope,
+            turn_id: None,
+            payload,
+            relations,
+            _meta: meta,
+        };
+        let res: EventAppendResult = self
+            .client
+            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .await
+            .context("event/append status.update")?;
+        Ok(res.event.id)
     }
 
     /// Publish a `service.self_complete` event into `scope` carrying the

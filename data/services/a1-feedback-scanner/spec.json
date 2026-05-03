@@ -1,10 +1,10 @@
 {
-  "id": "mr-detector",
+  "id": "a1-feedback-scanner",
   "kind": "scheduler",
   "actor": {
-    "id": "svc_mr_detector",
+    "id": "svc_a1_feedback_scanner",
     "kind": "service",
-    "displayName": "MR Detector (thread-bound)"
+    "displayName": "A1 Feedback Scanner"
   },
   "autostart": false,
   "lifecycle": "thread_bound",
@@ -13,27 +13,28 @@
     "auto_stop_on": ["thread.closed", "service.self_complete"]
   },
   "params_schema": {
-    "required": ["mr_url"],
+    "required": [],
     "properties": {
-      "mr_url": { "type": "string" }
+      "since_hours": { "type": "integer", "default": 24 },
+      "a1_filter": { "type": "string", "default": "" }
     }
   },
   "config": {
     "jobs": [
       {
-        "id": "poll",
-        "schedule": "*/2 * * * *",
+        "id": "scan",
+        "schedule": "0 * * * *",
         "source": {
           "kind": "command",
           "command": "bash",
           "args": [
-            "{spec.dir}/bundle/poll.sh",
-            "--mr-url",
-            "{params.mr_url}",
+            "{spec.dir}/bundle/scan.sh",
             "--state-dir",
-            "{instance.data_dir}"
+            "{instance.data_dir}",
+            "--since-hours",
+            "{params.since_hours}"
           ],
-          "timeoutMs": 60000
+          "timeoutMs": 300000
         },
         "scope": {
           "kind": "thread",
@@ -45,7 +46,7 @@
         "singleInFlight": true,
         "emit": {
           "mode": "artifact_per_json_line",
-          "artifactNameTemplate": "{artifact_kind}-{mr_id}-{captured_at}.json",
+          "artifactNameTemplate": "feedback-scan-{scan_id}-{bucket}.json",
           "statusEventType": "status.update"
         }
       }

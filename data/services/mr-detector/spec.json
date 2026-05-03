@@ -7,18 +7,18 @@
     "displayName": "MR Detector (thread-bound)"
   },
   "autostart": false,
+  "lifecycle": "thread_bound",
+  "bind": {
+    "scope": "thread",
+    "auto_stop_on": ["thread.closed", "service.self_complete"]
+  },
+  "params_schema": {
+    "required": ["mr_url"],
+    "properties": {
+      "mr_url": { "type": "string" }
+    }
+  },
   "config": {
-    "lifecycle": "thread-bound",
-    "bind": {
-      "scope": "thread",
-      "auto_stop_on": ["thread.closed", "service.self_complete"]
-    },
-    "params_schema": {
-      "required": ["mr_url"],
-      "properties": {
-        "mr_url": { "type": "string" }
-      }
-    },
     "jobs": [
       {
         "id": "poll",

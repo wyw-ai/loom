@@ -24,7 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use proto::methods::{ServiceLifecycle, ServiceSpec};
 use tokio::sync::watch;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::client::Client;
@@ -430,12 +430,16 @@ async fn run_one_instance(
 /// Polls `<data_root>/services/<spec.id>/instances/` once per second:
 ///
 /// * For each `<thread_id>/request.json` not in `active`, reads the
-///   request and spawns [`run_one_instance`] with an [`AbortHandle`]
+///   request and spawns [`run_one_instance`] with a [`JoinHandle`]
 ///   stored under the thread id.
-/// * For each `active` entry whose request file has disappeared,
-///   aborts the task and drops it. Disappearance is the canonical
-///   stop signal (`joi service stop` or scheduler self_complete both
-///   delete the file).
+/// * For each `active` entry whose plugin task has **finished**
+///   (e.g. the scheduler observed `service.self_complete` and
+///   self-aborted, or the plugin returned naturally), reaps the
+///   instance: deletes the `request.json` if still present and drops
+///   it from `active`.
+/// * For each `active` entry whose request file has disappeared
+///   without the task finishing (`joi service stop` removed it
+///   externally), aborts the task and drops it.
 /// * On `shutdown` notification, aborts every active task and exits.
 ///
 /// The watcher itself is panic-free: per-instance failures are
@@ -449,7 +453,7 @@ async fn supervise_instances(
     mut shutdown: ShutdownSignal,
     specs_dir: Option<PathBuf>,
 ) -> Result<()> {
-    let mut active: HashMap<String, AbortHandle> = HashMap::new();
+    let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
     let spec_id = spec.id.clone();
 
     tracing::info!(spec_id = %spec_id, "thread-bound instance watcher started");
@@ -457,6 +461,37 @@ async fn supervise_instances(
     loop {
         if *shutdown.borrow() {
             break;
+        }
+
+        // 1. Reap instances whose plugin task has finished naturally
+        //    (scheduler self_complete, plugin returned). Delete
+        //    request.json so subsequent ticks treat the instance as
+        //    stopped and don't re-spawn it.
+        let to_reap: Vec<String> = active
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for instance_id in to_reap {
+            active.remove(&instance_id);
+            match super::instance::delete_request(&data_root, &spec_id, &instance_id) {
+                Ok(true) => tracing::info!(
+                    spec_id = %spec_id,
+                    instance_id = %instance_id,
+                    "instance task finished; reaped request.json",
+                ),
+                Ok(false) => tracing::debug!(
+                    spec_id = %spec_id,
+                    instance_id = %instance_id,
+                    "instance task finished; request.json already gone",
+                ),
+                Err(e) => tracing::warn!(
+                    spec_id = %spec_id,
+                    instance_id = %instance_id,
+                    error = ?e,
+                    "instance task finished but request.json delete failed",
+                ),
+            }
         }
 
         // Diff filesystem state vs in-memory active map.
@@ -469,7 +504,8 @@ async fn supervise_instances(
         };
         let listed_set: HashSet<String> = listed.iter().cloned().collect();
 
-        // Stop instances whose request files have been removed.
+        // 2. Stop instances whose request files have been removed
+        //    externally (`joi service stop`).
         let to_drop: Vec<String> = active
             .keys()
             .filter(|k| !listed_set.contains(*k))
@@ -531,7 +567,7 @@ async fn supervise_instances(
                     );
                 }
             });
-            active.insert(instance_id, join.abort_handle());
+            active.insert(instance_id, join);
         }
 
         // Wait either for next tick or shutdown.

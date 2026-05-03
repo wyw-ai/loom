@@ -1,10 +1,10 @@
 {
-  "id": "mr-detector",
+  "id": "a1-bug-fix-loop",
   "kind": "scheduler",
   "actor": {
-    "id": "svc_mr_detector",
+    "id": "svc_a1_bug_fix_loop",
     "kind": "service",
-    "displayName": "MR Detector (thread-bound)"
+    "displayName": "A1 Bug Fix Loop"
   },
   "autostart": false,
   "lifecycle": "thread_bound",
@@ -13,27 +13,35 @@
     "auto_stop_on": ["thread.closed", "service.self_complete"]
   },
   "params_schema": {
-    "required": ["mr_url"],
+    "required": ["channel_id", "scanner_thread_id"],
     "properties": {
-      "mr_url": { "type": "string" }
+      "channel_id":         { "type": "string" },
+      "scanner_thread_id":  { "type": "string" },
+      "concurrency":        { "type": "integer", "default": 1 }
     }
   },
   "config": {
     "jobs": [
       {
-        "id": "poll",
-        "schedule": "*/2 * * * *",
+        "id": "tick",
+        "schedule": "*/5 * * * *",
         "source": {
           "kind": "command",
           "command": "bash",
           "args": [
-            "{spec.dir}/bundle/poll.sh",
-            "--mr-url",
-            "{params.mr_url}",
+            "{spec.dir}/bundle/tick.sh",
             "--state-dir",
-            "{instance.data_dir}"
+            "{instance.data_dir}",
+            "--channel-id",
+            "{params.channel_id}",
+            "--scanner-thread-id",
+            "{params.scanner_thread_id}",
+            "--loop-thread-id",
+            "{thread.id}",
+            "--concurrency",
+            "{params.concurrency}"
           ],
-          "timeoutMs": 60000
+          "timeoutMs": 180000
         },
         "scope": {
           "kind": "thread",
@@ -45,7 +53,7 @@
         "singleInFlight": true,
         "emit": {
           "mode": "artifact_per_json_line",
-          "artifactNameTemplate": "{artifact_kind}-{mr_id}-{captured_at}.json",
+          "artifactNameTemplate": "bug-fix-loop-status-{tick_id}.json",
           "statusEventType": "status.update"
         }
       }

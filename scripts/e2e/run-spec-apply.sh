@@ -117,10 +117,12 @@ after_name=$(jq -r '.actor.displayName' "$target_dir/spec.json")
 [ -d "$target_dir/.backups" ] && backup_count=$(find "$target_dir/.backups" -name spec.json | wc -l | tr -d ' ') || backup_count=0
 [ "$backup_count" -ge 1 ] || { echo "FAIL: no backup written"; fail=1; }
 
-epoch_marker="$ROOT/agent-data/agents/lesson-target/.reload-epoch"
-# fall back to checking under the data root structure used by reload markers
-[ -e "$epoch_marker" ] || epoch_marker="$(find "$ROOT/agent-data" -name '.reload-epoch' 2>/dev/null | head -n1)"
-[ -n "${epoch_marker:-}" ] && [ -e "$epoch_marker" ] || echo "WARN: reload epoch marker not located (may live elsewhere)"
+epoch_marker="$JOI_AGENT_DATA_ROOT/agents/lesson-target/reload-epoch.json"
+[ -f "$epoch_marker" ] || { echo "FAIL: reload epoch marker missing at $epoch_marker"; fail=1; }
+if [ -f "$epoch_marker" ]; then
+  epoch_val=$(jq -r '.epoch_ms // 0' "$epoch_marker" 2>/dev/null || echo 0)
+  [ "$epoch_val" -gt 0 ] || { echo "FAIL: reload epoch is $epoch_val (expected >0) at $epoch_marker"; fail=1; }
+fi
 
 # receipt artifact + spec_apply.completed status.update
 events=$(j --as actor_e2e_human event list --in "$th" --limit 100)

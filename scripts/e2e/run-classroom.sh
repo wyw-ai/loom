@@ -58,7 +58,7 @@ echo "thread  = $th"
 
 # ---- 2. publish task-goal + DoD as human -----------------------------------
 step "2. publish task-goal.json + definition-of-done.json"
-goal_file=$(mktemp -t task-goal).json
+goal_file=$(mktemp /tmp/task-goal.XXXXXX).json
 cat > "$goal_file" <<EOF
 {
   "schema_version": "1",
@@ -76,7 +76,7 @@ goal_id=$(j artifact publish --as actor_e2e_human --file "$goal_file" \
           | jq -r '.artifact.id')
 echo "task-goal = $goal_id"
 
-dod_file=$(mktemp -t dod).json
+dod_file=$(mktemp /tmp/dod.XXXXXX).json
 cat > "$dod_file" <<EOF
 {
   "schema_version": "1",
@@ -96,7 +96,7 @@ echo "dod = $dod_id"
 
 # ---- 3. trigger teacher -----------------------------------------------------
 step "3. handoff to teacher (hands_off_to relation)"
-prompt_file=$(mktemp -t classroom-prompt).txt
+prompt_file=$(mktemp /tmp/classroom-prompt.XXXXXX).txt
 cat > "$prompt_file" <<PROMPT
 Run phase A. You MUST execute the joi CLI commands yourself — do not just describe them.
 

@@ -50,7 +50,7 @@ echo "thread  = $th"
 
 # ---- 2. publish lesson-plan artifact --------------------------------------
 step "2. publish lesson-plan artifact (with spec_apply frontmatter)"
-plan=$(mktemp -t lesson-plan).md
+plan=$(mktemp /tmp/lesson-plan.XXXXXX).md
 cat > "$plan" <<'EOF'
 ```json
 {

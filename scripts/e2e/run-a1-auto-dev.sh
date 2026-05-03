@@ -59,7 +59,7 @@ echo "discovery thread = $dth"
 #     focuses on router→discovery→delivery+mr-detector.)
 # ------------------------------------------------------------------
 step "2. publish task-goal + dod"
-goal_file=$(mktemp -t a1-goal).json
+goal_file=$(mktemp /tmp/a1-goal.XXXXXX).json
 cat > "$goal_file" <<'EOF'
 {
   "schema_version": "1",
@@ -75,7 +75,7 @@ goal_id=$(j artifact publish --as actor_e2e_human --file "$goal_file" \
           | jq -r '.artifact.id')
 echo "task-goal = $goal_id"
 
-dod_file=$(mktemp -t a1-dod).json
+dod_file=$(mktemp /tmp/a1-dod.XXXXXX).json
 cat > "$dod_file" <<'EOF'
 {
   "schema_version": "1",
@@ -97,7 +97,7 @@ echo "dod = $dod_id"
 # 3. trigger router (hop 1)  — handoff to discovery
 # ------------------------------------------------------------------
 step "3. handoff human → router (hop 1)"
-discovery_instr_f=$(mktemp -t disc-instr).txt
+discovery_instr_f=$(mktemp /tmp/disc-instr.XXXXXX).txt
 cat > "$discovery_instr_f" <<DISC
 你是 discovery agent。任务：发布一份 clone-manifest.json artifact，然后
 handoff 回 router。**不要 clone、不要研究代码内容、不要分析 DoD 之外的
@@ -125,7 +125,7 @@ Step 3. 把 manifest handoff 回 router：
 DISC
 discovery_instr=$(cat "$discovery_instr_f")
 
-router_prompt_f=$(mktemp -t router-prompt).txt
+router_prompt_f=$(mktemp /tmp/router-prompt.XXXXXX).txt
 cat > "$router_prompt_f" <<PROMPT
 你是 a1-auto-dev 频道的 router。用户给了 task-goal + DoD，下一步按路由表
 应该 handoff 给 discovery（仓库尚未 bootstrap）。
@@ -221,7 +221,7 @@ echo "delivery thread = $delth"
 # ------------------------------------------------------------------
 step "7. handoff human → delivery (hop 3)"
 mr_desc_marker="MR_DESCRIPTOR_HERE"
-deliv_prompt_f=$(mktemp -t deliv-prompt).txt
+deliv_prompt_f=$(mktemp /tmp/deliv-prompt.XXXXXX).txt
 cat > "$deliv_prompt_f" <<PROMPT
 你是 delivery agent。task-goal + DoD + clone-manifest 已挂在本条 event。
 本 e2e 用 fixture 仓库（bare），不需要真做代码改动 / push。你只需发布

@@ -72,3 +72,58 @@ nohup ~/.local/bin/joi agent serve --server ws://127.0.0.1:7878/rpc \
 - O7 dead config 字段清理
 - 187 worktree 在 prod 上线后可删除：`git worktree remove ~/joi-apps-e2e`
 - 旧 backup（binaries + data-dir）观察一周后可删除
+
+## p5-e2e/3 后续（已在 commit `05ec4bf` 起完成）
+
+### 3a 代码侧收尾（commit `05ec4bf`）
+- O5: `joi service start --params` 现按 `ServiceSpec.params_schema` 做
+  required + 简单 type 校验（5 个单测覆盖 missing / wrong-type / 多 required /
+  无 schema pass-through 场景）。
+- N2: `data/services/mr-detector/spec.json` 中无人读取的 `config.self_complete_on`
+  字段删除，避免误导（实际 self-complete 由 `bundle/poll.sh` 写 sentinel 触发）。
+- O3: ALLOWED_PREFIXES 白名单全文审计；所有条目都是合法引用（设计文档反向
+  引用 + migrate-dev-helper 工具自身），无可删除项。
+
+### 3b prod 新 channel 拓扑
+
+187 上 `joi agent serve --allow-actors` 已扩展为
+`classmaster,teacher,router,discovery,delivery,bug-triage`（6 个 actor 全部
+`[connected]`）。新建 prod channel：
+
+| channel id | title | member actors | resident threads |
+| --- | --- | --- | --- |
+| `chan_31f8fa85d909` | a1-dev-canfeng | actor_human_0240d58e (canfeng), router, discovery, delivery, bug-triage | `thread_9233aa879002` resident_as=router；`thread_d7351e218562` resident_as=discovery |
+| `chan_4a634872b6f8` | classroom | actor_human_0240d58e (canfeng), classmaster, teacher | `thread_ac96f52872ce` (greeting) |
+
+定位：
+
+- **a1-dev-canfeng**：router 负责分发反馈 / 提需求；discovery 负责调研；
+  delivery 负责落地（提 MR + 走 mr-detector 关闭闭环）；bug-triage 负责
+  缺陷分流。设计 §4.7.1 的 resident_threads 把 router / discovery 各放在
+  自己常驻 thread，方便 router 通过角色名寻址 discovery，复用现有 a1-auto-dev
+  完整链路。
+- **classroom**：classmaster 收用户出题 / 发任务；teacher 自跑批生成 lesson-plan
+  artifact（带 `spec_apply` 块）→ `approval.spec_apply` → human accept →
+  `joi spec apply` 改写其它 agent 的 spec → reload。专门作为「迭代其它 actor
+  的车间」。
+
+旧 prod channel `chan_bcf8e1e730bd` (a1-auto-dev-old) / `chan_68b967d1627f`
+(学习小课堂-old) 不动，由 canfeng 在新 channel 稳定后自行 retire。
+
+### 3c smoke 与日志
+
+- 6 个 agent 全部 `[connected to ws://127.0.0.1:7878/rpc as Agent]`；
+  joi-server 日志 INFO 行 `long-lived host connection preempting existing
+  actor_conn binding` 是 agent serve restart 的正常现象，不是错误。
+- 出于不烧 prod LLM token 考虑，3b 阶段不做 hello content.add 真实 dispatch
+  smoke；连接 + 入会 + 拓扑可见即视为 smoke 通过。
+
+### 关联备份与可清理项
+
+- `~/.local/bin/joi{,-server}.cutover-20260503-231701` — Phase 5 baseline 二进制
+- `~/.local/bin/joi{,-server}.cutover3a-20260503-233453` — 3a 重启前备份
+- `~/joi-apps/data.cutover-20260503-231701` — Phase 5 baseline 数据快照
+- 187 worktree `~/joi-apps-e2e`（branch `e2e-cutover` tracking
+  `origin/feat/remove-dev-helper`）
+
+以上观察一周后可删除。

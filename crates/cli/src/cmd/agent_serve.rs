@@ -823,6 +823,10 @@ struct MountDecl {
     to: String,
     #[allow(dead_code)] // honored by callers that want to refuse writes; runtime defaults to symlink.
     readonly: bool,
+    /// Optional git ref. When the resolved source is a bare git repository,
+    /// `apply_mount` runs `git worktree add` against this ref instead of
+    /// creating a symlink. Defaults to `HEAD`.
+    git_ref: Option<String>,
 }
 
 /// Project every mount listed in `<workspace>/.joi/state/scope.json` into
@@ -884,11 +888,16 @@ fn parse_mount(value: &serde_json::Value) -> Result<MountDecl, String> {
         .get("readonly")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let git_ref = obj
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Ok(MountDecl {
         name,
         from,
         to,
         readonly,
+        git_ref,
     })
 }
 
@@ -904,6 +913,9 @@ fn apply_mount(workspace: &Path, channel_shared: &Path, mount: &MountDecl) -> st
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    if is_bare_git_repo(&source) {
+        return apply_git_worktree_mount(&source, &dest, mount);
+    }
     match std::fs::read_link(&dest) {
         Ok(existing) if existing == source => return Ok(()),
         Ok(_) => remove_path_if_exists(&dest)?,
@@ -911,6 +923,72 @@ fn apply_mount(workspace: &Path, channel_shared: &Path, mount: &MountDecl) -> st
         Err(_) => remove_path_if_exists(&dest)?,
     }
     symlink_path(&source, &dest)
+}
+
+fn is_bare_git_repo(p: &Path) -> bool {
+    p.is_dir() && p.join("HEAD").is_file() && !p.join(".git").exists()
+}
+
+/// Materialise a writable worktree at `dest` using `git worktree add`.
+/// If the destination already contains a worktree linked to `bare`, this
+/// is a no-op. The branch name is derived from the dest leaf so multiple
+/// threads can checkout the same ref without colliding.
+fn apply_git_worktree_mount(
+    bare: &Path,
+    dest: &Path,
+    mount: &MountDecl,
+) -> std::io::Result<()> {
+    if dest.join(".git").exists() {
+        // Best-effort idempotence: assume an existing worktree is fine.
+        return Ok(());
+    }
+    if dest.exists() {
+        // A symlink left over from an earlier projection or stale dir.
+        remove_path_if_exists(dest)?;
+    }
+    let git_ref = mount.git_ref.as_deref().unwrap_or("HEAD");
+    let leaf = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("joi-thread");
+    let branch = format!("joi/{leaf}");
+    // Try creating a new branch from the requested ref. If the branch
+    // already exists (re-projection across restarts), retry without -b.
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .arg("worktree")
+        .arg("add")
+        .arg("-B")
+        .arg(&branch)
+        .arg(dest)
+        .arg(git_ref)
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    let status2 = std::process::Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .arg("worktree")
+        .arg("add")
+        .arg("--detach")
+        .arg(dest)
+        .arg(git_ref)
+        .status()?;
+    if status2.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!(
+            "git worktree add failed for mount `{}` (bare={}, dest={}, ref={})",
+            mount.name,
+            bare.display(),
+            dest.display(),
+            git_ref
+        ),
+    ))
 }
 
 fn sanitize_workspace_relative(workspace: &Path, rel: &str) -> std::io::Result<PathBuf> {
@@ -3226,6 +3304,7 @@ mod tests {
                 from: "channel:///seed".into(),
                 to: (*bad).into(),
                 readonly: false,
+                git_ref: None,
             };
             let err =
                 apply_mount(&scope_paths.workspace, &scope_paths.channel_shared, &mount)

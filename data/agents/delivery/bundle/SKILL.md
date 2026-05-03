@@ -8,8 +8,8 @@
 
 - `task-goal.json`、`definition-of-done.json` —— 成功的标准。
 - `lesson-plan.md` —— teacher 选定的步骤和 skill。
-- `clone-manifest.json` —— `repo-provision` 服务已经把仓库布置到
-  `{workspace.dir}/repos/<repo_id>` 下。
+- `clone-manifest.json` —— `joi thread create --bootstrap-artifact` 已经把
+  仓库通过 §4.7.2 mount 投影到 `{workspace.dir}/repos/<repo_id>` 下。
 - `mr-event-*.json`（流式）—— 推送之后由 thread-bound 的 `mr-detector`
   服务持续吐出。
 
@@ -23,7 +23,7 @@
 ## 守则
 
 - `clone-manifest.json` 中标记 `readonly: true` 的仓库 **不准修改** ——
-  `repo-provision` 不一定在 FS 层面强制只读，请读
+  mount 投影不一定在 FS 层面强制只读，请读
   `repos/<repo_id>/.joi/repo.json` 确认意图。
 - 不要直接 push `main`/`master`；每个仓库都用形如 `joi/<task_id>/<short-slug>`
   的 topic branch。

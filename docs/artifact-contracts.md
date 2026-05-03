@@ -94,7 +94,7 @@ each criterion's `id` + `must`.
 
 ## 3. `clone-manifest.json`
 
-Producer: `discovery` / `router` / `repo-provision`. Consumer:
+Producer: `discovery` / `router`. Consumer:
 `delivery` (and `joi thread create --bootstrap-artifact`).
 
 This shape is *also consumed by* `joi thread create --bootstrap-artifact`

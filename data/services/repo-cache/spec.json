@@ -7,7 +7,7 @@
     "displayName": "Repo Cache"
   },
   "autostart": true,
-  "channelId": "channel_repo_cache",
+  "channelId": "chan_31f8fa85d909",
   "config": {
     "jobs": [
       {
@@ -27,7 +27,7 @@
         },
         "scope": {
           "kind": "channel",
-          "id": "channel_repo_cache"
+          "id": "chan_31f8fa85d909"
         },
         "dedupeBy": "payload_hash",
         "cursorBy": "body_hash",

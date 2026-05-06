@@ -11,8 +11,6 @@
 //! contact the joi-server. They exist so skill processes (running under a
 //! served agent) and operators can read/write workspace files without
 //! re-implementing the path-resolution dance.
-//!
-//! See `docs/remove-dev-helper-migration-design.md` §4.1 / §4.2.
 
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};

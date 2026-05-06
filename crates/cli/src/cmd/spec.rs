@@ -1,8 +1,7 @@
 //! `joi agent spec` / `joi service spec` / `joi agent bundle` — read-only
 //! spec and bundle inspection. Lets a teaching agent (e.g. `teacher`) or
 //! ops examine deployed AgentSpec / ServiceSpec / bundle layouts without
-//! touching the runtime. See `docs/remove-dev-helper-migration-design.md`
-//! §4.1.1.
+//! touching the runtime.
 //!
 //! These commands do not contact the joi-server. Specs and bundles are
 //! local config artifacts owned by the operator running `joi agent serve`

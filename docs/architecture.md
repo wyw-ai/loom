@@ -154,3 +154,17 @@ agent 管理现在是本地 CLI 行为：
 
 新的 runtime 能力只能放进 `crates/agent-runtime` 或 agent client；新的协议能力才进入
 server。
+
+## 8. 本地验证常用命令
+
+修改运行时链路时优先：
+
+- `cargo check -p joi-server -p joi-cli -p agent-runtime`
+- `cargo test -p joi-server`
+- `cargo test -p joi-cli agent_serve`
+- `cargo test -p agent-runtime`
+- `cargo fmt --check`
+- `git diff --check`
+
+只改 agent runtime 行为，通常重启 `joi agent serve` 即可；只有协议、store、
+fanout、artifact、server RPC 行为变更时才需要重启 `joi-server`。

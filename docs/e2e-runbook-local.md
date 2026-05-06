@@ -1,8 +1,7 @@
-# Local e2e Runbook — `feat/remove-dev-helper`
+# Local e2e Runbook
 
-> 适用范围：dev-helper → Joi 原生迁移在本地的最终验收。
-> 远端 cutover (187) **必须** 在本文所有步骤本地全绿后进行——见
-> `docs/remove-dev-helper-migration-design.md` §10。
+> 适用范围：本仓库 e2e 流水的本地验收（spec_apply / mr-detector / classroom /
+> a1-auto-dev / thread.closed 等）。远端 cutover 之前必须先在本地全绿。
 
 ## 前置依赖
 

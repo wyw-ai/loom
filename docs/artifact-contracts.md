@@ -3,8 +3,8 @@
 Cross-agent artifact JSON shapes for the joi runtime. Each artifact below
 is published with `joi artifact publish` and referenced via `attaches_artifact`
 on the `content.add` / `handoff.delivery` event that announces it. See
-[`remove-dev-helper-migration-design.md`](./remove-dev-helper-migration-design.md)
-§4.3 / §4.3.1 for the surrounding model. **These are stable contracts** —
+[`channel-topology-design.md`](./channel-topology-design.md) for the
+surrounding actor / event model. **These are stable contracts** —
 producers may extend them with non-required fields (forward compatible),
 but consumers must tolerate unknown fields and never rely on workspace
 paths to discover them.
@@ -174,8 +174,7 @@ block as the first non-blank content.
 
 #### Optional `spec_apply` block (classroom 教学循环收口)
 
-Lesson-plans destined for the `approval.spec_apply` action gate
-(`docs/remove-dev-helper-migration-design.md` §4.4) MAY include a
+Lesson-plans destined for the `approval.spec_apply` action gate MAY include a
 machine-actionable `spec_apply` block in the frontmatter. `joi spec
 apply --action <event_id>` reads it after the human approves and
 applies the changes to the on-disk AgentSpec / ServiceSpec, then bumps

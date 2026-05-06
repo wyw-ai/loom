@@ -1,8 +1,7 @@
 # Command Transport v0
 
-> **状态**：设计文档（draft），尚未落代码。隶属于
-> [docs/architecture-v1-agent-client.md](architecture-v1-agent-client.md) 的
-> Adapter 抽象之下的具体 transport 规范。
+> **状态**：已落地。Adapter 抽象见 [architecture.md](architecture.md)；
+> 实现位于 `crates/agent-runtime/src/command.rs`。本文档作为协议规范保留。
 
 ---
 
@@ -10,7 +9,7 @@
 
 ### 1.1 为什么需要 command transport
 
-[v1 Adapter 抽象](architecture-v1-agent-client.md#4-adapter-抽象) 已经把 ACP 作
+[v1 Adapter 抽象](architecture.md) 已经把 ACP 作
 为第一类 transport 落地。但现实里很多 agent 不长成 ACP 形态：
 
 - `claude -p "<prompt>"` 一次性 CLI；
@@ -628,9 +627,9 @@ stream-json"——切换需要改 spec 重启。
 
 ---
 
-## 10. 与 architecture-v1 的对应关系
+## 10. 与 architecture 的对应关系
 
-| 本文档章节 | architecture-v1 章节 |
+| 本文档章节 | architecture 章节 |
 | --- | --- |
 | §2 schema 扩展 | §4.4（`transport.kind` 取值表） |
 | §4 / §5 / §6 翻译规则 | §4.2（AdapterEvent）+ §6.2（translate_event 复用） |

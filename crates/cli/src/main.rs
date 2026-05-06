@@ -116,8 +116,7 @@ enum Cmd {
         sub: McpCmd,
     },
     /// Apply a lesson-plan to an on-disk AgentSpec / ServiceSpec
-    /// after `approval.spec_apply` has been accepted. See
-    /// `docs/remove-dev-helper-migration-design.md` §4.4 / §7.1.
+    /// after `approval.spec_apply` has been accepted.
     Spec {
         #[command(subcommand)]
         sub: SpecCmd,
@@ -129,8 +128,7 @@ enum Cmd {
         sub: ServiceCmd,
     },
     /// Read/write files under a scope's workspace directory. Local-only —
-    /// no server contact. See `docs/remove-dev-helper-migration-design.md`
-    /// §4.1.
+    /// no server contact.
     Workspace {
         #[command(subcommand)]
         sub: WorkspaceCmd,

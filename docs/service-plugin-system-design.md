@@ -84,11 +84,11 @@ graph LR
 ~/.config/joi/services/*.json
 ```
 
-service spec 与 agent spec 的关键差异：
+service spec 与 agent provider spec 的关键差异：
 
-- agent spec 隐式 `actor.kind = "agent"`。
+- agent provider spec 的 `actors[]` 隐式 `actor.kind = "agent"`。
 - service spec 必须显式声明 `actor.kind = "service"`，并允许同一 host 进程挂载多个不同 kind 的 service actor。
-- 其他公共字段，如 `id`、`displayName`、`autostart`，与 agent spec 对齐，便于复用 `crates/cli/src/cmd/agent_serve.rs` 的 spec 加载与 `--allow-*` 过滤逻辑。
+- service spec 是独立 schema；provider spec 先展开成 per-actor runtime spec，再复用 `crates/cli/src/cmd/agent_serve.rs` 的 adapter 调度逻辑。
 
 示例：
 

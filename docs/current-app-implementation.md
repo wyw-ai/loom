@@ -39,7 +39,7 @@ agent runtime。
 
 它不做：
 
-- agent spec 安装或读取
+- provider spec 安装或读取
 - adapter 启停
 - ACP / command 子进程管理
 - workspace 计算
@@ -75,7 +75,7 @@ GUI 和 chat CLI 是人类交互层。它们负责：
 | --- | --- |
 | server journal / SQLite / artifacts | server `--data-dir` |
 | CLI config | `~/.config/joi/config.toml` |
-| agent spec | `~/.config/joi/agents/*.json` |
+| provider spec | `~/.config/joi/agents/*.json` |
 | actor-private runtime 状态 | `~/.agentx/agents/<actor_id>` |
 | channel-scoped workspace | `~/.agentx/channels/<channel_id>/agents/<actor_id>/workspace` |
 | channel-scoped runtime logs | `~/.agentx/channels/<channel_id>/agents/<actor_id>/logs` |
@@ -86,7 +86,7 @@ workspace 已经按 channel 细分。ACP `session/new.cwd` 和 command subproces
 
 ## 4. Agent 生命周期
 
-1. `joi agent serve` 启动后读取本地 spec。
+1. `joi agent serve` 启动后读取本地 provider spec，并展开成 actor。
 2. 每个 agent worker 用自己的 actor id 连接 server。
 3. worker 通过 `actor/upsert` 和 `connection/open` 出现在 actor registry 中。
 4. 人类消息通过 `HandsOffTo` relation 指向 agent。
@@ -105,15 +105,16 @@ server 校验 channel member 后写入 `turn.close` event，并把该 event hand
 owner actor。`joi agent serve` 收到后取消本地 adapter。如果 adapter 已经产生了部分
 文本，agent client 会先 flush 为 `content.add`，再关闭 turn。
 
-## 6. Agent Spec
+## 6. Provider Spec
 
-agent spec 仍使用 `crates/proto::methods::AgentSpec` schema。transport 目前支持：
+落盘配置使用 `crates/proto::methods::AgentProviderSpec` schema，运行时展开成
+per-actor `AgentSpec`。transport 目前支持：
 
 - `acp_stdio`
 - `command`
 
 `transport.cwd` 已删除。cwd 是 runtime 根据 scope 计算出来的执行上下文，不属于
-agent spec。
+provider spec。
 
 ## 7. 当前验证重点
 

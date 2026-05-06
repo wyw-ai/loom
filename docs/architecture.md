@@ -23,14 +23,14 @@
 - artifact 元数据与文件存储
 - turn trace 读写与 owner-only 访问控制
 
-server 不读取 agent spec，不安装 agent，不 spawn agent 子进程，也不链接
+server 不读取 provider spec，不安装 agent，不 spawn agent 子进程，也不链接
 `agent-runtime` crate。任何 adapter 生命周期都不应该进入 `crates/server`。
 
 ### 1.2 joi agent serve
 
 `joi agent serve` 是本机 agent client / supervisor：
 
-- 读取本地 agent spec：默认 `~/.config/joi/agents/*.json`
+- 读取本地 provider spec：默认 `~/.config/joi/agents/*.json`
 - 为每个启用的 agent 建立一条到 server 的 WebSocket 连接
 - 使用 `connection/open(actorKind=agent)` 把 agent 注册为普通 actor
 - 订阅 agent 所属 scope，接收 handoff / directed delivery
@@ -62,7 +62,7 @@ runtime 代码集中在：
 | --- | --- | --- |
 | 协作 journal / actors / channels / events / turns | `joi-server` | server `--data-dir` |
 | artifact 文件 | `joi-server` | `<data-dir>/artifacts` |
-| agent spec | `joi agent serve` / CLI 本地管理 | `~/.config/joi/agents` |
+| provider spec | `joi agent serve` / CLI 本地管理 | `~/.config/joi/agents` |
 | actor-private profile / bundles | `joi agent serve` | `~/.agentx/agents/<actor_id>` |
 | channel-scoped workspace / logs | `joi agent serve` | `~/.agentx/channels/<channel_id>/agents/<actor_id>` |
 | shared channel artifacts for runtime | `joi agent serve` | `~/.agentx/channels/<channel_id>/shared/artifacts` |
@@ -149,7 +149,7 @@ agent 管理现在是本地 CLI 行为：
 | `crates/client` | WebSocket JSON-RPC client |
 | `crates/agent-runtime` | ACP / command adapter 与 runtime helper |
 | `crates/cli/src/cmd/agent_serve.rs` | agent client supervisor |
-| `crates/cli/src/cmd/agent.rs` | 本地 agent spec 管理 |
+| `crates/cli/src/cmd/agent.rs` | 本地 provider spec 管理 |
 | `crates/gui` | Tauri GUI |
 
 新的 runtime 能力只能放进 `crates/agent-runtime` 或 agent client；新的协议能力才进入

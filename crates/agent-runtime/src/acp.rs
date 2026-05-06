@@ -657,7 +657,7 @@ fn request_new_session_with_auth_retry(
             let Some(method) = method else {
                 return Err(format!(
                     "{err}; agent requires authentication but did not advertise a single \
-                     auth method. Set transport.authMethod in the agent spec."
+                     auth method. Set transport.authMethod in the provider spec."
                 ));
             };
             {

@@ -88,15 +88,10 @@ pub fn install(
     let local_id =
         local_actor_id.unwrap_or_else(|| format!("actor_{}", entry.id.replace('-', "_")));
     let display = display_name.unwrap_or_else(|| entry.name.clone());
-    let spec = AgentSpec {
-        actor: proto::types::Actor {
-            id: local_id,
-            kind: proto::types::ActorKind::Agent,
-            display_name: display,
-            capabilities: None,
-            _meta: None,
-        },
-        transport: AgentTransport {
+    let provider = single_actor_provider(
+        entry.id.clone(),
+        entry.name.clone(),
+        AgentTransport {
             kind: "acp_stdio".into(),
             command: resolved.command.clone(),
             args: resolved.args.clone(),
@@ -109,31 +104,38 @@ pub fn install(
             interactive: None,
             provider: None,
         },
-        autostart: false,
-        models: None,
-        bundle: None,
-        identity: Some(proto::methods::IdentitySpec::default()),
-        memory: Some(proto::methods::MemorySpec {
-            delivery: proto::methods::MemoryDeliverySpec {
-                prompt: true,
-                mcp: true,
-            },
-            ..Default::default()
-        }),
-        announcement: None,
-    };
-    let path = write_spec(&spec)?;
+        AgentActorSpec {
+            id: local_id,
+            display_name: Some(display),
+            capabilities: None,
+            meta: None,
+            transport: None,
+            autostart: None,
+            model: None,
+            models: None,
+            bundle: None,
+            identity: None,
+            memory: None,
+            announcement: None,
+        },
+    );
+    let path = write_provider_spec(&provider)?;
+    let actor = &provider.actors[0];
     println!(
         "installed {} at {} (source={}, command={})",
-        spec.actor.id,
+        actor.id,
         path.display(),
         resolved.source,
-        spec.transport.command,
+        provider.transport.command,
     );
     Ok(())
 }
 
 pub fn add() -> Result<()> {
+    let provider_id = prompt("provider id (e.g. codex_local): ")?;
+    if provider_id.is_empty() {
+        anyhow::bail!("provider id is required");
+    }
     let id = prompt("actor id (e.g. actor_my_agent): ")?;
     if id.is_empty() {
         anyhow::bail!("actor id is required");
@@ -161,19 +163,14 @@ pub fn add() -> Result<()> {
             eprintln!("(skipped) expected KEY=VAL, got `{}`", kv);
         }
     }
-    let spec = AgentSpec {
-        actor: proto::types::Actor {
-            id: id.clone(),
-            kind: proto::types::ActorKind::Agent,
-            display_name: if display.is_empty() {
-                id.clone()
-            } else {
-                display
-            },
-            capabilities: None,
-            _meta: None,
+    let provider = single_actor_provider(
+        provider_id.clone(),
+        if display.is_empty() {
+            provider_id
+        } else {
+            display.clone()
         },
-        transport: AgentTransport {
+        AgentTransport {
             kind: "acp_stdio".into(),
             command,
             args,
@@ -186,21 +183,27 @@ pub fn add() -> Result<()> {
             interactive: None,
             provider: None,
         },
-        autostart: false,
-        models: None,
-        bundle: None,
-        identity: Some(proto::methods::IdentitySpec::default()),
-        memory: Some(proto::methods::MemorySpec {
-            delivery: proto::methods::MemoryDeliverySpec {
-                prompt: true,
-                mcp: true,
+        AgentActorSpec {
+            id: id.clone(),
+            display_name: if display.is_empty() {
+                None
+            } else {
+                Some(display)
             },
-            ..Default::default()
-        }),
-        announcement: None,
-    };
-    let path = write_spec(&spec)?;
-    println!("registered {} at {}", spec.actor.id, path.display());
+            capabilities: None,
+            meta: None,
+            transport: None,
+            autostart: None,
+            model: None,
+            models: None,
+            bundle: None,
+            identity: None,
+            memory: None,
+            announcement: None,
+        },
+    );
+    let path = write_provider_spec(&provider)?;
+    println!("registered {} at {}", id, path.display());
     Ok(())
 }
 
@@ -436,20 +439,29 @@ interactive_command notes:
 
 pub fn register(path: PathBuf) -> Result<()> {
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read agent spec {}", path.display()))?;
-    let spec: AgentSpec = serde_json::from_str(&text)?;
-    let dest = write_spec(&spec)?;
-    println!("registered {} at {}", spec.actor.id, dest.display());
+        .with_context(|| format!("read agent provider spec {}", path.display()))?;
+    let provider: AgentProviderSpec = serde_json::from_str(&text)?;
+    let specs = provider.clone().into_agent_specs();
+    if specs.is_empty() {
+        bail!("agent provider spec has no actors: {}", path.display());
+    }
+    let dest = write_provider_spec(&provider)?;
+    let actor_ids = specs
+        .iter()
+        .map(|spec| spec.actor.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("registered {} at {}", actor_ids, dest.display());
     Ok(())
 }
 
-pub fn remove(actor_id: String) -> Result<()> {
-    let path = spec_path(&actor_id);
+pub fn remove(provider_id: String) -> Result<()> {
+    let path = provider_path(&provider_id);
     if !path.exists() {
-        bail!("agent spec not found: {}", path.display());
+        bail!("agent provider spec not found: {}", path.display());
     }
     std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
-    println!("removed {} ({})", actor_id, path.display());
+    println!("removed {} ({})", provider_id, path.display());
     Ok(())
 }
 
@@ -480,18 +492,45 @@ fn default_specs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
 }
 
-fn spec_path(actor_id: &str) -> PathBuf {
-    default_specs_dir().join(format!("{actor_id}.json"))
+fn provider_path(provider_id: &str) -> PathBuf {
+    default_specs_dir().join(format!("{provider_id}.json"))
 }
 
-fn write_spec(spec: &AgentSpec) -> Result<PathBuf> {
+fn write_provider_spec(spec: &AgentProviderSpec) -> Result<PathBuf> {
     let dir = default_specs_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = dir.join(format!("{}.json", spec.actor.id));
+    let path = provider_path(&spec.provider.id);
     let text = serde_json::to_string_pretty(spec)?;
     std::fs::write(&path, format!("{text}\n"))
         .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+fn single_actor_provider(
+    provider_id: String,
+    provider_display: String,
+    transport: AgentTransport,
+    actor: AgentActorSpec,
+) -> AgentProviderSpec {
+    AgentProviderSpec {
+        provider: AgentProviderInfo {
+            id: provider_id,
+            display_name: provider_display,
+        },
+        transport,
+        defaults: AgentActorDefaults {
+            identity: Some(proto::methods::IdentitySpec::default()),
+            memory: Some(proto::methods::MemorySpec {
+                delivery: proto::methods::MemoryDeliverySpec {
+                    prompt: true,
+                    mcp: true,
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        actors: vec![actor],
+    }
 }
 
 fn load_specs() -> Result<Vec<AgentSpec>> {
@@ -506,10 +545,10 @@ fn load_specs() -> Result<Vec<AgentSpec>> {
             continue;
         }
         let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read agent spec {}", path.display()))?;
-        let spec: AgentSpec = serde_json::from_str(&text)
-            .with_context(|| format!("parse agent spec {}", path.display()))?;
-        out.push(spec);
+            .with_context(|| format!("read agent provider spec {}", path.display()))?;
+        let provider: AgentProviderSpec = serde_json::from_str(&text)
+            .with_context(|| format!("parse agent provider spec {}", path.display()))?;
+        out.extend(provider.into_agent_specs());
     }
     out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
     Ok(out)

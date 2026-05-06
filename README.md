@@ -177,7 +177,7 @@ Agent runtime 一律由独立的 `joi agent serve` 进程托管，通过 WebSock
 | 进程 | 部署在哪 | 作用 |
 | --- | --- | --- |
 | `joi-server` | 一台共享机器或本机 | 维护 journal、artifact、channel/thread 状态，提供 `ws://.../rpc` |
-| `joi agent serve` | 每台需要跑 agent 的机器 | 读取本机 agent spec，为每个 agent 建立一条到 server 的 WebSocket 连接 |
+| `joi agent serve` | 每台需要跑 agent 的机器 | 读取本机 provider spec，为每个 actor 建立一条到 server 的 WebSocket 连接 |
 | `joi chat` / `joi say` / GUI | 人类使用的机器 | 作为 human actor 连接 server，创建 channel/thread 并 handoff |
 
 ```sh
@@ -189,7 +189,7 @@ joi-server \
 # 2. 在运行 agent host 的机器上配置 server URL。
 export JOI_SERVER=ws://127.0.0.1:7878/rpc
 
-# 3. 装一个 agent 到 ~/.config/joi/agents。
+# 3. 装一个 provider spec 到 ~/.config/joi/agents。
 joi agent install claude-acp \
     --actor-id actor_claude --name "Claude"
 
@@ -211,9 +211,9 @@ joi chat --in <thread_id>
 
 `joi agent serve` 的运行约束：
 
-- agent spec 默认从 `~/.config/joi/agents/*.json` 读取，`--specs <dir>` 可覆盖。
+- provider spec 默认从 `~/.config/joi/agents/*.json` 读取，`--specs <dir>` 可覆盖。
 - spec 只在进程启动时读取；新增、删除或修改 spec 后需要重启 `joi agent serve`。
-- 每个 agent spec 里的命令（例如 `claude-acp`、`codex-acp`、`claude`）必须在
+- 每个 provider spec 里的命令（例如 `claude-acp`、`codex-acp`、`claude`）必须在
   运行 `joi agent serve` 的机器上可执行。
 - 子进程会自动收到 `JOI_SERVER` 和 `JOI_ACTOR`，所以 agent 可以反向调用
   `joi --json ...` 读取历史和 actor 列表。
@@ -299,7 +299,7 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 | 内容 | 路径 |
 | --- | --- |
 | Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） |
-| Agent spec | `~/.config/joi/agents/`（`joi agent serve --specs <dir>` 可覆盖） |
+| Provider spec | `~/.config/joi/agents/`（`joi agent serve --specs <dir>` 可覆盖） |
 | Actor 持久状态 | `~/.agentx/agents/<id>/{profile,bundles}` |
 | Agent workspace 模板变量 | `~/.agentx/channels/<channel-id>/agents/<id>/{workspace,logs}` |
 | Command transport session 簿记 | `~/.agentx/sessions/<actor_id>/<scope_id>.json` |
@@ -308,7 +308,7 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 
 ## 配置 agent
 
-三种添加方式——结果都是写一份 spec JSON 到 `~/.config/joi/agents/`。运行
+三种添加方式——结果都是写一份 provider spec JSON 到 `~/.config/joi/agents/`。运行
 `joi agent serve --specs <dir>` 时可以改为读取其它目录。
 
 ### 1. 从内置 marketplace 装（推荐）
@@ -330,24 +330,60 @@ joi agent add
 
 ### 3. 手写 spec
 
+落盘格式是 provider spec：一个 provider 代表一套 agent CLI/runtime（例如
+Claude Code、Codex、Qoder CLI），`actors[]` 声明它在 Joi 里暴露出的一个或多个
+actor。运行时会展开成多条独立 actor 连接，profile、memory、workspace、模型选择
+状态都按 actor id 隔离。
+
 **ACP transport**（长连接子进程）：
 
-```json
+```jsonc
 {
-  "actor": {
-    "id": "actor_my_agent",
-    "displayName": "My Agent",
-    "kind": "agent",
-    "capabilities": {}
+  "provider": {
+    "id": "codex",
+    "displayName": "Codex ACP"
   },
   "transport": {
     "kind": "acp_stdio",
-    "command": "my-acp-binary",
-    "args": [],
-    "env": {},
-    "authMethod": null
+    "command": "npx",
+    "args": ["-y", "@zed-industries/codex-acp@0.10.0"],
+    "env": {}
   },
-  "autostart": false
+  "defaults": {
+    "models": {
+      "choices": [
+        { "id": "provider/model-strong", "label": "Strong" },
+        { "id": "provider/model-fast", "label": "Fast" }
+      ]
+    },
+    "memory": {
+      "delivery": { "prompt": true, "mcp": true }
+    }
+  },
+  "actors": [
+    {
+      "id": "actor_codex_architect",
+      "displayName": "Codex Architect",
+      "model": "provider/model-strong",
+      "identity": {
+        "description": "Architecture and design reviewer",
+        "scaffold": {
+          "identity": "# Codex Architect\n\n- Role: review architecture, risk, and tradeoffs."
+        }
+      }
+    },
+    {
+      "id": "actor_codex_fast",
+      "displayName": "Codex Fast",
+      "model": "provider/model-fast",
+      "identity": {
+        "description": "Fast implementation assistant",
+        "scaffold": {
+          "identity": "# Codex Fast\n\n- Role: make small scoped code changes quickly."
+        }
+      }
+    }
+  ]
 }
 ```
 
@@ -356,8 +392,13 @@ joi agent add
 完整 schema、`first_run_capture` 规则、`output_format` 翻译表与 worked example 见
 [docs/command-transport-v0.md](docs/command-transport-v0.md)。
 
-保存为 `~/.config/joi/agents/<actor-id>.json`，或运行：
+保存为 `~/.config/joi/agents/<provider-id>.json`，或运行：
 `joi agent register <path>`。
+
+`identity.scaffold.identity` / `identity.scaffold.soul` 只在对应 profile 文件不存在时写入；
+用户后续编辑 `{agent.profile}/identity.md` 或 `soul.md` 不会被覆盖。`model` 是
+`defaults.models.default` 的 actor 级简写；如果 ACP runtime 在 `/models` 时返回动态
+模型菜单，也可以继续通过聊天里的模型选择卡片改当前 actor 的模型。
 
 Agent 的默认 cwd 由 runtime 根据 `channelId + actorId` 计算，不在 spec 里配置。
 
@@ -404,8 +445,9 @@ joi 重写时覆盖。
 
 ## 身份、灵魂、记忆（per-actor 持久化）
 
-每个 actor 在 `{agent.profile}/` 下有三类**持久化状态**，由 spec 里的
-`identity` 和 `memory` 字段按需启用：
+每个 actor 在 `{agent.profile}/` 下有三类**持久化状态**，由 provider spec 里的
+`defaults.identity` / `defaults.memory` 或 actor 自己的 `identity` / `memory`
+字段按需启用：
 
 ```
 {agent.profile}/
@@ -438,23 +480,25 @@ public channel 被召回。关掉走 `"perChannel": false`。
   参数自指），agent 通过 `memory.query` / `memory.append` / `memory.get`
   三个 MCP tool 主动读写。
 
-marketplace install 和 `joi agent add` 现在默认**两条都开**。手写老 spec
-没这两个字段照样工作，行为跟过去一致。
+marketplace install 和 `joi agent add` 现在默认**两条都开**。
 
 ### spec 片段示例
 
 ```jsonc
 {
-  "actor": { "id": "actor_claude", "displayName": "Claude", "kind": "agent" },
-  "transport": { "kind": "acp_stdio", "command": "claude-acp", ... },
-  "identity": {
-    "files": { "identity": "identity.md", "soul": "soul.md" }
+  "provider": { "id": "claude", "displayName": "Claude Code" },
+  "transport": { "kind": "acp_stdio", "command": "claude-acp" },
+  "defaults": {
+    "identity": {
+      "files": { "identity": "identity.md", "soul": "soul.md" }
+    },
+    "memory": {
+      "store":    { "type": "jsonl", "root": "./memory/records", "shardBy": "month" },
+      "query":    { "mode": "heuristic", "bootstrapTopK": 8, "turnTopK": 4, "perChannel": true },
+      "delivery": { "prompt": true, "mcp": true }
+    }
   },
-  "memory": {
-    "store":    { "type": "jsonl", "root": "./memory/records", "shardBy": "month" },
-    "query":    { "mode": "heuristic", "bootstrapTopK": 8, "turnTopK": 4, "perChannel": true },
-    "delivery": { "prompt": true, "mcp": true }
-  }
+  "actors": [{ "id": "actor_claude", "displayName": "Claude" }]
 }
 ```
 

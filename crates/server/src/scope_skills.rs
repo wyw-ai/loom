@@ -122,7 +122,7 @@ impl ScopeSkills {
         scope_id: &str,
         desired: &BTreeMap<String, PathBuf>,
     ) -> io::Result<()> {
-        let skills_dir = self.skills_dir(kind, scope_id);
+        let skills_dir = self.skills_dir(kind, scope_id)?;
         std::fs::create_dir_all(&skills_dir)?;
 
         let desired_ids = desired.keys().map(String::as_str).collect::<HashSet<_>>();
@@ -151,7 +151,8 @@ impl ScopeSkills {
         actor_id: &str,
         target: &Path,
     ) -> io::Result<()> {
-        let skills_dir = self.skills_dir(kind, scope_id);
+        validate_path_component("actor_id", actor_id)?;
+        let skills_dir = self.skills_dir(kind, scope_id)?;
         std::fs::create_dir_all(&skills_dir)?;
         let link_path = skills_dir.join(actor_id);
         match std::fs::read_link(&link_path) {
@@ -164,12 +165,13 @@ impl ScopeSkills {
     }
 
     fn remove_actor_link(&self, kind: ScopeKind, scope_id: &str, actor_id: &str) -> io::Result<()> {
-        let link_path = self.skills_dir(kind, scope_id).join(actor_id);
+        validate_path_component("actor_id", actor_id)?;
+        let link_path = self.skills_dir(kind, scope_id)?.join(actor_id);
         remove_path_if_exists(&link_path)
     }
 
     fn clear_scope_skills(&self, kind: ScopeKind, scope_id: &str) -> io::Result<()> {
-        remove_path_if_exists(&self.skills_dir(kind, scope_id))
+        remove_path_if_exists(&self.skills_dir(kind, scope_id)?)
     }
 
     fn prune_missing_scope_skills(
@@ -196,12 +198,42 @@ impl ScopeSkills {
         Ok(())
     }
 
-    fn skills_dir(&self, kind: ScopeKind, scope_id: &str) -> PathBuf {
-        self.root
+    fn skills_dir(&self, kind: ScopeKind, scope_id: &str) -> io::Result<PathBuf> {
+        validate_path_component("scope_id", scope_id)?;
+        Ok(self
+            .root
             .join(scope_kind_name(kind))
             .join(scope_id)
-            .join("skills")
+            .join("skills"))
     }
+}
+
+/// Reject path components that could escape the projection root via
+/// traversal sequences, separators, NUL, or platform-specific quirks.
+/// Applied to every `actor_id` / `scope_id` before it is joined into a
+/// filesystem path under the scope-skills root.
+fn validate_path_component(label: &str, value: &str) -> io::Result<()> {
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} must not be empty"),
+        ));
+    }
+    if value == "." || value == ".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} must not be a path traversal token: {value:?}"),
+        ));
+    }
+    for ch in value.chars() {
+        if ch == '/' || ch == '\\' || ch == '\0' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} must not contain path separators or NUL: {value:?}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 trait ActorSkillSource {
@@ -214,6 +246,7 @@ struct FileActorSkillSource {
 
 impl ActorSkillSource for FileActorSkillSource {
     fn target_for_actor(&self, actor_id: &str) -> io::Result<Option<PathBuf>> {
+        validate_path_component("actor_id", actor_id)?;
         let release_path = self.agents_root.join(actor_id).join("bundle-release.json");
         let release_text = match std::fs::read_to_string(&release_path) {
             Ok(text) => text,
@@ -459,6 +492,51 @@ mod tests {
             .join(&thread.id)
             .join("skills")
             .exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_path_traversal_components() {
+        for (label, bad) in [
+            ("actor_id", ".."),
+            ("actor_id", "."),
+            ("actor_id", ""),
+            ("actor_id", "../etc"),
+            ("actor_id", "a/b"),
+            ("actor_id", "a\\b"),
+            ("actor_id", "a\0b"),
+            ("scope_id", "../../escape"),
+        ] {
+            let err = validate_path_component(label, bad)
+                .expect_err(&format!("expected rejection for {label}={bad:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        for ok in ["actor_alice", "actor_42", "thread_abc", "chan_31f8fa85d909"] {
+            validate_path_component("actor_id", ok).expect("legit id");
+        }
+    }
+
+    #[test]
+    fn ensure_actor_link_rejects_traversal() {
+        let root = temp_path("traversal");
+        let agents_root = root.join("agents");
+        std::fs::create_dir_all(&agents_root).expect("agents root");
+        let manager =
+            ScopeSkills::new(root.join("workspaces"), agents_root.clone()).expect("manager");
+        let target = agents_root.join("legit").join("bundle");
+        std::fs::create_dir_all(&target).expect("target");
+
+        let err = manager
+            .ensure_actor_link(ScopeKind::Channel, "chan_legit", "../escape", &target)
+            .expect_err("must reject ../");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = manager
+            .ensure_actor_link(ScopeKind::Thread, "../etc", "actor_alice", &target)
+            .expect_err("must reject ../ scope");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         std::fs::remove_dir_all(root).ok();
     }

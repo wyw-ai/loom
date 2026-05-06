@@ -21,8 +21,25 @@ fn map_store_err(err: StoreError) -> ErrorObject {
     }
 }
 
+#[allow(dead_code)]
 fn map_runtime_err(err: impl std::fmt::Display) -> ErrorObject {
     ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, err.to_string())
+}
+
+
+/// Log a scope-skills projection failure that follows a successful store
+/// mutation. We deliberately do NOT surface this as an RPC error: the
+/// authoritative state (channel/thread/membership) is already persisted, so
+/// returning an error would tempt callers to retry and create duplicates.
+/// The projection is reconciled lazily on next read / restart, or by an
+/// out-of-band repair job.
+fn warn_projection_failure(operation: &str, err: impl std::fmt::Display) {
+    tracing::warn!(
+        operation,
+        %err,
+        "scope_skills projection failed after successful store mutation; \
+         leaving store mutation in place and relying on lazy reconciliation"
+    );
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, ErrorObject> {
@@ -260,10 +277,12 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
         .create_channel(p.title, creator)
         .map_err(map_store_err)?;
     if let Some(actor_id) = channel.members.first() {
-        state
+        if let Err(e) = state
             .scope_skills
             .sync_actor_channel_membership(&state.store, &channel.id, actor_id)
-            .map_err(map_runtime_err)?;
+        {
+            warn_projection_failure("channel_create.sync_actor_channel_membership", e);
+        }
     }
     ok(ChannelCreateResult { channel })
 }
@@ -304,10 +323,12 @@ fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .grant_channel(&p.channel_id, &p.actor_id)
         .map_err(map_store_err)?;
-    state
+    if let Err(e) = state
         .scope_skills
         .sync_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
-        .map_err(map_runtime_err)?;
+    {
+        warn_projection_failure("channel_invite.sync_actor_channel_membership", e);
+    }
     ok(ChannelInviteResult { channel })
 }
 
@@ -339,10 +360,12 @@ fn channel_revoke(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .revoke_channel(&p.channel_id, &p.actor_id)
         .map_err(map_store_err)?;
-    state
+    if let Err(e) = state
         .scope_skills
         .remove_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
-        .map_err(map_runtime_err)?;
+    {
+        warn_projection_failure("channel_revoke.remove_actor_channel_membership", e);
+    }
     ok(ChannelRevokeResult { channel })
 }
 
@@ -400,10 +423,12 @@ fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) 
         .delete_channel(&p.channel_id, p.cascade)
         .map_err(map_store_err)?;
     if deleted {
-        state
+        if let Err(e) = state
             .scope_skills
             .remove_channel_scope(&p.channel_id, &thread_ids)
-            .map_err(map_runtime_err)?;
+        {
+            warn_projection_failure("channel_delete.remove_channel_scope", e);
+        }
     }
     ok(ChannelDeleteResult {
         deleted,
@@ -433,10 +458,12 @@ fn thread_create(state: &AppState, connection_id: &str, params: Option<Value>) -
         .store
         .create_thread(p.channel_id, p.title, p.root_event_id)
         .map_err(map_store_err)?;
-    state
+    if let Err(e) = state
         .scope_skills
         .sync_thread_channel_memberships(&state.store, &thread)
-        .map_err(map_runtime_err)?;
+    {
+        warn_projection_failure("thread_create.sync_thread_channel_memberships", e);
+    }
     ok(ThreadCreateResult { thread })
 }
 
@@ -509,10 +536,9 @@ fn thread_delete(state: &AppState, connection_id: &str, params: Option<Value>) -
         .delete_thread(&p.thread_id)
         .map_err(map_store_err)?;
     if deleted {
-        state
-            .scope_skills
-            .remove_thread_scope(&p.thread_id)
-            .map_err(map_runtime_err)?;
+        if let Err(e) = state.scope_skills.remove_thread_scope(&p.thread_id) {
+            warn_projection_failure("thread_delete.remove_thread_scope", e);
+        }
     }
     ok(ThreadDeleteResult { deleted })
 }

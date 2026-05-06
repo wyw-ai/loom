@@ -2,7 +2,7 @@
 //! `dev-helper` / `dev_helper` / `servicectl` / `run-agent.sh`
 //! surface introduced after the migration.
 //!
-//! The migration (see `docs/remove-dev-helper-migration-design.md`)
+//! The migration
 //! deletes the legacy code paths in favour of joi-native
 //! agent/service specs. Once the rewrite is done it is easy to
 //! regress by copy-pasting an old recipe; this test is the safety
@@ -171,7 +171,7 @@ fn no_new_dev_helper_references() {
              Either remove the reference, or — if it's a legitimate \
              pointer to the migration history — add the path prefix \
              to ALLOWED_PREFIXES in this test file.\n\
-             See docs/remove-dev-helper-migration-design.md for context.\n\n\
+             \n\n\
              Hits:\n  {}",
             body.len(),
             body.join("\n  "),

@@ -1,13 +1,12 @@
 # a1-dev-canfeng / classroom — Channel · Thread · Actor 设计文档
 
-> 本文承接 `docs/remove-dev-helper-migration-design.md`（v4），在“dev-helper
-> → Joi 原生迁移”已完成的元语之上（actor / channel / thread / event /
-> workspace / artifact / action / agent / service），描述当前两个生产
-> channel 的**职责切分、拓扑、工作流**，以及为了承担用户描述的真实剧情还需
-> 补齐的工程项。
+> 本文是 a1-dev-canfeng（自动化研发链路）和 classroom（actor 培训）两个频道
+> 的拓扑设计文档，基于 Joi 原生元语（actor / channel / thread / event /
+> workspace / artifact / action / agent / service），描述两个频道的**职责
+> 切分、拓扑、工作流**，以及承接真实剧情所需的工程项。
 >
-> 设计原则一致：**少造概念，全部复用现有 Joi 元语；不为剧情新增 protocol
-> 抽象**。本文的所有“组件”都映射到下面几个之一：
+> 设计原则：**少造概念，全部复用现有 Joi 元语；不为剧情新增 protocol
+> 抽象**。本文所有"组件"都映射到下面几个之一：
 >
 > - actor（agent / human / service）
 > - channel（人机协作的“工厂”）

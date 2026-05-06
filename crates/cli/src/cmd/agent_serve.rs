@@ -5,7 +5,7 @@
 //! and supervises that one agent through the same `agent-runtime` adapter trait
 //! used by ACP/command transports.
 //!
-//! Architecture (per docs/architecture-v1-agent-client.md §6):
+//! Architecture (per docs/architecture.md §6):
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
 //!   * `connection/open` with `actorKind = "agent"` binds the connection to the
 //!     agent's actor id; the server's actor-inbox delivery (see

@@ -221,8 +221,7 @@ joi chat --in <thread_id>
 `joi-server` 当前无认证、无签名，channel ACL 只按 actor id 过滤。不要把 server
 直接暴露到公网；跨机器部署时放在可信内网或自行加反向代理、访问控制。
 
-详细设计与 phase 切分见
-[docs/architecture-v1-agent-client.md](docs/architecture-v1-agent-client.md)。
+详细设计见 [docs/architecture.md](docs/architecture.md)。
 
 ## CLI 速览
 
@@ -468,11 +467,7 @@ marketplace install 和 `joi agent add` 现在默认**两条都开**。手写老
   - [`docs/protocol/channel-workspace-model.md`](docs/protocol/channel-workspace-model.md)
     —— Channel / Thread / Turn / Event 数据模型
 - 实现层
-  - [`docs/architecture.md`](docs/architecture.md) —— v0 当前架构（默认拓扑）
-  - [`docs/current-app-implementation.md`](docs/current-app-implementation.md)
-    —— v0 各 crate 实现现状
-  - [`docs/architecture-v1-agent-client.md`](docs/architecture-v1-agent-client.md)
-    —— v1 拆分设计与 phase 切分（已落 E1–E3）
+  - [`docs/architecture.md`](docs/architecture.md) —— 当前架构（进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理）
   - [`docs/command-transport-v0.md`](docs/command-transport-v0.md)
     —— Command transport schema + worked example
 

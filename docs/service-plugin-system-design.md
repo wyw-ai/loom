@@ -469,7 +469,7 @@ receipt/record(eventId, actorId, completed)
 
 ### 9.4 Service connection lease（已实现）
 
-复用 v1 agent-client 的同一策略（参见 `docs/architecture-v1-agent-client.md` §9 Q2，倾向“每个 actor 单 owner，后到的 `connection/open` 抢占前者”）。service host 不引入独立的 endpoint id / lease 协议。`connection/open` 的 server 端实现统一支持 service 与 agent。
+复用 v1 agent-client 的同一策略（参见 `docs/architecture.md`，倾向“每个 actor 单 owner，后到的 `connection/open` 抢占前者”）。service host 不引入独立的 endpoint id / lease 协议。`connection/open` 的 server 端实现统一支持 service 与 agent。
 
 实现细节：`crates/server/src/subscribe.rs::bind_actor` 的 preempt 规则覆盖 `ActorKind::Agent | ActorKind::Service`。短期 `joi --as svc_xxx <subcmd>` 默认 `actorKind = Human`（见 `crates/cli/src/client.rs::open_connection`），不会误抢长期 service host 的 inbox。stale 分支无条件清理失效绑定，使 host 干净重启同样能立即接管。
 

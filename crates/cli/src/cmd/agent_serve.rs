@@ -1,6 +1,6 @@
 //! `joi agent serve` — external agent runtime client (v1 phase E3c).
 //!
-//! Loads `AgentSpec` JSON files from `~/.config/joi/agents/` (override with
+//! Loads `AgentProviderSpec` JSON files from `~/.config/joi/agents/` (override with
 //! `--specs`), and for each spec opens a dedicated WebSocket to the joi server
 //! and supervises that one agent through the same `agent-runtime` adapter trait
 //! used by ACP/command transports.
@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
-    method, stream_kind, AgentModelChoice, AgentSpec, BundleInstallMode, EventAppendResult,
-    TurnOpenResult,
+    method, stream_kind, AgentModelChoice, AgentProviderSpec, AgentSpec, BundleInstallMode,
+    EventAppendResult, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -99,7 +99,7 @@ pub async fn run(
     }
     if specs.is_empty() {
         return Err(anyhow!(
-            "no agent specs to serve under {} (loaded {}, after --allow-actors filter: 0)",
+            "no agent actors to serve under {} (expanded {}, after --allow-actors filter: 0)",
             specs_dir.display(),
             total_loaded,
         ));
@@ -194,8 +194,17 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         warn_deprecated_transport_fields(&text, &path);
-        match serde_json::from_str::<AgentSpec>(&text) {
-            Ok(spec) => out.push(spec),
+        match serde_json::from_str::<AgentProviderSpec>(&text) {
+            Ok(provider) => {
+                let specs = provider.into_agent_specs();
+                if specs.is_empty() {
+                    eprintln!(
+                        "[warn] skipping {}: agent provider has no actors",
+                        path.display()
+                    );
+                }
+                out.extend(specs);
+            }
             Err(e) => eprintln!("[warn] skipping {}: {}", path.display(), e),
         }
     }
@@ -316,16 +325,20 @@ impl AgentPaths {
         std::fs::create_dir_all(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
         if spec.identity.is_some() || spec.memory.is_some() {
-            let identity_file = spec
-                .identity
-                .as_ref()
+            let identity = spec.identity.as_ref();
+            let identity_file = identity
                 .map(|s| s.files.identity.as_str())
                 .unwrap_or("identity.md");
-            let soul_file = spec
-                .identity
-                .as_ref()
-                .map(|s| s.files.soul.as_str())
-                .unwrap_or("soul.md");
+            let soul_file = identity.map(|s| s.files.soul.as_str()).unwrap_or("soul.md");
+            let description = identity
+                .and_then(|s| s.description.as_deref())
+                .unwrap_or("");
+            let identity_seed = identity
+                .and_then(|s| s.scaffold.as_ref())
+                .and_then(|s| s.identity.as_deref());
+            let soul_seed = identity
+                .and_then(|s| s.scaffold.as_ref())
+                .and_then(|s| s.soul.as_deref());
             let memory_root = spec
                 .memory
                 .as_ref()
@@ -336,10 +349,12 @@ impl AgentPaths {
                     profile_dir: &self.profile,
                     actor_id,
                     display_name: &spec.actor.display_name,
-                    description: "",
+                    description,
                     identity_file,
                     soul_file,
                     memory_root,
+                    identity_seed,
+                    soul_seed,
                 })
             {
                 tracing::warn!(actor = %actor_id, %e, "failed to scaffold profile");
@@ -1662,7 +1677,7 @@ async fn open_model_picker(
     let (choices, current, source, source_description) =
         model_picker_choices(state, adapter_options);
     if choices.is_empty() {
-        let mut text = "No model choices are available. The ACP runtime did not return model config options, and this agent spec does not define `models.choices`.".to_string();
+        let mut text = "No model choices are available. The ACP runtime did not return model config options, and this provider spec does not define `defaults.models.choices` or actor `models.choices`.".to_string();
         if let Some(err) = adapter_error {
             text.push_str(&format!("\n\nACP model lookup failed: `{err}`"));
         }
@@ -1767,7 +1782,7 @@ fn model_picker_choices(
         state.model_choices(),
         state.current_model(),
         ModelActionSource::Spec,
-        "These choices came from the agent spec. The selected model is saved for this agent and used when Joi creates ACP sessions.",
+        "These choices came from the provider spec. The selected model is saved for this actor and used when Joi creates ACP sessions.",
     )
 }
 

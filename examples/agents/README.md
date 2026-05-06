@@ -1,6 +1,6 @@
-# Agent spec 样例
+# Agent provider spec 样例
 
-这里是几份可直接复用的 ACP agent spec，对应仓库 README「配置 agent」章节里
+这里是几份可直接复用的 ACP provider spec，对应仓库 README「配置 agent」章节里
 「手写 spec」的格式。把任意一份拷到 `~/.config/joi/agents/` 即可被
 `joi agent serve` 加载（或运行 `joi agent serve --specs ./examples/agents`
 直接读这个目录）。
@@ -12,7 +12,7 @@
 | [`actor_opencode.json`](actor_opencode.json) | `opencode acp` | 需要本机已装 `opencode` CLI |
 | [`actor_qoder.json`](actor_qoder.json) | `npx -y @qoder-ai/qodercli@0.1.48 --acp` | Qoder ACP 模式；与 Zed registry 当前版本对齐 |
 
-Qoder 的 spec 需要跟 Zed registry 使用的 ACP 包版本保持一致。Zed 当前配置
+Qoder 的 provider spec 需要跟 Zed registry 使用的 ACP 包版本保持一致。Zed 当前配置
 为 `@qoder-ai/qodercli@0.1.48`；如果 Joi 仍使用旧版
 `@qoder-ai/qodercli@0.1.36`，可能会出现 Zed ACP 可用但 Joi ACP 仍提示
 `Authentication required` 并重新打开浏览器登录的情况。
@@ -21,7 +21,7 @@ Qoder 会根据客户端声明的 terminal auth 能力返回登录命令。Joi �
 Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志提示重新
 登录后重试。
 
-每份 spec 的 `env` 都留空了。如果你的网络环境需要走代理，自己加
+每份 provider spec 的 `env` 都留空了。如果你的网络环境需要走代理，自己加
 `http_proxy` / `https_proxy` / `all_proxy` 即可，例如：
 
 ```json
@@ -32,17 +32,60 @@ Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志
 }
 ```
 
-如果一个 agent runtime 支持在 ACP `session/new` 中指定模型，可以在 spec
-里声明模型菜单。之后在聊天框发送 `@actor_id /models`，Joi 会弹出选择卡片，
+如果一个 agent runtime 支持在 ACP `session/new` 中指定模型，可以在
+`defaults.models` 或 actor 自己的 `models` 里声明模型菜单。之后在聊天框发送
+`@actor_id /models`，Joi 会弹出选择卡片，
 并把选择结果保存到该 actor 的 profile，下次创建 ACP session 时带上选中的
 `model`：
 
 ```json
-"models": {
-  "default": "provider/model-id",
-  "choices": [
-    { "id": "provider/model-id", "label": "Default model" },
-    { "id": "provider/fast-model-id", "label": "Fast model" }
+"defaults": {
+  "models": {
+    "default": "provider/model-id",
+    "choices": [
+      { "id": "provider/model-id", "label": "Default model" },
+      { "id": "provider/fast-model-id", "label": "Fast model" }
+    ]
+  }
+}
+```
+
+同一个 provider / CLI 可以在一份 JSON 里声明多个 actor，避免为同一套
+`transport` 复制多份 spec。`defaults` 作为默认值，`actors[]` 里的 `identity`、
+`model`、`models` 等字段按 actor 覆盖：
+
+```jsonc
+{
+  "provider": { "id": "qoder", "displayName": "Qoder ACP" },
+  "transport": {
+    "kind": "acp_stdio",
+    "command": "npx",
+    "args": ["-y", "@qoder-ai/qodercli@0.1.48", "--acp"],
+    "env": {}
+  },
+  "actors": [
+    {
+      "id": "actor_qoder_reviewer",
+      "displayName": "Qoder Reviewer",
+      "model": "provider/model-strong",
+      "identity": {
+        "description": "Code review actor",
+        "scaffold": {
+          "identity": "# Qoder Reviewer\n\n- Role: review changes and call out risks."
+        }
+      }
+    },
+    {
+      "id": "actor_qoder_builder",
+      "displayName": "Qoder Builder",
+      "model": "provider/model-fast",
+      "identity": {
+        "description": "Implementation actor",
+        "scaffold": {
+          "identity": "# Qoder Builder\n\n- Role: implement scoped changes."
+        }
+      }
+    }
   ]
 }
 ```

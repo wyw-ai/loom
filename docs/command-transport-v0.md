@@ -111,10 +111,9 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
 
 ```json
 {
-  "actor": {
-    "id": "actor_claude_cmd",
-    "kind": "agent",
-    "displayName": "Claude (command mode)"
+  "provider": {
+    "id": "claude_cmd",
+    "displayName": "Claude Code Command"
   },
   "transport": {
     "kind": "command",
@@ -124,13 +123,21 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
       "ANTHROPIC_API_KEY": "{env.ANTHROPIC_API_KEY}"
     },
     "session": {
-      "first_run_capture": "stdout_json:.session_id",
-      "resume_args": ["--resume", "{session_id}", "-p"]
+      "firstRunCapture": "stdout_json:.session_id",
+      "resumeArgs": ["--resume", "{session_id}", "-p"]
     },
-    "output_format": "claude_stream_json",
-    "prompt_via": "args"
+    "outputFormat": "claude_stream_json",
+    "promptVia": "args"
   },
-  "autostart": true
+  "defaults": {
+    "autostart": true
+  },
+  "actors": [
+    {
+      "id": "actor_claude_cmd",
+      "displayName": "Claude (command mode)"
+    }
+  ]
 }
 ```
 
@@ -414,10 +421,9 @@ session_id。
 
 ```json
 {
-  "actor": {
-    "id": "actor_claude_cmd",
-    "kind": "agent",
-    "displayName": "Claude Code (command)"
+  "provider": {
+    "id": "claude_cmd",
+    "displayName": "Claude Code Command"
   },
   "transport": {
     "kind": "command",
@@ -425,13 +431,21 @@ session_id。
     "args": ["-p", "--output-format", "stream-json", "--verbose"],
     "env": {},
     "session": {
-      "first_run_capture": "stdout_json:.session_id",
-      "resume_args": ["--resume", "{session_id}", "-p", "--output-format", "stream-json", "--verbose"]
+      "firstRunCapture": "stdout_json:.session_id",
+      "resumeArgs": ["--resume", "{session_id}", "-p", "--output-format", "stream-json", "--verbose"]
     },
-    "output_format": "claude_stream_json",
-    "prompt_via": "args"
+    "outputFormat": "claude_stream_json",
+    "promptVia": "args"
   },
-  "autostart": true
+  "defaults": {
+    "autostart": true
+  },
+  "actors": [
+    {
+      "id": "actor_claude_cmd",
+      "displayName": "Claude Code (command)"
+    }
+  ]
 }
 ```
 
@@ -513,20 +527,27 @@ echo "{\"type\":\"done\",\"ok\":true}"
 
 ```json
 {
-  "actor": {
-    "id": "actor_echo",
-    "kind": "agent",
-    "displayName": "Echo Bot"
+  "provider": {
+    "id": "echo",
+    "displayName": "Echo Command"
   },
   "transport": {
     "kind": "command",
     "command": "/Users/me/agents/echo-back.sh",
     "args": [],
     "env": {},
-    "output_format": "ndjson_lines",
-    "prompt_via": "args"
+    "outputFormat": "ndjson_lines",
+    "promptVia": "args"
   },
-  "autostart": true
+  "defaults": {
+    "autostart": true
+  },
+  "actors": [
+    {
+      "id": "actor_echo",
+      "displayName": "Echo Bot"
+    }
+  ]
 }
 ```
 

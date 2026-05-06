@@ -25,6 +25,10 @@ pub struct ProfileScaffold<'a> {
     pub soul_file: &'a str,
     /// Relative-or-absolute path for memory records dir.
     pub memory_root: &'a str,
+    /// Optional first-run identity file contents. Existing files are preserved.
+    pub identity_seed: Option<&'a str>,
+    /// Optional first-run soul file contents. Existing files are preserved.
+    pub soul_seed: Option<&'a str>,
 }
 
 /// Ensure the profile-dir layout exists, writing templates only where
@@ -38,7 +42,11 @@ pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
         if let Some(parent) = identity_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&identity_path, scaffold_identity_md(params))?;
+        let content = params
+            .identity_seed
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| scaffold_identity_md(params));
+        std::fs::write(&identity_path, content)?;
     }
 
     let soul_path = resolve_relative(params.profile_dir, params.soul_file);
@@ -46,7 +54,11 @@ pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
         if let Some(parent) = soul_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&soul_path, scaffold_soul_md(params))?;
+        let content = params
+            .soul_seed
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| scaffold_soul_md(params));
+        std::fs::write(&soul_path, content)?;
     }
 
     let memory_root = resolve_relative(params.profile_dir, params.memory_root);
@@ -154,6 +166,8 @@ mod tests {
             identity_file: "identity.md",
             soul_file: "soul.md",
             memory_root: "./memory/records",
+            identity_seed: None,
+            soul_seed: None,
         }
     }
 
@@ -194,10 +208,40 @@ mod tests {
             identity_file: alt.to_str().unwrap(),
             soul_file: "soul.md",
             memory_root: "./memory/records",
+            identity_seed: None,
+            soul_seed: None,
         };
         ensure_profile_scaffold(&p).unwrap();
         assert!(alt.exists());
         assert!(!dir.join("identity.md").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn uses_seed_content_only_on_first_run() {
+        let dir = tmpdir();
+        let p = ProfileScaffold {
+            profile_dir: &dir,
+            actor_id: "a",
+            display_name: "A",
+            description: "",
+            identity_file: "identity.md",
+            soul_file: "soul.md",
+            memory_root: "./memory/records",
+            identity_seed: Some("# Architect\n\nOwn system design."),
+            soul_seed: Some("# Style\n\nBe direct."),
+        };
+        ensure_profile_scaffold(&p).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("identity.md")).unwrap(),
+            "# Architect\n\nOwn system design."
+        );
+        std::fs::write(dir.join("identity.md"), "# edited").unwrap();
+        ensure_profile_scaffold(&p).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("identity.md")).unwrap(),
+            "# edited"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -1040,6 +1040,160 @@ pub struct AgentSpec {
     pub announcement: Option<AnnouncementSpec>,
 }
 
+/// On-disk provider spec. A provider is one installed agent CLI/runtime
+/// (Claude Code, Codex, Qoder, ...). It may expose multiple runtime actors,
+/// each with its own identity, model, memory, profile, and workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderSpec {
+    pub provider: AgentProviderInfo,
+    pub transport: AgentTransport,
+    #[serde(default)]
+    pub defaults: AgentActorDefaults,
+    pub actors: Vec<AgentActorSpec>,
+}
+
+impl AgentProviderSpec {
+    pub fn into_agent_specs(self) -> Vec<AgentSpec> {
+        let AgentProviderSpec {
+            provider: _,
+            transport,
+            defaults,
+            actors,
+        } = self;
+        actors
+            .into_iter()
+            .map(|actor| {
+                let mut actor_models = actor.models.or_else(|| defaults.models.clone());
+                if let Some(model) = actor
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                {
+                    actor_models
+                        .get_or_insert_with(AgentModelSpec::default)
+                        .default = Some(model.to_string());
+                }
+                let display_name = actor
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&actor.id)
+                    .to_string();
+                AgentSpec {
+                    actor: Actor {
+                        id: actor.id,
+                        kind: ActorKind::Agent,
+                        display_name,
+                        capabilities: actor.capabilities,
+                        _meta: actor.meta,
+                    },
+                    transport: actor.transport.unwrap_or_else(|| transport.clone()),
+                    autostart: actor.autostart.unwrap_or(defaults.autostart),
+                    models: actor_models,
+                    bundle: actor.bundle.or_else(|| defaults.bundle.clone()),
+                    identity: merge_identity(defaults.identity.as_ref(), actor.identity),
+                    memory: actor.memory.or_else(|| defaults.memory.clone()),
+                    announcement: actor.announcement.or_else(|| defaults.announcement.clone()),
+                }
+            })
+            .collect()
+    }
+}
+
+fn merge_identity(
+    base: Option<&IdentitySpec>,
+    actor: Option<IdentitySpec>,
+) -> Option<IdentitySpec> {
+    match (base.cloned(), actor) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(actor)) => Some(actor),
+        (Some(base), Some(actor)) => Some(IdentitySpec {
+            files: if actor.files == IdentityFiles::default() {
+                base.files
+            } else {
+                actor.files
+            },
+            description: actor.description.or(base.description),
+            scaffold: merge_identity_scaffold(base.scaffold, actor.scaffold),
+        }),
+    }
+}
+
+fn merge_identity_scaffold(
+    base: Option<IdentityScaffoldSpec>,
+    actor: Option<IdentityScaffoldSpec>,
+) -> Option<IdentityScaffoldSpec> {
+    match (base, actor) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(actor)) => Some(actor),
+        (Some(base), Some(actor)) => Some(IdentityScaffoldSpec {
+            identity: actor.identity.or(base.identity),
+            soul: actor.soul.or(base.soul),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderInfo {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActorDefaults {
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AgentBundleSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentitySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<AnnouncementSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActorSpec {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
+    /// Optional transport override for this actor. Omit to share the provider
+    /// transport, which is the common "same CLI, multiple actors" path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<AgentTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart: Option<bool>,
+    /// Shorthand for setting `models.default` on this actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AgentBundleSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentitySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<AnnouncementSpec>,
+}
+
 // ---- models ----
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1141,9 +1295,26 @@ pub enum BundleInstallMode {
 pub struct IdentitySpec {
     #[serde(default)]
     pub files: IdentityFiles,
+    /// Optional short role description used when scaffolding a missing
+    /// identity file. Existing files are never overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional first-run file contents for `identity.md` / `soul.md`.
+    /// Existing files still win, so operators can edit profiles safely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaffold: Option<IdentityScaffoldSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityScaffoldSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityFiles {
     /// Markdown path relative to `{agent.profile}` (or absolute). Default
@@ -1452,6 +1623,87 @@ pub mod stream_kind {
     /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
     /// channel. Carries `{ channelId, actorId }`.
     pub const CHANNEL_REVOKED: &str = "channel.revoked";
+}
+
+#[cfg(test)]
+mod agent_provider_spec_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_spec_expands_shared_transport_with_actor_overrides() {
+        let provider: AgentProviderSpec = serde_json::from_value(json!({
+            "provider": { "id": "codex", "displayName": "Codex" },
+            "transport": { "kind": "acp_stdio", "command": "npx", "args": ["-y", "codex-acp"] },
+            "defaults": {
+                "models": {
+                    "choices": [
+                        { "id": "gpt-5.5", "label": "GPT-5.5" },
+                        { "id": "gpt-5.4-mini", "label": "GPT-5.4 Mini" }
+                    ]
+                },
+                "identity": {
+                    "scaffold": { "soul": "# Shared style" }
+                }
+            },
+            "actors": [
+                {
+                    "id": "actor_codex_architect",
+                    "displayName": "Codex Architect",
+                    "model": "gpt-5.5",
+                    "identity": {
+                        "description": "System design reviewer",
+                        "scaffold": { "identity": "# Architect" }
+                    }
+                },
+                {
+                    "id": "actor_codex_fast",
+                    "displayName": "Codex Fast",
+                    "model": "gpt-5.4-mini"
+                }
+            ]
+        }))
+        .expect("parse provider spec");
+
+        let specs = provider.into_agent_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].actor.id, "actor_codex_architect");
+        assert_eq!(specs[0].actor.display_name, "Codex Architect");
+        assert!(matches!(specs[0].actor.kind, ActorKind::Agent));
+        assert_eq!(specs[1].actor.id, "actor_codex_fast");
+        assert_eq!(specs[0].transport.args, specs[1].transport.args);
+        assert_eq!(
+            specs[0].models.as_ref().and_then(|m| m.default.as_deref()),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            specs[1].models.as_ref().and_then(|m| m.default.as_deref()),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(
+            specs[0]
+                .identity
+                .as_ref()
+                .and_then(|i| i.description.as_deref()),
+            Some("System design reviewer")
+        );
+        assert_eq!(
+            specs[0]
+                .identity
+                .as_ref()
+                .and_then(|i| i.scaffold.as_ref())
+                .and_then(|s| s.soul.as_deref()),
+            Some("# Shared style")
+        );
+        assert_eq!(
+            specs[1]
+                .identity
+                .as_ref()
+                .and_then(|i| i.scaffold.as_ref())
+                .and_then(|s| s.soul.as_deref()),
+            Some("# Shared style")
+        );
+    }
 }
 
 #[cfg(test)]

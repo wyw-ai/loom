@@ -1,0 +1,21 @@
+{
+  "provider": {
+    "id": "opencode",
+    "displayName": "OpenCode ACP"
+  },
+  "transport": {
+    "kind": "acp_stdio",
+    "command": "opencode",
+    "args": [
+      "acp"
+    ],
+    "env": {}
+  },
+  "actors": [
+    {
+      "id": "actor_opencode",
+      "displayName": "OpenCode",
+      "capabilities": {}
+    }
+  ]
+}

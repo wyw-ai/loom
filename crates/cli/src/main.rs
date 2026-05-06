@@ -330,13 +330,13 @@ enum AgentCmd {
     Add,
     /// Show AgentSpec examples for acp_stdio, command, and interactive_command transports.
     Example,
-    /// Register an agent from a local JSON spec file.
+    /// Register an agent provider from a local JSON spec file.
     Register {
         path: PathBuf,
     },
-    /// Remove a locally registered agent.
+    /// Remove a locally registered agent provider.
     Remove {
-        actor_id: String,
+        provider_id: String,
     },
     Start {
         actor_id: String,
@@ -349,15 +349,15 @@ enum AgentCmd {
         #[arg(long, default_value_t = 50)]
         tail: u32,
     },
-    /// Run as the v1 external agent client: load every AgentSpec under
+    /// Run as the v1 external agent client: load every AgentProviderSpec under
     /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
     /// over its own server connection.
     Serve {
-        /// Override the directory of AgentSpec JSON files.
+        /// Override the directory of AgentProviderSpec JSON files.
         #[arg(long)]
         specs: Option<PathBuf>,
         /// Comma-separated actor ids to load. Empty/omitted = load every
-        /// AgentSpec under --specs.
+        /// actor from every AgentProviderSpec under --specs.
         #[arg(long = "allow-actors", value_delimiter = ',')]
         allow_actors: Vec<String>,
     },
@@ -423,7 +423,7 @@ async fn main() -> Result<()> {
             AgentCmd::Add => cmd::agent::add()?,
             AgentCmd::Example => cmd::agent::example(),
             AgentCmd::Register { path } => cmd::agent::register(path)?,
-            AgentCmd::Remove { actor_id } => cmd::agent::remove(actor_id)?,
+            AgentCmd::Remove { provider_id } => cmd::agent::remove(provider_id)?,
             AgentCmd::Start { actor_id } => cmd::agent::start(actor_id)?,
             AgentCmd::Stop { actor_id } => cmd::agent::stop(actor_id)?,
             AgentCmd::Log { actor_id, tail } => cmd::agent::log(actor_id, tail)?,

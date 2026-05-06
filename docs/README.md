@@ -2,11 +2,14 @@
 
 ## 当前实现
 
-- [architecture.md](./architecture.md) —— 进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理 / 代码边界
+- [current-app-implementation.md](./current-app-implementation.md) —— 当前 app 实现技术总览，适合作为入口
+- [architecture.md](./architecture.md) —— 当前架构（进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理 / 代码边界）
+- [architecture-v1-agent-client.md](./architecture-v1-agent-client.md) —— agent client 拆分、adapter 模型与 v1 部署方式
 - [service-plugin-system-design.md](./service-plugin-system-design.md) —— service / plugin host 设计（runtime 引用此文档为权威规范）
 - [scheduler-plugin.md](./scheduler-plugin.md) —— `joi service serve` 内的 cron 任务插件
 - [am-joi-bridge.md](./am-joi-bridge.md) —— `am listen` 钉钉 bot 消息接入 Joi thread 的最小链路
 - [command-transport-v0.md](./command-transport-v0.md) —— Command Transport 协议规范（已落地）
+- [interactive-command-agent-transport-design.md](./interactive-command-agent-transport-design.md) —— interactive command transport 设计
 - [gui-desktop-design.md](./gui-desktop-design.md) —— Joi Desktop GUI 设计与设计 token 来源
 
 ## 频道 / actor 拓扑

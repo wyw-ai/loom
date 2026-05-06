@@ -467,9 +467,15 @@ marketplace install 和 `joi agent add` 现在默认**两条都开**。手写老
   - [`docs/protocol/channel-workspace-model.md`](docs/protocol/channel-workspace-model.md)
     —— Channel / Thread / Turn / Event 数据模型
 - 实现层
+  - [`docs/current-app-implementation.md`](docs/current-app-implementation.md)
+    —— 当前 app 的 crate 划分与实现现状总览
   - [`docs/architecture.md`](docs/architecture.md) —— 当前架构（进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理）
+  - [`docs/architecture-v1-agent-client.md`](docs/architecture-v1-agent-client.md)
+    —— agent client 拆分、adapter 模型与 v1 部署方式
   - [`docs/command-transport-v0.md`](docs/command-transport-v0.md)
     —— Command transport schema + worked example
+  - [`docs/interactive-command-agent-transport-design.md`](docs/interactive-command-agent-transport-design.md)
+    —— interactive command transport 设计
 
 ## v0 不在范围内的事
 

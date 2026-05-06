@@ -30,6 +30,7 @@ use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 pub struct InteractiveCommandConfig {
     pub actor_id: String,
     pub command: String,
+    pub base_args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub model: Option<String>,
     pub spec: InteractiveCommandSpec,
@@ -70,6 +71,7 @@ impl InteractiveCommandConfig {
         Self {
             actor_id,
             command,
+            base_args: base_args.to_vec(),
             env,
             model,
             spec,
@@ -156,9 +158,19 @@ impl Adapter for InteractiveCommandAdapter {
         let cfg = self.cfg.clone();
         let slot = self.slot_for(&prompt.scope.id);
         slot.lock().cancel_requested = false;
-        tokio::task::spawn_blocking(move || run_prompt(cfg, prompt, sender, slot))
-            .await
-            .map_err(|e| e.to_string())?
+        // Detach the provider turn onto a blocking worker. send_prompt must
+        // return promptly so the agent worker's notification loop stays
+        // free to process turn/close, action responses, and handoffs to
+        // other scopes while a (potentially long) interactive turn runs.
+        // Completion is driven entirely through AdapterEvent (Finished /
+        // Error), and run_prompt always emits a Finished event in both
+        // success and failure paths.
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = run_prompt(cfg, prompt, sender, slot) {
+                tracing::debug!(error = %e, "interactive run_prompt returned err (already reported via AdapterEvent)");
+            }
+        });
+        Ok(())
     }
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
@@ -301,7 +313,13 @@ fn run_prompt_inner(
     let used_first_run = resume_session_id.is_none();
     let session_id = resume_session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let prompt_text = build_interactive_prompt(cfg, prompt, &session_id);
-    let mut argv = if used_first_run {
+    // Prepend transport.args (the agent spec's executable-level base args)
+    // before the session-specific argv so wrapper / common flags actually
+    // reach the child process. Without this, base_args only participated in
+    // command_signature hashing and were silently dropped at spawn time,
+    // which contradicts the documented AgentSpec contract.
+    let mut argv = expand_argv(&cfg.base_args, cfg, prompt, Some(&session_id), &prompt_text);
+    let session_argv = if used_first_run {
         expand_argv(
             &cfg.spec.session.new_args,
             cfg,
@@ -317,6 +335,7 @@ fn run_prompt_inner(
         };
         expand_argv(template, cfg, prompt, Some(&session_id), &prompt_text)
     };
+    argv.extend(session_argv);
     append_provider_args(cfg, prompt, &mut argv)?;
 
     let mut child = spawn_child(cfg, prompt, &argv)?;

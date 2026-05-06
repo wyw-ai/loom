@@ -2,7 +2,7 @@
 # repo-cache/sync.sh — refresh git mirrors declared in a channel
 # `.joi/repos/manifest.json` into the service host data dir.
 #
-# Reads:    <manifest>  (see docs/remove-dev-helper-migration-design.md §4.5)
+# Reads:    <manifest> 
 # Writes:   <cache_root>/<urlencoded(repo_id)>/  (bare or --shared clone)
 # Emits:    one JSON line per repo on stdout (consumed by scheduler as the
 #           service event body); see schema below.

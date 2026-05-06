@@ -31,11 +31,11 @@ Phase 3 交付的 actor 清单：
   `copilot`；如果 spec 里写了 `transport.model`，runtime 会把 `--model=<id>`
   接到底层命令的参数尾。
 - `prompt_template.everyTurnPrefix` 里写标准的 `[joi handoff v1]` 信封
-  （设计文档 `docs/remove-dev-helper-migration-design.md` §5）。`firstTurnPrefix`
+  。`firstTurnPrefix`
   里写 `[joi bootstrap]` 引导段。这两段保留英文，避免将来 runtime 抽取字段时
   踩到本地化坑；它们不影响 LLM 的中文理解。
 - `handoff.triggerPromptPrefix` 在每次 inbox 派发时由 runtime 自动注入到 trigger
-  内容前面，让底层 provider 激活对应的 skill（设计文档 §5.0）。
+  内容前面，让底层 provider 激活对应的 skill（设计文档）。
 - `bundle.source` 为工作区相对路径。Agent host 在 register 时把 bundle 拷到
   `{agent.root}/bundles/<version>/`。
 

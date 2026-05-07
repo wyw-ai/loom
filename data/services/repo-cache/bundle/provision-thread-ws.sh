@@ -134,13 +134,14 @@ provision_one() {
             checkout_branch="$default"
         fi
     elif [[ -n "$TASK_BRANCH" ]]; then
-        # Fresh branch from main trunk; if the branch already exists upstream
-        # (resumed work), check it out as-is.
+        # Fresh branch from main trunk. Existing remote task branches are only
+        # valid in pickup mode; otherwise reusing them can silently import
+        # unrelated work from another delivery thread.
         if git rev-parse --verify "origin/$TASK_BRANCH" >/dev/null 2>&1; then
-            git checkout -B "$TASK_BRANCH" "origin/$TASK_BRANCH"
-        else
-            git checkout -B "$TASK_BRANCH" "origin/$default"
+            echo "[provision] task_branch origin/$TASK_BRANCH already exists for $repo; use pickup=true to continue it, or choose a new task_branch" >&2
+            return 1
         fi
+        git checkout -B "$TASK_BRANCH" "origin/$default"
         checkout_branch="$TASK_BRANCH"
     else
         git checkout -B "$default" "origin/$default"

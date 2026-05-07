@@ -2026,6 +2026,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          and JOI_ACTOR are already injected into your env, so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
            joi --json artifact get <art_id|artifact://...>\n\
+         Message targets use `#<channel_id>` for channels and\n\
+         `#<channel_id>:<root_event_id>` for threads; use\n\
+         `joi --json thread list` to map a thread scope id to that target.\n\
          Use `--json` for machine-readable output and `joi <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\

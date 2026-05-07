@@ -29,7 +29,7 @@ export async function tryHandleSlash(
   switch (rawCmd) {
     case "/handoff":
       // Handled inline in Prompt.send so the flow stays identical to
-      // "@agent msg" — leave as passthrough.
+      // "@agent msg" and becomes one content.add with a handoff relation.
       return "passthrough";
 
     case "/reply":

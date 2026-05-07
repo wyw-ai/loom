@@ -134,7 +134,9 @@ JOI WORKSPACE                 ⚙
 - **右键菜单**：
   - 在 channel 上：Rename / Delete / Invite... / Members / Leave（如果自己是成员）
   - 在 thread 上：Rename / Delete / Copy id
-- **增删**：右上角小 `+` 按钮触发 modal，对应 `channel/create` / `thread/create`。
+- **增删**：右上角小 `+` 按钮触发 modal；创建 thread 时先在 channel
+  公共区写入 root event，再以该 `rootEventId` 调用 `thread/create`。不能从
+  thread 内 event 继续创建子 thread。
 
 ### 3.3 Main 区（flex）
 
@@ -151,7 +153,7 @@ JOI WORKSPACE                 ⚙
      - `System`：灰色斜体、居中。
    - 每条气泡 hover 显示工具条：`Reply` · `Copy` · `Copy id` · 对 `ActionRequest` 显示各 choice 按钮。
    - **Reply quote line**：有 `reply_to_event_id` 时头部挂一条 `↩ @target: preview…`（TUI history.rs 已有同款概念）。
-   - **Handoff line**：有 `handoff_target` 时用 `→ handoff → @target: …` 样式，右侧小 badge 显示目标 agent 状态（从 `actor/list` 过滤 agent）。
+   - **Handoff line**：有 `handoff_target` 时用 `handoff -> @target: …` 样式，右侧小 badge 显示目标 agent 状态（从 `actor/list` 过滤 agent）。
 4. **Streaming status bar**（position: sticky; bottom）：展示当前 scope 内所有 open turn（`open_turns_in_scope`）。点击 ✕ 触发 `turn/close(status=cancelled)`。
 5. **Prompt**（固定底部，参考 Discord 输入框）：
    - 多行可伸缩 textarea，`Enter` 发送，`Shift+Enter` 换行。
@@ -389,7 +391,7 @@ type Bubble = {
 | `channel_members` | `{ channelId }` | |
 | `thread_list` / `thread_create` / `thread_update` / `thread_delete` | | |
 | `scope_subscribe` / `scope_unsubscribe` / `scope_read` | `{ scope, limit?, beforeEventId? }` | |
-| `event_append` | `{ event: EventAppendInput }` | 通用：say、handoff、action.response 都走这个 |
+| `event_append` | `{ event: EventAppendInput }` | 通用：message send、handoff、action.response 都走这个 |
 | `turn_close` | `{ turnId, status }` | cancel |
 | `actor_list` / `agent_list` | | 启动时引导 + @mention palette |
 | `artifact_publish` | `{ ingress, createdBy, scope }` | 粘贴附件 |

@@ -51,6 +51,11 @@ ScopeRef =
   channel:<channel_id>
 ```
 
+这里的 `thread:<thread_id>` / `channel:<channel_id>` 是 runtime 内部 session
+边界，不是 agent-facing message target。CLI target 的 canonical 形式是
+`#<channel_id>` 或 `#<channel_id>:<root_event_id>`；thread 由 channel 公共区
+的一条 root event 锚定，不能嵌套。
+
 `interactive_command` 的 provider session 生命周期直接跟随 `ScopeRef`：
 
 ```text

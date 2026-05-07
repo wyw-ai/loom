@@ -7,11 +7,16 @@ use serde_json::json;
 use crate::client::Client;
 use crate::render;
 
-pub async fn create(client: Arc<Client>, channel_id: String, title: String) -> Result<()> {
+pub async fn create(
+    client: Arc<Client>,
+    channel_id: String,
+    root_event_id: String,
+    title: String,
+) -> Result<()> {
     let res: ThreadCreateResult = client
         .call(
             method::THREAD_CREATE,
-            json!({ "channelId": channel_id, "title": title }),
+            json!({ "channelId": channel_id, "rootEventId": root_event_id, "title": title }),
         )
         .await?;
     if render::is_json() {

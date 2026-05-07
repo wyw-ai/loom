@@ -57,8 +57,7 @@ enum Cmd {
         #[arg(long)]
         reply: Option<String>,
     },
-    /// Hand off the turn to an agent: a `content.add` event carrying a
-    /// `HandsOffTo` relation pointing at the target actor.
+    /// Hand off the turn to an actor in a thread or channel.
     Handoff {
         /// Target actor id; omit to pick from a list of registered agents/humans.
         agent: Option<String>,
@@ -69,6 +68,11 @@ enum Cmd {
         channel: bool,
         #[arg(long, default_value = "")]
         message: String,
+    },
+    /// Message commands using the canonical #channel/#channel:root-event/dm:actor grammar.
+    Message {
+        #[command(subcommand)]
+        sub: MessageCmd,
     },
     /// Respond to an action.request event.
     Action {
@@ -95,6 +99,16 @@ enum Cmd {
     Artifact {
         #[command(subcommand)]
         sub: ArtifactCmd,
+    },
+    /// Upload or download message attachments.
+    Attachment {
+        #[command(subcommand)]
+        sub: AttachmentCmd,
+    },
+    /// Schedule and manage reminders.
+    Reminder {
+        #[command(subcommand)]
+        sub: ReminderCmd,
     },
     /// Interactive chat REPL. Bind to a thread with `--in <tid>` or to a
     /// channel's common area with `--channel <cid>`. Omit both to launch
@@ -224,6 +238,9 @@ enum ThreadCmd {
     Create {
         #[arg(long)]
         channel: String,
+        /// Channel-scope event that anchors the thread.
+        #[arg(long = "root-event")]
+        root_event: String,
         #[arg(long, default_value = "Untitled")]
         title: String,
     },
@@ -248,6 +265,44 @@ enum EventCmd {
         /// Cursor: only return events older than this event id.
         #[arg(long)]
         before: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MessageCmd {
+    /// Send a message to #channel, #channel:root-event, or dm:actor.
+    Send {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long = "attachment-id")]
+        attachment_ids: Vec<String>,
+    },
+    /// Read messages from #channel, #channel:root-event, or dm:actor.
+    Read {
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Drain this actor's pending directed inbox.
+    Check {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long = "no-ack")]
+        no_ack: bool,
+    },
+    /// Search visible message text.
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
     },
 }
 
@@ -283,6 +338,12 @@ enum ArtifactCmd {
         /// Read body from a local file. Mutually exclusive with --text.
         #[arg(long, conflicts_with = "text")]
         file: Option<PathBuf>,
+        /// Optional scope id to associate with the artifact.
+        #[arg(long)]
+        r#in: Option<String>,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
     },
     /// Fetch artifact metadata by id (`art_…`) or by `artifact://` uri.
     Get { id_or_uri: String },
@@ -291,6 +352,74 @@ enum ArtifactCmd {
         artifact_id: String,
         #[arg(long, default_value_t = 65536)]
         max_bytes: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AttachmentCmd {
+    /// Upload a file and return an attachment/artifact id.
+    Upload {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long = "mime-type")]
+        mime_type: Option<String>,
+    },
+    /// Download an attachment/artifact body to a local file.
+    View {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReminderCmd {
+    Schedule {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "msg-id")]
+        msg_id: Option<String>,
+        #[arg(long = "delay-seconds")]
+        delay_seconds: Option<i64>,
+        #[arg(long = "fire-at")]
+        fire_at: Option<String>,
+        #[arg(long)]
+        repeat: Option<String>,
+    },
+    List {
+        #[arg(long = "status", value_delimiter = ',')]
+        status: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    Cancel {
+        #[arg(long)]
+        id: String,
+    },
+    Snooze {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        by: String,
+    },
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "in")]
+        in_after: Option<String>,
+        #[arg(long = "fire-at")]
+        fire_at: Option<String>,
+        #[arg(long = "cadence")]
+        repeat: Option<String>,
     },
 }
 
@@ -521,9 +650,11 @@ async fn main() -> Result<()> {
             ChannelCmd::Members { channel_id } => cmd::channel::members(client, channel_id).await?,
         },
         Cmd::Thread { sub } => match sub {
-            ThreadCmd::Create { channel, title } => {
-                cmd::thread::create(client, channel, title).await?
-            }
+            ThreadCmd::Create {
+                channel,
+                root_event,
+                title,
+            } => cmd::thread::create(client, channel, root_event, title).await?,
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
         },
         Cmd::Say {
@@ -538,6 +669,26 @@ async fn main() -> Result<()> {
             channel,
             message,
         } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, channel, message).await?,
+        Cmd::Message { sub } => match sub {
+            MessageCmd::Send {
+                target,
+                text,
+                attachment_ids,
+            } => cmd::message::send(client, cfg.actor_id, target, text, attachment_ids).await?,
+            MessageCmd::Read {
+                target,
+                limit,
+                before,
+            } => cmd::message::read(client, cfg.actor_id, target, limit, before).await?,
+            MessageCmd::Check { limit, no_ack } => {
+                cmd::message::check(client, cfg.actor_id, limit, !no_ack).await?
+            }
+            MessageCmd::Search {
+                query,
+                target,
+                limit,
+            } => cmd::message::search(client, cfg.actor_id, query, target, limit).await?,
+        },
         Cmd::Action { sub } => match sub {
             ActionCmd::Accept { event_id, option } => {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, true).await?
@@ -570,12 +721,77 @@ async fn main() -> Result<()> {
                 media_type,
                 text,
                 file,
-            } => cmd::artifact::publish(client, cfg.actor_id, name, media_type, text, file).await?,
+                r#in,
+                channel,
+            } => {
+                cmd::artifact::publish(
+                    client,
+                    cfg.actor_id,
+                    name,
+                    media_type,
+                    text,
+                    file,
+                    r#in,
+                    channel,
+                )
+                .await?
+            }
             ArtifactCmd::Get { id_or_uri } => cmd::artifact::get(client, id_or_uri).await?,
             ArtifactCmd::Read {
                 artifact_id,
                 max_bytes,
             } => cmd::artifact::read(client, artifact_id, max_bytes).await?,
+        },
+        Cmd::Attachment { sub } => match sub {
+            AttachmentCmd::Upload {
+                target,
+                path,
+                mime_type,
+            } => cmd::attachment::upload(client, cfg.actor_id, target, path, mime_type).await?,
+            AttachmentCmd::View {
+                id,
+                output,
+                max_bytes,
+            } => cmd::attachment::view(client, id, output, max_bytes).await?,
+        },
+        Cmd::Reminder { sub } => match sub {
+            ReminderCmd::Schedule {
+                title,
+                target,
+                msg_id,
+                delay_seconds,
+                fire_at,
+                repeat,
+            } => {
+                cmd::reminder::schedule(
+                    client,
+                    cfg.actor_id,
+                    title,
+                    target,
+                    msg_id,
+                    delay_seconds,
+                    fire_at,
+                    repeat,
+                )
+                .await?
+            }
+            ReminderCmd::List { status, all } => {
+                cmd::reminder::list(client, cfg.actor_id, status, all).await?
+            }
+            ReminderCmd::Cancel { id } => cmd::reminder::cancel(client, cfg.actor_id, id).await?,
+            ReminderCmd::Snooze { id, by } => {
+                cmd::reminder::snooze(client, cfg.actor_id, id, by).await?
+            }
+            ReminderCmd::Update {
+                id,
+                title,
+                in_after,
+                fire_at,
+                repeat,
+            } => {
+                cmd::reminder::update(client, cfg.actor_id, id, title, in_after, fire_at, repeat)
+                    .await?
+            }
         },
         Cmd::Chat { r#in, channel } => {
             let (scope_id, scope_kind) = match (r#in, channel) {

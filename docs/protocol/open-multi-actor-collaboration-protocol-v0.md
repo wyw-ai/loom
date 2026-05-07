@@ -83,6 +83,7 @@ v0 明确不处理以下问题：
 | `Membership` | Actor 对某个作用域的持续上下文归属 | 是 |
 | `Delivery` | 某个事件对某个 Actor 的投递状态 | 是 |
 | `Receipt` | Actor 对某个事件的确认状态 | 是 |
+| `Reminder` | 某个 Actor 拥有的定时唤醒请求 | 是 |
 
 ### 4.2 结构图
 
@@ -99,6 +100,7 @@ flowchart TD
     MEMBER["Membership"]
     DEL["Delivery"]
     REC["Receipt"]
+    REM["Reminder"]
 
     SPACE --> CONV
     ACTOR --> MEMBER
@@ -110,6 +112,8 @@ flowchart TD
     EVENT --> ART
     EVENT --> DEL
     DEL --> REC
+    ACTOR --> REM
+    REM -. fires .-> EVENT
   end
 
   subgraph Access["Access Domain"]
@@ -128,6 +132,7 @@ flowchart TD
 ### 5.1 Scope 不变量
 
 - `Thread` 必须隶属于且仅隶属于一个 `Channel`。
+- `Thread` 必须锚定该 `Channel` 公共区中的一个 `rootEventId`。
 - `Thread` 不能再嵌套 `Thread`。
 - 一个 `Event` 必须且只能属于一个 `ScopeRef`。
 - `ScopeRef` 只能取两种值：`channel` 或 `thread`。
@@ -192,9 +197,9 @@ flowchart TD
 {
   "id": "actor_123",
   "kind": "human | agent | service",
-  "display_name": "string",
-  "capabilities": ["string"],
-  "metadata": {}
+  "displayName": "string",
+  "capabilities": {},
+  "_meta": {}
 }
 ```
 
@@ -204,7 +209,7 @@ flowchart TD
 {
   "id": "chan_123",
   "title": "string",
-  "metadata": {}
+  "_meta": {}
 }
 ```
 
@@ -213,10 +218,10 @@ flowchart TD
 ```json
 {
   "id": "thread_123",
-  "channel_id": "chan_123",
+  "channelId": "chan_123",
   "title": "string",
-  "root_event_id": "evt_001",
-  "metadata": {}
+  "rootEventId": "evt_001",
+  "_meta": {}
 }
 ```
 
@@ -225,16 +230,16 @@ flowchart TD
 ```json
 {
   "id": "turn_123",
-  "actor_id": "actor_123",
+  "actorId": "actor_123",
   "scope": {
     "kind": "thread",
     "id": "thread_123"
   },
-  "trigger_event_id": "evt_001",
+  "triggerEventId": "evt_001",
   "status": "open | closed | failed | cancelled",
-  "opened_at": "2026-04-18T12:00:00Z",
-  "closed_at": null,
-  "metadata": {}
+  "openedAt": "2026-04-18T12:00:00Z",
+  "closedAt": null,
+  "_meta": {}
 }
 ```
 
@@ -244,17 +249,17 @@ flowchart TD
 {
   "id": "evt_123",
   "type": "content.add",
-  "actor_id": "actor_123",
+  "actorId": "actor_123",
   "scope": {
     "kind": "thread",
     "id": "thread_123"
   },
-  "turn_id": "turn_123",
+  "turnId": "turn_123",
   "seq": 1,
-  "occurred_at": "2026-04-18T12:00:01Z",
+  "occurredAt": "2026-04-18T12:00:01Z",
   "payload": {},
   "relations": [],
-  "metadata": {}
+  "_meta": {}
 }
 ```
 
@@ -267,7 +272,7 @@ flowchart TD
     "kind": "actor",
     "id": "actor_456"
   },
-  "metadata": {}
+  "_meta": {}
 }
 ```
 
@@ -278,10 +283,10 @@ flowchart TD
   "id": "art_123",
   "uri": "artifact://authority/art_123",
   "name": "string",
-  "media_type": "text/markdown",
+  "mediaType": "text/markdown",
   "size": 1024,
   "checksum": "sha256:...",
-  "metadata": {}
+  "_meta": {}
 }
 ```
 
@@ -289,15 +294,15 @@ flowchart TD
 
 ```json
 {
-  "actor_id": "actor_456",
+  "actorId": "actor_456",
   "scope": {
     "kind": "thread",
     "id": "thread_123"
   },
-  "joined_at": "2026-04-18T12:00:00Z",
-  "updated_at": "2026-04-18T12:00:10Z",
-  "last_read_event_id": "evt_120",
-  "metadata": {}
+  "joinedAt": "2026-04-18T12:00:00Z",
+  "updatedAt": "2026-04-18T12:00:10Z",
+  "lastReadEventId": "evt_120",
+  "_meta": {}
 }
 ```
 
@@ -305,11 +310,11 @@ flowchart TD
 
 ```json
 {
-  "event_id": "evt_123",
-  "actor_id": "actor_456",
+  "eventId": "evt_123",
+  "actorId": "actor_456",
   "state": "pending | delivered | failed",
-  "updated_at": "2026-04-18T12:00:02Z",
-  "metadata": {}
+  "updatedAt": "2026-04-18T12:00:02Z",
+  "_meta": {}
 }
 ```
 
@@ -317,11 +322,11 @@ flowchart TD
 
 ```json
 {
-  "event_id": "evt_123",
-  "actor_id": "actor_456",
+  "eventId": "evt_123",
+  "actorId": "actor_456",
   "kind": "seen | read | accepted | declined | completed",
-  "recorded_at": "2026-04-18T12:00:03Z",
-  "metadata": {}
+  "recordedAt": "2026-04-18T12:00:03Z",
+  "_meta": {}
 }
 ```
 
@@ -399,7 +404,9 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 
 用途：
 
-- 在某个 `Channel` 下创建新的 `Thread`。
+- 基于某个 `Channel` 公共区中的 `rootEventId` 创建新的 `Thread`。
+- `rootEventId` 指向的 `Event.scope.kind` 必须是 `channel`，且 `Event.scope.id`
+  必须等于请求里的 `channelId`；不能用 thread 内事件继续创建子 thread。
 
 ### 10.5 `turn/open`
 
@@ -422,13 +429,13 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
   "params": {
     "event": {
       "type": "content.add",
-      "actor_id": "actor_user_1",
+      "actorId": "actor_user_1",
       "scope": {
         "kind": "thread",
         "id": "thread_123"
       },
       "payload": {
-        "content_type": "text/markdown",
+        "contentType": "text/markdown",
         "text": "这里是最新进展。"
       },
       "relations": [
@@ -462,6 +469,77 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 用途：
 
 - 为某个事件记录确认状态。
+
+### 10.9.1 `delivery/list`
+
+用途：
+
+- 拉取某个 actor 的 durable directed inbox。
+- 调用方必须绑定到同一个 `actorId`；server 必须拒绝跨 actor 读取 inbox。
+- agent-facing CLI 的 `message check` 以该方法为基础读取 pending delivery，并用
+  `receipt/record` 标记处理进度。
+
+### 10.10 `message/search`
+
+用途：
+
+- 搜索调用方可见的消息文本。
+- 这是 agent-facing CLI 的读能力补充；发送和读取消息仍分别映射到
+  `event/append` 与 `scope/read`。
+- 若传入 `scope`，server 必须先按调用方 actor 校验该 scope 的访问权；未传入
+  `scope` 时，server 只能返回调用方可见 channel / thread 中的事件。
+
+请求示例：
+
+```json
+{
+  "method": "message/search",
+  "params": {
+    "query": "keyword",
+    "scope": {
+      "kind": "thread",
+      "id": "thread_123"
+    },
+    "limit": 20
+  }
+}
+```
+
+响应示例：
+
+```json
+{
+  "events": [
+    {
+      "id": "evt_123",
+      "type": "content.add",
+      "actorId": "actor_user_1",
+      "scope": {
+        "kind": "thread",
+        "id": "thread_123"
+      },
+      "payload": {
+        "contentType": "text/markdown",
+        "text": "keyword in message"
+      },
+      "relations": []
+    }
+  ]
+}
+```
+
+### 10.11 `reminder/*`
+
+用途：
+
+- `reminder/schedule` 创建一个由 `actorId` 拥有的定时提醒。
+- `reminder/list` 列出该 actor 的提醒。
+- `reminder/cancel`、`reminder/snooze`、`reminder/update` 修改提醒生命周期。
+
+提醒到期时，如果 reminder 绑定了 `scope`，server 追加一条 `reminder.fire`
+事件；该事件带 `hands_off_to -> actor:<actorId>`，从而走同一套 directed delivery
+机制唤醒目标 actor。若 reminder 绑定了 `msgId`，到期事件还应带
+`responds_to -> event:<msgId>`。
 
 ## 11. 标准交互模式
 
@@ -499,6 +577,16 @@ sequenceDiagram
   B->>S: turn/open(scope)
 ```
 
+说明：
+
+- `handoff` 表示当前 scope 内的责任转移 / 唤醒。
+- `handoff` 不表示私聊。私聊是 binding 层目标解析：`dm:<actor_id>` 创建或复用
+  两人私有 channel，然后写入 `content.add`，并带 `hands_off_to` 指向收件 actor。
+- Canonical DM target 只有 `dm:<actor_id>`；`dm:@actor` 这类写法不是协议或 CLI
+  兼容目标。
+- Canonical thread target 是 `#<channel_id>:<root_event_id>`，对应一个
+  channel 消息下的 thread；`thread:<thread_id>` 不作为 binding target。
+
 ### 11.3 审批请求
 
 ```mermaid
@@ -532,7 +620,7 @@ sequenceDiagram
 
 说明：
 
-- trace 帧只对当前 Turn 的 owner（即 `Turn.actor_id`）可见。
+- trace 帧只对当前 Turn 的 owner（即 `Turn.actorId`）可见。
 - trace 不写入 `events_by_scope`，不出现在 `scope/read` 结果里。
 - owner 在重连后可通过 `turn/trace.read` 拉取该 turn 的历史 trace。
 
@@ -558,13 +646,15 @@ sequenceDiagram
 
 - 客户端不得把本地连接状态当作 `Turn` 或 `Thread` 的身份来源。
 - 客户端不得依赖裸文本解析来重建 handoff 或 directed delivery。
+- 客户端和 CLI binding 对同一语义应保留一个 canonical 名称；不得为了兼容旧拼法
+  继续暴露同义 alias。
 - 客户端可以聚合同一 `Turn` 的事件，但不得篡改原始事件顺序。
 
 ### 12.4 扩展约束
 
 - 实现可以增加新的 `Event.type` 与 `Relation.kind`。
 - 扩展不得改变 v0 核心类型的既有语义。
-- 扩展应保持向后兼容，未知类型应允许被透传和展示。
+- Wire-level 扩展不应重新解释核心字段；binding 层不要求保留旧命名或同义 alias。
 
 ## 13. 最小可互操作能力
 
@@ -580,13 +670,21 @@ sequenceDiagram
 - `Membership`
 - `Delivery`
 - `Receipt`
+- `Reminder`
 - `connection/open`
 - `scope/subscribe`
 - `scope/read`
 - `thread/create`
 - `event/append`
+- `message/search`
 - `artifact/publish`
 - `receipt/record`
+- `delivery/list`
+- `reminder/schedule`
+- `reminder/list`
+- `reminder/cancel`
+- `reminder/snooze`
+- `reminder/update`
 - `turn/trace.read`
 
 ## 14. 总结

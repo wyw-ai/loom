@@ -16,7 +16,7 @@ agent runtime。
 `joi-apps` 是一个本地多 actor 协作工作台：
 
 - `Channel` 是长期协作空间。
-- `Thread` 是 channel 内的任务分支。
+- `Thread` 是 channel 公共区某条 root event 下的任务分支，不支持嵌套。
 - 人、agent、service 都是 `Actor`。
 - 协作事实通过 `Event` 进入 timeline。
 - agent 的一次执行被组织为 `Turn`。

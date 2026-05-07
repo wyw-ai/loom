@@ -301,7 +301,7 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
   const targetName = targetActor?.displayName || target;
   return (
     <div className="text-sm text-secondary">
-      <span className="text-muted">→ handoff →</span>{" "}
+      <span className="text-muted">handoff →</span>{" "}
       <span className="text-role-agent" title={target}>
         @{targetName}
       </span>

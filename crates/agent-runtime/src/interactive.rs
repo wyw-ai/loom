@@ -773,7 +773,13 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.trim().to_string()
     } else {
-        let mut t = s[..max].trim().to_string();
+        let cut = s
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx <= max)
+            .last()
+            .unwrap_or(0);
+        let mut t = s[..cut].trim().to_string();
         t.push('…');
         t
     }
@@ -936,6 +942,14 @@ mod tests {
     #[test]
     fn ansi_stripper_removes_csi_sequences() {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+    }
+
+    #[test]
+    fn truncate_is_char_boundary_safe() {
+        let text = "修复 delivery 中文 stderr 截断 panic";
+        let truncated = truncate(text, 10);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() <= 13);
     }
 
     #[test]

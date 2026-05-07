@@ -120,19 +120,36 @@ else
 fi
 ```
 
-发起后立即 publish artifact 让 mr-watcher 自动接管：
+发起后立即用 **两种形式** 注册给 mr-watcher，且每个 MR 都要单独注册一次：
+
+1. publish `mr-opened.v1` artifact，作为结构化证据；
+2. handoff router 的正文里同时包含 `[mr-opened v1]...[/mr-opened v1]` block，
+   作为当前 mr-watcher 的稳定发现入口。
 
 ```bash
 joi artifact publish --kind mr-opened --schema mr-opened.v1 --content '
-{"schema":"mr-opened.v1","repo":"<group/project>","mr_url":"<url>","mr_id":<id>,"branch":"<branch>"}'
+{"schema":"mr-opened.v1","repo":"<group/project>","mr_url":"<url>","mr_id":<id>,"source_branch":"<branch>","target_branch":"<main_branch>"}'
 ```
 
 随后 handoff router 一次性汇报：
 
 ```bash
 joi handoff --as actor_delivery --in <thread> actor_router -m \
-  "已发起 MR：<url>。等待 mr-watcher 推送扫描结果 / discovery 复核结论。"
+  "已发起 MR：
+
+[mr-opened v1]
+repo: <group/project>
+mr_url: <url>
+mr_id: <id>
+source_branch: <branch>
+target_branch: <main_branch>
+[/mr-opened v1]
+
+等待 mr-watcher 推送扫描结果 / discovery 复核结论。"
 ```
+
+多仓库任务必须在同一条 handoff 中列出多个 `[mr-opened v1]` block；不要只写
+"已发起两个 MR"或只贴普通 URL，否则 watcher 可能只接管其中一个 MR。
 
 ### Step 5 — 处理 router 推回的 `review-result.v1`（v2 新增）
 

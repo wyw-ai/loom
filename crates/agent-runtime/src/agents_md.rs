@@ -92,7 +92,11 @@ These variables are already set in your process env:\n\
 A turn always runs in a *scope* (a `thread` or a `channel`). Your first\n\
 prompt in every new scope is prefixed with an auto-injected line that says\n\
 `current scope = thread:<id>` or `current scope = channel:<id>`. Copy that\n\
-id verbatim when you pass `--in <scope_id>` below.\n\
+id verbatim when you pass low-level `--in <scope_id>` commands below.\n\
+Message targets use a separate canonical grammar: `#<channel_id>` for a\n\
+channel and `#<channel_id>:<root_event_id>` for a thread. If you only have a\n\
+thread scope id, run `joi --json thread list` and find the row with that id;\n\
+its `channelId` and `rootEventId` form the message target.\n\
 \n\
 ### Read-only CLI\n\
 \n\
@@ -104,25 +108,43 @@ Use your own built-in tools or shell commands, and use `joi` / `a1` CLI\n\
 commands directly for server or Aone state.\n\
 \n\
 ```\n\
-joi --json event list --in <scope_id>                  # thread scope (default)\n\
-joi --json event list --in <scope_id> --channel        # channel scope\n\
-joi --json event list --in <scope_id> --before <event_id>\n\
+joi --json message read --target '#<channel_id>'\n\
+joi --json message read --target '#<channel_id>:<root_event_id>'\n\
+joi --json message read --target '#<channel_id>:<root_event_id>' --before <event_id>\n\
+joi --json message search --query \"keyword\" --target '#<channel_id>:<root_event_id>'\n\
+joi --json message check                               # drain directed inbox\n\
 joi --json thread list\n\
 joi --json channel list\n\
 joi --json actor list\n\
 joi --json agent list\n\
+joi --json reminder list\n\
 joi --json artifact get <art_id|artifact://...>\n\
 joi --json artifact read <art_id> [--max-bytes N]\n\
 ```\n\
 \n\
 ### Write CLI\n\
 \n\
-Publish a text artifact (draft / plan / summary / report):\n\
+Send messages, DMs, attachments, and reminders:\n\
 \n\
 ```\n\
+joi --json message send --target '#<channel_id>:<root_event_id>' <<'JOIMSG'\n\
+message body\n\
+JOIMSG\n\
+joi --json message send --target dm:<actor_id> <<'JOIMSG'\n\
+private note\n\
+JOIMSG\n\
+joi --json handoff <actor_id> --in <scope_id> --message \"please take this\"\n\
+joi --json attachment upload --target '#<channel_id>:<root_event_id>' --path <file>\n\
 joi --json artifact publish --in <scope_id> [--channel] \\\n\
     --name <file> [--media-type <type>] (--text <body> | --file <path>)\n\
+joi --json reminder schedule --target '#<channel_id>:<root_event_id>' \\\n\
+    --title \"follow up\" --delay-seconds 3600\n\
 ```\n\
+\n\
+Use `dm:<actor_id>` for private messages. `handoff` is responsibility\n\
+transfer in the current scope, not a DM target, and aliases such as\n\
+`dm:@actor` are not supported. Thread targets are rooted at channel events;\n\
+thread-in-thread targets are not supported.\n\
 \n\
 Use `joi --help` and `joi <subcommand> --help` for the full surface.\n\
 {END_MARKER}"

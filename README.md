@@ -178,7 +178,7 @@ Agent runtime 一律由独立的 `joi agent serve` 进程托管，通过 WebSock
 | --- | --- | --- |
 | `joi-server` | 一台共享机器或本机 | 维护 journal、artifact、channel/thread 状态，提供 `ws://.../rpc` |
 | `joi agent serve` | 每台需要跑 agent 的机器 | 读取本机 provider spec，为每个 actor 建立一条到 server 的 WebSocket 连接 |
-| `joi chat` / `joi say` / GUI | 人类使用的机器 | 作为 human actor 连接 server，创建 channel/thread 并 handoff |
+| `joi chat` / `joi message send` / GUI | 人类使用的机器 | 作为 human actor 连接 server，创建 channel/thread 并 handoff |
 
 ```sh
 # 1. 启 server。多人/多机访问时把 bind 改成内网地址或 0.0.0.0。
@@ -236,20 +236,35 @@ joi chat --in <thread_id>
 | `joi channel invite <channel_id> <actor_id>` | 把 actor 加进 channel |
 | `joi channel revoke <channel_id> <actor_id>` | 把 actor 移出 channel |
 | `joi channel members <channel_id>` | 打印当前成员表 |
-| `joi thread create --channel <id> --title …` | 在 channel 下新建 thread |
+| `joi thread create --channel <id> --root-event <event_id> --title …` | 基于 channel 内的一条消息新建 thread |
+| `joi message send --target '#<channel_id>:<root_event_id>' --text "…"` | 向某条 channel 消息的 thread 发送消息；也支持从 stdin 读正文 |
+| `joi message send --target '#<channel_id>' --text "…"` | 向 channel 公共区发送消息 |
+| `joi message send --target dm:<actor_id> --text "…"` | 向某个 actor 发送私聊消息 |
+| `joi message read --target '#<channel_id>:<root_event_id>' [--limit] [--before]` | 读取某个 thread 的消息历史 |
+| `joi message search --query "…" [--target '#<channel_id>:<root_event_id>']` | 搜索当前 actor 可见的消息 |
+| `joi message check` | 拉取并清空当前 actor 的 directed inbox |
 | `joi chat --in <thread_id>` | 进入交互式 TUI |
-| `joi say <text> --in <thread_id>` | 一次性发一条消息（脚本用） |
 | `joi handoff [agent] --in <thread_id> --message "…"` | 把 turn 交给某个 agent |
 | `joi action accept <event_id>` / `decline` | 回应 ACP 提出的 `action.request` |
 | `joi event list --in <scope_id> [--channel] [--limit] [--before]` | 拉历史事件 |
 | `joi actor list` | 列出 server 知道的所有 actor |
+| `joi attachment upload --target '#<channel_id>:<root_event_id>' --path ./foo.txt` | 上传附件并返回 artifact id |
+| `joi attachment view --id <art_id> --output ./foo.txt` | 下载附件 / artifact 正文 |
 | `joi artifact publish --name foo.md --file ./foo.md` | 发布 artifact |
 | `joi artifact get <art_id\|artifact://…>` | 查 artifact 元数据 |
 | `joi artifact read <art_id>` | 打印 artifact 正文 |
+| `joi reminder schedule --target '#<channel_id>:<root_event_id>' --title "…" --delay-seconds 3600` | 安排提醒 |
+| `joi reminder list` / `cancel` / `snooze` / `update` | 管理提醒 |
 | `joi agent serve [--specs <dir>] [--allow-actors a,b,c]` | v1：启动 agent client；`--allow-actors` 仅放行白名单内的 actor id |
 
 加 `--json`（或环境变量 `JOI_JSON=1`）任何输出命令都改成单行 JSON，方便 agent
 shell out。
+
+Agent-facing 的消息入口以 `joi message ...` 为准。`handoff` 只表达责任转移 /
+唤醒，不等同于私聊；私聊使用 `--target dm:<actor_id>`，不接受 `dm:@actor` 这类
+别名。Thread target 的 canonical 形式是 `#<channel_id>:<root_event_id>`；
+`root_event_id` 必须是该 channel 公共区里的 event，不能用 thread 内 event 继续
+开子 thread。
 
 ### Chat TUI 按键
 

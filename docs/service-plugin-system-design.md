@@ -461,7 +461,8 @@ receipt/record(eventId, actorId, completed)
 
 `event/append` 已有 scope ACL；现在 thread create/list/update/delete 四个 handler 也按 caller-actor 校验 channel membership：
 
-- `thread/create`：caller 必须是目标 channel 的 member（公区 channel 短路）。
+- `thread/create`：caller 必须是目标 channel 的 member（公区 channel 短路），且
+  `rootEventId` 必须指向该 channel 公共区事件。
 - `thread/list`：silently filter，只返回 caller 可见 channel 下的 thread；与 `channel/list` 同形态。
 - `thread/update` / `thread/delete`：先解析 thread → channel，再校验 caller membership。
 - 实现位置：`crates/server/src/handlers/mod.rs::thread_create / thread_list / thread_update / thread_delete`，dispatch 层透传 `connection_id`。

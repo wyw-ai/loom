@@ -349,6 +349,32 @@ mod tests {
         Store::open(journal).map_err(|err| io::Error::other(err.to_string()))
     }
 
+    fn create_thread_under(
+        store: &Arc<Store>,
+        channel_id: &str,
+        actor_id: &str,
+        title: &str,
+    ) -> proto::types::Thread {
+        let root_event_id = store
+            .append_event(
+                "content.add".into(),
+                actor_id.into(),
+                proto::types::ScopeRef {
+                    kind: proto::types::ScopeKind::Channel,
+                    id: channel_id.into(),
+                },
+                None,
+                serde_json::json!({ "text": title }),
+                vec![],
+                None,
+            )
+            .expect("append root event")
+            .id;
+        store
+            .create_thread(channel_id.into(), title.into(), root_event_id)
+            .expect("thread")
+    }
+
     #[test]
     fn reconcile_links_channel_members_into_channel_and_thread_skills() {
         let root = temp_path("reconcile");
@@ -357,9 +383,7 @@ mod tests {
         let channel = store
             .create_channel("dojo".into(), Some("actor_alice".into()))
             .expect("channel");
-        let thread = store
-            .create_thread(channel.id.clone(), "lesson".into(), None)
-            .expect("thread");
+        let thread = create_thread_under(&store, &channel.id, "actor_alice", "lesson");
         let manager = ScopeSkills::new(root.join("data").join("workspaces"), root.join("agents"))
             .expect("manager");
 
@@ -407,9 +431,7 @@ mod tests {
         let channel = store
             .create_channel("dojo".into(), Some("actor_alice".into()))
             .expect("channel");
-        let thread = store
-            .create_thread(channel.id.clone(), "lesson".into(), None)
-            .expect("thread");
+        let thread = create_thread_under(&store, &channel.id, "actor_alice", "lesson");
         let manager = ScopeSkills::new(root.join("data").join("workspaces"), root.join("agents"))
             .expect("manager");
 
@@ -464,9 +486,7 @@ mod tests {
         let channel = store
             .create_channel("dojo".into(), Some("actor_alice".into()))
             .expect("channel");
-        let thread = store
-            .create_thread(channel.id.clone(), "lesson".into(), None)
-            .expect("thread");
+        let thread = create_thread_under(&store, &channel.id, "actor_alice", "lesson");
         let manager = ScopeSkills::new(root.join("data").join("workspaces"), root.join("agents"))
             .expect("manager");
 

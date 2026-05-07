@@ -17,9 +17,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", content = "data", rename_all = "snake_case")]
 pub enum Mutation {
     ActorUpsert(Actor),
-    #[serde(alias = "space_create")]
     ChannelCreate(Channel),
-    #[serde(alias = "conversation_create")]
     ThreadCreate(Thread),
     TurnOpen(Turn),
     TurnClose {
@@ -31,13 +29,8 @@ pub enum Mutation {
     MembershipUpsert(Membership),
     DeliveryUpsert(Delivery),
     ReceiptRecord(Receipt),
+    ReminderUpsert(Reminder),
     ArtifactCreate(Artifact),
-    #[serde(alias = "conversation_root_set")]
-    ThreadRootSet {
-        #[serde(alias = "conversation_id")]
-        thread_id: String,
-        root_event_id: String,
-    },
     /// Turn-private trace frame. Stored on the journal so that the turn
     /// owner can re-read the frames after a reconnect via `turn/trace.read`.
     /// These never enter `events_by_scope` and are never broadcast on a
@@ -70,14 +63,10 @@ pub enum Mutation {
 }
 
 /// Variant names accepted as legacy envelope discriminators. Keep in sync
-/// with `Mutation`'s snake_case variant names AND any pre-rename names that
-/// can still appear on disk (e.g. `space_create`, `conversation_create`,
-/// `conversation_root_set` from before the channel/thread rename).
+/// with `Mutation`'s snake_case variant names.
 const LEGACY_VARIANTS: &[&str] = &[
     "actor_upsert",
-    "space_create",
     "channel_create",
-    "conversation_create",
     "thread_create",
     "turn_open",
     "turn_close",
@@ -85,9 +74,8 @@ const LEGACY_VARIANTS: &[&str] = &[
     "membership_upsert",
     "delivery_upsert",
     "receipt_record",
+    "reminder_upsert",
     "artifact_create",
-    "conversation_root_set",
-    "thread_root_set",
     "channel_grant",
     "channel_revoke",
 ];
@@ -258,105 +246,7 @@ mod tests {
 
     #[test]
     fn leaves_already_migrated_lines_alone() {
-        let already = r#"{"op":"space_create","data":{"id":"s","title":"T"}}"#;
+        let already = r#"{"op":"channel_create","data":{"id":"chan_s","title":"T"}}"#;
         assert!(try_convert_legacy(already).is_none());
-    }
-
-    /// Pre-rename journals carry `{"op":"space_create",...}` envelopes; the
-    /// serde alias on `ChannelCreate` should accept them so existing data
-    /// keeps replaying after the rename.
-    #[test]
-    fn space_create_envelope_deserializes_as_channel_create() {
-        let line = r#"{"op":"space_create","data":{"id":"chan_demo","title":"Demo"}}"#;
-        let m: Mutation = serde_json::from_str(line).unwrap();
-        match m {
-            Mutation::ChannelCreate(c) => {
-                assert_eq!(c.id, "chan_demo");
-                assert_eq!(c.title, "Demo");
-            }
-            other => panic!("expected ChannelCreate, got {other:?}"),
-        }
-    }
-
-    /// Same story for conversation_create → ThreadCreate, and the inner
-    /// `spaceId` field aliases onto the new `channel_id` field.
-    #[test]
-    fn conversation_create_envelope_deserializes_as_thread_create() {
-        let line = r#"{"op":"conversation_create","data":{"id":"thread_demo","spaceId":"chan_demo","title":"task1"}}"#;
-        let m: Mutation = serde_json::from_str(line).unwrap();
-        match m {
-            Mutation::ThreadCreate(t) => {
-                assert_eq!(t.id, "thread_demo");
-                assert_eq!(t.channel_id, "chan_demo");
-                assert_eq!(t.title, "task1");
-                assert!(t.root_event_id.is_none());
-            }
-            other => panic!("expected ThreadCreate, got {other:?}"),
-        }
-    }
-
-    /// `conversation_root_set` carries `conversation_id`; the variant alias
-    /// + field alias must both fire to deserialize as `ThreadRootSet`.
-    #[test]
-    fn conversation_root_set_envelope_deserializes_as_thread_root_set() {
-        let line = r#"{"op":"conversation_root_set","data":{"conversation_id":"thread_demo","root_event_id":"evt_1"}}"#;
-        let m: Mutation = serde_json::from_str(line).unwrap();
-        match m {
-            Mutation::ThreadRootSet {
-                thread_id,
-                root_event_id,
-            } => {
-                assert_eq!(thread_id, "thread_demo");
-                assert_eq!(root_event_id, "evt_1");
-            }
-            other => panic!("expected ThreadRootSet, got {other:?}"),
-        }
-    }
-
-    /// End-to-end replay against the real ./data/journal.jsonl committed in
-    /// the repo. Skipped when the file isn't present (e.g. CI without seed
-    /// data). Catches any field/variant rename that would break existing
-    /// users on first server restart after pulling the rename commit.
-    #[test]
-    fn replays_real_pre_rename_journal_if_present() {
-        let candidate = std::path::Path::new("../../data/journal.jsonl");
-        if !candidate.exists() {
-            eprintln!("skipping: no ./data/journal.jsonl available");
-            return;
-        }
-        let raw = std::fs::read_to_string(candidate).unwrap();
-        let mut total = 0;
-        let mut failures: Vec<(usize, String)> = Vec::new();
-        for (i, line) in raw.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            total += 1;
-            if let Err(e) = serde_json::from_str::<Mutation>(line) {
-                failures.push((i + 1, e.to_string()));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "{}/{} legacy journal lines failed to parse: first={:?}",
-            failures.len(),
-            total,
-            failures.first()
-        );
-    }
-
-    /// EventAppend carrying a legacy `"kind":"conversation"` scope still
-    /// loads via the `ScopeKind::Thread` alias.
-    #[test]
-    fn event_append_with_conversation_scope_loads() {
-        let line = r#"{"op":"event_append","data":{"id":"evt_1","type":"content.add","actorId":"actor_a","scope":{"kind":"conversation","id":"thread_demo"},"turnId":null,"seq":1,"occurredAt":"2026-04-20T00:00:00Z","payload":{"contentType":"text/markdown","text":"hi"},"relations":[]}}"#;
-        let m: Mutation = serde_json::from_str(line).unwrap();
-        match m {
-            Mutation::EventAppend(ev) => {
-                assert!(matches!(ev.scope.kind, ScopeKind::Thread));
-                assert_eq!(ev.scope.id, "thread_demo");
-            }
-            other => panic!("expected EventAppend, got {other:?}"),
-        }
     }
 }

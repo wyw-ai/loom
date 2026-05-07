@@ -29,10 +29,16 @@ pub mod method {
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
     pub const EVENT_APPEND: &str = "event/append";
+    pub const MESSAGE_SEARCH: &str = "message/search";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
     pub const ARTIFACT_READ: &str = "artifact/read";
     pub const RECEIPT_RECORD: &str = "receipt/record";
+    pub const REMINDER_SCHEDULE: &str = "reminder/schedule";
+    pub const REMINDER_LIST: &str = "reminder/list";
+    pub const REMINDER_CANCEL: &str = "reminder/cancel";
+    pub const REMINDER_SNOOZE: &str = "reminder/snooze";
+    pub const REMINDER_UPDATE: &str = "reminder/update";
     /// §9.2 Durable actor inbox. Caller (must be bound to `actorId`) lists
     /// deliveries pending against its inbox, with cursor pagination so a
     /// host can resume after restart without losing directed events.
@@ -169,7 +175,7 @@ pub struct ChannelCreateParams {
     pub title: String,
     /// When provided, the new channel is created `Private` and the creator
     /// is its sole initial member. When omitted, the channel is created
-    /// `Public` (legacy behavior, for back-compat with old callers).
+    /// `Public`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
 }
@@ -263,11 +269,9 @@ pub struct ChannelDeleteResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadCreateParams {
-    #[serde(alias = "spaceId")]
     pub channel_id: String,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_event_id: Option<String>,
+    pub root_event_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,7 +283,6 @@ pub struct ThreadCreateResult {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "spaceId")]
     pub channel_id: Option<String>,
 }
 
@@ -467,7 +470,7 @@ pub struct EventAppendInput {
     pub payload: Value,
     #[serde(default)]
     pub relations: Vec<Relation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -481,12 +484,34 @@ pub struct EventAppendResult {
     pub event: Event,
 }
 
+// ---- message/search ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSearchParams {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+fn default_search_limit() -> u32 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchResult {
+    pub events: Vec<Event>,
+}
+
 // ---- artifact/publish / get / read ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ArtifactIngress {
     InlineText(InlineTextIngress),
+    FileBytes(FileBytesIngress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,8 +523,21 @@ pub struct InlineTextIngress {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileBytesIngress {
+    pub name: String,
+    #[serde(default = "default_octet_stream_media_type")]
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
 fn default_text_media_type() -> String {
     "text/markdown".into()
+}
+
+fn default_octet_stream_media_type() -> String {
+    "application/octet-stream".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,6 +587,92 @@ pub struct ArtifactReadResult {
     pub media_type: String,
     pub truncated: bool,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bytes: Vec<u8>,
+}
+
+// ---- reminder/schedule / list / cancel / snooze / update ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderScheduleParams {
+    pub actor_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderScheduleResult {
+    pub reminder: Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderListParams {
+    pub actor_id: String,
+    #[serde(default)]
+    pub statuses: Vec<ReminderStatus>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderListResult {
+    pub reminders: Vec<Reminder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderIdParams {
+    pub actor_id: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderCancelResult {
+    pub reminder: Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSnoozeParams {
+    pub actor_id: String,
+    pub id: String,
+    pub by_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderSnoozeResult {
+    pub reminder: Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderUpdateParams {
+    pub actor_id: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderUpdateResult {
+    pub reminder: Reminder,
 }
 
 // ---- receipt/record ----

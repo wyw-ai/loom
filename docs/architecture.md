@@ -79,7 +79,7 @@ scope-aware workspace。
 | --- | --- |
 | `Actor` | 人、agent、service、system 的统一身份 |
 | `Channel` | 长期协作空间 |
-| `Thread` | channel 内的短期任务分支 |
+| `Thread` | channel 公共区某条 root event 下的短期任务分支 |
 | `Turn` | 某个 actor 的一次执行回合 |
 | `Event` | timeline 中不可变事实 |
 | `Relation` | reply / mention / handoff / artifact link |

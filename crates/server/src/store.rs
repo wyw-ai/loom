@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{Datelike, Duration as ChronoDuration, Utc, Weekday};
 use parking_lot::RwLock;
 use proto::types::trace::TraceFrame;
 use proto::types::*;
@@ -95,6 +95,7 @@ struct Inner {
     memberships: HashMap<(String, ScopeRef), Membership>,
     deliveries: HashMap<(String, String), Delivery>,
     receipts: HashMap<(String, String, ReceiptKind), Receipt>,
+    reminders: HashMap<String, Reminder>,
     artifacts: HashMap<String, Artifact>,
     /// turn id -> ordered trace frames (owner-private; never broadcast)
     trace_by_turn: HashMap<String, Vec<TraceFrame>>,
@@ -351,10 +352,24 @@ impl Store {
         &self,
         channel_id: String,
         title: String,
-        root_event_id: Option<String>,
+        root_event_id: String,
     ) -> StoreResult<Thread> {
         if self.get_channel(&channel_id).is_none() {
             return Err(StoreError::NotFound(format!("channel {channel_id}")));
+        }
+        let root = self
+            .get_event(&root_event_id)
+            .ok_or_else(|| StoreError::NotFound(format!("event {root_event_id}")))?;
+        if root.scope.kind != ScopeKind::Channel || root.scope.id != channel_id {
+            return Err(StoreError::InvalidState(format!(
+                "thread root event {root_event_id} must belong to channel {channel_id}"
+            )));
+        }
+        if let Some(existing) = self.find_thread_by_root(&channel_id, &root_event_id) {
+            return Err(StoreError::Conflict(format!(
+                "thread {} already uses root event {root_event_id}",
+                existing.id
+            )));
         }
         let thread = Thread {
             id: format!("thread_{}", short_id()),
@@ -388,6 +403,15 @@ impl Store {
 
     pub fn get_thread(&self, id: &str) -> Option<Thread> {
         self.inner.read().threads.get(id).cloned()
+    }
+
+    pub fn find_thread_by_root(&self, channel_id: &str, root_event_id: &str) -> Option<Thread> {
+        self.inner
+            .read()
+            .threads
+            .values()
+            .find(|t| t.channel_id == channel_id && t.root_event_id == root_event_id)
+            .cloned()
     }
 
     pub fn update_thread(&self, id: &str, title: String) -> StoreResult<Thread> {
@@ -426,20 +450,6 @@ impl Store {
         };
         inner.events_by_scope.remove(&scope);
         Ok(removed)
-    }
-
-    pub fn set_thread_root(&self, thread_id: String, root_event_id: String) -> StoreResult<()> {
-        self.journal.append(&Mutation::ThreadRootSet {
-            thread_id: thread_id.clone(),
-            root_event_id: root_event_id.clone(),
-        })?;
-        let mut inner = self.inner.write();
-        if let Some(t) = inner.threads.get_mut(&thread_id) {
-            t.root_event_id = Some(root_event_id);
-            Ok(())
-        } else {
-            Err(StoreError::NotFound(format!("thread {thread_id}")))
-        }
     }
 
     // -------- Turns --------
@@ -729,22 +739,6 @@ impl Store {
             self.emit(StoreEvent::DeliveryUpdated(delivery));
         }
 
-        // For threads whose root_event_id is unset, set it on the first
-        // appended event if it has no replies_to.
-        if let ScopeKind::Thread = event.scope.kind {
-            let needs_root = matches!(
-                self.get_thread(&event.scope.id),
-                Some(t) if t.root_event_id.is_none()
-            );
-            let is_top_level = !event
-                .relations
-                .iter()
-                .any(|r| matches!(r.kind, RelationKind::RepliesTo));
-            if needs_root && is_top_level {
-                let _ = self.set_thread_root(event.scope.id.clone(), event.id.clone());
-            }
-        }
-
         self.emit(StoreEvent::EventCreated(event.clone()));
 
         if implicit_turn {
@@ -781,6 +775,38 @@ impl Store {
             .filter_map(|id| inner.events.get(id).cloned())
             .collect();
         (slice, has_more)
+    }
+
+    pub fn search_messages(
+        &self,
+        actor_id: &str,
+        query: &str,
+        scope: Option<&ScopeRef>,
+        limit: u32,
+    ) -> Vec<Event> {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let limit = limit.max(1) as usize;
+        let inner = self.inner.read();
+        let mut events: Vec<Event> = inner
+            .events
+            .values()
+            .filter(|event| scope.is_none_or(|s| &event.scope == s))
+            .filter(|event| {
+                scope.is_some() || can_access_scope_inner(&inner, &event.scope, actor_id)
+            })
+            .filter(|event| event_search_text(event).contains(&needle))
+            .cloned()
+            .collect();
+        events.sort_by(|a, b| {
+            b.occurred_at
+                .cmp(&a.occurred_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        events.truncate(limit);
+        events
     }
 
     /// List deliveries for `actor_id`, sorted ascending by `(updated_at,
@@ -904,6 +930,226 @@ impl Store {
         Ok(receipt)
     }
 
+    // -------- Reminders --------
+
+    pub fn schedule_reminder(
+        &self,
+        actor_id: String,
+        title: String,
+        scope: Option<ScopeRef>,
+        msg_id: Option<String>,
+        fire_at: Timestamp,
+        repeat: Option<String>,
+    ) -> StoreResult<Reminder> {
+        if title.trim().is_empty() {
+            return Err(StoreError::InvalidState("reminder title is empty".into()));
+        }
+        if let Some(scope) = scope.as_ref() {
+            self.check_scope_access(scope, &actor_id)?;
+        }
+        let now = Utc::now();
+        let reminder = Reminder {
+            id: format!("rem_{}", short_id()),
+            actor_id,
+            title,
+            scope,
+            msg_id,
+            fire_at,
+            repeat,
+            status: ReminderStatus::Scheduled,
+            created_at: now,
+            updated_at: now,
+            last_fired_at: None,
+            _meta: None,
+        };
+        self.put_reminder(reminder)
+    }
+
+    pub fn list_reminders(
+        &self,
+        actor_id: &str,
+        statuses: &[ReminderStatus],
+        all: bool,
+    ) -> Vec<Reminder> {
+        let mut reminders: Vec<Reminder> = self
+            .inner
+            .read()
+            .reminders
+            .values()
+            .filter(|r| r.actor_id == actor_id)
+            .filter(|r| {
+                if all {
+                    true
+                } else if statuses.is_empty() {
+                    matches!(r.status, ReminderStatus::Scheduled)
+                } else {
+                    statuses.contains(&r.status)
+                }
+            })
+            .cloned()
+            .collect();
+        reminders.sort_by(|a, b| a.fire_at.cmp(&b.fire_at).then_with(|| a.id.cmp(&b.id)));
+        reminders
+    }
+
+    pub fn cancel_reminder(&self, actor_id: &str, id_or_prefix: &str) -> StoreResult<Reminder> {
+        let mut reminder = self.resolve_reminder_for_actor(actor_id, id_or_prefix)?;
+        reminder.status = ReminderStatus::Cancelled;
+        reminder.updated_at = Utc::now();
+        self.put_reminder(reminder)
+    }
+
+    pub fn snooze_reminder(
+        &self,
+        actor_id: &str,
+        id_or_prefix: &str,
+        by_seconds: i64,
+    ) -> StoreResult<Reminder> {
+        if by_seconds <= 0 {
+            return Err(StoreError::InvalidState(
+                "snooze duration must be positive".into(),
+            ));
+        }
+        let mut reminder = self.resolve_reminder_for_actor(actor_id, id_or_prefix)?;
+        reminder.fire_at = Utc::now() + ChronoDuration::seconds(by_seconds);
+        reminder.status = ReminderStatus::Scheduled;
+        reminder.updated_at = Utc::now();
+        self.put_reminder(reminder)
+    }
+
+    pub fn update_reminder(
+        &self,
+        actor_id: &str,
+        id_or_prefix: &str,
+        title: Option<String>,
+        fire_at: Option<Timestamp>,
+        repeat: Option<String>,
+    ) -> StoreResult<Reminder> {
+        let mut reminder = self.resolve_reminder_for_actor(actor_id, id_or_prefix)?;
+        if let Some(title) = title {
+            if title.trim().is_empty() {
+                return Err(StoreError::InvalidState("reminder title is empty".into()));
+            }
+            reminder.title = title;
+        }
+        if let Some(fire_at) = fire_at {
+            reminder.fire_at = fire_at;
+            reminder.status = ReminderStatus::Scheduled;
+        }
+        if repeat.is_some() {
+            reminder.repeat = repeat;
+        }
+        reminder.updated_at = Utc::now();
+        self.put_reminder(reminder)
+    }
+
+    pub fn fire_due_reminders(&self) -> Vec<Reminder> {
+        let now = Utc::now();
+        let due: Vec<Reminder> = {
+            let inner = self.inner.read();
+            inner
+                .reminders
+                .values()
+                .filter(|r| matches!(r.status, ReminderStatus::Scheduled) && r.fire_at <= now)
+                .cloned()
+                .collect()
+        };
+        let mut fired = Vec::new();
+        for mut reminder in due {
+            if let Some(scope) = reminder.scope.clone() {
+                let mut relations = vec![Relation {
+                    kind: RelationKind::HandsOffTo,
+                    target: Ref {
+                        kind: RefKind::Actor,
+                        id: reminder.actor_id.clone(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                }];
+                if let Some(msg_id) = reminder.msg_id.as_ref() {
+                    relations.push(Relation {
+                        kind: RelationKind::RespondsTo,
+                        target: Ref {
+                            kind: RefKind::Event,
+                            id: msg_id.clone(),
+                            _meta: None,
+                        },
+                        _meta: None,
+                    });
+                }
+                let payload = serde_json::json!({
+                    "reminderId": reminder.id,
+                    "title": reminder.title,
+                    "msgId": reminder.msg_id,
+                    "fireAt": reminder.fire_at,
+                });
+                if let Err(e) = self.append_event(
+                    "reminder.fire".into(),
+                    reminder.actor_id.clone(),
+                    scope,
+                    None,
+                    payload,
+                    relations,
+                    None,
+                ) {
+                    tracing::warn!(
+                        reminder = %reminder.id,
+                        error = %e,
+                        "failed to append reminder.fire event"
+                    );
+                }
+            }
+
+            reminder.last_fired_at = Some(now);
+            reminder.updated_at = now;
+            if let Some(next) = reminder
+                .repeat
+                .as_deref()
+                .and_then(|rule| next_repeat_after(now, rule))
+            {
+                reminder.fire_at = next;
+                reminder.status = ReminderStatus::Scheduled;
+            } else {
+                reminder.status = ReminderStatus::Fired;
+            }
+            if let Ok(saved) = self.put_reminder(reminder) {
+                fired.push(saved);
+            }
+        }
+        fired
+    }
+
+    fn resolve_reminder_for_actor(
+        &self,
+        actor_id: &str,
+        id_or_prefix: &str,
+    ) -> StoreResult<Reminder> {
+        let inner = self.inner.read();
+        let matches: Vec<Reminder> = inner
+            .reminders
+            .values()
+            .filter(|r| r.actor_id == actor_id && r.id.starts_with(id_or_prefix))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => Err(StoreError::NotFound(format!("reminder {id_or_prefix}"))),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            _ => Err(StoreError::Conflict(format!(
+                "reminder prefix {id_or_prefix} is ambiguous"
+            ))),
+        }
+    }
+
+    fn put_reminder(&self, reminder: Reminder) -> StoreResult<Reminder> {
+        self.journal
+            .append(&Mutation::ReminderUpsert(reminder.clone()))?;
+        self.inner
+            .write()
+            .reminders
+            .insert(reminder.id.clone(), reminder.clone());
+        Ok(reminder)
+    }
+
     // -------- Artifacts --------
 
     pub fn put_artifact(&self, artifact: Artifact) -> StoreResult<Artifact> {
@@ -985,16 +1231,11 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .receipts
                 .insert((r.event_id.clone(), r.actor_id.clone(), r.kind), r);
         }
+        Mutation::ReminderUpsert(r) => {
+            inner.reminders.insert(r.id.clone(), r);
+        }
         Mutation::ArtifactCreate(a) => {
             inner.artifacts.insert(a.id.clone(), a);
-        }
-        Mutation::ThreadRootSet {
-            thread_id,
-            root_event_id,
-        } => {
-            if let Some(t) = inner.threads.get_mut(&thread_id) {
-                t.root_event_id = Some(root_event_id);
-            }
         }
         Mutation::TraceAppend(frame) => {
             let entry = inner.trace_seq.entry(frame.turn_id.clone()).or_insert(0);
@@ -1054,6 +1295,112 @@ fn short_id() -> String {
     id[..12].to_string()
 }
 
+fn can_access_scope_inner(inner: &Inner, scope: &ScopeRef, actor_id: &str) -> bool {
+    let channel_id = match scope.kind {
+        ScopeKind::Channel => scope.id.as_str(),
+        ScopeKind::Thread => match inner.threads.get(&scope.id) {
+            Some(thread) => thread.channel_id.as_str(),
+            None => return false,
+        },
+    };
+    inner
+        .channels
+        .get(channel_id)
+        .is_some_and(|channel| match channel.visibility {
+            ChannelVisibility::Public => true,
+            ChannelVisibility::Private => channel.members.iter().any(|member| member == actor_id),
+        })
+}
+
+fn event_search_text(event: &Event) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
+        parts.push(text);
+    }
+    if let Some(title) = event.payload.get("title").and_then(|v| v.as_str()) {
+        parts.push(title);
+    }
+    parts.join("\n").to_ascii_lowercase()
+}
+
+fn next_repeat_after(from: chrono::DateTime<Utc>, rule: &str) -> Option<chrono::DateTime<Utc>> {
+    if let Some(raw) = rule.strip_prefix("every:") {
+        return parse_duration_seconds(raw)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| from + ChronoDuration::seconds(seconds));
+    }
+
+    if let Some(raw) = rule.strip_prefix("daily@") {
+        let (hour, minute) = parse_hh_mm(raw)?;
+        let today = from.date_naive().and_hms_opt(hour, minute, 0)?.and_utc();
+        return Some(if today > from {
+            today
+        } else {
+            today + ChronoDuration::days(1)
+        });
+    }
+
+    if let Some(raw) = rule.strip_prefix("weekly:") {
+        let (days_raw, time_raw) = raw.split_once('@')?;
+        let (hour, minute) = parse_hh_mm(time_raw)?;
+        let days: Vec<Weekday> = days_raw.split(',').filter_map(parse_weekday).collect();
+        if days.is_empty() {
+            return None;
+        }
+        for offset in 0..=7 {
+            let date = from.date_naive() + ChronoDuration::days(offset);
+            if !days.contains(&date.weekday()) {
+                continue;
+            }
+            let candidate = date.and_hms_opt(hour, minute, 0)?.and_utc();
+            if candidate > from {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_duration_seconds(raw: &str) -> Option<i64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let (num, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let value: i64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(value),
+        "m" => Some(value * 60),
+        "h" => Some(value * 60 * 60),
+        "d" => Some(value * 60 * 60 * 24),
+        _ => raw.parse().ok(),
+    }
+}
+
+fn parse_hh_mm(raw: &str) -> Option<(u32, u32)> {
+    let (hh, mm) = raw.split_once(':')?;
+    let hour: u32 = hh.parse().ok()?;
+    let minute: u32 = mm.parse().ok()?;
+    if hour < 24 && minute < 60 {
+        Some((hour, minute))
+    } else {
+        None
+    }
+}
+
+fn parse_weekday(raw: &str) -> Option<Weekday> {
+    match raw.to_ascii_lowercase().as_str() {
+        "mon" | "monday" => Some(Weekday::Mon),
+        "tue" | "tuesday" => Some(Weekday::Tue),
+        "wed" | "wednesday" => Some(Weekday::Wed),
+        "thu" | "thursday" => Some(Weekday::Thu),
+        "fri" | "friday" => Some(Weekday::Fri),
+        "sat" | "saturday" => Some(Weekday::Sat),
+        "sun" | "sunday" => Some(Weekday::Sun),
+        _ => None,
+    }
+}
+
 // silence unused-import lint while keeping BTreeMap available for future expansion
 #[allow(dead_code)]
 fn _meta_keep() -> BTreeMap<String, serde_json::Value> {
@@ -1072,6 +1419,41 @@ mod tests {
         let path: PathBuf = dir.join("journal.jsonl");
         let journal = Journal::open(path).expect("open journal");
         Store::open(journal).expect("open store")
+    }
+
+    fn append_channel_root(
+        store: &Arc<Store>,
+        channel_id: &str,
+        actor_id: &str,
+        text: &str,
+    ) -> String {
+        store
+            .append_event(
+                "content.add".into(),
+                actor_id.into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel_id.into(),
+                },
+                None,
+                serde_json::json!({ "text": text }),
+                vec![],
+                None,
+            )
+            .expect("append root event")
+            .id
+    }
+
+    fn create_thread_under(
+        store: &Arc<Store>,
+        channel_id: &str,
+        actor_id: &str,
+        title: &str,
+    ) -> Thread {
+        let root_event_id = append_channel_root(store, channel_id, actor_id, title);
+        store
+            .create_thread(channel_id.into(), title.into(), root_event_id)
+            .expect("create thread")
     }
 
     #[test]
@@ -1096,9 +1478,7 @@ mod tests {
     fn delete_channel_refuses_when_threads_exist() {
         let store = fresh_store();
         let ch = store.create_channel("keep me".into(), None).unwrap();
-        let _t = store
-            .create_thread(ch.id.clone(), "t".into(), None)
-            .unwrap();
+        let _t = create_thread_under(&store, &ch.id, "actor_owner", "t");
 
         let err = store
             .delete_channel(&ch.id, false)
@@ -1108,6 +1488,96 @@ mod tests {
             other => panic!("expected Conflict, got {other:?}"),
         }
         assert!(store.get_channel(&ch.id).is_some(), "channel must remain");
+    }
+
+    #[test]
+    fn create_thread_requires_channel_root_event() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let t = create_thread_under(&store, &ch.id, "actor_owner", "root");
+        let child_event = store
+            .append_event(
+                "content.add".into(),
+                "actor_owner".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: t.id.clone(),
+                },
+                None,
+                serde_json::json!({ "text": "thread reply" }),
+                vec![],
+                None,
+            )
+            .expect("append thread event")
+            .id;
+
+        let err = store
+            .create_thread(ch.id.clone(), "nested".into(), child_event)
+            .expect_err("thread-scoped root must be rejected");
+        assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_thread_rejects_duplicate_root_event() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "root");
+        store
+            .create_thread(ch.id.clone(), "first".into(), root_event_id.clone())
+            .expect("first thread");
+
+        let err = store
+            .create_thread(ch.id.clone(), "second".into(), root_event_id)
+            .expect_err("duplicate root must be rejected");
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn search_messages_respects_private_channel_acl() {
+        let store = fresh_store();
+        let public = store.create_channel("public".into(), None).unwrap();
+        let private = store
+            .create_channel("private".into(), Some("alice".into()))
+            .unwrap();
+
+        let public_scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: public.id.clone(),
+        };
+        let private_scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: private.id.clone(),
+        };
+        store
+            .append_event(
+                "content.add".into(),
+                "bob".into(),
+                public_scope,
+                None,
+                serde_json::json!({ "text": "needle public" }),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        store
+            .append_event(
+                "content.add".into(),
+                "alice".into(),
+                private_scope.clone(),
+                None,
+                serde_json::json!({ "text": "needle secret" }),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+
+        let bob_results = store.search_messages("bob", "needle", None, 10);
+        assert_eq!(bob_results.len(), 1);
+        assert_eq!(bob_results[0].actor_id, "bob");
+
+        let alice_results = store.search_messages("alice", "needle", Some(&private_scope), 10);
+        assert_eq!(alice_results.len(), 1);
+        assert_eq!(alice_results[0].actor_id, "alice");
     }
 
     #[test]
@@ -1128,12 +1598,8 @@ mod tests {
     fn delete_channel_with_cascade_removes_threads_and_channel() {
         let store = fresh_store();
         let ch = store.create_channel("doomed".into(), None).unwrap();
-        let _t1 = store
-            .create_thread(ch.id.clone(), "t1".into(), None)
-            .unwrap();
-        let _t2 = store
-            .create_thread(ch.id.clone(), "t2".into(), None)
-            .unwrap();
+        let _t1 = create_thread_under(&store, &ch.id, "actor_owner", "t1");
+        let _t2 = create_thread_under(&store, &ch.id, "actor_owner", "t2");
 
         let (deleted, threads) = store
             .delete_channel(&ch.id, true)
@@ -1163,9 +1629,7 @@ mod tests {
     fn update_thread_renames_and_replays() {
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
-        let t = store
-            .create_thread(ch.id.clone(), "old".into(), None)
-            .unwrap();
+        let t = create_thread_under(&store, &ch.id, "actor_owner", "old");
         let updated = store.update_thread(&t.id, "fresh".into()).unwrap();
         assert_eq!(updated.title, "fresh");
 
@@ -1178,9 +1642,7 @@ mod tests {
     fn delete_thread_removes_row_and_scope_index_and_replays() {
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
-        let t = store
-            .create_thread(ch.id.clone(), "doomed".into(), None)
-            .unwrap();
+        let t = create_thread_under(&store, &ch.id, "actor_owner", "doomed");
         let scope = ScopeRef {
             kind: ScopeKind::Thread,
             id: t.id.clone(),
@@ -1262,9 +1724,7 @@ mod tests {
         let ch = store
             .create_channel("priv".into(), Some("actor_alice".into()))
             .unwrap();
-        let t = store
-            .create_thread(ch.id.clone(), "t".into(), None)
-            .unwrap();
+        let t = create_thread_under(&store, &ch.id, "actor_alice", "t");
         let scope = ScopeRef {
             kind: ScopeKind::Thread,
             id: t.id.clone(),

@@ -15,6 +15,34 @@
 - `feedback-bundle.json`、`mr-event-*.json` 等 attaches_artifact；
 - 仓库 mount（如果 thread 有 `clone-manifest.json`）—— 可读源代码做归因。
 
+### 扫描总表输入：只做分类落文件，不进入研发
+
+如果输入来自 `feedback-scanner`，或正文包含 `[feedback-scan v1]` /
+`selection_mode:` / `selected items`，这只是常驻 bug-scan thread 的扫描快照。
+此时你的职责是**批量分类并维护队列文件**，不是启动研发。
+
+1. 从正文解析或直接读取这些文件路径：
+   - `raw_file=<...>/raw.json`
+   - `bugs_file=<...>/bugs.json`
+   - `others_file=<...>/others.json`
+   - `meta_file=<...>/scan-meta.json`
+2. 读取 raw/preliminary items，把每条反馈分到：
+   - `bugs.json`：存量功能 bug / 回归 / 报错 / 明确不符合现有功能预期的问题。
+   - `others.json`：新需求、能力增强、规范建议、咨询、不合理/不可行动 bug、重复项。
+3. 写回本地文件，保留已有条目的 `fix_status` / `bugfix_thread_id` /
+   `started_at` / `fixed_at` / `archived_at` 等状态字段；已 in_progress/fixed 的
+   条目不得因重扫丢失。
+4. 将 `scan-meta.json.classification_status` 更新为 `done`，写入
+   `classified_by="actor_a1_bug_triage"`、`classified_at`、`bugs_count`、
+   `others_count`。
+5. 只能 handoff `actor_router`，说明分类完成和两个文件的数量；**禁止**
+   handoff `actor_discovery` / `actor_delivery`，禁止为最高优先级项启动研发。
+
+```bash
+joi handoff --as actor_a1_bug_triage --in <thread> actor_router \
+  -m "feedback scan 分类完成：bugs=<N> others=<M>。队列文件已更新；逐条推进由 a1-bug-fix-loop 负责。"
+```
+
 ## 任务
 
 对每条收到的缺陷／反馈做四件事：

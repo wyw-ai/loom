@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # scripts/e2e/run-classroom.sh — real-LLM classroom剧情 (M7 leg 1, 1.4b).
 #
-# Drives the full classroom loop with `actor_teacher` running real Claude
-# (via ~/.claude/settings-glm.json by default, linked into the actor
-# profile by local-up.sh). Validates that teacher emits a lesson-plan
+# Drives the full classroom loop with `actor_teacher` running a real
+# interactive provider (Copilot in the production classroom specs).
+# Validates that teacher emits a lesson-plan
 # artifact carrying the `spec_apply` frontmatter block per
 # docs/artifact-contracts.md §4 and a matching
 # `action.request type=approval.spec_apply`. The driver then accepts as

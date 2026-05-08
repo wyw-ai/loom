@@ -1,14 +1,13 @@
 # teacher —— bundle
 
-两阶段 agent：**设计**（把 task-goal/DoD 翻译成 `lesson-plan.md`）和
-**验证**（把 delivery 的产出按 DoD 打分写进 `validation-report.json`）。
+actor 训练工程师：把 classmaster 归档的真实 actor 缺陷转成候选 bundle、
+回归作业、评分报告和训练记录。
 
-- 消费：`task-goal.json`（§1）、`definition-of-done.json`（§2）、delivery 提供的
-  证据 artifact。
-- 产出：`lesson-plan.md`（§4）、`validation-report.json`（§5）。
-- Handoff 去向：lesson plan 里指定的执行者（典型为 `delivery` 或
-  `lesson-designer`）；验证完之后回到 `classmaster` / 上游 router。
+- 消费：`actor-defect.v1`、`training-plan.v1`、`definition-of-done.json`。
+- 产出：`homework.v1`、`grading-report.v1`、`lesson-plan.md`
+  （含 `spec_apply`）、`training-record.v1`。
+- Handoff 去向：训练完成或需要决策时回 `actor_classmaster`。
 
-Provider：`claude`，走 `interactive_command`。Envelope 同 `classmaster`
-（参考 `data/agents/README.md`）；`maxTurnMs = 1800000`，因为验证轮可能通过
-skill 工具触发证据收集脚本。
+Provider：Codex CLI（`codex-joi` wrapper），走 `interactive_command`。
+Envelope 同 `classmaster`（参考 `data/agents/README.md`）；`maxTurnMs = 1800000`，
+因为验证轮可能通过工具收集证据。

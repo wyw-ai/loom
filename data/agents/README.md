@@ -19,7 +19,6 @@ Phase 3 交付的 actor 清单：
 | `router`            | claude   | `/router`                    | channel   | 派发到 discovery/teacher/delivery |
 | `discovery`         | claude   | `/discovery`                 | channel/thread | `clone-manifest.json`、仓库笔记 |
 | `delivery`          | claude   | `/delivery`                  | thread    | 代码改动、MR、`validation-report.json` |
-| `feedback-fix-orchestrator` | claude | `/feedback-fix-orchestrator` | channel/thread | 派发反馈修复任务 |
 
 上述所有 artifact 严格遵循 `docs/artifact-contracts.md`。
 

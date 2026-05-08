@@ -1,14 +1,15 @@
 # a1-bug-fix-loop
 
-Serial driver for `feedback-scan.bugs.v1` items.
+Serial driver for `feedback-scanner` scan results.
 
 Each tick (default `*/5 * * * *`):
 
-1. Reads the newest `feedback-scan.bugs.v1` from the scanner thread.
+1. Reads the newest `feedback-scan v1` event from the scanner thread.
 2. For every tracked bug currently `in_progress`, checks whether its
-   bugfix thread has published an `mr-merged.v1`. If yes, marks
-   `fixed`, replies to the feedback via `a1 feedback resolve`, and
-   announces the fix in the channel public chat via `joi say --channel`.
+   bugfix thread has published `mr-merged.v1` or a merged `mr-final.v1`.
+   If yes, comments on the corresponding Aone feedback, updates its
+   workitem status to `Fixed`, marks the local ledger `fixed`, and writes
+   the closure note in the resident scanner thread.
 3. If the concurrency budget allows (`params.concurrency`, default 1),
    promotes the next `pending` feedback from the scanner artifact to
    `in_progress`:

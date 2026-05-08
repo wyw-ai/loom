@@ -27,8 +27,7 @@ Conventions
 
 ## 1. `task-goal.json`
 
-Producer: `classmaster` / `router`. Consumer: `teacher` / `delivery` /
-`feedback-fix-orchestrator`.
+Producer: `classmaster` / `router`. Consumer: `teacher` / `delivery`.
 
 ```json
 {
@@ -58,8 +57,7 @@ Required: `schema_version`, `producer`, `task_id`, `title`, `narrative`,
 
 ## 2. `definition-of-done.json`
 
-Producer: `classmaster` / `teacher`. Consumer: `delivery` / `teacher` /
-`feedback-fix-orchestrator`.
+Producer: `classmaster` / `teacher`. Consumer: `delivery` / `teacher`.
 
 A DoD is a *checklist of falsifiable criteria*. Each criterion has a
 machine-checkable `verify` hint (kept as informal text) and a unique
@@ -223,7 +221,7 @@ the reload-epoch marker so the running host re-spawns the worker.
 ## 5. `validation-report.json`
 
 Producer: `teacher` / `delivery`. Consumer: `release-approval` /
-`classmaster` / `feedback-fix-orchestrator`.
+`classmaster`.
 
 ```json
 {
@@ -632,6 +630,91 @@ When `recommendation == "publish"`, classmaster MAY emit
 `approval.spec_apply` to install the new bundle as `current` for the
 target actor. When `verdict == "needs_revision"`, classmaster hands
 off to teacher with the reason for the next iteration.
+
+---
+
+## 15. `actor-defect.v1`
+
+Producer: `actor_classmaster` or an upstream production channel actor.
+Consumer: `actor_teacher`.
+
+Records why an actor needs training. This artifact should point at real
+production evidence where possible, so classroom can be audited later.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "actor_classmaster",
+  "defect_id": "defect-delivery-multi-mr-watcher-2026-05-07",
+  "target_actor": "actor_delivery",
+  "severity": "p0",
+  "summary": "delivery created two MRs but only one was registered for watcher",
+  "observed_behavior": "aone/a1 MR CI failed without mr-watcher handoff",
+  "expected_behavior": "every MR emits mr-opened.v1 and a [mr-opened v1] block",
+  "evidence": [
+    {
+      "kind": "thread",
+      "uri": "joi://thread/thread_9fee4a9462a6",
+      "note": "delivery task for base image OpenAPI registration"
+    }
+  ],
+  "captured_at": "2026-05-07T10:00:00Z"
+}
+```
+
+Required: `schema_version`, `producer`, `defect_id`, `target_actor`,
+`severity`, `summary`, `observed_behavior`, `expected_behavior`,
+`captured_at`.
+
+Allowed values:
+- `severity`: `"p0"` | `"p1"` | `"p2"` | `"p3"`.
+
+---
+
+## 16. `training-record.v1`
+
+Producer: `actor_teacher` or `actor_classmaster`. Consumer: human,
+classmaster, future classroom runs.
+
+Indexes the complete classroom loop for one training attempt. It does not
+replace `training-plan.v1`, `homework.v1`, `grading-report.v1`, or
+`lesson-plan.md`; it links them together and records the publish result.
+
+```json
+{
+  "schema_version": "1",
+  "producer": "actor_teacher",
+  "training_id": "training-delivery-multi-mr-5c9e3b2a",
+  "target_actor": "actor_delivery",
+  "mode": "shadow",
+  "input_artifacts": [
+    "joi://artifact/<actor-defect>",
+    "joi://artifact/<training-plan>",
+    "joi://artifact/<definition-of-done>"
+  ],
+  "output_artifacts": [
+    "joi://artifact/<homework>",
+    "joi://artifact/<grading-report>",
+    "joi://artifact/<lesson-plan>"
+  ],
+  "verdict": "pass",
+  "recommendation": "publish",
+  "published": false,
+  "summary": "候选 bundle 已覆盖多 MR 注册、handoff router 和工作区隔离。",
+  "risks": [
+    "shadow 模式尚未替换生产 actor_delivery"
+  ],
+  "captured_at": "2026-05-07T11:00:00Z"
+}
+```
+
+Required: `schema_version`, `producer`, `training_id`, `target_actor`,
+`mode`, `input_artifacts`, `output_artifacts`, `verdict`,
+`recommendation`, `published`, `summary`, `captured_at`.
+
+Allowed values:
+- `mode`: `"shadow"` | `"controlled"` | `"incident-intake"`.
+- `verdict` and `recommendation`: same as `grading-report.v1`.
 
 ---
 

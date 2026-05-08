@@ -113,7 +113,7 @@ start_agent_host() {
     echo "joi agent serve already running"; return
   fi
   nohup env \
-    PATH="$REPO_ROOT/target/release:$PATH" \
+    PATH="$REPO_ROOT/data/runtime-tools/classroom:$REPO_ROOT/target/release:$PATH" \
     JOI_SERVER="ws://127.0.0.1:$PORT/rpc" \
     JOI_AGENT_DATA_ROOT="$ROOT/agent-data" \
     "$BIN_JOI" agent serve --specs "$ROOT/agent-specs" \

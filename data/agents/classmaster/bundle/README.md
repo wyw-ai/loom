@@ -1,15 +1,14 @@
 # classmaster —— bundle
 
-频道（channel）级编排 agent。负责每次会话里的 **任务定型** 阶段：
+classroom 频道级编排 agent。负责 actor 训练项目的 **收敛、归档、发布审批**：
 
-- 消费：用户的自由文本请求。
-- 产出：`task-goal.json`、`definition-of-done.json` artifact
-  （`docs/artifact-contracts.md` §1、§2）。
-- Handoff 去向：`router` / `discovery` / `teacher` / `delivery` —— 被叫方的身份
-  通过它们各自 `handoff.triggerPromptPrefix` 在 runtime 侧注入，所以 bundle 里
-  不写死任何 callee 名字。
+- 消费：用户的训练需求、a1-dev-canfeng 的 actor 缺陷上报。
+- 产出：`actor-defect.v1`、`training-plan.v1`、`definition-of-done.json`，
+  并在通过后发起 `approval.spec_apply`。
+- Handoff 去向：主要是 `actor_teacher`；发布结果和训练状态回 classroom 公共频道。
 
-Provider：`claude`，走 `interactive_command` transport（见 `spec.json`）。
+Provider：Codex CLI（`codex-joi` wrapper），走 `interactive_command`
+transport（见 `spec.json`）。
 完成契约：`__JOI_DONE__` 哨兵。
 
 每轮注入到 skill 的 prompt envelope 变量：

@@ -51,8 +51,11 @@ joi artifact publish --name task-goal.json --media-type application/json --file 
 - 信息够了就同回合 publish 三件组 + handoff router：
   ```bash
   joi handoff --as actor_discovery --in <thread> actor_router -m \
-    "discovery 三件组就绪：task-goal=<art1> DoD=<art2> clone-manifest=<art3>"
+    "discovery 三件组就绪：feedback_id=<id-if-any> task-goal=<art1> DoD=<art2> clone-manifest=<art3>"
   ```
+  如果输入是 `bugfix_loop_item` / 存量 bug 修复，**必须原样带回**
+  `feedback_id=<id>`；router 依赖该 id 做 delivery 幂等、MR workitem 关联和
+  post-merge feedback 收口。不要只回 artifact id。
 
 ### A2. 接手中分支（pickup mode，v2 新增）
 
@@ -76,11 +79,107 @@ router 会建 delivery thread 并触发 provision；delivery 摘要后会 handof
 读 summary，重写正式三件套（task-goal / DoD / clone-manifest，schema_version=2，
 `pickup=true` 保留），handoff router 走情况 A 的同样模板继续推进。
 
+### A2b. reviewer 原则性质疑复核（adversarial-review）
+
+router handoff `[adversarial-review]` 时，你不是做普通 MR pass/fail 复核，而是要站在
+reviewer 角度重新挑战任务假设。
+
+必须检查并输出：
+
+1. **缺陷是否真实存在**：基于 feedback、MR、代码、必要时真实命令/接口语义，判断
+   create --relation 是否真的会丢 relation。
+2. **reviewer 观点是否成立**：例如"工作项 create API 本身支持 relation"是否意味着
+   CLI 当前传参正确，还是只是 API 具备能力但调用方式/参数缺失。
+3. **当前方案是否仍合理**：继续当前 MR、改方案、撤回 MR、还是需要 human/API owner 决策。
+4. **评论姿势**：如果 disputed note 是子评论，delivery 应该回复第一条根评论
+   `root_note=<id>`，不要回复子评论。
+
+完成后 publish `dispute-review-result.v1` artifact，并 handoff router：
+
+```bash
+joi handoff --as actor_discovery --in <thread> actor_router -m \
+  "[dispute-review-result] verdict=<continue|revise|withdraw|need_human> art=<artifact_id>
+   root_note=<root_note_id>
+   结论=<一句话>
+   证据=<关键证据摘要>"
+```
+
+verdict 含义：
+- `continue`：缺陷真实且当前方案合理，但 delivery 需要用证据回复 reviewer。
+- `revise`：缺陷真实但当前方案/验证不足，需要改 MR 或补验证。
+- `withdraw`：缺陷不成立或方案方向错误，应关闭/撤回 MR。
+- `need_human`：需要 API owner / human 决策，不能由 actor 自行判断。
+
+### A3. 已有 MR / 手工分支后置分析（posthoc_existing_mr）
+
+router 的 message 以 `posthoc_existing_mr` 开头，或 human 明确说"这个分支/MR
+已经手工开发、不需要重新开发，只要分析 MR 和 feedback/需求的对应关系并进入
+mr-watcher"时：
+
+- **禁止**产普通 clone-manifest，禁止要求 delivery 重新开发。
+- 基于 `a1 repo mr view/status/diff/comment list` 和 human 给出的 feedback/需求背景，
+  一次性产出 3 个 artifact：
+  1. `task-goal.json`：说明该 MR 实际解决的问题、功能背景、与 feedback/需求的关系。
+  2. `definition-of-done.json`：说明该 MR 进入 watcher 前必须满足的验收项。
+  3. `posthoc-mr-analysis.json`：至少包含
+     `repo`、`mr_id`、`source_branch`、`target_branch`、`feedback_or_requirement`、
+     `covered_points[]`、`uncovered_points[]`、`watcher_policy`。
+- handoff router 时使用稳定模板：
+  ```bash
+  joi handoff --as actor_discovery --in <desk_thread> actor_router -m \
+    "posthoc-mr-analysis 就绪：task-goal=<art1> DoD=<art2> posthoc-mr-analysis=<art3>
+     repo=<group/project> mr_id=<mr_id> source_branch=<branch> target_branch=<branch>"
+  ```
+- router 后续必须新建独立 `delivery-posthoc-mr-*` thread；你不要指挥 delivery，
+  不要把该任务塞进已有 bugfix/delivery thread。
+
 ### B. 短小 bug 修复（bug-fix loop 在 bugfix thread 里 handoff 给你）
 
 - 触发 message 会写明「这是 existing_bug，必须一次性产出」。**不要追问**；
   基于 `bug-triage.v1` + 自己读代码直接产出。
-- DoD 至少包含「能复现该 bug 的最小步骤」+「修复后该步骤不复现」。
+- 先做缺陷存在性判断和责任仓库定位，再决定是否给代码方案。`task-goal.json` 必须包含：
+  `reproduction_status = reproduced | reproduced_cross_repo | not_reproduced | already_covered | not_a_bug | needs_human_data`，
+  并写明真实命令 / API / 版本 / 输入 id / 输出摘要。只读验证优先；必须写数据时只能用
+  明确安全的测试 project / workspace。
+- 固定验证上下文：
+  - `a1 project ...` / workitem / relation / project 级反馈：使用或 link 测试项目
+    `2158824`，在该项目内构造最小安全复现。
+  - `a1 app ...` / app / cr / app-center 相关反馈：使用或 link `a1-mock-server`
+    作为安全验证上下文；需要真实 app 数据时 handoff router 请求 human 提供。
+  - `a1 repo ...` / repo / MR / CR 相关反馈：参考或 link
+    `git@gitlab.alibaba-inc.com:aone/a1-mock-server.git`，不要直接用生产仓库做破坏性验证。
+- 真实性验证不是“只验证 a1 CLI 仓库是否有 bug”，也不是根据 feedback 文本猜仓库。
+  你要验证“用户动作背后的问题是否真实存在”，再基于证据决定**该改什么、不该改什么**。
+  如果用户动作确实复现出 401/403/502、tengine、后端路由缺失、代理错误、OpenAPI
+  语义错误、前后端契约不一致等真实故障，即使 CLI 本身没错，也必须标记
+  `reproduction_status=reproduced_cross_repo`，并把实际责任仓库列为
+  `clone-manifest.repos[].mode=worktree`。例如：
+  - a1-server 代理 / 认证 / CR codereview 路由问题 → `aone/a1-server` 可能是待修改仓库；
+  - app-center OpenAPI / 应用 CR 后端设计问题 → 视证据加入 `aone/app-center`、
+    `trefe/aone-micro-app-center` 或相关前端/服务仓库；
+  - workitem 后端语义问题 → 视证据加入 `ak47/aone-workitem`、
+    `ak47/aone-workitem-fe` 等仓库；
+  - 多仓契约/设计问题 → clone-manifest 可以包含多个 worktree 仓库，delivery 应一次性处理。
+- `not_reproduced` 只用于“同一用户动作没有复现任何等价问题，也没有发现跨仓库真实故障”。
+  不允许把“CLI 正常但 a1-server 返回 502/401/路由错误”归为 `not_reproduced` 或
+  `[bugfix-invalid]`。
+- 如果最初的 clone-manifest 只包含 `aone/a1`，但验证后发现真实问题在其他仓库或需要多仓，
+  这是 `scope correction`，不是 invalid；必须重写 task-goal/DoD/clone-manifest 并
+  handoff router 启动新的正确 delivery。
+- 你可以和 delivery 通过 router 协作完成验证：如果你只能给出验证方案但不能安全执行，
+  handoff router，要求 delivery 先执行“验证-only”而非开发；delivery 回传证据后你再判定
+  `reproduction_status`。不要在证据不足时直接产出 clone-manifest。
+- 只有 `reproduction_status=reproduced` 或 `reproduced_cross_repo` 时，才能产出代码改动方案和 clone-manifest。
+  如果结论是 `not_reproduced` / `already_covered` / `not_a_bug`，不要强行把它解释成
+  必须修的代码问题，直接 handoff router：
+  ```bash
+  joi handoff --as actor_discovery --in <thread> actor_router -m \
+    "[bugfix-invalid] feedback_id=<id> verdict=<not_reproduced|already_covered|not_a_bug>
+     证据=<命令/输出/代码依据>
+     建议=<关闭反馈/转新问题/需要 human 决策>"
+  ```
+- DoD 至少包含「能复现该 bug 的最小步骤」+「修复后该步骤不复现」；如果是
+  `already_covered` / `not_a_bug`，DoD 改为“证明无需本轮代码修复”的验证证据。
 - handoff router 同 A。
 
 ### C. 复核 delivery 的 MR（review-request，v2 新增）

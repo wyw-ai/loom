@@ -6,34 +6,24 @@
   },
   "transport": {
     "kind": "interactive_command",
-    "command": "claude",
+    "command": "codex-joi",
     "args": [],
     "env": {},
-    "model": "claude-sonnet-4.6",
     "provider": {
-      "kind": "claude",
-      "settings": {
-        "mode": "actor_profile"
-      }
+      "kind": "codex"
     },
     "interactive": {
       "session": {
         "idStrategy": "joi_uuid_per_scope",
         "newArgs": [
-          "--print",
-          "--permission-mode",
-          "bypassPermissions",
-          "{prompt}",
-          "--session-id",
-          "{session_id}"
+          "new",
+          "{session_id}",
+          "{prompt}"
         ],
         "resumeArgs": [
-          "--print",
-          "--permission-mode",
-          "bypassPermissions",
-          "{prompt}",
-          "--resume",
-          "{session_id}"
+          "resume",
+          "{session_id}",
+          "{prompt}"
         ],
         "onMissing": "create",
         "onSignatureChanged": "create",
@@ -43,7 +33,7 @@
         "template": "{joi_envelope}",
         "completionContract": {
           "sentinel": "__JOI_DONE__",
-          "instruction": "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it."
+          "instruction": "When your final user-visible answer is complete, output the token __JOI_DONE__ as the final line. Do not output anything after it."
         }
       },
       "completion": {

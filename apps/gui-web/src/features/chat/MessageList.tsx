@@ -42,14 +42,14 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
   }
 
   return (
-    <div className="stable-scrollbar h-full overflow-y-scroll px-4 py-4">
+    <div className="stable-scrollbar h-full overflow-y-scroll bg-white px-4 py-5">
       {bubbles.length === 0 ? (
-        <div className="flex min-h-full items-center justify-center text-sm text-muted">
+        <div className="flex min-h-full items-center justify-center font-mono text-sm text-black/40">
           No messages yet. Say something.
         </div>
       ) : (
         groups.map((group, gi) => (
-          <div key={gi} className="mb-4 last:mb-0">
+          <div key={gi} className="mb-5 last:mb-0">
             {group.map((b, bi) => {
               const replyContext = buildReplyContext(
                 b.replyToEventId,

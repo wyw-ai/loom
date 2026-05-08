@@ -168,6 +168,36 @@ impl Subscriptions {
             .and_then(|c| c.actor_id.clone())
     }
 
+    pub fn connected_actor_ids(&self, actor_ids: &[String]) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut out = if actor_ids.is_empty() {
+            inner
+                .actor_conn
+                .iter()
+                .filter_map(|(actor_id, conn_id)| {
+                    inner
+                        .connections
+                        .contains_key(conn_id)
+                        .then(|| actor_id.clone())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            actor_ids
+                .iter()
+                .filter(|actor_id| {
+                    inner
+                        .actor_conn
+                        .get(*actor_id)
+                        .is_some_and(|conn_id| inner.connections.contains_key(conn_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Snapshot the set of connection ids currently subscribed to `scope`.
     /// Returned as a `Vec<String>` (not borrowed) so the caller can drop
     /// the read lock before doing per-connection work like ACL filtering.

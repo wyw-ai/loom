@@ -1,5 +1,4 @@
 import { useEffect } from "react";
-import clsx from "clsx";
 import { UserPlus, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
@@ -8,6 +7,7 @@ import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { openInviteToChannel } from "@/features/sidebar/channelActions";
+import { PixelAvatar } from "@/features/common/PixelAvatar";
 
 export function MembersRail() {
   const scope = useChannels((s) => s.currentScope);
@@ -45,11 +45,11 @@ export function MembersRail() {
   const rows = members[channelId] ?? [];
 
   return (
-    <aside className="absolute inset-y-0 right-0 z-20 flex w-72 max-w-[min(18rem,calc(100vw-6rem))] flex-col border-l border-border bg-sidebar shadow-[-16px_0_32px_rgba(0,0,0,0.22)]">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border/60 px-4">
+    <aside className="absolute inset-y-0 right-0 z-20 flex w-72 max-w-[min(18rem,calc(100vw-6rem))] flex-col border-l-2 border-black bg-brutal-cream shadow-[-8px_0_0_#111]">
+      <header className="flex h-panel-header shrink-0 items-center gap-2 border-b-2 border-black px-4">
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold text-primary">
-            Members
+            Participants
           </div>
           <div className="truncate text-xs text-muted">
             {channel?.title ?? channelId}
@@ -59,7 +59,7 @@ export function MembersRail() {
           <button
             aria-label="Invite actor"
             title="Invite actor"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+            className="btn-brutal-sm bg-white p-1.5"
             onClick={() => openInviteToChannel(channel)}
           >
             <UserPlus size={16} />
@@ -68,7 +68,7 @@ export function MembersRail() {
         <button
           aria-label="Close members"
           title="Close members"
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="btn-brutal-sm bg-white p-1.5"
           onClick={toggleMembers}
         >
           <X size={16} />
@@ -159,20 +159,11 @@ function MemberRowInner({
   return (
     <div
       onContextMenu={onContextMenu}
-      className="flex min-w-0 items-center gap-2 px-3 py-1.5 text-sm text-secondary hover:bg-hover"
+      className="flex min-w-0 items-center gap-2 border-2 border-transparent px-3 py-1.5 text-sm font-bold text-black hover:border-black hover:bg-white"
     >
-      <span
-        className={clsx(
-          "flex h-7 w-7 shrink-0 items-center justify-center text-[10px] font-semibold",
-          actor.kind === "human" && "rounded-full bg-role-human/20 text-role-human",
-          actor.kind === "agent" && "rounded-md bg-role-agent/20 text-role-agent",
-          actor.kind === "service" && "rounded bg-role-service/20 text-role-service rotate-45",
-        )}
-      >
-        {(actor.displayName ?? actor.id).slice(0, 2).toUpperCase()}
-      </span>
+      <PixelAvatar id={actor.id} label={actor.displayName} size={28} />
       <span className="min-w-0 flex-1 truncate">{actor.displayName || actor.id}</span>
-      <span className="shrink-0 text-[11px] text-muted">{actor.kind}</span>
+      <span className="shrink-0 font-mono text-[11px] text-black/45">{actor.kind}</span>
     </div>
   );
 }

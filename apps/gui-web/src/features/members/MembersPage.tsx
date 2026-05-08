@@ -1,0 +1,704 @@
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import clsx from "clsx";
+import {
+  BellRing,
+  ChevronDown,
+  ChevronRight,
+  Edit3,
+  Folder,
+  type LucideIcon,
+  MessageSquare,
+  Monitor,
+  Plus,
+  RotateCcw,
+  Square,
+  Trash2,
+  Users,
+  Workflow,
+} from "lucide-react";
+
+import * as ipc from "@/ipc/bridge";
+import type { Actor, AgentInfo, MachineInfo } from "@/ipc/types";
+import { scopeKey } from "@/ipc/types";
+import { useActors } from "@/store/actors";
+import { useChannels } from "@/store/channels";
+import { useUI } from "@/store/ui";
+import { PixelAvatar } from "@/features/common/PixelAvatar";
+
+type AgentTab = "profile" | "dms" | "reminders" | "workspace" | "activity";
+
+interface ManagedAgent {
+  actor: Actor;
+  status: string;
+  machineId: string;
+  machine: string;
+  specsDir: string;
+  dataRoot: string;
+  providerId: string;
+  provider: string;
+  runtime: string;
+  model: string;
+  description: string;
+  creator: string;
+  created: string;
+  env: Array<{ key: string; value: string }>;
+  command: string;
+  args: string[];
+  autostart: boolean;
+}
+
+type AgentMachineContext = Pick<
+  MachineInfo,
+  "id" | "name" | "specsDir" | "dataRoot"
+>;
+
+export function MembersPage() {
+  const actorsById = useActors((s) => s.byId);
+  const upsertMany = useActors((s) => s.upsertMany);
+  const currentScope = useChannels((s) => s.currentScope);
+  const setView = useUI((s) => s.setView);
+  const setDraft = useUI((s) => s.setDraft);
+  const pushToast = useUI((s) => s.pushToast);
+  const openModal = useUI((s) => s.openModal);
+  const [agents, setAgents] = useState<ManagedAgent[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tab, setTab] = useState<AgentTab>("profile");
+  const [agentsOpen, setAgentsOpen] = useState(true);
+  const [humansOpen, setHumansOpen] = useState(true);
+
+  const applyMachineAgents = (machines: MachineInfo[]) => {
+    const rows = machines.flatMap((machine) =>
+      machine.agents.map((agent) => normalizeAgent(agent, machine)),
+    );
+    setAgents(rows);
+    upsertMany(rows.map((row) => row.actor));
+    setSelectedId((current) =>
+      current && rows.some((row) => row.actor.id === current)
+        ? current
+        : rows[0]?.actor.id ?? null,
+    );
+  };
+
+  useEffect(() => {
+    (async () => {
+      const [machineResult, actorResult] = await Promise.allSettled([
+        ipc.machineList(),
+        ipc.actorList(),
+      ]);
+      if (actorResult.status === "fulfilled") {
+        upsertMany(actorResult.value.actors);
+      }
+      if (machineResult.status === "fulfilled") {
+        applyMachineAgents(machineResult.value.machines);
+      } else {
+        pushToast(
+          "error",
+          `machine/list failed: ${
+            machineResult.reason instanceof Error
+              ? machineResult.reason.message
+              : String(machineResult.reason)
+          }`,
+        );
+        setAgents([]);
+      }
+    })();
+  }, [pushToast, upsertMany]);
+
+  const allAgents = agents;
+  const humans = useMemo(
+    () => Object.values(actorsById).filter((a) => a.kind === "human"),
+    [actorsById],
+  );
+  const selected = allAgents.find((a) => a.actor.id === selectedId) ?? null;
+
+  const removeAgent = async (agent: ManagedAgent) => {
+    const result = await ipc.machineAgentRemove(agent.machineId, agent.actor.id);
+    applyMachineAgents(result.machines);
+    pushToast("info", `${agent.actor.displayName || agent.actor.id} removed`);
+  };
+
+  const updateAgent = async (
+    agent: ManagedAgent,
+    patch: { displayName?: string; description?: string },
+  ) => {
+    const updated = normalizeAgent(
+      await ipc.agentUpdate({
+        machineId: agent.machineId,
+        actorId: agent.actor.id,
+        ...patch,
+      }),
+      {
+        id: agent.machineId,
+        name: agent.machine,
+        specsDir: agent.specsDir,
+        dataRoot: agent.dataRoot,
+      },
+    );
+    setAgents((xs) =>
+      xs.map((row) => (row.actor.id === updated.actor.id ? updated : row)),
+    );
+    upsertMany([updated.actor]);
+    pushToast("info", `${updated.actor.displayName || updated.actor.id} updated`);
+  };
+
+  const messageAgent = () => {
+    if (!selected) return;
+    setView("chat");
+    if (!currentScope) {
+      pushToast("info", "Pick a channel before messaging an agent");
+      return;
+    }
+    setDraft(currentScope, `@${selected.actor.id} `);
+    window.dispatchEvent(
+      new CustomEvent("joi:focus-prompt", {
+        detail: { scopeKey: scopeKey(currentScope) },
+      }),
+    );
+  };
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0 bg-white text-black">
+      <aside className="hidden h-full w-60 shrink-0 select-none flex-col border-r-2 border-black bg-brutal-cream md:flex">
+        <header className="flex h-panel-header shrink-0 items-center border-b-2 border-black px-5">
+          <div className="text-lg font-black">Members</div>
+        </header>
+        <div className="stable-scrollbar min-h-0 flex-1 overflow-y-auto px-2 py-3">
+          <GroupHeader
+            label="Agents"
+            count={allAgents.length}
+            open={agentsOpen}
+            onToggle={() => setAgentsOpen((x) => !x)}
+            onAdd={() => setView("machines")}
+          />
+          {agentsOpen &&
+            allAgents.map((agent) => (
+              <AgentListRow
+                key={agent.actor.id}
+                agent={agent}
+                active={agent.actor.id === selectedId}
+                onClick={() => {
+                  setSelectedId(agent.actor.id);
+                  setTab("profile");
+                }}
+              />
+            ))}
+
+          <GroupHeader
+            label="Humans"
+            count={humans.length}
+            open={humansOpen}
+            onToggle={() => setHumansOpen((x) => !x)}
+            onAdd={() =>
+              openModal({
+                type: "input",
+                title: "Invite human",
+                label: "Email or actor id",
+                placeholder: "name@example.com",
+                confirmLabel: "Invite",
+                onSubmit: (value) =>
+                  pushToast("info", `invite staged for ${value}`),
+              })
+            }
+          />
+          {humansOpen &&
+            humans.map((human) => (
+              <button
+                key={human.id}
+                className="mb-1 flex w-full items-center gap-2 border-2 border-transparent px-2 py-2 text-left text-sm font-bold hover:border-black hover:bg-white hover:shadow-brutal-sm"
+              >
+                <PixelAvatar id={human.id} label={human.displayName} size={20} />
+                <span className="min-w-0 flex-1 truncate">
+                  {human.displayName || human.id}
+                </span>
+                <span className="font-mono text-[11px] text-black/40">human</span>
+              </button>
+            ))}
+        </div>
+      </aside>
+
+      <main className="min-h-0 min-w-0 flex-1 bg-white">
+        {selected ? (
+          <AgentDetail
+            agent={selected}
+            tab={tab}
+            setTab={setTab}
+            onMessage={messageAgent}
+            onRemove={() => void removeAgent(selected)}
+            onUpdate={(patch) => updateAgent(selected, patch)}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center text-lg font-black uppercase text-black/40">
+            Select an agent
+          </div>
+        )}
+      </main>
+
+    </div>
+  );
+}
+
+function GroupHeader({
+  label,
+  count,
+  open,
+  onToggle,
+  onAdd,
+}: {
+  label: string;
+  count: number;
+  open: boolean;
+  onToggle: () => void;
+  onAdd: () => void;
+}) {
+  return (
+    <div className="mb-1 mt-2 flex items-center justify-between px-2">
+      <button
+        type="button"
+        className="flex items-center gap-1 text-xs font-black uppercase tracking-widest text-black"
+        onClick={onToggle}
+      >
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        {label}
+        <span className="font-mono text-black/40">{count}</span>
+      </button>
+      <button className="btn-brutal-sm bg-white p-0.5" onClick={onAdd}>
+        <Plus size={14} />
+      </button>
+    </div>
+  );
+}
+
+function AgentListRow({
+  agent,
+  active,
+  onClick,
+}: {
+  agent: ManagedAgent;
+  active: boolean;
+  onClick: () => void;
+}) {
+  const online = agent.status.toLowerCase() === "online";
+  return (
+    <>
+      <div className="mt-1 flex items-center gap-1 px-3 text-[10px] font-mono lowercase text-black/40">
+        <Monitor size={9} />
+        <span className="truncate">{agent.machine}</span>
+      </div>
+      <button
+        className={clsx(
+          "mb-1 flex w-full items-center gap-2 border-2 px-2 py-1.5 text-left text-sm font-bold transition-colors",
+          active
+            ? "border-black bg-brutal-pink shadow-brutal-sm"
+            : "border-transparent hover:border-black hover:bg-white hover:shadow-brutal-sm",
+        )}
+        onClick={onClick}
+      >
+        <PixelAvatar
+          id={agent.actor.id}
+          label={agent.actor.displayName}
+          size={20}
+        />
+        <span className="min-w-0 flex-1 truncate">
+          {agent.actor.displayName || agent.actor.id}
+        </span>
+        <span
+          className={clsx(
+            "h-2.5 w-2.5 shrink-0 rounded-full border border-black",
+            online ? "bg-brutal-lime" : "bg-black/20",
+          )}
+          title={online ? "online" : agent.status}
+        />
+      </button>
+    </>
+  );
+}
+
+function AgentDetail({
+  agent,
+  tab,
+  setTab,
+  onMessage,
+  onRemove,
+  onUpdate,
+}: {
+  agent: ManagedAgent;
+  tab: AgentTab;
+  setTab: (tab: AgentTab) => void;
+  onMessage: () => void;
+  onRemove: () => void;
+  onUpdate: (patch: { displayName?: string; description?: string }) => Promise<void>;
+}) {
+  const ui = useUI();
+  const online = agent.status.toLowerCase() === "online";
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <header className="flex h-panel-header shrink-0 items-center gap-3 border-b-2 border-black bg-white px-5">
+        <PixelAvatar id={agent.actor.id} label={agent.actor.displayName} size={36} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-base font-black">
+            {agent.actor.displayName || agent.actor.id}
+          </div>
+          <div className="font-mono text-xs text-black/45">{agent.actor.id}</div>
+        </div>
+        <button className="btn-brutal-sm gap-1 bg-white px-3 py-1.5 text-xs" onClick={onMessage}>
+          <MessageSquare size={14} /> Message
+        </button>
+        <button
+          className="btn-brutal-sm bg-white p-1.5"
+          title="Stop Agent"
+          onClick={() =>
+            ui.openModal({
+              type: "confirm",
+              title: `Stop ${agent.actor.displayName || agent.actor.id}?`,
+              body: "This agent is registered in local Joi agent specs. Running processes are owned by `joi agent serve`, so stop it from the host process that launched it.",
+              confirmLabel: "Got It",
+              danger: true,
+              onConfirm: () =>
+                ui.pushToast("warn", "agent process control belongs to joi agent serve"),
+            })
+          }
+        >
+          <Square size={14} />
+        </button>
+        <button
+          className="btn-brutal-sm bg-white p-1.5"
+          title="Restart / Reset"
+          onClick={() =>
+            ui.pushToast("warn", "restart the owning `joi agent serve` process")
+          }
+        >
+          <RotateCcw size={14} />
+        </button>
+        <button
+          className="btn-brutal-sm bg-white p-1.5"
+          title="Remove Agent"
+          onClick={() =>
+            ui.openModal({
+              type: "confirm",
+              title: `Remove ${agent.actor.displayName || agent.actor.id}?`,
+              body: "This removes the agent registration from local Joi agent specs. It does not kill a running external host process.",
+              confirmLabel: "Remove",
+              danger: true,
+              onConfirm: onRemove,
+            })
+          }
+        >
+          <Trash2 size={14} />
+        </button>
+      </header>
+
+      <div className="flex shrink-0 overflow-x-auto border-b-2 border-black bg-white scrollbar-none">
+        <AgentTabButton active={tab === "profile"} icon={Users} label="Profile" onClick={() => setTab("profile")} />
+        <AgentTabButton active={tab === "dms"} icon={MessageSquare} label="Agent DMs" onClick={() => setTab("dms")} />
+        <AgentTabButton active={tab === "reminders"} icon={BellRing} label="Reminders" onClick={() => setTab("reminders")} />
+        <AgentTabButton active={tab === "workspace"} icon={Folder} label="Workspace" onClick={() => setTab("workspace")} />
+        <AgentTabButton active={tab === "activity"} icon={Workflow} label="Activity" onClick={() => setTab("activity")} />
+      </div>
+
+      <div className="stable-scrollbar min-h-0 flex-1 overflow-y-auto bg-white">
+        {tab === "profile" && (
+          <ProfileTab agent={agent} online={online} onUpdate={onUpdate} />
+        )}
+        {tab === "dms" && <EmptyTab label="No agent-to-agent DMs yet" />}
+        {tab === "reminders" && (
+          <div className="p-5">
+            <div className="border-2 border-dashed border-black/30 px-5 py-8 text-center">
+              <BellRing className="mx-auto mb-2 text-black/25" size={26} />
+              <div className="font-black">No pending reminders.</div>
+              <div className="mt-1 text-sm text-black/50">
+                Reminders appear here in real time as soon as the agent schedules them.
+              </div>
+            </div>
+          </div>
+        )}
+        {tab === "workspace" && <WorkspaceTab agent={agent} />}
+        {tab === "activity" && <ActivityTab agent={agent} />}
+      </div>
+    </div>
+  );
+}
+
+function AgentTabButton({
+  active,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={clsx(
+        "flex items-center gap-1.5 border-r-2 border-black px-4 py-1.5 text-xs font-black uppercase tracking-wide",
+        active ? "bg-brutal-yellow" : "bg-white hover:bg-black/5",
+      )}
+      onClick={onClick}
+    >
+      <Icon size={12} />
+      {label}
+    </button>
+  );
+}
+
+function ProfileTab({
+  agent,
+  online,
+  onUpdate,
+}: {
+  agent: ManagedAgent;
+  online: boolean;
+  onUpdate: (patch: { displayName?: string; description?: string }) => Promise<void>;
+}) {
+  const ui = useUI();
+  return (
+    <div>
+      <section className="flex gap-4 border-b border-black/10 p-5">
+        <PixelAvatar id={agent.actor.id} label={agent.actor.displayName} size={64} />
+        <div>
+          <div className="text-xl font-black">
+            {agent.actor.displayName || agent.actor.id}{" "}
+            <span className={clsx("inline-block h-2.5 w-2.5 rounded-full border border-black", online ? "bg-brutal-lime" : "bg-black/20")} />
+            <span className="ml-1 font-mono text-sm font-normal text-black/50">
+              {online ? "Online" : agent.status}
+            </span>
+          </div>
+          <div className="font-mono text-sm text-black/45">@{agent.actor.id.replace(/^actor_/, "")}</div>
+        </div>
+      </section>
+
+      <InfoSection title="Display Name" action="Edit display name">
+        <button
+          className="inline-flex items-center gap-2 hover:underline"
+          onClick={() =>
+            ui.openModal({
+              type: "input",
+              title: "Edit display name",
+              label: "Display name",
+              initial: agent.actor.displayName || agent.actor.id,
+              confirmLabel: "Save",
+              onSubmit: (displayName) => onUpdate({ displayName }),
+            })
+          }
+        >
+          {agent.actor.displayName || agent.actor.id}
+          <Edit3 size={13} className="text-black/40" />
+        </button>
+      </InfoSection>
+
+      <InfoSection title="Description" action="Edit description">
+        <button
+          className="inline-flex items-center gap-2 text-black/55 hover:text-black"
+          onClick={() =>
+            ui.openModal({
+              type: "input",
+              title: "Edit description",
+              label: "Description",
+              initial: agent.description,
+              confirmLabel: "Save",
+              onSubmit: (description) => onUpdate({ description }),
+            })
+          }
+        >
+          {agent.description || "No description"}
+          <Edit3 size={13} className="text-black/40" />
+        </button>
+      </InfoSection>
+
+      <InfoSection title="Info">
+        <div className="grid max-w-2xl grid-cols-2 gap-5 text-sm">
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Machine
+            </div>
+            <span>{agent.machine}</span>{" "}
+            <span className="font-mono text-xs text-black/45">connected</span>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Creator
+            </div>
+            <span className="font-black">{agent.creator}</span>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Created
+            </div>
+            <span>{agent.created}</span>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Command
+            </div>
+            <span className="font-mono text-xs">{[agent.command, ...agent.args].join(" ")}</span>
+          </div>
+        </div>
+      </InfoSection>
+
+      <InfoSection title="Agent Spec">
+        <div className="flex flex-wrap gap-2">
+          <span className="chip-brutal bg-brutal-cyan">{agent.provider}</span>
+          <span className="chip-brutal bg-brutal-yellow">{agent.runtime}</span>
+          <span className="chip-brutal bg-brutal-lavender">{agent.model}</span>
+        </div>
+      </InfoSection>
+
+      <InfoSection title="Environment Variables" action="Edit environment variables">
+        {agent.env.length === 0 ? (
+          <span className="italic text-black/45">No environment variables configured</span>
+        ) : (
+          <div className="space-y-1">
+            {agent.env.map((row) => (
+              <div key={row.key} className="font-mono text-xs">
+                {row.key}=<span className="text-black/45">{row.value}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </InfoSection>
+
+      <InfoSection title="Created Agents (0)">
+        <span className="italic text-black/45">No created agents</span>
+      </InfoSection>
+    </div>
+  );
+}
+
+function InfoSection({
+  title,
+  action,
+  children,
+}: {
+  title: string;
+  action?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="border-b border-black/10 px-5 py-4">
+      <div className="mb-2 flex items-center gap-2 text-xs font-black uppercase tracking-widest text-black/45">
+        {title}
+        {action && (
+          <button title={action} className="hover:text-black">
+            <Edit3 size={13} />
+          </button>
+        )}
+      </div>
+      <div className="text-sm">{children}</div>
+    </section>
+  );
+}
+
+function EmptyTab({ label }: { label: string }) {
+  return (
+    <div className="flex h-full min-h-[22rem] items-center justify-center font-mono text-sm text-black/40">
+      {label}
+    </div>
+  );
+}
+
+function WorkspaceTab({ agent }: { agent: ManagedAgent }) {
+  return (
+    <div className="p-5">
+      <InfoSection title="Machine">
+        <div className="grid max-w-3xl grid-cols-2 gap-5 text-sm">
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Machine
+            </div>
+            <span>{agent.machine}</span>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Provider
+            </div>
+            <span>{agent.provider}</span>
+          </div>
+        </div>
+      </InfoSection>
+      <InfoSection title="Paths">
+        <div className="space-y-2 font-mono text-xs">
+          <div className="truncate">
+            <span className="text-black/45">specs </span>
+            {agent.specsDir}
+          </div>
+          <div className="truncate">
+            <span className="text-black/45">data </span>
+            {agent.dataRoot}
+          </div>
+        </div>
+      </InfoSection>
+      <InfoSection title="Transport">
+        <div className="space-y-2 font-mono text-xs">
+          <div>{agent.runtime}</div>
+          <div className="break-all">{[agent.command, ...agent.args].join(" ")}</div>
+        </div>
+      </InfoSection>
+    </div>
+  );
+}
+
+function ActivityTab({ agent }: { agent: ManagedAgent }) {
+  return (
+    <div className="p-5">
+      <InfoSection title="Connection">
+        <div className="grid max-w-2xl grid-cols-2 gap-5 text-sm">
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Status
+            </div>
+            <span>{agent.status}</span>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-black uppercase tracking-widest text-black/45">
+              Autostart
+            </div>
+            <span>{agent.autostart ? "enabled" : "disabled"}</span>
+          </div>
+        </div>
+      </InfoSection>
+    </div>
+  );
+}
+
+function normalizeAgent(
+  info: AgentInfo,
+  machine: AgentMachineContext,
+): ManagedAgent {
+  const spec = info.spec;
+  const actor = spec.actor;
+  const meta = actor._meta ?? {};
+  const env = spec.transport.env ?? {};
+  const model = spec.models?.default ?? spec.transport.model ?? "";
+  const providerId =
+    typeof meta.providerId === "string" ? meta.providerId : "unknown";
+  const provider =
+    typeof meta.providerName === "string" ? meta.providerName : providerId;
+  const runtime =
+    typeof meta.transportKind === "string"
+      ? meta.transportKind
+      : spec.transport.kind === "interactive_command"
+        ? "Interactive command"
+        : spec.transport.kind;
+  return {
+    actor,
+    status: info.status,
+    machineId: machine.id,
+    machine: machine.name,
+    specsDir: machine.specsDir,
+    dataRoot: machine.dataRoot,
+    providerId,
+    provider,
+    runtime,
+    model: model || "Default",
+    description: spec.identity?.description ?? "",
+    creator: "local spec",
+    created: "registered",
+    env: Object.entries(env).map(([key, value]) => ({ key, value })),
+    command: spec.transport.command,
+    args: spec.transport.args ?? [],
+    autostart: !!spec.autostart,
+  };
+}

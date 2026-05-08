@@ -9,6 +9,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONNECTION_OPEN: &str = "connection/open";
     pub const CONNECTION_CLOSE: &str = "connection/close";
+    pub const CONNECTION_LIST: &str = "connection/list";
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const SCOPE_READ: &str = "scope/read";
@@ -122,6 +123,23 @@ pub struct ConnectionCloseParams {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionCloseResult {
     pub closed: bool,
+}
+
+// ---- connection/list ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionListParams {
+    /// Optional actor id filter. Empty means every currently-bound actor.
+    #[serde(default)]
+    pub actor_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionListResult {
+    /// Actor ids that currently own a live actor inbox connection.
+    pub actor_ids: Vec<String>,
 }
 
 // ---- scope/subscribe ----

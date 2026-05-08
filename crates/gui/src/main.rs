@@ -53,6 +53,16 @@ fn main() {
             ipc::event_append,
             ipc::turn_close,
             ipc::actor_list,
+            ipc::agent_list,
+            ipc::agent_create,
+            ipc::agent_update,
+            ipc::agent_remove,
+            ipc::machine_list,
+            ipc::machine_check,
+            ipc::machine_create,
+            ipc::machine_remove,
+            ipc::machine_agent_create,
+            ipc::machine_agent_remove,
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]

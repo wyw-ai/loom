@@ -64,6 +64,7 @@ pub async fn run(
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create data dir {}", data_root.display()))?;
 
+    let machine_host = machine_host_spec_from_env();
     let mut specs = load_specs(&specs_dir)?;
     let total_loaded = specs.len();
     if !allow_actors.is_empty() {
@@ -97,7 +98,7 @@ pub async fn run(
             },
         );
     }
-    if specs.is_empty() {
+    if specs.is_empty() && machine_host.is_none() {
         return Err(anyhow!(
             "no agent actors to serve under {} (expanded {}, after --allow-actors filter: 0)",
             specs_dir.display(),
@@ -111,6 +112,12 @@ pub async fn run(
         specs_dir.display()
     );
     let mut handles = Vec::new();
+    if let Some(host) = machine_host {
+        let server = server_url.clone();
+        handles.push(tokio::spawn(async move {
+            run_machine_host_loop(host, server).await;
+        }));
+    }
     for spec in specs {
         let server = server_url.clone();
         let root = data_root.clone();
@@ -179,6 +186,96 @@ fn default_data_root() -> PathBuf {
     dirs::home_dir()
         .map(|d| d.join(".agentx"))
         .unwrap_or_else(|| PathBuf::from(".agentx"))
+}
+
+#[derive(Debug, Clone)]
+struct MachineHostSpec {
+    machine_id: String,
+    actor_id: String,
+    display_name: String,
+}
+
+fn machine_host_spec_from_env() -> Option<MachineHostSpec> {
+    let machine_id = std::env::var("JOI_MACHINE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let actor_id = std::env::var("JOI_MACHINE_ACTOR_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("actor_service_{machine_id}"));
+    let display_name = std::env::var("JOI_MACHINE_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| machine_id.clone());
+
+    Some(MachineHostSpec {
+        machine_id,
+        actor_id,
+        display_name,
+    })
+}
+
+async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
+    let mut attempt = 0u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let delay = reconnect_delay(attempt);
+        match run_machine_host_once(&host, &server_url).await {
+            Ok(()) => {
+                attempt = 0;
+                eprintln!(
+                    "[{}] machine host disconnected; reconnecting in {}s",
+                    host.machine_id,
+                    delay.as_secs()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] machine host exited with error: {e:#}; reconnecting in {}s",
+                    host.machine_id,
+                    delay.as_secs()
+                );
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
+async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Result<()> {
+    let client = Client::connect(server_url).await?;
+    client.initialize().await?;
+    let _: Value = client
+        .call(
+            method::ACTOR_UPSERT,
+            json!({
+                "actor": {
+                    "id": &host.actor_id,
+                    "kind": "service",
+                    "displayName": &host.display_name,
+                    "_meta": {
+                        "role": "machine",
+                        "machineId": &host.machine_id,
+                    },
+                },
+            }),
+        )
+        .await
+        .with_context(|| format!("actor/upsert for machine {}", host.machine_id))?;
+    client
+        .open_connection_as(&host.actor_id, "service", Some(&host.display_name))
+        .await?;
+    eprintln!(
+        "[{}] machine host connected to {} as {}",
+        host.machine_id, server_url, host.actor_id
+    );
+
+    loop {
+        sleep(Duration::from_secs(15)).await;
+        let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
+    }
 }
 
 fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {

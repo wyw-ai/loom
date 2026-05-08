@@ -15,11 +15,15 @@ import { MembersRail } from "@/features/members/MembersRail";
 import { ChatView } from "@/features/chat/ChatView";
 import { InboxPage } from "@/features/inbox/InboxPage";
 import { Landing } from "@/features/landing/Landing";
+import { TasksPage } from "@/features/tasks/TasksPage";
+import { MembersPage } from "@/features/members/MembersPage";
+import { MachinesPage } from "@/features/members/MachinesPage";
 import { Toast } from "@/features/common/Toast";
 import { ModalHost } from "@/features/common/Modal";
 import { ContextMenuHost } from "@/features/common/ContextMenu";
 import { DisconnectedOverlay } from "@/features/common/DisconnectedOverlay";
 import { AddWorkspaceHost } from "@/features/workspaces/AddWorkspaceModal";
+import { WorkspaceSwitcherHost } from "@/features/workspaces/WorkspaceSwitcher";
 import { summarizeActionRequest } from "@/features/chat/actionRequestSummary";
 import { notifyDesktop } from "@/features/notifications/desktop";
 
@@ -270,33 +274,39 @@ export function App() {
     }
   }
 
-  // When no workspace is bound yet, render the Landing page in place of the
-  // chat view. ServerRail still renders so the user can pick/add.
-  const showLanding = !workspace || connection === "idle";
+  // When no workspace is bound yet, render the Landing page only in the chat
+  // slot. Local admin pages such as Machines should remain reachable before a
+  // server connection exists.
+  const showLanding = view === "chat" && (!workspace || connection === "idle");
+  const fullWidthView =
+    view === "members" || view === "machines" || view === "settings";
 
   return (
     <div
       className="grid h-screen w-screen overflow-hidden text-primary"
       style={{
-        gridTemplateColumns: showLanding || !sidebarVisible
+        gridTemplateColumns: showLanding || fullWidthView || !sidebarVisible
           ? "72px minmax(0, 1fr)"
           : "72px 240px minmax(0, 1fr)",
       }}
     >
       <ServerRail />
-      {!showLanding && sidebarVisible && <ChannelsPane />}
+      {!showLanding && !fullWidthView && sidebarVisible && <ChannelsPane />}
       <main className="relative min-h-0 min-w-0 overflow-hidden bg-main">
         {showLanding ? (
           <Landing />
+        ) : view === "tasks" ? (
+          <TasksPage />
+        ) : view === "members" ? (
+          <MembersPage />
+        ) : view === "machines" ? (
+          <MachinesPage />
+        ) : view === "inbox" ? (
+          <InboxPage />
+        ) : view === "settings" ? (
+          <SettingsPlaceholder />
         ) : (
-          <>
-            <ChatView />
-            {view === "inbox" && (
-              <div className="absolute inset-0 z-10 bg-main">
-                <InboxPage />
-              </div>
-            )}
-          </>
+          <ChatView />
         )}
         {!showLanding && view === "chat" && membersVisible && <MembersRail />}
         {connection === "closed" && workspace && <DisconnectedOverlay />}
@@ -304,7 +314,21 @@ export function App() {
       <Toast />
       <ModalHost />
       <ContextMenuHost />
+      <WorkspaceSwitcherHost />
       <AddWorkspaceHost />
+    </div>
+  );
+}
+
+function SettingsPlaceholder() {
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col bg-white text-black">
+      <header className="flex h-panel-header items-center border-b-2 border-black px-5">
+        <div className="text-lg font-black">Settings</div>
+      </header>
+      <div className="flex flex-1 items-center justify-center font-mono text-sm text-black/40">
+        Settings are not implemented yet.
+      </div>
     </div>
   );
 }

@@ -62,6 +62,7 @@ pub async fn dispatch(
         method::INITIALIZE => initialize(params),
         method::CONNECTION_OPEN => connection_open(state, connection_id, params),
         method::CONNECTION_CLOSE => connection_close(state, params),
+        method::CONNECTION_LIST => connection_list(state, params),
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::SCOPE_READ => scope_read(state, connection_id, params),
@@ -159,6 +160,17 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
     ok(ConnectionOpenResult {
         connection: connection.into(),
         actor,
+    })
+}
+
+fn connection_list(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ConnectionListParams = if params.is_some() {
+        parse_params(params)?
+    } else {
+        ConnectionListParams::default()
+    };
+    ok(ConnectionListResult {
+        actor_ids: state.subscriptions.connected_actor_ids(&p.actor_ids),
     })
 }
 

@@ -1,16 +1,50 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   Actor,
+  AgentInfo,
   Channel,
   DesktopConfig,
   JoiEvent,
+  MachineInfo,
   ScopeRef,
   StreamUpdate,
   Thread,
   TurnStreamDelta,
 } from "./types";
+
+function hasTauriRuntime() {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(
+      (window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__,
+    )
+  );
+}
+
+function invoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  if (!hasTauriRuntime()) {
+    return Promise.reject(
+      new Error(`Tauri runtime unavailable for ${command}`),
+    );
+  }
+  return tauriInvoke<T>(command, args);
+}
+
+function listen<T>(
+  event: string,
+  handler: (event: { payload: T }) => void,
+): Promise<UnlistenFn> {
+  if (!hasTauriRuntime()) {
+    return Promise.resolve(() => {});
+  }
+  return tauriListen<T>(event, handler);
+}
 
 // ---- workspace profile management ----
 
@@ -165,9 +199,77 @@ export async function actorList(): Promise<{ actors: Actor[] }> {
 }
 
 export async function agentList(): Promise<{
-  agents: Array<{ spec: { actor: Actor }; status: string; pid?: number }>;
+  agents: AgentInfo[];
 }> {
   return invoke("agent_list");
+}
+
+export async function agentCreate(args: {
+  machineId?: string;
+  providerId: string;
+  actorId?: string;
+  name: string;
+  description?: string;
+  model?: string;
+  autostart?: boolean;
+}): Promise<AgentInfo> {
+  return invoke("agent_create", { args });
+}
+
+export async function agentRemove(actorId: string): Promise<{
+  agents: AgentInfo[];
+}> {
+  return invoke("agent_remove", { args: { actorId } });
+}
+
+export async function agentUpdate(args: {
+  machineId?: string;
+  actorId: string;
+  displayName?: string;
+  description?: string;
+}): Promise<AgentInfo> {
+  return invoke("agent_update", { args });
+}
+
+export async function machineList(): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_list");
+}
+
+export async function machineCheck(): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_check");
+}
+
+export async function machineCreate(args: {
+  name: string;
+  specsDir?: string;
+  dataRoot?: string;
+}): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_create", { args });
+}
+
+export async function machineRemove(machineId: string): Promise<{
+  machines: MachineInfo[];
+}> {
+  return invoke("machine_remove", { args: { machineId } });
+}
+
+export async function machineAgentCreate(args: {
+  machineId: string;
+  providerId: string;
+  actorId?: string;
+  name: string;
+  description?: string;
+  model?: string;
+  autostart?: boolean;
+}): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_agent_create", { args });
+}
+
+export async function machineAgentRemove(
+  machineId: string,
+  actorId: string,
+): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_agent_remove", { args: { machineId, actorId } });
 }
 
 // ---- inbound (event listeners) ----

@@ -1,30 +1,42 @@
-/* Design tokens — source of truth: docs/gui-desktop-design.md §4. */
+/* Slock-style brutal desktop tokens. */
 
 :root {
-  --bg-servers: #1a1b1e;
-  --bg-sidebar: #23252a;
-  --bg-main: #2b2d31;
-  --bg-elevated: #1e1f22;
-  --bg-hover: #34363c;
-  --bg-active: #404249;
-  --bg-mention: rgba(255, 196, 0, 0.08);
+  --bg-servers: #ffd83d;
+  --bg-sidebar: #fff9ec;
+  --bg-main: #ffffff;
+  --bg-elevated: #fff9ec;
+  --bg-hover: #ffffff;
+  --bg-active: #f26ea4;
+  --bg-mention: #fff0b6;
 
-  --border: #1f2023;
+  --border: #111111;
 
-  --text-primary: #f2f3f5;
-  --text-secondary: #b5bac1;
-  --text-muted: #80848e;
+  --text-primary: #111111;
+  --text-secondary: rgba(17, 17, 17, 0.72);
+  --text-muted: rgba(17, 17, 17, 0.42);
 
-  --accent: #5865f2;
-  --accent-hover: #4752c4;
-  --accent-contrast: #ffffff;
+  --accent: #ffd83d;
+  --accent-hover: #f2c900;
+  --accent-contrast: #111111;
 
-  --success: #3ba55d;
-  --warning: #f2b14a;
-  --danger: #ed4245;
+  --success: #95e86b;
+  --warning: #ffb66b;
+  --danger: #ff5d5d;
 
-  --role-human: #b794f4;
-  --role-agent: #22d3ee;
-  --role-service: #a1a1aa;
+  --role-human: #b79bf2;
+  --role-agent: #27ccf3;
+  --role-service: #a8a8a8;
   --role-self: var(--text-primary);
+
+  --brutal-yellow: #ffd83d;
+  --brutal-pink: #f26ea4;
+  --brutal-cyan: #27ccf3;
+  --brutal-lime: #95e86b;
+  --brutal-orange: #ff9a4f;
+  --brutal-lavender: #b79bf2;
+  --brutal-cream: #fff9ec;
+  --brutal-shadow: 4px 4px 0 #111111;
+  --brutal-shadow-sm: 2px 2px 0 #111111;
+  --panel-header: 60px;
+  --icon-header: 36px;
 }

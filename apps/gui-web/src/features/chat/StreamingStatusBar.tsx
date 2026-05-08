@@ -18,20 +18,20 @@ export function StreamingStatusBar({ scope }: { scope: ScopeRef }) {
   if (entries.length === 0) return null;
 
   return (
-    <div className="flex items-center gap-2 border-t border-border bg-elevated px-4 py-1 text-xs text-secondary">
+    <div className="flex items-center gap-2 border-t-2 border-black bg-brutal-cream px-4 py-1 text-xs font-bold text-black/70">
       {entries.map(([turnId, info]) => (
         <span
           key={turnId}
-          className="inline-flex items-center gap-1 rounded bg-hover px-2 py-0.5"
+          className="inline-flex items-center gap-1 border border-black bg-white px-2 py-0.5"
         >
-          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-accent" />
-          <span className="text-role-agent" title={info.actorId}>
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full border border-black bg-brutal-lime" />
+          <span className="text-black" title={info.actorId}>
             @{actorsById[info.actorId]?.displayName || info.actorId}
           </span>
-          <span>typing…</span>
+          <span>typing...</span>
           <button
             aria-label="Cancel turn"
-            className="ml-1 text-muted hover:text-danger"
+            className="ml-1 text-black/45 hover:text-danger"
             onClick={async () => {
               try {
                 await ipc.turnClose(turnId, "cancelled");

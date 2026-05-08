@@ -8,6 +8,7 @@ import {
   Copy,
   CornerDownRight,
   Fingerprint,
+  Bookmark,
   XCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -29,6 +30,7 @@ import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
+import { PixelAvatar } from "@/features/common/PixelAvatar";
 
 export interface BubbleReplyContext {
   actorId: string;
@@ -64,7 +66,7 @@ export function Bubble({
     return (
       <div
         id={domId}
-        className="my-1 scroll-mt-16 text-center text-xs italic text-muted"
+      className="my-1 scroll-mt-16 text-center font-mono text-xs italic text-black/40"
       >
         {bubble.text}
       </div>
@@ -138,7 +140,7 @@ export function Bubble({
   return (
     <div
       id={domId}
-      className="group relative flex scroll-mt-16 gap-3 rounded-md px-2 py-1 transition-colors hover:bg-hover focus-within:bg-hover"
+      className="group relative flex scroll-mt-16 gap-3 px-2 py-1 transition-colors hover:bg-brutal-cream focus-within:bg-brutal-cream"
       onContextMenu={onContextMenu}
     >
       <div className="w-10 shrink-0">
@@ -147,7 +149,7 @@ export function Bubble({
             type="button"
             onClick={() => void revealId()}
             title={actorId}
-            className="block rounded-full outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="block outline-none focus-visible:ring-2 focus-visible:ring-black"
           >
             <Avatar actorId={actorId} displayName={displayName} />
           </button>
@@ -161,17 +163,17 @@ export function Bubble({
               onClick={() => void revealId()}
               title={actorId}
               className={clsx(
-                "text-sm font-semibold outline-none hover:underline focus-visible:underline",
+                "text-sm font-black outline-none hover:underline focus-visible:underline",
                 isSelf ? "text-primary" : roleColor(actorId),
               )}
             >
               {displayName}
             </button>
-            <span className="text-[11px] text-muted">
+            <span className="font-mono text-[11px] text-black/40">
               {formatChatTime(bubble.ts)}
             </span>
             {bubble.delivery === "pending" && (
-              <span className="text-[11px] text-muted">sending…</span>
+              <span className="font-mono text-[11px] text-black/40">sending...</span>
             )}
           </header>
         )}
@@ -180,7 +182,7 @@ export function Bubble({
           <button
             type="button"
             disabled={replyContext.missing}
-            className="mb-0.5 flex max-w-full items-center gap-1.5 rounded-sm text-left text-xs text-muted hover:text-secondary disabled:cursor-default disabled:hover:text-muted"
+            className="mb-0.5 flex max-w-full items-center gap-1.5 text-left text-xs text-black/45 hover:text-black/70 disabled:cursor-default disabled:hover:text-black/45"
             onClick={jumpToReply}
             title={replyContext.preview}
           >
@@ -208,14 +210,20 @@ export function Bubble({
 
       {/* Hover toolbar — floats just above the top-right, Discord-style.
           It mirrors the context menu for the fast reply/copy path. */}
-      <div
-        className="pointer-events-none absolute -top-3 right-3 flex items-center gap-0.5 rounded-md border border-border bg-elevated px-0.5 py-0.5 opacity-0 shadow-md transition-opacity duration-75 group-hover:pointer-events-auto group-hover:opacity-100"
-      >
+      <div className="pointer-events-none absolute -top-3 right-3 flex items-center gap-0.5 border-2 border-black bg-white px-0.5 py-0.5 opacity-0 shadow-brutal-sm transition-opacity duration-75 group-hover:pointer-events-auto group-hover:opacity-100">
+        <button
+          type="button"
+          title="Save message"
+          onClick={() => pushToast("info", "message saved")}
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
+        >
+          <Bookmark size={13} />
+        </button>
         <button
           type="button"
           title="Reply"
           onClick={replyToThis}
-          className="flex h-6 w-6 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
         >
           <CornerDownRight size={14} />
         </button>
@@ -223,7 +231,7 @@ export function Bubble({
           type="button"
           title="Copy text"
           onClick={() => void copyText()}
-          className="flex h-6 w-6 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
         >
           <Copy size={14} />
         </button>
@@ -231,7 +239,7 @@ export function Bubble({
           type="button"
           title="Copy actor id"
           onClick={() => void revealId()}
-          className="flex h-6 w-6 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
         >
           <Fingerprint size={14} />
         </button>
@@ -254,23 +262,14 @@ function Avatar({
   actorId: string;
   displayName: string;
 }) {
-  const base = displayName && displayName !== actorId ? displayName : actorId;
-  const initials = base.slice(0, 2).toUpperCase();
-  return (
-    <div
-      className="flex h-9 w-9 items-center justify-center rounded-full bg-elevated text-xs font-semibold text-secondary"
-      aria-label={actorId}
-    >
-      {initials}
-    </div>
-  );
+  return <PixelAvatar id={actorId} label={displayName} size={36} />;
 }
 
 function roleColor(actorId: string): string {
-  if (actorId.startsWith("actor_agent_")) return "text-role-agent";
-  if (actorId.startsWith("actor_service_")) return "text-role-service";
-  if (actorId === "system") return "text-muted";
-  return "text-role-human";
+  if (actorId.startsWith("actor_agent_")) return "text-black";
+  if (actorId.startsWith("actor_service_")) return "text-black/70";
+  if (actorId === "system") return "text-black/45";
+  return "text-black";
 }
 
 function Body({ bubble }: { bubble: BubbleT }) {
@@ -300,9 +299,9 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
   const targetActor = useActors((s) => s.byId[target]);
   const targetName = targetActor?.displayName || target;
   return (
-    <div className="text-sm text-secondary">
-      <span className="text-muted">handoff →</span>{" "}
-      <span className="text-role-agent" title={target}>
+    <div className="text-sm text-black/70">
+      <span className="text-black/45">handoff {"->"}</span>{" "}
+      <span className="bg-mention px-1 font-black text-black" title={target}>
         @{targetName}
       </span>
       {bubble.text ? <>: {bubble.text}</> : null}
@@ -312,7 +311,7 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
 
 function MarkdownText({ text }: { text: string }) {
   return (
-    <div className="prose-chat text-sm leading-6 text-primary">
+    <div className="prose-chat text-sm leading-6 text-black">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
     </div>
   );
@@ -356,7 +355,7 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
   const statusTone = actionStatusTone(status);
   const StatusIcon = statusTone.icon;
   const [expanded, setExpanded] = useState(() => !disabled);
-  const cardShell = "mt-1 w-full max-w-3xl overflow-hidden rounded-md border shadow-sm";
+  const cardShell = "mt-1 w-full max-w-3xl overflow-hidden border-2 border-black bg-white shadow-brutal-sm";
   const bodyShell = "px-3 pb-3 pt-2";
   const hasStructuredBody =
     bubble.actionReason || bubble.actionCommand || bubble.actionRawInput;
@@ -377,7 +376,7 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
           <button
             type="button"
             onClick={() => setExpanded(false)}
-            className="flex h-5 w-5 items-center justify-center rounded text-muted hover:bg-hover hover:text-primary"
+            className="flex h-5 w-5 items-center justify-center text-black/45 hover:bg-brutal-yellow hover:text-black"
           >
             <ChevronDown size={14} />
           </button>
@@ -389,12 +388,12 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         size={15}
         className={clsx("justify-self-center", statusTone.iconClass)}
       />
-      <div className="min-w-0 truncate text-sm font-semibold text-primary">
+      <div className="min-w-0 truncate text-sm font-black text-black">
         {actionTitle}
       </div>
       <span
         className={clsx(
-          "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
+          "shrink-0 border border-black px-1.5 py-0.5 text-[11px] font-black",
           statusTone.badge,
         )}
       >
@@ -430,8 +429,8 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
       {hasStructuredBody ? (
         <div className={clsx(bodyShell, "space-y-2")}>
           {bubble.actionReason && (
-            <div className="text-sm text-secondary">
-              <div className="mb-0.5 text-[11px] font-semibold uppercase text-muted">
+            <div className="text-sm text-black/70">
+              <div className="mb-0.5 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Reason
               </div>
               <div className="whitespace-pre-wrap">{bubble.actionReason}</div>
@@ -439,20 +438,20 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
           )}
           {bubble.actionCommand && (
             <div>
-              <div className="mb-1 text-[11px] font-semibold uppercase text-muted">
+              <div className="mb-1 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Command
               </div>
-              <code className="block overflow-x-auto rounded bg-elevated/80 px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
+              <code className="block overflow-x-auto border-2 border-black bg-brutal-cream px-2 py-1.5 font-mono text-xs leading-5 text-black/70">
                 {bubble.actionCommand}
               </code>
             </div>
           )}
           {bubble.actionRawInput && (
             <div>
-              <div className="mb-1 text-[11px] font-semibold uppercase text-muted">
+              <div className="mb-1 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Raw input
               </div>
-              <code className="block overflow-x-auto whitespace-pre rounded bg-elevated/80 px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
+              <code className="block overflow-x-auto whitespace-pre border-2 border-black bg-brutal-cream px-2 py-1.5 font-mono text-xs leading-5 text-black/70">
                 {bubble.actionRawInput}
               </code>
             </div>
@@ -460,7 +459,7 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         </div>
       ) : (
         <div className={bodyShell}>
-          <div className="text-sm text-primary whitespace-pre-wrap">
+          <div className="whitespace-pre-wrap text-sm text-black">
             {bubble.text}
           </div>
         </div>
@@ -476,10 +475,10 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
                   void respond(c.id, isDecline ? "declined" : "accepted")
                 }
                 className={clsx(
-                  "rounded px-3 py-1 text-xs font-medium",
+                  "btn-brutal-sm px-3 py-1 text-xs font-black",
                   isDecline
-                    ? "bg-elevated text-secondary hover:bg-hover"
-                    : "bg-accent text-accent-contrast hover:bg-accent-hover",
+                    ? "bg-white"
+                    : "bg-brutal-pink",
                 )}
               >
                 {c.label}
@@ -497,25 +496,25 @@ function actionStatusTone(status: NonNullable<BubbleT["actionStatus"]>) {
     return {
       label: "Approved",
       icon: CheckCircle2,
-      iconClass: "text-success",
-      card: "border-[rgba(59,165,93,0.35)] bg-[rgba(59,165,93,0.12)]",
-      badge: "bg-[rgba(59,165,93,0.16)] text-success",
+      iconClass: "text-black",
+      card: "bg-brutal-lime",
+      badge: "bg-white text-black",
     };
   }
   if (status === "declined") {
     return {
       label: "Rejected",
       icon: XCircle,
-      iconClass: "text-danger",
-      card: "border-[rgba(237,66,69,0.35)] bg-[rgba(237,66,69,0.12)]",
-      badge: "bg-[rgba(237,66,69,0.16)] text-danger",
+      iconClass: "text-black",
+      card: "bg-danger",
+      badge: "bg-white text-black",
     };
   }
   return {
     label: "Waiting",
     icon: Clock3,
-    iconClass: "text-warning",
-    card: "border-[rgba(242,177,74,0.35)] bg-[rgba(242,177,74,0.12)]",
-    badge: "bg-[rgba(242,177,74,0.16)] text-warning",
+    iconClass: "text-black",
+    card: "bg-brutal-yellow",
+    badge: "bg-white text-black",
   };
 }

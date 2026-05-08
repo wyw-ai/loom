@@ -15,25 +15,25 @@ body,
 body {
   background: var(--bg-main);
   color: var(--text-primary);
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
+  font-family: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "Menlo",
+    "Consolas", monospace;
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Custom scrollbars — thin, subtle, Discord-adjacent. */
+/* Custom scrollbars. */
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 *::-webkit-scrollbar-thumb {
-  background: #1f2023;
-  border-radius: 4px;
+  background: #111111;
+  border: 2px solid #ffffff;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: #2a2b2f;
+  background: #333333;
 }
 *::-webkit-scrollbar-track {
   background: transparent;
@@ -52,6 +52,120 @@ button:disabled {
 }
 
 .bubble-flash {
-  background: rgba(88, 101, 242, 0.18);
+  background: rgba(242, 110, 164, 0.24);
   transition: background 180ms ease;
+}
+
+.font-display {
+  font-family: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "Menlo",
+    "Consolas", monospace;
+}
+
+.h-panel-header {
+  height: var(--panel-header);
+}
+
+.size-icon-header {
+  width: var(--icon-header);
+  height: var(--icon-header);
+}
+
+.shadow-brutal {
+  box-shadow: var(--brutal-shadow);
+}
+
+.shadow-brutal-sm {
+  box-shadow: var(--brutal-shadow-sm);
+}
+
+.btn-brutal,
+.btn-brutal-sm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #111111;
+  color: #111111;
+  background: #ffffff;
+  box-shadow: var(--brutal-shadow-sm);
+  font-weight: 800;
+  transition:
+    transform 80ms ease,
+    box-shadow 80ms ease,
+    background-color 80ms ease;
+}
+
+.btn-brutal:hover,
+.btn-brutal-sm:hover {
+  box-shadow: var(--brutal-shadow);
+}
+
+.btn-brutal:active,
+.btn-brutal-sm:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+
+.btn-brutal-sm {
+  min-height: 28px;
+  min-width: 28px;
+}
+
+.input-brutal {
+  border: 2px solid #111111;
+  background: #ffffff;
+  color: #111111;
+  box-shadow: var(--brutal-shadow-sm);
+  outline: none;
+  padding: 0.625rem 0.75rem;
+}
+
+.input-brutal:focus {
+  background: #fffdf8;
+  box-shadow: var(--brutal-shadow);
+}
+
+.card-brutal {
+  border: 2px solid #111111;
+  background: #ffffff;
+  color: #111111;
+  box-shadow: var(--brutal-shadow);
+}
+
+.chip-brutal {
+  border: 2px solid #111111;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.45rem;
+  font-size: 0.7rem;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.prose-chat :where(p, ul, ol, pre, blockquote) {
+  margin: 0.15rem 0;
+}
+
+.prose-chat :where(code) {
+  background: #fff0b6;
+  border: 1px solid rgba(17, 17, 17, 0.35);
+  padding: 0 0.2rem;
+}
+
+.prose-chat :where(a) {
+  background: #efe5ff;
+  border: 1px solid rgba(17, 17, 17, 0.35);
+  color: #111111;
+  font-weight: 800;
+  padding: 0 0.2rem;
+  text-decoration: none;
 }

@@ -11,40 +11,57 @@ import { useUI } from "@/store/ui";
 import { openScope } from "@/features/chat/scopeActions";
 
 export function openCreateChannel() {
-  useUI.getState().openModal({
-    type: "input",
-    title: "New channel",
-    label: "Title",
-    placeholder: "e.g. design",
-    confirmLabel: "Create",
-    onSubmit: async (title) => {
-      const t = title.trim();
-      if (!t) return;
-      const actorId = useSession.getState().workspace?.actorId;
-      try {
-        const { channel } = await ipc.channelCreate({ title: t, actorId });
-        useChannels.getState().upsertChannel(channel);
-        await openScope({ kind: "channel", id: channel.id });
-      } catch (e) {
-        useUI
-          .getState()
-          .pushToast(
-            "error",
-            `create channel: ${e instanceof Error ? e.message : String(e)}`,
-          );
-      }
-    },
-  });
+  (async () => {
+    const actorItems = await loadActorItems();
+    useUI.getState().openModal({
+      type: "channelForm",
+      title: "Create channel",
+      initialTitle: "",
+      initialDescription: "",
+      confirmLabel: "Create Channel",
+      actorItems,
+      onSubmit: async ({ title, actorIds }) => {
+        const t = title.trim();
+        if (!t) return;
+        const actorId = useSession.getState().workspace?.actorId;
+        try {
+          const { channel } = await ipc.channelCreate({ title: t, actorId });
+          useChannels.getState().upsertChannel(channel);
+          for (const invitee of actorIds) {
+            try {
+              await ipc.channelInvite({
+                channelId: channel.id,
+                actorId: invitee,
+              });
+            } catch {
+              /* keep channel creation successful; invite can be retried */
+            }
+          }
+          await openScope({ kind: "channel", id: channel.id });
+        } catch (e) {
+          useUI
+            .getState()
+            .pushToast(
+              "error",
+              `create channel: ${e instanceof Error ? e.message : String(e)}`,
+            );
+        }
+      },
+    });
+  })();
 }
 
 export function openRenameChannel(channel: Channel) {
   useUI.getState().openModal({
-    type: "input",
-    title: `Rename #${channel.title}`,
-    label: "Title",
-    initial: channel.title,
-    confirmLabel: "Rename",
-    onSubmit: async (title) => {
+    type: "channelForm",
+    title: "Edit channel",
+    nameLabel: "Name",
+    initialTitle: channel.title,
+    initialDescription:
+      channel.title === "all" ? "General channel for all members" : "",
+    titleLocked: channel.title === "all",
+    confirmLabel: "Save Changes",
+    onSubmit: async ({ title }) => {
       const t = title.trim();
       if (!t || t === channel.title) return;
       try {
@@ -189,6 +206,25 @@ export function openCreateThread(channelId: string) {
       }
     },
   });
+}
+
+async function loadActorItems(): Promise<
+  Array<{ id: string; label: string; hint?: string; kind?: string }>
+> {
+  try {
+    const r = await ipc.actorList();
+    useActors.getState().upsertMany(r.actors);
+    return r.actors
+      .filter((a) => a.kind !== "service")
+      .map((a) => ({
+        id: a.id,
+        label: a.displayName || a.id,
+        hint: a.kind,
+        kind: a.kind,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 export function openRenameThread(thread: Thread) {

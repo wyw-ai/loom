@@ -11,6 +11,7 @@ export interface Actor {
   kind: ActorKind;
   displayName?: string;
   capabilities?: unknown;
+  _meta?: Record<string, unknown>;
 }
 
 export type ChannelVisibility = "public" | "private";
@@ -110,9 +111,79 @@ export interface Workspace {
   displayName: string;
 }
 
+export interface MachineConfig {
+  workspaceId?: string | null;
+  id: string;
+  name: string;
+  kind: string;
+  specsDir: string;
+  dataRoot: string;
+}
+
 export interface DesktopConfig {
   active?: string | null;
   workspaces: Workspace[];
+  machines?: MachineConfig[];
+}
+
+// ---- local agent / machine management ----
+
+export interface AgentTransport {
+  kind: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  model?: string | null;
+}
+
+export interface AgentSpec {
+  actor: Actor;
+  transport: AgentTransport;
+  autostart?: boolean;
+  models?: {
+    default?: string | null;
+    choices?: Array<{ id: string; label?: string; description?: string }>;
+  } | null;
+  identity?: {
+    description?: string | null;
+  } | null;
+}
+
+export interface AgentInfo {
+  spec: AgentSpec;
+  status: string;
+  pid?: number;
+  sessionId?: string;
+}
+
+export interface AgentProviderSummary {
+  id: string;
+  name: string;
+  transportKind: string;
+  command: string;
+  args?: string[];
+  actorCount: number;
+  defaultModel?: string | null;
+  modelChoices?: Array<{ id: string; label?: string; description?: string }>;
+}
+
+export interface MachineInfo {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  setupStatus: string;
+  connectionStatus: string;
+  connectionActorId: string;
+  specsDir: string;
+  dataRoot: string;
+  configDir: string;
+  agentCount: number;
+  onlineAgentCount: number;
+  providers: AgentProviderSummary[];
+  agents: AgentInfo[];
+  serveCommand: string;
+  setupScript: string;
 }
 
 // ---- bubble (front-end only) ----

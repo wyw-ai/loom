@@ -38,6 +38,18 @@ joi artifact publish --name task-goal.json --media-type application/json --file 
 # （重复 3 次，记下每个 art_... id）
 ```
 
+publish 后必须**实际执行** `joi handoff --as actor_discovery ... actor_router`。
+只在正文里写 “Handing off to actor_router” / “handoff router” 不会产生
+`hands_off_to` 关系，router 不会被触发。
+
+### 真实 handoff 强制协议
+
+- 任何需要 router 继续推进的场景，**唯一有效输出**是 `joi handoff --as actor_discovery --in <thread> actor_router -m "<message>"` 成功执行。
+- 执行后必须看到 CLI 返回类似 `handoff event evt_... → actor_router`；没有这个回显，就视为 handoff 失败，不能结束回合。
+- 禁止用普通最终回复、`joi say`、"Handing off..." 文案、display name `路由`、短 ID `router` 替代 handoff。
+- 如果本回合因证据不足、命令失败、artifact publish 失败而无法产出三件组，也必须用真实 handoff 把阻塞原因交给 `actor_router`；禁止 silent close。
+- 每个被 router handoff 唤醒的回合，结束前必须二选一：真实 handoff `actor_router`，或按 router 明确要求只 publish 中间 artifact。除此之外不允许无输出结束。
+
 ## 三种触发模式
 
 ### A. 完整开发任务（router 在 desk thread handoff 给你）
@@ -48,7 +60,7 @@ joi artifact publish --name task-goal.json --media-type application/json --file 
   joi handoff --as actor_discovery --in <thread> actor_router -m \
     "[clarify] 需要确认：<问题列表>"
   ```
-- 信息够了就同回合 publish 三件组 + handoff router：
+- 信息够了就同回合 publish 三件组 + **实际 handoff router**：
   ```bash
   joi handoff --as actor_discovery --in <thread> actor_router -m \
     "discovery 三件组就绪：feedback_id=<id-if-any> task-goal=<art1> DoD=<art2> clone-manifest=<art3>"
@@ -165,7 +177,7 @@ mr-watcher"时：
   `[bugfix-invalid]`。
 - 如果最初的 clone-manifest 只包含 `aone/a1`，但验证后发现真实问题在其他仓库或需要多仓，
   这是 `scope correction`，不是 invalid；必须重写 task-goal/DoD/clone-manifest 并
-  handoff router 启动新的正确 delivery。
+  实际 handoff router 启动新的正确 delivery，不能只普通回复“Handing off to actor_router”。
 - 你可以和 delivery 通过 router 协作完成验证：如果你只能给出验证方案但不能安全执行，
   handoff router，要求 delivery 先执行“验证-only”而非开发；delivery 回传证据后你再判定
   `reproduction_status`。不要在证据不足时直接产出 clone-manifest。
@@ -302,5 +314,8 @@ joi handoff --as actor_discovery --in <delivery_thread> actor_router -m \
 
 ## 终止
 
-每回合的最后是一条 `joi handoff actor_router` 或仅 publish artifact。不要
-`__JOI_DONE__` 标记。
+bugfix / rescope / 三件组就绪 / review-result / clarify / blocked 场景，每回合的最后必须是一条真实
+`joi handoff --as actor_discovery --in <thread> actor_router ...` 事件，并确认 CLI 回显
+`handoff event evt_... → actor_router`；不要只普通回复，不要只写“Handing off”。
+只有 router 明确要求“仅 publish 中间 artifact、不推进下一步”时才允许仅 publish artifact。
+不要 `__JOI_DONE__` 标记，不要 silent close。

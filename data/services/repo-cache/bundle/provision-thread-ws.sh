@@ -16,6 +16,9 @@
 #   "task_branch": "feat/foo",          # default branch for "worktree" entries
 #   "pickup": false,                    # if true: do not create new branch,
 #                                       # checkout existing remote pickup_branch
+#                                       # repos[].pickup_branch overrides the
+#                                       # global pickup_branch for multi-repo
+#                                       # pickup tasks.
 #   "repos": [
 #     { "repo": "aone/a1", "role": "worktree", "url": "git@.../a1.git" },
 #     { "repo": "aone/a1-server", "role": "worktree" },
@@ -84,7 +87,7 @@ resolve_default() {
 }
 
 provision_one() {
-    local repo="$1"; local role="$2"; local url="$3"
+    local repo="$1"; local role="$2"; local url="$3"; local repo_pickup_branch="${4:-}"
     local base; base=$(basename_of "$repo")
     local mirror="$SHARED_ROOT/${base}.git"
     local dest="$WS_ROOT/$base"
@@ -123,15 +126,19 @@ provision_one() {
     git fetch origin --prune --quiet
 
     local checkout_branch
-    if [[ "$PICKUP" == "true" && -n "$PICKUP_BRANCH" ]]; then
+    local effective_pickup_branch="${repo_pickup_branch:-$PICKUP_BRANCH}"
+    if [[ "$PICKUP" == "true" ]]; then
         # Pick up an in-progress branch.
-        if git rev-parse --verify "origin/$PICKUP_BRANCH" >/dev/null 2>&1; then
-            git checkout -B "$PICKUP_BRANCH" "origin/$PICKUP_BRANCH"
-            checkout_branch="$PICKUP_BRANCH"
+        if [[ -z "$effective_pickup_branch" ]]; then
+            echo "[provision] pickup=true requires pickup_branch for $repo" >&2
+            return 1
+        fi
+        if git rev-parse --verify "origin/$effective_pickup_branch" >/dev/null 2>&1; then
+            git checkout -B "$effective_pickup_branch" "origin/$effective_pickup_branch"
+            checkout_branch="$effective_pickup_branch"
         else
-            echo "[provision] pickup_branch origin/$PICKUP_BRANCH not found; falling back to $default" >&2
-            git checkout -B "$default" "origin/$default"
-            checkout_branch="$default"
+            echo "[provision] pickup_branch origin/$effective_pickup_branch not found for $repo" >&2
+            return 1
         fi
     elif [[ -n "$TASK_BRANCH" ]]; then
         # Fresh branch from main trunk. Existing remote task branches are only
@@ -155,9 +162,10 @@ provision_one() {
 # Iterate manifest entries.
 jq -c '.repos[]' "$MANIFEST" | while read -r entry; do
     repo=$(jq -rn --argjson e "$entry" '$e.repo')
-    role=$(jq -rn --argjson e "$entry" '$e.role // "worktree"')
+    role=$(jq -rn --argjson e "$entry" '$e.mode // $e.role // "worktree"')
     url=$(jq -rn  --argjson e "$entry" '$e.url // empty')
-    provision_one "$repo" "$role" "$url"
+    repo_pickup_branch=$(jq -rn --argjson e "$entry" '$e.pickup_branch // empty')
+    provision_one "$repo" "$role" "$url" "$repo_pickup_branch"
 done
 
 echo "{\"ok\":true,\"thread_id\":\"$THREAD_ID\",\"workspace\":\"$WS_ROOT\"}"

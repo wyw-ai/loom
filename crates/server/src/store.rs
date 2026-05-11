@@ -1932,7 +1932,7 @@ mod tests {
     fn action_response_to_own_action_request_keeps_reverse_delivery() {
         // GUI misconfiguration can make the human workspace use the same actor
         // id as the agent runtime. For permission prompts that still needs to
-        // route back to the long-lived `joi agent serve` inbox.
+        // route back to the long-lived daemon worker inbox.
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
         store.grant_channel(&ch.id, "agent_qa").unwrap();

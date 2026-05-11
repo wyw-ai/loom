@@ -1,9 +1,8 @@
-//! `joi agent serve` — external agent runtime client (v1 phase E3c).
+//! Daemon agent worker internals.
 //!
-//! Loads `AgentProviderSpec` JSON files from `~/.config/joi/agents/` (override with
-//! `--specs`), and for each spec opens a dedicated WebSocket to the joi server
-//! and supervises that one agent through the same `agent-runtime` adapter trait
-//! used by ACP/command transports.
+//! `joi daemon` synthesizes `AgentSpec`s from the desktop machine config and
+//! uses this module to open a dedicated WebSocket per agent, then supervise
+//! that one agent through the shared `agent-runtime` adapter trait.
 //!
 //! Architecture (per docs/architecture-v1-agent-client.md §6):
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
@@ -26,8 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
-    method, stream_kind, AgentModelChoice, AgentProviderSpec, AgentSpec, BundleInstallMode,
-    EventAppendResult, TurnOpenResult,
+    method, stream_kind, AgentModelChoice, AgentSpec, BundleInstallMode, EventAppendResult,
+    TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -48,111 +47,10 @@ use agent_runtime::{
 };
 
 use crate::client::Client;
-use crate::{config, daemon_ipc};
+use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
-
-pub async fn run(
-    specs_dir_opt: Option<PathBuf>,
-    server_url: String,
-    allow_actors: Vec<String>,
-) -> Result<()> {
-    let specs_dir = specs_dir_opt.unwrap_or_else(default_specs_dir);
-    std::fs::create_dir_all(&specs_dir)
-        .with_context(|| format!("create specs dir {}", specs_dir.display()))?;
-    let machine_host = machine_host_spec_from_env();
-    let specs = load_specs(&specs_dir)?;
-    let total_loaded = specs.len();
-    run_with_specs(
-        "joi agent serve",
-        specs,
-        format!("{}", specs_dir.display()),
-        server_url,
-        allow_actors,
-        machine_host,
-        total_loaded,
-    )
-    .await
-}
-
-pub async fn run_with_specs(
-    runtime_name: &'static str,
-    mut specs: Vec<AgentSpec>,
-    specs_label: String,
-    server_url: String,
-    allow_actors: Vec<String>,
-    machine_host: Option<MachineHostSpec>,
-    total_loaded: usize,
-) -> Result<()> {
-    let data_root = default_data_root();
-    std::fs::create_dir_all(&data_root)
-        .with_context(|| format!("create data dir {}", data_root.display()))?;
-
-    if !allow_actors.is_empty() {
-        let allow: HashSet<&str> = allow_actors.iter().map(String::as_str).collect();
-        let (kept, skipped): (Vec<_>, Vec<_>) = specs
-            .into_iter()
-            .partition(|s| allow.contains(s.actor.id.as_str()));
-        specs = kept;
-        let skipped_ids: Vec<&str> = skipped.iter().map(|s| s.actor.id.as_str()).collect();
-        let unknown: Vec<&str> = allow_actors
-            .iter()
-            .map(String::as_str)
-            .filter(|id| !specs.iter().any(|s| s.actor.id == *id))
-            .collect();
-        eprintln!(
-            "{runtime_name}: --allow-actors filter active; loaded {} of {} agent(s){}{}",
-            specs.len(),
-            total_loaded,
-            if skipped_ids.is_empty() {
-                String::new()
-            } else {
-                format!("; skipped: {}", skipped_ids.join(","))
-            },
-            if unknown.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; warning: requested ids with no matching spec: {}",
-                    unknown.join(",")
-                )
-            },
-        );
-    }
-    if specs.is_empty() && machine_host.is_none() {
-        return Err(anyhow!(
-            "no agent actors to serve under {} (expanded {}, after --allow-actors filter: 0)",
-            specs_label,
-            total_loaded,
-        ));
-    }
-
-    eprintln!(
-        "{runtime_name}: loaded {} agent(s) from {}",
-        specs.len(),
-        specs_label
-    );
-    let mut handles = Vec::new();
-    if let Some(host) = machine_host {
-        let server = server_url.clone();
-        handles.push(spawn_machine_host_loop(host, server));
-    }
-    for spec in specs {
-        handles.push(spawn_agent_worker_loop(
-            spec,
-            server_url.clone(),
-            data_root.clone(),
-        ));
-    }
-    eprintln!("{runtime_name}: ready (ctrl-c to stop)");
-    let _ = tokio::signal::ctrl_c().await;
-    eprintln!("\n{runtime_name}: shutting down");
-    for h in handles {
-        h.abort();
-    }
-    Ok(())
-}
 
 pub fn spawn_agent_worker_loop(
     spec: AgentSpec,
@@ -208,51 +106,11 @@ fn current_joi_binary() -> Option<PathBuf> {
         .or_else(|| Some(PathBuf::from("joi")))
 }
 
-fn default_specs_dir() -> PathBuf {
-    config::agent_specs_dir()
-}
-
-fn default_data_root() -> PathBuf {
-    for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            if !value.is_empty() {
-                return PathBuf::from(value);
-            }
-        }
-    }
-    dirs::home_dir()
-        .map(|d| d.join(".agentx"))
-        .unwrap_or_else(|| PathBuf::from(".agentx"))
-}
-
 #[derive(Debug, Clone)]
 pub struct MachineHostSpec {
     pub machine_id: String,
     pub actor_id: String,
     pub display_name: String,
-}
-
-fn machine_host_spec_from_env() -> Option<MachineHostSpec> {
-    let machine_id = std::env::var("JOI_MACHINE_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
-    let actor_id = std::env::var("JOI_MACHINE_ACTOR_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("actor_service_{machine_id}"));
-    let display_name = std::env::var("JOI_MACHINE_NAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| machine_id.clone());
-
-    Some(MachineHostSpec {
-        machine_id,
-        actor_id,
-        display_name,
-    })
 }
 
 async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
@@ -312,76 +170,6 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     loop {
         sleep(Duration::from_secs(15)).await;
         let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
-    }
-}
-
-fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
-    let mut out = Vec::new();
-    for entry in
-        std::fs::read_dir(dir).with_context(|| format!("read specs dir {}", dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let text =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        warn_deprecated_transport_fields(&text, &path);
-        match serde_json::from_str::<AgentProviderSpec>(&text) {
-            Ok(provider) => {
-                let specs = provider.into_agent_specs();
-                if specs.is_empty() {
-                    eprintln!(
-                        "[warn] skipping {}: agent provider has no actors",
-                        path.display()
-                    );
-                }
-                out.extend(specs);
-            }
-            Err(e) => eprintln!("[warn] skipping {}: {}", path.display(), e),
-        }
-    }
-    Ok(out)
-}
-
-fn warn_deprecated_transport_fields(text: &str, path: &Path) {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
-    if value
-        .get("transport")
-        .and_then(|transport| transport.get("cwd"))
-        .is_some()
-    {
-        eprintln!(
-            "[warn] {}: transport.cwd is ignored; Joi computes ACP session cwd \
-             from the target channel/thread workspace",
-            path.display()
-        );
-    }
-
-    let transport = value
-        .get("transport")
-        .and_then(|transport| transport.as_object());
-    let command = transport
-        .and_then(|transport| transport.get("command"))
-        .and_then(|command| command.as_str());
-    const ZED_QODERCLI_ACP_VERSION: &str = "0.1.48";
-    let qodercli_pin = transport
-        .and_then(|transport| transport.get("args"))
-        .and_then(|args| args.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|arg| arg.as_str())
-        .find_map(|arg| arg.strip_prefix("@qoder-ai/qodercli@"));
-    if command == Some("npx") && qodercli_pin.is_some_and(|pin| pin != ZED_QODERCLI_ACP_VERSION) {
-        eprintln!(
-            "[warn] {}: pinned @qoder-ai/qodercli version differs from Zed \
-             registry ({ZED_QODERCLI_ACP_VERSION}); Qoder ACP auth may fail \
-             even when Zed works",
-            path.display(),
-        );
     }
 }
 
@@ -596,6 +384,7 @@ impl AgentPaths {
         channel_id: &str,
         scope_ref: &ScopeRef,
         server_url: &str,
+        active: Option<&ActiveTurn>,
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut env = BTreeMap::new();
@@ -607,6 +396,15 @@ impl AgentPaths {
             );
         }
         env.insert("JOI_ACTOR".into(), actor_id.to_string());
+        env.insert("JOI_SCOPE_ID".into(), scope_ref.id.clone());
+        env.insert(
+            "JOI_SCOPE_KIND".into(),
+            scope_kind_name(scope_ref.kind).to_string(),
+        );
+        if let Some(active) = active {
+            env.insert("JOI_TURN_ID".into(), active.id.clone());
+            env.insert("JOI_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+        }
         env.insert(
             "JOI_AGENT_PROFILE".into(),
             self.profile.display().to_string(),
@@ -1476,6 +1274,16 @@ async fn handle_action_response(
         saw_response_relation = true;
         let request_event_id = relation.target.id.as_str();
         let echoed_request_id = action_request_id_from_response(event);
+        if echoed_request_id
+            .as_deref()
+            .is_some_and(is_joi_tool_request_id)
+        {
+            eprintln!(
+                "[{}] action.response {} is for a joi human-interaction tool {}; leaving it for the waiting tool process",
+                state.actor_id, event.id, request_event_id
+            );
+            return Ok(());
+        }
         if state.is_model_action_request(request_event_id)
             || echoed_request_id
                 .as_deref()
@@ -1497,7 +1305,7 @@ async fn handle_action_response(
                 None => {
                     eprintln!(
                         "[{}] action.response {} ignored: no pending ACP request for {} \
-                         (agent serve may have restarted after the action.request)",
+                         (joi daemon may have restarted after the action.request)",
                         state.actor_id, event.id, request_event_id
                     );
                     continue;
@@ -1545,6 +1353,10 @@ fn action_request_id_from_response(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+fn is_joi_tool_request_id(id: &str) -> bool {
+    id.starts_with("joi:question:") || id.starts_with("joi:approval:")
 }
 
 async fn handle_model_action_response(
@@ -1803,7 +1615,7 @@ async fn open_model_picker(
 ) -> Result<()> {
     let mut adapter_error = adapter_start_error;
     let adapter_options = if adapter_error.is_none() {
-        match build_adapter_prompt(client, state, &trigger.scope, String::new()).await {
+        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None).await {
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
                 Err(err) => {
@@ -1826,7 +1638,7 @@ async fn open_model_picker(
     let (choices, current, source, source_description) =
         model_picker_choices(state, adapter_options);
     if choices.is_empty() {
-        let mut text = "No model choices are available. The ACP runtime did not return model config options, and this provider spec does not define `defaults.models.choices` or actor `models.choices`.".to_string();
+        let mut text = "No model choices are available. The ACP runtime did not return model config options, and this runtime definition does not define model choices.".to_string();
         if let Some(err) = adapter_error {
             text.push_str(&format!("\n\nACP model lookup failed: `{err}`"));
         }
@@ -1931,7 +1743,7 @@ fn model_picker_choices(
         state.model_choices(),
         state.current_model(),
         ModelActionSource::Spec,
-        "These choices came from the provider spec. The selected model is saved for this actor and used when Joi creates ACP sessions.",
+        "These choices came from the runtime definition. The selected model is saved for this actor and used when Joi creates ACP sessions.",
     )
 }
 
@@ -1996,7 +1808,8 @@ async fn dispatch_handoff(
 
         let user_text = render_prompt(&trigger);
         let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
-        let adapter_prompt = build_adapter_prompt(client, state, &trigger.scope, prompt).await?;
+        let adapter_prompt =
+            build_adapter_prompt(client, state, &trigger.scope, prompt, Some(&active)).await?;
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
@@ -2025,6 +1838,7 @@ async fn build_adapter_prompt(
     state: &Arc<WorkerState>,
     scope: &ScopeRef,
     content: String,
+    active: Option<&ActiveTurn>,
 ) -> Result<AdapterPrompt> {
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
@@ -2037,9 +1851,13 @@ async fn build_adapter_prompt(
         content,
         model: state.current_model(),
         cwd: scope_paths.workspace,
-        env: state
-            .paths
-            .scope_env(&state.actor_id, &channel_id, scope, &state.agent_server_url),
+        env: state.paths.scope_env(
+            &state.actor_id,
+            &channel_id,
+            scope,
+            &state.agent_server_url,
+            active,
+        ),
         template_vars: state
             .paths
             .template_vars(&state.actor_id, &channel_id, scope),
@@ -2082,11 +1900,12 @@ async fn compose_envelope_prompt(
     scope: &ScopeRef,
     user_text: &str,
 ) -> String {
-    let scope_bootstrap = if state.take_seed_slot(&scope.id) {
-        seed_manifest(&state.actor_id, scope)
-    } else {
-        String::new()
-    };
+    let scope_bootstrap =
+        if state.take_seed_slot(&scope.id) || command_transport_without_resume(&state.spec) {
+            seed_manifest(&state.actor_id, scope)
+        } else {
+            String::new()
+        };
 
     let identity_spec = state.spec.identity.as_ref();
     let memory_spec = state.spec.memory.as_ref();
@@ -2112,6 +1931,16 @@ async fn compose_envelope_prompt(
             scope_bootstrap: &scope_bootstrap,
         });
     prompt
+}
+
+fn command_transport_without_resume(spec: &AgentSpec) -> bool {
+    if spec.transport.kind != "command" {
+        return false;
+    }
+    match spec.transport.session.as_ref() {
+        Some(session) => session.first_run_capture.is_none() || session.resume_args.is_none(),
+        None => true,
+    }
 }
 
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
@@ -2166,16 +1995,23 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
     };
     format!(
         "=== System: Joi multi-actor context (auto-injected on session start) ===\n\
-         You are an agent driven by `joi agent serve`.\n\
+         You are an agent driven by `joi daemon`.\n\
          Identity:\n\
            actor id      = {actor_id}\n\
            current scope = {scope_kind}:{scope_id}\n\
          \n\
-         You can shell out to the `joi` CLI for read-only access. JOI_SERVER,\n\
-         JOI_DAEMON_SOCKET, and JOI_ACTOR are already injected into your env,\n\
+         You can shell out to the `joi` CLI for server access. JOI_SERVER,\n\
+         JOI_DAEMON_SOCKET, JOI_ACTOR, JOI_SCOPE_ID, JOI_SCOPE_KIND, JOI_TURN_ID, and JOI_TRIGGER_ACTOR are already injected into your env,\n\
          so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
            joi --json artifact get <art_id|artifact://...>\n\
+           joi --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
+           joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
+         `joi ask-user-question` is for choices or missing input; its JSON\n\
+         output is the human's answer to your question, not an approval.\n\
+         `joi request-approval` is for approve/reject gates before risky work.\n\
+         continue the current task using `answer.optionId`, `answer.label`, or\n\
+         `answer.text`, and phrase follow-up messages as the user's answer.\n\
          Message targets use `#<channel_id>` for channels and\n\
          `#<channel_id>:<root_event_id>` for threads; use\n\
          `joi --json thread list` to map a thread scope id to that target.\n\
@@ -2721,6 +2557,78 @@ mod tests {
         assert!(scope_paths.skills.exists());
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scope_env_includes_current_scope_identity() {
+        let root = temp_path("scope-env");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+
+        let active = ActiveTurn {
+            id: "turn_demo".into(),
+            scope: scope.clone(),
+            trigger_event_id: "evt_trigger".into(),
+            trigger_actor: "human_alice".into(),
+            cancel_requested: false,
+        };
+        let env = paths.scope_env(
+            "actor_demo",
+            "chan_demo",
+            &scope,
+            "ws://127.0.0.1:7891/rpc",
+            Some(&active),
+        );
+
+        assert_eq!(
+            env.get("JOI_SCOPE_ID").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            env.get("JOI_SCOPE_KIND").map(String::as_str),
+            Some("channel")
+        );
+        assert_eq!(
+            env.get("AGENTX_CHANNEL_ID").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            env.get("JOI_TURN_ID").map(String::as_str),
+            Some("turn_demo")
+        );
+        assert_eq!(
+            env.get("JOI_TRIGGER_ACTOR").map(String::as_str),
+            Some("human_alice")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_transport_without_resume_tracks_session_capability() {
+        let no_session = sample_spec(None);
+        assert!(command_transport_without_resume(&no_session));
+
+        let mut resumable = sample_spec(None);
+        resumable.transport.session = Some(proto::methods::CommandSession {
+            first_run_capture: Some("stdout_json:.session_id".into()),
+            resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
+        });
+        assert!(!command_transport_without_resume(&resumable));
+
+        let mut acp = sample_spec(None);
+        acp.transport.kind = "acp_stdio".into();
+        assert!(!command_transport_without_resume(&acp));
+    }
+
+    #[test]
+    fn joi_human_interaction_request_ids_are_tool_local() {
+        assert!(is_joi_tool_request_id("joi:question:abc"));
+        assert!(is_joi_tool_request_id("joi:approval:abc"));
+        assert!(!is_joi_tool_request_id("joi:model:abc"));
+        assert!(!is_joi_tool_request_id("acp:permission:abc"));
     }
 
     #[test]

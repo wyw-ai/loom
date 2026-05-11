@@ -323,7 +323,10 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
   const pushToast = useUI((s) => s.pushToast);
   const disabled = bubble.acknowledged === true;
 
-  const respond = async (optionId: string, kind: "accepted" | "declined") => {
+  const respond = async (
+    optionId: string,
+    kind: "accepted" | "declined" | "answered",
+  ) => {
     if (!currentScope || !selfId) return;
     try {
       await ipc.eventAppend({
@@ -354,6 +357,10 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
   const status = bubble.actionStatus ?? (disabled ? "accepted" : "pending");
   const statusTone = actionStatusTone(status);
   const StatusIcon = statusTone.icon;
+  const statusLabel =
+    status === "answered" && bubble.actionSelectedLabel
+      ? `Selected: ${bubble.actionSelectedLabel}`
+      : statusTone.label;
   const [expanded, setExpanded] = useState(() => !disabled);
   const cardShell = "mt-1 w-full max-w-3xl overflow-hidden border-2 border-black bg-white shadow-brutal-sm";
   const bodyShell = "px-3 pb-3 pt-2";
@@ -393,11 +400,11 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
       </div>
       <span
         className={clsx(
-          "shrink-0 border border-black px-1.5 py-0.5 text-[11px] font-black",
+          "max-w-[14rem] shrink-0 truncate border border-black px-1.5 py-0.5 text-[11px] font-black",
           statusTone.badge,
         )}
       >
-        {statusTone.label}
+        {statusLabel}
       </span>
     </div>
   );
@@ -468,12 +475,15 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         <div className="flex flex-wrap gap-2 px-3 pb-3">
           {choices.map((c) => {
             const isDecline = /reject|decline|cancel|abort|no/i.test(c.label);
+            const kind = isQuestionRequest(bubble.requestType)
+              ? "answered"
+              : isDecline
+                ? "declined"
+                : "accepted";
             return (
               <button
                 key={c.id}
-                onClick={() =>
-                  void respond(c.id, isDecline ? "declined" : "accepted")
-                }
+                onClick={() => void respond(c.id, kind)}
                 className={clsx(
                   "btn-brutal-sm px-3 py-1 text-xs font-black",
                   isDecline
@@ -492,6 +502,15 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
 }
 
 function actionStatusTone(status: NonNullable<BubbleT["actionStatus"]>) {
+  if (status === "answered") {
+    return {
+      label: "Answered",
+      icon: CheckCircle2,
+      iconClass: "text-black",
+      card: "bg-brutal-yellow",
+      badge: "bg-white text-black",
+    };
+  }
   if (status === "accepted") {
     return {
       label: "Approved",
@@ -517,4 +536,8 @@ function actionStatusTone(status: NonNullable<BubbleT["actionStatus"]>) {
     card: "bg-brutal-yellow",
     badge: "bg-white text-black",
   };
+}
+
+function isQuestionRequest(requestType?: string): boolean {
+  return requestType === "question" || requestType === "human_decision";
 }

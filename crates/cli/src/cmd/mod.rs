@@ -3,6 +3,7 @@ pub mod actor;
 pub mod agent;
 pub mod agent_serve;
 pub mod artifact;
+pub mod ask_user_question;
 pub mod attachment;
 pub mod channel;
 pub mod chat;

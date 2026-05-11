@@ -45,10 +45,6 @@ pub fn config_path() -> PathBuf {
     config_dir().join("cli.toml")
 }
 
-pub fn agent_specs_dir() -> PathBuf {
-    config_dir().join("agents")
-}
-
 pub fn service_specs_dir() -> PathBuf {
     config_dir().join("services")
 }
@@ -93,7 +89,6 @@ fn migrate_legacy_configs() {
     let new_root = config_dir();
     copy_legacy_file(&legacy_root, &new_root, "cli.toml");
     copy_legacy_file(&legacy_root, &new_root, "desktop.toml");
-    copy_legacy_dir(&legacy_agent_specs_dir(), &agent_specs_dir());
     copy_legacy_dir(&legacy_service_specs_dir(), &service_specs_dir());
 }
 
@@ -101,12 +96,6 @@ fn legacy_config_dir() -> Option<PathBuf> {
     dirs::config_dir()
         .map(|dir| dir.join("joi-apps"))
         .filter(|dir| dir != &config_dir())
-}
-
-fn legacy_agent_specs_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|dir| dir.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
 }
 
 fn legacy_service_specs_dir() -> PathBuf {

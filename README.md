@@ -4,13 +4,13 @@
 的免认证参考实现。包含：
 
 - Rust **server**（`joi-server`）：基于 WebSocket 的 JSON-RPC 2.0 消息枢纽。
-- Rust **CLI**（`joi`）：人类用的终端客户端，也可作为 v1 模式下的 agent 客户端常驻进程。
+- Rust **CLI**（`joi`）：人类用的终端客户端，也包含 `joi daemon` 机器端 agent host。
 - Rust + React **Desktop GUI**（`joi-gui`，Tauri 2）：与 TUI 并行的桌面客户端，
   Discord-风格四栏布局。设计文档见
   [docs/gui-desktop-design.md](docs/gui-desktop-design.md)。
   `make gui-dev` 启动（前置：`pnpm --dir apps/gui-web install` + `cargo install tauri-cli --version ^2`）。
-- 可插拔 **agent runtime**：支持 ACP 协议子进程（如 `claude-acp`、`codex-acp`）以及
-  一次性 CLI（`claude -p`、`codex` 等）两类 transport。
+- 可插拔 **agent runtime**：daemon 自动探测 `claude`、`codex`、`qodercli`、
+  `copilot`、`opencode` 等本机 CLI，并按各自格式以 YOLO 模式启动。
 
 v0 的目标很小：人在 CLI / GUI 里打开一个 thread，把一个或多个配置好的 agent
 `handoff` 进来，看它们以协议事件的形式流回。无认证、无数据库。
@@ -21,11 +21,11 @@ v0 的目标很小：人在 CLI / GUI 里打开一个 thread，把一个或多�
 crates/proto           协议类型 + JSON-RPC 信封
 crates/agent-runtime   Adapter trait + AcpAdapter / CommandAdapter 实现
 crates/server          joi-server 二进制（WebSocket 消息枢纽）
-crates/cli             joi 二进制（人类终端 + agent 客户端）
+crates/cli             joi 二进制（人类终端 + daemon host）
 crates/gui             joi-gui 桌面壳（Tauri 2，复用 proto+WS 客户端）
 apps/gui-web           joi-gui 前端（React + TS + Tailwind，Discord-风格 UI）
-agents/                示例 agent JSON spec
-assets/marketplace.json  内置 marketplace 编目
+agents/                旧版 agent JSON spec 示例
+assets/marketplace.json  旧版 marketplace 编目
 data/                  server 运行时生成（journal + artifacts）
 docs/                  协议规范 + 架构文档
 ```
@@ -34,7 +34,7 @@ docs/                  协议规范 + 架构文档
 
 仓库已经把 toolchain pin 在 `rust-toolchain.toml`（stable + rustfmt + clippy），
 直接 `cargo` 即可。除此之外**唯一**的运行时依赖：每个具体 agent 自己的命令行工具
-（例如 `claude-acp` 走 `npx`，`claude` 走二进制 PATH）。
+（例如 `claude`、`codex`、`qodercli`、`copilot`、`opencode` 在 PATH 上）。
 
 ```sh
 # 验证编译 + 跑测试
@@ -44,8 +44,8 @@ cargo test --workspace
 
 ## 构建 CLI / Server 二进制
 
-`joi agent serve` 不是单独的二进制；它是 `joi` CLI 里的子命令。部署 agent
-host 时只需要把 `joi` 放到目标机器的 PATH，`joi agent serve` 就已经包含在里面。
+`joi daemon` 不是单独的二进制；它是 `joi` CLI 里的子命令。部署 agent
+host 时只需要把 `joi` 放到目标机器的 PATH，daemon host 就已经包含在里面。
 顶层 workspace 的默认构建不包含 Tauri GUI，所以 CLI / server 出包不会拉 GUI
 原生依赖。
 
@@ -53,7 +53,7 @@ host 时只需要把 `joi` 放到目标机器的 PATH，`joi agent serve` 就已
 # 同时构建 CLI + server
 cargo build -p joi-cli -p joi-server --release
 
-# 只构建 agent host / 人类终端 CLI
+# 只构建 daemon host / 人类终端 CLI
 cargo build -p joi-cli --release
 
 # 只构建 WebSocket server
@@ -172,15 +172,16 @@ make gui-clean
 ## 部署模式
 
 `joi-server` 只负责 WebSocket JSON-RPC、journal、artifact 和事件 fanout。
-Agent runtime 一律由独立的 `joi agent serve` 进程托管，通过 WebSocket 跟 server
-通信。每个被管理的 agent 在 server 上是一条独立连接。
+Agent runtime 一律由 `joi daemon` 托管。daemon 从桌面 machine 配置读取要托管的
+agent，自动探测本机支持的 agent CLI，并为每个 agent 建立一条到 server 的 WebSocket
+连接。
 
 最小拓扑是三个进程：
 
 | 进程 | 部署在哪 | 作用 |
 | --- | --- | --- |
 | `joi-server` | 一台共享机器或本机 | 维护 journal、artifact、channel/thread 状态，提供 `ws://.../rpc` |
-| `joi agent serve` | 每台需要跑 agent 的机器 | 读取本机 provider spec，为每个 actor 建立一条到 server 的 WebSocket 连接 |
+| `joi daemon` | 每台需要跑 agent 的机器 | 读取 machine 配置、自动探测本机 provider CLI，为每个 actor 建立一条到 server 的 WebSocket 连接 |
 | `joi chat` / `joi message send` / GUI | 人类使用的机器 | 作为 human actor 连接 server，创建 channel/thread 并 handoff |
 
 ```sh
@@ -192,15 +193,14 @@ joi-server \
 # 2. 在运行 agent host 的机器上配置 server URL。
 export JOI_SERVER=ws://127.0.0.1:7878/rpc
 
-# 3. 装一个 provider spec 到 ~/.config/joi/agents。
-joi agent install claude-acp \
-    --actor-id actor_claude --name "Claude"
+# 3. 在 GUI 的 Computers 页面为当前 machine 添加 agent，或手写
+#    ~/.joi-apps/desktop.toml 的 [[machines.agents]]。
 
-# 4. 启 agent client；它会为每个 spec 起一条到 server 的连接。
-joi agent serve
+# 4. 启 daemon；它会从 machine 配置里拉起 agent。
+joi daemon --machine-id local
 
 # 如果这台机器只允许托管部分 agent：
-joi agent serve --allow-actors actor_claude,actor_codex
+joi daemon --machine-id local --allow-actors actor_claude,actor_codex
 
 # 5. 人类侧照常使用 CLI 或 GUI。
 joi channel create --title "Demo"
@@ -209,15 +209,18 @@ joi chat --in <thread_id>
 ```
 
 开发期也可以不用安装二进制，直接用 `cargo run -p joi-server -- ...` 和
-`cargo run -p joi-cli -- agent serve`。生产或长驻部署时建议使用 release 产物，
-并让进程管理器分别守护 `joi-server` 与每台 agent host 上的 `joi agent serve`。
+`cargo run -p joi-cli -- daemon --machine-id local`。生产或长驻部署时建议使用 release
+产物，并让进程管理器分别守护 `joi-server` 与每台 agent host 上的 `joi daemon`。
 
-`joi agent serve` 的运行约束：
+`joi daemon` 的运行约束：
 
-- provider spec 默认从 `~/.config/joi/agents/*.json` 读取，`--specs <dir>` 可覆盖。
-- spec 只在进程启动时读取；新增、删除或修改 spec 后需要重启 `joi agent serve`。
-- 每个 provider spec 里的命令（例如 `claude-acp`、`codex-acp`、`claude`）必须在
-  运行 `joi agent serve` 的机器上可执行。
+- agent 定义来自 `~/.joi-apps/desktop.toml` 的 machine 配置，运行时不再读取本地
+  provider JSON。
+- provider CLI 必须在运行 daemon 的机器上可执行。当前自动探测 `claude`、`codex`
+  / `codexcli`、`qodercli`、`copilot` / `copilotcli`、`opencode`。
+- daemon 会用 YOLO 参数拉起 provider：Codex 为 `--sandbox danger-full-access`
+  `--ask-for-approval never` 并启用 network access；Claude/Qoder/Copilot/OpenCode
+  使用各自的 bypass/yolo 参数。
 - 子进程会自动收到 `JOI_SERVER` 和 `JOI_ACTOR`，所以 agent 可以反向调用
   `joi --json ...` 读取历史和 actor 列表。
 
@@ -225,7 +228,7 @@ joi chat --in <thread_id>
 直接暴露到公网；跨机器部署时放在可信内网或自行加反向代理、访问控制。
 
 详细设计与 phase 切分见
-[docs/architecture-v1-agent-client.md](docs/architecture-v1-agent-client.md)。
+[docs/architecture.md](docs/architecture.md)。
 
 ## CLI 速览
 
@@ -248,7 +251,9 @@ joi chat --in <thread_id>
 | `joi message check` | 拉取并清空当前 actor 的 directed inbox |
 | `joi chat --in <thread_id>` | 进入交互式 TUI |
 | `joi handoff [agent] --in <thread_id> --message "…"` | 把 turn 交给某个 agent |
-| `joi action accept <event_id>` / `decline` | 回应 ACP 提出的 `action.request` |
+| `joi ask-user-question --question "…" --choice a=A --choice b=B` | agent 阻塞式询问触发人，答案返回给当前工具调用 |
+| `joi request-approval --reason "…"` | agent 阻塞式请求批准/拒绝，结果返回给当前工具调用 |
+| `joi action accept <event_id>` / `decline` | 手动回应 approval 类 `action.request`；响应只是传输层消息，不会让 daemon 自动续跑 |
 | `joi event list --in <scope_id> [--channel] [--limit] [--before]` | 拉历史事件 |
 | `joi actor list` | 列出 server 知道的所有 actor |
 | `joi attachment upload --target '#<channel_id>:<root_event_id>' --path ./foo.txt` | 上传附件并返回 artifact id |
@@ -258,7 +263,7 @@ joi chat --in <thread_id>
 | `joi artifact read <art_id>` | 打印 artifact 正文 |
 | `joi reminder schedule --target '#<channel_id>:<root_event_id>' --title "…" --delay-seconds 3600` | 安排提醒 |
 | `joi reminder list` / `cancel` / `snooze` / `update` | 管理提醒 |
-| `joi agent serve [--specs <dir>] [--allow-actors a,b,c]` | v1：启动 agent client；`--allow-actors` 仅放行白名单内的 actor id |
+| `joi daemon [--machine-id <id>] [--allow-actors a,b,c]` | 启动当前机器的 daemon host；`--allow-actors` 仅放行白名单内的 actor id |
 
 加 `--json`（或环境变量 `JOI_JSON=1`）任何输出命令都改成单行 JSON，方便 agent
 shell out。
@@ -302,11 +307,11 @@ Agent-facing 的消息入口以 `joi message ...` 为准。`handoff` 只表达�
 - 没有角色分级——只要是成员，都能 invite / revoke 别人；只有把自己 revoke 出
   最后一个成员的 channel 这种自废武功的操作会被拒。
 
-如果想限制本机 `joi agent serve` 实际拉起哪些 agent，加 `--allow-actors`：
+如果想限制本机 `joi daemon` 实际拉起哪些 agent，加 `--allow-actors`：
 
 ```sh
-# 本机只跑 actor_a 和 actor_b，其它 spec 文件即便存在也不连
-joi agent serve --allow-actors actor_a,actor_b
+# 本机只跑 actor_a 和 actor_b，其它 machine agent 不连
+joi daemon --allow-actors actor_a,actor_b
 ```
 
 ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公网的 server 抱有任何
@@ -317,111 +322,41 @@ ACL 是按 actor id 信任的，没有签名/认证——不要对暴露在公�
 | 内容 | 路径 |
 | --- | --- |
 | Server 数据 / journal / artifacts | `--data-dir`（默认 `./data`） |
-| Provider spec | `~/.config/joi/agents/`（`joi agent serve --specs <dir>` 可覆盖） |
+| Machine / agent 配置 | `~/.joi-apps/desktop.toml` |
 | Actor 持久状态 | `~/.agentx/agents/<id>/{profile,bundles}` |
 | Agent workspace 模板变量 | `~/.agentx/channels/<channel-id>/agents/<id>/{workspace,logs}` |
 | Command transport session 簿记 | `~/.agentx/sessions/<actor_id>/<scope_id>.json` |
-| CLI 用户配置 | `~/.config/joi-apps/cli.toml`（`server_url` / `actor_id` / `display_name`） |
-| GUI workspace 配置 | `~/.config/joi-apps/desktop.toml` |
+| CLI 用户配置 | `~/.joi-apps/cli.toml`（`server_url` / `actor_id` / `display_name`） |
+| GUI workspace / machine 配置 | `~/.joi-apps/desktop.toml` |
 
 ## 配置 agent
 
-三种添加方式——结果都是写一份 provider spec JSON 到 `~/.config/joi/agents/`。运行
-`joi agent serve --specs <dir>` 时可以改为读取其它目录。
+当前只保留 daemon 模式。Agent 定义写在 `~/.joi-apps/desktop.toml` 的
+machine 配置里，推荐通过 GUI 的 Computers 页面维护；也可以手写：
 
-### 1. 从内置 marketplace 装（推荐）
+```toml
+[[machines]]
+id = "local"
+name = "Local Machine"
+data_root = "~/.agentx"
 
-```sh
-joi agent marketplace                         # 列出内置 6 个 ACP agent
-joi agent install claude-acp \
-    --actor-id actor_claude --name "Claude"
+[[machines.agents]]
+provider_id = "codex"
+actor_id = "actor_codex"
+name = "Codex"
+model = "gpt-5.5"
+reasoning_effort = "high"
+autostart = true
 ```
 
-会按 `npx → uvx → 平台匹配的 binary` 顺序解析 PATH 上的可用项；不下载任何东西，
-只写 spec 文件。
+`provider_id` 必须是 daemon 能在 PATH 上自动探测到的 runtime：`claude`、`codex`
+（或 `codexcli`）、`qoder`、`copilot`、`opencode`。daemon 会按 provider 自己的
+格式合成 runtime 配置；不会再读取 `~/.config/joi/agents/*.json`。
 
-### 2. 交互式添加自定义命令
+Agent 的默认 cwd 由 runtime 根据 `channelId + actorId` 计算，不在 machine 配置里配置。
 
-```sh
-joi agent add
-```
-
-### 3. 手写 spec
-
-落盘格式是 provider spec：一个 provider 代表一套 agent CLI/runtime（例如
-Claude Code、Codex、Qoder CLI），`actors[]` 声明它在 Joi 里暴露出的一个或多个
-actor。运行时会展开成多条独立 actor 连接，profile、memory、workspace、模型选择
-状态都按 actor id 隔离。
-
-**ACP transport**（长连接子进程）：
-
-```jsonc
-{
-  "provider": {
-    "id": "codex",
-    "displayName": "Codex ACP"
-  },
-  "transport": {
-    "kind": "acp_stdio",
-    "command": "npx",
-    "args": ["-y", "@zed-industries/codex-acp@0.10.0"],
-    "env": {}
-  },
-  "defaults": {
-    "models": {
-      "choices": [
-        { "id": "provider/model-strong", "label": "Strong" },
-        { "id": "provider/model-fast", "label": "Fast" }
-      ]
-    },
-    "memory": {
-      "delivery": { "prompt": true, "mcp": true }
-    }
-  },
-  "actors": [
-    {
-      "id": "actor_codex_architect",
-      "displayName": "Codex Architect",
-      "model": "provider/model-strong",
-      "identity": {
-        "description": "Architecture and design reviewer",
-        "scaffold": {
-          "identity": "# Codex Architect\n\n- Role: review architecture, risk, and tradeoffs."
-        }
-      }
-    },
-    {
-      "id": "actor_codex_fast",
-      "displayName": "Codex Fast",
-      "model": "provider/model-fast",
-      "identity": {
-        "description": "Fast implementation assistant",
-        "scaffold": {
-          "identity": "# Codex Fast\n\n- Role: make small scoped code changes quickly."
-        }
-      }
-    }
-  ]
-}
-```
-
-**Command transport**（一次性 CLI，例如 `claude -p`）：
-
-完整 schema、`first_run_capture` 规则、`output_format` 翻译表与 worked example 见
-[docs/command-transport-v0.md](docs/command-transport-v0.md)。
-
-保存为 `~/.config/joi/agents/<provider-id>.json`，或运行：
-`joi agent register <path>`。
-
-`identity.scaffold.identity` / `identity.scaffold.soul` 只在对应 profile 文件不存在时写入；
-用户后续编辑 `{agent.profile}/identity.md` 或 `soul.md` 不会被覆盖。`model` 是
-`defaults.models.default` 的 actor 级简写；如果 ACP runtime 在 `/models` 时返回动态
-模型菜单，也可以继续通过聊天里的模型选择卡片改当前 actor 的模型。
-
-Agent 的默认 cwd 由 runtime 根据 `channelId + actorId` 计算，不在 spec 里配置。
-
-模板变量（`env`，以及 command transport 的 `args` /
-`session.first_run_capture` / `session.resume_args` 里可用）：
+模板变量（runtime env，command transport 的 `args` /
+`session.first_run_capture` / `session.resume_args` 内部使用）：
 `{agent.workspace}` / `{agent.profile}` / `{agent.logs}` / `{agent.root}` /
 `{agent.bundle_root}` / `{agent.bundle}` / `{actor.id}` /
 `{scope.id}` / `{channel.root}` / `{channel.shared}` / `{channel.sharedArtifacts}`。
@@ -434,16 +369,17 @@ skills / toolchains / model assets 则放在和 `profile/` 平级的 `bundles/` 
 
 ## Agent 子进程能反向调 joi 读历史
 
-`joi agent serve` 在 spawn agent 子进程时会自动注入两个环境变量
-（前提是 spec 自己没设）：
+`joi daemon` 在 spawn agent 子进程时会自动注入这些环境变量：
 
 - `JOI_SERVER` → server 的 WebSocket URL（本机可达时会优先注入 loopback 地址；`JOI_AGENT_SERVER` 可显式覆盖）
 - `JOI_ACTOR`  → 该 agent 自己的 actor id
+- `JOI_SCOPE_ID` / `JOI_SCOPE_KIND` → 当前 turn 所在 scope（`thread` 或 `channel`）
 
 所以子进程可以直接：
 
 ```sh
-joi --json event list --in <thread_id> --limit 200
+joi --json event list --in "$JOI_SCOPE_ID" --limit 200
+joi --json event list --in "$JOI_SCOPE_ID" --channel --limit 200
 joi --json actor list
 joi --json channel list
 ```
@@ -463,9 +399,8 @@ joi 重写时覆盖。
 
 ## 身份、灵魂、记忆（per-actor 持久化）
 
-每个 actor 在 `{agent.profile}/` 下有三类**持久化状态**，由 provider spec 里的
-`defaults.identity` / `defaults.memory` 或 actor 自己的 `identity` / `memory`
-字段按需启用：
+每个 actor 在 `{agent.profile}/` 下有三类**持久化状态**，由 daemon 生成的 runtime
+定义按需启用：
 
 ```
 {agent.profile}/
@@ -481,15 +416,15 @@ joi 重写时覆盖。
 labeled sections（不是只首轮），确保不被上下文压缩吃掉。相关模块在
 `agent-runtime/src/{envelope,memory,profile}`。
 
-**scaffold**：`joi agent install` / `joi agent add` 在第一次启动 agent 时
-按模板生成 `identity.md` 和 `soul.md`；用户改了就不再覆盖。`memory/records/`
-每次 spawn 都 mkdir，JSONL 文件按月自动切片。
+**scaffold**：daemon 第一次启动 agent 时按 machine agent 的 description 生成
+`identity.md`；用户改了就不再覆盖。`memory/records/` 每次 spawn 都 mkdir，JSONL
+文件按月自动切片。
 
 **跨 channel 隔离**：`memory.query.perChannel` 默认 `true`——查询记忆时会
 按 `source.channelId` 过滤，防止 actor 在 private channel 学到的事实在
 public channel 被召回。关掉走 `"perChannel": false`。
 
-**双通道投递**（spec `memory.delivery`）：
+**双通道投递**（runtime `memory.delivery`）：
 - `"prompt": true` — 每轮把 `Bootstrap memory` + `Relevant memory` 两段
   拼进 `session/prompt`。Bootstrap 走近期 + 高 confidence；Relevant 走
   当前 prompt 关键词匹配。两边 topK 各自可配（默认 8 / 4）。
@@ -498,27 +433,7 @@ public channel 被召回。关掉走 `"perChannel": false`。
   参数自指），agent 通过 `memory.query` / `memory.append` / `memory.get`
   三个 MCP tool 主动读写。
 
-marketplace install 和 `joi agent add` 现在默认**两条都开**。
-
-### spec 片段示例
-
-```jsonc
-{
-  "provider": { "id": "claude", "displayName": "Claude Code" },
-  "transport": { "kind": "acp_stdio", "command": "claude-acp" },
-  "defaults": {
-    "identity": {
-      "files": { "identity": "identity.md", "soul": "soul.md" }
-    },
-    "memory": {
-      "store":    { "type": "jsonl", "root": "./memory/records", "shardBy": "month" },
-      "query":    { "mode": "heuristic", "bootstrapTopK": 8, "turnTopK": 4, "perChannel": true },
-      "delivery": { "prompt": true, "mcp": true }
-    }
-  },
-  "actors": [{ "id": "actor_claude", "displayName": "Claude" }]
-}
-```
+daemon 合成的内置 runtime 默认开启 prompt 与 MCP 两条记忆投递路径。
 
 ## 文档导航
 

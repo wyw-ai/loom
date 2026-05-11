@@ -31,6 +31,7 @@ const KNOWN_RUNTIMES = [
   { id: "codex", name: "Codex CLI" },
   { id: "qoder", name: "Qoder CLI" },
   { id: "copilot", name: "Copilot CLI" },
+  { id: "opencode", name: "OpenCode" },
 ];
 
 const CODEX_MODELS = [
@@ -1171,7 +1172,6 @@ function agentModelLabel(agent: AgentInfo) {
 
 interface MachineCreateInput {
   name: string;
-  specsDir?: string;
   dataRoot?: string;
 }
 

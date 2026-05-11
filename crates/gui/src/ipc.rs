@@ -9,7 +9,7 @@
 //!   deliberately avoid typed Rust structs here so schema drift stays
 //!   debuggable on the TypeScript side.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,10 +18,7 @@ use agent_runtime::discovery::{
     DetectedAgentProvider,
 };
 use proto::methods::method;
-use proto::methods::{
-    AgentActorSpec, AgentInfo, AgentListResult, AgentModelChoice, AgentProviderSpec, AgentSpec,
-    IdentityFiles, IdentityScaffoldSpec, IdentitySpec,
-};
+use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
@@ -382,16 +379,16 @@ pub async fn actor_delete(state: State<'_, AppState>, params: Value) -> Result<V
 
 #[tauri::command]
 pub async fn agent_list() -> Result<AgentListResult, String> {
-    let agents = load_agent_specs()
-        .map_err(stringify)?
-        .into_iter()
-        .map(|spec| AgentInfo {
-            spec,
-            status: "registered".into(),
-            pid: None,
-            session_id: None,
-        })
-        .collect();
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let server_url = active_server_url(&cfg);
+    let mut agents = Vec::new();
+    for machine in cfg
+        .machines
+        .iter()
+        .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
+    {
+        agents.extend(machine_info(machine, server_url).map_err(stringify)?.agents);
+    }
     Ok(AgentListResult { agents })
 }
 
@@ -416,21 +413,18 @@ pub struct AgentCreateArgs {
 
 #[tauri::command]
 pub async fn agent_create(args: AgentCreateArgs) -> Result<AgentInfo, String> {
-    let specs_dir = agent_specs_dir_for(args.machine_id.as_deref()).map_err(stringify)?;
-    let agent_spec = add_agent_actor_to_provider(args, &specs_dir).map_err(stringify)?;
-    Ok(AgentInfo {
-        spec: agent_spec,
-        status: "registered".into(),
-        pid: None,
-        session_id: None,
-    })
+    Err(format!(
+        "agent creation is daemon-only; create this agent on a machine profile{}",
+        args.machine_id
+            .as_deref()
+            .map(|machine| format!(" ({machine})"))
+            .unwrap_or_default()
+    ))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRemoveArgs {
-    #[serde(default)]
-    pub machine_id: Option<String>,
     pub actor_id: String,
 }
 
@@ -439,8 +433,27 @@ pub async fn agent_remove(
     state: State<'_, AppState>,
     args: AgentRemoveArgs,
 ) -> Result<AgentListResult, String> {
-    let specs_dir = agent_specs_dir_for(args.machine_id.as_deref()).map_err(stringify)?;
-    remove_agent_by_actor_id_from_dir(&args.actor_id, &specs_dir).map_err(stringify)?;
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let mut removed = false;
+    for machine in cfg
+        .machines
+        .iter_mut()
+        .filter(|machine| machine.workspace_id == active_workspace_id)
+    {
+        let before = machine.agents.len();
+        machine
+            .agents
+            .retain(|agent| agent.actor_id != args.actor_id);
+        removed |= machine.agents.len() != before;
+    }
+    if !removed {
+        return Err(format!(
+            "daemon-configured agent not found: {}",
+            args.actor_id
+        ));
+    }
+    config::save(&cfg).map_err(stringify)?;
     delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
     agent_list().await
 }
@@ -470,14 +483,10 @@ pub async fn agent_update(args: AgentUpdateArgs) -> Result<AgentInfo, String> {
     if let Some(info) = update_machine_agent_in_config(&args).map_err(stringify)? {
         return Ok(info);
     }
-    let specs_dir = agent_specs_dir_for(args.machine_id.as_deref()).map_err(stringify)?;
-    let spec = update_agent_spec_in_dir(args, &specs_dir).map_err(stringify)?;
-    Ok(AgentInfo {
-        spec,
-        status: "registered".into(),
-        pid: None,
-        session_id: None,
-    })
+    Err(format!(
+        "daemon-configured agent not found: {}",
+        args.actor_id
+    ))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -490,7 +499,6 @@ pub struct MachineInfo {
     pub setup_status: String,
     pub connection_status: String,
     pub connection_actor_id: String,
-    pub specs_dir: String,
     pub data_root: String,
     pub config_dir: String,
     pub agent_count: usize,
@@ -540,8 +548,6 @@ pub async fn machine_check(state: State<'_, AppState>) -> Result<MachineListResu
 pub struct MachineCreateArgs {
     pub name: String,
     #[serde(default)]
-    pub specs_dir: String,
-    #[serde(default)]
     pub data_root: String,
 }
 
@@ -566,18 +572,11 @@ pub async fn machine_create(
         slugify(name),
         machine_id.trim_start_matches("machine_")
     );
-    let (specs_dir_expr, specs_dir) = machine_path_input(
-        args.specs_dir.trim(),
-        config::machine_specs_dir_expr(&workspace_dir, &dir_slug),
-    )
-    .map_err(stringify)?;
     let (data_root_expr, data_root) = machine_path_input(
         args.data_root.trim(),
         config::machine_data_root_expr(&workspace_dir, &dir_slug),
     )
     .map_err(stringify)?;
-    std::fs::create_dir_all(&specs_dir)
-        .map_err(|e| format!("create specs dir {}: {e}", specs_dir.display()))?;
     std::fs::create_dir_all(&data_root)
         .map_err(|e| format!("create data root {}: {e}", data_root.display()))?;
 
@@ -586,7 +585,6 @@ pub async fn machine_create(
         id: machine_id,
         name: name.to_string(),
         kind: "local".into(),
-        specs_dir: specs_dir_expr,
         data_root: data_root_expr,
         agents: Vec::new(),
     });
@@ -683,11 +681,10 @@ pub async fn machine_agent_create(
         .iter()
         .any(|provider| provider.id == args.provider_id)
     {
-        let specs_dir =
-            normalize_local_path(config::expand_home(&cfg.machines[machine_index].specs_dir))
-                .map_err(stringify)?;
-        add_agent_actor_to_provider(args, &specs_dir).map_err(stringify)?;
-        return machines_from_config(&cfg, state.try_client().await).await;
+        return Err(format!(
+            "provider `{}` is not available on PATH for daemon mode",
+            args.provider_id
+        ));
     }
     let actor_id_for_upsert = actor_id.clone();
     cfg.machines[machine_index].agents.push(MachineAgentConfig {
@@ -743,11 +740,12 @@ pub async fn machine_agent_remove(
         .agents
         .retain(|agent| agent.actor_id != args.actor_id);
     if machine.agents.len() == before {
-        let specs_dir = agent_specs_dir_for(Some(&args.machine_id)).map_err(stringify)?;
-        remove_agent_by_actor_id_from_dir(&args.actor_id, &specs_dir).map_err(stringify)?;
-    } else {
-        config::save(&cfg).map_err(stringify)?;
+        return Err(format!(
+            "daemon-configured agent not found: {}",
+            args.actor_id
+        ));
     }
+    config::save(&cfg).map_err(stringify)?;
     delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
     machines_from_config(&cfg, state.try_client().await).await
 }
@@ -917,28 +915,16 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
 }
 
 fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<MachineInfo> {
-    let specs_dir = config::expand_home(&machine.specs_dir);
     let data_root = if machine.data_root.trim().is_empty() {
         config::default_agent_data_root()
     } else {
         config::expand_home(&machine.data_root)
     };
     let detected_providers = detect_agent_cli_providers();
-    let file_provider_specs = load_agent_providers_from_dir(&specs_dir)?;
     let mut providers = detected_providers
         .iter()
         .map(detected_provider_summary)
         .collect::<Vec<_>>();
-    let detected_ids = providers
-        .iter()
-        .map(|provider| provider.id.clone())
-        .collect::<HashSet<_>>();
-    providers.extend(
-        file_provider_specs
-            .iter()
-            .map(|(_, provider)| provider_summary(provider))
-            .filter(|provider| !detected_ids.contains(&provider.id)),
-    );
     for provider in &mut providers {
         provider.actor_count += machine
             .agents
@@ -951,15 +937,11 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
         .iter()
         .map(machine_agent_definition)
         .collect::<Vec<_>>();
-    let mut provider_specs =
+    let provider_specs =
         provider_specs_from_agent_definitions(&detected_providers, &machine_agent_defs);
-    provider_specs.extend(
-        file_provider_specs
-            .iter()
-            .map(|(_, provider)| provider.clone()),
-    );
-    let agents: Vec<AgentInfo> = agent_specs_from_providers(provider_specs)
+    let agents: Vec<AgentInfo> = provider_specs
         .into_iter()
+        .flat_map(|provider| provider.into_agent_specs())
         .map(|spec| AgentInfo {
             spec,
             status: "registered".into(),
@@ -998,7 +980,6 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
         setup_status: setup_status.into(),
         connection_status: "notConnected".into(),
         connection_actor_id,
-        specs_dir: config::home_path_expr(&specs_dir),
         data_root: config::home_path_expr(&data_root),
         config_dir: config::home_path_expr(&config::config_dir()),
         agent_count: agents.len(),
@@ -1054,92 +1035,6 @@ fn shell_double_quote(value: &str) -> String {
         .replace('"', "\\\"")
         .replace('$', "\\$")
         .replace('`', "\\`")
-}
-
-fn agent_specs_dir_for(machine_id: Option<&str>) -> anyhow::Result<PathBuf> {
-    let Some(machine_id) = machine_id
-        .map(str::trim)
-        .filter(|machine_id| !machine_id.is_empty())
-    else {
-        return Ok(config::default_agent_specs_dir());
-    };
-    let cfg = config::load_or_init()?;
-    let machine = cfg
-        .machines
-        .iter()
-        .find(|machine| {
-            machine.id == machine_id && config::machine_belongs_to_active_workspace(machine, &cfg)
-        })
-        .ok_or_else(|| anyhow::anyhow!("unknown machine id: {machine_id}"))?;
-    normalize_local_path(config::expand_home(&machine.specs_dir))
-}
-
-fn load_agent_providers_from_dir(dir: &Path) -> anyhow::Result<Vec<(PathBuf, AgentProviderSpec)>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut providers = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path)?;
-        let provider: AgentProviderSpec = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
-        providers.push((path, provider));
-    }
-    providers.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(providers)
-}
-
-fn load_agent_specs() -> anyhow::Result<Vec<AgentSpec>> {
-    load_agent_specs_from_dir(&config::default_agent_specs_dir())
-}
-
-fn load_agent_specs_from_dir(dir: &Path) -> anyhow::Result<Vec<AgentSpec>> {
-    let providers = load_agent_providers_from_dir(dir)?
-        .into_iter()
-        .map(|(_, provider)| provider)
-        .collect();
-    Ok(agent_specs_from_providers(providers))
-}
-
-fn agent_specs_from_providers(providers: Vec<AgentProviderSpec>) -> Vec<AgentSpec> {
-    let mut out = Vec::new();
-    for provider in providers {
-        let provider_id = provider.provider.id.clone();
-        let provider_name =
-            non_empty(provider.provider.display_name.trim()).unwrap_or_else(|| provider_id.clone());
-        for mut spec in provider.into_agent_specs() {
-            let transport_kind = spec.transport.kind.clone();
-            let meta = spec.actor._meta.get_or_insert_with(BTreeMap::new);
-            meta.entry("providerId".into())
-                .or_insert_with(|| json!(provider_id.clone()));
-            meta.entry("providerName".into())
-                .or_insert_with(|| json!(provider_name.clone()));
-            meta.entry("transportKind".into())
-                .or_insert_with(|| json!(transport_kind.clone()));
-            out.push(spec);
-        }
-    }
-    out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
-    out
-}
-
-fn provider_summary(provider: &AgentProviderSpec) -> MachineAgentProviderInfo {
-    let models = provider.defaults.models.clone().unwrap_or_default();
-    MachineAgentProviderInfo {
-        id: provider.provider.id.clone(),
-        name: non_empty(provider.provider.display_name.trim())
-            .unwrap_or_else(|| provider.provider.id.clone()),
-        transport_kind: provider.transport.kind.clone(),
-        command: provider.transport.command.clone(),
-        args: provider.transport.args.clone(),
-        actor_count: provider.actors.len(),
-        default_model: models.default,
-        model_choices: models.choices,
-    }
 }
 
 fn detected_provider_summary(provider: &DetectedAgentProvider) -> MachineAgentProviderInfo {
@@ -1221,146 +1116,6 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
         .agents
         .into_iter()
         .find(|agent| agent.spec.actor.id == args.actor_id))
-}
-
-fn remove_agent_by_actor_id_from_dir(actor_id: &str, dir: &Path) -> anyhow::Result<()> {
-    let mut found = false;
-    for (path, mut provider) in load_agent_providers_from_dir(dir)? {
-        let before = provider.actors.len();
-        provider.actors.retain(|actor| actor.id != actor_id);
-        if provider.actors.len() == before {
-            continue;
-        }
-        found = true;
-        write_provider_to_path(&path, &provider)?;
-    }
-    if !found {
-        anyhow::bail!("agent actor not found: {actor_id}");
-    }
-    Ok(())
-}
-
-fn update_agent_spec_in_dir(args: AgentUpdateArgs, dir: &Path) -> anyhow::Result<AgentSpec> {
-    for (path, mut provider) in load_agent_providers_from_dir(dir)? {
-        let mut changed = false;
-        for actor in &mut provider.actors {
-            if actor.id != args.actor_id {
-                continue;
-            }
-            if let Some(display_name) = args.display_name.as_deref() {
-                actor.display_name = non_empty(display_name.trim());
-                changed = true;
-            }
-            if let Some(description) = args.description.as_deref() {
-                actor.identity = Some(IdentitySpec {
-                    files: IdentityFiles::default(),
-                    description: non_empty(description.trim()),
-                    scaffold: non_empty(description.trim()).map(|text| IdentityScaffoldSpec {
-                        identity: Some(text),
-                        soul: None,
-                    }),
-                });
-                changed = true;
-            }
-        }
-        if changed {
-            write_provider_to_path(&path, &provider)?;
-            let mut specs = agent_specs_from_providers(vec![provider])
-                .into_iter()
-                .filter(|spec| spec.actor.id == args.actor_id);
-            if let Some(spec) = specs.next() {
-                return Ok(spec);
-            }
-        }
-    }
-    anyhow::bail!("agent actor not found: {}", args.actor_id)
-}
-
-fn write_provider_to_path(path: &Path, provider: &AgentProviderSpec) -> anyhow::Result<()> {
-    let text = serde_json::to_string_pretty(provider)?;
-    std::fs::write(path, format!("{text}\n"))?;
-    Ok(())
-}
-
-fn add_agent_actor_to_provider(args: AgentCreateArgs, dir: &Path) -> anyhow::Result<AgentSpec> {
-    let display_name = args.name.trim();
-    if display_name.is_empty() {
-        anyhow::bail!("agent name is required");
-    }
-    let provider_id = args.provider_id.trim();
-    if provider_id.is_empty() {
-        anyhow::bail!("agent provider is required");
-    }
-    let actor_id = actor_id_from_input(&args.actor_id, display_name)?;
-    let mut providers = load_agent_providers_from_dir(dir)?;
-    if providers
-        .iter()
-        .any(|(_, provider)| provider.actors.iter().any(|actor| actor.id == actor_id))
-    {
-        anyhow::bail!("agent actor already exists: {actor_id}");
-    }
-    let Some((path, provider)) = providers
-        .iter_mut()
-        .find(|(_, provider)| provider.provider.id == provider_id)
-    else {
-        anyhow::bail!("unknown agent provider: {provider_id}");
-    };
-
-    let model = non_empty(args.model.trim());
-    if let Some(model) = model.as_deref() {
-        ensure_provider_allows_model(provider, model)?;
-    }
-
-    let mut meta = BTreeMap::new();
-    meta.insert("createdBy".into(), json!("joi-gui"));
-
-    provider.actors.push(AgentActorSpec {
-        id: actor_id.clone(),
-        display_name: Some(display_name.to_string()),
-        capabilities: None,
-        meta: Some(meta),
-        transport: None,
-        autostart: Some(args.autostart),
-        model,
-        models: None,
-        bundle: None,
-        identity: identity_from_description(args.description.trim()),
-        memory: None,
-        announcement: None,
-    });
-    write_provider_to_path(path, provider)?;
-
-    agent_specs_from_providers(vec![provider.clone()])
-        .into_iter()
-        .find(|spec| spec.actor.id == actor_id)
-        .ok_or_else(|| anyhow::anyhow!("agent provider generated no matching actor"))
-}
-
-fn identity_from_description(description: &str) -> Option<IdentitySpec> {
-    non_empty(description).map(|description| IdentitySpec {
-        files: IdentityFiles::default(),
-        description: Some(description.clone()),
-        scaffold: Some(IdentityScaffoldSpec {
-            identity: Some(description),
-            soul: None,
-        }),
-    })
-}
-
-fn ensure_provider_allows_model(provider: &AgentProviderSpec, model: &str) -> anyhow::Result<()> {
-    let Some(models) = provider.defaults.models.as_ref() else {
-        return Ok(());
-    };
-    if models.choices.is_empty()
-        || models.default.as_deref() == Some(model)
-        || models.choices.iter().any(|choice| choice.id == model)
-    {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "model `{model}` is not declared by provider `{}`",
-        provider.provider.id
-    )
 }
 
 fn actor_id_from_input(value: &str, display_name: &str) -> anyhow::Result<String> {

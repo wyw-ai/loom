@@ -46,7 +46,6 @@ interface ManagedAgent {
   status: string;
   machineId: string;
   machine: string;
-  specsDir: string;
   dataRoot: string;
   providerId: string;
   provider: string;
@@ -74,7 +73,7 @@ interface AgentUpdatePatch {
 
 type AgentMachineContext = Pick<
   MachineInfo,
-  "id" | "name" | "specsDir" | "dataRoot" | "providers"
+  "id" | "name" | "dataRoot" | "providers"
 >;
 
 export function MembersPage() {
@@ -157,7 +156,6 @@ export function MembersPage() {
       {
         id: agent.machineId,
         name: agent.machine,
-        specsDir: agent.specsDir,
         dataRoot: agent.dataRoot,
         providers: agent.providers,
       },
@@ -830,10 +828,6 @@ function WorkspaceTab({ agent }: { agent: ManagedAgent }) {
       <InfoSection title="Paths">
         <div className="space-y-2 font-mono text-xs">
           <div className="truncate">
-            <span className="text-black/45">specs </span>
-            {agent.specsDir}
-          </div>
-          <div className="truncate">
             <span className="text-black/45">data </span>
             {agent.dataRoot}
           </div>
@@ -898,7 +892,6 @@ function normalizeAgent(
     status: info.status,
     machineId: machine.id,
     machine: machine.name,
-    specsDir: machine.specsDir,
     dataRoot: machine.dataRoot,
     providerId,
     provider,

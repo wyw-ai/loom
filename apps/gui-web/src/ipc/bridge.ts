@@ -254,7 +254,6 @@ export async function machineCheck(): Promise<{ machines: MachineInfo[] }> {
 
 export async function machineCreate(args: {
   name: string;
-  specsDir?: string;
   dataRoot?: string;
 }): Promise<{ machines: MachineInfo[] }> {
   return invoke("machine_create", { args });

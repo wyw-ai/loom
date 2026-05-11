@@ -157,11 +157,16 @@ export function App() {
           const p = summarizeActionRequest(
             (ev.payload ?? {}) as Record<string, unknown>,
           );
+          const payload = (ev.payload ?? {}) as Record<string, unknown>;
           inbox.add({
             requestEventId: ev.id,
             scope: ev.scope,
             title: p.title,
             description: p.description,
+            requestType:
+              typeof payload.requestType === "string"
+                ? payload.requestType
+                : undefined,
             reason: p.reason,
             command: p.command,
             rawInput: p.rawInput,

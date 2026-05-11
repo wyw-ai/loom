@@ -47,7 +47,6 @@ pub struct MachineConfig {
     pub name: String,
     #[serde(default = "default_machine_kind")]
     pub kind: String,
-    pub specs_dir: String,
     pub data_root: String,
     #[serde(default)]
     pub agents: Vec<MachineAgentConfig>,
@@ -130,19 +129,12 @@ fn migrate_legacy_configs() {
     let new_root = config_dir();
     copy_legacy_file(&legacy_root, &new_root, "cli.toml");
     copy_legacy_file(&legacy_root, &new_root, "desktop.toml");
-    copy_legacy_dir(&legacy_agent_specs_dir(), &default_agent_specs_dir());
 }
 
 fn legacy_config_dir() -> Option<PathBuf> {
     dirs::config_dir()
         .map(|dir| dir.join("joi-apps"))
         .filter(|dir| dir != &config_dir())
-}
-
-fn legacy_agent_specs_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|dir| dir.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
 }
 
 fn copy_legacy_file(legacy_root: &Path, new_root: &Path, file_name: &str) {
@@ -155,31 +147,6 @@ fn copy_legacy_file(legacy_root: &Path, new_root: &Path, file_name: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::copy(source, dest);
-}
-
-fn copy_legacy_dir(source: &Path, dest: &Path) {
-    if dest.exists() || !source.is_dir() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = copy_dir_recursive(source, dest);
-}
-
-fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dest_path = dest.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else if ty.is_file() && !dest_path.exists() {
-            std::fs::copy(entry.path(), dest_path)?;
-        }
-    }
-    Ok(())
 }
 
 fn try_seed_from_cli() -> Option<Workspace> {
@@ -209,10 +176,6 @@ pub fn generate_machine_id() -> String {
     format!("machine_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
-pub fn default_agent_specs_dir() -> PathBuf {
-    config_dir().join("agents")
-}
-
 pub fn default_agent_data_root() -> PathBuf {
     dirs::home_dir()
         .map(|d| d.join(".agentx"))
@@ -235,16 +198,8 @@ pub fn home_path_expr(path: &Path) -> String {
     abbreviate_home(path).unwrap_or_else(|| path.display().to_string())
 }
 
-pub fn default_agent_specs_dir_expr() -> String {
-    home_path_expr(&default_agent_specs_dir())
-}
-
 pub fn default_agent_data_root_expr() -> String {
     "~/.agentx".into()
-}
-
-pub fn machine_specs_dir_expr(workspace_key: &str, machine_key: &str) -> String {
-    format!("~/.joi-apps/machines/{workspace_key}/{machine_key}/agents")
 }
 
 pub fn machine_data_root_expr(workspace_key: &str, machine_key: &str) -> String {
@@ -283,7 +238,6 @@ pub fn default_machine_for_workspace(workspace_id: &str) -> MachineConfig {
         id: format!("machine_{suffix}"),
         name: "Local Machine".into(),
         kind: default_machine_kind(),
-        specs_dir: machine_specs_dir_expr(&workspace_key, "local"),
         data_root: machine_data_root_expr(&workspace_key, "local"),
         agents: Vec::new(),
     }
@@ -293,9 +247,6 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
     let mut changed = false;
 
     for machine in &mut cfg.machines {
-        if normalize_home_path_expr(&mut machine.specs_dir) {
-            changed = true;
-        }
         if normalize_home_path_expr(&mut machine.data_root) {
             changed = true;
         }
@@ -323,9 +274,6 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
     for machine in &mut cfg.machines {
         if machine.workspace_id.is_none() {
             machine.workspace_id = Some(active_id.clone());
-            changed = true;
-        }
-        if normalize_home_path_expr(&mut machine.specs_dir) {
             changed = true;
         }
         if normalize_home_path_expr(&mut machine.data_root) {
@@ -362,7 +310,6 @@ fn default_machine() -> MachineConfig {
         id: "local".into(),
         name: "Local Machine".into(),
         kind: default_machine_kind(),
-        specs_dir: default_agent_specs_dir_expr(),
         data_root: default_agent_data_root_expr(),
         agents: Vec::new(),
     }

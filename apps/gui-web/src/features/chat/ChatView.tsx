@@ -150,11 +150,11 @@ export function ChatView() {
               ui.openModal({
                 type: "confirm",
                 title: "Stop all agents in this channel?",
-                body: "Agent processes are owned by `joi agent serve`; stop the host process that is serving the agents for this channel.",
+                body: "Agent processes are owned by `joi daemon`; stop or restart the daemon on the host computer.",
                 confirmLabel: "Got It",
                 danger: true,
                 onConfirm: () =>
-                  ui.pushToast("warn", "agent process control belongs to joi agent serve"),
+                  ui.pushToast("warn", "agent process control belongs to joi daemon"),
               })
             }
           >
@@ -254,7 +254,9 @@ function ChannelTasksPanel() {
         id: bubble.id,
         title: bubble.actionTitle || bubble.text.split("\n").find(Boolean) || "Untitled task",
         status:
-          bubble.actionStatus === "accepted" || bubble.actionStatus === "declined"
+          bubble.actionStatus === "accepted" ||
+          bubble.actionStatus === "declined" ||
+          bubble.actionStatus === "answered"
             ? ("done" as TaskStatus)
             : ("todo" as TaskStatus),
       }))

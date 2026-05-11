@@ -1,9 +1,8 @@
 //! `joi daemon` — machine-scoped agent host.
 //!
-//! The daemon is the spec-less successor to `joi agent serve`: it reads the
-//! desktop machine config, auto-detects supported local agent CLIs, synthesizes
-//! runtime `AgentSpec`s in memory, and then reuses the existing agent worker
-//! implementation.
+//! The daemon is the machine-scoped agent host: it reads the desktop machine
+//! config, auto-detects supported local agent CLIs, synthesizes runtime
+//! `AgentSpec`s in memory, and then runs the shared agent worker implementation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

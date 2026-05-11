@@ -72,6 +72,7 @@ function actionResponseStatus(
   payload: Record<string, unknown>,
   bubble: Bubble,
 ): ActionStatus {
+  if (isQuestionRequest(bubble.requestType)) return "answered";
   const kind = asString(payload.kind);
   if (kind === "declined") return "declined";
   if (kind === "accepted") return "accepted";
@@ -82,6 +83,23 @@ function actionResponseStatus(
   return /reject|decline|cancel|abort|no/i.test(label)
     ? "declined"
     : "accepted";
+}
+
+function actionResponseLabel(
+  payload: Record<string, unknown>,
+  bubble: Bubble,
+): string | undefined {
+  const optionId = asString(payload.optionId);
+  return (
+    bubble.choices?.find((choice) => choice.id === optionId)?.label ||
+    optionId ||
+    asString(payload.text) ||
+    undefined
+  );
+}
+
+function isQuestionRequest(requestType?: string): boolean {
+  return requestType === "question" || requestType === "human_decision";
 }
 
 function extractText(ev: JoiEvent): string {
@@ -223,6 +241,7 @@ function applyEvent(state: ScopeState, ev: JoiEvent): ScopeState {
                   ...b,
                   acknowledged: true,
                   actionStatus: actionResponseStatus(payload, b),
+                  actionSelectedLabel: actionResponseLabel(payload, b),
                 }
               : b,
           )

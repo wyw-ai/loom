@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use proto::methods::{
     AgentActorDefaults, AgentActorSpec, AgentModelChoice, AgentProviderInfo, AgentProviderSpec,
-    AgentTransport, CommandOutputFormat, IdentityFiles, IdentityScaffoldSpec, IdentitySpec,
-    PromptVia,
+    AgentTransport, CommandOutputFormat, CommandSession, IdentityFiles, IdentityScaffoldSpec,
+    IdentitySpec, PromptVia,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -74,6 +74,12 @@ const PROVIDER_DEFS: &[ProviderDef] = &[
         candidates: &["codex", "codexcli"],
         args: &["exec", "--skip-git-repo-check"],
     },
+    ProviderDef {
+        id: "opencode",
+        display_name: "OpenCode",
+        candidates: &["opencode"],
+        args: &["run"],
+    },
 ];
 
 pub fn detect_agent_cli_providers() -> Vec<DetectedAgentProvider> {
@@ -104,15 +110,23 @@ pub fn provider_specs_from_agent_definitions(
 
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
+        let mut env = BTreeMap::new();
+        if self.id == "codex" {
+            // Codex runs model-generated shell commands inside its own
+            // sandbox. The Joi daemon socket is outside the actor workspace
+            // and macOS Seatbelt denies AF_UNIX access there, so have `joi`
+            // CLI calls use JOI_SERVER directly.
+            env.insert("JOI_NO_DAEMON".into(), "1".into());
+        }
         AgentTransport {
             kind: self.transport_kind.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
-            env: BTreeMap::new(),
+            env,
             auth_method: None,
             model: self.default_model.clone(),
-            session: None,
-            output_format: Some(CommandOutputFormat::Text),
+            session: command_session_for_provider(&self.id, &self.args),
+            output_format: Some(command_output_format_for_provider(&self.id)),
             prompt_via: PromptVia::Args,
             interactive: None,
             provider: None,
@@ -213,27 +227,76 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
     match def.id {
         "claude" => {
             append_add_dir_arg(&mut args, &joi_config_dir);
-            args.push("--allowed-tools".into());
-            args.push("Bash(joi *)".into());
+            args.push("--permission-mode".into());
+            args.push("bypassPermissions".into());
+            args.push("--output-format".into());
+            args.push("stream-json".into());
+            args.push("--verbose".into());
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "qoder" => {
             append_add_dir_arg(&mut args, &joi_config_dir);
-            args.push("--allowed-tools".into());
-            args.push("Bash(joi *)".into());
+            args.push("--yolo".into());
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "copilot" => {
             append_add_dir_arg(&mut args, &joi_config_dir);
-            args.push("--allow-tool=shell(joi:*)".into());
+            args.push("--yolo".into());
+            args.push("--output-format".into());
+            args.push("json".into());
+            args.push("--stream".into());
+            args.push("off".into());
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "codex" => {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
+            args.push("--sandbox".into());
+            args.push("danger-full-access".into());
+            args.push("--ask-for-approval".into());
+            args.push("never".into());
+            args.push("-c".into());
+            args.push("sandbox_workspace_write.network_access=true".into());
             append_add_dir_arg(&mut args, &joi_config_dir);
+        }
+        "opencode" => {
+            args.extend(def.args.iter().map(|arg| (*arg).to_string()));
+            args.push("--dangerously-skip-permissions".into());
         }
         _ => args.extend(def.args.iter().map(|arg| (*arg).to_string())),
     }
+    args
+}
+
+fn command_output_format_for_provider(provider_id: &str) -> CommandOutputFormat {
+    match provider_id {
+        "claude" => CommandOutputFormat::ClaudeStreamJson,
+        "copilot" => CommandOutputFormat::CopilotJson,
+        _ => CommandOutputFormat::Text,
+    }
+}
+
+fn command_session_for_provider(
+    provider_id: &str,
+    first_run_args: &[String],
+) -> Option<CommandSession> {
+    match provider_id {
+        "claude" => Some(CommandSession {
+            first_run_capture: Some("stdout_json:.session_id".into()),
+            resume_args: Some(claude_resume_args(first_run_args)),
+        }),
+        _ => None,
+    }
+}
+
+fn claude_resume_args(first_run_args: &[String]) -> Vec<String> {
+    let mut args = first_run_args
+        .iter()
+        .filter(|arg| arg.as_str() != "-p")
+        .cloned()
+        .collect::<Vec<_>>();
+    args.push("--resume".into());
+    args.push("{session_id}".into());
+    args.push("-p".into());
     args
 }
 
@@ -331,8 +394,10 @@ mod tests {
     fn detects_supported_cli_binaries_from_path() {
         let dir = temp_dir("path");
         let config_dir = temp_dir("config");
+        make_executable(&dir.join("claude"));
         make_executable(&dir.join("codex"));
         make_executable(&dir.join("copilot"));
+        make_executable(&dir.join("opencode"));
         make_executable(&dir.join("qodercli"));
 
         let providers = detect_agent_cli_providers_in_path_with_config_dir(
@@ -343,13 +408,58 @@ mod tests {
         let config_dir_arg = config_dir.display().to_string();
         let add_dir = vec!["--add-dir", config_dir_arg.as_str()];
 
-        assert_eq!(ids, vec!["qoder", "copilot", "codex"]);
+        assert_eq!(ids, vec!["claude", "qoder", "copilot", "codex", "opencode"]);
+        let claude = providers
+            .iter()
+            .find(|provider| provider.id == "claude")
+            .expect("claude provider");
+        let mut expected = add_dir.clone();
+        expected.extend([
+            "--permission-mode",
+            "bypassPermissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]);
+        expected.push("-p");
+        assert_eq!(claude.args, expected);
+        let claude_transport = claude.transport();
+        assert_eq!(
+            claude_transport.output_format,
+            Some(CommandOutputFormat::ClaudeStreamJson)
+        );
+        assert_eq!(
+            claude_transport
+                .session
+                .as_ref()
+                .and_then(|s| s.first_run_capture.as_deref()),
+            Some("stdout_json:.session_id")
+        );
+        assert_eq!(
+            claude_transport
+                .session
+                .as_ref()
+                .and_then(|s| s.resume_args.as_ref())
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "--add-dir",
+                config_dir_arg.as_str(),
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--resume",
+                "{session_id}",
+                "-p",
+            ])
+        );
         let qoder = providers
             .iter()
             .find(|provider| provider.id == "qoder")
             .expect("qoder provider");
         let mut expected = add_dir.clone();
-        expected.extend(["--allowed-tools", "Bash(joi *)"]);
+        expected.push("--yolo");
         expected.push("-p");
         assert_eq!(qoder.args, expected);
         let copilot = providers
@@ -357,16 +467,46 @@ mod tests {
             .find(|provider| provider.id == "copilot")
             .expect("copilot provider");
         let mut expected = add_dir.clone();
-        expected.push("--allow-tool=shell(joi:*)");
+        expected.push("--yolo");
+        expected.push("--output-format");
+        expected.push("json");
+        expected.push("--stream");
+        expected.push("off");
         expected.push("-p");
         assert_eq!(copilot.args, expected);
+        assert_eq!(
+            copilot.transport().output_format,
+            Some(CommandOutputFormat::CopilotJson)
+        );
         let codex = providers
             .iter()
             .find(|provider| provider.id == "codex")
             .expect("codex provider");
-        let mut expected = vec!["exec", "--skip-git-repo-check"];
+        let mut expected = vec![
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "danger-full-access",
+            "--ask-for-approval",
+            "never",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
+        ];
         expected.extend(add_dir);
         assert_eq!(codex.args, expected);
+        assert_eq!(
+            codex
+                .transport()
+                .env
+                .get("JOI_NO_DAEMON")
+                .map(String::as_str),
+            Some("1")
+        );
+        let opencode = providers
+            .iter()
+            .find(|provider| provider.id == "opencode")
+            .expect("opencode provider");
+        assert_eq!(opencode.args, vec!["run", "--dangerously-skip-permissions"]);
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
     }
@@ -381,6 +521,12 @@ mod tests {
             args: vec![
                 "exec".into(),
                 "--skip-git-repo-check".into(),
+                "--sandbox".into(),
+                "danger-full-access".into(),
+                "--ask-for-approval".into(),
+                "never".into(),
+                "-c".into(),
+                "sandbox_workspace_write.network_access=true".into(),
                 "--add-dir".into(),
                 "/tmp/joi-config".into(),
             ],
@@ -408,9 +554,23 @@ mod tests {
             vec![
                 "exec",
                 "--skip-git-repo-check",
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "never",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
                 "--add-dir",
                 "/tmp/joi-config"
             ]
+        );
+        assert_eq!(
+            specs[0]
+                .transport
+                .env
+                .get("JOI_NO_DAEMON")
+                .map(String::as_str),
+            Some("1")
         );
     }
 }

@@ -337,7 +337,9 @@ function deriveTasks(
     for (const bubble of scopeState.bubbles) {
       if (bubble.kind !== "actionRequest") continue;
       const status =
-        bubble.actionStatus === "accepted" || bubble.actionStatus === "declined"
+        bubble.actionStatus === "accepted" ||
+        bubble.actionStatus === "declined" ||
+        bubble.actionStatus === "answered"
           ? "done"
           : "todo";
       tasks.set(bubble.id, {

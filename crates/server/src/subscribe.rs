@@ -49,7 +49,7 @@ impl Subscriptions {
     /// becomes the actor-inbox owner depends on `actor_kind`:
     ///
     /// * `Agent` / `Service` — always takes over. Long-lived host processes
-    ///   (`joi agent serve`, `joi service serve`) claiming an actor means
+    ///   (`joi daemon`, `joi service serve`) claiming an actor means
     ///   "I am the runtime for this actor"; a restart after a crash needs
     ///   to win even if the previous WS hasn't been reaped yet (the old
     ///   conn's TCP close detection on the server side may lag the new
@@ -364,7 +364,7 @@ mod tests {
     fn service_kind_preempts_existing_live_binding() {
         // §9.4: a long-lived `joi service serve` restart must take over the
         // actor-inbox even if the previous WS hasn't been reaped yet — same
-        // contract as `joi agent serve`. Without preempt, the new host can't
+        // contract as `joi daemon`. Without preempt, the new host can't
         // receive any actor-inbox push until the old conn TCP-times out.
         let subs = Subscriptions::new();
         subs.add_connection(make_conn("conn_old"));

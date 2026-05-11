@@ -80,8 +80,67 @@ enum Cmd {
         #[command(subcommand)]
         sub: ActionCmd,
     },
-    /// Manage agents. Run `joi agent example` for AgentSpec examples covering
-    /// acp_stdio, command, and interactive_command transports.
+    /// Ask the triggering human to choose or provide input, then return the answer to this process.
+    AskUserQuestion {
+        /// Max seconds to wait for action.response.
+        #[arg(long = "timeout-seconds")]
+        timeout_seconds: Option<u64>,
+        /// Scope id. Defaults to JOI_SCOPE_ID inside daemon-managed agent turns.
+        #[arg(long)]
+        r#in: Option<String>,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Actor id that should answer. Defaults to JOI_TRIGGER_ACTOR inside daemon turns.
+        #[arg(long)]
+        to: Option<String>,
+        /// Turn id to associate with the action.request. Defaults to JOI_TURN_ID.
+        #[arg(long = "turn-id")]
+        turn_id: Option<String>,
+        /// Short title shown in clients. JSON stdin may also provide header/title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Question text. If omitted, read the full question payload as JSON from stdin.
+        #[arg(long)]
+        question: Option<String>,
+        /// Choice formatted as id=label. Repeat for multiple choices.
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+        /// Mark the request as allowing free-form text for clients that support it.
+        #[arg(long = "allow-freeform")]
+        allow_freeform: bool,
+    },
+    /// Ask the triggering human to approve or reject a proposed action, then return the result.
+    RequestApproval {
+        /// Max seconds to wait for action.response.
+        #[arg(long = "timeout-seconds")]
+        timeout_seconds: Option<u64>,
+        /// Scope id. Defaults to JOI_SCOPE_ID inside daemon-managed agent turns.
+        #[arg(long)]
+        r#in: Option<String>,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Actor id that should approve. Defaults to JOI_TRIGGER_ACTOR inside daemon turns.
+        #[arg(long)]
+        to: Option<String>,
+        /// Turn id to associate with the action.request. Defaults to JOI_TURN_ID.
+        #[arg(long = "turn-id")]
+        turn_id: Option<String>,
+        /// Short title shown in clients. JSON stdin may also provide title.
+        #[arg(long)]
+        title: Option<String>,
+        /// What the agent wants approval to do. If omitted, read JSON from stdin.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Label for the approving option.
+        #[arg(long = "approve-label")]
+        approve_label: Option<String>,
+        /// Label for the rejecting option.
+        #[arg(long = "reject-label")]
+        reject_label: Option<String>,
+    },
+    /// Inspect daemon-configured agents. Runtime hosting is done by `joi daemon`.
     Agent {
         #[command(subcommand)]
         sub: AgentCmd,
@@ -475,57 +534,8 @@ enum ActionCmd {
 
 #[derive(Subcommand, Debug)]
 enum AgentCmd {
-    /// List locally registered agents.
+    /// List agents configured for daemon-managed machines.
     List,
-    /// Show the bundled marketplace catalog.
-    Marketplace,
-    /// Install an agent from the bundled marketplace.
-    Install {
-        marketplace_id: String,
-        /// Local actor id to assign (defaults to `actor_<marketplace_id>`).
-        #[arg(long = "actor-id")]
-        local_actor_id: Option<String>,
-        #[arg(long = "name")]
-        display_name: Option<String>,
-        /// Force a specific distribution: auto (default), npx, uvx, binary.
-        #[arg(long)]
-        prefer: Option<String>,
-    },
-    /// Add a custom agent interactively.
-    Add,
-    /// Show AgentSpec examples for acp_stdio, command, and interactive_command transports.
-    Example,
-    /// Register an agent provider from a local JSON spec file.
-    Register {
-        path: PathBuf,
-    },
-    /// Remove a locally registered agent provider.
-    Remove {
-        provider_id: String,
-    },
-    Start {
-        actor_id: String,
-    },
-    Stop {
-        actor_id: String,
-    },
-    Log {
-        actor_id: String,
-        #[arg(long, default_value_t = 50)]
-        tail: u32,
-    },
-    /// Run as the v1 external agent client: load every AgentProviderSpec under
-    /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
-    /// over its own server connection.
-    Serve {
-        /// Override the directory of AgentProviderSpec JSON files.
-        #[arg(long)]
-        specs: Option<PathBuf>,
-        /// Comma-separated actor ids to load. Empty/omitted = load every
-        /// actor from every AgentProviderSpec under --specs.
-        #[arg(long = "allow-actors", value_delimiter = ',')]
-        allow_actors: Vec<String>,
-    },
 }
 
 #[tokio::main]
@@ -560,44 +570,16 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `agent serve` opens its own per-agent connections and never acts as the
-    // local human actor — bypass the up-front connection_open below so we
-    // don't pollute the server's actor table with an unused row.
-    if let Cmd::Agent {
-        sub: AgentCmd::Serve {
-            specs,
-            allow_actors,
-        },
-    } = args.cmd
-    {
-        return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
-    }
-
-    // Agent registry management is local to `joi agent serve`; the server is
-    // only the message bus.
+    // Agent runtime hosting is daemon-only. `joi agent` is kept as an offline
+    // inspection namespace so it doesn't open an unused human connection.
     if let Cmd::Agent { sub } = args.cmd {
         match sub {
             AgentCmd::List => cmd::agent::list()?,
-            AgentCmd::Marketplace => cmd::agent::marketplace()?,
-            AgentCmd::Install {
-                marketplace_id,
-                local_actor_id,
-                display_name,
-                prefer,
-            } => cmd::agent::install(marketplace_id, local_actor_id, display_name, prefer)?,
-            AgentCmd::Add => cmd::agent::add()?,
-            AgentCmd::Example => cmd::agent::example(),
-            AgentCmd::Register { path } => cmd::agent::register(path)?,
-            AgentCmd::Remove { provider_id } => cmd::agent::remove(provider_id)?,
-            AgentCmd::Start { actor_id } => cmd::agent::start(actor_id)?,
-            AgentCmd::Stop { actor_id } => cmd::agent::stop(actor_id)?,
-            AgentCmd::Log { actor_id, tail } => cmd::agent::log(actor_id, tail)?,
-            AgentCmd::Serve { .. } => unreachable!("handled above"),
         }
         return Ok(());
     }
 
-    // `service serve` follows the same shape as `agent serve`: it opens
+    // `service serve` follows the daemon worker shape: it opens
     // its own per-service connections (one per ServiceSpec, bound to the
     // service actor) and must not pollute the actor table with a human
     // entry. Same early-exit pattern.
@@ -758,6 +740,62 @@ async fn main() -> Result<()> {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, false).await?
             }
         },
+        Cmd::AskUserQuestion {
+            timeout_seconds,
+            r#in,
+            channel,
+            to,
+            turn_id,
+            title,
+            question,
+            choices,
+            allow_freeform,
+        } => {
+            cmd::ask_user_question::run(
+                client,
+                cfg.actor_id,
+                cmd::ask_user_question::RunArgs {
+                    timeout_seconds,
+                    scope_id: r#in,
+                    is_channel: channel,
+                    to,
+                    turn_id,
+                    title,
+                    question,
+                    choices,
+                    allow_freeform,
+                },
+            )
+            .await?
+        }
+        Cmd::RequestApproval {
+            timeout_seconds,
+            r#in,
+            channel,
+            to,
+            turn_id,
+            title,
+            reason,
+            approve_label,
+            reject_label,
+        } => {
+            cmd::ask_user_question::run_approval(
+                client,
+                cfg.actor_id,
+                cmd::ask_user_question::ApprovalArgs {
+                    timeout_seconds,
+                    scope_id: r#in,
+                    is_channel: channel,
+                    to,
+                    turn_id,
+                    title,
+                    reason,
+                    approve_label,
+                    reject_label,
+                },
+            )
+            .await?
+        }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Event { sub } => match sub {

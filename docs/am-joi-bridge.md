@@ -75,10 +75,10 @@ joi channel invite <joi_channel_id> svc_am_bridge
 joi channel invite <joi_channel_id> <target_agent_actor_id>
 ```
 
-目标 agent 需要由 `joi agent serve` 在线接收 actor-inbox handoff：
+目标 agent 需要由 `joi daemon` 在线接收 actor-inbox handoff：
 
 ```bash
-joi agent serve --specs ~/.config/joi/agents --allow-actors <target_agent_actor_id>
+joi daemon --allow-actors <target_agent_actor_id>
 ```
 
 ## 3. 启动 am listener

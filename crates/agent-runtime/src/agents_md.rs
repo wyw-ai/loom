@@ -87,13 +87,21 @@ These variables are already set in your process env:\n\
 - `JOI_SERVER` — WebSocket URL of the joi server.\n\
 - `JOI_DAEMON_SOCKET` — local daemon socket used automatically by `joi` CLI when available.\n\
 - `JOI_ACTOR`  — your actor id ({actor_id}).\n\
+- `JOI_SCOPE_ID` — current thread or channel scope id for this turn.\n\
+- `JOI_SCOPE_KIND` — `thread` or `channel` for this turn.\n\
+- `JOI_TURN_ID` — current Joi turn id.\n\
+- `JOI_TRIGGER_ACTOR` — actor id of the human or agent that triggered this turn.\n\
+- `AGENTX_CHANNEL_ID` — channel id that owns the current scope.\n\
 \n\
 ### Current scope\n\
 \n\
-A turn always runs in a *scope* (a `thread` or a `channel`). Your first\n\
-prompt in every new scope is prefixed with an auto-injected line that says\n\
-`current scope = thread:<id>` or `current scope = channel:<id>`. Copy that\n\
-id verbatim when you pass low-level `--in <scope_id>` commands below.\n\
+A turn always runs in a *scope* (a `thread` or a `channel`). The first prompt\n\
+in each provider session is prefixed with the current `actor id` and\n\
+`current scope = thread:<id>` or `current scope = channel:<id>`; command\n\
+agents without resume support receive that prefix on every turn. Copy that id\n\
+verbatim when you pass low-level `--in <scope_id>` commands below. If a user\n\
+asks for channel or thread history, query Joi first; do not answer from the\n\
+local profile memory directory.\n\
 Message targets use a separate canonical grammar: `#<channel_id>` for a\n\
 channel and `#<channel_id>:<root_event_id>` for a thread. If you only have a\n\
 thread scope id, run `joi --json thread list` and find the row with that id;\n\
@@ -109,6 +117,8 @@ Use your own built-in tools or shell commands, and use `joi` / `a1` CLI\n\
 commands directly for server or Aone state.\n\
 \n\
 ```\n\
+joi --json event list --in \"$JOI_SCOPE_ID\" --limit 200        # thread scope\n\
+joi --json event list --in \"$JOI_SCOPE_ID\" --channel --limit 200  # channel scope\n\
 joi --json message read --target '#<channel_id>'\n\
 joi --json message read --target '#<channel_id>:<root_event_id>'\n\
 joi --json message read --target '#<channel_id>:<root_event_id>' --before <event_id>\n\
@@ -137,6 +147,9 @@ joi --json message send --target dm:<actor_id> <<'JOIMSG'\n\
 private note\n\
 JOIMSG\n\
 joi --json handoff <actor_id> --in <scope_id> --message \"please take this\"\n\
+joi --json ask-user-question --title \"Choose option\" --question \"Which option?\" \\\n\
+    --choice a=A --choice b=B\n\
+joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
 joi --json attachment upload --target '#<channel_id>:<root_event_id>' --path <file>\n\
 joi --json artifact publish --in <scope_id> [--channel] \\\n\
     --name <file> [--media-type <type>] (--text <body> | --file <path>)\n\
@@ -162,6 +175,7 @@ mod tests {
     fn first_write_just_joi_block() {
         let out = update_block("", &joi_block("actor_demo"));
         assert!(out.contains("actor_demo"));
+        assert!(out.contains("JOI_SCOPE_ID"));
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains(END_MARKER));
     }

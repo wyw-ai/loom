@@ -116,7 +116,6 @@ export interface MachineConfig {
   id: string;
   name: string;
   kind: string;
-  specsDir: string;
   dataRoot: string;
   agents?: MachineAgentConfig[];
 }
@@ -186,7 +185,6 @@ export interface MachineInfo {
   setupStatus: string;
   connectionStatus: string;
   connectionActorId: string;
-  specsDir: string;
   dataRoot: string;
   configDir: string;
   agentCount: number;
@@ -201,7 +199,7 @@ export interface MachineInfo {
 
 export type BubbleKind = "stream" | "static" | "actionRequest" | "system";
 export type DeliveryState = "na" | "pending" | "delivered";
-export type ActionStatus = "pending" | "accepted" | "declined";
+export type ActionStatus = "pending" | "answered" | "accepted" | "declined";
 
 export interface ActionChoice {
   id: string;
@@ -227,6 +225,7 @@ export interface Bubble {
   actionRawInput?: string;
   actionRequestId?: string;
   actionStatus?: ActionStatus;
+  actionSelectedLabel?: string;
   choices?: ActionChoice[];
   acknowledged?: boolean;
 }

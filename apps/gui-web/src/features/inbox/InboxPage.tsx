@@ -22,7 +22,7 @@ export function InboxPage() {
     eventId: string,
     scope: { kind: "channel" | "thread"; id: string },
     optionId: string,
-    kind: "accepted" | "declined",
+    kind: "accepted" | "declined" | "answered",
     actionRequestId?: string,
   ) => {
     if (!selfId) return;
@@ -126,6 +126,13 @@ export function InboxPage() {
                       ]
                   ).map((c) => {
                     const isDecline = /reject|decline|cancel|abort|no/i.test(c.label);
+                    const kind =
+                      it.requestType === "question" ||
+                      it.requestType === "human_decision"
+                        ? "answered"
+                        : isDecline
+                          ? "declined"
+                          : "accepted";
                     const Icon = isDecline ? XCircle : CheckCircle2;
                     return (
                       <button
@@ -135,7 +142,7 @@ export function InboxPage() {
                             it.requestEventId,
                             it.scope,
                             c.id,
-                            isDecline ? "declined" : "accepted",
+                            kind,
                             it.actionRequestId,
                           )
                         }

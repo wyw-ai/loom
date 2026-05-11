@@ -141,6 +141,12 @@ function openActionPicker({ scope }: DispatchCtx) {
         onPick: async (optionId) => {
           const label = choices.find((c) => c.id === optionId)?.label ?? "";
           const declined = /reject|decline|cancel|abort|no/i.test(label);
+          const kind =
+            b.requestType === "question" || b.requestType === "human_decision"
+              ? "answered"
+              : declined
+                ? "declined"
+                : "accepted";
           try {
             await ipc.eventAppend({
               type: "action.response",
@@ -148,7 +154,7 @@ function openActionPicker({ scope }: DispatchCtx) {
               scope,
               payload: {
                 optionId,
-                kind: declined ? "declined" : "accepted",
+                kind,
                 ...(b.actionRequestId ? { requestId: b.actionRequestId } : {}),
               },
               relations: [

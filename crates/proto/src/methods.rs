@@ -797,7 +797,7 @@ pub struct AgentTransport {
 
     // ---- command / interactive command transport only ----
     /// Optional default model for transports that expose a CLI-level model flag.
-    /// `joi agent serve` may override this with the actor's selected runtime
+    /// `joi daemon` may override this with the actor's selected runtime
     /// model; when an interactive command has an active model, the runtime
     /// appends `--model=<model>` to the provider argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1140,6 +1140,8 @@ pub enum CommandOutputFormat {
     Text,
     /// Anthropic Claude Code `--output-format stream-json` framing.
     ClaudeStreamJson,
+    /// GitHub Copilot CLI `--output-format json` JSONL session events.
+    CopilotJson,
     /// OpenAI codex CLI `--output-format stream-json` framing (placeholder).
     CodexStreamJson,
     /// Generic line-delimited JSON (each line carries `{"type": "...", ...}`).
@@ -1165,7 +1167,7 @@ pub struct AgentSpec {
     #[serde(default)]
     pub autostart: bool,
     /// Optional model menu for this actor. Joi treats these as runtime-level
-    /// model ids: `joi agent serve` can surface them through `/models` and
+    /// model ids: `joi daemon` can surface them through `/models` and
     /// pass the selected id to transports that support model selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<AgentModelSpec>,

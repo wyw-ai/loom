@@ -188,7 +188,7 @@ impl Client {
     }
 
     /// Open a connection bound to `actor_id` with an explicit `actor_kind`
-    /// (`"human"` or `"agent"`). The v1 `joi agent serve` worker uses this to
+    /// (`"human"` or `"agent"`). The daemon-managed agent worker uses this to
     /// register one connection per managed agent so the server's actor-inbox
     /// delivery routes hands_off_to events to the right WS.
     pub async fn open_connection_as(

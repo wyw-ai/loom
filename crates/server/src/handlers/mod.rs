@@ -612,7 +612,7 @@ async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>
 
     // Journal the cancel as a `turn.close` event so channel members render a
     // system divider. The event is handed to the agent actor so external
-    // `joi agent serve` can cancel the actual adapter process; server itself
+    // `joi daemon` can cancel the actual adapter process; server itself
     // stays transport-agnostic.
     let close_payload = json!({
         "status": "cancelled",
@@ -966,7 +966,7 @@ fn actor_list(state: &AppState) -> HandlerResult {
 
 /// Pre-register or update an actor row. `connection/open` already does an
 /// implicit upsert, but it stamps `kind = Human` if the caller forgets to
-/// pass `actorKind`. This dedicated RPC lets `joi agent serve` (and any
+/// pass `actorKind`. This dedicated RPC lets `joi daemon` (and any
 /// other operator) declare an agent's full `Actor` (id, kind, display,
 /// capabilities) before the agent ever opens its own connection — which
 /// is what makes the "invite this agent into the channel, agent connects

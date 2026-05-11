@@ -9,8 +9,9 @@
 //! `<agent-client-data>/sessions/<actor>/<scope_id>.json`.
 //!
 //! E2 scope (initial implementation):
-//!   * `output_format`: `Text`, `NdjsonLines`, `ClaudeStreamJson`. CodexStreamJson
-//!     is wired through but its translation table is a placeholder per the doc.
+//!   * `output_format`: `Text`, `NdjsonLines`, `ClaudeStreamJson`,
+//!     `CopilotJson`. CodexStreamJson is wired through but its translation
+//!     table is a placeholder per the doc.
 //!   * `prompt_via`: `Args`, `Stdin`, `Env`.
 //!   * `first_run_capture`: `stdout_json:<path>`, `file:<path>`. The
 //!     `stderr_regex:` form is recognised but returns an unimplemented error so
@@ -261,7 +262,7 @@ fn run_prompt(
     let scope = prompt.scope.clone();
     let content = prompt.content.clone();
     let command_signature = command_signature_for_prompt(&cfg, &prompt);
-    let session = load_session(&cfg, &scope.id);
+    let session = load_session(&cfg, &scope);
     let resume_session_id = session
         .as_ref()
         .filter(|s| s.command_signature == command_signature)
@@ -296,11 +297,11 @@ fn run_prompt(
     };
 
     // First-run capture: try once, save to disk on success.
-    if is_first_run {
+    if is_first_run && outcome.exit_code == 0 {
         if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
-                    if let Err(e) = save_session(&cfg, &scope.id, &sid, &command_signature) {
+                    if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
                         tracing::warn!(actor = %cfg.actor_id, %e, "failed to save command session");
                     }
                 }
@@ -320,9 +321,15 @@ fn run_prompt(
         // NOT auto-retry inside this call — the user's prompt has already been
         // reported as failed; re-running it silently could double-charge LLM
         // calls.
-        let _ = delete_session(&cfg, &scope.id);
+        let _ = delete_session(&cfg, &scope);
         tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
             "command transport: dropped stale session after resume failure");
+    } else if !is_first_run && outcome.exit_code == 0 {
+        if let Some(sid) = resume_session_id.as_deref() {
+            if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
+                tracing::warn!(actor = %cfg.actor_id, %e, "failed to update command session");
+            }
+        }
     }
 
     Ok(())
@@ -421,6 +428,13 @@ fn spawn_and_collect(
                 translate_claude_stream_line(&line, &prompt.scope, sender);
             }
         }
+        CommandOutputFormat::CopilotJson => {
+            let r = BufReader::new(stdout);
+            for line in r.lines().map_while(Result::ok) {
+                collected_stdout.push_str(&line);
+                collected_stdout.push('\n');
+            }
+        }
         CommandOutputFormat::CodexStreamJson => {
             let r = BufReader::new(stdout);
             for line in r.lines().map_while(Result::ok) {
@@ -467,6 +481,15 @@ fn spawn_and_collect(
                 let _ = sender.send(AdapterEvent::Text {
                     scope: Some(prompt.scope.clone()),
                     content: collected_stdout.clone(),
+                    is_partial: false,
+                });
+            }
+        }
+        CommandOutputFormat::CopilotJson => {
+            if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
+                let _ = sender.send(AdapterEvent::Text {
+                    scope: Some(prompt.scope.clone()),
+                    content,
                     is_partial: false,
                 });
             }
@@ -660,6 +683,76 @@ fn translate_codex_stream_line(
     }
 }
 
+fn extract_copilot_json_final_text(stdout: &str) -> Option<String> {
+    let mut final_text: Option<String> = None;
+    let mut streamed_text = String::new();
+
+    for line in stdout.lines() {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Copilot includes `agentId` only for sub-agent events. Those are
+        // timeline details, not the user-visible answer for the current actor.
+        let has_subagent_id = v.get("agentId").is_some_and(|agent_id| !agent_id.is_null());
+        let has_parent_tool_call = v
+            .pointer("/data/parentToolCallId")
+            .is_some_and(|call_id| !call_id.is_null());
+        if has_subagent_id || has_parent_tool_call {
+            continue;
+        }
+        let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        match kind {
+            "assistant.message" => {
+                if copilot_message_phase_is_hidden(&v) {
+                    continue;
+                }
+                if let Some(content) =
+                    string_at_paths(&v, &["/data/content", "/message/content", "/content"])
+                        .and_then(non_blank)
+                {
+                    final_text = Some(content);
+                }
+            }
+            "assistant.message_delta" => {
+                if let Some(delta) =
+                    string_at_paths(&v, &["/data/deltaContent", "/deltaContent", "/delta"])
+                {
+                    streamed_text.push_str(&delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    final_text.or_else(|| non_blank(streamed_text))
+}
+
+fn copilot_message_phase_is_hidden(v: &Value) -> bool {
+    let Some(phase) = v.pointer("/data/phase").and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(
+        phase.to_ascii_lowercase().as_str(),
+        "thinking" | "reasoning"
+    )
+}
+
+fn string_at_paths(v: &Value, paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| v.pointer(path).and_then(Value::as_str).map(str::to_string))
+}
+
+fn non_blank(s: String) -> Option<String> {
+    let trimmed = s.trim_end().to_string();
+    if trimmed.trim().is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 // ---------------- session bookkeeping ----------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -672,39 +765,37 @@ struct SessionRecord {
     command_signature: String,
 }
 
-fn session_path(cfg: &CommandConfig, scope_id: &str) -> PathBuf {
+fn session_path(cfg: &CommandConfig, scope: &ScopeRef) -> PathBuf {
+    let kind = match scope.kind {
+        proto::types::ScopeKind::Thread => "thread",
+        proto::types::ScopeKind::Channel => "channel",
+    };
     cfg.sessions_dir
         .join(&cfg.actor_id)
-        .join(format!("{scope_id}.json"))
+        .join(format!("{kind}-{}.json", scope.id))
 }
 
-fn load_session(cfg: &CommandConfig, scope_id: &str) -> Option<SessionRecord> {
-    let path = session_path(cfg, scope_id);
+fn load_session(cfg: &CommandConfig, scope: &ScopeRef) -> Option<SessionRecord> {
+    let path = session_path(cfg, scope);
     let text = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 fn save_session(
     cfg: &CommandConfig,
-    scope_id: &str,
+    scope: &ScopeRef,
     session_id: &str,
     command_signature: &str,
 ) -> std::io::Result<()> {
-    let path = session_path(cfg, scope_id);
+    let path = session_path(cfg, scope);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let now = chrono::Utc::now().to_rfc3339();
-    let existing = load_session(cfg, scope_id);
+    let existing = load_session(cfg, scope);
     let record = SessionRecord {
         actor_id: cfg.actor_id.clone(),
-        scope: ScopeRef {
-            kind: existing
-                .as_ref()
-                .map(|e| e.scope.kind)
-                .unwrap_or(proto::types::ScopeKind::Thread),
-            id: scope_id.to_string(),
-        },
+        scope: scope.clone(),
         session_id: session_id.to_string(),
         created_at: existing
             .map(|e| e.created_at)
@@ -727,8 +818,8 @@ fn command_signature_for_prompt(cfg: &CommandConfig, request: &AdapterPrompt) ->
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn delete_session(cfg: &CommandConfig, scope_id: &str) -> std::io::Result<()> {
-    let path = session_path(cfg, scope_id);
+fn delete_session(cfg: &CommandConfig, scope: &ScopeRef) -> std::io::Result<()> {
+    let path = session_path(cfg, scope);
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -948,6 +1039,13 @@ mod tests {
         }
     }
 
+    fn named_scope(kind: ScopeKind, id: &str) -> ScopeRef {
+        ScopeRef {
+            kind,
+            id: id.into(),
+        }
+    }
+
     fn prompt(content: &str) -> AdapterPrompt {
         AdapterPrompt {
             scope: scope(),
@@ -1007,6 +1105,55 @@ mod tests {
     }
 
     #[test]
+    fn copilot_json_final_text_picks_last_root_assistant_message() {
+        let stdout = r#"{"type":"assistant.message","data":{"messageId":"m1","content":"I will inspect it.","toolRequests":[{"name":"shell"}]}}
+{"type":"tool.completed","data":{"toolCallId":"t1","content":"done"}}
+{"type":"assistant.message","data":{"messageId":"m2","content":"Final answer\n"}}
+"#;
+
+        assert_eq!(
+            extract_copilot_json_final_text(stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn copilot_json_final_text_ignores_subagent_messages() {
+        let stdout = r#"{"agentId":"sub_1","type":"assistant.message","data":{"messageId":"m1","content":"Sub-agent detail"}}
+{"type":"assistant.message","data":{"messageId":"m2","content":"Root answer"}}
+"#;
+
+        assert_eq!(
+            extract_copilot_json_final_text(stdout),
+            Some("Root answer".into())
+        );
+    }
+
+    #[test]
+    fn copilot_json_final_text_ignores_hidden_phases() {
+        let stdout = r#"{"type":"assistant.message","data":{"messageId":"m1","phase":"thinking","content":"Private reasoning"}}
+{"agentId":null,"type":"assistant.message","data":{"messageId":"m2","content":"Visible answer"}}
+"#;
+
+        assert_eq!(
+            extract_copilot_json_final_text(stdout),
+            Some("Visible answer".into())
+        );
+    }
+
+    #[test]
+    fn copilot_json_final_text_falls_back_to_deltas() {
+        let stdout = r#"{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"hello"}}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":" world"}}
+"#;
+
+        assert_eq!(
+            extract_copilot_json_final_text(stdout),
+            Some("hello world".into())
+        );
+    }
+
+    #[test]
     fn template_expands_scope_and_session_and_prompt() {
         let cfg = cfg();
         let request = prompt("hello world");
@@ -1042,6 +1189,36 @@ mod tests {
         assert!(looks_like_session_lost("error: Session not found"));
         assert!(looks_like_session_lost("UNKNOWN session abc"));
         assert!(!looks_like_session_lost("everything is fine"));
+    }
+
+    #[test]
+    fn session_path_distinguishes_thread_and_channel() {
+        let cfg = cfg();
+        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same"));
+        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "same"));
+
+        assert_ne!(thread, channel);
+        assert!(thread.ends_with("thread-same.json"));
+        assert!(channel.ends_with("channel-same.json"));
+    }
+
+    #[test]
+    fn save_session_preserves_created_at_and_updates_last_used() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("joi-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        let scope = named_scope(ScopeKind::Channel, "chan");
+
+        save_session(&cfg, &scope, "sid", "sig").unwrap();
+        let first = load_session(&cfg, &scope).expect("first session");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        save_session(&cfg, &scope, "sid", "sig").unwrap();
+        let second = load_session(&cfg, &scope).expect("second session");
+
+        assert_eq!(second.scope.kind, ScopeKind::Channel);
+        assert_eq!(second.created_at, first.created_at);
+        assert!(second.last_used_at > first.last_used_at);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -85,6 +85,7 @@ start. Anything outside the `BEGIN joi` / `END joi` markers is preserved.\n\
 These variables are already set in your process env:\n\
 \n\
 - `JOI_SERVER` — WebSocket URL of the joi server.\n\
+- `JOI_DAEMON_SOCKET` — local daemon socket used automatically by `joi` CLI when available.\n\
 - `JOI_ACTOR`  — your actor id ({actor_id}).\n\
 \n\
 ### Current scope\n\

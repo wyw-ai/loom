@@ -16,6 +16,7 @@ use proto::methods::ServiceSpec;
 
 use std::sync::Arc;
 
+use crate::config;
 use crate::service::scheduler::SchedulerPlugin;
 use crate::service::{state, ServiceHost};
 
@@ -23,14 +24,7 @@ fn default_specs_dir() -> PathBuf {
     if let Ok(s) = std::env::var("JOI_SERVICE_SPECS") {
         return PathBuf::from(s);
     }
-    dirs::config_dir()
-        .map(|p| p.join("joi").join("services"))
-        .unwrap_or_else(|| {
-            PathBuf::from(".")
-                .join(".config")
-                .join("joi")
-                .join("services")
-        })
+    config::service_specs_dir()
 }
 
 /// Load every `*.json` under `dir` and parse as `ServiceSpec`. Malformed

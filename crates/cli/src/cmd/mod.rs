@@ -6,6 +6,7 @@ pub mod artifact;
 pub mod attachment;
 pub mod channel;
 pub mod chat;
+pub mod daemon;
 pub mod event;
 pub mod handoff;
 pub mod mcp_announcement;

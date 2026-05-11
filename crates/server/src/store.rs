@@ -150,6 +150,17 @@ impl Store {
         Ok(actor)
     }
 
+    pub fn delete_actor(&self, actor_id: &str) -> StoreResult<bool> {
+        let mutation = Mutation::ActorDelete {
+            actor_id: actor_id.to_string(),
+        };
+        self.journal.append(&mutation)?;
+        let mut inner = self.inner.write();
+        let existed = inner.actors.contains_key(actor_id);
+        apply(&mut inner, mutation);
+        Ok(existed)
+    }
+
     pub fn get_actor(&self, id: &str) -> Option<Actor> {
         self.inner.read().actors.get(id).cloned()
     }
@@ -1182,6 +1193,21 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::ActorUpsert(a) => {
             inner.actors.insert(a.id.clone(), a);
         }
+        Mutation::ActorDelete { actor_id } => {
+            inner.actors.remove(&actor_id);
+            for channel in inner.channels.values_mut() {
+                channel.members.retain(|member| member != &actor_id);
+            }
+            inner
+                .memberships
+                .retain(|(member_actor_id, _), _| member_actor_id != &actor_id);
+            inner
+                .deliveries
+                .retain(|(_, target_actor_id), _| target_actor_id != &actor_id);
+            inner
+                .receipts
+                .retain(|(_, receipt_actor_id, _), _| receipt_actor_id != &actor_id);
+        }
         Mutation::ChannelCreate(c) => {
             inner.channels.insert(c.id.clone(), c);
         }
@@ -1419,6 +1445,31 @@ mod tests {
         let path: PathBuf = dir.join("journal.jsonl");
         let journal = Journal::open(path).expect("open journal");
         Store::open(journal).expect("open store")
+    }
+
+    #[test]
+    fn delete_actor_removes_actor_and_channel_membership_on_replay() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_qa".into(),
+            kind: ActorKind::Agent,
+            display_name: "QA".into(),
+            capabilities: None,
+            _meta: None,
+        };
+        store.upsert_actor(actor).expect("upsert actor");
+        let channel = store
+            .create_channel("private".into(), Some("actor_agent_qa".into()))
+            .expect("create channel");
+
+        assert!(store.delete_actor("actor_agent_qa").expect("delete actor"));
+        assert!(store.get_actor("actor_agent_qa").is_none());
+        assert!(!store.is_channel_member(&channel.id, "actor_agent_qa"));
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        assert!(replayed.get_actor("actor_agent_qa").is_none());
+        assert!(!replayed.is_channel_member(&channel.id, "actor_agent_qa"));
     }
 
     fn append_channel_root(

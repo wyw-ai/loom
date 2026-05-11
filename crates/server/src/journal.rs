@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", content = "data", rename_all = "snake_case")]
 pub enum Mutation {
     ActorUpsert(Actor),
+    ActorDelete {
+        actor_id: String,
+    },
     ChannelCreate(Channel),
     ThreadCreate(Thread),
     TurnOpen(Turn),
@@ -66,6 +69,7 @@ pub enum Mutation {
 /// with `Mutation`'s snake_case variant names.
 const LEGACY_VARIANTS: &[&str] = &[
     "actor_upsert",
+    "actor_delete",
     "channel_create",
     "thread_create",
     "turn_open",

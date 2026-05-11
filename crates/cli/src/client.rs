@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use proto::{Notification, Request, Response, RpcEnvelope};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -23,6 +25,10 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
+        Self::connect_ws(url).await
+    }
+
+    pub async fn connect_ws(url: &str) -> Result<Arc<Self>> {
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .with_context(|| format!("ws connect {}", url))?;
@@ -41,7 +47,6 @@ impl Client {
             let _ = sink.close().await;
         });
 
-        // Reader task
         let pending_r = pending.clone();
         tokio::spawn(async move {
             while let Some(msg) = stream.next().await {
@@ -55,36 +60,71 @@ impl Client {
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
                     Message::Close(_) => break,
                 };
-                let envelope: RpcEnvelope = match serde_json::from_str(&text) {
-                    Ok(v) => v,
+                dispatch_frame(text, &pending_r, &notif_tx).await;
+            }
+        });
+
+        Ok(Self::new(out_tx, pending, notif_rx))
+    }
+
+    #[cfg(unix)]
+    pub async fn connect_daemon_socket(path: &Path) -> Result<Arc<Self>> {
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            .with_context(|| format!("connect daemon socket {}", path.display()))?;
+        let (reader, mut writer) = stream.into_split();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(async move {
+            while let Some(frame) = out_rx.recv().await {
+                if writer.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                if writer.write_all(b"\n").await.is_err() {
+                    break;
+                }
+            }
+            let _ = writer.shutdown().await;
+        });
+
+        let pending_r = pending.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(text)) => dispatch_frame(text, &pending_r, &notif_tx).await,
+                    Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!(%e, frame = %text, "bad frame");
-                        continue;
-                    }
-                };
-                match envelope {
-                    RpcEnvelope::Response(r) => {
-                        let key = id_to_key(&r.id);
-                        if let Some(tx) = pending_r.lock().await.remove(&key) {
-                            let _ = tx.send(r);
-                        }
-                    }
-                    RpcEnvelope::Notification(n) => {
-                        let _ = notif_tx.send(n);
-                    }
-                    RpcEnvelope::Request(_) => {
-                        // Server doesn't send requests in v0.
+                        tracing::warn!(%e, "daemon socket read failed");
+                        break;
                     }
                 }
             }
         });
 
-        Ok(Arc::new(Self {
+        Ok(Self::new(out_tx, pending, notif_rx))
+    }
+
+    #[cfg(not(unix))]
+    pub async fn connect_daemon_socket(_path: &Path) -> Result<Arc<Self>> {
+        Err(anyhow!(
+            "joi daemon IPC is only supported on Unix platforms"
+        ))
+    }
+
+    fn new(
+        out_tx: mpsc::UnboundedSender<String>,
+        pending: Pending,
+        notif_rx: mpsc::UnboundedReceiver<Notification>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             out_tx,
             pending,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             notifications: Mutex::new(notif_rx),
-        }))
+        })
     }
 
     pub async fn call_raw(&self, method: &str, params: Option<Value>) -> Result<Value> {
@@ -99,7 +139,7 @@ impl Client {
         let frame = serde_json::to_string(&req)?;
         self.out_tx
             .send(frame)
-            .map_err(|_| anyhow!("ws writer closed"))?;
+            .map_err(|_| anyhow!("rpc writer closed"))?;
         let resp = tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .map_err(|_| anyhow!("rpc `{}` timed out", method))?
@@ -174,5 +214,33 @@ fn id_to_key(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         _ => "_".into(),
+    }
+}
+
+async fn dispatch_frame(
+    text: String,
+    pending: &Pending,
+    notif_tx: &mpsc::UnboundedSender<Notification>,
+) {
+    let envelope: RpcEnvelope = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%e, frame = %text, "bad frame");
+            return;
+        }
+    };
+    match envelope {
+        RpcEnvelope::Response(r) => {
+            let key = id_to_key(&r.id);
+            if let Some(tx) = pending.lock().await.remove(&key) {
+                let _ = tx.send(r);
+            }
+        }
+        RpcEnvelope::Notification(n) => {
+            let _ = notif_tx.send(n);
+        }
+        RpcEnvelope::Request(_) => {
+            // Server doesn't send requests in v0.
+        }
     }
 }

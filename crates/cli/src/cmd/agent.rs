@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
 
-use crate::render;
+use crate::{config, render};
 
 pub fn list() -> Result<()> {
     let agents = load_specs()?
@@ -487,9 +487,7 @@ pub fn log(actor_id: String, _tail: u32) -> Result<()> {
 }
 
 fn default_specs_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+    config::agent_specs_dir()
 }
 
 fn provider_path(provider_id: &str) -> PathBuf {

@@ -95,6 +95,7 @@ pub async fn dispatch(
         method::DELIVERY_LIST => delivery_list(state, connection_id, params),
         method::ACTOR_LIST => actor_list(state),
         method::ACTOR_UPSERT => actor_upsert(state, params),
+        method::ACTOR_DELETE => actor_delete(state, params),
         other => Err(ErrorObject::new(
             ErrorCode::METHOD_NOT_FOUND,
             format!("unknown method `{}`", other),
@@ -974,6 +975,15 @@ fn actor_upsert(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ActorUpsertParams = parse_params(params)?;
     let actor = state.store.upsert_actor(p.actor).map_err(map_store_err)?;
     ok(ActorUpsertResult { actor })
+}
+
+fn actor_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ActorDeleteParams = parse_params(params)?;
+    let deleted = state
+        .store
+        .delete_actor(&p.actor_id)
+        .map_err(map_store_err)?;
+    ok(ActorDeleteResult { deleted })
 }
 
 #[allow(dead_code)]

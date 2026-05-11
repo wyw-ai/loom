@@ -46,6 +46,7 @@ pub mod method {
     pub const DELIVERY_LIST: &str = "delivery/list";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
+    pub const ACTOR_DELETE: &str = "actor/delete";
 
     // outbound notification
     pub const STREAM_UPDATE: &str = "stream/update";
@@ -765,6 +766,18 @@ pub struct ActorUpsertParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorUpsertResult {
     pub actor: Actor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorDeleteParams {
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorDeleteResult {
+    pub deleted: bool,
 }
 
 // ---- agent/* ----

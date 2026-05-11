@@ -18,6 +18,7 @@ import { Landing } from "@/features/landing/Landing";
 import { TasksPage } from "@/features/tasks/TasksPage";
 import { MembersPage } from "@/features/members/MembersPage";
 import { MachinesPage } from "@/features/members/MachinesPage";
+import { SettingsPage } from "@/features/settings/SettingsPage";
 import { Toast } from "@/features/common/Toast";
 import { ModalHost } from "@/features/common/Modal";
 import { ContextMenuHost } from "@/features/common/ContextMenu";
@@ -79,17 +80,40 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "k") return;
+      e.preventDefault();
+
+      const ui = useUI.getState();
+      if (ui.modal) return;
+      ui.openModal({ type: "quickSwitch" });
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // When a workspace becomes active, run the "after connect" bootstrap:
   // pull channel list. The connect() call itself happens in ServerRail /
   // Landing (user-initiated) so we never auto-contact a server the user
   // hasn't asked us to touch.
   useEffect(() => {
     if (connection !== "open" || !workspace) return;
+    let alive = true;
+    const workspaceId = workspace.id;
+    const stillCurrent = () =>
+      alive &&
+      useSession.getState().connection === "open" &&
+      useSession.getState().workspace?.id === workspaceId;
+
     (async () => {
       try {
         const r = await ipc.channelList();
+        if (!stillCurrent()) return;
         useChannels.getState().replaceChannels(r.channels);
       } catch (e) {
+        if (!stillCurrent()) return;
         useUI
           .getState()
           .pushToast(
@@ -102,8 +126,27 @@ export function App() {
       // own-message bubbles render the right name.
       try {
         const r = await ipc.actorList();
+        if (!stillCurrent()) return;
+        useActors.getState().clear();
         useActors.getState().upsertMany(r.actors);
-        if (workspace.displayName) {
+        const account = useWorkspaces.getState().account;
+        if (account) {
+          useActors.getState().upsert({
+            id: account.actorId,
+            kind: "human",
+            displayName: account.nickname || account.realName || account.staffId,
+            _meta: {
+              account: {
+                provider: account.provider,
+                staffId: account.staffId,
+                nickname: account.nickname,
+                realName: account.realName,
+                email: account.email,
+              },
+              avatarUrl: account.avatarUrl,
+            },
+          });
+        } else if (workspace.displayName) {
           useActors.getState().upsert({
             id: workspace.actorId,
             kind: "human",
@@ -114,7 +157,10 @@ export function App() {
         /* best-effort — bubbles fall back to actorId */
       }
     })();
-  }, [connection, workspace]);
+    return () => {
+      alive = false;
+    };
+  }, [connection, workspace?.id]);
 
   function handleStream(u: {
     kind: string;
@@ -319,7 +365,7 @@ export function App() {
         ) : view === "inbox" ? (
           <InboxPage />
         ) : view === "settings" ? (
-          <SettingsPlaceholder />
+          <SettingsPage />
         ) : (
           <ChatView />
         )}
@@ -331,19 +377,6 @@ export function App() {
       <ContextMenuHost />
       <WorkspaceSwitcherHost />
       <AddWorkspaceHost />
-    </div>
-  );
-}
-
-function SettingsPlaceholder() {
-  return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col bg-white text-black">
-      <header className="flex h-panel-header items-center border-b-2 border-black px-5">
-        <div className="text-lg font-black">Settings</div>
-      </header>
-      <div className="flex flex-1 items-center justify-center font-mono text-sm text-black/40">
-        Settings are not implemented yet.
-      </div>
     </div>
   );
 }

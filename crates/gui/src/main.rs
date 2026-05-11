@@ -2,6 +2,8 @@
 // the GUI. Harmless on mac/linux.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod account;
+mod avatar;
 mod config;
 mod dev_frontend;
 mod forward;
@@ -34,6 +36,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             ipc::workspaces_list,
             ipc::workspaces_save,
+            ipc::account_get,
+            ipc::account_login,
+            ipc::account_logout,
+            ipc::avatar_cached_url,
             ipc::workspace_add,
             ipc::workspace_remove,
             ipc::set_active_workspace,

@@ -73,13 +73,20 @@ export function MachinesPage() {
   };
 
   const load = async (check = false, showLoading = true) => {
+    const requestWorkspaceId = useWorkspaces.getState().activeId;
     if (showLoading) setLoading(true);
     setError(null);
     try {
       const result = check ? await ipc.machineCheck() : await ipc.machineList();
+      if (useWorkspaces.getState().activeId !== requestWorkspaceId) {
+        return [];
+      }
       applyMachines(result.machines);
       return result.machines;
     } catch (e) {
+      if (useWorkspaces.getState().activeId !== requestWorkspaceId) {
+        return [];
+      }
       const message = e instanceof Error ? e.message : String(e);
       setError(message);
       if (showLoading) pushToast("error", `computer/list failed: ${message}`);
@@ -90,6 +97,9 @@ export function MachinesPage() {
   };
 
   useEffect(() => {
+    setMachines([]);
+    setSelectedId(null);
+    setError(null);
     void load(true);
     const interval = window.setInterval(() => void load(true, false), 4000);
     return () => window.clearInterval(interval);

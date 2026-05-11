@@ -299,9 +299,18 @@ struct DesktopConfig {
     #[serde(default)]
     active: Option<String>,
     #[serde(default)]
+    account: Option<HumanAccount>,
+    #[serde(default)]
     workspaces: Vec<WorkspaceConfig>,
     #[serde(default)]
     machines: Vec<MachineConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HumanAccount {
+    #[serde(default)]
+    actor_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,6 +323,8 @@ struct WorkspaceConfig {
 struct MachineConfig {
     #[serde(default)]
     workspace_id: Option<String>,
+    #[serde(default)]
+    owner_actor_id: Option<String>,
     id: String,
     name: String,
     #[serde(default)]
@@ -347,24 +358,54 @@ fn load_desktop_config() -> Result<DesktopConfig> {
 }
 
 fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<MachineConfig> {
+    let active = active_workspace_id(cfg);
+    let owner = active_account_actor_id(cfg);
+
     if let Some(id) = requested.filter(|id| !id.trim().is_empty()) {
-        return cfg
+        let machine = cfg
             .machines
             .iter()
             .find(|machine| machine.id == id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown machine id: {id}"));
+        let machine = machine?;
+        if !machine_belongs_to_owner(&machine, owner) {
+            return Err(anyhow!(
+                "machine id {id} does not belong to the active account"
+            ));
+        }
+        return Ok(machine);
     }
 
-    let active = active_workspace_id(cfg);
+    if let Some(machine) = cfg
+        .machines
+        .iter()
+        .find(|machine| machine_belongs_to_workspace_and_owner(machine, active, owner))
+    {
+        return Ok(machine.clone());
+    }
+
+    if owner.is_some() {
+        return Err(anyhow!(
+            "no machine configured for the active account; open the GUI Computers page to create one"
+        ));
+    }
+
     cfg.machines
         .iter()
-        .find(|machine| machine.workspace_id.as_deref() == active)
-        .or_else(|| cfg.machines.first())
+        .find(|machine| {
+            machine.workspace_id.as_deref() == active && machine.owner_actor_id.is_none()
+        })
+        .or_else(|| {
+            cfg.machines
+                .iter()
+                .find(|machine| machine.owner_actor_id.is_none())
+        })
         .cloned()
         .or_else(|| {
             Some(MachineConfig {
                 workspace_id: active.map(ToString::to_string),
+                owner_actor_id: None,
                 id: "local".into(),
                 name: "Local Machine".into(),
                 data_root: default_agent_data_root_expr(),
@@ -380,6 +421,26 @@ fn active_workspace_id(cfg: &DesktopConfig) -> Option<&str> {
         .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
         .or_else(|| cfg.workspaces.first())
         .map(|workspace| workspace.id.as_str())
+}
+
+fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
+    cfg.account
+        .as_ref()
+        .map(|account| account.actor_id.trim())
+        .filter(|actor_id| !actor_id.is_empty())
+}
+
+fn machine_belongs_to_workspace_and_owner(
+    machine: &MachineConfig,
+    workspace_id: Option<&str>,
+    owner_actor_id: Option<&str>,
+) -> bool {
+    machine.workspace_id.as_deref() == workspace_id
+        && machine_belongs_to_owner(machine, owner_actor_id)
+}
+
+fn machine_belongs_to_owner(machine: &MachineConfig, owner_actor_id: Option<&str>) -> bool {
+    machine.owner_actor_id.as_deref() == owner_actor_id
 }
 
 fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
@@ -427,5 +488,61 @@ fn non_empty(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_owner(owner: &str, machines: Vec<MachineConfig>) -> DesktopConfig {
+        DesktopConfig {
+            active: Some("ws_main".into()),
+            account: Some(HumanAccount {
+                actor_id: owner.into(),
+            }),
+            workspaces: vec![WorkspaceConfig {
+                id: "ws_main".into(),
+            }],
+            machines,
+        }
+    }
+
+    fn machine(id: &str, owner: Option<&str>) -> MachineConfig {
+        MachineConfig {
+            workspace_id: Some("ws_main".into()),
+            owner_actor_id: owner.map(ToString::to_string),
+            id: id.into(),
+            name: id.into(),
+            data_root: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_machine_uses_active_account_owner() {
+        let cfg = cfg_with_owner(
+            "actor_human_1",
+            vec![
+                machine("machine_other", Some("actor_human_2")),
+                machine("machine_mine", Some("actor_human_1")),
+            ],
+        );
+
+        let selected = select_machine(&cfg, None).expect("select machine");
+
+        assert_eq!(selected.id, "machine_mine");
+    }
+
+    #[test]
+    fn select_machine_rejects_requested_machine_for_other_owner() {
+        let cfg = cfg_with_owner(
+            "actor_human_1",
+            vec![machine("machine_other", Some("actor_human_2"))],
+        );
+
+        let err = select_machine(&cfg, Some("machine_other")).expect_err("owner mismatch");
+
+        assert!(err.to_string().contains("active account"));
     }
 }

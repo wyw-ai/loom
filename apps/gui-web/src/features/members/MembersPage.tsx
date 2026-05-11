@@ -25,9 +25,12 @@ import type {
   MachineInfo,
 } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
+import { ActorAvatar } from "@/features/common/ActorAvatar";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
+import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
+import { useWorkspaces } from "@/store/workspaces";
 import { PixelAvatar } from "@/features/common/PixelAvatar";
 
 type AgentTab = "profile" | "dms" | "reminders" | "workspace" | "activity";
@@ -81,6 +84,8 @@ export function MembersPage() {
   const upsertMany = useActors((s) => s.upsertMany);
   const removeMany = useActors((s) => s.removeMany);
   const currentScope = useChannels((s) => s.currentScope);
+  const activeWorkspaceId = useWorkspaces((s) => s.activeId);
+  const sessionWorkspaceId = useSession((s) => s.workspace?.id ?? null);
   const setView = useUI((s) => s.setView);
   const setDraft = useUI((s) => s.setDraft);
   const pushToast = useUI((s) => s.pushToast);
@@ -105,11 +110,18 @@ export function MembersPage() {
   };
 
   useEffect(() => {
+    let alive = true;
+    const requestWorkspaceId = activeWorkspaceId;
+    setAgents([]);
+    setSelectedId(null);
     (async () => {
       const [machineResult, actorResult] = await Promise.allSettled([
         ipc.machineList(),
         ipc.actorList(),
       ]);
+      if (!alive || useWorkspaces.getState().activeId !== requestWorkspaceId) {
+        return;
+      }
       if (actorResult.status === "fulfilled") {
         upsertMany(actorResult.value.actors);
       }
@@ -127,7 +139,10 @@ export function MembersPage() {
         setAgents([]);
       }
     })();
-  }, [pushToast, upsertMany]);
+    return () => {
+      alive = false;
+    };
+  }, [activeWorkspaceId, sessionWorkspaceId, pushToast, upsertMany]);
 
   const allAgents = agents;
   const humans = useMemo(
@@ -232,7 +247,7 @@ export function MembersPage() {
                 key={human.id}
                 className="mb-1 flex w-full items-center gap-2 border-2 border-transparent px-2 py-2 text-left text-sm font-bold hover:border-black hover:bg-white hover:shadow-brutal-sm"
               >
-                <PixelAvatar id={human.id} label={human.displayName} size={20} />
+                <ActorAvatar actor={human} size={20} />
                 <span className="min-w-0 flex-1 truncate">
                   {human.displayName || human.id}
                 </span>

@@ -1,9 +1,10 @@
 import { create } from "zustand";
 
-import type { Workspace } from "@/ipc/types";
+import type { HumanAccount, Workspace } from "@/ipc/types";
 
 interface WorkspacesState {
   workspaces: Workspace[];
+  account: HumanAccount | null;
   activeId: string | null;
   connectingId: string | null;
   /// Drives <AddWorkspaceHost />. Keeping the flag here (rather than in the
@@ -13,7 +14,12 @@ interface WorkspacesState {
   addOpen: boolean;
   switchOpen: boolean;
 
-  setConfig: (cfg: { workspaces: Workspace[]; active?: string | null }) => void;
+  setConfig: (cfg: {
+    workspaces: Workspace[];
+    active?: string | null;
+    account?: HumanAccount | null;
+  }) => void;
+  setAccount: (account: HumanAccount | null) => void;
   setActive: (id: string | null) => void;
   setConnecting: (id: string | null) => void;
   setAddOpen: (open: boolean) => void;
@@ -23,6 +29,7 @@ interface WorkspacesState {
 
 export const useWorkspaces = create<WorkspacesState>((set, get) => ({
   workspaces: [],
+  account: null,
   activeId: null,
   connectingId: null,
   addOpen: false,
@@ -31,8 +38,10 @@ export const useWorkspaces = create<WorkspacesState>((set, get) => ({
   setConfig: (cfg) =>
     set({
       workspaces: cfg.workspaces,
+      account: cfg.account ?? null,
       activeId: cfg.active ?? null,
     }),
+  setAccount: (account) => set({ account }),
   setActive: (id) => set({ activeId: id }),
   setConnecting: (id) => set({ connectingId: id }),
   setAddOpen: (open) => set({ addOpen: open }),

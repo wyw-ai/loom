@@ -42,6 +42,7 @@ export function ServerRail() {
   const activeId = useWorkspaces((s) => s.activeId);
   const connectingId = useWorkspaces((s) => s.connectingId);
   const connection = useSession((s) => s.connection);
+  const pendingInboxItems = useInbox((s) => s.items.length);
   const unseen = useInbox((s) => s.items.filter((x) => !x.seen).length);
   const view = useUI((s) => s.view);
   const setView = useUI((s) => s.setView);
@@ -133,20 +134,24 @@ export function ServerRail() {
         })}
       </div>
 
-      <button
-        aria-label={`Notification center (${unseen} warnings)`}
-        title="Notifications"
-        className={clsx(
-          "btn-brutal-sm relative mb-3 h-9 w-9 bg-brutal-orange",
-          view === "inbox" && "bg-white",
-        )}
-        onClick={() => setView(view === "inbox" ? "chat" : "inbox")}
-      >
-        <TriangleAlert size={18} />
-        {unseen > 0 && (
-          <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-black bg-brutal-orange" />
-        )}
-      </button>
+      {pendingInboxItems > 0 && (
+        <button
+          aria-label={`Pending action requests (${pendingInboxItems} pending${
+            unseen > 0 ? `, ${unseen} new` : ""
+          })`}
+          title="Pending action requests"
+          className={clsx(
+            "btn-brutal-sm relative mb-3 h-9 w-9 bg-brutal-orange",
+            view === "inbox" && "bg-white",
+          )}
+          onClick={() => setView(view === "inbox" ? "chat" : "inbox")}
+        >
+          <TriangleAlert size={18} />
+          {unseen > 0 && (
+            <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-black bg-brutal-orange" />
+          )}
+        </button>
+      )}
 
       <button
         aria-label="Settings"

@@ -2613,6 +2613,20 @@ mod tests {
         path
     }
 
+    fn empty_prompt_stats() -> PromptStats {
+        PromptStats {
+            char_count: 0,
+            byte_count: 0,
+            approx_token_count: 0,
+        }
+    }
+
+    fn empty_prompt_breakdown() -> PromptBreakdown {
+        PromptBreakdown {
+            sections: Vec::new(),
+        }
+    }
+
     #[test]
     fn bundle_paths_resolve_custom_root_and_current() {
         let root = temp_path("bundle-paths");
@@ -2734,6 +2748,8 @@ mod tests {
             id: "turn_demo".into(),
             scope: scope.clone(),
             trigger_event_id: "evt_trigger".into(),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "human_alice".into(),
             cancel_requested: false,
         };
@@ -2823,6 +2839,8 @@ mod tests {
             id: "turn_1".into(),
             scope: scope.clone(),
             trigger_event_id: "evt_1".into(),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
             cancel_requested: false,
         });

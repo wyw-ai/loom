@@ -112,8 +112,19 @@ export interface Workspace {
   displayName: string;
 }
 
+export interface HumanAccount {
+  provider: string;
+  staffId: string;
+  nickname: string;
+  realName: string;
+  email: string;
+  actorId: string;
+  avatarUrl: string;
+}
+
 export interface MachineConfig {
   workspaceId?: string | null;
+  ownerActorId?: string | null;
   id: string;
   name: string;
   kind: string;
@@ -133,6 +144,7 @@ export interface MachineAgentConfig {
 
 export interface DesktopConfig {
   active?: string | null;
+  account?: HumanAccount | null;
   workspaces: Workspace[];
   machines?: MachineConfig[];
 }

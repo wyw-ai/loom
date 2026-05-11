@@ -6,12 +6,14 @@ import type {
   AgentInfo,
   Channel,
   DesktopConfig,
+  HumanAccount,
   JoiEvent,
   MachineInfo,
   ScopeRef,
   StreamUpdate,
   Thread,
   TurnStreamDelta,
+  Workspace,
 } from "./types";
 
 function hasTauriRuntime() {
@@ -55,8 +57,6 @@ export async function workspacesList(): Promise<DesktopConfig> {
 export async function workspaceAdd(args: {
   name: string;
   serverUrl: string;
-  actorId: string;
-  displayName?: string;
   activate?: boolean;
 }): Promise<DesktopConfig> {
   return invoke("workspace_add", { args });
@@ -70,9 +70,33 @@ export async function setActiveWorkspace(id: string): Promise<DesktopConfig> {
   return invoke("set_active_workspace", { args: { id } });
 }
 
+// ---- local human account ----
+
+export async function accountGet(): Promise<HumanAccount | null> {
+  return invoke("account_get");
+}
+
+export async function accountLogin(provider: "buc"): Promise<{
+  account: HumanAccount;
+  config: DesktopConfig;
+}> {
+  return invoke("account_login", { args: { provider } });
+}
+
+export async function accountLogout(): Promise<DesktopConfig> {
+  return invoke("account_logout");
+}
+
+export async function avatarCachedUrl(url: string): Promise<string> {
+  return invoke("avatar_cached_url", { args: { url } });
+}
+
 // ---- connection ----
 
-export async function connect(workspaceId: string): Promise<unknown> {
+export async function connect(workspaceId: string): Promise<{
+  workspace: Workspace;
+  open: unknown;
+}> {
   return invoke("connect", { args: { workspaceId } });
 }
 

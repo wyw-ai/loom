@@ -97,6 +97,35 @@ make install-targets      # 一次性装齐 4 个 triple 的 std：
 | 全平台 release | `make all-release` | 上述所有 |
 | 全平台 debug+release | `make all` | 同上再加 `dist/debug/...` |
 
+一键打包 release：
+
+```sh
+make package-release
+```
+
+这个目标会先构建 macOS / Linux 的 release runtime，再生成统一发布包：
+
+```text
+dist/packages/
+  joi-runtime-<version>-aarch64-apple-darwin.tar.gz
+  joi-runtime-<version>-x86_64-apple-darwin.tar.gz
+  joi-runtime-<version>-universal-apple-darwin.tar.gz
+  joi-runtime-<version>-aarch64-unknown-linux-musl.tar.gz
+  joi-runtime-<version>-x86_64-unknown-linux-musl.tar.gz
+  joi-gui-<version>-aarch64-apple-darwin.dmg
+  SHA256SUMS
+  manifest.txt
+```
+
+每个 `joi-runtime-*` 包都包含 `bin/joi` 和 `bin/joi-server`；`joi daemon` 是
+`bin/joi` 的子命令，所以 daemon host 跟 CLI 使用同一个跨平台二进制。GUI 只打
+macOS arm64 的 dmg。只复用已有二进制或跳过 GUI 时，可以直接跑脚本：
+
+```sh
+scripts/package-release.sh --skip-build
+scripts/package-release.sh --skip-gui
+```
+
 linux 档默认用 host 的 `cargo` 原生交叉，需要装好 musl 工具链。macOS 上推荐：
 
 ```sh
@@ -149,6 +178,8 @@ make gui-dev
 
 ```sh
 make gui-release
+# 只出 macOS arm64 dmg：
+make gui-dmg-mac-arm
 ```
 
 `make gui-release` 会在 `crates/gui/` 下执行 `cargo tauri build`；Tauri 的

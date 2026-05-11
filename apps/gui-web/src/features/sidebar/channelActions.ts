@@ -26,18 +26,22 @@ export function openCreateChannel() {
         const actorId = useSession.getState().workspace?.actorId;
         try {
           const { channel } = await ipc.channelCreate({ title: t, actorId });
-          useChannels.getState().upsertChannel(channel);
+          let latestChannel = channel;
+          useChannels.getState().upsertChannel(latestChannel);
           for (const invitee of actorIds) {
             try {
               await upsertKnownActor(invitee);
-              await ipc.channelInvite({
+              const r = await ipc.channelInvite({
                 channelId: channel.id,
                 actorId: invitee,
               });
+              latestChannel = r.channel;
+              useChannels.getState().upsertChannel(latestChannel);
             } catch {
               /* keep channel creation successful; invite can be retried */
             }
           }
+          await refreshChannelMembers(latestChannel.id);
           await openScope({ kind: "channel", id: channel.id });
         } catch (e) {
           useUI
@@ -161,12 +165,7 @@ export function openInviteToChannel(channel: Channel) {
           // full Actor rows (displayName, kind, …). Refetch so the panel
           // shows the new invitee immediately without waiting for the user
           // to toggle/reopen the rail.
-          try {
-            const m = await ipc.channelMembers(channel.id);
-            useChannels.getState().replaceMembers(channel.id, m.members);
-          } catch {
-            /* leave stale — next open will refetch */
-          }
+          await refreshChannelMembers(channel.id);
           useUI
             .getState()
             .pushToast("info", `invited ${actorId} to #${channel.title}`);
@@ -269,6 +268,15 @@ async function upsertKnownActor(actorId: string) {
     await ipc.actorUpsert(actor);
   } catch {
     /* channel/invite will surface the connection error if the server is down */
+  }
+}
+
+async function refreshChannelMembers(channelId: string) {
+  try {
+    const m = await ipc.channelMembers(channelId);
+    useChannels.getState().replaceMembers(channelId, m.members);
+  } catch {
+    /* leave stale — next open will refetch */
   }
 }
 

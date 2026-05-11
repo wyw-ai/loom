@@ -107,10 +107,19 @@ function extractText(ev: JoiEvent): string {
   return asString(p?.text);
 }
 
+function eventMeta(ev: JoiEvent): Record<string, unknown> | undefined {
+  if (ev._meta && typeof ev._meta === "object") return ev._meta;
+  const payload = ev.payload as { _meta?: unknown } | undefined;
+  return payload?._meta && typeof payload._meta === "object"
+    ? (payload._meta as Record<string, unknown>)
+    : undefined;
+}
+
 function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
   const text = extractText(ev);
   const replyTo = replyTarget(ev);
   const turnId = ev.turnId ?? undefined;
+  const meta = eventMeta(ev);
 
   // Dedupe by event id first — the same `event.created` can arrive twice if
   // `scope/subscribe` is called repeatedly (switching back to a scope
@@ -121,6 +130,7 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
     next[dupIdx] = {
       ...next[dupIdx],
       text: text || next[dupIdx].text,
+      meta: meta ?? next[dupIdx].meta,
       streaming: false,
       delivery: "delivered",
       ts: ev.occurredAt,
@@ -140,6 +150,7 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
         next[i] = {
           ...b,
           text: text || b.text,
+          meta: meta ?? b.meta,
           streaming: false,
           delivery: "delivered",
           ts: ev.occurredAt,
@@ -161,6 +172,7 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
       text,
       ts: ev.occurredAt,
       replyToEventId: replyTo,
+      meta,
       streaming: false,
       delivery: "delivered",
     },
@@ -193,6 +205,7 @@ function applyEvent(state: ScopeState, ev: JoiEvent): ScopeState {
             kind: "static",
             text: extractText(ev),
             ts: ev.occurredAt,
+            meta: eventMeta(ev),
             streaming: false,
             delivery: "delivered",
             handoffTarget: handoff,

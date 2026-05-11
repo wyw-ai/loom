@@ -9,6 +9,7 @@ import {
   CornerDownRight,
   Fingerprint,
   Bookmark,
+  BarChart3,
   XCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -206,6 +207,7 @@ export function Bubble({
         )}
 
         <Body bubble={bubble} />
+        <MessageMeta meta={bubble.meta} />
       </div>
 
       {/* Hover toolbar — floats just above the top-right, Discord-style.
@@ -315,6 +317,274 @@ function MarkdownText({ text }: { text: string }) {
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
     </div>
   );
+}
+
+interface PromptStatsMeta {
+  char_count: number;
+  byte_count: number;
+  approx_token_count: number;
+}
+
+interface PromptBreakdownSection {
+  key: string;
+  label: string;
+  char_count: number;
+  byte_count: number;
+  approx_token_count: number;
+  percentage: number;
+}
+
+interface TokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  total_cost_usd?: number;
+  estimated?: boolean;
+}
+
+interface TokenUsageMeta {
+  increment?: TokenUsage;
+  cumulative?: TokenUsage;
+}
+
+function MessageMeta({ meta }: { meta?: Record<string, unknown> }) {
+  const stats = getPromptStats(meta);
+  const breakdown = getPromptBreakdown(meta);
+  const tokenUsage = getTokenUsage(meta);
+  if (!stats && !tokenUsage) return null;
+
+  return (
+    <div className="mt-1 max-w-2xl text-[11px] text-black/45">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono">
+        <BarChart3 size={12} className="text-black/35" />
+        {tokenUsage?.increment && (
+          <span>
+            {`usage ${formatTokenUsage(tokenUsage.increment, true)}`}
+            {tokenUsage.cumulative
+              ? ` · total ${formatTokenUsage(tokenUsage.cumulative, false)}`
+              : ""}
+          </span>
+        )}
+        {stats && (
+          <span>{`prompt ctx ~${formatCompactCount(stats.approx_token_count)} tok · ${formatBytes(stats.byte_count)}`}</span>
+        )}
+      </div>
+      {breakdown.length > 0 && (
+        <details className="mt-1 max-w-xl">
+          <summary className="cursor-pointer select-none font-mono text-[11px] text-black/45 hover:text-black/70">
+            Context breakdown
+          </summary>
+          <div className="mt-1 border-l-2 border-black/20 pl-2">
+            <div className="flex h-2 overflow-hidden border border-black/20 bg-black/5">
+              {breakdown.map((section) => (
+                <div
+                  key={section.key}
+                  className="h-full"
+                  title={`${section.label}: ~${formatCompactCount(section.approx_token_count)} tok`}
+                  style={{
+                    width: `${Math.max(section.percentage, 2)}%`,
+                    background: contextSectionColor(section.key),
+                  }}
+                />
+              ))}
+            </div>
+            <div className="mt-1 grid gap-1">
+              {breakdown.map((section) => (
+                <div
+                  key={section.key}
+                  className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 font-mono text-[11px]"
+                >
+                  <span className="min-w-0 truncate text-black/55">
+                    <span
+                      className="mr-1 inline-block h-2 w-2 border border-black/20 align-[-1px]"
+                      style={{ background: contextSectionColor(section.key) }}
+                    />
+                    {section.label}
+                  </span>
+                  <span className="text-black/45">
+                    {`~${formatCompactCount(section.approx_token_count)} tok · ${formatPercentage(section.percentage)}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function getPromptStats(
+  meta?: Record<string, unknown>,
+): PromptStatsMeta | null {
+  const stats = asRecord(meta?.prompt_stats) ?? asRecord(meta?.promptStats);
+  if (!stats) return null;
+  const char_count = asNumber(stats.char_count ?? stats.charCount);
+  const byte_count = asNumber(stats.byte_count ?? stats.byteCount);
+  const approx_token_count = asNumber(
+    stats.approx_token_count ?? stats.approxTokenCount,
+  );
+  if (
+    char_count === null ||
+    byte_count === null ||
+    approx_token_count === null
+  ) {
+    return null;
+  }
+  return { char_count, byte_count, approx_token_count };
+}
+
+function getPromptBreakdown(
+  meta?: Record<string, unknown>,
+): PromptBreakdownSection[] {
+  const breakdown =
+    asRecord(meta?.prompt_breakdown) ?? asRecord(meta?.promptBreakdown);
+  const rawSections = breakdown?.sections;
+  if (!Array.isArray(rawSections)) return [];
+  return rawSections
+    .map((raw) => {
+      const section = asRecord(raw);
+      if (!section) return null;
+      const key = asStringValue(section.key);
+      const label = asStringValue(section.label);
+      const char_count = asNumber(section.char_count ?? section.charCount);
+      const byte_count = asNumber(section.byte_count ?? section.byteCount);
+      const approx_token_count = asNumber(
+        section.approx_token_count ?? section.approxTokenCount,
+      );
+      const percentage = asNumber(section.percentage);
+      if (
+        !key ||
+        !label ||
+        char_count === null ||
+        byte_count === null ||
+        approx_token_count === null ||
+        percentage === null
+      ) {
+        return null;
+      }
+      return {
+        key,
+        label,
+        char_count,
+        byte_count,
+        approx_token_count,
+        percentage,
+      };
+    })
+    .filter((section): section is PromptBreakdownSection => Boolean(section));
+}
+
+function getTokenUsage(meta?: Record<string, unknown>): TokenUsageMeta | null {
+  const usage = asRecord(meta?.token_usage) ?? asRecord(meta?.tokenUsage);
+  if (!usage) return null;
+  const increment = parseUsage(usage.increment);
+  const cumulative = parseUsage(usage.cumulative);
+  if (!increment && !cumulative) return null;
+  return { increment: increment ?? undefined, cumulative: cumulative ?? undefined };
+}
+
+function parseUsage(raw: unknown): TokenUsage | null {
+  const usage = asRecord(raw);
+  if (!usage) return null;
+  const parsed: TokenUsage = {
+    input_tokens: asOptionalNumber(usage.input_tokens ?? usage.inputTokens),
+    output_tokens: asOptionalNumber(usage.output_tokens ?? usage.outputTokens),
+    total_tokens: asOptionalNumber(usage.total_tokens ?? usage.totalTokens),
+    total_cost_usd: asOptionalNumber(usage.total_cost_usd ?? usage.totalCostUsd),
+    estimated: usage.estimated === true,
+  };
+  if (
+    parsed.input_tokens === undefined &&
+    parsed.output_tokens === undefined &&
+    parsed.total_tokens === undefined &&
+    parsed.total_cost_usd === undefined
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatTokenUsage(usage: TokenUsage, includeDelta: boolean): string {
+  const total =
+    usage.total_tokens ??
+    sumDefined([usage.input_tokens, usage.output_tokens]);
+  const prefix = includeDelta ? "+" : "";
+  const approx = usage.estimated ? "~" : "";
+  const cost =
+    typeof usage.total_cost_usd === "number"
+      ? ` · $${usage.total_cost_usd.toFixed(4)}`
+      : "";
+  if (typeof total !== "number") return cost.trim().replace(/^· /, "") || "n/a";
+  return `${prefix}${approx}${formatCompactCount(total)} tok${cost}`;
+}
+
+function sumDefined(values: Array<number | undefined>): number | undefined {
+  let total = 0;
+  let seen = false;
+  for (const value of values) {
+    if (typeof value !== "number") continue;
+    total += value;
+    seen = true;
+  }
+  return seen ? total : undefined;
+}
+
+function contextSectionColor(key: string): string {
+  switch (key) {
+    case "identity":
+      return "var(--brutal-cyan)";
+    case "soul":
+      return "var(--brutal-lavender)";
+    case "bootstrap_memory":
+    case "turn_memory":
+      return "var(--brutal-lime)";
+    case "scope_bootstrap":
+      return "var(--brutal-orange)";
+    case "user_message":
+      return "var(--brutal-pink)";
+    default:
+      return "var(--brutal-yellow)";
+  }
+}
+
+function formatCompactCount(value: number): string {
+  if (value >= 1_000_000) return `${trimFixed(value / 1_000_000)}m`;
+  if (value >= 1_000) return `${trimFixed(value / 1_000)}k`;
+  return String(Math.round(value));
+}
+
+function trimFixed(value: number): string {
+  return value.toFixed(value >= 10 ? 0 : 1).replace(/\.0$/, "");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${trimFixed(bytes / 1024 / 1024)} MB`;
+  if (bytes >= 1024) return `${trimFixed(bytes / 1024)} KB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function formatPercentage(value: number): string {
+  if (value >= 10) return `${Math.round(value)}%`;
+  return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asStringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function ActionRequestBody({ bubble }: { bubble: BubbleT }) {

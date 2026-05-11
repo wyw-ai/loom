@@ -136,7 +136,17 @@ export function App() {
               members: string[];
             }
           | undefined;
-        if (channel) channels.upsertChannel(channel);
+        if (channel) {
+          const existing = channels.channels.find((c) => c.id === channel.id);
+          channels.upsertChannel(
+            existing
+              ? {
+                  ...channel,
+                  members: mergeMemberIds(existing.members, channel.members),
+                }
+              : channel,
+          );
+        }
         return;
       }
       case "event.created": {
@@ -336,4 +346,17 @@ function SettingsPlaceholder() {
       </div>
     </div>
   );
+}
+
+function mergeMemberIds(...memberLists: string[][]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const members of memberLists) {
+    for (const member of members) {
+      if (seen.has(member)) continue;
+      seen.add(member);
+      merged.push(member);
+    }
+  }
+  return merged;
 }

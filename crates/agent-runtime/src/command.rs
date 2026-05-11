@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use crate::usage::extract_token_usage_from_text;
 
 /// Per-scope handle to an in-flight subprocess. The PID is set after spawn
 /// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
@@ -174,6 +175,7 @@ impl Adapter for CommandAdapter {
                 scope: Some(prompt.scope),
                 success: false,
                 summary: "empty prompt".into(),
+                usage: None,
             });
             return Ok(());
         }
@@ -291,6 +293,7 @@ fn run_prompt(
                 scope: Some(scope.clone()),
                 success: false,
                 summary: e.clone(),
+                usage: None,
             });
             return Err(e);
         }
@@ -505,10 +508,13 @@ fn spawn_and_collect(
             });
         }
     }
+    let usage = extract_token_usage_from_text(&collected_stdout)
+        .or_else(|| extract_token_usage_from_text(&collected_stderr));
     let _ = sender.send(AdapterEvent::Finished {
         scope: Some(prompt.scope.clone()),
         success,
         summary,
+        usage,
     });
 
     Ok(SpawnOutcome {

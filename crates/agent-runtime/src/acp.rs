@@ -31,8 +31,9 @@ use uuid::Uuid;
 
 use super::adapter::{
     ActionChoice, Adapter, AdapterEvent, AdapterModelChoice, AdapterModelOptions, AdapterPrompt,
-    AdapterStartInfo,
+    AdapterStartInfo, TokenUsage,
 };
+use crate::usage::{extract_token_usage, normalized_usage};
 
 const SHELL_ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
 const TERMINAL_AUTH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -96,7 +97,7 @@ struct AcpShared {
     /// Outstanding `session/prompt` requests we are waiting on. Maps request id
     /// → originating scope so the asynchronous `Finished` event can be tagged
     /// with the right scope when the response comes back.
-    in_flight_prompts: Mutex<HashMap<String, ScopeRef>>,
+    in_flight_prompts: Mutex<HashMap<String, (ScopeRef, String)>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
     /// Reverse map populated when `send_prompt` mints a new ACP session for a
     /// scope. Inbound `session/update` and `session/request_permission` carry
@@ -106,6 +107,10 @@ struct AcpShared {
     /// session id → latest model menu reported by session/new or
     /// session/update. Supports both ACP configOptions and Qoder-style models.
     model_options_by_session: Mutex<HashMap<String, AdapterModelOptions>>,
+    /// session id → token usage observed before the final session/prompt
+    /// response. Some ACP agents report usage as a session/update rather than
+    /// on the prompt response itself.
+    usage_by_session: Mutex<HashMap<String, TokenUsage>>,
     action_namespace: String,
     /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
     /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
@@ -172,10 +177,10 @@ impl AcpAdapter {
         let content = prompt.content;
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let request_id = shared.next_request_id_string();
-            shared
-                .in_flight_prompts
-                .lock()
-                .insert(request_id.clone(), scope_for_prompt.clone());
+            shared.in_flight_prompts.lock().insert(
+                request_id.clone(),
+                (scope_for_prompt.clone(), session_id.clone()),
+            );
             eprintln!(
                 "[joi:acp] session/prompt sent id={} session={} scope={} (in_flight={})",
                 request_id,
@@ -435,6 +440,7 @@ impl AcpAdapter {
                     }));
                 }
                 shared.model_options_by_session.lock().clear();
+                shared.usage_by_session.lock().clear();
             }
             if let Some(ref mut c) = child {
                 drop(c.stdin.take());
@@ -570,6 +576,7 @@ fn start_blocking(
         pending_permissions: Mutex::new(HashMap::new()),
         sessions_by_id: Mutex::new(HashMap::new()),
         model_options_by_session: Mutex::new(HashMap::new()),
+        usage_by_session: Mutex::new(HashMap::new()),
         action_namespace: Uuid::new_v4().to_string(),
         mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
@@ -1278,21 +1285,24 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
         fail_pending_waiters(&shared, "ACP agent disconnected".into());
         {
             let mut prompts = shared.in_flight_prompts.lock();
-            for (req_id, scope) in prompts.drain() {
+            for (req_id, (scope, session_id)) in prompts.drain() {
                 let _ = shared.event_sender.send(AdapterEvent::Error {
                     scope: Some(scope.clone()),
                     message: format!("ACP agent disconnected (pending request {req_id})"),
                 });
+                shared.usage_by_session.lock().remove(&session_id);
                 let _ = shared.event_sender.send(AdapterEvent::Finished {
                     scope: Some(scope),
                     success: false,
                     summary: "agent disconnected".into(),
+                    usage: None,
                 });
             }
         }
         shared.pending_permissions.lock().clear();
         shared.sessions_by_id.lock().clear();
         shared.model_options_by_session.lock().clear();
+        shared.usage_by_session.lock().clear();
         let _ = shared.event_sender.send(AdapterEvent::StatusChange {
             scope: None,
             status: "stopped".into(),
@@ -1408,6 +1418,12 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
         .unwrap_or(Value::Null);
     if let Some(session_id) = session_id.as_deref() {
         update_model_options_for_session(shared, session_id, &update);
+        if let Some(usage) = extract_token_usage(&update) {
+            shared
+                .usage_by_session
+                .lock()
+                .insert(session_id.to_string(), normalized_usage(usage));
+        }
     }
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
         Some("agent_message_chunk") => {
@@ -1457,12 +1473,13 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         let remaining = guard.len();
         popped.map(|scope| (scope, remaining))
     };
-    if let Some((scope, remaining)) = popped {
+    if let Some(((scope, session_id), remaining)) = popped {
         eprintln!(
             "[joi:acp] session/prompt response id={} scope={} (in_flight remaining={})",
             id_key, scope.id, remaining
         );
         if let Some(error) = message.get("error") {
+            shared.usage_by_session.lock().remove(&session_id);
             let _ = shared.event_sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: json_value_to_string(error),
@@ -1471,9 +1488,15 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
                 scope: Some(scope),
                 success: false,
                 summary: json_value_to_string(error),
+                usage: None,
             });
             return;
         }
+        let result = message.get("result").cloned().unwrap_or(Value::Null);
+        let update_usage = shared.usage_by_session.lock().remove(&session_id);
+        let usage = extract_token_usage(&result)
+            .map(normalized_usage)
+            .or(update_usage);
         let stop_reason = message
             .get("result")
             .and_then(|r| r.get("stopReason"))
@@ -1484,6 +1507,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
             scope: Some(scope),
             success: stop_reason != "cancelled",
             summary: stop_reason,
+            usage,
         });
         return;
     }

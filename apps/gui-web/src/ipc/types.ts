@@ -71,6 +71,7 @@ export interface JoiEvent {
   occurredAt: string;
   payload: unknown;
   relations: Relation[];
+  _meta?: Record<string, unknown>;
 }
 
 export type TurnStatus = "open" | "closed" | "failed" | "cancelled";
@@ -213,6 +214,7 @@ export interface Bubble {
   kind: BubbleKind;
   text: string;
   ts: string;
+  meta?: Record<string, unknown>;
   replyToEventId?: string;
   streaming: boolean;
   delivery: DeliveryState;

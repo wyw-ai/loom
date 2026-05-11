@@ -24,7 +24,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
+use crate::usage::extract_token_usage_from_text;
 
 #[derive(Debug, Clone)]
 pub struct InteractiveCommandConfig {
@@ -151,6 +152,7 @@ impl Adapter for InteractiveCommandAdapter {
                 scope: Some(prompt.scope),
                 success: false,
                 summary: "empty prompt".into(),
+                usage: None,
             });
             return Ok(());
         }
@@ -220,6 +222,7 @@ struct RunOutcome {
     stderr: String,
     session_id: String,
     command_signature: String,
+    usage: Option<TokenUsage>,
 }
 
 fn run_prompt(
@@ -254,6 +257,7 @@ fn run_prompt(
                         scope: Some(prompt.scope.clone()),
                         success: false,
                         summary: msg.clone(),
+                        usage: None,
                     });
                     msg
                 })?;
@@ -274,6 +278,7 @@ fn run_prompt(
                 scope: Some(prompt.scope.clone()),
                 success: outcome.success,
                 summary: outcome.summary,
+                usage: outcome.usage,
             });
             Ok(())
         }
@@ -286,6 +291,7 @@ fn run_prompt(
                 scope: Some(prompt.scope),
                 success: false,
                 summary: e.clone(),
+                usage: None,
             });
             Err(e)
         }
@@ -450,6 +456,8 @@ fn run_prompt_inner(
         s.cancel_requested = false;
     }
     let stderr = stderr_handle.join().unwrap_or_default();
+    let usage = extract_token_usage_from_text(&collected)
+        .or_else(|| extract_token_usage_from_text(&stderr));
     Ok(RunOutcome {
         success: success && found_done,
         summary,
@@ -458,6 +466,7 @@ fn run_prompt_inner(
         stderr,
         session_id,
         command_signature,
+        usage,
     })
 }
 

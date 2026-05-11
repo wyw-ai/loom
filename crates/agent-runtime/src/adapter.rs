@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use proto::types::ScopeRef;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -96,6 +97,31 @@ pub struct AdapterModelChoice {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub estimated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Emitted by every adapter back into the runtime.
 #[derive(Debug, Clone)]
 pub enum AdapterEvent {
@@ -125,6 +151,7 @@ pub enum AdapterEvent {
         scope: Option<ScopeRef>,
         success: bool,
         summary: String,
+        usage: Option<TokenUsage>,
     },
     Error {
         scope: Option<ScopeRef>,

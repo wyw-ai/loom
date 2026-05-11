@@ -30,7 +30,7 @@ use proto::methods::{
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus,
+    ActorKind, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,9 +41,10 @@ use tokio::time::{sleep, Duration};
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
+use agent_runtime::usage;
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
-    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, TokenUsage,
 };
 
 use crate::client::Client;
@@ -601,8 +602,11 @@ struct WorkerState {
     /// one-at-a-time when the scope's current turn closes.
     pending_triggers: Mutex<HashMap<String, VecDeque<Event>>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
-    /// `Finished` (and on any non-partial `Text` chunk).
+    /// `Finished`, once final usage metadata is available.
     text_buffer: Mutex<HashMap<String, String>>,
+    /// Provider session usage accumulated per scope. ACP, command, and
+    /// interactive transports all use scope as the session boundary here.
+    usage_totals: Mutex<HashMap<String, TokenUsage>>,
     /// Per-scope first-prompt-seeded set; first prompt for a given scope on a
     /// freshly-started agent gets the bootstrap manifest prepended.
     seeded: Mutex<HashSet<String>>,
@@ -629,6 +633,8 @@ struct ActiveTurn {
     id: String,
     scope: ScopeRef,
     trigger_event_id: String,
+    prompt_stats: PromptStats,
+    prompt_breakdown: PromptBreakdown,
     /// Actor that triggered the current turn — needed when emitting a
     /// `action.request` so we can hand the choice back to them.
     trigger_actor: String,
@@ -637,6 +643,41 @@ struct ActiveTurn {
     /// Finished(cancelled) arrives so that stale completion cannot close the
     /// next turn in the same scope.
     cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptStats {
+    char_count: usize,
+    byte_count: usize,
+    approx_token_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptBreakdown {
+    sections: Vec<PromptBreakdownSection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptBreakdownSection {
+    key: String,
+    label: String,
+    char_count: usize,
+    byte_count: usize,
+    approx_token_count: u64,
+    percentage: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PromptTelemetry {
+    content: String,
+    stats: PromptStats,
+    breakdown: PromptBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TokenUsageMeta {
+    increment: TokenUsage,
+    cumulative: TokenUsage,
 }
 
 #[derive(Debug, Clone)]
@@ -677,6 +718,7 @@ impl WorkerState {
             active_turns: Mutex::new(HashMap::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
+            usage_totals: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
             seen_events: Mutex::new(HashSet::new()),
@@ -751,6 +793,13 @@ impl WorkerState {
     fn take_text(&self, turn_id: &str) -> Option<String> {
         let mut buf = self.text_buffer.lock().expect("text_buffer poisoned");
         buf.remove(turn_id).filter(|s| !s.is_empty())
+    }
+
+    fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
+        let mut totals = self.usage_totals.lock().expect("usage_totals poisoned");
+        let total = totals.entry(scope_id.to_string()).or_default();
+        usage::add_usage(total, increment);
+        usage::normalized_usage(total.clone())
     }
 
     fn take_seed_slot(&self, scope_id: &str) -> bool {
@@ -1430,6 +1479,7 @@ async fn handle_model_action_response(
             "text": text
         }),
         vec![responds_to(&event.id)],
+        None,
     )
     .await?;
     eprintln!(
@@ -1500,6 +1550,7 @@ async fn append_model_selection_failure(
             "text": format!("Failed to set model `{label}` (`{option_id}`): `{err}`.")
         }),
         vec![responds_to(&event.id)],
+        None,
     )
     .await?;
     Ok(())
@@ -1653,6 +1704,7 @@ async fn open_model_picker(
                 "text": text
             }),
             vec![responds_to(&trigger.id)],
+            None,
         )
         .await?;
         return Ok(());
@@ -1697,6 +1749,7 @@ async fn open_model_picker(
                 _meta: None,
             },
         ],
+        None,
     )
     .await?;
     state.record_model_action_request(
@@ -1797,19 +1850,22 @@ async fn dispatch_handoff(
                 }),
             )
             .await?;
+        let user_text = render_prompt(&trigger);
+        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
         let active = ActiveTurn {
             id: turn_res.turn.id.clone(),
             scope: trigger.scope.clone(),
             trigger_event_id: trigger.id.clone(),
+            prompt_stats: prompt.stats.clone(),
+            prompt_breakdown: prompt.breakdown.clone(),
             trigger_actor: trigger.actor_id.clone(),
             cancel_requested: false,
         };
         state.set_turn(active.clone());
 
-        let user_text = render_prompt(&trigger);
-        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
         let adapter_prompt =
-            build_adapter_prompt(client, state, &trigger.scope, prompt, Some(&active)).await?;
+            build_adapter_prompt(client, state, &trigger.scope, prompt.content, Some(&active))
+                .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
@@ -1899,7 +1955,7 @@ async fn compose_envelope_prompt(
     state: &Arc<WorkerState>,
     scope: &ScopeRef,
     user_text: &str,
-) -> String {
+) -> PromptTelemetry {
     let scope_bootstrap =
         if state.take_seed_slot(&scope.id) || command_transport_without_resume(&state.spec) {
             seed_manifest(&state.actor_id, scope)
@@ -1911,16 +1967,34 @@ async fn compose_envelope_prompt(
     let memory_spec = state.spec.memory.as_ref();
 
     if identity_spec.is_none() && memory_spec.is_none() {
-        return if scope_bootstrap.is_empty() {
-            user_text.to_string()
+        let sections = if scope_bootstrap.is_empty() {
+            vec![agent_runtime::PromptSection {
+                name: "user_message",
+                content: user_text.to_string(),
+            }]
         } else {
-            format!("{scope_bootstrap}\n\n=== User message ===\n{user_text}")
+            vec![
+                agent_runtime::PromptSection {
+                    name: "scope_bootstrap",
+                    content: scope_bootstrap.clone(),
+                },
+                agent_runtime::PromptSection {
+                    name: "user_message",
+                    content: format!("=== User message ===\n{user_text}"),
+                },
+            ]
         };
+        let content = sections
+            .iter()
+            .map(|section| section.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return prompt_telemetry(content, &sections);
     }
 
     let channel_id = resolve_channel_for_scope(client, state, scope).await;
 
-    let (prompt, _sections) =
+    let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             profile_dir: &state.profile_dir,
             identity_spec,
@@ -1930,7 +2004,61 @@ async fn compose_envelope_prompt(
             user_message: user_text,
             scope_bootstrap: &scope_bootstrap,
         });
-    prompt
+    prompt_telemetry(prompt, &sections)
+}
+
+fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) -> PromptTelemetry {
+    let stats = prompt_stats(&content);
+    let mut breakdown_sections: Vec<PromptBreakdownSection> = sections
+        .iter()
+        .filter(|section| !section.content.trim().is_empty())
+        .map(|section| {
+            let stats = prompt_stats(&section.content);
+            PromptBreakdownSection {
+                key: section.name.to_string(),
+                label: prompt_section_label(section.name).to_string(),
+                char_count: stats.char_count,
+                byte_count: stats.byte_count,
+                approx_token_count: stats.approx_token_count,
+                percentage: 0.0,
+            }
+        })
+        .collect();
+    let total_tokens = breakdown_sections
+        .iter()
+        .map(|section| section.approx_token_count)
+        .sum::<u64>()
+        .max(1) as f64;
+    for section in &mut breakdown_sections {
+        section.percentage = (section.approx_token_count as f64 / total_tokens) * 100.0;
+    }
+    PromptTelemetry {
+        content,
+        stats,
+        breakdown: PromptBreakdown {
+            sections: breakdown_sections,
+        },
+    }
+}
+
+fn prompt_stats(text: &str) -> PromptStats {
+    PromptStats {
+        char_count: text.chars().count(),
+        byte_count: text.len(),
+        approx_token_count: usage::estimate_tokens(text),
+    }
+}
+
+fn prompt_section_label(name: &str) -> &str {
+    match name {
+        "identity" => "Identity",
+        "soul" => "Soul",
+        "bootstrap_memory" => "Bootstrap Memory",
+        "turn_memory" => "Turn Memory",
+        "scope_bootstrap" => "Scope Bootstrap",
+        "user_message" => "Latest Message",
+        other => other,
+    }
 }
 
 fn command_transport_without_resume(spec: &AgentSpec) -> bool {
@@ -2075,7 +2203,7 @@ async fn translate_one(
         AdapterEvent::Text {
             scope: _,
             content,
-            is_partial,
+            is_partial: _,
         } => {
             let Some(active) = active else {
                 tracing::warn!(actor = %actor_id, "Text event without matching active turn; dropping");
@@ -2092,19 +2220,6 @@ async fn translate_one(
                 json!({ "text": content }),
             )
             .await?;
-            if !is_partial {
-                if let Some(text) = state.take_text(&active.id) {
-                    flush_text(
-                        client,
-                        actor_id,
-                        &active.scope,
-                        &active.id,
-                        &active.trigger_event_id,
-                        text,
-                    )
-                    .await?;
-                }
-            }
         }
         AdapterEvent::ToolUse {
             scope: _,
@@ -2172,6 +2287,7 @@ async fn translate_one(
                 Some(&active.id),
                 payload,
                 relations,
+                None,
             )
             .await?;
             state.record_action_request(appended.event.id.clone(), id.clone());
@@ -2202,6 +2318,7 @@ async fn translate_one(
             scope,
             success,
             summary,
+            usage,
         } => {
             let Some(active) = active else {
                 tracing::warn!(
@@ -2214,6 +2331,7 @@ async fn translate_one(
             if active.cancel_requested {
                 let _ = state.take_text(&active.id);
             } else if let Some(text) = state.take_text(&active.id) {
+                let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
                 flush_text(
                     client,
                     actor_id,
@@ -2221,10 +2339,12 @@ async fn translate_one(
                     &active.id,
                     &active.trigger_event_id,
                     text,
+                    Some(meta),
                 )
                 .await?;
             } else if !success {
                 if let Some(text) = failed_turn_text(&summary) {
+                    let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
                     flush_text(
                         client,
                         actor_id,
@@ -2232,6 +2352,7 @@ async fn translate_one(
                         &active.id,
                         &active.trigger_event_id,
                         text,
+                        Some(meta),
                     )
                     .await?;
                 }
@@ -2253,6 +2374,7 @@ async fn translate_one(
                         "stopReason": summary,
                     }),
                     vec![],
+                    None,
                 )
                 .await;
                 if let Err(e) = close_turn(client, &active.id, status).await {
@@ -2305,6 +2427,40 @@ fn failed_turn_text(summary: &str) -> Option<String> {
     }
 }
 
+fn build_turn_meta(
+    state: &WorkerState,
+    active: &ActiveTurn,
+    provider_usage: Option<&TokenUsage>,
+    output_text: &str,
+) -> Meta {
+    let increment = provider_usage
+        .cloned()
+        .map(usage::normalized_usage)
+        .unwrap_or_else(|| {
+            usage::estimated_usage(active.prompt_stats.approx_token_count, output_text)
+        });
+    let cumulative = state.accumulate_usage(&active.scope.id, &increment);
+    let usage_meta = TokenUsageMeta {
+        increment,
+        cumulative,
+    };
+
+    let mut meta = Meta::new();
+    meta.insert(
+        "prompt_stats".into(),
+        serde_json::to_value(&active.prompt_stats).unwrap_or(Value::Null),
+    );
+    meta.insert(
+        "prompt_breakdown".into(),
+        serde_json::to_value(&active.prompt_breakdown).unwrap_or(Value::Null),
+    );
+    meta.insert(
+        "token_usage".into(),
+        serde_json::to_value(&usage_meta).unwrap_or(Value::Null),
+    );
+    meta
+}
+
 async fn append_trace(
     client: &Arc<Client>,
     turn_id: &str,
@@ -2329,6 +2485,7 @@ async fn append_event(
     turn_id: Option<&str>,
     payload: Value,
     relations: Vec<Relation>,
+    meta: Option<Meta>,
 ) -> Result<EventAppendResult> {
     let mut input = json!({
         "type": kind,
@@ -2339,6 +2496,9 @@ async fn append_event(
     });
     if let Some(t) = turn_id {
         input["turnId"] = json!(t);
+    }
+    if let Some(meta) = meta {
+        input["_meta"] = serde_json::to_value(meta)?;
     }
     let res: EventAppendResult = client
         .call(method::EVENT_APPEND, json!({ "event": input }))
@@ -2354,6 +2514,7 @@ async fn flush_text(
     turn_id: &str,
     trigger_event_id: &str,
     text: String,
+    meta: Option<Meta>,
 ) -> Result<()> {
     let relations = if trigger_event_id.is_empty() {
         vec![]
@@ -2376,6 +2537,7 @@ async fn flush_text(
         Some(turn_id),
         json!({ "contentType": "text/markdown", "text": text }),
         relations,
+        meta,
     )
     .await
     .map(|_| ())

@@ -128,6 +128,8 @@ joi --json artifact read <art_id> [--max-bytes N]\n\
 Send messages, DMs, attachments, and reminders:\n\
 \n\
 ```\n\
+joi --json message send --target '#<channel_id>' --text \"thread title\"   # returns event.id\n\
+joi --json thread create --channel <channel_id> --root-event <event_id> --title \"thread title\"\n\
 joi --json message send --target '#<channel_id>:<root_event_id>' <<'JOIMSG'\n\
 message body\n\
 JOIMSG\n\

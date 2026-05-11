@@ -8,6 +8,74 @@
 
 旧的 server-hosted runtime、server 侧 agent registry、`agent/*` runtime RPC 已删除。
 
+## 0. 当前拓扑图
+
+```mermaid
+flowchart TD
+    subgraph ServerHost["任意部署位置：joi-server"]
+        Server["crates/server<br/>WebSocket JSON-RPC message hub"]
+        Store["store / journal / artifacts / scope skills"]
+        Server --> Store
+    end
+
+    subgraph HumanMachine["人类使用机器"]
+        subgraph Gui["joi-gui 桌面端"]
+            Web["apps/gui-web<br/>React WebView"]
+            Tauri["crates/gui<br/>Tauri IPC / config / forward"]
+            GuiClient["gui ws::Client<br/>direct WS only"]
+            Web --> Tauri
+            Tauri --> GuiClient
+        end
+
+        Chat["joi chat / joi message / one-shot CLI"]
+    end
+
+    subgraph MachineHost["需要运行 agent/service 的机器"]
+        Daemon["joi daemon<br/>user-started machine host + Unix socket proxy"]
+        AgentServe["joi agent serve<br/>user-started legacy/standalone host"]
+        ServiceServe["joi service serve<br/>user-started service host"]
+        AgentWorker["agent workers"]
+        ServiceHost["service plugin workers"]
+        Daemon --> AgentWorker
+        Daemon --> ServiceHost
+        AgentServe --> AgentWorker
+        ServiceServe --> ServiceHost
+    end
+
+    subgraph AgentRuntime["crates/agent-runtime"]
+        Adapter["Adapter trait"]
+        Acp["AcpAdapter"]
+        Command["CommandAdapter"]
+        Interactive["InteractiveCommandAdapter"]
+        Adapter --> Acp
+        Adapter --> Command
+        Adapter --> Interactive
+    end
+
+    Provider["external agent CLI<br/>claude / codex / acp child"]
+
+    GuiClient -- "WS JSON-RPC<br/>workspace.server_url" --> Server
+    Chat -- "WS JSON-RPC or daemon socket" --> Daemon
+    Chat -- "fallback WS JSON-RPC" --> Server
+
+    Daemon -- "proxy WS frames" --> Server
+    Daemon -- "starts/reconciles local agents from desktop.toml" --> AgentWorker
+    Daemon -- "optional local services" --> ServiceHost
+    AgentWorker -- "one WS connection per actor" --> Server
+    ServiceHost -- "one WS connection per service actor" --> Server
+    AgentWorker --> Adapter
+    Adapter --> Provider
+```
+
+关键边界：
+
+- `joi-server` 可以在本机、内网机器或远端机器；GUI 只读取 workspace 的
+  `server_url` 并连接它。
+- GUI 启动时只补齐自身前端运行环境（debug 下的 Vite dev server），不启动
+  `joi-server`，也不启动 `joi daemon`。
+- `joi daemon`、`joi agent serve`、`joi service serve` 都是 server 的外部客户端，
+  由用户在需要运行 agent/service 的机器上显式配置和启动。
+
 ## 1. 进程边界
 
 ### 1.1 joi-server

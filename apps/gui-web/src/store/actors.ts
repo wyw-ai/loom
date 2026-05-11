@@ -11,6 +11,7 @@ interface ActorsState {
   byId: Record<string, Actor>;
   upsert: (actor: Actor) => void;
   upsertMany: (actors: Actor[]) => void;
+  removeMany: (actorIds: string[]) => void;
   clear: () => void;
 }
 
@@ -22,6 +23,12 @@ export const useActors = create<ActorsState>((set) => ({
     set((s) => {
       const next = { ...s.byId };
       for (const a of actors) next[a.id] = a;
+      return { byId: next };
+    }),
+  removeMany: (actorIds) =>
+    set((s) => {
+      const next = { ...s.byId };
+      for (const id of actorIds) delete next[id];
       return { byId: next };
     }),
   clear: () => set({ byId: {} }),

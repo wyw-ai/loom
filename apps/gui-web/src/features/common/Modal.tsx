@@ -304,7 +304,8 @@ function ChannelForm({
         {actors.length > 0 && (
           <div>
             <label className="mb-1 block text-sm font-black uppercase tracking-wide">
-              Members <span className="text-black/40 normal-case">(optional)</span>
+              Initial members{" "}
+              <span className="text-black/40 normal-case">(optional)</span>
             </label>
             <SearchInput
               value={filter}

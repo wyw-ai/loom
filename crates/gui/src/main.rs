@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod dev_frontend;
 mod forward;
 mod ipc;
 mod state;
@@ -22,6 +23,8 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,joi_gui=debug")),
         )
         .init();
+
+    let _dev_frontend = dev_frontend::DevFrontend::start_if_needed();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -53,6 +56,8 @@ fn main() {
             ipc::event_append,
             ipc::turn_close,
             ipc::actor_list,
+            ipc::actor_upsert,
+            ipc::actor_delete,
             ipc::agent_list,
             ipc::agent_create,
             ipc::agent_update,

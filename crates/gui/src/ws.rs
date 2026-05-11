@@ -57,36 +57,24 @@ impl Client {
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
                     Message::Close(_) => break,
                 };
-                let envelope: RpcEnvelope = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(%e, frame = %text, "bad frame");
-                        continue;
-                    }
-                };
-                match envelope {
-                    RpcEnvelope::Response(r) => {
-                        let key = id_to_key(&r.id);
-                        if let Some(tx) = pending_r.lock().await.remove(&key) {
-                            let _ = tx.send(r);
-                        }
-                    }
-                    RpcEnvelope::Notification(n) => {
-                        let _ = notif_tx.send(n);
-                    }
-                    RpcEnvelope::Request(_) => {
-                        // Server doesn't send requests in v0.
-                    }
-                }
+                dispatch_frame(text, &pending_r, &notif_tx).await;
             }
         });
 
-        Ok(Arc::new(Self {
+        Ok(Self::new(out_tx, pending, notif_rx))
+    }
+
+    fn new(
+        out_tx: mpsc::UnboundedSender<String>,
+        pending: Pending,
+        notif_rx: mpsc::UnboundedReceiver<Notification>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             out_tx,
             pending,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             notifications: Mutex::new(Some(notif_rx)),
-        }))
+        })
     }
 
     pub async fn take_notifications(&self) -> Option<mpsc::UnboundedReceiver<Notification>> {
@@ -152,6 +140,34 @@ impl Client {
             })),
         )
         .await
+    }
+}
+
+async fn dispatch_frame(
+    text: String,
+    pending: &Pending,
+    notif_tx: &mpsc::UnboundedSender<Notification>,
+) {
+    let envelope: RpcEnvelope = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%e, frame = %text, "bad frame");
+            return;
+        }
+    };
+    match envelope {
+        RpcEnvelope::Response(r) => {
+            let key = id_to_key(&r.id);
+            if let Some(tx) = pending.lock().await.remove(&key) {
+                let _ = tx.send(r);
+            }
+        }
+        RpcEnvelope::Notification(n) => {
+            let _ = notif_tx.send(n);
+        }
+        RpcEnvelope::Request(_) => {
+            // Server doesn't send requests in v0.
+        }
     }
 }
 

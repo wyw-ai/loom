@@ -125,9 +125,12 @@ export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 
 ## 本地 GUI 打包
 
-`joi-gui` 是 Tauri 2 桌面壳，前端在 `apps/gui-web/`。GUI 只是客户端，不内嵌
-`joi-server`，也不负责托管 agent；使用 GUI 前仍要启动 server，agent 能力仍由
-独立的 `joi agent serve` 进程提供。
+`joi-gui` 是 Tauri 2 桌面壳，前端在 `apps/gui-web/`。开发期用
+`cargo run -p joi-gui` 直接启动时，桌面壳会在 debug 模式下补起 Vite dev server；
+不会启动或托管 `joi-server`。GUI 永远连接 workspace 配置里的 `server_url`，
+服务端可以部署在本机、内网或远端。GUI 也不会启动 `joi daemon`；machine/daemon
+需要由用户在对应机器上按需配置和启动。要禁用 Vite 自启动，设置
+`JOI_GUI_NO_DEV_SERVER=1`。
 
 一次性准备：
 

@@ -118,6 +118,17 @@ export interface MachineConfig {
   kind: string;
   specsDir: string;
   dataRoot: string;
+  agents?: MachineAgentConfig[];
+}
+
+export interface MachineAgentConfig {
+  providerId: string;
+  actorId: string;
+  name: string;
+  description?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
 }
 
 export interface DesktopConfig {

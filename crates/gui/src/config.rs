@@ -1,6 +1,6 @@
 //! Local GUI config.
 //!
-//! Layout: `~/.config/joi-apps/desktop.toml`
+//! Layout: `~/.joi-apps/desktop.toml`
 //!
 //! ```toml
 //! active = "default"
@@ -25,6 +25,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const ENV_CONFIG_DIR: &str = "JOI_CONFIG_DIR";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -47,6 +49,24 @@ pub struct MachineConfig {
     pub kind: String,
     pub specs_dir: String,
     pub data_root: String,
+    #[serde(default)]
+    pub agents: Vec<MachineAgentConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineAgentConfig {
+    pub provider_id: String,
+    pub actor_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -60,8 +80,11 @@ pub struct DesktopConfig {
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("joi-apps"))
+    if let Some(value) = std::env::var_os(ENV_CONFIG_DIR).filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".joi-apps"))
         .unwrap_or_else(|| PathBuf::from(".joi-apps"))
 }
 
@@ -74,6 +97,7 @@ fn legacy_cli_config_path() -> PathBuf {
 }
 
 pub fn load_or_init() -> Result<DesktopConfig> {
+    migrate_legacy_configs();
     let path = desktop_config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(cfg) = toml::from_str::<DesktopConfig>(&text) {
@@ -96,6 +120,65 @@ pub fn save(cfg: &DesktopConfig) -> Result<()> {
     let _ = std::fs::create_dir_all(config_dir());
     let text = toml::to_string_pretty(cfg)?;
     std::fs::write(desktop_config_path(), text)?;
+    Ok(())
+}
+
+fn migrate_legacy_configs() {
+    let Some(legacy_root) = legacy_config_dir() else {
+        return;
+    };
+    let new_root = config_dir();
+    copy_legacy_file(&legacy_root, &new_root, "cli.toml");
+    copy_legacy_file(&legacy_root, &new_root, "desktop.toml");
+    copy_legacy_dir(&legacy_agent_specs_dir(), &default_agent_specs_dir());
+}
+
+fn legacy_config_dir() -> Option<PathBuf> {
+    dirs::config_dir()
+        .map(|dir| dir.join("joi-apps"))
+        .filter(|dir| dir != &config_dir())
+}
+
+fn legacy_agent_specs_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|dir| dir.join("joi").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+}
+
+fn copy_legacy_file(legacy_root: &Path, new_root: &Path, file_name: &str) {
+    let source = legacy_root.join(file_name);
+    let dest = new_root.join(file_name);
+    if dest.exists() || !source.is_file() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(source, dest);
+}
+
+fn copy_legacy_dir(source: &Path, dest: &Path) {
+    if dest.exists() || !source.is_dir() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = copy_dir_recursive(source, dest);
+}
+
+fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else if ty.is_file() && !dest_path.exists() {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
     Ok(())
 }
 
@@ -127,9 +210,7 @@ pub fn generate_machine_id() -> String {
 }
 
 pub fn default_agent_specs_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+    config_dir().join("agents")
 }
 
 pub fn default_agent_data_root() -> PathBuf {
@@ -204,6 +285,7 @@ pub fn default_machine_for_workspace(workspace_id: &str) -> MachineConfig {
         kind: default_machine_kind(),
         specs_dir: machine_specs_dir_expr(&workspace_key, "local"),
         data_root: machine_data_root_expr(&workspace_key, "local"),
+        agents: Vec::new(),
     }
 }
 
@@ -282,6 +364,7 @@ fn default_machine() -> MachineConfig {
         kind: default_machine_kind(),
         specs_dir: default_agent_specs_dir_expr(),
         data_root: default_agent_data_root_expr(),
+        agents: Vec::new(),
     }
 }
 

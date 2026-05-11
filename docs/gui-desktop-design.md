@@ -11,7 +11,8 @@
 1. 为人类 actor 提供一个持续驻留、桌面原生的工作台（mac / linux），取代 TUI 的长连接窗口。
 2. **完全等价**地覆盖 TUI 当前所有交互：channel/thread 浏览、发送、流式接收、@handoff、`/slash`、reply target、cancel turn、action.request 审批、announcement 面板、channel 邀请/撤销、跨 scope 的 action.request inbox。
 3. 视觉与交互向 Discord 的「服务器栏 · 频道栏 · 主内容 · 成员栏」四栏范式看齐，便于新用户零学习成本。
-4. 不引入任何新的 WS 方法、不改 joi-server。GUI 只是 `joi-cli` 能做之事的可视化表面。
+4. 不引入任何新的 WS 方法。GUI 仍是协议客户端，不托管 `joi-server`，
+   也不启动 `joi daemon`；machine/daemon 由用户在目标机器上自行配置和启动。
 
 ### 非目标
 
@@ -21,6 +22,43 @@
 - **不**字面拷贝 Discord 的 CSS / 位图资源（版权与法律风险）。我们复刻的是**设计语言**：三/四栏骨架、深色配色比例、消息组、reactions、@mention picker、slash palette、bell inbox、context menu。
 
 ## 2. 技术栈与工程结构
+
+### 2.0 运行拓扑
+
+```mermaid
+flowchart LR
+    subgraph Desktop["本机桌面进程：joi-gui"]
+        Web["React WebView<br/>apps/gui-web"]
+        IPC["Tauri IPC<br/>crates/gui/src/ipc.rs"]
+        Client["GUI Client<br/>crates/gui/src/ws.rs"]
+        Forward["forward.rs<br/>server notifications -> Tauri events"]
+
+        Web -- "invoke / listen" --> IPC
+        IPC --> Client
+        Client --> Forward
+        Forward -- "joi://stream / joi://connection" --> Web
+    end
+
+    subgraph MachineHost["需要运行 agent/service 的机器"]
+        Daemon["joi daemon<br/>user configured / user started"]
+        Agent["local agent workers"]
+        Service["optional service host"]
+        Daemon --> Agent
+        Daemon --> Service
+    end
+
+    Server["joi-server<br/>configured workspace.server_url<br/>can be local / intranet / remote"]
+
+    Client -- "direct WS JSON-RPC<br/>workspace.server_url" --> Server
+    Daemon -- "WS JSON-RPC proxy / actor connections" --> Server
+    Agent -- "WS JSON-RPC actor connection" --> Server
+    Service -- "WS JSON-RPC service connection" --> Server
+```
+
+这条边界必须保持稳定：GUI 可以为了 `cargo run -p joi-gui` 的开发体验补起 Vite dev
+server；但 `joi-server` 和 `joi daemon` 都是用户显式管理的外部进程。GUI 启动不
+依赖它们已经在线，也不负责拉起它们；用户在 GUI 里选择 workspace 后，才按
+`server_url` 尝试连接对应服务端。
 
 ### 2.1 栈
 

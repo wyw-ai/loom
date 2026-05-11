@@ -2,11 +2,20 @@ import { useEffect, useMemo, useRef } from "react";
 
 import type { Bubble as BubbleModel, ScopeRef } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
+import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
 import { Bubble, type BubbleReplyContext } from "./Bubble";
 
 export function MessageList({ scope }: { scope: ScopeRef }) {
   const scopeStore = useMessages((s) => s.byScope[scopeKey(scope)]);
+  const rootEventId = useChannels((s) => {
+    if (scope.kind !== "thread") return undefined;
+    for (const threads of Object.values(s.threadsByChannel)) {
+      const thread = threads.find((t) => t.id === scope.id);
+      if (thread?.rootEventId) return thread.rootEventId;
+    }
+    return undefined;
+  });
   const bubbles = scopeStore?.bubbles ?? [];
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -54,6 +63,7 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
               const replyContext = buildReplyContext(
                 b.replyToEventId,
                 bubblesById,
+                rootEventId,
               );
               return (
                 <Bubble
@@ -76,8 +86,10 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
 function buildReplyContext(
   replyToEventId: string | undefined,
   bubblesById: Map<string, BubbleModel>,
+  threadRootEventId: string | undefined,
 ): BubbleReplyContext | undefined {
   if (!replyToEventId) return undefined;
+  if (replyToEventId === threadRootEventId) return undefined;
   const target = bubblesById.get(replyToEventId);
   if (!target) {
     return {

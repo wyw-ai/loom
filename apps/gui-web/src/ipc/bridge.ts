@@ -124,7 +124,7 @@ export async function channelRevoke(params: {
 export async function threadCreate(params: {
   channelId: string;
   title: string;
-  rootEventId?: string;
+  rootEventId: string;
 }): Promise<{ thread: Thread }> {
   return invoke("thread_create", { params });
 }
@@ -198,6 +198,14 @@ export async function actorList(): Promise<{ actors: Actor[] }> {
   return invoke("actor_list");
 }
 
+export async function actorUpsert(actor: Actor): Promise<{ actor: Actor }> {
+  return invoke("actor_upsert", { params: { actor } });
+}
+
+export async function actorDelete(actorId: string): Promise<{ deleted: boolean }> {
+  return invoke("actor_delete", { params: { actorId } });
+}
+
 export async function agentList(): Promise<{
   agents: AgentInfo[];
 }> {
@@ -211,6 +219,7 @@ export async function agentCreate(args: {
   name: string;
   description?: string;
   model?: string;
+  reasoningEffort?: string;
   autostart?: boolean;
 }): Promise<AgentInfo> {
   return invoke("agent_create", { args });
@@ -227,6 +236,10 @@ export async function agentUpdate(args: {
   actorId: string;
   displayName?: string;
   description?: string;
+  providerId?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
 }): Promise<AgentInfo> {
   return invoke("agent_update", { args });
 }
@@ -260,6 +273,7 @@ export async function machineAgentCreate(args: {
   name: string;
   description?: string;
   model?: string;
+  reasoningEffort?: string;
   autostart?: boolean;
 }): Promise<{ machines: MachineInfo[] }> {
   return invoke("machine_agent_create", { args });

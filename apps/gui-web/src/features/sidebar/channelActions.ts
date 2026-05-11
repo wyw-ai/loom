@@ -3,7 +3,7 @@
 // and the flow is easy to unit-test.
 
 import * as ipc from "@/ipc/bridge";
-import type { Channel, Thread } from "@/ipc/types";
+import type { Actor, Channel, Thread } from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
@@ -29,6 +29,7 @@ export function openCreateChannel() {
           useChannels.getState().upsertChannel(channel);
           for (const invitee of actorIds) {
             try {
+              await upsertKnownActor(invitee);
               await ipc.channelInvite({
                 channelId: channel.id,
                 actorId: invitee,
@@ -119,11 +120,10 @@ export function openInviteToChannel(channel: Channel) {
   // Pre-load actor directory so the picker has names, then show.
   (async () => {
     let actors: Array<{ id: string; label: string; hint: string }> = [];
+    const known = await loadKnownActors();
     try {
-      const r = await ipc.actorList();
-      useActors.getState().upsertMany(r.actors);
       const already = new Set(channel.members);
-      actors = r.actors
+      actors = known
         .filter((a) => !already.has(a.id))
         .map((a) => ({
           id: a.id,
@@ -135,7 +135,7 @@ export function openInviteToChannel(channel: Channel) {
         .getState()
         .pushToast(
           "error",
-          `actor/list: ${e instanceof Error ? e.message : String(e)}`,
+          `actor list: ${e instanceof Error ? e.message : String(e)}`,
         );
       return;
     }
@@ -151,6 +151,7 @@ export function openInviteToChannel(channel: Channel) {
       items: actors,
       onPick: async (actorId) => {
         try {
+          await upsertKnownActor(actorId);
           const r = await ipc.channelInvite({
             channelId: channel.id,
             actorId,
@@ -192,8 +193,26 @@ export function openCreateThread(channelId: string) {
     onSubmit: async (title) => {
       const t = title.trim();
       if (!t) return;
+      const actorId = useSession.getState().workspace?.actorId;
+      if (!actorId) {
+        useUI
+          .getState()
+          .pushToast("error", "connect a workspace before creating a thread");
+        return;
+      }
       try {
-        const r = await ipc.threadCreate({ channelId, title: t });
+        const root = await ipc.eventAppend({
+          type: "content.add",
+          actorId,
+          scope: { kind: "channel", id: channelId },
+          payload: { contentType: "text/markdown", text: t },
+          relations: [],
+        });
+        const r = await ipc.threadCreate({
+          channelId,
+          rootEventId: root.event.id,
+          title: t,
+        });
         useChannels.getState().upsertThread(r.thread);
         await openScope({ kind: "thread", id: r.thread.id });
       } catch (e) {
@@ -211,19 +230,45 @@ export function openCreateThread(channelId: string) {
 async function loadActorItems(): Promise<
   Array<{ id: string; label: string; hint?: string; kind?: string }>
 > {
+  const actors = await loadKnownActors();
+  return actors
+    .filter((a) => a.kind !== "service")
+    .map((a) => ({
+      id: a.id,
+      label: a.displayName || a.id,
+      hint: a.kind,
+      kind: a.kind,
+    }));
+}
+
+async function loadKnownActors(): Promise<Actor[]> {
+  const byId = new Map<string, Actor>();
   try {
     const r = await ipc.actorList();
-    useActors.getState().upsertMany(r.actors);
-    return r.actors
-      .filter((a) => a.kind !== "service")
-      .map((a) => ({
-        id: a.id,
-        label: a.displayName || a.id,
-        hint: a.kind,
-        kind: a.kind,
-      }));
+    for (const actor of r.actors) byId.set(actor.id, actor);
   } catch {
-    return [];
+    /* machine-config agents below still give the picker useful options */
+  }
+  try {
+    const r = await ipc.machineList();
+    for (const agent of r.machines.flatMap((machine) => machine.agents)) {
+      byId.set(agent.spec.actor.id, agent.spec.actor);
+    }
+  } catch {
+    /* fall back to server actors only */
+  }
+  const actors = [...byId.values()];
+  useActors.getState().upsertMany(actors);
+  return actors;
+}
+
+async function upsertKnownActor(actorId: string) {
+  const actor = useActors.getState().byId[actorId];
+  if (!actor) return;
+  try {
+    await ipc.actorUpsert(actor);
+  } catch {
+    /* channel/invite will surface the connection error if the server is down */
   }
 }
 

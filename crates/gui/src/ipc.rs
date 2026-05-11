@@ -13,6 +13,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agent_runtime::discovery::{
+    detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
+    DetectedAgentProvider,
+};
 use proto::methods::method;
 use proto::methods::{
     AgentActorSpec, AgentInfo, AgentListResult, AgentModelChoice, AgentProviderSpec, AgentSpec,
@@ -22,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::config::{self, DesktopConfig, MachineConfig, Workspace};
+use crate::config::{self, DesktopConfig, MachineAgentConfig, MachineConfig, Workspace};
 use crate::forward;
 use crate::state::AppState;
 use crate::ws::Client;
@@ -354,6 +358,26 @@ pub async fn actor_list(state: State<'_, AppState>) -> Result<Value, String> {
         .map_err(stringify)
 }
 
+#[tauri::command]
+pub async fn actor_upsert(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ACTOR_UPSERT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn actor_delete(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ACTOR_DELETE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
 // ---- local agent / machine management -------------------------------------
 
 #[tauri::command]
@@ -385,6 +409,8 @@ pub struct AgentCreateArgs {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default)]
     pub autostart: bool,
 }
 
@@ -409,9 +435,13 @@ pub struct AgentRemoveArgs {
 }
 
 #[tauri::command]
-pub async fn agent_remove(args: AgentRemoveArgs) -> Result<AgentListResult, String> {
+pub async fn agent_remove(
+    state: State<'_, AppState>,
+    args: AgentRemoveArgs,
+) -> Result<AgentListResult, String> {
     let specs_dir = agent_specs_dir_for(args.machine_id.as_deref()).map_err(stringify)?;
     remove_agent_by_actor_id_from_dir(&args.actor_id, &specs_dir).map_err(stringify)?;
+    delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
     agent_list().await
 }
 
@@ -425,10 +455,21 @@ pub struct AgentUpdateArgs {
     pub display_name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub autostart: Option<bool>,
 }
 
 #[tauri::command]
 pub async fn agent_update(args: AgentUpdateArgs) -> Result<AgentInfo, String> {
+    if let Some(info) = update_machine_agent_in_config(&args).map_err(stringify)? {
+        return Ok(info);
+    }
     let specs_dir = agent_specs_dir_for(args.machine_id.as_deref()).map_err(stringify)?;
     let spec = update_agent_spec_in_dir(args, &specs_dir).map_err(stringify)?;
     Ok(AgentInfo {
@@ -547,6 +588,7 @@ pub async fn machine_create(
         kind: "local".into(),
         specs_dir: specs_dir_expr,
         data_root: data_root_expr,
+        agents: Vec::new(),
     });
     config::save(&cfg).map_err(stringify)?;
     machines_from_config(&cfg, state.try_client().await).await
@@ -584,6 +626,15 @@ pub async fn machine_remove(
     }
     let before = cfg.machines.len();
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let server_url = active_server_url(&cfg).to_string();
+    let actor_ids = cfg
+        .machines
+        .iter()
+        .find(|machine| {
+            machine.id == args.machine_id && machine.workspace_id == active_workspace_id
+        })
+        .map(|machine| actor_ids_for_machine(machine, &server_url))
+        .unwrap_or_default();
     cfg.machines.retain(|machine| {
         machine.id != args.machine_id || machine.workspace_id != active_workspace_id
     });
@@ -591,6 +642,7 @@ pub async fn machine_remove(
         return Err(format!("unknown machine id: {}", args.machine_id));
     }
     config::save(&cfg).map_err(stringify)?;
+    delete_actors_from_server(state.try_client().await, &actor_ids).await;
     machines_from_config(&cfg, state.try_client().await).await
 }
 #[tauri::command]
@@ -598,18 +650,70 @@ pub async fn machine_agent_create(
     state: State<'_, AppState>,
     args: AgentCreateArgs,
 ) -> Result<MachineListResult, String> {
-    if args
+    let machine_id = args
         .machine_id
         .as_deref()
         .unwrap_or_default()
         .trim()
-        .is_empty()
-    {
+        .to_string();
+    if machine_id.is_empty() {
         return Err("machine id is required".into());
     }
-    let specs_dir = agent_specs_dir_for(args.machine_id.as_deref()).map_err(stringify)?;
-    add_agent_actor_to_provider(args, &specs_dir).map_err(stringify)?;
-    let cfg = config::load_or_init().map_err(stringify)?;
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err("agent name is required".into());
+    }
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let actor_id = actor_id_from_input(&args.actor_id, name).map_err(stringify)?;
+    let machine_index = cfg
+        .machines
+        .iter()
+        .position(|machine| machine.id == machine_id && machine.workspace_id == active_workspace_id)
+        .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
+    if cfg.machines[machine_index]
+        .agents
+        .iter()
+        .any(|agent| agent.actor_id == actor_id)
+    {
+        return Err(format!("agent actor already exists: {actor_id}"));
+    }
+    let providers = detect_agent_cli_providers();
+    if !providers
+        .iter()
+        .any(|provider| provider.id == args.provider_id)
+    {
+        let specs_dir =
+            normalize_local_path(config::expand_home(&cfg.machines[machine_index].specs_dir))
+                .map_err(stringify)?;
+        add_agent_actor_to_provider(args, &specs_dir).map_err(stringify)?;
+        return machines_from_config(&cfg, state.try_client().await).await;
+    }
+    let actor_id_for_upsert = actor_id.clone();
+    cfg.machines[machine_index].agents.push(MachineAgentConfig {
+        provider_id: args.provider_id,
+        actor_id,
+        name: name.to_string(),
+        description: args.description.trim().to_string(),
+        model: args.model.trim().to_string(),
+        reasoning_effort: args.reasoning_effort.trim().to_string(),
+        autostart: args.autostart,
+    });
+    config::save(&cfg).map_err(stringify)?;
+    if let Some(client) = state.try_client().await {
+        let _ = client
+            .call_raw(
+                method::ACTOR_UPSERT,
+                Some(json!({
+                    "actor": {
+                        "id": actor_id_for_upsert,
+                        "kind": "agent",
+                        "displayName": name,
+                    }
+                })),
+            )
+            .await;
+    }
     machines_from_config(&cfg, state.try_client().await).await
 }
 
@@ -625,10 +729,72 @@ pub async fn machine_agent_remove(
     state: State<'_, AppState>,
     args: MachineAgentRemoveArgs,
 ) -> Result<MachineListResult, String> {
-    let specs_dir = agent_specs_dir_for(Some(&args.machine_id)).map_err(stringify)?;
-    remove_agent_by_actor_id_from_dir(&args.actor_id, &specs_dir).map_err(stringify)?;
-    let cfg = config::load_or_init().map_err(stringify)?;
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let machine = cfg
+        .machines
+        .iter_mut()
+        .find(|machine| {
+            machine.id == args.machine_id && machine.workspace_id == active_workspace_id
+        })
+        .ok_or_else(|| format!("unknown machine id: {}", args.machine_id))?;
+    let before = machine.agents.len();
+    machine
+        .agents
+        .retain(|agent| agent.actor_id != args.actor_id);
+    if machine.agents.len() == before {
+        let specs_dir = agent_specs_dir_for(Some(&args.machine_id)).map_err(stringify)?;
+        remove_agent_by_actor_id_from_dir(&args.actor_id, &specs_dir).map_err(stringify)?;
+    } else {
+        config::save(&cfg).map_err(stringify)?;
+    }
+    delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
     machines_from_config(&cfg, state.try_client().await).await
+}
+
+async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[String]) {
+    let Some(client) = client else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    for actor_id in actor_ids {
+        let actor_id = actor_id.trim();
+        if actor_id.is_empty() || !seen.insert(actor_id.to_string()) {
+            continue;
+        }
+        if let Err(err) = client
+            .call_raw(
+                method::ACTOR_DELETE,
+                Some(json!({
+                    "actorId": actor_id,
+                })),
+            )
+            .await
+        {
+            tracing::warn!(%actor_id, %err, "failed to delete actor from server");
+        }
+    }
+}
+
+fn actor_ids_for_machine(machine: &MachineConfig, server_url: &str) -> Vec<String> {
+    let mut actor_ids = vec![machine_connection_actor_id(machine)];
+    actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
+    match machine_info(machine, server_url) {
+        Ok(info) => {
+            actor_ids.extend(info.agents.into_iter().map(|agent| agent.spec.actor.id));
+        }
+        Err(err) => {
+            tracing::warn!(
+                machine_id = %machine.id,
+                %err,
+                "failed to read machine agents while deleting machine; falling back to config agents"
+            );
+            actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
+        }
+    }
+    actor_ids.sort();
+    actor_ids.dedup();
+    actor_ids
 }
 
 fn stringify(e: anyhow::Error) -> String {
@@ -757,54 +923,71 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
     } else {
         config::expand_home(&machine.data_root)
     };
-    let provider_specs = load_agent_providers_from_dir(&specs_dir)?;
-    let providers = provider_specs
+    let detected_providers = detect_agent_cli_providers();
+    let file_provider_specs = load_agent_providers_from_dir(&specs_dir)?;
+    let mut providers = detected_providers
         .iter()
-        .map(|(_, provider)| provider_summary(provider))
+        .map(detected_provider_summary)
         .collect::<Vec<_>>();
-    let agents: Vec<AgentInfo> = agent_specs_from_providers(
-        provider_specs
+    let detected_ids = providers
+        .iter()
+        .map(|provider| provider.id.clone())
+        .collect::<HashSet<_>>();
+    providers.extend(
+        file_provider_specs
             .iter()
-            .map(|(_, provider)| provider.clone())
-            .collect(),
-    )
-    .into_iter()
-    .map(|spec| AgentInfo {
-        spec,
-        status: "registered".into(),
-        pid: None,
-        session_id: None,
-    })
-    .collect();
-    let setup_status = if !specs_dir.exists() {
-        "missing"
-    } else if providers.is_empty() {
-        "empty"
+            .map(|(_, provider)| provider_summary(provider))
+            .filter(|provider| !detected_ids.contains(&provider.id)),
+    );
+    for provider in &mut providers {
+        provider.actor_count += machine
+            .agents
+            .iter()
+            .filter(|agent| agent.provider_id == provider.id)
+            .count();
+    }
+    let machine_agent_defs = machine
+        .agents
+        .iter()
+        .map(machine_agent_definition)
+        .collect::<Vec<_>>();
+    let mut provider_specs =
+        provider_specs_from_agent_definitions(&detected_providers, &machine_agent_defs);
+    provider_specs.extend(
+        file_provider_specs
+            .iter()
+            .map(|(_, provider)| provider.clone()),
+    );
+    let agents: Vec<AgentInfo> = agent_specs_from_providers(provider_specs)
+        .into_iter()
+        .map(|spec| AgentInfo {
+            spec,
+            status: "registered".into(),
+            pid: None,
+            session_id: None,
+        })
+        .collect();
+    let setup_status = if providers.is_empty() {
+        "noCli"
+    } else if agents.is_empty() {
+        "ready"
     } else {
         "configured"
     };
     let connection_actor_id = machine_connection_actor_id(machine);
-    let specs_dir_arg = shell_path_arg(&specs_dir);
     let data_root_arg = shell_path_arg(&data_root);
     let serve_command = format!(
-        "JOI_MACHINE_ID={} JOI_MACHINE_ACTOR_ID={} JOI_MACHINE_NAME={} JOI_AGENT_DATA_ROOT={} joi --server {} agent serve --specs {}",
-        shell_arg(&machine.id),
-        shell_arg(&connection_actor_id),
-        shell_arg(&machine.name),
+        "JOI_AGENT_DATA_ROOT={} joi --server {} daemon --machine-id {}",
         data_root_arg,
         shell_arg(server_url),
-        specs_dir_arg,
+        shell_arg(&machine.id),
     );
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {} {}\nexport JOI_MACHINE_ID={}\nexport JOI_MACHINE_ACTOR_ID={}\nexport JOI_MACHINE_NAME={}\nexport JOI_AGENT_DATA_ROOT={}\nexec joi --server {} agent serve --specs {}\n",
-        shell_path_arg(&specs_dir),
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport JOI_AGENT_DATA_ROOT={}\nexec joi --server {} daemon --machine-id {}\n",
         shell_path_arg(&data_root),
-        shell_arg(&machine.id),
-        shell_arg(&connection_actor_id),
-        shell_arg(&machine.name),
         shell_path_arg(&data_root),
         shell_arg(server_url),
-        shell_path_arg(&specs_dir),
+        shell_arg(&machine.id),
     );
 
     Ok(MachineInfo {
@@ -957,6 +1140,87 @@ fn provider_summary(provider: &AgentProviderSpec) -> MachineAgentProviderInfo {
         default_model: models.default,
         model_choices: models.choices,
     }
+}
+
+fn detected_provider_summary(provider: &DetectedAgentProvider) -> MachineAgentProviderInfo {
+    MachineAgentProviderInfo {
+        id: provider.id.clone(),
+        name: provider.display_name.clone(),
+        transport_kind: provider.transport_kind.clone(),
+        command: provider.command.clone(),
+        args: provider.args.clone(),
+        actor_count: 0,
+        default_model: provider.default_model.clone(),
+        model_choices: provider.model_choices.clone(),
+    }
+}
+
+fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
+    AgentDefinition {
+        provider_id: agent.provider_id.clone(),
+        actor_id: agent.actor_id.clone(),
+        display_name: agent.name.clone(),
+        description: non_empty(agent.description.trim()),
+        model: non_empty(agent.model.trim()),
+        reasoning_effort: non_empty(agent.reasoning_effort.trim()),
+        autostart: agent.autostart,
+    }
+}
+
+fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Option<AgentInfo>> {
+    let Some(machine_id) = args
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let mut cfg = config::load_or_init()?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let Some(machine_index) = cfg.machines.iter().position(|machine| {
+        machine.id == machine_id && machine.workspace_id == active_workspace_id
+    }) else {
+        return Ok(None);
+    };
+    let Some(agent_index) = cfg.machines[machine_index]
+        .agents
+        .iter()
+        .position(|agent| agent.actor_id == args.actor_id)
+    else {
+        return Ok(None);
+    };
+
+    {
+        let agent = &mut cfg.machines[machine_index].agents[agent_index];
+        if let Some(provider_id) = args.provider_id.as_deref() {
+            agent.provider_id = provider_id.trim().to_string();
+        }
+        if let Some(display_name) = args.display_name.as_deref() {
+            agent.name = display_name.trim().to_string();
+        }
+        if let Some(description) = args.description.as_deref() {
+            agent.description = description.trim().to_string();
+        }
+        if let Some(model) = args.model.as_deref() {
+            agent.model = model.trim().to_string();
+        }
+        if let Some(reasoning_effort) = args.reasoning_effort.as_deref() {
+            agent.reasoning_effort = reasoning_effort.trim().to_string();
+        }
+        if let Some(autostart) = args.autostart {
+            agent.autostart = autostart;
+        }
+    }
+
+    config::save(&cfg)?;
+    let server_url = active_server_url(&cfg).to_string();
+    let machine = machine_info(&cfg.machines[machine_index], &server_url)?;
+    Ok(machine
+        .agents
+        .into_iter()
+        .find(|agent| agent.spec.actor.id == args.actor_id))
 }
 
 fn remove_agent_by_actor_id_from_dir(actor_id: &str, dir: &Path) -> anyhow::Result<()> {

@@ -18,7 +18,12 @@ import {
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { Actor, AgentInfo, MachineInfo } from "@/ipc/types";
+import type {
+  Actor,
+  AgentInfo,
+  AgentProviderSummary,
+  MachineInfo,
+} from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
@@ -26,6 +31,15 @@ import { useUI } from "@/store/ui";
 import { PixelAvatar } from "@/features/common/PixelAvatar";
 
 type AgentTab = "profile" | "dms" | "reminders" | "workspace" | "activity";
+
+const CODEX_MODELS = [
+  { id: "gpt-5.5", label: "GPT-5.5" },
+  { id: "gpt-5.4", label: "GPT-5.4" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
+  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
+];
+
+const REASONING_CHOICES = ["low", "medium", "high", "xhigh"];
 
 interface ManagedAgent {
   actor: Actor;
@@ -36,8 +50,10 @@ interface ManagedAgent {
   dataRoot: string;
   providerId: string;
   provider: string;
+  providers: AgentProviderSummary[];
   runtime: string;
   model: string;
+  reasoningEffort: string;
   description: string;
   creator: string;
   created: string;
@@ -47,14 +63,24 @@ interface ManagedAgent {
   autostart: boolean;
 }
 
+interface AgentUpdatePatch {
+  displayName?: string;
+  description?: string;
+  providerId?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+}
+
 type AgentMachineContext = Pick<
   MachineInfo,
-  "id" | "name" | "specsDir" | "dataRoot"
+  "id" | "name" | "specsDir" | "dataRoot" | "providers"
 >;
 
 export function MembersPage() {
   const actorsById = useActors((s) => s.byId);
   const upsertMany = useActors((s) => s.upsertMany);
+  const removeMany = useActors((s) => s.removeMany);
   const currentScope = useChannels((s) => s.currentScope);
   const setView = useUI((s) => s.setView);
   const setDraft = useUI((s) => s.setDraft);
@@ -113,13 +139,14 @@ export function MembersPage() {
 
   const removeAgent = async (agent: ManagedAgent) => {
     const result = await ipc.machineAgentRemove(agent.machineId, agent.actor.id);
+    removeMany([agent.actor.id]);
     applyMachineAgents(result.machines);
     pushToast("info", `${agent.actor.displayName || agent.actor.id} removed`);
   };
 
   const updateAgent = async (
     agent: ManagedAgent,
-    patch: { displayName?: string; description?: string },
+    patch: AgentUpdatePatch,
   ) => {
     const updated = normalizeAgent(
       await ipc.agentUpdate({
@@ -132,6 +159,7 @@ export function MembersPage() {
         name: agent.machine,
         specsDir: agent.specsDir,
         dataRoot: agent.dataRoot,
+        providers: agent.providers,
       },
     );
     setAgents((xs) =>
@@ -326,7 +354,7 @@ function AgentDetail({
   setTab: (tab: AgentTab) => void;
   onMessage: () => void;
   onRemove: () => void;
-  onUpdate: (patch: { displayName?: string; description?: string }) => Promise<void>;
+  onUpdate: (patch: AgentUpdatePatch) => Promise<void>;
 }) {
   const ui = useUI();
   const online = agent.status.toLowerCase() === "online";
@@ -351,11 +379,11 @@ function AgentDetail({
             ui.openModal({
               type: "confirm",
               title: `Stop ${agent.actor.displayName || agent.actor.id}?`,
-              body: "This agent is registered in local Joi agent specs. Running processes are owned by `joi agent serve`, so stop it from the host process that launched it.",
+              body: "This agent is owned by the machine daemon. Stop or restart the daemon on the host computer to control the process.",
               confirmLabel: "Got It",
               danger: true,
               onConfirm: () =>
-                ui.pushToast("warn", "agent process control belongs to joi agent serve"),
+                ui.pushToast("warn", "agent process control belongs to joi daemon"),
             })
           }
         >
@@ -365,7 +393,7 @@ function AgentDetail({
           className="btn-brutal-sm bg-white p-1.5"
           title="Restart / Reset"
           onClick={() =>
-            ui.pushToast("warn", "restart the owning `joi agent serve` process")
+            ui.pushToast("warn", "restart the owning `joi daemon` process")
           }
         >
           <RotateCcw size={14} />
@@ -377,7 +405,7 @@ function AgentDetail({
             ui.openModal({
               type: "confirm",
               title: `Remove ${agent.actor.displayName || agent.actor.id}?`,
-              body: "This removes the agent registration from local Joi agent specs. It does not kill a running external host process.",
+              body: "This removes the agent from its computer profile. It does not stop an already running daemon process.",
               confirmLabel: "Remove",
               danger: true,
               onConfirm: onRemove,
@@ -451,7 +479,7 @@ function ProfileTab({
 }: {
   agent: ManagedAgent;
   online: boolean;
-  onUpdate: (patch: { displayName?: string; description?: string }) => Promise<void>;
+  onUpdate: (patch: AgentUpdatePatch) => Promise<void>;
 }) {
   const ui = useUI();
   return (
@@ -538,13 +566,7 @@ function ProfileTab({
         </div>
       </InfoSection>
 
-      <InfoSection title="Agent Spec">
-        <div className="flex flex-wrap gap-2">
-          <span className="chip-brutal bg-brutal-cyan">{agent.provider}</span>
-          <span className="chip-brutal bg-brutal-yellow">{agent.runtime}</span>
-          <span className="chip-brutal bg-brutal-lavender">{agent.model}</span>
-        </div>
-      </InfoSection>
+      <RuntimeConfigSection agent={agent} onUpdate={onUpdate} />
 
       <InfoSection title="Environment Variables" action="Edit environment variables">
         {agent.env.length === 0 ? (
@@ -564,6 +586,134 @@ function ProfileTab({
         <span className="italic text-black/45">No created agents</span>
       </InfoSection>
     </div>
+  );
+}
+
+function RuntimeConfigSection({
+  agent,
+  onUpdate,
+}: {
+  agent: ManagedAgent;
+  onUpdate: (patch: AgentUpdatePatch) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [providerId, setProviderId] = useState(agent.providerId);
+  const [model, setModel] = useState(agent.model === "Default" ? "" : agent.model);
+  const [reasoningEffort, setReasoningEffort] = useState(agent.reasoningEffort);
+  const [autostart, setAutostart] = useState(agent.autostart);
+  const selectedProvider =
+    agent.providers.find((provider) => provider.id === providerId) ??
+    agent.providers.find((provider) => provider.id === agent.providerId);
+  const modelChoices = modelChoicesForProvider(selectedProvider);
+
+  useEffect(() => {
+    setProviderId(agent.providerId);
+    setModel(agent.model === "Default" ? "" : agent.model);
+    setReasoningEffort(agent.reasoningEffort);
+    setAutostart(agent.autostart);
+  }, [agent.actor.id, agent.providerId, agent.model, agent.reasoningEffort, agent.autostart]);
+
+  const save = async () => {
+    await onUpdate({
+      providerId,
+      model,
+      reasoningEffort,
+      autostart,
+    });
+    setEditing(false);
+  };
+
+  return (
+    <section className="border-b border-black/10 px-5 py-4">
+      <div className="mb-2 flex items-center gap-2 text-xs font-black uppercase tracking-widest text-black/45">
+        Runtime Configuration
+        {!editing && (
+          <button title="Edit runtime configuration" onClick={() => setEditing(true)}>
+            <Edit3 size={13} />
+          </button>
+        )}
+      </div>
+      {!editing ? (
+        <div className="flex flex-wrap gap-2">
+          <span className="chip-brutal bg-brutal-cyan">{agent.provider}</span>
+          <span className="chip-brutal bg-brutal-yellow">{agent.model}</span>
+          {agent.reasoningEffort && (
+            <span className="chip-brutal bg-brutal-lavender">
+              {agent.reasoningEffort}
+            </span>
+          )}
+          <span className="chip-brutal bg-white">
+            {agent.autostart ? "autostart" : "manual"}
+          </span>
+        </div>
+      ) : (
+        <div className="max-w-xl space-y-3">
+          <Field label="Runtime">
+            <SelectLike
+              value={selectedProvider?.name || providerId}
+              options={agent.providers.map((provider) => ({
+                id: provider.id,
+                label: provider.name || provider.id,
+              }))}
+              onPick={setProviderId}
+            />
+          </Field>
+          {modelChoices.length > 0 ? (
+            <Field label="Model">
+              <SelectLike
+                value={
+                  modelChoices.find((choice) => choice.id === model)?.label ||
+                  model ||
+                  "Default"
+                }
+                options={modelChoices}
+                onPick={setModel}
+              />
+            </Field>
+          ) : (
+            <Field label="Model" optional>
+              <input
+                className="input-brutal w-full"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+              />
+            </Field>
+          )}
+          {providerId === "codex" && (
+            <Field label="Reasoning">
+              <SelectLike
+                value={reasoningEffort || "medium"}
+                options={REASONING_CHOICES.map((id) => ({ id, label: id }))}
+                onPick={setReasoningEffort}
+              />
+            </Field>
+          )}
+          <label className="flex items-center gap-2 text-sm font-bold">
+            <input
+              type="checkbox"
+              checked={autostart}
+              onChange={(e) => setAutostart(e.target.checked)}
+              className="h-4 w-4 accent-black"
+            />
+            Autostart
+          </label>
+          <div className="flex gap-2">
+            <button
+              className="btn-brutal-sm bg-brutal-pink px-3 py-1.5 text-xs"
+              onClick={() => void save()}
+            >
+              Save
+            </button>
+            <button
+              className="btn-brutal-sm bg-white px-3 py-1.5 text-xs"
+              onClick={() => setEditing(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -588,6 +738,65 @@ function InfoSection({
       </div>
       <div className="text-sm">{children}</div>
     </section>
+  );
+}
+
+function Field({
+  label,
+  optional,
+  children,
+}: {
+  label: string;
+  optional?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-sm font-black uppercase tracking-wide">
+        {label}
+        {optional && <span className="text-black/40 normal-case">(optional)</span>}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function SelectLike({
+  value,
+  options,
+  onPick,
+}: {
+  value: string;
+  options: Array<{ id: string; label?: string | null }>;
+  onPick: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        className="input-brutal flex w-full items-center justify-between gap-2 text-sm"
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="truncate">{value}</span>
+        <ChevronDown size={14} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 top-full z-10 mt-1 border-2 border-black bg-white shadow-brutal">
+          {options.map((option) => (
+            <button
+              key={option.id}
+              className="block w-full px-3 py-2 text-left text-sm font-bold hover:bg-brutal-yellow"
+              onClick={() => {
+                onPick(option.id);
+                setOpen(false);
+              }}
+            >
+              {option.label || option.id}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -672,6 +881,8 @@ function normalizeAgent(
   const meta = actor._meta ?? {};
   const env = spec.transport.env ?? {};
   const model = spec.models?.default ?? spec.transport.model ?? "";
+  const reasoningEffort =
+    typeof meta.reasoningEffort === "string" ? meta.reasoningEffort : "";
   const providerId =
     typeof meta.providerId === "string" ? meta.providerId : "unknown";
   const provider =
@@ -691,8 +902,10 @@ function normalizeAgent(
     dataRoot: machine.dataRoot,
     providerId,
     provider,
+    providers: machine.providers,
     runtime,
     model: model || "Default",
+    reasoningEffort,
     description: spec.identity?.description ?? "",
     creator: "local spec",
     created: "registered",
@@ -701,4 +914,11 @@ function normalizeAgent(
     args: spec.transport.args ?? [],
     autostart: !!spec.autostart,
   };
+}
+
+function modelChoicesForProvider(provider: AgentProviderSummary | null | undefined) {
+  if (!provider) return [];
+  if (provider.modelChoices?.length) return provider.modelChoices;
+  if (provider.id === "codex") return CODEX_MODELS;
+  return [];
 }

@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CornerDownRight, ImagePlus, Paperclip, Send, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { ScopeRef } from "@/ipc/types";
+import type { Actor, Channel, ScopeRef, Thread } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
 import { useActors } from "@/store/actors";
+import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { SlashPalette, type SlashPaletteHandle } from "./SlashPalette";
@@ -30,6 +31,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   const drafts = useUI((s) => s.drafts);
   const setDraft = useUI((s) => s.setDraft);
   const actorsById = useActors((s) => s.byId);
+  const channels = useChannels((s) => s.channels);
+  const threadsByChannel = useChannels((s) => s.threadsByChannel);
   const reply = useUI((s) => s.replyTargets[currentScopeKey] ?? null);
   const replyAuthor = useActors((s) =>
     reply ? s.byId[reply.actorId] : undefined,
@@ -134,6 +137,18 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         ) {
           addHandoff(replyHandoffActor);
         }
+      }
+
+      const blockedHandoffs = privateChannelHandoffBlockers({
+        scope,
+        channels,
+        threadsByChannel,
+        actorsById,
+        actorIds: [...handoffTargets],
+      });
+      if (blockedHandoffs.length > 0) {
+        pushToast("warn", blockedHandoffs[0]);
+        return;
       }
 
       await ipc.eventAppend(
@@ -364,7 +379,7 @@ function findMentionTrigger(text: string, caret: number): MentionTrigger | null 
 
 function mentionTargets(
   text: string,
-  actorsById: Record<string, unknown>,
+  actorsById: Record<string, Actor>,
 ): string[] {
   const targets = new Set<string>();
   const re = /@([A-Za-z0-9._-]+)/g;
@@ -383,4 +398,45 @@ function firstLine(value: string): string {
 
 function isMentionWordChar(ch: string | undefined): boolean {
   return !!ch && /[A-Za-z0-9._-]/.test(ch);
+}
+
+function privateChannelHandoffBlockers({
+  scope,
+  channels,
+  threadsByChannel,
+  actorsById,
+  actorIds,
+}: {
+  scope: ScopeRef;
+  channels: Channel[];
+  threadsByChannel: Record<string, Thread[]>;
+  actorsById: Record<string, Actor>;
+  actorIds: string[];
+}): string[] {
+  const channel = resolveChannelForScope(scope, channels, threadsByChannel);
+  if (!channel || channel.visibility !== "private") return [];
+
+  const members = new Set(channel.members);
+  return actorIds
+    .filter((actorId) => !members.has(actorId))
+    .map((actorId) => {
+      const display = actorsById[actorId]?.displayName || actorId;
+      return `${display} is not in #${channel.title}. Invite them before handing off.`;
+    });
+}
+
+function resolveChannelForScope(
+  scope: ScopeRef,
+  channels: Channel[],
+  threadsByChannel: Record<string, Thread[]>,
+): Channel | null {
+  if (scope.kind === "channel") {
+    return channels.find((c) => c.id === scope.id) ?? null;
+  }
+  for (const [channelId, threads] of Object.entries(threadsByChannel)) {
+    if (threads.some((thread) => thread.id === scope.id)) {
+      return channels.find((c) => c.id === channelId) ?? null;
+    }
+  }
+  return null;
 }

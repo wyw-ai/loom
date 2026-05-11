@@ -2265,8 +2265,10 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "proto",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-notification",
@@ -2275,6 +2277,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

@@ -31,7 +31,7 @@ import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
-import { PixelAvatar } from "@/features/common/PixelAvatar";
+import { ActorAvatar } from "@/features/common/ActorAvatar";
 
 export interface BubbleReplyContext {
   actorId: string;
@@ -152,7 +152,7 @@ export function Bubble({
             title={actorId}
             className="block outline-none focus-visible:ring-2 focus-visible:ring-black"
           >
-            <Avatar actorId={actorId} displayName={displayName} />
+            <ActorAvatar actor={actor} id={actorId} label={displayName} size={36} />
           </button>
         )}
       </div>
@@ -255,16 +255,6 @@ function previewText(text: string, handoffTarget?: string): string {
   const head = handoffTarget ? `→@${handoffTarget}: ` : "";
   const body = flat.length > 64 ? flat.slice(0, 63) + "…" : flat;
   return `${head}${body}` || "(no text)";
-}
-
-function Avatar({
-  actorId,
-  displayName,
-}: {
-  actorId: string;
-  displayName: string;
-}) {
-  return <PixelAvatar id={actorId} label={displayName} size={36} />;
 }
 
 function roleColor(actorId: string): string {

@@ -19,6 +19,7 @@ pub fn list() -> Result<()> {
     let definitions = cfg
         .machines
         .iter()
+        .filter(|machine| machine_belongs_to_active_context(machine, &cfg))
         .flat_map(|machine| {
             machine
                 .agents
@@ -58,12 +59,34 @@ pub fn list() -> Result<()> {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DesktopConfig {
     #[serde(default)]
+    active: Option<String>,
+    #[serde(default)]
+    account: Option<HumanAccount>,
+    #[serde(default)]
+    workspaces: Vec<WorkspaceConfig>,
+    #[serde(default)]
     machines: Vec<MachineConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct HumanAccount {
+    #[serde(default)]
+    actor_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkspaceConfig {
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MachineConfig {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    owner_actor_id: Option<String>,
     #[serde(default)]
     agents: Vec<MachineAgentConfig>,
 }
@@ -89,6 +112,26 @@ fn load_desktop_config() -> Result<DesktopConfig> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read desktop config {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+fn machine_belongs_to_active_context(machine: &MachineConfig, cfg: &DesktopConfig) -> bool {
+    machine.workspace_id.as_deref() == active_workspace_id(cfg)
+        && machine.owner_actor_id.as_deref() == active_account_actor_id(cfg)
+}
+
+fn active_workspace_id(cfg: &DesktopConfig) -> Option<&str> {
+    cfg.active
+        .as_deref()
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .or_else(|| cfg.workspaces.first())
+        .map(|workspace| workspace.id.as_str())
+}
+
+fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
+    cfg.account
+        .as_ref()
+        .map(|account| account.actor_id.trim())
+        .filter(|actor_id| !actor_id.is_empty())
 }
 
 fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {

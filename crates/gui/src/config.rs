@@ -5,11 +5,20 @@
 //! ```toml
 //! active = "default"
 //!
+//! [account]
+//! provider = "buc"
+//! staff_id = "<staff_id>"
+//! nickname = "bojun"
+//! real_name = "Bo Jun"
+//! email = "bojun@example.com"
+//! actor_id = "actor_human_<staff_id>"
+//! avatar_url = "//work.alibaba-inc.com/photo/<staff_id>.140x140.jpg"
+//!
 //! [[workspaces]]
 //! id = "default"
 //! name = "Local"
 //! server_url = "ws://127.0.0.1:7878/rpc"
-//! actor_id = "actor_human_abcdef12"
+//! actor_id = "actor_human_<staff_id>"
 //! display_name = "bojun"
 //! ```
 //!
@@ -38,11 +47,30 @@ pub struct Workspace {
     pub display_name: String,
 }
 
+/// Locally persisted human identity.
+///
+/// This is profile-only for now: BUC OAuth tokens are used only during login
+/// and are not stored here. The provider field keeps the shape open for future
+/// authentication providers without making workspace identity provider-specific.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanAccount {
+    pub provider: String,
+    pub staff_id: String,
+    pub nickname: String,
+    pub real_name: String,
+    pub email: String,
+    pub actor_id: String,
+    pub avatar_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_actor_id: Option<String>,
     pub id: String,
     pub name: String,
     #[serde(default = "default_machine_kind")]
@@ -72,6 +100,8 @@ pub struct MachineAgentConfig {
 pub struct DesktopConfig {
     #[serde(default)]
     pub active: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<HumanAccount>,
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
@@ -176,6 +206,57 @@ pub fn generate_machine_id() -> String {
     format!("machine_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
+pub fn account_display_name(account: &HumanAccount) -> String {
+    first_non_empty([
+        account.nickname.as_str(),
+        account.real_name.as_str(),
+        account.staff_id.as_str(),
+        account.actor_id.as_str(),
+    ])
+    .to_string()
+}
+
+pub fn human_actor_id_for_staff_id(staff_id: &str) -> String {
+    format!("actor_human_{}", safe_config_key(staff_id.trim()))
+}
+
+pub fn human_avatar_url(staff_id: &str) -> String {
+    format!(
+        "//work.alibaba-inc.com/photo/{}.140x140.jpg",
+        staff_id.trim()
+    )
+}
+
+pub fn normalize_human_account(mut account: HumanAccount) -> HumanAccount {
+    account.provider = first_non_empty([account.provider.as_str(), "unknown"]).to_string();
+    account.staff_id = account.staff_id.trim().to_string();
+    account.nickname = account.nickname.trim().to_string();
+    account.real_name = account.real_name.trim().to_string();
+    account.email = account.email.trim().to_string();
+    account.actor_id = human_actor_id_for_staff_id(&account.staff_id);
+    account.avatar_url = human_avatar_url(&account.staff_id);
+    account
+}
+
+pub fn apply_account_identity(cfg: &mut DesktopConfig) -> bool {
+    let Some(account) = cfg.account.as_ref() else {
+        return false;
+    };
+    let display_name = account_display_name(account);
+    let mut changed = false;
+    for workspace in &mut cfg.workspaces {
+        if workspace.actor_id != account.actor_id {
+            workspace.actor_id = account.actor_id.clone();
+            changed = true;
+        }
+        if workspace.display_name != display_name {
+            workspace.display_name = display_name.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
 pub fn default_agent_data_root() -> PathBuf {
     dirs::home_dir()
         .map(|d| d.join(".agentx"))
@@ -224,27 +305,70 @@ pub fn active_workspace_id(cfg: &DesktopConfig) -> Option<&str> {
         .map(|workspace| workspace.id.as_str())
 }
 
-pub fn machine_belongs_to_active_workspace(machine: &MachineConfig, cfg: &DesktopConfig) -> bool {
-    machine.workspace_id.as_deref() == active_workspace_id(cfg)
+pub fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
+    cfg.account
+        .as_ref()
+        .map(|account| account.actor_id.as_str())
 }
 
-pub fn default_machine_for_workspace(workspace_id: &str) -> MachineConfig {
+pub fn machine_belongs_to_active_workspace(machine: &MachineConfig, cfg: &DesktopConfig) -> bool {
+    machine_belongs_to_workspace_and_owner(
+        machine,
+        active_workspace_id(cfg),
+        active_account_actor_id(cfg),
+    )
+}
+
+pub fn machine_belongs_to_workspace_and_owner(
+    machine: &MachineConfig,
+    workspace_id: Option<&str>,
+    owner_actor_id: Option<&str>,
+) -> bool {
+    machine.workspace_id.as_deref() == workspace_id
+        && machine.owner_actor_id.as_deref() == owner_actor_id
+}
+
+pub fn default_machine_for_workspace(
+    workspace_id: &str,
+    owner_actor_id: Option<&str>,
+) -> MachineConfig {
     let workspace_key = safe_config_key(workspace_id);
     let suffix = workspace_key
         .strip_prefix("ws_")
         .unwrap_or(workspace_key.as_str());
+    let owner_key = owner_actor_id.map(safe_config_key);
+    let id_suffix = owner_key
+        .as_deref()
+        .map(|owner| format!("{suffix}_{owner}"))
+        .unwrap_or_else(|| suffix.to_string());
+    let data_key = owner_key
+        .as_deref()
+        .map(|owner| format!("{owner}/local"))
+        .unwrap_or_else(|| "local".into());
     MachineConfig {
         workspace_id: Some(workspace_id.to_string()),
-        id: format!("machine_{suffix}"),
+        owner_actor_id: owner_actor_id.map(ToString::to_string),
+        id: format!("machine_{id_suffix}"),
         name: "Local Machine".into(),
         kind: default_machine_kind(),
-        data_root: machine_data_root_expr(&workspace_key, "local"),
+        data_root: machine_data_root_expr(&workspace_key, &data_key),
         agents: Vec::new(),
     }
 }
 
 fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
     let mut changed = false;
+
+    if let Some(account) = cfg.account.clone() {
+        let normalized = normalize_human_account(account);
+        if cfg.account.as_ref() != Some(&normalized) {
+            cfg.account = Some(normalized);
+            changed = true;
+        }
+    }
+    if apply_account_identity(&mut cfg) {
+        changed = true;
+    }
 
     for machine in &mut cfg.machines {
         if normalize_home_path_expr(&mut machine.data_root) {
@@ -281,19 +405,24 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
         }
     }
 
+    let active_owner_actor_id = active_account_actor_id(&cfg).map(ToString::to_string);
     let workspace_ids: Vec<String> = cfg
         .workspaces
         .iter()
         .map(|workspace| workspace.id.clone())
         .collect();
     for workspace_id in workspace_ids {
-        if !cfg
-            .machines
-            .iter()
-            .any(|machine| machine.workspace_id.as_deref() == Some(workspace_id.as_str()))
-        {
-            cfg.machines
-                .push(default_machine_for_workspace(&workspace_id));
+        if !cfg.machines.iter().any(|machine| {
+            machine_belongs_to_workspace_and_owner(
+                machine,
+                Some(workspace_id.as_str()),
+                active_owner_actor_id.as_deref(),
+            )
+        }) {
+            cfg.machines.push(default_machine_for_workspace(
+                &workspace_id,
+                active_owner_actor_id.as_deref(),
+            ));
             changed = true;
         }
     }
@@ -307,6 +436,7 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
 fn default_machine() -> MachineConfig {
     MachineConfig {
         workspace_id: None,
+        owner_actor_id: None,
         id: "local".into(),
         name: "Local Machine".into(),
         kind: default_machine_kind(),
@@ -331,6 +461,14 @@ fn safe_config_key(value: &str) -> String {
     }
 }
 
+fn first_non_empty<'a, const N: usize>(values: [&'a str; N]) -> &'a str {
+    values
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("")
+}
+
 fn normalize_home_path_expr(value: &mut String) -> bool {
     let resolved = expand_home(value);
     if !resolved.is_absolute() {
@@ -342,5 +480,109 @@ fn normalize_home_path_expr(value: &mut String) -> bool {
     } else {
         *value = next;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_human_account_binds_actor_and_avatar_to_staff_id() {
+        let account = normalize_human_account(HumanAccount {
+            provider: "buc".into(),
+            staff_id: " 12345 ".into(),
+            nickname: " bojun ".into(),
+            real_name: " Bo Jun ".into(),
+            email: " bojun@example.com ".into(),
+            actor_id: "actor_human_random".into(),
+            avatar_url: "old".into(),
+        });
+
+        assert_eq!(account.staff_id, "12345");
+        assert_eq!(account.actor_id, "actor_human_12345");
+        assert_eq!(
+            account.avatar_url,
+            "//work.alibaba-inc.com/photo/12345.140x140.jpg"
+        );
+    }
+
+    #[test]
+    fn apply_account_identity_updates_workspace_human_identity() {
+        let mut cfg = DesktopConfig {
+            account: Some(normalize_human_account(HumanAccount {
+                provider: "buc".into(),
+                staff_id: "12345".into(),
+                nickname: "bojun".into(),
+                real_name: "Bo Jun".into(),
+                email: "bojun@example.com".into(),
+                actor_id: String::new(),
+                avatar_url: String::new(),
+            })),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: "actor_human_old".into(),
+                display_name: "old".into(),
+            }],
+            ..DesktopConfig::default()
+        };
+
+        assert!(apply_account_identity(&mut cfg));
+        assert_eq!(cfg.workspaces[0].actor_id, "actor_human_12345");
+        assert_eq!(cfg.workspaces[0].display_name, "bojun");
+    }
+
+    #[test]
+    fn machine_filter_requires_matching_account_owner() {
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(normalize_human_account(HumanAccount {
+                provider: "buc".into(),
+                staff_id: "12345".into(),
+                nickname: "bojun".into(),
+                real_name: "Bo Jun".into(),
+                email: "bojun@example.com".into(),
+                actor_id: String::new(),
+                avatar_url: String::new(),
+            })),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: "actor_human_12345".into(),
+                display_name: "bojun".into(),
+            }],
+            ..DesktopConfig::default()
+        };
+        let machine = default_machine_for_workspace("default", Some("actor_human_12345"));
+        let legacy_machine = MachineConfig {
+            owner_actor_id: None,
+            ..machine.clone()
+        };
+        let other_owner_machine = MachineConfig {
+            owner_actor_id: Some("actor_human_other".into()),
+            ..machine.clone()
+        };
+
+        assert!(machine_belongs_to_active_workspace(&machine, &cfg));
+        assert!(!machine_belongs_to_active_workspace(&legacy_machine, &cfg));
+        assert!(!machine_belongs_to_active_workspace(
+            &other_owner_machine,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn account_owned_default_machine_uses_owner_scoped_id_and_path() {
+        let machine = default_machine_for_workspace("ws_local", Some("actor_human_12345"));
+
+        assert_eq!(machine.owner_actor_id.as_deref(), Some("actor_human_12345"));
+        assert_eq!(machine.id, "machine_local_actor_human_12345");
+        assert_eq!(
+            machine.data_root,
+            "~/.agentx/machines/ws_local/actor_human_12345/local"
+        );
     }
 }

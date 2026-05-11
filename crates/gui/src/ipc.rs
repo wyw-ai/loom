@@ -19,14 +19,18 @@ use agent_runtime::discovery::{
 };
 use proto::methods::method;
 use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::config::{self, DesktopConfig, MachineAgentConfig, MachineConfig, Workspace};
+use crate::config::{
+    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount,
+    MachineAgentConfig, MachineConfig, Workspace,
+};
 use crate::forward;
 use crate::state::AppState;
 use crate::ws::Client;
+use crate::{account, avatar};
 
 // ---- workspace management -------------------------------------------------
 
@@ -46,14 +50,80 @@ pub async fn workspaces_save(args: SaveWorkspacesArgs) -> Result<DesktopConfig, 
     Ok(config::load_or_init().map_err(|e| e.to_string())?)
 }
 
+#[tauri::command]
+pub async fn account_get() -> Result<Option<HumanAccount>, String> {
+    Ok(config::load_or_init().map_err(stringify)?.account)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginArgs {
+    pub provider: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginResult {
+    pub account: HumanAccount,
+    pub config: DesktopConfig,
+}
+
+#[tauri::command]
+pub async fn account_login(
+    state: State<'_, AppState>,
+    args: AccountLoginArgs,
+) -> Result<AccountLoginResult, String> {
+    let provider = args.provider.trim().to_ascii_lowercase();
+    if provider != "buc" {
+        return Err(format!("unsupported account provider: {}", args.provider));
+    }
+
+    let account = account::login_buc().await.map_err(deep_stringify)?;
+    let avatar_account = account.clone();
+    tokio::spawn(async move {
+        if let Err(err) = avatar::prefetch_account_avatar(&avatar_account).await {
+            tracing::warn!(%err, "avatar prefetch failed");
+        }
+    });
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    cfg.account = Some(account.clone());
+    apply_account_identity(&mut cfg);
+    config::save(&cfg).map_err(stringify)?;
+    let cfg = config::load_or_init().map_err(stringify)?;
+    state.set(None).await;
+    Ok(AccountLoginResult {
+        account: cfg.account.clone().unwrap_or(account),
+        config: cfg,
+    })
+}
+
+#[tauri::command]
+pub async fn account_logout(state: State<'_, AppState>) -> Result<DesktopConfig, String> {
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    cfg.account = None;
+    config::save(&cfg).map_err(stringify)?;
+    state.set(None).await;
+    Ok(cfg)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarCachedUrlArgs {
+    pub url: String,
+}
+
+#[tauri::command]
+pub async fn avatar_cached_url(args: AvatarCachedUrlArgs) -> Result<String, String> {
+    avatar::cached_avatar_data_url(&args.url)
+        .await
+        .map_err(deep_stringify)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceAddArgs {
     pub name: String,
     pub server_url: String,
-    pub actor_id: String,
-    #[serde(default)]
-    pub display_name: String,
     /// Mark the new workspace as active immediately. Default true — the
     /// usual "add and jump in" flow.
     #[serde(default = "default_activate")]
@@ -67,32 +137,23 @@ fn default_activate() -> bool {
 #[tauri::command]
 pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    let had_workspaces = !cfg.workspaces.is_empty();
+    let account = cfg
+        .account
+        .clone()
+        .ok_or_else(|| "account login required before adding a human workspace".to_string())?;
     let id = config::generate_id();
     let ws = Workspace {
         id: id.clone(),
         name: args.name,
         server_url: args.server_url,
-        actor_id: args.actor_id,
-        display_name: args.display_name,
+        actor_id: account.actor_id.clone(),
+        display_name: account_display_name(&account),
     };
     cfg.workspaces.push(ws);
-    if had_workspaces {
-        cfg.machines
-            .push(config::default_machine_for_workspace(&id));
-    } else {
-        let mut adopted_unscoped = false;
-        for machine in &mut cfg.machines {
-            if machine.workspace_id.is_none() {
-                machine.workspace_id = Some(id.clone());
-                adopted_unscoped = true;
-            }
-        }
-        if !adopted_unscoped {
-            cfg.machines
-                .push(config::default_machine_for_workspace(&id));
-        }
-    }
+    cfg.machines.push(config::default_machine_for_workspace(
+        &id,
+        Some(&account.actor_id),
+    ));
     if args.activate {
         cfg.active = Some(id);
     }
@@ -143,7 +204,14 @@ pub async fn connect(
     state: State<'_, AppState>,
     args: ConnectArgs,
 ) -> Result<Value, String> {
-    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let account = cfg
+        .account
+        .clone()
+        .ok_or_else(|| "account login required before connecting as a human".to_string())?;
+    if apply_account_identity(&mut cfg) {
+        config::save(&cfg).map_err(stringify)?;
+    }
     let ws = cfg
         .workspaces
         .iter()
@@ -166,6 +234,9 @@ pub async fn connect(
         .open_connection(&ws.actor_id, Some(&ws.display_name))
         .await
         .map_err(deep_stringify)?;
+    upsert_human_actor(&client, &account)
+        .await
+        .map_err(deep_stringify)?;
 
     forward::spawn(app.clone(), Arc::clone(&client));
     state.set(Some(client)).await;
@@ -180,6 +251,32 @@ pub async fn connect(
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     state.set(None).await;
+    Ok(())
+}
+
+async fn upsert_human_actor(client: &Arc<Client>, account: &HumanAccount) -> anyhow::Result<()> {
+    client
+        .call_raw(
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": account.actor_id,
+                    "kind": "human",
+                    "displayName": account_display_name(account),
+                    "_meta": {
+                        "account": {
+                            "provider": account.provider,
+                            "staffId": account.staff_id,
+                            "nickname": account.nickname,
+                            "realName": account.real_name,
+                            "email": account.email,
+                        },
+                        "avatarUrl": account.avatar_url,
+                    },
+                },
+            })),
+        )
+        .await?;
     Ok(())
 }
 
@@ -435,12 +532,15 @@ pub async fn agent_remove(
 ) -> Result<AgentListResult, String> {
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let mut removed = false;
-    for machine in cfg
-        .machines
-        .iter_mut()
-        .filter(|machine| machine.workspace_id == active_workspace_id)
-    {
+    for machine in cfg.machines.iter_mut().filter(|machine| {
+        config::machine_belongs_to_workspace_and_owner(
+            machine,
+            active_workspace_id.as_deref(),
+            active_owner_actor_id.as_deref(),
+        )
+    }) {
         let before = machine.agents.len();
         machine
             .agents
@@ -562,6 +662,7 @@ pub async fn machine_create(
     }
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let workspace_dir = workspace_id
         .as_deref()
         .map(slugify)
@@ -572,9 +673,13 @@ pub async fn machine_create(
         slugify(name),
         machine_id.trim_start_matches("machine_")
     );
+    let data_root_key = owner_actor_id
+        .as_deref()
+        .map(|owner| format!("{}/{}", slugify(owner), dir_slug))
+        .unwrap_or_else(|| dir_slug.clone());
     let (data_root_expr, data_root) = machine_path_input(
         args.data_root.trim(),
-        config::machine_data_root_expr(&workspace_dir, &dir_slug),
+        config::machine_data_root_expr(&workspace_dir, &data_root_key),
     )
     .map_err(stringify)?;
     std::fs::create_dir_all(&data_root)
@@ -582,6 +687,7 @@ pub async fn machine_create(
 
     cfg.machines.push(MachineConfig {
         workspace_id,
+        owner_actor_id,
         id: machine_id,
         name: name.to_string(),
         kind: "local".into(),
@@ -624,17 +730,28 @@ pub async fn machine_remove(
     }
     let before = cfg.machines.len();
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let server_url = active_server_url(&cfg).to_string();
     let actor_ids = cfg
         .machines
         .iter()
         .find(|machine| {
-            machine.id == args.machine_id && machine.workspace_id == active_workspace_id
+            machine.id == args.machine_id
+                && config::machine_belongs_to_workspace_and_owner(
+                    machine,
+                    active_workspace_id.as_deref(),
+                    active_owner_actor_id.as_deref(),
+                )
         })
         .map(|machine| actor_ids_for_machine(machine, &server_url))
         .unwrap_or_default();
     cfg.machines.retain(|machine| {
-        machine.id != args.machine_id || machine.workspace_id != active_workspace_id
+        machine.id != args.machine_id
+            || !config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
     });
     if cfg.machines.len() == before {
         return Err(format!("unknown machine id: {}", args.machine_id));
@@ -663,11 +780,19 @@ pub async fn machine_agent_create(
     }
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let actor_id = actor_id_from_input(&args.actor_id, name).map_err(stringify)?;
     let machine_index = cfg
         .machines
         .iter()
-        .position(|machine| machine.id == machine_id && machine.workspace_id == active_workspace_id)
+        .position(|machine| {
+            machine.id == machine_id
+                && config::machine_belongs_to_workspace_and_owner(
+                    machine,
+                    active_workspace_id.as_deref(),
+                    active_owner_actor_id.as_deref(),
+                )
+        })
         .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
     if cfg.machines[machine_index]
         .agents
@@ -728,11 +853,17 @@ pub async fn machine_agent_remove(
 ) -> Result<MachineListResult, String> {
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let machine = cfg
         .machines
         .iter_mut()
         .find(|machine| {
-            machine.id == args.machine_id && machine.workspace_id == active_workspace_id
+            machine.id == args.machine_id
+                && config::machine_belongs_to_workspace_and_owner(
+                    machine,
+                    active_workspace_id.as_deref(),
+                    active_owner_actor_id.as_deref(),
+                )
         })
         .ok_or_else(|| format!("unknown machine id: {}", args.machine_id))?;
     let before = machine.agents.len();
@@ -1074,8 +1205,14 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
 
     let mut cfg = config::load_or_init()?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let Some(machine_index) = cfg.machines.iter().position(|machine| {
-        machine.id == machine_id && machine.workspace_id == active_workspace_id
+        machine.id == machine_id
+            && config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
     }) else {
         return Ok(None);
     };

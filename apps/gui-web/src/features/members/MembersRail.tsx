@@ -7,7 +7,7 @@ import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { openInviteToChannel } from "@/features/sidebar/channelActions";
-import { PixelAvatar } from "@/features/common/PixelAvatar";
+import { ActorAvatar } from "@/features/common/ActorAvatar";
 
 export function MembersRail() {
   const scope = useChannels((s) => s.currentScope);
@@ -161,7 +161,7 @@ function MemberRowInner({
       onContextMenu={onContextMenu}
       className="flex min-w-0 items-center gap-2 border-2 border-transparent px-3 py-1.5 text-sm font-bold text-black hover:border-black hover:bg-white"
     >
-      <PixelAvatar id={actor.id} label={actor.displayName} size={28} />
+      <ActorAvatar actor={actor} size={28} />
       <span className="min-w-0 flex-1 truncate">{actor.displayName || actor.id}</span>
       <span className="shrink-0 font-mono text-[11px] text-black/45">{actor.kind}</span>
     </div>

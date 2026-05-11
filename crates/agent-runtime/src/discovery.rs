@@ -252,8 +252,6 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
             args.push("--sandbox".into());
             args.push("danger-full-access".into());
-            args.push("--ask-for-approval".into());
-            args.push("never".into());
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
             append_add_dir_arg(&mut args, &joi_config_dir);
@@ -487,8 +485,6 @@ mod tests {
             "--skip-git-repo-check",
             "--sandbox",
             "danger-full-access",
-            "--ask-for-approval",
-            "never",
             "-c",
             "sandbox_workspace_write.network_access=true",
         ];
@@ -523,8 +519,6 @@ mod tests {
                 "--skip-git-repo-check".into(),
                 "--sandbox".into(),
                 "danger-full-access".into(),
-                "--ask-for-approval".into(),
-                "never".into(),
                 "-c".into(),
                 "sandbox_workspace_write.network_access=true".into(),
                 "--add-dir".into(),
@@ -556,8 +550,6 @@ mod tests {
                 "--skip-git-repo-check",
                 "--sandbox",
                 "danger-full-access",
-                "--ask-for-approval",
-                "never",
                 "-c",
                 "sandbox_workspace_write.network_access=true",
                 "--add-dir",

@@ -444,12 +444,14 @@ pub async fn turn_close(state: State<'_, AppState>, params: Value) -> Result<Val
 
 #[tauri::command]
 pub async fn actor_list(state: State<'_, AppState>) -> Result<Value, String> {
-    state
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let value = state
         .client()
         .await?
         .call_raw(method::ACTOR_LIST, None)
         .await
-        .map_err(stringify)
+        .map_err(stringify)?;
+    Ok(filter_actor_list_for_active_context(value, &cfg))
 }
 
 #[tauri::command]
@@ -1045,6 +1047,35 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
         .collect()
 }
 
+fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
+    let allowed_agents = cfg
+        .machines
+        .iter()
+        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
+        .flat_map(|machine| machine.agents.iter().map(|agent| agent.actor_id.clone()))
+        .collect::<HashSet<_>>();
+
+    let Some(actors) = value.get_mut("actors").and_then(Value::as_array_mut) else {
+        return value;
+    };
+
+    actors.retain(|actor| {
+        let kind = actor
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind != "agent" {
+            return true;
+        }
+        actor
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| allowed_agents.contains(id))
+    });
+
+    value
+}
+
 fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<MachineInfo> {
     let data_root = if machine.data_root.trim().is_empty() {
         config::default_agent_data_root()
@@ -1295,5 +1326,82 @@ fn slugify(value: &str) -> String {
         "agent".into()
     } else {
         trimmed.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_account() -> HumanAccount {
+        config::normalize_human_account(HumanAccount {
+            provider: "buc".into(),
+            staff_id: "88084".into(),
+            nickname: "星楚".into(),
+            real_name: "陈博俊".into(),
+            email: String::new(),
+            actor_id: String::new(),
+            avatar_url: String::new(),
+        })
+    }
+
+    fn test_machine(id: &str, owner_actor_id: Option<&str>, agent_actor_id: &str) -> MachineConfig {
+        MachineConfig {
+            workspace_id: Some("default".into()),
+            owner_actor_id: owner_actor_id.map(ToString::to_string),
+            id: id.into(),
+            name: id.into(),
+            kind: "local".into(),
+            data_root: "~/.agentx".into(),
+            agents: vec![MachineAgentConfig {
+                provider_id: "codex".into(),
+                actor_id: agent_actor_id.into(),
+                name: agent_actor_id.into(),
+                description: String::new(),
+                model: String::new(),
+                reasoning_effort: String::new(),
+                autostart: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn actor_list_filter_hides_agents_from_other_machine_owners() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+            machines: vec![
+                test_machine("mine", Some(account.actor_id.as_str()), "actor_agent_mine"),
+                test_machine("other", Some("actor_human_other"), "actor_agent_other"),
+            ],
+        };
+        let value = json!({
+            "actors": [
+                { "id": account.actor_id, "kind": "human", "displayName": "星楚" },
+                { "id": "actor_agent_mine", "kind": "agent", "displayName": "Mine" },
+                { "id": "actor_agent_other", "kind": "agent", "displayName": "Other" },
+                { "id": "actor_service_other", "kind": "service", "displayName": "Other Service" }
+            ]
+        });
+
+        let filtered = filter_actor_list_for_active_context(value, &cfg);
+        let actor_ids = filtered["actors"]
+            .as_array()
+            .expect("actors")
+            .iter()
+            .filter_map(|actor| actor["id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(actor_ids.contains(&"actor_agent_mine"));
+        assert!(!actor_ids.contains(&"actor_agent_other"));
+        assert!(actor_ids.contains(&"actor_service_other"));
     }
 }

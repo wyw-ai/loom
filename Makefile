@@ -16,6 +16,7 @@ CARGO          ?= cargo
 CROSS          ?= cross
 LIPO           ?= lipo
 DIST_DIR       ?= dist
+PACKAGE_OUT_DIR ?= $(DIST_DIR)/packages
 # Default to native cargo + musl-cross toolchain; cross+Docker is broken on
 # Apple Silicon (rustc segfaults under QEMU). Override with LINUX_BUILDER=cross
 # if you actually have a working cross container setup.
@@ -61,6 +62,7 @@ help:
 	@echo "  all-debug                   every target, debug"
 	@echo "  all-release                 every target, release"
 	@echo "  all                         debug + release"
+	@echo "  package-release             one-shot runtime archives + mac arm64 GUI dmg"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  install-targets             rustup target add (all triples)"
@@ -72,6 +74,7 @@ help:
 	@echo "Overrides:"
 	@echo "  CARGO=$(CARGO)  CROSS=$(CROSS)  LIPO=$(LIPO)"
 	@echo "  DIST_DIR=$(DIST_DIR)"
+	@echo "  PACKAGE_OUT_DIR=$(PACKAGE_OUT_DIR)"
 	@echo "  LINUX_BUILDER=$(LINUX_BUILDER)   (set to '$(CROSS)' to use cross-rs containers)"
 
 # ---- Native --------------------------------------------------------------
@@ -196,7 +199,7 @@ distclean: clean
 PNPM ?= pnpm
 GUI_NO_PROXY_HOSTS ?= localhost,127.0.0.1,::1
 
-.PHONY: gui-deps gui-dev gui-release gui-clean
+.PHONY: gui-deps gui-dev gui-release gui-dmg-mac-arm gui-clean package-release
 
 gui-deps:
 	$(PNPM) --dir apps/gui-web install
@@ -207,5 +210,11 @@ gui-dev:
 gui-release:
 	cd crates/gui && $(CARGO) tauri build
 
+gui-dmg-mac-arm:
+	cd crates/gui && $(CARGO) tauri build --target $(TRIPLE_MAC_ARM) --bundles dmg --ci
+
 gui-clean:
 	rm -rf apps/gui-web/node_modules apps/gui-web/dist crates/gui/gen
+
+package-release:
+	CARGO="$(CARGO)" PNPM="$(PNPM)" DIST_DIR="$(DIST_DIR)" PACKAGE_OUT_DIR="$(PACKAGE_OUT_DIR)" LINUX_BUILDER="$(LINUX_BUILDER)" bash scripts/package-release.sh

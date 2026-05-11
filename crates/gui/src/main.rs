@@ -13,7 +13,6 @@ mod ws;
 
 use std::sync::Arc;
 
-use tauri::Manager;
 use tokio::sync::Mutex;
 
 use crate::state::AppState;

@@ -48,6 +48,7 @@ use agent_runtime::{
 };
 
 use crate::client::Client;
+use crate::{config, daemon_ipc};
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
@@ -60,13 +61,34 @@ pub async fn run(
     let specs_dir = specs_dir_opt.unwrap_or_else(default_specs_dir);
     std::fs::create_dir_all(&specs_dir)
         .with_context(|| format!("create specs dir {}", specs_dir.display()))?;
+    let machine_host = machine_host_spec_from_env();
+    let specs = load_specs(&specs_dir)?;
+    let total_loaded = specs.len();
+    run_with_specs(
+        "joi agent serve",
+        specs,
+        format!("{}", specs_dir.display()),
+        server_url,
+        allow_actors,
+        machine_host,
+        total_loaded,
+    )
+    .await
+}
+
+pub async fn run_with_specs(
+    runtime_name: &'static str,
+    mut specs: Vec<AgentSpec>,
+    specs_label: String,
+    server_url: String,
+    allow_actors: Vec<String>,
+    machine_host: Option<MachineHostSpec>,
+    total_loaded: usize,
+) -> Result<()> {
     let data_root = default_data_root();
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create data dir {}", data_root.display()))?;
 
-    let machine_host = machine_host_spec_from_env();
-    let mut specs = load_specs(&specs_dir)?;
-    let total_loaded = specs.len();
     if !allow_actors.is_empty() {
         let allow: HashSet<&str> = allow_actors.iter().map(String::as_str).collect();
         let (kept, skipped): (Vec<_>, Vec<_>) = specs
@@ -80,7 +102,7 @@ pub async fn run(
             .filter(|id| !specs.iter().any(|s| s.actor.id == *id))
             .collect();
         eprintln!(
-            "joi agent serve: --allow-actors filter active; loaded {} of {} agent(s){}{}",
+            "{runtime_name}: --allow-actors filter active; loaded {} of {} agent(s){}{}",
             specs.len(),
             total_loaded,
             if skipped_ids.is_empty() {
@@ -101,58 +123,75 @@ pub async fn run(
     if specs.is_empty() && machine_host.is_none() {
         return Err(anyhow!(
             "no agent actors to serve under {} (expanded {}, after --allow-actors filter: 0)",
-            specs_dir.display(),
+            specs_label,
             total_loaded,
         ));
     }
 
     eprintln!(
-        "joi agent serve: loaded {} agent(s) from {}",
+        "{runtime_name}: loaded {} agent(s) from {}",
         specs.len(),
-        specs_dir.display()
+        specs_label
     );
     let mut handles = Vec::new();
     if let Some(host) = machine_host {
         let server = server_url.clone();
-        handles.push(tokio::spawn(async move {
-            run_machine_host_loop(host, server).await;
-        }));
+        handles.push(spawn_machine_host_loop(host, server));
     }
     for spec in specs {
-        let server = server_url.clone();
-        let root = data_root.clone();
-        let actor = spec.actor.id.clone();
-        handles.push(tokio::spawn(async move {
-            let mut attempt = 0u32;
-            loop {
-                attempt = attempt.saturating_add(1);
-                let delay = reconnect_delay(attempt);
-                match run_agent_worker(spec.clone(), server.clone(), root.clone()).await {
-                    Ok(()) => {
-                        attempt = 0;
-                        eprintln!(
-                            "[{actor}] worker disconnected; reconnecting in {}s",
-                            delay.as_secs()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[{actor}] worker exited with error: {e}; reconnecting in {}s",
-                            delay.as_secs()
-                        );
-                    }
-                }
-                sleep(delay).await;
-            }
-        }));
+        handles.push(spawn_agent_worker_loop(
+            spec,
+            server_url.clone(),
+            data_root.clone(),
+        ));
     }
-    eprintln!("joi agent serve: ready (ctrl-c to stop)");
+    eprintln!("{runtime_name}: ready (ctrl-c to stop)");
     let _ = tokio::signal::ctrl_c().await;
-    eprintln!("\njoi agent serve: shutting down");
+    eprintln!("\n{runtime_name}: shutting down");
     for h in handles {
         h.abort();
     }
     Ok(())
+}
+
+pub fn spawn_agent_worker_loop(
+    spec: AgentSpec,
+    server_url: String,
+    data_root: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    let actor = spec.actor.id.clone();
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let delay = reconnect_delay(attempt);
+            match run_agent_worker(spec.clone(), server_url.clone(), data_root.clone()).await {
+                Ok(()) => {
+                    attempt = 0;
+                    eprintln!(
+                        "[{actor}] worker disconnected; reconnecting in {}s",
+                        delay.as_secs()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[{actor}] worker exited with error: {e}; reconnecting in {}s",
+                        delay.as_secs()
+                    );
+                }
+            }
+            sleep(delay).await;
+        }
+    })
+}
+
+pub fn spawn_machine_host_loop(
+    host: MachineHostSpec,
+    server_url: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_machine_host_loop(host, server_url).await;
+    })
 }
 
 fn reconnect_delay(attempt: u32) -> Duration {
@@ -170,9 +209,7 @@ fn current_joi_binary() -> Option<PathBuf> {
 }
 
 fn default_specs_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+    config::agent_specs_dir()
 }
 
 fn default_data_root() -> PathBuf {
@@ -189,10 +226,10 @@ fn default_data_root() -> PathBuf {
 }
 
 #[derive(Debug, Clone)]
-struct MachineHostSpec {
-    machine_id: String,
-    actor_id: String,
-    display_name: String,
+pub struct MachineHostSpec {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub display_name: String,
 }
 
 fn machine_host_spec_from_env() -> Option<MachineHostSpec> {
@@ -563,6 +600,12 @@ impl AgentPaths {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut env = BTreeMap::new();
         env.insert("JOI_SERVER".into(), server_url.to_string());
+        if let Some(socket) = daemon_ipc::env_socket_path() {
+            env.insert(
+                daemon_ipc::ENV_DAEMON_SOCKET.into(),
+                socket.display().to_string(),
+            );
+        }
         env.insert("JOI_ACTOR".into(), actor_id.to_string());
         env.insert(
             "JOI_AGENT_PROFILE".into(),
@@ -1225,6 +1268,15 @@ fn build_adapter(
     command_env
         .entry("JOI_SERVER".into())
         .or_insert_with(|| server_url.to_string());
+    if let Some(socket) = daemon_ipc::env_socket_path() {
+        let socket = socket.display().to_string();
+        process_env
+            .entry(daemon_ipc::ENV_DAEMON_SOCKET.into())
+            .or_insert_with(|| socket.clone());
+        command_env
+            .entry(daemon_ipc::ENV_DAEMON_SOCKET.into())
+            .or_insert(socket);
+    }
     process_env
         .entry("JOI_ACTOR".into())
         .or_insert_with(|| spec.actor.id.clone());
@@ -2119,8 +2171,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            actor id      = {actor_id}\n\
            current scope = {scope_kind}:{scope_id}\n\
          \n\
-         You can shell out to the `joi` CLI for read-only access. JOI_SERVER\n\
-         and JOI_ACTOR are already injected into your env, so commands like:\n\
+         You can shell out to the `joi` CLI for read-only access. JOI_SERVER,\n\
+         JOI_DAEMON_SOCKET, and JOI_ACTOR are already injected into your env,\n\
+         so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
            joi --json artifact get <art_id|artifact://...>\n\
          Message targets use `#<channel_id>` for channels and\n\
@@ -2334,6 +2387,18 @@ async fn translate_one(
                     text,
                 )
                 .await?;
+            } else if !success {
+                if let Some(text) = failed_turn_text(&summary) {
+                    flush_text(
+                        client,
+                        actor_id,
+                        &active.scope,
+                        &active.id,
+                        &active.trigger_event_id,
+                        text,
+                    )
+                    .await?;
+                }
             }
             if !active.cancel_requested {
                 let status = if success {
@@ -2393,6 +2458,15 @@ async fn translate_one(
         }
     }
     Ok(())
+}
+
+fn failed_turn_text(summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(format!("Agent run failed:\n\n{summary}"))
+    }
 }
 
 async fn append_trace(
@@ -2848,6 +2922,15 @@ mod tests {
 
         assert_eq!(state.current_model().as_deref(), Some("spec_default"));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_turn_text_uses_non_empty_summary() {
+        assert_eq!(failed_turn_text("   "), None);
+        assert_eq!(
+            failed_turn_text("Not inside a trusted directory").as_deref(),
+            Some("Agent run failed:\n\nNot inside a trusted directory")
+        );
     }
 
     #[test]

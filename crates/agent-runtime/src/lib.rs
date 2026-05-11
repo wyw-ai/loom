@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod agents_md;
 pub mod bundle;
 pub mod command;
+pub mod discovery;
 pub mod envelope;
 pub mod interactive;
 pub mod mcp_servers;

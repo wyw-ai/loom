@@ -1,12 +1,13 @@
 mod client;
 mod cmd;
 mod config;
+mod daemon_ipc;
 mod render;
 mod service;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::client::Client;
@@ -134,6 +135,39 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         sub: ServiceCmd,
+    },
+    /// Run the machine-scoped daemon: auto-detect supported local agent CLIs
+    /// and host agents configured on the selected machine.
+    Daemon {
+        /// Machine id from the desktop machine config. Defaults to the active
+        /// workspace's first machine.
+        #[arg(long = "machine-id", env = "JOI_MACHINE_ID")]
+        machine_id: Option<String>,
+        /// Override the daemon data root. Defaults to the machine data root.
+        #[arg(long = "data-root", env = "JOI_AGENT_DATA_ROOT")]
+        data_root: Option<PathBuf>,
+        /// Comma-separated actor ids to load. Empty/omitted = load every
+        /// agent configured on the machine.
+        #[arg(long = "allow-actors", value_delimiter = ',')]
+        allow_actors: Vec<String>,
+        /// Print auto-detected local providers and exit.
+        #[arg(long = "list-providers")]
+        list_providers: bool,
+        /// Override the directory of ServiceSpec JSON files loaded by the
+        /// daemon. Defaults to `~/.config/joi/services/` or
+        /// `$JOI_SERVICE_SPECS`.
+        #[arg(long = "services")]
+        services: Option<PathBuf>,
+        /// Comma-separated service ids to load through the daemon. Empty or
+        /// omitted means load every ServiceSpec under --services.
+        #[arg(long = "allow-services", value_delimiter = ',')]
+        allow_services: Vec<String>,
+        /// Do not start the service host from this daemon.
+        #[arg(long = "no-services")]
+        no_services: bool,
+        /// Unix socket used by local `joi` CLI clients to reach this daemon.
+        #[arg(long = "socket", env = "JOI_DAEMON_SOCKET")]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -320,6 +354,8 @@ enum ActorCmd {
         #[arg(long)]
         display: Option<String>,
     },
+    /// Delete an actor row from the server registry.
+    Delete { actor_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -575,6 +611,31 @@ async fn main() -> Result<()> {
         return cmd::service::serve(specs, cfg.server_url, allow_services).await;
     }
 
+    if let Cmd::Daemon {
+        machine_id,
+        data_root,
+        allow_actors,
+        list_providers,
+        services,
+        allow_services,
+        no_services,
+        socket,
+    } = args.cmd
+    {
+        return cmd::daemon::run(
+            machine_id,
+            data_root,
+            allow_actors,
+            list_providers,
+            services,
+            allow_services,
+            no_services,
+            socket,
+            cfg.server_url,
+        )
+        .await;
+    }
+
     // `service validate` is offline — no server contact needed.
     if let Cmd::Service {
         sub: ServiceCmd::Validate { path },
@@ -626,7 +687,7 @@ async fn main() -> Result<()> {
         return cmd::mcp_announcement::run(actor_id.clone(), server.clone()).await;
     }
 
-    let client = Client::connect(&cfg.server_url).await?;
+    let client = connect_client(&cfg.server_url, explicit_server_arg_present()).await?;
     client.initialize().await?;
     let _ = client
         .open_connection(&cfg.actor_id, Some(&cfg.display_name))
@@ -714,6 +775,7 @@ async fn main() -> Result<()> {
                 kind,
                 display,
             } => cmd::actor::upsert(client, actor_id, kind, display).await?,
+            ActorCmd::Delete { actor_id } => cmd::actor::delete(client, actor_id).await?,
         },
         Cmd::Artifact { sub } => match sub {
             ArtifactCmd::Publish {
@@ -802,8 +864,53 @@ async fn main() -> Result<()> {
             cmd::chat::run(client, cfg.actor_id, scope_id, scope_kind).await?
         }
         Cmd::Service { .. } => unreachable!("handled before client setup"),
+        Cmd::Daemon { .. } => unreachable!("handled before client setup"),
     }
     Ok(())
+}
+
+async fn connect_client(
+    server_url: &str,
+    explicit_server_arg: bool,
+) -> Result<std::sync::Arc<Client>> {
+    if !explicit_server_arg && !daemon_ipc::daemon_disabled() {
+        if let Some(socket) = daemon_ipc::resolve_socket() {
+            let server_matches = socket
+                .server_url
+                .as_deref()
+                .map(|url| url == server_url)
+                .unwrap_or(socket.source == daemon_ipc::SocketSource::Env);
+            if server_matches {
+                match Client::connect_daemon_socket(&socket.path).await {
+                    Ok(client) => return Ok(client),
+                    Err(err) if socket.source == daemon_ipc::SocketSource::Discovery => {
+                        tracing::warn!(
+                            error = %err,
+                            socket = %socket.path.display(),
+                            "daemon socket unavailable; falling back to server URL"
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("connect daemon socket {}", socket.path.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Client::connect(server_url).await
+}
+
+fn explicit_server_arg_present() -> bool {
+    std::env::args_os().skip(1).any(|arg| {
+        arg == "--server"
+            || arg
+                .to_str()
+                .map(|value| value.starts_with("--server="))
+                .unwrap_or(false)
+    })
 }
 
 fn init_tracing() {

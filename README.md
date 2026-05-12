@@ -383,6 +383,10 @@ autostart = true
 `provider_id` 必须是 daemon 能在 PATH 上自动探测到的 runtime：`claude`、`codex`
 （或 `codexcli`）、`qoder`、`copilot`、`opencode`。daemon 会按 provider 自己的
 格式合成 runtime 配置；不会再读取 `~/.config/joi/agents/*.json`。
+内置 command provider 会把选中的模型按各 CLI 的 `--model <id>` 参数传入；
+聊天框里发送 `@actor_id /models` 可以从自动探测到的模型菜单中切换。Claude
+没有稳定的模型列表命令，daemon 使用保守的静态候选；Qoder/Codex 会优先读取本机
+模型 registry/cache。
 
 Agent 的默认 cwd 由 runtime 根据 `channelId + actorId` 计算，不在 machine 配置里配置。
 

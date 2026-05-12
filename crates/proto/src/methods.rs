@@ -407,6 +407,7 @@ mod tests {
         .unwrap();
         assert_eq!(transport.kind, "acp_stdio");
         assert!(transport.model.is_none());
+        assert!(transport.model_args.is_empty());
         assert!(transport.interactive.is_none());
         assert!(transport.provider.is_none());
     }
@@ -418,6 +419,7 @@ mod tests {
                 "kind": "interactive_command",
                 "command": "claude",
                 "model": "claude-sonnet-4.6",
+                "modelArgs": ["--model", "{model}"],
                 "interactive": {
                     "session": {
                         "newArgs": ["{prompt}", "--session-id", "{session_id}"],
@@ -433,6 +435,7 @@ mod tests {
         .unwrap();
         assert_eq!(transport.kind, "interactive_command");
         assert_eq!(transport.model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(transport.model_args, vec!["--model", "{model}"]);
         let interactive = transport.interactive.unwrap();
         assert_eq!(interactive.session.new_args.len(), 3);
         let provider = transport.provider.unwrap();
@@ -802,11 +805,14 @@ pub struct AgentTransport {
 
     // ---- command / interactive command transport only ----
     /// Optional default model for transports that expose a CLI-level model flag.
-    /// `joi daemon` may override this with the actor's selected runtime
-    /// model; when an interactive command has an active model, the runtime
-    /// appends `--model=<model>` to the provider argv.
+    /// `joi daemon` may override this with the actor's selected runtime model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Argv template appended when a command-style transport has an active
+    /// model. `{model}` expands to the selected model id. Empty means this
+    /// transport does not receive a CLI model argument.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "modelArgs")]
+    pub model_args: Vec<String>,
     /// How to capture and re-use the underlying CLI's session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<CommandSession>,

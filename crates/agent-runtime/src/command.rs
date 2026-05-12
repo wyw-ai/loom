@@ -61,6 +61,9 @@ pub struct CommandConfig {
     /// First-run argv (template — `{prompt}` may appear when `prompt_via=args`).
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Argv template appended when the prompt selects a model. `{model}` is
+    /// expanded only after a non-empty selected model exists.
+    pub model_args: Vec<String>,
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
     pub output_format: CommandOutputFormat,
@@ -88,6 +91,10 @@ impl CommandConfig {
             hasher.update(b"\x00");
             hasher.update(a.as_bytes());
         }
+        for a in &spec.model_args {
+            hasher.update(b"\x00model_arg\x00");
+            hasher.update(a.as_bytes());
+        }
         let command_signature = format!("sha256:{}", hex::encode(hasher.finalize()));
         let session = spec.session.clone();
         Self {
@@ -95,6 +102,7 @@ impl CommandConfig {
             command,
             args,
             env,
+            model_args: spec.model_args.clone(),
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
             output_format: spec.output_format.unwrap_or_default(),
@@ -1053,6 +1061,7 @@ fn expand_first_run_argv(
         .iter()
         .map(|a| expand_template(a, cfg, request, None, prompt))
         .collect();
+    append_model_args(&mut argv, cfg, request, None, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
         // Only append when the template didn't already place {prompt} itself.
         let already = argv.iter().any(|a| a == prompt);
@@ -1074,6 +1083,7 @@ fn expand_argv(
         .iter()
         .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
+    append_model_args(&mut argv, cfg, request, session_id, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
         let already = template.iter().any(|a| a.contains("{prompt}"));
         if !already {
@@ -1098,6 +1108,7 @@ fn expand_template(
         .replace("{actor.id}", &cfg.actor_id)
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
+        .replace("{model}", active_model(request).as_deref().unwrap_or(""))
         .replace("{prompt}", prompt);
     if let Some(sid) = session_id {
         out = out.replace("{session_id}", sid);
@@ -1106,6 +1117,32 @@ fn expand_template(
         out = out.replace(&format!("{{{key}}}"), value);
     }
     out
+}
+
+fn active_model(request: &AdapterPrompt) -> Option<String> {
+    request
+        .model
+        .as_ref()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn append_model_args(
+    argv: &mut Vec<String>,
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) {
+    if active_model(request).is_none() {
+        return;
+    }
+    argv.extend(
+        cfg.model_args
+            .iter()
+            .map(|arg| expand_template(arg, cfg, request, session_id, prompt)),
+    );
 }
 
 fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String, String> {
@@ -1117,9 +1154,8 @@ fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String
     for (k, v) in &request.env {
         env.entry(k.clone()).or_insert_with(|| v.clone());
     }
-    if let Some(model) = request.model.as_ref().filter(|m| !m.trim().is_empty()) {
-        env.entry("JOI_AGENT_MODEL".into())
-            .or_insert_with(|| model.clone());
+    if let Some(model) = active_model(request) {
+        env.entry("JOI_AGENT_MODEL".into()).or_insert(model);
     }
     env
 }
@@ -1140,6 +1176,7 @@ mod tests {
             command: "echo".into(),
             args: vec!["-n".into()],
             env: BTreeMap::new(),
+            model_args: Vec::new(),
             first_run_capture: None,
             resume_args: None,
             output_format: CommandOutputFormat::Text,
@@ -1190,6 +1227,36 @@ mod tests {
 
         assert_ne!(model_a, cfg.command_signature);
         assert_ne!(model_a, model_b);
+    }
+
+    #[test]
+    fn argv_inserts_model_args_before_prompt_argument() {
+        let mut cfg = cfg();
+        cfg.model_args = vec!["--model".into(), "{model}".into()];
+        let mut request = prompt("hello");
+        request.model = Some("model_a".into());
+
+        let argv = expand_first_run_argv(&cfg, &request, "hello");
+
+        assert_eq!(
+            argv,
+            vec![
+                "-n".to_string(),
+                "--model".to_string(),
+                "model_a".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_omits_model_args_without_selected_model() {
+        let mut cfg = cfg();
+        cfg.model_args = vec!["--model".into(), "{model}".into()];
+
+        let argv = expand_first_run_argv(&cfg, &prompt("hello"), "hello");
+
+        assert_eq!(argv, vec!["-n".to_string(), "hello".to_string()]);
     }
 
     #[test]

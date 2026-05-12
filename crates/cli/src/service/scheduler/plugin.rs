@@ -66,8 +66,9 @@ impl ServicePlugin for SchedulerPlugin {
     async fn run(&self, ctx: ServiceContext) -> Result<()> {
         // §4.7.3 placeholder substitution. For thread-bound instances
         // (and harmlessly for channel-singletons too) interpolate
-        // `{thread.id}` / `{channel.id}` / `{params.X}` /
-        // `{instance.data_dir}` everywhere inside spec.config so jobs
+        // `{thread.id}` / `{channel.id}` / `{channel.workspace}` /
+        // `{params.X}` / `{instance.data_dir}` / `{service.data_dir}`
+        // everywhere inside spec.config so jobs
         // can reference the per-instance binding without the host
         // having to teach every plugin a separate templating layer.
         let subs = build_substitutions(&ctx);
@@ -172,12 +173,12 @@ impl ServicePlugin for SchedulerPlugin {
 /// Build the §4.7.3 substitution map from a [`ServiceContext`].
 ///
 /// Keys are the literal placeholder strings (`{thread.id}`,
-/// `{channel.id}`, `{instance.data_dir}`, `{params.<name>}`); values
-/// are their concrete replacements pulled from
-/// `ctx.instance` / `ctx.runtime`. For non-thread-bound runs the
-/// instance-keyed entries simply aren't inserted, so unrelated
-/// placeholders are left intact for the next layer (or, more usually,
-/// don't appear at all).
+/// `{channel.id}`, `{channel.workspace}`, `{instance.data_dir}`,
+/// `{service.data_dir}`, `{params.<name>}`); values are their concrete
+/// replacements pulled from `ctx.instance` / `ctx.spec` / `ctx.runtime`.
+/// Scope-keyed entries are only inserted when the context carries the
+/// corresponding channel, thread, or params, so unrelated placeholders are
+/// left intact for the next layer (or, more usually, don't appear at all).
 ///
 /// `params` are flattened one level deep — a top-level object keyed
 /// by name, value rendered as: strings used verbatim, everything
@@ -185,10 +186,9 @@ impl ServicePlugin for SchedulerPlugin {
 /// their decimal form, nested objects/arrays their compact JSON).
 fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
     let mut subs: HashMap<String, String> = HashMap::new();
-    subs.insert(
-        "{instance.data_dir}".to_string(),
-        ctx.runtime.state_dir().display().to_string(),
-    );
+    let service_data_dir = ctx.runtime.state_dir().display().to_string();
+    subs.insert("{service.data_dir}".to_string(), service_data_dir.clone());
+    subs.insert("{instance.data_dir}".to_string(), service_data_dir);
     if let Some(path) = ctx.spec_path.as_ref() {
         if let Some(dir) = path.parent() {
             let dir_str = dir.display().to_string();
@@ -196,11 +196,20 @@ fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
             subs.insert("{bundle.dir}".to_string(), format!("{dir_str}/bundle"));
         }
     }
+    let channel_id = ctx
+        .instance
+        .as_ref()
+        .and_then(|inst| inst.scope.channel_id.as_deref())
+        .or(ctx.spec.channel_id.as_deref());
+    if let Some(channel) = channel_id {
+        subs.insert("{channel.id}".to_string(), channel.to_string());
+        subs.insert(
+            "{channel.workspace}".to_string(),
+            channel_workspace_dir(channel).display().to_string(),
+        );
+    }
     if let Some(inst) = &ctx.instance {
         subs.insert("{thread.id}".to_string(), inst.scope.id.clone());
-        if let Some(channel) = &inst.scope.channel_id {
-            subs.insert("{channel.id}".to_string(), channel.clone());
-        }
         if let Some(params) = inst.params.as_object() {
             for (k, v) in params {
                 let rendered = match v {
@@ -212,6 +221,13 @@ fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
         }
     }
     subs
+}
+
+fn channel_workspace_dir(channel_id: &str) -> std::path::PathBuf {
+    crate::cmd::agent_serve::default_data_root_pub()
+        .join("channels")
+        .join(channel_id)
+        .join("shared")
 }
 
 /// Apply the substitution map to every string within `v`, recursing
@@ -1012,5 +1028,40 @@ mod tests {
         substitute_in_value(&mut v, &subs);
         assert_eq!(v["args"][0], json!("--flag=true"));
         assert_eq!(v["args"][1], json!("--n=7"));
+    }
+
+    #[test]
+    fn substitute_replaces_channel_and_service_placeholders() {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        subs.insert("{channel.id}".into(), "chan_repo".into());
+        subs.insert(
+            "{channel.workspace}".into(),
+            "/data/channels/chan_repo/shared".into(),
+        );
+        subs.insert("{service.data_dir}".into(), "/svc/repo-cache".into());
+
+        let mut v = json!({
+            "args": [
+                "--channel={channel.id}",
+                "{channel.workspace}/.joi/repos/manifest.json",
+                "{service.data_dir}/cache"
+            ]
+        });
+        substitute_in_value(&mut v, &subs);
+
+        assert_eq!(v["args"][0], json!("--channel=chan_repo"));
+        assert_eq!(
+            v["args"][1],
+            json!("/data/channels/chan_repo/shared/.joi/repos/manifest.json")
+        );
+        assert_eq!(v["args"][2], json!("/svc/repo-cache/cache"));
+    }
+
+    #[test]
+    fn channel_workspace_dir_points_at_channel_shared() {
+        let suffix = std::path::Path::new("channels")
+            .join("chan_repo")
+            .join("shared");
+        assert!(channel_workspace_dir("chan_repo").ends_with(&suffix));
     }
 }

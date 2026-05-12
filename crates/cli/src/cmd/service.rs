@@ -447,3 +447,28 @@ mod params_schema_tests {
         assert!(err.contains("must be a JSON object"), "{err}");
     }
 }
+
+#[cfg(test)]
+mod service_spec_loader_tests {
+    use super::load_specs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn load_real_data_services_preserves_top_level_params_schema() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/services");
+        let specs = load_specs(&dir).expect("load data/services specs");
+        let mr_detector = specs
+            .iter()
+            .find(|spec| spec.id == "mr-detector")
+            .expect("mr-detector spec");
+
+        assert!(
+            mr_detector
+                .params_schema
+                .as_ref()
+                .and_then(|schema| schema.get("required"))
+                .is_some(),
+            "top-level params_schema must survive ServiceSpec deserialization"
+        );
+    }
+}

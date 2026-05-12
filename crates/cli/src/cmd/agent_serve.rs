@@ -27,7 +27,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentModelChoice, AgentSpec, BundleInstallMode,
-    EventAppendResult, TurnOpenResult,
+    EventAppendResult, HandoffApplyOn, PromptTemplateSpec, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -53,6 +53,131 @@ use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+
+pub async fn run(
+    specs_dir_opt: Option<PathBuf>,
+    server_url: String,
+    allow_actors: Vec<String>,
+) -> Result<()> {
+    let specs_dir = specs_dir_opt.unwrap_or_else(default_specs_dir);
+    std::fs::create_dir_all(&specs_dir)
+        .with_context(|| format!("create specs dir {}", specs_dir.display()))?;
+    let data_root = default_data_root();
+    std::fs::create_dir_all(&data_root)
+        .with_context(|| format!("create data dir {}", data_root.display()))?;
+
+    let mut specs = load_specs(&specs_dir)?;
+    let total_loaded = specs.len();
+    if !allow_actors.is_empty() {
+        let allow: HashSet<&str> = allow_actors.iter().map(String::as_str).collect();
+        specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
+    }
+    if specs.is_empty() {
+        return Err(anyhow!(
+            "no agent specs to serve under {} (loaded {}, after --allow-actors filter: {})",
+            specs_dir.display(),
+            total_loaded,
+            specs.len(),
+        ));
+    }
+
+    eprintln!(
+        "joi agent serve: loaded {} agent(s) from {}",
+        specs.len(),
+        specs_dir.display()
+    );
+    let mut handles = Vec::new();
+    for spec in specs {
+        let server = server_url.clone();
+        let root = data_root.clone();
+        let actor = spec.actor.id.clone();
+        let specs_dir_for_task = specs_dir.clone();
+        handles.push(tokio::spawn(async move {
+            let mut attempt = 0u32;
+            let marker = crate::cmd::reload::agent_marker_path(&root, &actor);
+            let mut last_spec = spec;
+            loop {
+                attempt = attempt.saturating_add(1);
+                let delay = reconnect_delay(attempt);
+                let spec_for_run = match reload_spec(&specs_dir_for_task, &actor) {
+                    Ok(Some(next)) => {
+                        last_spec = next;
+                        last_spec.clone()
+                    }
+                    Ok(None) => last_spec.clone(),
+                    Err(e) => {
+                        eprintln!(
+                            "[{actor}] failed to re-read spec ({e}); continuing with last-known spec"
+                        );
+                        last_spec.clone()
+                    }
+                };
+                let baseline_epoch = crate::cmd::reload::read_epoch(&marker);
+                let worker = tokio::spawn(run_agent_worker(
+                    spec_for_run,
+                    server.clone(),
+                    root.clone(),
+                ));
+                let watcher_marker = marker.clone();
+                let worker_abort = worker.abort_handle();
+                let actor_for_watch = actor.clone();
+                let watcher = tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_millis(1000)).await;
+                        let cur = crate::cmd::reload::read_epoch(&watcher_marker);
+                        if cur > baseline_epoch {
+                            eprintln!(
+                                "[{actor_for_watch}] reload requested (epoch_ms={cur}); restarting worker"
+                            );
+                            worker_abort.abort();
+                            return;
+                        }
+                    }
+                });
+
+                let join_result = worker.await;
+                watcher.abort();
+                let _ = watcher.await;
+                match join_result {
+                    Ok(Ok(())) => {
+                        attempt = 0;
+                        eprintln!(
+                            "[{actor}] worker disconnected; reconnecting in {}s",
+                            delay.as_secs()
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "[{actor}] worker exited with error: {e}; reconnecting in {}s",
+                            delay.as_secs()
+                        );
+                    }
+                    Err(join_err) if join_err.is_cancelled() => {
+                        attempt = 0;
+                        eprintln!("[{actor}] worker aborted for reload; respawning");
+                        continue;
+                    }
+                    Err(join_err) => {
+                        eprintln!(
+                            "[{actor}] worker task panicked: {join_err}; reconnecting in {}s",
+                            delay.as_secs()
+                        );
+                    }
+                }
+                sleep(delay).await;
+            }
+        }));
+    }
+
+    futures_util::future::pending::<()>().await;
+    #[allow(unreachable_code)]
+    {
+        for handle in handles {
+            handle.abort();
+        }
+        Ok(())
+    }
+}
 
 pub fn spawn_agent_worker_loop(
     spec: AgentSpec,
@@ -97,6 +222,82 @@ pub fn spawn_machine_host_loop(
 fn reconnect_delay(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(4);
     Duration::from_secs((RECONNECT_BASE_DELAY_SECS << shift).min(RECONNECT_MAX_DELAY_SECS))
+}
+
+pub(crate) fn default_data_root_pub() -> PathBuf {
+    default_data_root()
+}
+
+fn default_data_root() -> PathBuf {
+    if let Ok(s) = std::env::var("JOI_AGENT_DATA_ROOT") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    dirs::data_dir()
+        .map(|d| d.join("joi").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".joi").join("agents-data"))
+}
+
+fn default_specs_dir() -> PathBuf {
+    if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    dirs::config_dir()
+        .map(|d| d.join("joi").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+}
+
+fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
+    let mut out = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("read specs dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let target = if file_type.is_dir() {
+            let nested = path.join("spec.json");
+            if !nested.exists() {
+                continue;
+            }
+            nested
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            path
+        } else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&target)
+            .with_context(|| format!("read {}", target.display()))?;
+        match serde_json::from_str::<AgentSpec>(&text) {
+            Ok(spec) => out.push(spec),
+            Err(e) => eprintln!("[warn] skipping {}: {}", target.display(), e),
+        }
+    }
+    out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
+    Ok(out)
+}
+
+fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
+    let nested = specs_dir.join(actor_id).join("spec.json");
+    let flat = specs_dir.join(format!("{actor_id}.json"));
+    let path = if nested.exists() {
+        nested
+    } else if flat.exists() {
+        flat
+    } else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+    };
+    let spec: AgentSpec =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(spec))
 }
 
 /// The path to *this* joi binary. Used as the `command` for the
@@ -347,7 +548,24 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
+        let scope_kind = scope_kind_name(scope_ref.kind).to_string();
         let mut vars = BTreeMap::new();
+        vars.insert("actor.id".into(), actor_id.to_string());
+        vars.insert("scope.id".into(), scope_ref.id.clone());
+        vars.insert("scope.kind".into(), scope_kind);
+        vars.insert("channel.id".into(), channel_id.to_string());
+        vars.insert(
+            "thread.id".into(),
+            if matches!(scope_ref.kind, ScopeKind::Thread) {
+                scope_ref.id.clone()
+            } else {
+                String::new()
+            },
+        );
+        vars.insert(
+            "workspace.dir".into(),
+            scope.workspace.display().to_string(),
+        );
         vars.insert(
             "agent.workspace".into(),
             scope.workspace.display().to_string(),
@@ -365,6 +583,9 @@ impl AgentPaths {
             "agent.bundle".into(),
             self.bundle_current.display().to_string(),
         );
+        let skill_body =
+            std::fs::read_to_string(self.bundle_current.join("SKILL.md")).unwrap_or_default();
+        vars.insert("agent.skillBody".into(), skill_body);
         vars.insert(
             "channel.root".into(),
             scope.channel_root.display().to_string(),
@@ -1704,7 +1925,7 @@ async fn open_model_picker(
 ) -> Result<()> {
     let mut adapter_error = adapter_start_error;
     let adapter_options = if adapter_error.is_none() {
-        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None).await {
+        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None, None).await {
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
                 Err(err) => {
@@ -1892,7 +2113,7 @@ async fn dispatch_handoff(
             )
             .await?;
         let user_text = render_trigger_prompt(client, state, &trigger).await;
-        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
+        let prompt = compose_envelope_prompt(client, state, &trigger, &user_text).await;
         let active = ActiveTurn {
             id: turn_res.turn.id.clone(),
             scope: trigger.scope.clone(),
@@ -1904,9 +2125,15 @@ async fn dispatch_handoff(
         };
         state.set_turn(active.clone());
 
-        let adapter_prompt =
-            build_adapter_prompt(client, state, &trigger.scope, prompt.content, Some(&active))
-                .await?;
+        let adapter_prompt = build_adapter_prompt(
+            client,
+            state,
+            &trigger.scope,
+            prompt.content,
+            Some(&active),
+            Some(&trigger),
+        )
+        .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
@@ -1936,6 +2163,7 @@ async fn build_adapter_prompt(
     scope: &ScopeRef,
     content: String,
     active: Option<&ActiveTurn>,
+    trigger: Option<&Event>,
 ) -> Result<AdapterPrompt> {
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
@@ -1943,6 +2171,10 @@ async fn build_adapter_prompt(
     let scope_paths = state
         .paths
         .ensure_scope(&state.actor_id, &channel_id, scope)?;
+    let mut template_vars = state
+        .paths
+        .template_vars(&state.actor_id, &channel_id, scope);
+    extend_prompt_template_vars(&mut template_vars, state, trigger);
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content,
@@ -1955,9 +2187,7 @@ async fn build_adapter_prompt(
             &state.agent_server_url,
             active,
         ),
-        template_vars: state
-            .paths
-            .template_vars(&state.actor_id, &channel_id, scope),
+        template_vars,
     })
 }
 
@@ -2313,17 +2543,29 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    scope: &ScopeRef,
+    trigger: &Event,
     user_text: &str,
 ) -> PromptTelemetry {
+    let scope = &trigger.scope;
+    let first_turn = state.take_seed_slot(&scope.id);
     let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
     let runtime_context = local_time_manifest();
-    let scope_bootstrap =
-        if state.take_seed_slot(&scope.id) || command_transport_without_resume(&state.spec) {
-            seed_manifest(&state.actor_id, scope)
-        } else {
-            String::new()
-        };
+    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.spec) {
+        seed_manifest(&state.actor_id, scope)
+    } else {
+        String::new()
+    };
+    let channel_id = resolve_channel_for_scope(client, state, scope).await;
+    let template_vars = channel_id
+        .as_deref()
+        .map(|channel_id| prompt_template_vars(state, trigger, channel_id))
+        .unwrap_or_else(|| minimal_prompt_template_vars(state, trigger));
+    let user_text = apply_prompt_template(
+        state.spec.prompt_template.as_ref(),
+        &template_vars,
+        first_turn,
+        &user_text,
+    );
 
     let identity_spec = state.spec.identity.as_ref();
     let memory_spec = state.spec.memory.as_ref();
@@ -2352,10 +2594,12 @@ async fn compose_envelope_prompt(
             .map(|section| section.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        return prompt_telemetry(content, &sections);
+        return apply_handoff_prefix_to_prompt(
+            &state.spec,
+            prompt_telemetry(content, &sections),
+            first_turn,
+        );
     }
-
-    let channel_id = resolve_channel_for_scope(client, state, scope).await;
 
     let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
@@ -2366,10 +2610,143 @@ async fn compose_envelope_prompt(
             channel_id: channel_id.as_deref(),
             thread_context: "",
             runtime_context: &runtime_context,
-            user_message: user_text,
+            user_message: &user_text,
             scope_bootstrap: &scope_bootstrap,
         });
-    prompt_telemetry(prompt, &sections)
+    apply_handoff_prefix_to_prompt(&state.spec, prompt_telemetry(prompt, &sections), first_turn)
+}
+
+fn apply_handoff_prefix_to_prompt(
+    spec: &AgentSpec,
+    mut prompt: PromptTelemetry,
+    first_turn: bool,
+) -> PromptTelemetry {
+    let Some(prefix) = handoff_prefix_for_turn(spec, first_turn) else {
+        return prompt;
+    };
+    if prompt.content.starts_with(prefix) {
+        return prompt;
+    }
+
+    prompt.content = format!("{prefix}{}", prompt.content);
+    prompt.stats = prompt_stats(&prompt.content);
+
+    let stats = prompt_stats(prefix);
+    prompt.breakdown.sections.insert(
+        0,
+        PromptBreakdownSection {
+            key: "handoff_prefix".to_string(),
+            label: "Handoff Prefix".to_string(),
+            char_count: stats.char_count,
+            byte_count: stats.byte_count,
+            approx_token_count: stats.approx_token_count,
+            percentage: 0.0,
+        },
+    );
+    recalculate_prompt_breakdown_percentages(&mut prompt.breakdown.sections);
+    prompt
+}
+
+fn handoff_prefix_for_turn(spec: &AgentSpec, first_turn: bool) -> Option<&str> {
+    let handoff = spec.handoff.as_ref()?;
+    let prefix = handoff.trigger_prompt_prefix.as_str();
+    if prefix.is_empty() {
+        return None;
+    }
+    let applies = match handoff.apply_on {
+        HandoffApplyOn::EveryTurn => true,
+        HandoffApplyOn::FirstTurn => first_turn,
+    };
+    applies.then_some(prefix)
+}
+
+fn apply_prompt_template(
+    template: Option<&PromptTemplateSpec>,
+    vars: &BTreeMap<String, String>,
+    first_turn: bool,
+    user_text: &str,
+) -> String {
+    let Some(template) = template else {
+        return user_text.to_string();
+    };
+    let mut sections = Vec::new();
+    sections.extend(
+        template
+            .every_turn_prefix
+            .iter()
+            .map(|line| expand_prompt_vars(line, vars)),
+    );
+    if first_turn {
+        sections.extend(
+            template
+                .first_turn_prefix
+                .iter()
+                .map(|line| expand_prompt_vars(line, vars)),
+        );
+    }
+    sections.push(user_text.to_string());
+    sections.extend(
+        template
+            .every_turn_suffix
+            .iter()
+            .map(|line| expand_prompt_vars(line, vars)),
+    );
+    sections
+        .into_iter()
+        .filter(|section| !section.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn prompt_template_vars(
+    state: &WorkerState,
+    trigger: &Event,
+    channel_id: &str,
+) -> BTreeMap<String, String> {
+    let mut vars = state
+        .paths
+        .template_vars(&state.actor_id, channel_id, &trigger.scope);
+    extend_prompt_template_vars(&mut vars, state, Some(trigger));
+    vars
+}
+
+fn minimal_prompt_template_vars(state: &WorkerState, trigger: &Event) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    vars.insert("actor.id".into(), state.actor_id.clone());
+    vars.insert("scope.id".into(), trigger.scope.id.clone());
+    vars.insert(
+        "scope.kind".into(),
+        scope_kind_name(trigger.scope.kind).to_string(),
+    );
+    extend_prompt_template_vars(&mut vars, state, Some(trigger));
+    vars
+}
+
+fn extend_prompt_template_vars(
+    vars: &mut BTreeMap<String, String>,
+    state: &WorkerState,
+    trigger: Option<&Event>,
+) {
+    if let Some(trigger) = trigger {
+        vars.insert("trigger.id".into(), trigger.id.clone());
+        vars.insert("trigger.actor_id".into(), trigger.actor_id.clone());
+    }
+    if let Some(template) = state.spec.prompt_template.as_ref() {
+        if let Some(active_skill) = template.active_skill.as_deref() {
+            vars.insert("prompt.activeSkill".into(), active_skill.to_string());
+        }
+        for (key, value) in &template.vars {
+            vars.insert(format!("vars.{key}"), value.clone());
+        }
+    }
+}
+
+fn expand_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = input.to_string();
+    for (key, value) in vars {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    out
 }
 
 fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) -> PromptTelemetry {
@@ -2389,20 +2766,24 @@ fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) 
             }
         })
         .collect();
-    let total_tokens = breakdown_sections
-        .iter()
-        .map(|section| section.approx_token_count)
-        .sum::<u64>()
-        .max(1) as f64;
-    for section in &mut breakdown_sections {
-        section.percentage = (section.approx_token_count as f64 / total_tokens) * 100.0;
-    }
+    recalculate_prompt_breakdown_percentages(&mut breakdown_sections);
     PromptTelemetry {
         content,
         stats,
         breakdown: PromptBreakdown {
             sections: breakdown_sections,
         },
+    }
+}
+
+fn recalculate_prompt_breakdown_percentages(sections: &mut [PromptBreakdownSection]) {
+    let total_tokens = sections
+        .iter()
+        .map(|section| section.approx_token_count)
+        .sum::<u64>()
+        .max(1) as f64;
+    for section in sections {
+        section.percentage = (section.approx_token_count as f64 / total_tokens) * 100.0;
     }
 }
 
@@ -2936,7 +3317,9 @@ async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::methods::{AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport};
+    use proto::methods::{
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, HandoffSpec,
+    };
     use proto::types::{Actor, ActorKind};
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
@@ -2968,6 +3351,8 @@ mod tests {
             identity: None,
             memory: None,
             announcement: None,
+            handoff: None,
+            prompt_template: None,
         }
     }
 
@@ -3302,6 +3687,154 @@ mod tests {
         let mut acp = sample_spec(None);
         acp.transport.kind = "acp_stdio".into();
         assert!(!command_transport_without_resume(&acp));
+    }
+
+    #[test]
+    fn handoff_prefix_applies_to_every_turn() {
+        let mut spec = sample_spec(None);
+        spec.handoff = Some(HandoffSpec {
+            trigger_prompt_prefix: "/router\n".into(),
+            apply_on: HandoffApplyOn::EveryTurn,
+        });
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "hello".into(),
+        }];
+
+        assert_eq!(
+            apply_handoff_prefix_to_prompt(
+                &spec,
+                prompt_telemetry("hello".into(), &sections),
+                false,
+            )
+            .content,
+            "/router\nhello"
+        );
+        assert_eq!(
+            apply_handoff_prefix_to_prompt(
+                &spec,
+                prompt_telemetry("/router\nhello".into(), &sections),
+                false,
+            )
+            .content,
+            "/router\nhello"
+        );
+    }
+
+    #[test]
+    fn prompt_template_expands_runtime_vars_and_first_turn_prefix() {
+        let mut vars = BTreeMap::new();
+        vars.insert("actor.id".into(), "actor_router".into());
+        vars.insert("scope.kind".into(), "channel".into());
+        vars.insert("scope.id".into(), "chan_1".into());
+        vars.insert("workspace.dir".into(), "/tmp/work".into());
+        vars.insert("agent.skillBody".into(), "# Router skill".into());
+        vars.insert("prompt.activeSkill".into(), "router".into());
+        vars.insert("vars.mode".into(), "fast".into());
+        let template = PromptTemplateSpec {
+            active_skill: Some("router".into()),
+            every_turn_prefix: vec![
+                "[joi] {actor.id} {scope.kind}:{scope.id}".into(),
+                "workspace_dir: {workspace.dir}".into(),
+                "mode: {vars.mode}".into(),
+            ],
+            first_turn_prefix: vec![
+                "skill: {prompt.activeSkill}".into(),
+                "{agent.skillBody}".into(),
+            ],
+            every_turn_suffix: vec!["done".into()],
+            vars: BTreeMap::new(),
+        };
+
+        let first = apply_prompt_template(Some(&template), &vars, true, "/router\nhi");
+        assert!(first.contains("[joi] actor_router channel:chan_1"));
+        assert!(first.contains("workspace_dir: /tmp/work"));
+        assert!(first.contains("skill: router"));
+        assert!(first.contains("# Router skill"));
+        assert!(first.contains("/router\nhi"));
+        assert!(first.ends_with("done"));
+
+        let later = apply_prompt_template(Some(&template), &vars, false, "hi");
+        assert!(!later.contains("# Router skill"));
+        assert!(later.contains("hi"));
+    }
+
+    #[test]
+    fn handoff_prefix_is_first_in_final_prompt() {
+        let mut spec = sample_spec(None);
+        spec.handoff = Some(HandoffSpec {
+            trigger_prompt_prefix: "/router\n".into(),
+            apply_on: HandoffApplyOn::EveryTurn,
+        });
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "=== User message ===\n[joi envelope]\nhello".into(),
+        }];
+        let prompt = prompt_telemetry(sections[0].content.clone(), &sections);
+
+        let prompt = apply_handoff_prefix_to_prompt(&spec, prompt, false);
+
+        assert!(prompt.content.starts_with("/router\n=== User message ==="));
+        assert_eq!(prompt.breakdown.sections[0].key, "handoff_prefix");
+    }
+
+    #[test]
+    fn prompt_template_vars_include_trigger_and_paths() {
+        let root = temp_path("prompt-template-vars");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let mut spec = sample_spec(None);
+        spec.prompt_template = Some(PromptTemplateSpec {
+            active_skill: Some("demo".into()),
+            vars: BTreeMap::from([("role".into(), "router".into())]),
+            ..Default::default()
+        });
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let trigger = Event {
+            id: "evt_trigger".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_human".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: chrono::Utc::now(),
+            payload: serde_json::json!({}),
+            relations: Vec::new(),
+            _meta: None,
+        };
+
+        let vars = prompt_template_vars(&state, &trigger, "chan_demo");
+
+        assert_eq!(vars.get("actor.id").map(String::as_str), Some("actor_demo"));
+        assert_eq!(
+            vars.get("channel.id").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            vars.get("trigger.id").map(String::as_str),
+            Some("evt_trigger")
+        );
+        assert_eq!(
+            vars.get("trigger.actor_id").map(String::as_str),
+            Some("actor_human")
+        );
+        assert_eq!(
+            vars.get("prompt.activeSkill").map(String::as_str),
+            Some("demo")
+        );
+        assert_eq!(vars.get("vars.role").map(String::as_str), Some("router"));
+        assert!(vars
+            .get("workspace.dir")
+            .is_some_and(|value| value.contains("chan_demo")));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

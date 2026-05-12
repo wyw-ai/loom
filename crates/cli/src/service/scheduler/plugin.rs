@@ -25,7 +25,7 @@
 //! the gate is held across the whole fire, so a slow source or a slow
 //! agent cannot stack a queue of pending fires (§8.5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,9 +33,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use proto::methods::ServiceLifecycle;
 use proto::types::{Meta, ScopeRef};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::service::plugin::{ServiceContext, ServicePlugin, ShutdownSignal};
@@ -43,7 +46,10 @@ use crate::service::runtime::ServiceRuntime;
 
 use super::cron::Schedule;
 use super::source::exec_source;
-use super::spec::{CursorBy, DedupeBy, JobSpec, SchedulerConfig, ScopeBinding, ScopeKind, Source};
+use super::spec::{
+    CursorBy, DedupeBy, EmitConfig, EmitMode, JobSpec, SchedulerConfig, ScopeBinding, ScopeKind,
+    Source,
+};
 
 /// Plugin-kind discriminator used by [`crate::service::ServiceHost`].
 pub const KIND: &str = "scheduler";
@@ -58,16 +64,41 @@ impl ServicePlugin for SchedulerPlugin {
     }
 
     async fn run(&self, ctx: ServiceContext) -> Result<()> {
-        let config: SchedulerConfig = if ctx.spec.config.is_null() || ctx.spec.config == json!({}) {
+        // §4.7.3 placeholder substitution. For thread-bound instances
+        // (and harmlessly for channel-singletons too) interpolate
+        // `{thread.id}` / `{channel.id}` / `{channel.workspace}` /
+        // `{params.X}` / `{instance.data_dir}` / `{service.data_dir}`
+        // everywhere inside spec.config so jobs
+        // can reference the per-instance binding without the host
+        // having to teach every plugin a separate templating layer.
+        let subs = build_substitutions(&ctx);
+        let mut config_json = ctx.spec.config.clone();
+        if !subs.is_empty() {
+            substitute_in_value(&mut config_json, &subs);
+        }
+        let config: SchedulerConfig = if config_json.is_null() || config_json == json!({}) {
             SchedulerConfig::default()
         } else {
-            serde_json::from_value(ctx.spec.config.clone())
-                .context("parse spec.config as SchedulerConfig")?
+            serde_json::from_value(config_json).context("parse spec.config as SchedulerConfig")?
         };
         config.validate().context("validate scheduler config")?;
 
         let runtime = ctx.runtime.clone();
         let shutdown = ctx.shutdown.clone();
+
+        // §4.7.3: thread-bound services tear down their instance when
+        // any event in `bind.auto_stop_on` is observed. Today the
+        // self_complete sentinel is the only signal scheduler raises;
+        // future expansions (e.g., listening for `thread.closed` on
+        // delivery_list) reuse the same Notify.
+        let stop_on_self_complete = matches!(ctx.spec.lifecycle, ServiceLifecycle::ThreadBound)
+            && ctx
+                .spec
+                .bind
+                .as_ref()
+                .map(|b| b.auto_stop_on.iter().any(|k| k == "service.self_complete"))
+                .unwrap_or(false);
+        let self_complete = Arc::new(Notify::new());
 
         // Pre-flight: make sure the actor can reach every scope channel.
         // best-effort; channel/invite is idempotent on the server.
@@ -102,9 +133,10 @@ impl ServicePlugin for SchedulerPlugin {
         for job in config.jobs {
             let runtime = runtime.clone();
             let shutdown = shutdown.clone();
+            let self_complete = self_complete.clone();
             let job = Arc::new(job);
             joinset.spawn(async move {
-                if let Err(e) = run_job_loop(job.clone(), runtime, shutdown).await {
+                if let Err(e) = run_job_loop(job.clone(), runtime, shutdown, self_complete).await {
                     tracing::error!(
                         job = %job.id,
                         error = ?e,
@@ -113,11 +145,116 @@ impl ServicePlugin for SchedulerPlugin {
                 }
             });
         }
-        // Wait for either every job loop to exit (shutdown) or the
-        // shutdown signal directly. The per-job loops observe shutdown
-        // themselves; this just keeps `run` alive until they're done.
-        while joinset.join_next().await.is_some() {}
+        // Wait for either every job loop to exit (shutdown) or, for a
+        // thread-bound spec opted into `service.self_complete`, the
+        // first time a job emits the sentinel. In the latter case we
+        // cancel the remaining jobs so the scheduler instance can
+        // unwind cleanly and the host's per-instance task ends.
+        if stop_on_self_complete {
+            tokio::select! {
+                _ = async { while joinset.join_next().await.is_some() {} } => {}
+                _ = self_complete.notified() => {
+                    tracing::info!(
+                        service = %runtime.service_id(),
+                        instance = ?runtime.instance_id(),
+                        "service.self_complete observed; aborting remaining jobs",
+                    );
+                    joinset.abort_all();
+                    while joinset.join_next().await.is_some() {}
+                }
+            }
+        } else {
+            while joinset.join_next().await.is_some() {}
+        }
         Ok(())
+    }
+}
+
+/// Build the §4.7.3 substitution map from a [`ServiceContext`].
+///
+/// Keys are the literal placeholder strings (`{thread.id}`,
+/// `{channel.id}`, `{channel.workspace}`, `{instance.data_dir}`,
+/// `{service.data_dir}`, `{params.<name>}`); values are their concrete
+/// replacements pulled from `ctx.instance` / `ctx.spec` / `ctx.runtime`.
+/// Scope-keyed entries are only inserted when the context carries the
+/// corresponding channel, thread, or params, so unrelated placeholders are
+/// left intact for the next layer (or, more usually, don't appear at all).
+///
+/// `params` are flattened one level deep — a top-level object keyed
+/// by name, value rendered as: strings used verbatim, everything
+/// else `to_string()` (so booleans become "true"/"false", numbers
+/// their decimal form, nested objects/arrays their compact JSON).
+fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
+    let mut subs: HashMap<String, String> = HashMap::new();
+    let service_data_dir = ctx.runtime.state_dir().display().to_string();
+    subs.insert("{service.data_dir}".to_string(), service_data_dir.clone());
+    subs.insert("{instance.data_dir}".to_string(), service_data_dir);
+    if let Some(path) = ctx.spec_path.as_ref() {
+        if let Some(dir) = path.parent() {
+            let dir_str = dir.display().to_string();
+            subs.insert("{spec.dir}".to_string(), dir_str.clone());
+            subs.insert("{bundle.dir}".to_string(), format!("{dir_str}/bundle"));
+        }
+    }
+    let channel_id = ctx
+        .instance
+        .as_ref()
+        .and_then(|inst| inst.scope.channel_id.as_deref())
+        .or(ctx.spec.channel_id.as_deref());
+    if let Some(channel) = channel_id {
+        subs.insert("{channel.id}".to_string(), channel.to_string());
+        subs.insert(
+            "{channel.workspace}".to_string(),
+            channel_workspace_dir(channel).display().to_string(),
+        );
+    }
+    if let Some(inst) = &ctx.instance {
+        subs.insert("{thread.id}".to_string(), inst.scope.id.clone());
+        if let Some(params) = inst.params.as_object() {
+            for (k, v) in params {
+                let rendered = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                subs.insert(format!("{{params.{k}}}"), rendered);
+            }
+        }
+    }
+    subs
+}
+
+fn channel_workspace_dir(channel_id: &str) -> std::path::PathBuf {
+    crate::cmd::agent_serve::default_data_root_pub()
+        .join("channels")
+        .join(channel_id)
+        .join("shared")
+}
+
+/// Apply the substitution map to every string within `v`, recursing
+/// into arrays and objects in place. O(N · M) where N = total bytes
+/// of strings, M = number of placeholders; both are tiny (<10 each
+/// in practice) so the plain `String::contains` + `String::replace`
+/// pair beats a regex/aho-corasick build cost here.
+fn substitute_in_value(v: &mut Value, subs: &HashMap<String, String>) {
+    match v {
+        Value::String(s) => {
+            for (placeholder, replacement) in subs {
+                if s.contains(placeholder) {
+                    *s = s.replace(placeholder, replacement);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                substitute_in_value(item, subs);
+            }
+        }
+        Value::Object(obj) => {
+            for (_, val) in obj.iter_mut() {
+                substitute_in_value(val, subs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -132,6 +269,7 @@ async fn run_job_loop(
     job: Arc<JobSpec>,
     runtime: Arc<ServiceRuntime>,
     mut shutdown: ShutdownSignal,
+    self_complete: Arc<Notify>,
 ) -> Result<()> {
     let schedule = Schedule::parse(&job.schedule)
         .with_context(|| format!("re-parse cron `{}`", job.schedule))?;
@@ -177,10 +315,11 @@ async fn run_job_loop(
         }
         let runtime = runtime.clone();
         let state_clone = state.clone();
+        let self_complete = self_complete.clone();
         // Spawn the actual fire so the loop can sleep for the next tick
         // promptly; the gate is released at the end of the fire task.
         tokio::spawn(async move {
-            let res = fire_once(state_clone.clone(), runtime, next).await;
+            let res = fire_once(state_clone.clone(), runtime, next, self_complete).await;
             if state_clone.spec.single_in_flight {
                 state_clone.in_flight.store(false, Ordering::Release);
             }
@@ -207,9 +346,10 @@ async fn fire_once(
     state: Arc<JobState>,
     runtime: Arc<ServiceRuntime>,
     fire_time: DateTime<Utc>,
+    self_complete: Arc<Notify>,
 ) -> Result<()> {
     let job = &state.spec;
-    let body = match exec_source(&job.source).await {
+    let raw_body = match exec_source(&job.source).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
@@ -220,86 +360,163 @@ async fn fire_once(
             return Ok(());
         }
     };
-    let body_hash = sha256_hex(&body);
-
-    // Cursor diff (§8.3): `body_hash` skips when unchanged. cursor_save
-    // happens *after* successful append so the next tick's diff still
-    // sees the prior value if append fails.
-    let cursor_name = job.id.clone();
-    if matches!(job.cursor_by, CursorBy::BodyHash) {
-        if let Some(prev) = runtime.cursor_load(&cursor_name)? {
-            if prev == body_hash {
-                tracing::debug!(
-                    job = %job.id,
-                    fire_time_utc = %fire_time.to_rfc3339_opts(SecondsFormat::Secs, true),
-                    "body unchanged; skipping",
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    // Dedupe (§8.4) — must run *before* the append.
-    let dedupe_key = build_dedupe_key(runtime.service_id(), job, fire_time, &body_hash);
-    if let Some(key) = dedupe_key.as_deref() {
-        if !runtime.dedupe_once(key)? {
-            tracing::debug!(job = %job.id, key = %key, "dedupe hit; skipping");
-            return Ok(());
-        }
-    }
+    // §4.7.3: a service plugin (e.g., mr-detector bundle) may signal
+    // "this instance is done" by writing a sentinel JSON object as the
+    // last line of stdout. We strip the sentinel from the body so it
+    // doesn't leak into the user-visible event, then publish a separate
+    // `service.self_complete` event and notify the run() loop so the
+    // scheduler can tear the instance down when `auto_stop_on` opts in.
+    let (body_vec, self_complete_signal) = strip_self_complete(&raw_body);
+    let body = body_vec.as_slice();
+    let body_hash = sha256_hex(body);
 
     let scope = scope_ref(&job.scope);
-    let body_text = stringify_body(&body);
-    let meta = build_meta(job, fire_time, &body_hash);
-    let event_id = if let Some(target) = job.target_agent.as_deref() {
-        runtime
-            .handoff(target, scope.clone(), body_text.clone(), Some(meta))
-            .await
-            .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
-    } else {
-        runtime
-            .append_content(scope.clone(), body_text.clone(), Vec::new(), Some(meta))
-            .await
-            .with_context(|| format!("scheduler append for job `{}`", job.id))?
-    };
+    let mut event_id: Option<String> = None;
 
-    // Cursor save after success.
-    if matches!(job.cursor_by, CursorBy::BodyHash) {
-        if let Err(e) = runtime.cursor_save(&cursor_name, &body_hash) {
-            tracing::warn!(
-                job = %job.id,
-                error = ?e,
-                "cursor_save failed (will re-fire on next tick)",
-            );
+    // If the body is empty after stripping the sentinel, skip the
+    // regular content event (a self_complete-only tick has nothing
+    // user-visible to log). Otherwise run the cursor diff / dedupe /
+    // append / await chain like a normal tick.
+    if !body.is_empty() {
+        // Cursor diff (§8.3): `body_hash` skips when unchanged.
+        // cursor_save happens *after* successful append so the next
+        // tick's diff still sees the prior value if append fails.
+        let mut cursor_skip = false;
+        let cursor_name = job.id.clone();
+        if matches!(job.cursor_by, CursorBy::BodyHash) {
+            if let Some(prev) = runtime.cursor_load(&cursor_name)? {
+                if prev == body_hash {
+                    tracing::debug!(
+                        job = %job.id,
+                        fire_time_utc = %fire_time.to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "body unchanged; skipping",
+                    );
+                    cursor_skip = true;
+                }
+            }
+        }
+
+        if !cursor_skip {
+            // Dedupe (§8.4) — must run *before* the append.
+            let dedupe_key = build_dedupe_key(runtime.service_id(), job, fire_time, &body_hash);
+            let dedupe_skip = if let Some(key) = dedupe_key.as_deref() {
+                if !runtime.dedupe_once(key)? {
+                    tracing::debug!(job = %job.id, key = %key, "dedupe hit; skipping");
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !dedupe_skip {
+                let id = if let Some(emit) = job.emit.as_ref() {
+                    emit_per_line(
+                        emit,
+                        body,
+                        &runtime,
+                        scope.clone(),
+                        job,
+                        fire_time,
+                        &body_hash,
+                    )
+                    .await
+                    .with_context(|| format!("scheduler emit-per-line for job `{}`", job.id))?
+                } else {
+                    let body_text = stringify_body(body);
+                    let meta = build_meta(job, fire_time, &body_hash);
+                    if let Some(target) = job.target_agent.as_deref() {
+                        runtime
+                            .handoff(target, scope.clone(), body_text.clone(), Some(meta))
+                            .await
+                            .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
+                    } else {
+                        runtime
+                            .append_content(
+                                scope.clone(),
+                                body_text.clone(),
+                                Vec::new(),
+                                Some(meta),
+                            )
+                            .await
+                            .with_context(|| format!("scheduler append for job `{}`", job.id))?
+                    }
+                };
+                event_id = Some(id);
+
+                // Cursor save after success.
+                if matches!(job.cursor_by, CursorBy::BodyHash) {
+                    if let Err(e) = runtime.cursor_save(&cursor_name, &body_hash) {
+                        tracing::warn!(
+                            job = %job.id,
+                            error = ?e,
+                            "cursor_save failed (will re-fire on next tick)",
+                        );
+                    }
+                }
+            }
         }
     }
 
-    // Awaited mode: block until the agent answers (or timeout).
-    if job.await_reply {
-        let timeout = Duration::from_secs(job.await_timeout_secs);
-        match runtime.await_responds_to(&event_id, timeout).await {
-            Ok(events) if !events.is_empty() => {
+    // §4.7.3: emit the self_complete event regardless of cursor /
+    // dedupe outcome — the bundle saying "I'm done" is itself the
+    // event that matters, and a stuck cursor must not silence it.
+    if let Some(signal) = self_complete_signal {
+        match runtime
+            .publish_self_complete(scope.clone(), signal.reason.clone())
+            .await
+        {
+            Ok(id) => {
                 tracing::info!(
                     job = %job.id,
-                    trigger = %event_id,
-                    replies = events.len(),
-                    "scheduler awaited reply received",
-                );
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    job = %job.id,
-                    trigger = %event_id,
-                    timeout_secs = job.await_timeout_secs,
-                    "scheduler awaited reply timed out",
+                    instance = ?runtime.instance_id(),
+                    reason = %signal.reason,
+                    event_id = %id,
+                    "service.self_complete published",
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     job = %job.id,
                     error = ?e,
-                    "await_responds_to error",
+                    "publish_self_complete failed (continuing)",
                 );
+            }
+        }
+        // Wake up `run()`'s select; a no-op when no one is waiting.
+        self_complete.notify_waiters();
+    }
+
+    // Awaited mode: block until the agent answers (or timeout). Only
+    // meaningful when the tick actually emitted an event.
+    if let Some(event_id) = event_id.as_deref() {
+        if job.await_reply {
+            let timeout = Duration::from_secs(job.await_timeout_secs);
+            match runtime.await_responds_to(event_id, timeout).await {
+                Ok(events) if !events.is_empty() => {
+                    tracing::info!(
+                        job = %job.id,
+                        trigger = %event_id,
+                        replies = events.len(),
+                        "scheduler awaited reply received",
+                    );
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        job = %job.id,
+                        trigger = %event_id,
+                        timeout_secs = job.await_timeout_secs,
+                        "scheduler awaited reply timed out",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job = %job.id,
+                        error = ?e,
+                        "await_responds_to error",
+                    );
+                }
             }
         }
     }
@@ -377,6 +594,195 @@ fn stringify_body(body: &[u8]) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
+/// Emit one artifact + one `status.update` event per non-empty JSON
+/// line in `body`. Returns the id of the *last* event appended so the
+/// caller can drive the regular cursor / await_responds_to bookkeeping.
+/// A line that fails JSON parse is logged and skipped — one bad line
+/// must not block subsequent transitions in the same tick. When zero
+/// lines are emittable, returns the body-hash-stamped no-op event id
+/// to preserve cursor invariants.
+async fn emit_per_line(
+    emit: &EmitConfig,
+    body: &[u8],
+    runtime: &ServiceRuntime,
+    scope: ScopeRef,
+    job: &JobSpec,
+    fire_time: DateTime<Utc>,
+    body_hash: &str,
+) -> Result<String> {
+    if !matches!(emit.mode, EmitMode::ArtifactPerJsonLine) {
+        // Defensive: future EmitMode variants must extend this.
+        anyhow::bail!("unsupported emit mode for job `{}`", job.id);
+    }
+    let text = String::from_utf8_lossy(body);
+    let mut last_event_id: Option<String> = None;
+    let template = emit
+        .artifact_name_template
+        .clone()
+        .unwrap_or_else(|| format!("{}-{{event_kind}}.json", job.id));
+    let mut emitted = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let payload: Value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                tracing::warn!(
+                    job = %job.id,
+                    "emit-per-line: skipping non-object JSON line",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    job = %job.id,
+                    error = %e,
+                    "emit-per-line: skipping unparseable line",
+                );
+                continue;
+            }
+        };
+        let name = render_artifact_name(&template, &payload);
+        let body_text =
+            serde_json::to_string(&payload).with_context(|| "serialize artifact body")?;
+        let (artifact_id, _uri) = runtime
+            .publish_artifact(
+                scope.clone(),
+                name.clone(),
+                Some("application/json".into()),
+                body_text,
+            )
+            .await
+            .with_context(|| format!("publish_artifact for job `{}`", job.id))?;
+        let mut meta = build_meta(job, fire_time, body_hash);
+        meta.insert("artifactName".into(), Value::String(name.clone()));
+        let event_id = runtime
+            .append_status(
+                scope.clone(),
+                emit.status_event_type.clone(),
+                payload,
+                Some(&artifact_id),
+                Some(meta),
+            )
+            .await
+            .with_context(|| format!("append_status for job `{}`", job.id))?;
+        last_event_id = Some(event_id);
+        emitted += 1;
+    }
+    if emitted == 0 {
+        // No usable lines — fall back to a single empty status.update so
+        // cursor / await_responds_to plumbing remains coherent.
+        let meta = build_meta(job, fire_time, body_hash);
+        let id = runtime
+            .append_status(
+                scope,
+                emit.status_event_type.clone(),
+                json!({"empty": true}),
+                None,
+                Some(meta),
+            )
+            .await?;
+        return Ok(id);
+    }
+    Ok(last_event_id.expect("emitted > 0 implies last_event_id set"))
+}
+
+/// Substitute `{key}` tokens in `template` with the matching top-level
+/// string field from `payload`. Missing or non-string fields render as
+/// the literal placeholder so the artifact name flags the gap rather
+/// than silently coalescing distinct events.
+fn render_artifact_name(template: &str, payload: &Value) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(close) = template[i..].find('}') {
+                let key = &template[i + 1..i + close];
+                let replacement = payload
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(sanitize_name_segment)
+                    .unwrap_or_else(|| format!("{{{key}}}"));
+                out.push_str(&replacement);
+                i += close + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn sanitize_name_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Sentinel parsed off the last line of a tick's stdout. See §4.7.3.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct SelfCompleteSentinel {
+    #[serde(rename = "service.self_complete")]
+    service_self_complete: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfCompleteSignal {
+    reason: String,
+}
+
+/// If the last non-empty line of `body` parses as `{"service.self_complete":
+/// true, "reason": "..."}`, return the rest of the body (sentinel
+/// stripped, with any trailing blank lines trimmed) plus the parsed
+/// signal. Otherwise return `body` unchanged. Tolerates JSON whose
+/// `reason` is omitted; rejects sentinels whose flag is false or whose
+/// JSON shape doesn't match — those are passed through as ordinary
+/// stdout so the operator sees them.
+fn strip_self_complete(body: &[u8]) -> (Vec<u8>, Option<SelfCompleteSignal>) {
+    let text = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return (body.to_vec(), None),
+    };
+    // Walk lines from the end skipping pure whitespace; the first
+    // non-empty line is the candidate.
+    let trimmed_end = text.trim_end_matches(['\n', '\r', ' ', '\t']);
+    let last_newline = trimmed_end.rfind('\n');
+    let (head, last_line) = match last_newline {
+        Some(i) => (&trimmed_end[..i], trimmed_end[i + 1..].trim()),
+        None => ("", trimmed_end.trim()),
+    };
+    if last_line.is_empty() || !last_line.starts_with('{') {
+        return (body.to_vec(), None);
+    }
+    let parsed: SelfCompleteSentinel = match serde_json::from_str::<SelfCompleteSentinel>(last_line)
+    {
+        Ok(p) if p.service_self_complete => p,
+        _ => return (body.to_vec(), None),
+    };
+    let reason = if parsed.reason.is_empty() {
+        "unspecified".to_string()
+    } else {
+        parsed.reason
+    };
+    let mut head_bytes = head.trim_end_matches(['\n', '\r']).as_bytes().to_vec();
+    if !head_bytes.is_empty() {
+        head_bytes.push(b'\n');
+    }
+    (head_bytes, Some(SelfCompleteSignal { reason }))
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
@@ -421,7 +827,30 @@ mod tests {
             single_in_flight: true,
             await_reply: false,
             await_timeout_secs: 60,
+            emit: None,
         }
+    }
+
+    #[test]
+    fn render_artifact_name_substitutes_top_level_fields() {
+        let payload = json!({"event_kind": "merged", "mr_id": 42});
+        let out = render_artifact_name("mr-event-{event_kind}-{mr_id}.json", &payload);
+        // mr_id is a number, not a string, so it's left as the literal placeholder.
+        assert_eq!(out, "mr-event-merged-{mr_id}.json");
+    }
+
+    #[test]
+    fn render_artifact_name_sanitizes_unsafe_chars() {
+        let payload = json!({"event_kind": "build/passed?", "mr_id": "12"});
+        let out = render_artifact_name("mr-{event_kind}-{mr_id}.json", &payload);
+        assert_eq!(out, "mr-build_passed_-12.json");
+    }
+
+    #[test]
+    fn render_artifact_name_keeps_unknown_placeholders() {
+        let payload = json!({"event_kind": "merged"});
+        let out = render_artifact_name("mr-{event_kind}-{missing}.json", &payload);
+        assert_eq!(out, "mr-merged-{missing}.json");
     }
 
     #[test]
@@ -504,5 +933,135 @@ mod tests {
         // Should not panic on non-UTF-8 — replacement char.
         let s = stringify_body(&[0xFFu8, 0xFE, b'a']);
         assert!(s.contains('a'));
+    }
+
+    #[test]
+    fn strip_self_complete_detects_sentinel_only_body() {
+        let body = b"{\"service.self_complete\":true,\"reason\":\"merged\"}\n";
+        let (rest, sig) = strip_self_complete(body);
+        assert!(rest.is_empty(), "sentinel-only body strips to empty");
+        let sig = sig.expect("signal parsed");
+        assert_eq!(sig.reason, "merged");
+    }
+
+    #[test]
+    fn strip_self_complete_keeps_preceding_stdout() {
+        // Real bundle shape: emit one tick event line then the sentinel
+        // as the trailing line. The tick event must survive untouched.
+        let body = b"{\"event\":\"opened\",\"raw_event_fingerprint\":\"sha256:abc\"}\n{\"service.self_complete\":true,\"reason\":\"closed\"}\n";
+        let (rest, sig) = strip_self_complete(body);
+        let rest_str = String::from_utf8(rest).unwrap();
+        assert!(rest_str.contains("\"event\":\"opened\""));
+        assert!(!rest_str.contains("self_complete"));
+        assert_eq!(sig.unwrap().reason, "closed");
+    }
+
+    #[test]
+    fn strip_self_complete_passes_through_when_absent() {
+        let body = b"hello world\n";
+        let (rest, sig) = strip_self_complete(body);
+        assert_eq!(rest, body);
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn strip_self_complete_ignores_false_flag() {
+        let body = b"{\"service.self_complete\":false,\"reason\":\"x\"}\n";
+        let (rest, sig) = strip_self_complete(body);
+        assert_eq!(rest, body);
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn strip_self_complete_defaults_reason_when_missing() {
+        let body = b"{\"service.self_complete\":true}\n";
+        let (_rest, sig) = strip_self_complete(body);
+        assert_eq!(sig.unwrap().reason, "unspecified");
+    }
+
+    #[test]
+    fn strip_self_complete_tolerates_non_utf8_input() {
+        let body = &[0xFF, 0xFE, b'\n'][..];
+        let (rest, sig) = strip_self_complete(body);
+        assert_eq!(rest, body.to_vec());
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn substitute_replaces_thread_and_params_in_strings() {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        subs.insert("{thread.id}".into(), "thr_42".into());
+        subs.insert("{params.mr_url}".into(), "https://x/y".into());
+
+        let mut v = json!({
+            "scope": { "id": "{thread.id}" },
+            "command": "fetch {params.mr_url} into {thread.id}",
+            "args": ["{thread.id}", "literal", "{params.mr_url}/path"],
+        });
+        substitute_in_value(&mut v, &subs);
+
+        assert_eq!(v["scope"]["id"], json!("thr_42"));
+        assert_eq!(v["command"], json!("fetch https://x/y into thr_42"));
+        assert_eq!(v["args"][0], json!("thr_42"));
+        assert_eq!(v["args"][1], json!("literal"));
+        assert_eq!(v["args"][2], json!("https://x/y/path"));
+    }
+
+    #[test]
+    fn substitute_leaves_unmatched_placeholders_untouched() {
+        let subs: HashMap<String, String> = HashMap::new();
+        let mut v = json!({ "x": "{thread.id} stays" });
+        substitute_in_value(&mut v, &subs);
+        assert_eq!(v["x"], json!("{thread.id} stays"));
+    }
+
+    #[test]
+    fn substitute_renders_non_string_param_values() {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        // Mirror what build_substitutions does for non-string values.
+        subs.insert("{params.flag}".into(), Value::Bool(true).to_string());
+        subs.insert("{params.n}".into(), Value::from(7).to_string());
+
+        let mut v = json!({
+            "args": ["--flag={params.flag}", "--n={params.n}"],
+        });
+        substitute_in_value(&mut v, &subs);
+        assert_eq!(v["args"][0], json!("--flag=true"));
+        assert_eq!(v["args"][1], json!("--n=7"));
+    }
+
+    #[test]
+    fn substitute_replaces_channel_and_service_placeholders() {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        subs.insert("{channel.id}".into(), "chan_repo".into());
+        subs.insert(
+            "{channel.workspace}".into(),
+            "/data/channels/chan_repo/shared".into(),
+        );
+        subs.insert("{service.data_dir}".into(), "/svc/repo-cache".into());
+
+        let mut v = json!({
+            "args": [
+                "--channel={channel.id}",
+                "{channel.workspace}/.joi/repos/manifest.json",
+                "{service.data_dir}/cache"
+            ]
+        });
+        substitute_in_value(&mut v, &subs);
+
+        assert_eq!(v["args"][0], json!("--channel=chan_repo"));
+        assert_eq!(
+            v["args"][1],
+            json!("/data/channels/chan_repo/shared/.joi/repos/manifest.json")
+        );
+        assert_eq!(v["args"][2], json!("/svc/repo-cache/cache"));
+    }
+
+    #[test]
+    fn channel_workspace_dir_points_at_channel_shared() {
+        let suffix = std::path::Path::new("channels")
+            .join("chan_repo")
+            .join("shared");
+        assert!(channel_workspace_dir("chan_repo").ends_with(&suffix));
     }
 }

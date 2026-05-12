@@ -1,7 +1,7 @@
 //! Cross-transport adapter abstraction.
 //!
 //! v0 had a single `AcpAdapter` whose concrete API leaked out into `RuntimeManager`
-//! and `wakeup`. v1 (per docs/architecture-v1-agent-client.md §4) introduces the
+//! and `wakeup`. v1 (per docs/architecture.md §4) introduces the
 //! `Adapter` trait so additional transports — first up `CommandAdapter`, see
 //! docs/command-transport-v0.md — can plug in without changing call sites.
 //!

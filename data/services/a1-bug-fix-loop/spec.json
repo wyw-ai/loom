@@ -1,0 +1,62 @@
+{
+  "id": "a1-bug-fix-loop",
+  "kind": "scheduler",
+  "actor": {
+    "id": "svc_a1_bug_fix_loop",
+    "kind": "service",
+    "displayName": "A1 Bug Fix Loop"
+  },
+  "autostart": false,
+  "lifecycle": "thread_bound",
+  "bind": {
+    "scope": "thread",
+    "auto_stop_on": ["thread.closed", "service.self_complete"]
+  },
+  "params_schema": {
+    "required": ["channel_id", "scanner_thread_id"],
+    "properties": {
+      "channel_id":         { "type": "string" },
+      "scanner_thread_id":  { "type": "string" },
+      "concurrency":        { "type": "integer", "default": 1 }
+    }
+  },
+  "config": {
+    "jobs": [
+      {
+        "id": "tick",
+        "schedule": "*/5 * * * *",
+        "source": {
+          "kind": "command",
+          "command": "bash",
+          "args": [
+            "{spec.dir}/bundle/tick.sh",
+            "--state-dir",
+            "{instance.data_dir}",
+            "--channel-id",
+            "{params.channel_id}",
+            "--scanner-thread-id",
+            "{params.scanner_thread_id}",
+            "--loop-thread-id",
+            "{thread.id}",
+            "--concurrency",
+            "{params.concurrency}"
+          ],
+          "timeoutMs": 180000
+        },
+        "scope": {
+          "kind": "thread",
+          "id": "{thread.id}",
+          "channelId": "{channel.id}"
+        },
+        "dedupeBy": "source_event_id",
+        "cursorBy": "body_hash",
+        "singleInFlight": true,
+        "emit": {
+          "mode": "artifact_per_json_line",
+          "artifactNameTemplate": "bug-fix-loop-status-{tick_id}.json",
+          "statusEventType": "status.update"
+        }
+      }
+    ]
+  }
+}

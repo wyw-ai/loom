@@ -107,6 +107,11 @@ pub struct ConnectionOpenParams {
     pub actor_kind: Option<ActorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Whether this connection should become the actor-inbox owner.
+    /// Long-lived runtimes keep the default `true`; observer clients can
+    /// bind identity for authorization without preempting the runtime.
+    #[serde(default = "default_true")]
+    pub claim_inbox: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Endpoint>,
 }
@@ -1328,6 +1333,74 @@ pub struct AgentSpec {
     /// the right-side panel of any chat client subscribed to the scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announcement: Option<AnnouncementSpec>,
+    /// Optional callee-described handoff metadata (design §5.0). Lets the
+    /// agent declare a slash-command prefix that the runtime auto-injects
+    /// into trigger event content when *anyone* hands off to it, so
+    /// callers don't have to know about skill-activation conventions like
+    /// `/delivery` or `/discovery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffSpec>,
+    /// Optional per-actor prompt template (design §5). Wraps the trigger
+    /// event content with `everyTurnPrefix`, `firstTurnPrefix` (first
+    /// turn per scope only), and `everyTurnSuffix` lines, with template
+    /// variable substitution. When absent the runtime falls back to the
+    /// bare envelope shape used before the migration.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "promptTemplate"
+    )]
+    pub prompt_template: Option<PromptTemplateSpec>,
+}
+
+/// Callee-described handoff metadata. See `AgentSpec.handoff`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffSpec {
+    /// Text prepended to the trigger event content (the user message side
+    /// of the prompt). Typically a slash command like `"/delivery\n"` so
+    /// the underlying provider activates the right skill.
+    #[serde(default)]
+    pub trigger_prompt_prefix: String,
+    /// Whether the prefix applies on the first turn of a scope only or
+    /// on every handoff. Default: `every-turn`.
+    #[serde(default)]
+    pub apply_on: HandoffApplyOn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffApplyOn {
+    FirstTurn,
+    #[default]
+    EveryTurn,
+}
+
+/// Per-actor prompt template (design §5). All three lists are joined with
+/// newlines after template-variable substitution. Variables not bound by
+/// the runtime are left as literal `{var}` text (so missing vars never
+/// collapse the prompt).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptTemplateSpec {
+    /// Optional active-skill marker. Reserved for future use; runtime
+    /// currently only echoes it back as `{prompt.activeSkill}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_skill: Option<String>,
+    /// Lines prepended to *every* turn's prompt.
+    #[serde(default)]
+    pub every_turn_prefix: Vec<String>,
+    /// Lines prepended only on the first turn per scope (after
+    /// `everyTurnPrefix`, before the user message).
+    #[serde(default)]
+    pub first_turn_prefix: Vec<String>,
+    /// Lines appended to *every* turn's prompt (after the user message).
+    #[serde(default)]
+    pub every_turn_suffix: Vec<String>,
+    /// Extra variables surfaced as `{vars.<key>}`. Static per-actor
+    /// constants the spec author wants without polluting global names.
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 /// On-disk provider spec. A provider is one installed agent CLI/runtime
@@ -1387,6 +1460,8 @@ impl AgentProviderSpec {
                     identity: merge_identity(defaults.identity.as_ref(), actor.identity),
                     memory: actor.memory.or_else(|| defaults.memory.clone()),
                     announcement: actor.announcement.or_else(|| defaults.announcement.clone()),
+                    handoff: None,
+                    prompt_template: None,
                 }
             })
             .collect()
@@ -1814,11 +1889,60 @@ pub struct ServiceSpec {
     /// overrides per-event. Plugins are not forced to honor this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent: Option<String>,
+    /// Lifecycle of this service. `channel_singleton` (default) means
+    /// one instance per host bound to `channel_id`; `thread_bound` means
+    /// the service is launched per-thread with state stored under
+    /// `instances/<thread_id>/`. See design §4.7.3.
+    #[serde(default)]
+    pub lifecycle: ServiceLifecycle,
+    /// Optional binding constraints for `lifecycle = thread_bound`. The
+    /// host reads `bind.auto_stop_on` to decide which events tear down
+    /// the per-thread instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<ServiceBind>,
+    /// Optional JSON-Schema fragment describing `--params` accepted at
+    /// `joi service start --in <thread> --params {...}`. The CLI validates
+    /// start params against the shallow subset it supports.
+    #[serde(
+        default,
+        alias = "params_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub params_schema: Option<Value>,
     /// Plugin-specific configuration. Parsed by the plugin itself, not by
     /// the host. Schema is the plugin's contract (see §7 for am, §8 for
     /// scheduler).
     #[serde(default)]
     pub config: Value,
+}
+
+/// Lifecycle of a [`ServiceSpec`]. See design §4.7.3.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceLifecycle {
+    /// Single channel-level instance per host. Default.
+    #[default]
+    ChannelSingleton,
+    /// One instance per bound thread. Multiple instances of the same
+    /// spec coexist; each owns its own state dir.
+    ThreadBound,
+}
+
+/// Binding info for a [`ServiceLifecycle::ThreadBound`] service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ServiceBind {
+    /// Scope kind the instance is bound to. v1: only `"thread"`.
+    #[serde(default = "default_bind_scope")]
+    pub scope: String,
+    /// Event kinds that auto-stop the instance. Typical values:
+    /// `"thread.closed"`, `"service.self_complete"`.
+    #[serde(default)]
+    pub auto_stop_on: Vec<String>,
+}
+
+fn default_bind_scope() -> String {
+    "thread".to_string()
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1838,6 +1962,46 @@ pub enum ServiceSpecError {
 }
 
 impl ServiceSpec {
+    /// Hoist the legacy `config.{lifecycle,bind,paramsSchema}` shape into
+    /// the typed top-level fields. Pre-`p4a` ServiceSpec carried these
+    /// under `config{}` because the typed fields didn't exist; once
+    /// migrated, hoisting is a no-op so it's safe to call repeatedly.
+    /// Top-level fields win when both positions are populated.
+    pub fn normalize(&mut self) {
+        let cfg = match self.config.as_object_mut() {
+            Some(map) => map,
+            None => return,
+        };
+        if matches!(self.lifecycle, ServiceLifecycle::ChannelSingleton) {
+            if let Some(v) = cfg.remove("lifecycle") {
+                if let Ok(lc) = serde_json::from_value::<ServiceLifecycle>(v) {
+                    self.lifecycle = lc;
+                }
+            }
+        } else {
+            cfg.remove("lifecycle");
+        }
+        if self.bind.is_none() {
+            if let Some(v) = cfg.remove("bind") {
+                if let Ok(b) = serde_json::from_value::<ServiceBind>(v) {
+                    self.bind = Some(b);
+                }
+            }
+        } else {
+            cfg.remove("bind");
+        }
+        if self.params_schema.is_none() {
+            if let Some(v) = cfg.remove("params_schema") {
+                self.params_schema = Some(v);
+            } else if let Some(v) = cfg.remove("paramsSchema") {
+                self.params_schema = Some(v);
+            }
+        } else {
+            cfg.remove("params_schema");
+            cfg.remove("paramsSchema");
+        }
+    }
+
     /// Reject specs with a malformed actor or empty discriminators. §6.1's
     /// invariant is "actor.kind must be service"; the loader calls this
     /// after `serde_json::from_str` and surfaces the error to the operator.
@@ -2021,6 +2185,9 @@ mod service_spec_tests {
             autostart: true,
             channel_id: Some("chan_x".into()),
             target_agent: Some("actor_qa".into()),
+            lifecycle: ServiceLifecycle::ChannelSingleton,
+            bind: None,
+            params_schema: None,
             config: json!({}),
         }
     }
@@ -2120,5 +2287,119 @@ mod service_spec_tests {
         });
         let spec: ServiceSpec = serde_json::from_value(raw).expect("deserialize");
         assert!(spec.autostart);
+    }
+
+    #[test]
+    fn lifecycle_defaults_channel_singleton() {
+        let spec = base_spec();
+        assert_eq!(spec.lifecycle, ServiceLifecycle::ChannelSingleton);
+        assert!(spec.bind.is_none());
+        assert!(spec.params_schema.is_none());
+    }
+
+    #[test]
+    fn normalize_hoists_legacy_config_lifecycle() {
+        // mr-detector-shaped spec — typed fields living under config{}
+        // before p4a. After normalize() they must move to the top level
+        // and config{} loses them so plugin parsers don't see noise.
+        let raw = json!({
+            "id": "mr-detector",
+            "kind": "scheduler",
+            "actor": {"id": "svc_mr_detector", "kind": "service"},
+            "autostart": false,
+            "config": {
+                "lifecycle": "thread_bound",
+                "bind": {
+                    "scope": "thread",
+                    "auto_stop_on": ["thread.closed", "service.self_complete"]
+                },
+                "params_schema": {"required": ["mr_url"]},
+                "jobs": []
+            }
+        });
+        let mut spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
+        spec.normalize();
+        assert_eq!(spec.lifecycle, ServiceLifecycle::ThreadBound);
+        let bind = spec.bind.as_ref().expect("bind hoisted");
+        assert_eq!(bind.scope, "thread");
+        assert_eq!(
+            bind.auto_stop_on,
+            vec!["thread.closed".to_string(), "service.self_complete".into()]
+        );
+        assert!(spec.params_schema.is_some());
+        // jobs is a SchedulerConfig field — must remain inside config.
+        assert!(spec.config.get("jobs").is_some());
+        assert!(spec.config.get("lifecycle").is_none());
+        assert!(spec.config.get("bind").is_none());
+        assert!(spec.config.get("params_schema").is_none());
+    }
+
+    #[test]
+    fn normalize_accepts_camelcase_params_schema() {
+        let raw = json!({
+            "id": "x",
+            "kind": "scheduler",
+            "actor": {"id": "svc_x", "kind": "service"},
+            "config": {"paramsSchema": {"required": ["a"]}}
+        });
+        let mut spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
+        spec.normalize();
+        assert!(spec.params_schema.is_some());
+    }
+
+    #[test]
+    fn deserialize_accepts_top_level_snake_case_params_schema() {
+        let raw = json!({
+            "id": "x",
+            "kind": "scheduler",
+            "actor": {"id": "svc_x", "kind": "service"},
+            "params_schema": {"required": ["mr_url"]},
+            "config": {"jobs": []}
+        });
+        let spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
+        assert_eq!(
+            spec.params_schema
+                .as_ref()
+                .and_then(|schema| schema.get("required"))
+                .and_then(|required| required.as_array())
+                .map(|required| required.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn normalize_top_level_wins_over_legacy_config() {
+        // If both positions carry a value, the typed top-level wins and
+        // the legacy duplicate is dropped from config{} to keep specs
+        // canonical.
+        let raw = json!({
+            "id": "x",
+            "kind": "scheduler",
+            "actor": {"id": "svc_x", "kind": "service"},
+            "lifecycle": "thread_bound",
+            "config": {"lifecycle": "channel_singleton"}
+        });
+        let mut spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
+        spec.normalize();
+        assert_eq!(spec.lifecycle, ServiceLifecycle::ThreadBound);
+        assert!(spec.config.get("lifecycle").is_none());
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let raw = json!({
+            "id": "x",
+            "kind": "scheduler",
+            "actor": {"id": "svc_x", "kind": "service"},
+            "config": {
+                "lifecycle": "thread_bound",
+                "bind": {"scope": "thread", "auto_stop_on": []}
+            }
+        });
+        let mut spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
+        spec.normalize();
+        let after_first = (spec.lifecycle, spec.bind.clone());
+        spec.normalize();
+        assert_eq!(after_first, (spec.lifecycle, spec.bind.clone()));
     }
 }

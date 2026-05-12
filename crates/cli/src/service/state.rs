@@ -39,11 +39,40 @@ pub fn state_dir(root: &Path, service_id: &str) -> PathBuf {
     root.join("services").join(service_id)
 }
 
+/// Per-instance directory for a `lifecycle = thread_bound` service
+/// (`<root>/services/<service_id>/instances/<instance_id>/`). Pure path
+/// composition — does not touch the filesystem. See design §4.7.3.
+pub fn instance_state_dir(root: &Path, service_id: &str, instance_id: &str) -> PathBuf {
+    state_dir(root, service_id)
+        .join("instances")
+        .join(instance_id)
+}
+
 /// Materialize the service directory and its standard subdirs so plugins
 /// can write without each creating their own paths. Idempotent.
 pub fn ensure_state_dir(root: &Path, service_id: &str) -> Result<PathBuf> {
     let dir = state_dir(root, service_id);
     fs::create_dir_all(&dir).with_context(|| format!("create service dir at {}", dir.display()))?;
+    fs::create_dir_all(dir.join("cursors"))?;
+    fs::create_dir_all(dir.join("logs"))?;
+    Ok(dir)
+}
+
+/// Materialize a per-instance state dir under the parent service. Each
+/// thread-bound instance owns its own `cursors/` and `logs/` so cursor /
+/// dedupe state is scoped to that thread.
+pub fn ensure_instance_state_dir(
+    root: &Path,
+    service_id: &str,
+    instance_id: &str,
+) -> Result<PathBuf> {
+    // Make sure the parent service dir exists too so listing
+    // `instances/` makes sense even when no channel-singleton instance
+    // ran first.
+    let _ = ensure_state_dir(root, service_id)?;
+    let dir = instance_state_dir(root, service_id, instance_id);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("create instance dir at {}", dir.display()))?;
     fs::create_dir_all(dir.join("cursors"))?;
     fs::create_dir_all(dir.join("logs"))?;
     Ok(dir)
@@ -218,5 +247,34 @@ mod tests {
         cursor_save(&dir, "ci", "v1").expect("save");
         let tmp = dir.join("cursors").join("ci.json.tmp");
         assert!(!tmp.exists(), "tmp file should be renamed away");
+    }
+
+    #[test]
+    fn ensure_instance_state_dir_isolates_per_thread() {
+        // Two thread-bound instances of the same spec must get disjoint
+        // cursor / dedupe directories so their state cannot collide.
+        let root = temp_root();
+        let a = ensure_instance_state_dir(&root, "mr-detector", "thread_aaa").expect("a");
+        let b = ensure_instance_state_dir(&root, "mr-detector", "thread_bbb").expect("b");
+        assert_ne!(a, b);
+        assert!(a.exists() && b.exists());
+        assert!(a.join("cursors").exists() && b.join("cursors").exists());
+        assert!(a.join("logs").exists() && b.join("logs").exists());
+        let parent = state_dir(&root, "mr-detector");
+        assert!(parent.exists(), "parent service dir is materialized too");
+        assert_eq!(a.parent().unwrap(), parent.join("instances"));
+    }
+
+    #[test]
+    fn instance_dedupe_state_is_per_instance() {
+        // Recording the same key under two different instance dirs must
+        // not cross-pollinate — each instance has its own DedupeStore.
+        let root = temp_root();
+        let dir_a = ensure_instance_state_dir(&root, "svc", "inst_a").expect("a");
+        let dir_b = ensure_instance_state_dir(&root, "svc", "inst_b").expect("b");
+        let store_a = DedupeStore::open(&dir_a).expect("a open");
+        let store_b = DedupeStore::open(&dir_b).expect("b open");
+        assert!(store_a.record("k1").expect("a first"));
+        assert!(store_b.record("k1").expect("b first"));
     }
 }

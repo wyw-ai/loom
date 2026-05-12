@@ -92,8 +92,10 @@ am listen --topic /v1.0/im/bot/messages/get \
 解析后等价执行：
 
 ```bash
+joi --as svc_am_bridge event append --channel --in <joi_channel_id> \
+  --type thread.opened --text "钉钉答疑 · <sender>"
 joi --as svc_am_bridge thread create --channel <joi_channel_id> \
-  --title "钉钉答疑 · <sender>"
+  --root-event <anchor_event_id> --title "钉钉答疑 · <sender>"
 joi --as svc_am_bridge handoff <target_agent_actor_id> \
   --in <thread_id> --message "<question>"
 ```

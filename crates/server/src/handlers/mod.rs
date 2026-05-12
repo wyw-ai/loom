@@ -764,6 +764,7 @@ fn task_assignment_update(
 ) -> HandlerResult {
     let p: TaskAssignmentUpdateParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
+    let requested_status = p.status;
     let assignment = state
         .store
         .get_assignment(&p.assignment_id)
@@ -777,17 +778,102 @@ fn task_assignment_update(
         .store
         .update_task_assignment(
             &p.assignment_id,
-            p.status,
+            requested_status,
             p.result_event_id,
             p.result_summary,
         )
         .map_err(map_store_err)?;
+    if requested_status.is_some_and(is_terminal_assignment_status) {
+        emit_assignment_return_handoff(state, &caller, &task, &assignment);
+    }
     ok(TaskAssignmentUpdateResult { assignment, task })
+}
+
+fn is_terminal_assignment_status(status: TaskAssignmentStatus) -> bool {
+    matches!(
+        status,
+        TaskAssignmentStatus::Completed
+            | TaskAssignmentStatus::Failed
+            | TaskAssignmentStatus::Canceled
+    )
+}
+
+fn emit_assignment_return_handoff(
+    state: &AppState,
+    from_actor_id: &str,
+    task: &Task,
+    assignment: &TaskAssignment,
+) {
+    let target_actor_id = assignment.from_actor_id.as_str();
+    let status = serde_json::to_value(assignment.status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{:?}", assignment.status));
+    let mut text = format!(
+        "Assignment `{assignment_id}` ({assignment_type:?}) is {status}.\n\nHanding task #{number} back to @{target_actor_id}. Continue from the assignment result: revise, create a follow-up assignment, ask the requester, or update the task status.",
+        assignment_id = assignment.id,
+        assignment_type = assignment.assignment_type,
+        number = task.number,
+    );
+    if !assignment.result_summary.trim().is_empty() {
+        text.push_str("\n\nResult summary:\n");
+        text.push_str(assignment.result_summary.trim());
+    }
+
+    if let Err(err) = state.store.append_event(
+        "content.add".into(),
+        from_actor_id.into(),
+        ScopeRef {
+            kind: ScopeKind::Thread,
+            id: task.canonical_thread_id.clone(),
+        },
+        None,
+        json!({
+            "contentType": "text/markdown",
+            "text": text,
+            "_meta": {
+                "taskId": task.id.clone(),
+                "taskNumber": task.number,
+                "assignmentId": assignment.id.clone(),
+                "assignmentStatus": status,
+                "expectedOutput": "Continue the task in this thread; either revise, create follow-up assignments, ask the requester, or update the task status."
+            }
+        }),
+        vec![
+            Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: target_actor_id.into(),
+                    _meta: None,
+                },
+                _meta: None,
+            },
+            Relation {
+                kind: RelationKind::RelatesToTask,
+                target: Ref {
+                    kind: RefKind::Task,
+                    id: task.id.clone(),
+                    _meta: None,
+                },
+                _meta: None,
+            },
+        ],
+        None,
+    ) {
+        tracing::warn!(
+            task = %task.id,
+            assignment = %assignment.id,
+            target = %target_actor_id,
+            %err,
+            "failed to append assignment return handoff"
+        );
+    }
 }
 
 fn task_assignment_message(task: &Task, assignment: &TaskAssignment) -> String {
     format!(
-        "Task #{number}: {title}\n\nAssignment `{assignment_id}` ({assignment_type:?}) for @{to_actor}.\n\n{instruction}\n\nReturn your result in this thread and update the assignment when complete.",
+        "Task #{number}: {title}\n\nAssignment `{assignment_id}` ({assignment_type:?}) for @{to_actor}.\n\n{instruction}\n\nReturn your result in this thread and update the assignment when complete. Completion hands the task back to the actor who assigned it for the next step.",
         number = task.number,
         title = task.title,
         assignment_id = assignment.id,
@@ -1436,6 +1522,147 @@ mod tests {
             meta.get("assignmentId").and_then(|value| value.as_str()),
             Some(assigned.assignment.id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn task_assignment_update_hands_terminal_result_back_to_assigner() {
+        let state = fresh_state("task-assignment-return");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_conn(&state, "conn_delegate", "actor_delegate").await;
+        open_conn(&state, "conn_reviewer", "actor_reviewer").await;
+        let channel = state
+            .store
+            .create_channel("tasks".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_delegate")
+            .expect("grant delegate");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_reviewer")
+            .expect("grant reviewer");
+        let source_event_id =
+            append_channel_root(&state, &channel.id, "actor_owner", "write story");
+
+        let created = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_CREATE,
+            Some(json!({
+                "sourceEventId": source_event_id,
+                "title": "write story",
+                "ownerActorId": "actor_owner"
+            })),
+        )
+        .await
+        .expect("task/create");
+        let created: TaskCreateResult = serde_json::from_value(created).unwrap();
+
+        let assigned = dispatch(
+            &state,
+            "conn_delegate",
+            method::TASK_ASSIGNMENT_CREATE,
+            Some(json!({
+                "taskId": created.task.id,
+                "toActorId": "actor_reviewer",
+                "type": "review",
+                "instruction": "review the story"
+            })),
+        )
+        .await
+        .expect("task/assignment.create");
+        let assigned: TaskAssignmentCreateResult = serde_json::from_value(assigned).unwrap();
+        let result_event = state
+            .store
+            .append_event(
+                "content.add".into(),
+                "actor_reviewer".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: created.task.canonical_thread_id.clone(),
+                },
+                None,
+                json!({ "contentType": "text/markdown", "text": "looks good" }),
+                vec![],
+                None,
+            )
+            .expect("result event");
+
+        let updated = dispatch(
+            &state,
+            "conn_reviewer",
+            method::TASK_ASSIGNMENT_UPDATE,
+            Some(json!({
+                "assignmentId": assigned.assignment.id,
+                "status": "completed",
+                "resultEventId": result_event.id,
+                "resultSummary": "looks good"
+            })),
+        )
+        .await
+        .expect("task/assignment.update");
+        let updated: TaskAssignmentUpdateResult = serde_json::from_value(updated).unwrap();
+        assert_eq!(updated.assignment.status, TaskAssignmentStatus::Completed);
+
+        let (events, _) = state.store.read_scope(
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: created.task.canonical_thread_id.clone(),
+            },
+            20,
+            None,
+        );
+        let callback = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.actor_id == "actor_reviewer"
+                    && event.relations.iter().any(|relation| {
+                        matches!(relation.kind, RelationKind::HandsOffTo)
+                            && relation.target.kind == RefKind::Actor
+                            && relation.target.id == "actor_delegate"
+                    })
+                    && event
+                        .payload
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|text| text.contains("Handing task #"))
+            })
+            .expect("assignment return handoff event");
+        assert!(callback.relations.iter().any(|relation| {
+            matches!(relation.kind, RelationKind::RelatesToTask)
+                && relation.target.kind == RefKind::Task
+                && relation.target.id == created.task.id
+        }));
+        let meta = callback
+            .payload
+            .get("_meta")
+            .and_then(|value| value.as_object())
+            .expect("callback meta");
+        assert_eq!(
+            meta.get("assignmentStatus")
+                .and_then(|value| value.as_str()),
+            Some("completed")
+        );
+        assert_eq!(
+            meta.get("assignmentId").and_then(|value| value.as_str()),
+            Some(updated.assignment.id.as_str())
+        );
+        let delegate_deliveries =
+            state
+                .store
+                .list_deliveries("actor_delegate", Some(DeliveryState::Pending), 20, None);
+        assert!(delegate_deliveries
+            .iter()
+            .any(|delivery| delivery.event_id == callback.id));
+        let owner_deliveries =
+            state
+                .store
+                .list_deliveries("actor_owner", Some(DeliveryState::Pending), 20, None);
+        assert!(!owner_deliveries
+            .iter()
+            .any(|delivery| delivery.event_id == callback.id));
     }
 
     #[test]

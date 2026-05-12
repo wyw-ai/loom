@@ -62,11 +62,15 @@ enum Cmd {
     Handoff {
         /// Target actor id; omit to pick from a list of registered agents/humans.
         agent: Option<String>,
+        /// Internal thread/channel scope id. Prefer --target when you have a channel/root event target.
         #[arg(long)]
-        r#in: String,
+        r#in: Option<String>,
         /// Treat --in as a channel id instead of a thread id.
         #[arg(long)]
         channel: bool,
+        /// Canonical destination target: #<channel_id> or #<channel_id>:<root_event_id>.
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long, default_value = "")]
         message: String,
     },
@@ -804,8 +808,9 @@ async fn main() -> Result<()> {
             agent,
             r#in,
             channel,
+            target,
             message,
-        } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, channel, message).await?,
+        } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, channel, target, message).await?,
         Cmd::Message { sub } => match sub {
             MessageCmd::Send {
                 target,

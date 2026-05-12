@@ -1637,8 +1637,9 @@ async fn handle_turn_close(
 }
 
 fn is_for_us(event: &Event, actor_id: &str) -> bool {
-    // Self-authored handoffs are intentional: agents use them to move a
-    // channel triage turn into the canonical task thread.
+    // Self-authored handoffs are still explicit routing signals. They are not
+    // the normal way to enter a thread, but generated callbacks or deliberate
+    // follow-up turns must not be filtered out just because author == target.
     event.relations.iter().any(|r| {
         matches!(r.kind, RelationKind::HandsOffTo)
             && r.target.kind == RefKind::Actor
@@ -2506,9 +2507,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          `joi request-approval` is for approve/reject gates before risky work.\n\
          continue the current task using `answer.optionId`, `answer.label`, or\n\
          `answer.text`, and phrase follow-up messages as the user's answer.\n\
-         Message targets use `#<channel_id>` for channels and\n\
-         `#<channel_id>:<root_event_id>` for threads; use\n\
-         `joi --json thread list` to map a thread scope id to that target.\n\
+         Message and handoff targets use `#<channel_id>` for channels and\n\
+         `#<channel_id>:<root_event_id>` for threads; sending to a thread\n\
+         target creates or reuses the thread automatically. Use\n\
+         `joi --json thread list` only when you need to map a thread scope id\n\
+         back to that target.\n\
          Use `--json` for machine-readable output and `joi <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\

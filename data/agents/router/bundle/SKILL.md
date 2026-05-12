@@ -415,8 +415,22 @@ channel 摘要 1 行：`已发起 MR <url>，已交 discovery 复核（thread: <
 3. discovery 返回后：
    - `continue`：handoff delivery："复核确认可继续；请按 root_note=<id> 回复 reviewer，说明证据与验证，不要回复子评论。"
    - `revise`：handoff delivery："复核要求改方案：<摘要>；修订后 push 并在 root note 回复。"
+     但如果复核摘要或 human 明确表示“MR 没有意义 / 需求过时 / 缺陷不成立”，或
+     “修订”实质上是移除本 MR 的核心能力/flag/行为，导致剩余 diff 没有独立交付价值，
+     router 必须把它升级为 `withdraw`，不能继续等待 reviewer 审批。
    - `withdraw`：handoff delivery："复核认为应撤回/关闭 MR：<原因>；请关闭 MR 并在 root note 说明。"
    - `need_human`：channel 升级 human，附 thread/MR/争议摘要。
+
+如果 human 在 channel 中明确决定当前 MR 无意义、应废弃、应回滚、或不应继续合并，
+router 不需要再次进入普通 review loop；直接 handoff delivery：
+
+```bash
+joi handoff --as actor_router --in <delivery_thread_id> actor_delivery -m \
+  "[withdraw] human 决定当前 MR 无继续意义/应废弃。
+   repo=<repo> mr_id=<mr_id> root_note=<root_note_id-if-any>
+   原因=<human 原话摘要>
+   请关闭 MR，并在根 note 或 MR 评论中用中文说明撤回原因；完成后 handoff router。"
+```
 
 #### 情况 B3：bugfix-invalid / 缺陷证伪或无需修复
 

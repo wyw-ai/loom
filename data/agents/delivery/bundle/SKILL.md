@@ -395,16 +395,26 @@ discovery 复核 verdict=pass 且 mr-watcher 没有新事项后，归档变更�
 如果收到的是 `terminal_kind=closed` / `MR 已关闭` / `关闭此任务`，或 router 明确告知
 `[bugfix-invalid]` / `withdraw`：
 
-1. 这不是 Fixed。必须在 feedback 下用中文说明真实结论，例如“经复核缺陷不成立 /
-   当前版本已有能力覆盖 / 本 MR 已撤回”，**不要**写“随下一次版本发布生效”。
-2. 若状态尚未关闭，优先尝试更新为 `Closed`；不可用时再尝试 `已关闭` /
+1. 先处理 MR 本身：如果 MR 仍是 opened，必须主动关闭/废弃 MR，不能仅回复“等待审批”。
+   关闭前/后在 root note（若有）或 MR 评论下用中文说明真实结论，例如“经复核缺陷不成立 /
+   当前版本已有能力覆盖 / 本 MR 已撤回”。关闭命令优先使用：
+   ```bash
+   a1 repo mr close --repo <repo> <mr_id>
+   ```
+   如果关闭失败，把 stderr 原样 handoff router；不要假装已收口。
+2. 这不是 Fixed。若有关联 feedback，必须在 feedback 下说明非 Fixed 结论，**不要**
+   写“随下一次版本发布生效”。
+3. 若 feedback 状态尚未关闭，优先尝试更新为 `Closed`；不可用时再尝试 `已关闭` /
    `Won't Fix` / `无需修复`。若状态更新失败，把 stderr handoff router。
-3. handoff router：
+4. handoff router：
    ```bash
    joi handoff --as actor_delivery --in <thread> actor_router -m \
      "feedback <id> 已按非 Fixed 终态收口：outcome=<not_a_bug|already_covered|withdrawn|closed>；
       MR <repo> !<mr_id> 已关闭，bugfix-loop 可以归档并推进下一条。"
    ```
+
+如果 discovery/human 的结论使你移除了本 MR 的核心能力/flag/行为，且剩余 diff
+没有独立业务价值，也按 `withdraw` 处理：关闭 MR，而不是把它当“已修订，等待审批”。
 
 ## 半自主：什么时候可以 handoff router 让 router 询 human
 

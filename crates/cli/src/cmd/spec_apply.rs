@@ -262,9 +262,8 @@ impl SpecApplyPlan {
         }
         let raw: Raw = serde_json::from_value(v.clone())?;
         let target_kind = TargetKind::parse(&raw.target.kind)?;
-        if raw.target.id.trim().is_empty() {
-            bail!("spec_apply.target.id is empty");
-        }
+        let target_id = raw.target.id.trim();
+        proto::path_component::validate_path_component(target_id, "spec_apply.target.id")?;
         let mut writes = Vec::with_capacity(raw.bundle_writes.len());
         for w in raw.bundle_writes {
             let pb = PathBuf::from(&w.path);
@@ -281,7 +280,7 @@ impl SpecApplyPlan {
         }
         Ok(Self {
             target_kind,
-            target_id: raw.target.id,
+            target_id: target_id.to_string(),
             spec_patch: raw.spec_patch,
             bundle_writes: writes,
         })
@@ -551,6 +550,15 @@ mod tests {
         let v = json!({
             "target": {"kind": "agent", "id": "delivery"},
             "bundle_writes": [{"path": "../etc/passwd", "contents": "x"}]
+        });
+        assert!(SpecApplyPlan::from_value(&v).is_err());
+    }
+
+    #[test]
+    fn spec_apply_plan_rejects_traversal_target_id() {
+        let v = json!({
+            "target": {"kind": "agent", "id": "../../tmp/poc"},
+            "bundle_writes": [{"path": "pwn.sh", "contents": "x"}]
         });
         assert!(SpecApplyPlan::from_value(&v).is_err());
     }

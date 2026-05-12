@@ -64,6 +64,7 @@ fn main() {
             ipc::artifact_get,
             ipc::artifact_read,
             ipc::turn_close,
+            ipc::reminder_list,
             ipc::actor_list,
             ipc::actor_upsert,
             ipc::actor_delete,

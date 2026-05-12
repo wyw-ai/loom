@@ -11,6 +11,8 @@ import type {
   HumanAccount,
   JoiEvent,
   MachineInfo,
+  Reminder,
+  ReminderStatus,
   ScopeRef,
   StreamUpdate,
   Thread,
@@ -247,6 +249,20 @@ export async function turnClose(
   status: "closed" | "cancelled" = "cancelled",
 ): Promise<unknown> {
   return invoke("turn_close", { params: { turnId, status } });
+}
+
+export async function reminderList(params: {
+  actorId: string;
+  statuses?: ReminderStatus[];
+  all?: boolean;
+}): Promise<{ reminders: Reminder[] }> {
+  return invoke("reminder_list", {
+    params: {
+      actorId: params.actorId,
+      statuses: params.statuses ?? [],
+      all: params.all ?? false,
+    },
+  });
 }
 
 export async function actorList(): Promise<{ actors: Actor[] }> {

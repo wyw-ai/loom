@@ -33,6 +33,7 @@ pub async fn run(
     allow_services: Vec<String>,
     no_services: bool,
     socket_path: Option<PathBuf>,
+    no_ipc: bool,
     server_url: String,
 ) -> Result<()> {
     let providers = detect_agent_cli_providers();
@@ -55,14 +56,19 @@ pub async fn run(
         display_name: machine.name.clone(),
     };
 
-    let socket_path = socket_path
-        .or_else(daemon_ipc::env_socket_path)
-        .unwrap_or_else(daemon_ipc::default_socket_path);
-    let proxy_handle = daemon_ipc::start_proxy(socket_path.clone(), server_url.clone()).await?;
-    std::env::set_var(daemon_ipc::ENV_DAEMON_SOCKET, &socket_path);
-    if let Err(err) = daemon_ipc::write_discovery(&socket_path, &server_url) {
-        eprintln!("joi daemon: warning: failed to write daemon discovery: {err:#}");
-    }
+    let (socket_path, proxy_handle) = if no_ipc {
+        (None, None)
+    } else {
+        let socket_path = socket_path
+            .or_else(daemon_ipc::env_socket_path)
+            .unwrap_or_else(daemon_ipc::default_socket_path);
+        let proxy_handle = daemon_ipc::start_proxy(socket_path.clone(), server_url.clone()).await?;
+        std::env::set_var(daemon_ipc::ENV_DAEMON_SOCKET, &socket_path);
+        if let Err(err) = daemon_ipc::write_discovery(&socket_path, &server_url) {
+            eprintln!("joi daemon: warning: failed to write daemon discovery: {err:#}");
+        }
+        (Some(socket_path), Some(proxy_handle))
+    };
 
     if no_services {
         eprintln!("joi daemon: service host disabled by --no-services");
@@ -82,7 +88,11 @@ pub async fn run(
         data_root.display(),
         CONFIG_RELOAD_INTERVAL.as_secs()
     );
-    eprintln!("joi daemon: socket={}", socket_path.display());
+    if let Some(socket_path) = socket_path.as_ref() {
+        eprintln!("joi daemon: socket={}", socket_path.display());
+    } else {
+        eprintln!("joi daemon: socket disabled");
+    }
     eprintln!("joi daemon: ready (ctrl-c to stop)");
 
     loop {
@@ -104,13 +114,17 @@ pub async fn run(
     }
 
     eprintln!("\njoi daemon: shutting down");
-    proxy_handle.abort();
+    if let Some(proxy_handle) = proxy_handle {
+        proxy_handle.abort();
+    }
     machine_host_handle.abort();
     for (_, running) in running_agents {
         running.handle.abort();
     }
-    daemon_ipc::remove_discovery_for(&socket_path);
-    daemon_ipc::cleanup_socket(&socket_path).await;
+    if let Some(socket_path) = socket_path {
+        daemon_ipc::remove_discovery_for(&socket_path);
+        daemon_ipc::cleanup_socket(&socket_path).await;
+    }
     Ok(())
 }
 

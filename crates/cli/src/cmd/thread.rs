@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use crate::client::Client;
 use crate::render;
 
-/// `joi thread create [--resident-as <role>] [--bootstrap-artifact <uri>]`.
+/// `joi thread create --root-event <event_id> [--resident-as <role>] [--bootstrap-artifact <uri>]`.
 ///
 /// After the server creates the thread, the CLI writes two channel-local
 /// metadata files when the optional flags are passed (see design §4.7.1
@@ -25,7 +25,7 @@ use crate::render;
 pub async fn create(
     client: Arc<Client>,
     channel_id: String,
-    root_event_id: Option<String>,
+    root_event_id: String,
     title: String,
     resident_as: Option<String>,
     bootstrap_artifact: Option<String>,
@@ -33,7 +33,7 @@ pub async fn create(
     let res: ThreadCreateResult = client
         .call(
             method::THREAD_CREATE,
-            json!({ "channelId": channel_id, "rootEventId": root_event_id.unwrap_or_default(), "title": title }),
+            json!({ "channelId": channel_id, "rootEventId": root_event_id, "title": title }),
         )
         .await?;
     let thread_id = res.thread.id.clone();

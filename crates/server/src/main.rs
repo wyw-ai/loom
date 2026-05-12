@@ -10,7 +10,7 @@ mod ws;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
@@ -35,6 +35,14 @@ struct Args {
     /// Data directory (journal + artifacts)
     #[arg(long, default_value = "./data", env = "JOI_DATA_DIR")]
     data_dir: PathBuf,
+
+    /// Unix socket to bind for local JSON-line RPC instead of TCP WebSocket.
+    #[arg(long, env = "JOI_UNIX_SOCKET")]
+    unix_socket: Option<PathBuf>,
+
+    /// Directory to use for local file-based JSON RPC instead of sockets.
+    #[arg(long, env = "JOI_FILE_RPC")]
+    file_rpc: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -67,15 +75,63 @@ async fn main() -> Result<()> {
     ws::spawn_stream_broadcaster(state.clone());
     spawn_reminder_worker(state.clone());
 
+    if let Some(socket) = args.unix_socket {
+        return serve_unix(state, socket).await;
+    }
+    if let Some(root) = args.file_rpc {
+        return serve_file_rpc(state, root).await;
+    }
+
     let app = Router::new()
         .route("/rpc", get(ws::ws_upgrade))
         .with_state(state);
-
     let addr: std::net::SocketAddr = args.bind.parse()?;
     tracing::info!(%addr, "joi-server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn serve_file_rpc(state: AppState, root: PathBuf) -> Result<()> {
+    ws::spawn_file_rpc(state, root.clone())
+        .with_context(|| format!("start file-rpc transport {}", root.display()))?;
+    tracing::info!(root = %root.display(), "joi-server listening on file-rpc directory");
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn serve_unix(state: AppState, socket: PathBuf) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create unix socket dir {}", parent.display()))?;
+    }
+    if socket.exists() {
+        let file_type = std::fs::symlink_metadata(&socket)
+            .with_context(|| format!("stat unix socket {}", socket.display()))?
+            .file_type();
+        if !file_type.is_socket() {
+            bail!("{} exists and is not a unix socket", socket.display());
+        }
+        std::fs::remove_file(&socket)
+            .with_context(|| format!("remove stale unix socket {}", socket.display()))?;
+    }
+
+    let listener = tokio::net::UnixListener::bind(&socket)
+        .with_context(|| format!("bind unix socket {}", socket.display()))?;
+    tracing::info!(socket = %socket.display(), "joi-server listening on unix socket");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(ws::handle_unix_socket(state.clone(), stream));
+    }
+}
+
+#[cfg(not(unix))]
+async fn serve_unix(_state: AppState, socket: PathBuf) -> Result<()> {
+    let _ = socket;
+    bail!("unix sockets are only supported on Unix platforms");
 }
 
 fn spawn_reminder_worker(state: AppState) {

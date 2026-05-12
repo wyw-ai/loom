@@ -6,6 +6,8 @@ use proto::methods::method;
 use proto::types::{ActorKind, ChannelVisibility, ScopeKind, ScopeRef};
 use proto::{ErrorCode, ErrorObject, RpcEnvelope};
 use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -19,9 +21,116 @@ pub async fn ws_upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
     ws.on_upgrade(move |socket| handle_socket(state, socket))
 }
 
-async fn handle_socket(state: AppState, socket: WebSocket) {
+pub fn spawn_file_rpc(state: AppState, root: PathBuf) -> std::io::Result<JoinHandle<()>> {
+    std::fs::create_dir_all(root.join("clients"))?;
+    Ok(tokio::spawn(async move {
+        let mut connections: HashMap<String, FileRpcConnection> = HashMap::new();
+        loop {
+            if let Err(err) = poll_file_rpc(&state, &root, &mut connections).await {
+                tracing::warn!(error = %err, "file-rpc poll failed");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }))
+}
+
+struct FileRpcConnection {
+    tx: mpsc::UnboundedSender<String>,
+    seen: BTreeSet<String>,
+}
+
+async fn poll_file_rpc(
+    state: &AppState,
+    root: &Path,
+    connections: &mut HashMap<String, FileRpcConnection>,
+) -> std::io::Result<()> {
+    let clients_dir = root.join("clients");
+    for entry in std::fs::read_dir(clients_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(connection_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !connections.contains_key(&connection_id) {
+            let client_dir = entry.path();
+            let out_dir = client_dir.join("out");
+            std::fs::create_dir_all(client_dir.join("in"))?;
+            std::fs::create_dir_all(&out_dir)?;
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            state.subscriptions.add_connection(Connection {
+                id: connection_id.clone(),
+                actor_id: None,
+                tx: tx.clone(),
+            });
+            tokio::spawn(file_rpc_writer(out_dir, rx));
+            connections.insert(
+                connection_id.clone(),
+                FileRpcConnection {
+                    tx,
+                    seen: BTreeSet::new(),
+                },
+            );
+        }
+        if let Some(connection) = connections.get_mut(&connection_id) {
+            let in_dir = entry.path().join("in");
+            let mut files = std::fs::read_dir(in_dir)?
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect::<Vec<_>>();
+            files.sort();
+            for file in files {
+                let Some(name) = file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if !connection.seen.insert(name) {
+                    continue;
+                }
+                match std::fs::read_to_string(&file) {
+                    Ok(text) => {
+                        handle_text_frame(state, &connection_id, &connection.tx, text).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(file = %file.display(), error = %err, "read file-rpc request failed")
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn file_rpc_writer(out_dir: PathBuf, mut rx: mpsc::UnboundedReceiver<String>) {
+    let mut seq = 0_u64;
+    while let Some(frame) = rx.recv().await {
+        seq = seq.saturating_add(1);
+        if let Err(err) = write_frame_file(&out_dir, seq, &frame) {
+            tracing::warn!(dir = %out_dir.display(), error = %err, "write file-rpc response failed");
+            break;
+        }
+    }
+}
+
+fn write_frame_file(dir: &Path, seq: u64, frame: &str) -> std::io::Result<()> {
+    let final_path = dir.join(format!("{seq:020}.json"));
+    let tmp_path = dir.join(format!("{seq:020}.json.tmp"));
+    std::fs::write(&tmp_path, frame)?;
+    std::fs::rename(tmp_path, final_path)
+}
+
+fn new_connection_id() -> String {
     let suffix = Uuid::new_v4().simple().to_string();
-    let connection_id = format!("conn_{}", &suffix[..12]);
+    format!("conn_{}", &suffix[..12])
+}
+
+async fn handle_socket(state: AppState, socket: WebSocket) {
+    let connection_id = new_connection_id();
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
@@ -55,6 +164,47 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             Message::Close(_) => break,
         };
         handle_text_frame(&state, &connection_id, &tx, text).await;
+    }
+
+    cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;
+}
+
+#[cfg(unix)]
+pub async fn handle_unix_socket(state: AppState, socket: tokio::net::UnixStream) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let connection_id = new_connection_id();
+    let (reader, mut writer) = socket.into_split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    state.subscriptions.add_connection(Connection {
+        id: connection_id.clone(),
+        actor_id: None,
+        tx: tx.clone(),
+    });
+
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if writer.write_all(frame.as_bytes()).await.is_err() {
+                break;
+            }
+            if writer.write_all(b"\n").await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(text)) => handle_text_frame(&state, &connection_id, &tx, text).await,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(error = %err, "unix rpc socket read failed");
+                break;
+            }
+        }
     }
 
     cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;

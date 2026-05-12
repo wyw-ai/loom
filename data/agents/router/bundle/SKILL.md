@@ -102,7 +102,8 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
    读 scope，取 `resident_threads.discovery_desk`。
 2. 命中 → 复用该 thread_id；缺失 → `joi thread list --channel <channel_id> --json`
    找 title=`discovery-desk`；仍 0 命中才
-   `joi thread create --channel <channel_id> --title "discovery-desk" --resident-as discovery_desk --json` 拿 thread_id。
+   先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: discovery-desk" --json | jq -r '.event.id')`，
+   再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "discovery-desk" --resident-as discovery_desk --json` 拿 thread_id。
 3. **绝不新建第二个 discovery-desk**。
 4. `joi handoff actor_discovery --in <thread_id> --message "new_task：<原文需求>"`。
 
@@ -114,7 +115,8 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 1. 解析所有 `repo + branch`。若同一任务出现多个 repo，必须放入**同一个**
    delivery thread，不要拆分。
 2. 直接创建可读 delivery thread，例如：
-   `joi thread create --channel <channel_id> --title "[pickup] <任务标题>" --json`。
+   先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: pickup delivery" --json | jq -r '.event.id')`，
+   再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "[pickup] <任务标题>" --json`。
 3. publish 一个 pickup clone-manifest：
    - `schema_version=2`
    - `pickup=true`
@@ -152,8 +154,8 @@ human 的短摘要。**禁止**在 channel 公共区写扫描日志或唤醒非�
      读 `resident_threads.bug_scan`。
    - 若没有，用 `joi thread list --channel <channel_id> --json` 查 title=
      `bug-scan-desk` / `feedback-scan`。
-   - 仍没有才创建：
-     `joi thread create --channel <channel_id> --title "bug-scan-desk" --resident-as bug_scan --json`。
+    - 仍没有才创建：先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: bug-scan-desk" --json | jq -r '.event.id')`，
+      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "bug-scan-desk" --resident-as bug_scan --json`。
 2. 在 bug-scan thread 内触发扫描（本回合唯一动作）：
    ```bash
    joi handoff --as actor_router --in <bug_scan_thread_id> feedback-scanner -m \
@@ -236,8 +238,9 @@ new_task 或 pickup 开发任务。
    ```
 2. discovery 回来后，如果 message 含 `posthoc-mr-analysis` / `existing-mr` /
    `MR 后置分析完成` / `task-goal + DoD` 且可解析出 repo + mr_id/branch：
-   - **必须新建一个独立 delivery thread**，标题优先可读：
-     `joi thread create --channel <channel_id> --title "[posthoc-mr:<mr_id>] <repo> <MR主题或任务标题>" --json`
+    - **必须新建一个独立 delivery thread**，标题优先可读：先
+      `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: posthoc-mr <mr_id>" --json | jq -r '.event.id')`，
+      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "[posthoc-mr:<mr_id>] <repo> <MR主题或任务标题>" --json`
      若没有 MR 主题/任务标题，再退化为 `"[posthoc-mr:<mr_id>] <repo>"`；不要只用随机 hash。
    - **严禁**复用当前正在修别的问题的 `bugfix-deliver-*` 或 `delivery-task-*`
      thread；除非 human 明确给出同一个 thread_id 并说"接着这个 thread 做"。
@@ -593,9 +596,11 @@ delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。
    `cache-ctl.sh verify --json` 看缺哪些；缺的 `cache-ctl.sh add <git-url>`。
 5. 建 delivery thread（标题必须可读）：
     - bugfix 模式：
-      `joi thread create --channel <channel_id> --title "[bugfix:<feedback_id>] <feedback title>" --bootstrap-artifact <art_clonemanifest> --json`
+      先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: bugfix <feedback_id>" --json | jq -r '.event.id')`，
+      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "[bugfix:<feedback_id>] <feedback title>" --bootstrap-artifact <art_clonemanifest> --json`
     - 普通模式：
-      `joi thread create --channel <channel_id> --title "<task title>" --bootstrap-artifact <art_clonemanifest> --json`
+      先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: <task title>" --json | jq -r '.event.id')`，
+      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "<task title>" --bootstrap-artifact <art_clonemanifest> --json`
       若同名冲突则用 `"<task title> · <8字hash>"`。
     → 取 thread_id。
 6. **provision thread workspace（v2 必做）**：把 clone-manifest 写到

@@ -49,6 +49,19 @@ Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志
 }
 ```
 
+command / interactive_command runtime 可以通过 `transport.modelArgs` 声明 CLI
+模型参数模板。内置 daemon provider 已经按各 CLI 填好 `["--model", "{model}"]`；
+手写 spec 时可显式设置：
+
+```json
+"transport": {
+  "kind": "command",
+  "command": "codex",
+  "args": ["exec", "--json"],
+  "modelArgs": ["--model", "{model}"]
+}
+```
+
 同一个 provider / CLI 可以在一份 JSON 里声明多个 actor，避免为同一套
 `transport` 复制多份 spec。`defaults` 作为默认值，`actors[]` 里的 `identity`、
 `model`、`models` 等字段按 actor 覆盖：

@@ -46,10 +46,14 @@ export JOI_AGENT_DATA_ROOT="$ROOT/agent-data"
 export JOI_SERVICE_HOST_DATA="$ROOT/service-data"
 
 j() { "$JOI" --as "$USER_ACTOR" --display "$USER_DISPLAY" --json "$@"; }
+thread_anchor() {
+  j event append --channel --in "$1" --type thread.opened --text "$2" | jq -r '.event.id'
+}
 
 step "2. create channel + thread"
 ch=$(j channel create --title "e2e-thread-closed" | jq -r '.channel.id // .id')
-th=$(j thread create --channel "$ch" --title "thread-closed-smoke" | jq -r '.thread.id // .id')
+root=$(thread_anchor "$ch" "anchor: thread-closed-smoke")
+th=$(j thread create --channel "$ch" --root-event "$root" --title "thread-closed-smoke" | jq -r '.thread.id // .id')
 echo "channel=$ch thread=$th"
 
 step "3. invite svc_mr_detector + start instance"

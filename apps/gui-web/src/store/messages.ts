@@ -64,6 +64,12 @@ function respondsToTarget(ev: JoiEvent): string | undefined {
   return r?.target.id;
 }
 
+function attachedArtifactIds(ev: JoiEvent): string[] {
+  return ev.relations
+    .filter((r) => r.kind === "attaches_artifact" && r.target.kind === "artifact")
+    .map((r) => r.target.id);
+}
+
 function asString(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
@@ -120,6 +126,7 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
   const replyTo = replyTarget(ev);
   const turnId = ev.turnId ?? undefined;
   const meta = eventMeta(ev);
+  const attachmentIds = attachedArtifactIds(ev);
 
   // Dedupe by event id first — the same `event.created` can arrive twice if
   // `scope/subscribe` is called repeatedly (switching back to a scope
@@ -131,6 +138,9 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
       ...next[dupIdx],
       text: text || next[dupIdx].text,
       meta: meta ?? next[dupIdx].meta,
+      attachmentIds: attachmentIds.length
+        ? attachmentIds
+        : next[dupIdx].attachmentIds,
       streaming: false,
       delivery: "delivered",
       ts: ev.occurredAt,
@@ -151,6 +161,7 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
           ...b,
           text: text || b.text,
           meta: meta ?? b.meta,
+          attachmentIds: attachmentIds.length ? attachmentIds : b.attachmentIds,
           streaming: false,
           delivery: "delivered",
           ts: ev.occurredAt,
@@ -173,6 +184,7 @@ function pushOrMergeStream(bubbles: Bubble[], ev: JoiEvent): Bubble[] {
       ts: ev.occurredAt,
       replyToEventId: replyTo,
       meta,
+      attachmentIds,
       streaming: false,
       delivery: "delivered",
     },
@@ -195,6 +207,7 @@ function applyEvent(state: ScopeState, ev: JoiEvent): ScopeState {
     case "content.add": {
       const handoff = handsOffTarget(ev);
       const reply = replyTarget(ev);
+      const attachmentIds = attachedArtifactIds(ev);
       if (handoff && !reply) {
         return {
           ...state,
@@ -206,6 +219,7 @@ function applyEvent(state: ScopeState, ev: JoiEvent): ScopeState {
             text: extractText(ev),
             ts: ev.occurredAt,
             meta: eventMeta(ev),
+            attachmentIds,
             streaming: false,
             delivery: "delivered",
             handoffTarget: handoff,
@@ -240,6 +254,7 @@ function applyEvent(state: ScopeState, ev: JoiEvent): ScopeState {
           actionRequestId: summary.requestId,
           actionStatus: "pending",
           choices: summary.choices,
+          attachmentIds: attachedArtifactIds(ev),
         }),
       };
     }

@@ -79,7 +79,8 @@ classroom 公共频道是 **人和 classmaster 沟通的地方**，不是日志�
 2. 创建 training thread：
 
    ```bash
-   joi thread create --channel <classroom_channel_id> --title "training-<target_actor>-<short-topic>" --json
+   anchor_id=$(joi event append --channel --in <classroom_channel_id> --type thread.opened --text "anchor: training-<target_actor>-<short-topic>" --json | jq -r '.event.id')
+   joi thread create --channel <classroom_channel_id> --root-event "$anchor_id" --title "training-<target_actor>-<short-topic>" --json
    ```
 
 3. 邀请成员：`actor_teacher` 必须在 thread 内；目标 actor 如可运行也邀请进来。

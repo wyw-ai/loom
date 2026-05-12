@@ -178,6 +178,10 @@ async fn prepare_socket_path(socket: &Path) -> Result<()> {
 
 #[cfg(unix)]
 async fn proxy_client(stream: tokio::net::UnixStream, server_url: String) -> Result<()> {
+    if let Some(path) = unix_url_path(&server_url) {
+        return proxy_client_to_unix(stream, path).await;
+    }
+
     let (ws, _) = tokio_tungstenite::connect_async(&server_url)
         .await
         .with_context(|| format!("ws connect {}", server_url))?;
@@ -217,4 +221,47 @@ async fn proxy_client(stream: tokio::net::UnixStream, server_url: String) -> Res
         result = local_to_ws => result,
         result = ws_to_local => result,
     }
+}
+
+#[cfg(unix)]
+async fn proxy_client_to_unix(stream: tokio::net::UnixStream, path: &str) -> Result<()> {
+    let server = tokio::net::UnixStream::connect(path)
+        .await
+        .with_context(|| format!("connect unix server socket {}", path))?;
+    let (server_reader, mut server_writer) = server.into_split();
+    let (local_reader, mut local_writer) = stream.into_split();
+    let mut local_lines = BufReader::new(local_reader).lines();
+    let mut server_lines = BufReader::new(server_reader).lines();
+
+    let local_to_server = async {
+        while let Some(line) = local_lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            server_writer.write_all(line.as_bytes()).await?;
+            server_writer.write_all(b"\n").await?;
+        }
+        let _ = server_writer.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let server_to_local = async {
+        while let Some(line) = server_lines.next_line().await? {
+            local_writer.write_all(line.as_bytes()).await?;
+            local_writer.write_all(b"\n").await?;
+        }
+        let _ = local_writer.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        result = local_to_server => result,
+        result = server_to_local => result,
+    }
+}
+
+#[cfg(unix)]
+fn unix_url_path(url: &str) -> Option<&str> {
+    url.strip_prefix("unix://")
+        .or_else(|| url.strip_prefix("unix:"))
 }

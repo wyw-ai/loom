@@ -26,6 +26,9 @@ export JOI_SERVICE_SPECS="$ROOT/service-specs"
 
 step() { echo; echo "=== $* ==="; }
 j()    { "$BIN_JOI" --json "$@"; }
+thread_anchor() {
+  j event append --channel --in "$1" --type thread.opened --text "$2" --as actor_e2e_human | jq -r '.event.id'
+}
 
 # ---- 0. seed lesson-target spec ---------------------------------------------
 step "0. seed lesson-target agent spec"
@@ -44,7 +47,8 @@ echo "seeded -> $target_dir/spec.json"
 step "1. create channel + thread + invite teacher"
 ch=$(j channel create --title "spec-apply-smoke" --as actor_e2e_human | jq -r '.channel.id')
 j channel invite "$ch" actor_teacher --as actor_e2e_human >/dev/null
-th=$(j thread create --channel "$ch" --as actor_e2e_human --title "spec-apply" | jq -r '.thread.id')
+root=$(thread_anchor "$ch" "anchor: spec-apply")
+th=$(j thread create --channel "$ch" --root-event "$root" --as actor_e2e_human --title "spec-apply" | jq -r '.thread.id')
 echo "channel = $ch"
 echo "thread  = $th"
 

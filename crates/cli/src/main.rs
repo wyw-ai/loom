@@ -239,6 +239,10 @@ enum Cmd {
         /// Unix socket used by local `joi` CLI clients to reach this daemon.
         #[arg(long = "socket", env = "JOI_DAEMON_SOCKET")]
         socket: Option<PathBuf>,
+        /// Do not expose the local daemon IPC socket. Useful for tests where
+        /// agents connect to the server directly.
+        #[arg(long = "no-ipc")]
+        no_ipc: bool,
     },
 }
 
@@ -536,7 +540,7 @@ enum ThreadCmd {
         channel: String,
         /// Channel-scope event that anchors the thread.
         #[arg(long = "root-event")]
-        root_event: Option<String>,
+        root_event: String,
         #[arg(long, default_value = "Untitled")]
         title: String,
         /// Record this thread under `resident_threads.<role>` in the
@@ -729,9 +733,11 @@ enum ArtifactCmd {
     },
     /// Fetch artifact metadata by id (`art_…`) or by `artifact://` uri.
     Get { id_or_uri: String },
-    /// Print artifact body (text only). Use --max-bytes to fetch more than 64 KiB.
+    /// Print artifact body (text only). Use --offset/--max-bytes for progressive reads.
     Read {
         artifact_id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
         #[arg(long, default_value_t = 65536)]
         max_bytes: u64,
     },
@@ -754,8 +760,19 @@ enum AttachmentCmd {
         id: String,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
         #[arg(long, default_value_t = 10 * 1024 * 1024)]
         max_bytes: u64,
+    },
+    /// Download a whole attachment/artifact body in chunks.
+    Download {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long = "chunk-bytes", default_value_t = 1024 * 1024)]
+        chunk_bytes: u64,
     },
 }
 
@@ -968,6 +985,7 @@ async fn main() -> Result<()> {
         allow_services,
         no_services,
         socket,
+        no_ipc,
     } = args.cmd
     {
         return cmd::daemon::run(
@@ -979,6 +997,7 @@ async fn main() -> Result<()> {
             allow_services,
             no_services,
             socket,
+            no_ipc,
             cfg.server_url,
         )
         .await;
@@ -1371,8 +1390,9 @@ async fn main() -> Result<()> {
             ArtifactCmd::Get { id_or_uri } => cmd::artifact::get(client, id_or_uri).await?,
             ArtifactCmd::Read {
                 artifact_id,
+                offset,
                 max_bytes,
-            } => cmd::artifact::read(client, artifact_id, max_bytes).await?,
+            } => cmd::artifact::read(client, artifact_id, offset, max_bytes).await?,
         },
         Cmd::Attachment { sub } => match sub {
             AttachmentCmd::Upload {
@@ -1383,8 +1403,14 @@ async fn main() -> Result<()> {
             AttachmentCmd::View {
                 id,
                 output,
+                offset,
                 max_bytes,
-            } => cmd::attachment::view(client, id, output, max_bytes).await?,
+            } => cmd::attachment::view(client, id, output, offset, max_bytes).await?,
+            AttachmentCmd::Download {
+                id,
+                output,
+                chunk_bytes,
+            } => cmd::attachment::download(client, id, output, chunk_bytes).await?,
         },
         Cmd::Reminder { sub } => match sub {
             ReminderCmd::Schedule {

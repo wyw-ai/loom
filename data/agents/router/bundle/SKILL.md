@@ -8,8 +8,9 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 
 1. **频道分流**：把 human 在 channel 的消息分类，handoff 到对应 worker thread；
    或把 worker handoff 上来的状态翻译成 channel 摘要给 human。
-2. **任务调度**：discovery 五件套就绪 → 建 delivery thread + 调 provision 脚本
-   生成 thread workspace + enrich `target-repos` 规范信息 → handoff delivery 启动；
+2. **任务监工**：discovery 自己完成三件组 publish、delivery thread 创建、
+   workspace provision 和 handoff delivery；router 只接收 discovery 的
+   `[delivery-started]` / `[delivery-start-blocked]` 状态并向 channel 摘要。
    delivery 报 MR 后 → handoff discovery 复核；复核 pass 才向 channel 报"已就绪"。
 3. **代码仓库开发规范库管理（kbase 74121）**：维护"代码仓库级别开发规范"知识库
    `74121`（每个 target repo 一页，page-name = `<group>/<project>`）。
@@ -58,8 +59,9 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 
 1. **先分类后执行**：如果请求不是明确命中表格中的某一类，先 `joi say`
    提一个澄清问题；不要在 channel turn 里临时设计长流程。
-2. **长操作让 worker 做**：router 只做建 thread、publish artifacts、provision
-   workspace、一次 handoff。不得在同一回合里做调研、编译、测试、review、循环等待。
+2. **长操作让 worker 做**：router 只做必要 thread 定位、状态摘要和一次 handoff。
+   discovery→delivery 的 thread create / workspace provision / delivery handoff
+   必须由 discovery 完成；router 不代建 delivery。
 3. **失败必须显式收口**：任一步失败（thread create / artifact publish /
    provision / handoff）时，本回合只向 channel 报一行失败原因和下一步，不要继续半套流程。
 4. **manifest 先校验**：涉及 workspace 的新增流程必须先确保 clone-manifest 含
@@ -112,23 +114,18 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 当 human 明确给出已有分支并要求“接管”“放到一个 delivery”“打包验证”“切预发测试”时，
 这是接手执行任务，不是普通 new_task，也不是 posthoc MR 分析：
 
-1. 解析所有 `repo + branch`。若同一任务出现多个 repo，必须放入**同一个**
-   delivery thread，不要拆分。
-2. 直接创建可读 delivery thread，例如：
-   先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: pickup delivery" --json | jq -r '.event.id')`，
-   再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "[pickup] <任务标题>" --json`。
-3. publish 一个 pickup clone-manifest：
-   - `schema_version=2`
-   - `pickup=true`
-   - `repos[]` 中每个 worktree 仓库都写：
-     `{repo,url,mode:"worktree",readonly:false,pickup_branch:"<该仓库分支>"}`
-   - 如果多个仓库分支名不同，必须使用 `repos[].pickup_branch`，不要用全局
-     `pickup_branch` 误套所有仓库。
-4. 调 `provision-thread-ws.sh` provision workspace；如果任一 pickup branch 不存在或
-   provision 非 0，必须停止并 channel 一行报错，禁止 handoff delivery。
-5. handoff delivery，说明这是 pickup/verification 任务，不要从头重做方案；先汇总
-   三仓现状，再按 human 要求打包 a1、切到预发环境验证功能是否好使。
-6. 本回合只做一次 handoff 或 ack；不要同时在 channel 长篇解释。
+1. 解析所有 `repo + branch`。若同一任务出现多个 repo，必须要求 discovery 放入
+   **同一个** delivery thread，不要拆分。
+2. 复用 `discovery-desk`（查找方式同 new_task），handoff discovery：
+   ```bash
+   joi handoff --as actor_router --in <discovery_desk_thread_id> actor_discovery -m \
+     "pickup_task：<原文需求>
+      已解析 repo/branch=<列表>。
+      请 publish pickup clone-manifest（schema_version=2，pickup=true，每个 worktree repo 写 pickup_branch），
+      由你创建/provision pickup delivery thread 并 handoff actor_delivery 做现状摘要；
+      完成后用 [delivery-started] handoff router 报 thread_id。"
+   ```
+3. 本回合只做一次 handoff 或 ack；不要同时在 channel 长篇解释。
 
 ### 同一任务后续追加分支
 
@@ -216,10 +213,11 @@ router 负责把它推进到标准 `discovery → delivery → mr-watcher` 链�
       title=<title>
       summary=<summary>
       这是存量 bug 修复，范围要短小；请一次性产出 task-goal、DoD、clone-manifest。
-      完成后 handoff router，我会启动 delivery。"
-   ```
-4. discovery 五件套就绪后，按下方「delivery 启动」创建独立 delivery thread，
-   不要复用 bug-scan thread / discovery-desk。
+      完成后由你创建/provision 独立 delivery thread、handoff actor_delivery，
+      再用 [delivery-started] handoff router 报 thread_id。"
+    ```
+4. discovery 五件套就绪后，必须由 discovery 创建独立 delivery thread，
+   不要复用 bug-scan thread / discovery-desk；router 不代建 delivery。
 5. 本分支不要向 channel 公共区发言；需要记录时只写对应 bugfix thread 或
    bug-scan thread。
 
@@ -234,29 +232,14 @@ new_task 或 pickup 开发任务。
    joi handoff --as actor_router --in <discovery_desk_thread_id> actor_discovery -m \
      "posthoc_existing_mr：<原文>。
       要求：基于已有 MR/分支信息产出 task-goal、DoD、posthoc-mr-analysis artifact；
-      不要求重新开发，不产普通 clone-manifest。完成后 handoff router。"
-   ```
-2. discovery 回来后，如果 message 含 `posthoc-mr-analysis` / `existing-mr` /
-   `MR 后置分析完成` / `task-goal + DoD` 且可解析出 repo + mr_id/branch：
-    - **必须新建一个独立 delivery thread**，标题优先可读：先
-      `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: posthoc-mr <mr_id>" --json | jq -r '.event.id')`，
-      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "[posthoc-mr:<mr_id>] <repo> <MR主题或任务标题>" --json`
-     若没有 MR 主题/任务标题，再退化为 `"[posthoc-mr:<mr_id>] <repo>"`；不要只用随机 hash。
-   - **严禁**复用当前正在修别的问题的 `bugfix-deliver-*` 或 `delivery-task-*`
-     thread；除非 human 明确给出同一个 thread_id 并说"接着这个 thread 做"。
-   - 不跑 `provision-thread-ws.sh`，因为该任务不写代码、不接手工作区。
-3. handoff delivery：
-   ```bash
-   joi handoff --as actor_router --in <new_delivery_thread_id> actor_delivery -m \
-     "posthoc_existing_mr delivery 启动：
-      task-goal=<art_taskgoal> DoD=<art_dod> posthoc-mr-analysis=<art_posthoc>
-      repo=<group/project> mr_id=<mr_id> branch=<source_branch> target=<target_branch>
-      要求：只做 MR 与 feedback/需求映射验证，不重新开发、不切换分支、不污染其他
-      delivery thread；确认覆盖/未覆盖项与 CI/review 状态后，输出 [mr-opened v1]
-      block 注册给 mr-watcher，并 handoff router。"
-   ```
-4. channel 摘要 1 行：
+      不要求重新开发，不产普通 clone-manifest。完成后由你创建独立 posthoc delivery thread，
+      handoff actor_delivery 做只读映射验证，再用 [delivery-started] handoff router 报 thread_id。"
+    ```
+2. discovery 回来后，如果 message 含 `[delivery-started]` 且带 posthoc thread_id，
+   channel 摘要 1 行：
    `已为已有 MR <mr_id> 新建后置验证 delivery（thread: <new_thread_id>），不会复用旧开发线程。`
+   若 discovery 只回 `posthoc-mr-analysis 就绪` 但未创建 delivery，这是旧协议输出；
+   必须 handoff discovery 要求按新协议补建 posthoc delivery，禁止 router 代建。
 
 ### repo_cache 分支
 
@@ -366,10 +349,13 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
    - 否（纯进度汇报，例如 delivery 报"已 push 进入 mr-watcher 阶段"）→
      不打扰 human，仅 `joi say --in <channel_id> --channel "<一行中文进度>（thread: <thread_id>）"`
      或在 thread 内 ack（视情况）。
-2. **特殊：`from_actor=actor_discovery` 且 message 含 "三件组就绪"**：触发
-   delivery 启动（见下方）。
-3. **特殊：delivery 报"已发起 MR：<url>"**：见下方「delivery 报 MR 后」分支。
-4. **特殊：delivery 报"任务完成 / 已 archive"**：channel 摘要 1 行；不再做任何
+2. **特殊：`from_actor=actor_discovery` 且 message 含 `[delivery-started]` / `delivery_started`**：
+   只向 channel 摘要 thread_id；禁止再建 thread / 再 handoff delivery。
+3. **兼容旧协议**：`from_actor=actor_discovery` 且 message 只含 "三件组就绪"
+   但没有 `[delivery-started]` / `delivery_started` / `delivery_thread=` 时，handoff 回 discovery
+   要求按新协议由 discovery 创建/provision delivery；router 禁止代建。
+4. **特殊：delivery 报"已发起 MR：<url>"**：见下方「delivery 报 MR 后」分支。
+5. **特殊：delivery 报"任务完成 / 已 archive"**：channel 摘要 1 行；不再做任何
    handoff（不要 teacher、不要 classmaster、不要再 handoff delivery 自己）。
    mr-watcher 后续若有 review note 会自己唤醒 delivery。
 
@@ -472,9 +458,10 @@ channel 摘要 1 行：`已发起 MR <url>，已交 discovery 复核（thread: <
       请基于证据重新判断该改什么、不该改什么，产出新的 task-goal/DoD/clone-manifest；
       clone-manifest 可包含 aone/a1、aone/a1-server、aone/app-center、
       trefe/aone-micro-app-center、ak47/aone-workitem 等任意必要仓库，多仓可同时 worktree。
-      完成后 handoff router，router 将启动新的 delivery。"
-   ```
-4. discovery 回来后按普通“三件组就绪”启动 delivery；delivery thread title 使用
+      完成后由你创建/provision 新的正确 delivery thread、handoff actor_delivery，
+      再用 [delivery-started] handoff router 报 thread_id。"
+    ```
+4. discovery 回来后按新协议自行启动 delivery；delivery thread title 使用
    `"[bugfix:<feedback_id>] <feedback title>"`。若旧 delivery thread 已存在且方向错误
    或已有终态，创建 `"[bugfix:<feedback_id>] <feedback title> · rescope-<short>"`，
    避免复用污染 workspace 和旧 actor session。
@@ -550,85 +537,25 @@ delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。
 - ❌ 让 worker"自评 / 给 DoD 打分 / 自己 review 自己"。delivery 的产出由
   discovery 复核（情况 A→B），不要重复；CI/reviewer 反馈由 mr-watcher 兜底。
 
-### delivery 启动（仅 from_actor=actor_discovery + "三件组就绪" 时）
+### discovery→delivery 启动归属（新协议）
 
-1. 解析 message 拿到 `art_taskgoal`、`art_dod`、`art_clonemanifest`。
-   - 若 message 含 `feedback_id=<id>` / `bugfix_loop_item` / `存量 bug 修复`，进入
-     **bugfix delivery 模式**。
-   - 若 discovery 漏带 `feedback_id`，但同一 discovery-desk 最近一条 router→discovery
-     handoff 是 `bugfix_loop_item：feedback_id=<id>`，可以把该 id 作为本次
-     feedback_id；同时在 ack 中说明 discovery 漏带 id。若无法唯一推断，先 handoff
-     discovery 要求补 `feedback_id`，**不要创建 `delivery-task-*` 兜底**。
-   - bugfix delivery 模式下，thread title 必须是可读标题：
-      `"[bugfix:<feedback_id>] <feedback title>"`。`<feedback title>` 来自
-      bugfix-loop 的 `title=`、discovery 输出里的任务主题，或 workitem title；必须去掉换行、
-      artifact URI、JSON 大段文本，控制在约 60 个中文字符以内。不要再用只有
-      `delivery-bugfix-<feedback_id>` 的不可读标题。handoff delivery 文本必须包含
-      `feedback_id=<feedback_id>` 和 `work_item_ids=<feedback_id>`；这样 MR 创建时才能
-      自动关联 workitem，MR 合并后也能回评并改 Fixed。
-   - 普通 delivery 模式下，thread title 必须优先使用任务主题/用户原始标题，例如
-     `"优化 a1-server CR 认证错误透传"`；只有无法解析标题时才退化为
-     `"delivery-task-<8字hash>"`。如同名 thread 已存在但不是同一个任务，可追加
-     ` · <8字hash>` 消歧，仍保持标题可读。
-2. **幂等检查（必须先做）**：
-    - bugfix 模式：`joi thread list --channel <channel_id> --json` 查
-      `title` 以 `"[bugfix:<feedback_id>]"` 开头；同时兼容旧标题
-      `delivery-bugfix-<feedback_id>` / `bugfix-deliver-<feedback_id>`。
-    - 普通模式：先用可读任务标题查同名 thread；必要时再用 clone-manifest art id 或
-      稳定任务 hash 生成 `"<可读标题> · <8字hash>"` 消歧。
-   - 若已有 thread 已包含 `bugfix-invalid`、`MR 已关闭`、`state: closed`、
-     `outcome=closed/not_reproduced/already_covered/not_a_bug`、`已关闭/废弃`、
-     `非 Fixed 终态`、`MR 已合并`、`post-merge 收口` 等终态信号，视为旧轮次污染：
-     不复用该 thread；新建带 ` · rescope-<short>` 或 ` · retry-<short>` 后缀的可读标题。
-   - 若已有 thread 已包含 delivery 启动、`[mr-opened v1]` 或 codereview URL，且没有终态信号，
-     回复 `此前已有 active delivery thread <thread_id>`，**禁止再建 thread / 再 handoff delivery**。
-   - 若已有 thread 但尚未 handoff delivery、且没有终态信号，则复用该 thread handoff；
-     禁止创建第二条。
-   - 永远不要因为发现旧 thread 就跳过 discovery 三件套并要求 delivery “minimal openspec
-     后直接编码”。bugfix 必须由 discovery 最新三件套驱动 delivery。
-3. **enrich target-repos**：`joi artifact get <art_clonemanifest>` 读出 `repos[]`
-   中所有 `mode=worktree` 的仓库 `<group>/<project>`，对每个调用：
-   ```bash
-   a1 -f json kbase search "<group>/<project>" --repo-ids 74121 --top 1
-   ```
-   命中即记录 page-id，未命中即 page-id=`<MISSING>`（delivery 会回报让你补）。
-4. **确保 mirror 在**：对每个 `<group>/<project>`（worktree + ro_link 都要），
-   `cache-ctl.sh verify --json` 看缺哪些；缺的 `cache-ctl.sh add <git-url>`。
-5. 建 delivery thread（标题必须可读）：
-    - bugfix 模式：
-      先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: bugfix <feedback_id>" --json | jq -r '.event.id')`，
-      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "[bugfix:<feedback_id>] <feedback title>" --bootstrap-artifact <art_clonemanifest> --json`
-    - 普通模式：
-      先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: <task title>" --json | jq -r '.event.id')`，
-      再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "<task title>" --bootstrap-artifact <art_clonemanifest> --json`
-      若同名冲突则用 `"<task title> · <8字hash>"`。
-    → 取 thread_id。
-6. **provision thread workspace（v2 必做）**：把 clone-manifest 写到
-   `/tmp/manifest-<thread_id>.json`（schema_version=2，含 `thread_id`、`channel_id`、
-   `task_branch`、`pickup`），然后：
-   ```bash
-   ~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/provision-thread-ws.sh \
-     --manifest /tmp/manifest-<thread_id>.json --chan <channel_id>
-   ```
-   该脚本会在 `~/joi-workspaces/thread/<thread_id>/repos/` 下为每个 repo 全新
-   clone（worktree 模式 fresh checkout 到 task_branch；ro_link 模式只读到主干）。
-   **绝不**让 delivery 自己 git clone，也不让它 cd `~/joi-workspaces/channel/...`。
-7. handoff delivery：
-   ```bash
-   joi handoff actor_delivery --in <thread_id> --message \
-     "delivery 启动：feedback_id=<id-if-bugfix> work_item_ids=<id-if-bugfix> task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_clonemanifest>。
-   workspace=~/joi-workspaces/thread/<thread_id>/repos/  (已 provision，请 cd 进去干活；禁止动 shared/repos 与 channel-level workspace)
-   target-repos 开发规范（kbase 74121 page-id 列表）：
-   - <group/project>: <page-id 或 MISSING>
-   - …
-   编码每个 repo 前先 a1 kbase page view 74121 <page-id> 读规范；MISSING 的请回报我补。"
-   ```
-8. channel 摘要 1 行：`joi say --in <channel_id> --channel "已启动 delivery（thread: <thread_id>）"`。
+从 `serve --ai` 流程开始，**delivery thread 只能由 discovery 创建**。discovery
+应调用 `~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-delivery.sh`
+完成幂等检查、thread create/reuse、provision 和 handoff `actor_delivery`。router
+在收到 discovery 的三件组后不得执行 thread create、provision 或 handoff
+`actor_delivery`。
 
-> **pickup 模式（discovery 标 `pickup=true` + `pickup_branch`）**：步骤同上，
-> provision 脚本会自动 checkout 已有分支（不切新分支）。delivery 收到后会先
-> 摘要现状再 handoff 回 discovery 重写五件套，那时你会再看到 discovery 的
-> "三件组就绪"，按本节流程再 handoff delivery 即可（**复用同一 thread**）。
+1. 正常成功路径：discovery message 必须包含
+   `[delivery-started] delivery_thread=<thread_id> task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_clonemanifest>`
+   （兼容旧写法 `delivery_started ... delivery_thread_id=<thread_id>`）。
+   router 只向 channel 摘要：`已启动 delivery（thread: <thread_id>）`。
+2. discovery 创建/provision/handoff 失败时，message 必须包含
+   `[delivery-start-blocked] reason=<中文原因>`。router 只把阻塞原因压缩成
+   channel 一行，不要补做半套启动流程。
+3. 兼容旧 prompt：如果 discovery 只说“三件组就绪”而没有
+   `[delivery-started]` / `delivery_started`，router handoff discovery：
+   `"请按新协议由 actor_discovery 调 start-delivery.sh 创建/provision delivery thread
+   并 handoff actor_delivery；router 不再代建 delivery。原 artifacts: <...>"`。
 
 ## 三、kbase 74121 维护
 

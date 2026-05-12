@@ -134,8 +134,7 @@ discovery 只**读**，不在这里写改动。
 
 ### 2.3 派生 thread：delivery-task-`<task_id>`
 
-router 看到新的 `task-brief.v1` + 人类批准（`approval.task_start` 的
-action.request → user accept）后，调用：
+discovery 产出 `task-brief.v1` / clone manifest 且进入交付阶段后，直接调用：
 
 ```
 joi thread create --in <channel> \
@@ -147,7 +146,7 @@ runtime 根据 manifest 写 thread `scope.json.mounts`（modify_repos →
 worktree，reference_repos → ro_link），ensure_scope 时落盘；发
 `thread.bootstrapped` event。
 
-router 接着 `handoff → actor_delivery` 进入该 thread，message 内含：
+discovery 接着 `handoff → actor_delivery` 进入该 thread，message 内含：
 
 - `task-brief` artifact uri（delivery 自行 fetch）
 - 明确指令：按 `openspec-propose → openspec-apply-change → openspec-archive-change`
@@ -224,16 +223,15 @@ thread.workspace/
 | 2 | `joi thread create --in <channel> --title "bugfix: <feedback title>"` 派生 bugfix thread | thread |
 | 3 | `handoff → actor_discovery` 到 bugfix thread，prompt 强调「短小 bug，必须一次产出 task-brief.v1」 | event + artifact |
 | 4 | 收到 task-brief + clone_manifest 后，`a1 feedback reply <id> --message <粗方案摘要>` 把方案回给提报人 | a1 命令 |
-| 5 | `handoff → actor_router` 在 bugfix thread 内，附 task-brief uri，要求 router 进入 delivery 阶段（router 复用 §2.3 的 thread create + delivery handoff，不另建 thread；本 thread 即 delivery thread） | event |
+| 5 | discovery 在 bugfix thread 内直接进入 delivery 阶段（按 §2.3 bootstrap + handoff delivery；本 thread 即 delivery thread），再 `handoff → actor_router` 汇报 `[delivery-started]` | event |
 | 6 | 监听本 thread 的 `mr-merged.v1` artifact | artifact 订阅 |
 | 7 | merged → `a1 feedback reply <id> --message "已合入，将随下次发版上线"` + `a1 feedback set-status <id> fixed` | a1 命令 |
 | 8 | 关闭 bugfix thread；继续下一条 | thread |
 
-> 这里的取舍：原始描述中 step 3 的 discovery 完成后“handoff router 让他将
-> 这个任务进入 delivery 阶段”——为了减少 thread 数量，**bugfix thread
-> 直接复用为 delivery thread**（loop 把 task-brief 给 router 时不让 router
-> 另开新 thread；router 就在当前 thread 里 bootstrap mounts + handoff
-> delivery）。这要求 §2.3 的 `joi thread create --bootstrap-artifact` 变体
+> 这里的取舍：discovery 完成后不再让 router 进入 delivery 阶段。为了减少
+> thread 数量，**bugfix thread 直接复用为 delivery thread**（discovery 在当前
+> thread 里 bootstrap mounts + handoff delivery，再向 router 汇报
+> `[delivery-started]`）。这要求 §2.3 的 `joi thread create --bootstrap-artifact` 变体
 > 同时支持 `joi thread bootstrap --in <existing-thread>`，把 mounts 写进
 > 已存在的 thread 的 scope.json——这是 §4.7 的小扩展，不新增概念。
 
@@ -397,7 +395,7 @@ chan_4a634872b6f8 (classroom)
                 ▼
         [bugfix-<fb>: discovery one-shot brief]
                 │ a1 reply 粗方案 + handoff router
-                │ router bootstrap mounts + handoff delivery (复用 §5.1 后半段)
+                │ discovery bootstrap mounts + handoff delivery (复用 §5.1 后半段)
                 ▼
         [bugfix-<fb>: mr-merged] → a1 reply + a1 set-status fixed → 回 loop
 ```

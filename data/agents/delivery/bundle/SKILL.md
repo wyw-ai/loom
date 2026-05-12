@@ -40,7 +40,7 @@ push topic branch，**自动发起 MR**，处理 mr-watcher 推回的 CI / 冲�
 - 启动 handoff message 中携带的 **target-repos 开发规范 page-id 列表**
   （kbase 74121）。
 - **thread workspace 路径**：`~/joi-workspaces/thread/<thread_id>/repos/<basename>/`
-  —— 由 router 调 `provision-thread-ws.sh` 已经 fresh-clone 好；woktree 仓库已经
+  —— 由 discovery 调 `provision-thread-ws.sh` 已经 fresh-clone 好；worktree 仓库已经
   切到目标分支（或 pickup 分支）。**直接 cd 进去干活**。
 - 后续：mr-watcher 推回的 MR 扫描报告（ci_issues / conflict / new_notes）；
   router 推回的 `review-result.v1`（discovery 的复核结论）。
@@ -112,10 +112,10 @@ push topic branch，**自动发起 MR**，处理 mr-watcher 推回的 CI / 冲�
    ```bash
    joi handoff --as actor_delivery --in <thread> actor_discovery -m \
      "[pickup-summary] 已读完接手分支 <branch>。摘要 art=<art_pickup_summary>。
-      请基于现状重写 task-goal/DoD/clone-manifest，handoff router 后我会被
-      重新唤醒继续。"
+      请基于现状重写 task-goal/DoD/clone-manifest，并由你复用当前 thread
+      重新 provision/唤醒我继续。"
    ```
-4. **本回合结束**。下一次唤醒（router 重启 delivery）按正常流程跑 Step 1+。
+4. **本回合结束**。下一次唤醒（discovery 重启 delivery）按正常流程跑 Step 1+。
 
 ### Step 1 — 读每个 target repo 的开发规范（必须，编码前）
 

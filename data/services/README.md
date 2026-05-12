@@ -10,13 +10,16 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
   做离线冒烟。
 - `bundle/README.md` —— 给运维的说明（参数、产出 artifact、依赖）。
 
-Phase 3 交付的服务清单：
+当前远端同步的服务清单：
 
 | Service id        | Kind        | Lifecycle    | 触发                | 主要产出 |
 | --- | --- | --- | --- | --- |
 | `repo-cache`      | scheduler   | channel-level | cron `*/15 * * * *` | 仓库镜像（本地缓存） |
 | `repo-notes`      | command     | channel-level | 手动子命令           | a1 kbase 仓库笔记 |
 | `mr-detector`     | scheduler   | thread-bound  | cron + 自我完成      | `mr-event-*.json`（artifact-contracts §6） |
+| `a1-bug-fix-loop` | scheduler   | thread-bound  | cron `*/5 * * * *`  | bugfix loop status artifact |
+| `feedback-scanner` | scheduler  | channel-level | remote-managed placeholder | feedback scanner service actor |
+| `mr-watcher`      | scheduler   | channel-level | remote-managed placeholder | MR watcher service actor |
 
 > Thread bootstrap（按 clone-manifest 准备 thread workspace 仓库目录）由
 > `joi thread create --bootstrap-artifact` 通过 §4.2.1 mounts 投影完成；

@@ -1,52 +1,46 @@
-# `data/agents/` — AgentSpec 库
+# `data/agents/` — profile-mode agent snapshots
 
-Joi 原生的 `AgentSpec` 定义集合，通过 `joi agent register` 注册。每个子目录交付：
+This directory is the repository copy of the currently deployed Joi agent
+profiles. Agent behavior now comes from profile files, not legacy skill files.
 
-- `spec.json` —— `AgentSpec` JSON。可被 `serde_json::from_str::<AgentSpec>(...)`
-  正确解析，并能通过 `joi agent register` 完整往返（参见下面的 *验证* 小节）。
-- `bundle/SKILL.md` —— actor 的 skill 正文。Agent 在首轮通过 `firstTurnPrefix`
-  载入（`Read your skill from {agent.bundle}/SKILL.md.`）。
-- `bundle/README.md` —— 给运维者的说明（handoff 契约、产出/消费的 artifact、
-  prompt template 变量）。
+Each agent directory contains:
 
-Phase 3 交付的 actor 清单：
+- `spec.json` — the daemon-generated profile-mode `AgentSpec` snapshot. It has
+  `identity.files` and no bundle/bootstrap skill loading.
+- `profile/identity.md` — stable role, responsibilities, input/output protocol,
+  and workflow rules injected on every turn.
+- `profile/soul.md` — operating contract and guardrails injected on every turn.
+- Optional `profile/references/*` — profile-owned reference data used by the
+  actor, for example classroom regression cases.
 
-| Actor               | Provider | Slash 前缀（handoff prefix） | Scope     | 主要产出 |
-| --- | --- | --- | --- | --- |
-| `classmaster`       | claude   | `/classmaster`               | channel   | `task-goal.json`、`definition-of-done.json` |
-| `teacher`           | claude   | `/teacher`                   | channel/thread | `lesson-plan.md`、`validation-report.json` |
-| `lesson-designer`   | claude   | `/lesson-designer`           | channel   | `lesson-plan.md` |
-| `router`            | claude   | `/router`                    | channel   | 派发到 discovery/teacher/delivery |
-| `discovery`         | claude   | `/discovery`                 | channel/thread | `clone-manifest.json`、仓库笔记 |
-| `delivery`          | claude   | `/delivery`                  | thread    | 代码改动、MR、`validation-report.json` |
+The checked-in profile files are intended to be synced to the machine data root
+under:
 
-上述所有 artifact 严格遵循 `docs/artifact-contracts.md`。
-
-## 约定
-
-- `actor.id` 沿用既有舰队的 `actor_<带下划线的 kebab>` 命名；`displayName` 用
-  自然语言（中文）。
-- `transport.kind = "interactive_command"`。`provider.kind` 决定走 `claude` 还是
-  `copilot`；如果 spec 里写了 `transport.model`，runtime 会把 `--model=<id>`
-  接到底层命令的参数尾。
-- `prompt_template.everyTurnPrefix` 里写标准的 `[joi handoff v1]` 信封
-  。`firstTurnPrefix`
-  里写 `[joi bootstrap]` 引导段。这两段保留英文，避免将来 runtime 抽取字段时
-  踩到本地化坑；它们不影响 LLM 的中文理解。
-- `handoff.triggerPromptPrefix` 在每次 inbox 派发时由 runtime 自动注入到 trigger
-  内容前面，让底层 provider 激活对应的 skill（设计文档）。
-- `bundle.source` 为工作区相对路径。Agent host 在 register 时把 bundle 拷到
-  `{agent.root}/bundles/<version>/`。
-
-## 验证
-
-每个 spec 都必须能解析为合法的 `AgentSpec`。冒烟脚本：
-
-```sh
-JOI_AGENT_SPECS=$(mktemp -d) cargo run -q --bin joi -- \
-    agent register data/agents/classmaster/spec.json
+```text
+<machine-data-root>/agents/<actor_id>/profile/
 ```
 
-正常退出 + `registered actor_classmaster at …` 即代表 JSON 结构合法。同一个
-`JOI_AGENT_SPECS` 目录可以传给 `joi agent serve --specs <dir>` 做 runtime
-冒烟（Phase 5）。
+## Current deployed agents
+
+| Directory | Actor id | Provider | Purpose |
+| --- | --- | --- | --- |
+| `a1-bug-triage` | `actor_a1_bug_triage` | Claude | A1 feedback triage |
+| `router` | `actor_router` | Claude | Human-facing routing and orchestration |
+| `discovery` | `actor_discovery` | Claude | Task discovery, repo analysis, delivery handoff |
+| `delivery` | `actor_delivery` | Claude | Implementation, MR, review/CI handling |
+| `classmaster` | `actor_classmaster` | Codex | Classroom training control plane |
+| `teacher` | `actor_teacher` | Codex | Training homework/grading/profile patch authoring |
+| `canfeng-codex` | `canfeng-codex` | Codex | General engineering seat |
+| `canfeng-copilot` | `canfeng-copilot` | Copilot | General engineering seat |
+| `canfeng-deepseek` | `canfeng-deepseek` | Claude | General engineering seat |
+| `canfeng-glm` | `canfeng-glm` | Claude | General engineering seat |
+| `canfeng-minimax` | `canfeng-minimax` | Claude | General engineering seat |
+
+## Validation
+
+All specs should be valid JSON and must not reference agent bundles:
+
+```sh
+find data/agents -name spec.json -print0 | xargs -0 -n1 jq empty
+find data/agents -path '*/bundle/*' -print
+```

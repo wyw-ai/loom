@@ -10,14 +10,27 @@
   "lifecycle": "thread_bound",
   "bind": {
     "scope": "thread",
-    "auto_stop_on": ["thread.closed", "service.self_complete"]
+    "auto_stop_on": [
+      "thread.closed",
+      "service.self_complete"
+    ]
   },
   "params_schema": {
-    "required": ["channel_id", "scanner_thread_id"],
+    "required": [
+      "channel_id",
+      "scanner_thread_id"
+    ],
     "properties": {
-      "channel_id":         { "type": "string" },
-      "scanner_thread_id":  { "type": "string" },
-      "concurrency":        { "type": "integer", "default": 1 }
+      "channel_id": {
+        "type": "string"
+      },
+      "scanner_thread_id": {
+        "type": "string"
+      },
+      "concurrency": {
+        "type": "integer",
+        "default": 1
+      }
     }
   },
   "config": {

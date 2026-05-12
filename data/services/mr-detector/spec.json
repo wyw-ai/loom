@@ -10,12 +10,19 @@
   "lifecycle": "thread_bound",
   "bind": {
     "scope": "thread",
-    "auto_stop_on": ["thread.closed", "service.self_complete"]
+    "auto_stop_on": [
+      "thread.closed",
+      "service.self_complete"
+    ]
   },
   "params_schema": {
-    "required": ["mr_url"],
+    "required": [
+      "mr_url"
+    ],
     "properties": {
-      "mr_url": { "type": "string" }
+      "mr_url": {
+        "type": "string"
+      }
     }
   },
   "config": {

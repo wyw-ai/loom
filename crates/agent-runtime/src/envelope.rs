@@ -5,7 +5,9 @@
 //! the model can distinguish "who I am" from "what I should remember" from
 //! "what the user just said". Section order is intentional — identity and
 //! soul go **first** (stable persona), then memory (less stable context),
-//! then the scope bootstrap if applicable, then the user message at the
+//! then the scope bootstrap if applicable. Stable sections stay before
+//! dynamic per-turn context so provider-side prefix caches can reuse the
+//! longest possible prompt prefix. The latest user message stays at the
 //! bottom so it's closest to the model's attention.
 //!
 //! Sections with empty content are skipped.
@@ -32,10 +34,17 @@ pub struct PromptSection {
 /// formatted by `MemoryRenderer`) are passed through verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct EnvelopeInput<'a> {
+    /// Runtime actor identity resolved by Joi itself. Unlike the profile
+    /// identity markdown, this is protocol metadata (actor id/display name)
+    /// and should be injected every prompt.
+    pub actor_context: &'a str,
     pub identity_markdown: &'a str,
     pub soul_markdown: &'a str,
     pub bootstrap_memory: &'a str,
     pub turn_memory: &'a str,
+    /// Dynamic runtime facts for this turn, such as the local wall clock used
+    /// by the UI. This is injected every prompt, unlike scope bootstrap.
+    pub runtime_context: &'a str,
     /// One-shot scope manifest (who you are, what scope, what CLI is
     /// available). Expected to fire per (actor, scope) on first prompt.
     pub scope_bootstrap: &'a str,
@@ -48,6 +57,11 @@ pub struct EnvelopeInput<'a> {
 pub fn compose_prompt(input: &EnvelopeInput<'_>) -> (String, Vec<PromptSection>) {
     let mut sections: Vec<PromptSection> = Vec::new();
 
+    push_nonempty(
+        &mut sections,
+        "actor_context",
+        input.actor_context.trim().to_string(),
+    );
     push_nonempty(
         &mut sections,
         "identity",
@@ -65,13 +79,18 @@ pub fn compose_prompt(input: &EnvelopeInput<'_>) -> (String, Vec<PromptSection>)
     );
     push_nonempty(
         &mut sections,
+        "scope_bootstrap",
+        input.scope_bootstrap.trim().to_string(),
+    );
+    push_nonempty(
+        &mut sections,
         "turn_memory",
         input.turn_memory.trim().to_string(),
     );
     push_nonempty(
         &mut sections,
-        "scope_bootstrap",
-        input.scope_bootstrap.trim().to_string(),
+        "runtime_context",
+        input.runtime_context.trim().to_string(),
     );
 
     // User message is always last, even if blank — an empty user message is
@@ -121,6 +140,9 @@ use crate::profile::read_markdown_file;
 /// (profile dir, specs, current channel) once and hand it in.
 #[derive(Debug)]
 pub struct BuildContext<'a> {
+    /// Joi-resolved actor identity section. Stable for this actor, so callers
+    /// should keep volatile facts out of it for better prompt-cache reuse.
+    pub actor_context: &'a str,
     /// Absolute path to this actor's profile dir. Identity / soul files
     /// and memory root are all resolved under this.
     pub profile_dir: &'a Path,
@@ -136,6 +158,8 @@ pub struct BuildContext<'a> {
     /// Recent thread / channel context text used to bias the turn-memory
     /// keyword query. May be empty.
     pub thread_context: &'a str,
+    /// Dynamic runtime facts that should be refreshed for every turn.
+    pub runtime_context: &'a str,
     /// The user's message (or equivalent handoff payload). Goes verbatim
     /// into the final `=== User message ===` block.
     pub user_message: &'a str,
@@ -176,10 +200,12 @@ pub fn build_envelope(cx: &BuildContext<'_>) -> (String, Vec<PromptSection>) {
     };
 
     compose_prompt(&EnvelopeInput {
+        actor_context: cx.actor_context,
         identity_markdown: &identity_md,
         soul_markdown: &soul_md,
         bootstrap_memory: &bootstrap_rendered,
         turn_memory: &turn_rendered,
+        runtime_context: cx.runtime_context,
         scope_bootstrap: cx.scope_bootstrap,
         user_message: cx.user_message,
     })
@@ -227,10 +253,13 @@ mod tests {
     #[test]
     fn full_envelope_orders_sections() {
         let (body, sections) = compose_prompt(&EnvelopeInput {
+            actor_context:
+                "=== System: Joi actor identity ===\nYou are Coder (@actor_agent_coder).",
             identity_markdown: "# role",
             soul_markdown: "# style",
             bootstrap_memory: "Bootstrap memory:\n- [fact / high] a",
             turn_memory: "Relevant memory:\n- [note / medium] b",
+            runtime_context: "",
             scope_bootstrap: "=== joi bootstrap ===\nscope: thread:x",
             user_message: "hi",
         });
@@ -238,16 +267,31 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "actor_context",
                 "identity",
                 "soul",
                 "bootstrap_memory",
-                "turn_memory",
                 "scope_bootstrap",
+                "turn_memory",
                 "user_message",
             ]
         );
         // Identity must appear before user message.
         assert!(body.find("Agent identity:").unwrap() < body.find("=== User message ===").unwrap());
+    }
+
+    #[test]
+    fn actor_context_is_injected_before_profile_identity() {
+        let (body, sections) = compose_prompt(&EnvelopeInput {
+            actor_context:
+                "=== System: Joi actor identity ===\nYou are Coder (@actor_agent_coder).",
+            identity_markdown: "# role",
+            user_message: "hi",
+            ..Default::default()
+        });
+        let names: Vec<_> = sections.iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["actor_context", "identity", "user_message"]);
+        assert!(body.find("Joi actor identity").unwrap() < body.find("Agent identity:").unwrap());
     }
 
     #[test]
@@ -261,6 +305,25 @@ mod tests {
         });
         let names: Vec<_> = sections.iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["identity", "user_message"]);
+    }
+
+    #[test]
+    fn stable_scope_bootstrap_precedes_dynamic_runtime_context_for_cache_reuse() {
+        let (body, sections) = compose_prompt(&EnvelopeInput {
+            runtime_context: "=== System: Local time context ===\nCurrent local time: x",
+            scope_bootstrap: "=== joi bootstrap ===\nscope: thread:x",
+            user_message: "hi",
+            ..Default::default()
+        });
+        let names: Vec<_> = sections.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec!["scope_bootstrap", "runtime_context", "user_message"]
+        );
+        assert!(body.find("joi bootstrap").unwrap() < body.find("Local time context").unwrap());
+        assert!(
+            body.find("Local time context").unwrap() < body.find("=== User message ===").unwrap()
+        );
     }
 
     #[test]

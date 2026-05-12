@@ -1,12 +1,19 @@
 import { useEffect } from "react";
 
 import * as ipc from "@/ipc/bridge";
-import { scopeKey, type JoiEvent, type ScopeRef } from "@/ipc/types";
+import {
+  scopeKey,
+  type JoiEvent,
+  type ScopeRef,
+  type Task,
+  type TaskAssignment,
+} from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useInbox } from "@/store/inbox";
 import { useMessages } from "@/store/messages";
 import { useSession } from "@/store/session";
+import { useTasks } from "@/store/tasks";
 import { useUI } from "@/store/ui";
 import { useWorkspaces } from "@/store/workspaces";
 import { ServerRail } from "@/features/sidebar/ServerRail";
@@ -155,6 +162,13 @@ export function App() {
         }
       } catch {
         /* best-effort — bubbles fall back to actorId */
+      }
+      try {
+        const r = await ipc.taskList();
+        if (!stillCurrent()) return;
+        useTasks.getState().replaceTasks(r.tasks);
+      } catch {
+        if (stillCurrent()) useTasks.getState().clear();
       }
     })();
     return () => {
@@ -330,6 +344,18 @@ export function App() {
           | { id: string; channelId: string; title: string }
           | undefined;
         if (thread) channels.upsertThread(thread);
+        return;
+      }
+      case "task.changed": {
+        const task = u.data.task as Task | undefined;
+        if (task) useTasks.getState().upsertTask(task);
+        return;
+      }
+      case "task_assignment.changed": {
+        const task = u.data.task as Task | undefined;
+        const assignment = u.data.assignment as TaskAssignment | undefined;
+        if (task) useTasks.getState().upsertTask(task);
+        if (assignment) useTasks.getState().upsertAssignment(assignment);
         return;
       }
     }

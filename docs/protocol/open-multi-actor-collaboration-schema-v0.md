@@ -41,6 +41,8 @@
 - `Actor`
 - `Channel`
 - `Thread`
+- `Task`
+- `TaskAssignment`
 - `Turn`
 - `Event`
 - `Relation`
@@ -286,7 +288,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 ```json
 {
-  "kind": "actor | channel | thread | turn | event | artifact",
+  "kind": "actor | channel | thread | turn | event | artifact | task",
   "id": "string",
   "_meta": {}
 }
@@ -385,7 +387,7 @@ binding 层的 canonical target 使用 `#<channel_id>:<root_event_id>`。
 
 ```json
 {
-  "kind": "replies_to | hands_off_to | responds_to | attaches_artifact",
+  "kind": "replies_to | hands_off_to | responds_to | attaches_artifact | relates_to_task",
   "target": {
     "kind": "event",
     "id": "evt_001"
@@ -414,7 +416,52 @@ binding 层的 canonical target 使用 `#<channel_id>:<root_event_id>`。
 }
 ```
 
-### 7.11 `ArtifactEntry`
+### 7.11 `Task`
+
+`Task` 是 channel 顶层 event 的工作状态维度。`sourceEventId` 必须指向
+channel scope 的 root event；`canonicalThreadId` 是该 root event 下的 thread。
+
+```json
+{
+  "id": "task_123",
+  "number": 12,
+  "channelId": "chan_123",
+  "sourceEventId": "evt_001",
+  "canonicalThreadId": "thread_123",
+  "title": "整理 slock CLI 文档",
+  "description": "string",
+  "requesterActorId": "actor_human",
+  "ownerActorId": "actor_agent",
+  "status": "todo | claimed | in_progress | waiting_review | done | failed | canceled",
+  "resultSummary": "string",
+  "artifactIds": ["art_123"],
+  "assignmentIds": ["asgn_123"],
+  "createdAt": "2026-05-12T09:00:00Z",
+  "updatedAt": "2026-05-12T09:20:00Z",
+  "_meta": {}
+}
+```
+
+### 7.12 `TaskAssignment`
+
+```json
+{
+  "id": "asgn_123",
+  "taskId": "task_123",
+  "fromActorId": "actor_owner",
+  "toActorId": "actor_reviewer",
+  "type": "generate | review | investigate | fix | verify | other",
+  "instruction": "请评审",
+  "status": "pending | running | completed | failed | canceled",
+  "resultEventId": "evt_review",
+  "resultSummary": "string",
+  "createdAt": "2026-05-12T09:10:00Z",
+  "updatedAt": "2026-05-12T09:20:00Z",
+  "_meta": {}
+}
+```
+
+### 7.13 `ArtifactEntry`
 
 ```json
 {
@@ -427,7 +474,7 @@ binding 层的 canonical target 使用 `#<channel_id>:<root_event_id>`。
 }
 ```
 
-### 7.12 `Artifact`
+### 7.14 `Artifact`
 
 ```json
 {
@@ -1515,6 +1562,7 @@ v0 定义两类 notification：
 - `hands_off_to` 的目标必须是 `Actor`。
 - `attaches_artifact` 的目标必须是 `Artifact`。
 - `responds_to` 的目标必须是 `Event`。
+- `relates_to_task` 的目标必须是 `Task`。
 
 ### 12.4 Artifact 校验
 

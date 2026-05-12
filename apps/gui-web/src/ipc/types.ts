@@ -46,7 +46,8 @@ export type RelationKind =
   | "replies_to"
   | "hands_off_to"
   | "responds_to"
-  | "attaches_artifact";
+  | "attaches_artifact"
+  | "relates_to_task";
 
 export type RefKind =
   | "actor"
@@ -54,7 +55,8 @@ export type RefKind =
   | "thread"
   | "turn"
   | "event"
-  | "artifact";
+  | "artifact"
+  | "task";
 
 export interface Relation {
   kind: RelationKind;
@@ -71,6 +73,64 @@ export interface JoiEvent {
   occurredAt: string;
   payload: unknown;
   relations: Relation[];
+  _meta?: Record<string, unknown>;
+}
+
+export type TaskStatus =
+  | "todo"
+  | "claimed"
+  | "in_progress"
+  | "waiting_review"
+  | "done"
+  | "failed"
+  | "canceled";
+
+export type TaskAssignmentType =
+  | "generate"
+  | "review"
+  | "investigate"
+  | "fix"
+  | "verify"
+  | "other";
+
+export type TaskAssignmentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export interface Task {
+  id: string;
+  number: number;
+  channelId: string;
+  sourceEventId: string;
+  canonicalThreadId: string;
+  title: string;
+  description: string;
+  requesterActorId: string;
+  ownerActorId?: string | null;
+  status: TaskStatus;
+  resultSummary: string;
+  artifactIds?: string[];
+  assignmentIds?: string[];
+  createdAt: string;
+  updatedAt: string;
+  _meta?: Record<string, unknown>;
+}
+
+export interface TaskAssignment {
+  id: string;
+  taskId: string;
+  fromActorId: string;
+  toActorId: string;
+  type: TaskAssignmentType;
+  instruction: string;
+  status: TaskAssignmentStatus;
+  resultEventId?: string | null;
+  resultSummary: string;
+  createdAt: string;
+  updatedAt: string;
   _meta?: Record<string, unknown>;
 }
 

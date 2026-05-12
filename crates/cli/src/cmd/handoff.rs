@@ -1,43 +1,86 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use proto::methods::*;
-use proto::types::{Actor, ActorKind, ScopeKind, ScopeRef};
+use proto::types::{Actor, ActorKind, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef};
 use serde_json::json;
 
 use crate::client::Client;
 use crate::render;
 
+use super::target::{resolve_target, TargetMode};
+
 pub async fn run(
     client: Arc<Client>,
     actor_id: String,
     target_actor_id: Option<String>,
-    scope_id: String,
+    scope_id: Option<String>,
     is_channel: bool,
+    target_scope: Option<String>,
     message: String,
 ) -> Result<()> {
     let target = match target_actor_id {
         Some(t) if !t.is_empty() => t,
         _ => pick_target(&client).await?,
     };
-    let scope = ScopeRef {
-        kind: if is_channel {
-            ScopeKind::Channel
-        } else {
-            ScopeKind::Thread
-        },
-        id: scope_id,
+
+    let (scope, root_event_id) = match target_scope {
+        Some(raw_target) => {
+            if scope_id.is_some() {
+                bail!("use either --target or --in, not both");
+            }
+            if raw_target.trim().starts_with("dm:") {
+                bail!("handoff --target supports #<channel_id> and #<channel_id>:<root_event_id>; use message send for dm:<actor_id>");
+            }
+            let resolved =
+                resolve_target(&client, &actor_id, &raw_target, TargetMode::Write).await?;
+            (resolved.scope, resolved.thread_root_event_id)
+        }
+        None => {
+            let Some(scope_id) = scope_id else {
+                bail!("missing destination scope: pass --target '#<channel_id>[:<root_event_id>]' or --in <scope_id>");
+            };
+            (
+                ScopeRef {
+                    kind: if is_channel {
+                        ScopeKind::Channel
+                    } else {
+                        ScopeKind::Thread
+                    },
+                    id: scope_id,
+                },
+                None,
+            )
+        }
     };
+    let mut relations = vec![Relation {
+        kind: RelationKind::HandsOffTo,
+        target: Ref {
+            kind: RefKind::Actor,
+            id: target.clone(),
+            _meta: None,
+        },
+        _meta: None,
+    }];
+    if let Some(root_event_id) = root_event_id {
+        relations.push(Relation {
+            kind: RelationKind::RepliesTo,
+            target: Ref {
+                kind: RefKind::Event,
+                id: root_event_id,
+                _meta: None,
+            },
+            _meta: None,
+        });
+    }
     let payload = json!({
         "event": {
             "type": "content.add",
             "actorId": actor_id,
             "scope": scope,
             "payload": { "contentType": "text/markdown", "text": message },
-            "relations": [
-                { "kind": "hands_off_to", "target": { "kind": "actor", "id": target } }
-            ],
+            "relations": relations,
         }
     });
     let res: EventAppendResult = client.call(method::EVENT_APPEND, payload).await?;

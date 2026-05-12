@@ -15,6 +15,7 @@ pub enum RefKind {
     Turn,
     Event,
     Artifact,
+    Task,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +141,7 @@ pub enum RelationKind {
     HandsOffTo,
     RespondsTo,
     AttachesArtifact,
+    RelatesToTask,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +175,92 @@ pub struct Event {
     pub payload: Value,
     #[serde(default)]
     pub relations: Vec<Relation>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Todo,
+    Claimed,
+    InProgress,
+    WaitingReview,
+    Done,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAssignmentType {
+    Generate,
+    Review,
+    Investigate,
+    Fix,
+    Verify,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAssignmentStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub id: String,
+    /// Monotonic, human-facing number scoped to `channel_id`.
+    pub number: u64,
+    pub channel_id: String,
+    /// Top-level channel event that anchors this work item.
+    pub source_event_id: String,
+    /// Thread attached to `source_event_id`; all progress and handoff
+    /// discussion should return here.
+    pub canonical_thread_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub requester_actor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_actor_id: Option<String>,
+    pub status: TaskStatus,
+    #[serde(default)]
+    pub result_summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignment_ids: Vec<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignment {
+    pub id: String,
+    pub task_id: String,
+    pub from_actor_id: String,
+    pub to_actor_id: String,
+    #[serde(rename = "type")]
+    pub assignment_type: TaskAssignmentType,
+    #[serde(default)]
+    pub instruction: String,
+    pub status: TaskAssignmentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_event_id: Option<String>,
+    #[serde(default)]
+    pub result_summary: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }

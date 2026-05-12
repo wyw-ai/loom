@@ -171,8 +171,8 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
             }
             onClick={() => onPick(e.id)}
           >
-            <span className={actorRoleClass(e.kind)}>@{e.display}</span>
-            <span className="text-[11px] text-muted">{e.id}</span>
+            <span className={actorRoleClass(e.kind)}>{e.display}</span>
+            <span className="text-[11px] text-muted">(@{e.id})</span>
             {e.status && (
               <span className="ml-auto text-[11px] text-muted">{e.status}</span>
             )}

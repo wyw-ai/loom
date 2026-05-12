@@ -296,7 +296,10 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
     <div className="break-words text-sm text-black/70">
       <span className="text-black/45">handoff {"->"}</span>{" "}
       <span className="bg-mention px-1 font-black text-black" title={target}>
-        @{targetName}
+        {targetName}
+        <span className="ml-1 font-mono text-[11px] font-normal text-black/55">
+          (@{target})
+        </span>
       </span>
       {bubble.text ? <>: {bubble.text}</> : null}
     </div>

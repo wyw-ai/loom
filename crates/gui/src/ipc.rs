@@ -813,7 +813,7 @@ pub async fn machine_agent_create(
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
     let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
-    let actor_id = actor_id_from_input(&args.actor_id, name).map_err(stringify)?;
+    let actor_id = actor_id_from_input(&args.actor_id, name, &machine_id).map_err(stringify)?;
     let machine_index = cfg
         .machines
         .iter()
@@ -1316,11 +1316,22 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
         .find(|agent| agent.spec.actor.id == args.actor_id))
 }
 
-fn actor_id_from_input(value: &str, display_name: &str) -> anyhow::Result<String> {
+fn actor_id_from_input(
+    value: &str,
+    display_name: &str,
+    machine_id: &str,
+) -> anyhow::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        return Ok(format!("actor_agent_{}_{}", slugify(display_name), suffix));
+        let display_slug = slugify(display_name);
+        let machine_slug = compact_machine_slug(machine_id);
+        let stem = if display_slug == "agent" || display_slug.chars().count() < 2 {
+            machine_slug
+        } else {
+            display_slug
+        };
+        return Ok(format!("actor_agent_{}_{}", stem, suffix));
     }
     if trimmed
         .chars()
@@ -1329,6 +1340,15 @@ fn actor_id_from_input(value: &str, display_name: &str) -> anyhow::Result<String
         return Ok(trimmed.to_string());
     }
     anyhow::bail!("actor id contains unsupported characters")
+}
+
+fn compact_machine_slug(machine_id: &str) -> String {
+    let slug = slugify(machine_id);
+    let compact = slug
+        .strip_prefix("machine_")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(slug.as_str());
+    format!("machine_{compact}")
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -1393,6 +1413,28 @@ mod tests {
                 autostart: false,
             }],
         }
+    }
+
+    #[test]
+    fn generated_actor_id_uses_machine_stem_for_short_ascii_name_fragments() {
+        let id = actor_id_from_input("", "G仔", "machine_macbook_01").expect("actor id");
+
+        assert!(id.starts_with("actor_agent_machine_macbook_01_"));
+    }
+
+    #[test]
+    fn generated_actor_id_can_use_meaningful_display_slug() {
+        let id = actor_id_from_input("", "Reviewer", "machine_macbook_01").expect("actor id");
+
+        assert!(id.starts_with("actor_agent_reviewer_"));
+    }
+
+    #[test]
+    fn explicit_actor_id_is_preserved_when_valid() {
+        let id = actor_id_from_input("actor_agent_custom:01", "G仔", "machine_macbook_01")
+            .expect("actor id");
+
+        assert_eq!(id, "actor_agent_custom:01");
     }
 
     #[test]

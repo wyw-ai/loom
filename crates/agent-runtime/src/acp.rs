@@ -29,10 +29,15 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::adapter::{ActionChoice, Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use super::adapter::{
+    ActionChoice, Adapter, AdapterEvent, AdapterModelChoice, AdapterModelOptions, AdapterPrompt,
+    AdapterStartInfo, TokenUsage,
+};
+use crate::usage::{extract_token_usage, normalized_usage};
 
 const SHELL_ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
 const TERMINAL_AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const SESSION_MODEL_CONFIG_ID: &str = "joi:acp:session-model";
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
@@ -92,13 +97,20 @@ struct AcpShared {
     /// Outstanding `session/prompt` requests we are waiting on. Maps request id
     /// → originating scope so the asynchronous `Finished` event can be tagged
     /// with the right scope when the response comes back.
-    in_flight_prompts: Mutex<HashMap<String, ScopeRef>>,
+    in_flight_prompts: Mutex<HashMap<String, (ScopeRef, String)>>,
     pending_permissions: Mutex<HashMap<String, PendingPermission>>,
     /// Reverse map populated when `send_prompt` mints a new ACP session for a
     /// scope. Inbound `session/update` and `session/request_permission` carry
     /// `params.sessionId`; the stdout reader uses this to tag the resulting
     /// `AdapterEvent` with the originating scope.
     sessions_by_id: Mutex<HashMap<String, ScopeRef>>,
+    /// session id → latest model menu reported by session/new or
+    /// session/update. Supports both ACP configOptions and Qoder-style models.
+    model_options_by_session: Mutex<HashMap<String, AdapterModelOptions>>,
+    /// session id → token usage observed before the final session/prompt
+    /// response. Some ACP agents report usage as a session/update rather than
+    /// on the prompt response itself.
+    usage_by_session: Mutex<HashMap<String, TokenUsage>>,
     action_namespace: String,
     /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
     /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
@@ -155,82 +167,20 @@ impl AcpAdapter {
 
     async fn send_prompt_internal(&self, prompt: AdapterPrompt) -> Result<(), String> {
         let scope = prompt.scope.clone();
-        // Snapshot what we need under the parking_lot guard, then drop it
-        // before any spawn_blocking / await.
-        let requested_model = prompt
-            .model
-            .as_ref()
-            .map(|m| m.trim())
-            .filter(|m| !m.is_empty())
-            .map(ToOwned::to_owned);
-        let (shared, existing_session) = {
-            let inner = self.inner.lock();
-            let shared = inner.shared.clone().ok_or("ACP agent not running")?;
-            let session = inner
-                .sessions
-                .get(&scope.id)
-                .filter(|s| s.model == requested_model)
-                .cloned();
-            (shared, session)
-        };
-
-        // Lazy session/new for this scope. The runtime layer serializes prompts
-        // per scope, so we shouldn't see two concurrent send_prompt calls for
-        // the same scope racing on this allocation.
-        let session_id = match existing_session {
-            Some(session) => session.id,
-            None => {
-                let scope_for_new = scope.clone();
-                let shared_for_new = shared.clone();
-                let mcp_servers = shared.mcp_servers.clone();
-                let cwd = prompt.cwd.clone();
-                let model = requested_model.clone();
-                let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                    std::fs::create_dir_all(&cwd).map_err(|e| {
-                        format!(
-                            "Failed to create ACP session cwd `{}`: {}",
-                            cwd.display(),
-                            e
-                        )
-                    })?;
-                    let res = request_new_session_with_auth_retry(
-                        &shared_for_new,
-                        &cwd,
-                        &mcp_servers,
-                        model.as_deref(),
-                    )?;
-                    let sid = res
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "ACP agent did not return sessionId".to_string())?
-                        .to_string();
-                    shared_for_new
-                        .sessions_by_id
-                        .lock()
-                        .insert(sid.clone(), scope_for_new);
-                    Ok(sid)
-                })
-                .await
-                .map_err(|e| e.to_string())??;
-                self.inner.lock().sessions.insert(
-                    scope.id.clone(),
-                    AcpSession {
-                        id: new_sid.clone(),
-                        model: requested_model.clone(),
-                    },
-                );
-                new_sid
-            }
-        };
+        let requested_model = normalize_model(prompt.model.as_deref());
+        let (shared, session) = self
+            .ensure_session(scope.clone(), prompt.cwd.clone(), requested_model)
+            .await?;
+        let session_id = session.id;
 
         let scope_for_prompt = scope.clone();
         let content = prompt.content;
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let request_id = shared.next_request_id_string();
-            shared
-                .in_flight_prompts
-                .lock()
-                .insert(request_id.clone(), scope_for_prompt.clone());
+            shared.in_flight_prompts.lock().insert(
+                request_id.clone(),
+                (scope_for_prompt.clone(), session_id.clone()),
+            );
             eprintln!(
                 "[joi:acp] session/prompt sent id={} session={} scope={} (in_flight={})",
                 request_id,
@@ -257,6 +207,143 @@ impl AcpAdapter {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    async fn ensure_session(
+        &self,
+        scope: ScopeRef,
+        cwd: PathBuf,
+        requested_model: Option<String>,
+    ) -> Result<(Arc<AcpShared>, AcpSession), String> {
+        // Snapshot what we need under the parking_lot guard, then drop it
+        // before any spawn_blocking / await.
+        let (shared, existing_session) = {
+            let inner = self.inner.lock();
+            let shared = inner.shared.clone().ok_or("ACP agent not running")?;
+            let session = inner
+                .sessions
+                .get(&scope.id)
+                .filter(|s| s.model == requested_model)
+                .cloned();
+            (shared, session)
+        };
+
+        if let Some(session) = existing_session {
+            return Ok((shared, session));
+        }
+
+        // Lazy session/new for this scope. The runtime layer serializes prompts
+        // per scope, so we shouldn't see two concurrent send_prompt calls for
+        // the same scope racing on this allocation.
+        let scope_for_new = scope.clone();
+        let shared_for_new = shared.clone();
+        let mcp_servers = shared.mcp_servers.clone();
+        let model = requested_model.clone();
+        let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            std::fs::create_dir_all(&cwd).map_err(|e| {
+                format!(
+                    "Failed to create ACP session cwd `{}`: {}",
+                    cwd.display(),
+                    e
+                )
+            })?;
+            let res = request_new_session_with_auth_retry(
+                &shared_for_new,
+                &cwd,
+                &mcp_servers,
+                model.as_deref(),
+            )?;
+            let sid = res
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "ACP agent did not return sessionId".to_string())?
+                .to_string();
+            shared_for_new
+                .sessions_by_id
+                .lock()
+                .insert(sid.clone(), scope_for_new);
+            update_model_options_for_session(&shared_for_new, &sid, &res);
+            Ok(sid)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        let session = AcpSession {
+            id: new_sid.clone(),
+            model: requested_model,
+        };
+        self.inner
+            .lock()
+            .sessions
+            .insert(scope.id.clone(), session.clone());
+        Ok((shared, session))
+    }
+
+    async fn list_model_options_internal(
+        &self,
+        prompt: AdapterPrompt,
+    ) -> Result<Option<AdapterModelOptions>, String> {
+        let scope = prompt.scope.clone();
+        let requested_model = normalize_model(prompt.model.as_deref());
+        let first = self
+            .ensure_session(scope.clone(), prompt.cwd.clone(), requested_model.clone())
+            .await;
+        let (shared, session) = match first {
+            Ok(session) => session,
+            Err(err) if requested_model.is_some() => {
+                eprintln!(
+                    "[joi:acp] session/new with saved model failed while listing models; \
+                     retrying without model: {err}"
+                );
+                self.ensure_session(scope, prompt.cwd, None).await?
+            }
+            Err(err) => return Err(err),
+        };
+        let options = shared
+            .model_options_by_session
+            .lock()
+            .get(&session.id)
+            .cloned();
+        Ok(options)
+    }
+
+    async fn set_model_option_internal(
+        &self,
+        scope: ScopeRef,
+        config_id: String,
+        value: String,
+    ) -> Result<Option<AdapterModelOptions>, String> {
+        let (shared, session_id) = {
+            let inner = self.inner.lock();
+            let shared = inner.shared.clone().ok_or("ACP agent not running")?;
+            let session = inner
+                .sessions
+                .get(&scope.id)
+                .ok_or_else(|| format!("No ACP session for scope {}", scope.id))?;
+            (shared, session.id.clone())
+        };
+        let set_request = set_model_request(&session_id, &config_id, &value);
+        let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+            shared.request_and_wait(&set_request.0, set_request.1, Duration::from_secs(30))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let shared = {
+            let inner = self.inner.lock();
+            inner.shared.clone().ok_or("ACP agent not running")?
+        };
+        update_model_options_for_session(&shared, &session_id, &res);
+        let model_options = {
+            let mut guard = shared.model_options_by_session.lock();
+            if let Some(options) = guard.get_mut(&session_id) {
+                options.current_value = normalize_model(Some(&value));
+            }
+            guard.get(&session_id).cloned()
+        };
+        if let Some(session) = self.inner.lock().sessions.get_mut(&scope.id) {
+            session.model = normalize_model(Some(&value));
+        }
+        Ok(model_options)
     }
 
     async fn respond_permission_internal(
@@ -352,6 +439,8 @@ impl AcpAdapter {
                         "params": { "sessionId": session_id }
                     }));
                 }
+                shared.model_options_by_session.lock().clear();
+                shared.usage_by_session.lock().clear();
             }
             if let Some(ref mut c) = child {
                 drop(c.stdin.take());
@@ -390,6 +479,23 @@ impl Adapter for AcpAdapter {
 
     async fn respond_action(&self, request_id: String, option_id: String) -> Result<(), String> {
         self.respond_permission_internal(request_id, option_id)
+            .await
+    }
+
+    async fn list_model_options(
+        &self,
+        prompt: AdapterPrompt,
+    ) -> Result<Option<AdapterModelOptions>, String> {
+        self.list_model_options_internal(prompt).await
+    }
+
+    async fn set_model_option(
+        &self,
+        scope: ScopeRef,
+        config_id: String,
+        value: String,
+    ) -> Result<Option<AdapterModelOptions>, String> {
+        self.set_model_option_internal(scope, config_id, value)
             .await
     }
 
@@ -469,6 +575,8 @@ fn start_blocking(
         in_flight_prompts: Mutex::new(HashMap::new()),
         pending_permissions: Mutex::new(HashMap::new()),
         sessions_by_id: Mutex::new(HashMap::new()),
+        model_options_by_session: Mutex::new(HashMap::new()),
+        usage_by_session: Mutex::new(HashMap::new()),
         action_namespace: Uuid::new_v4().to_string(),
         mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
@@ -556,7 +664,7 @@ fn request_new_session_with_auth_retry(
             let Some(method) = method else {
                 return Err(format!(
                     "{err}; agent requires authentication but did not advertise a single \
-                     auth method. Set transport.authMethod in the agent spec."
+                     auth method. Set transport.authMethod in the provider spec."
                 ));
             };
             {
@@ -597,6 +705,186 @@ fn request_new_session_with_auth_retry(
         }
         Err(err) => Err(err),
     }
+}
+
+fn normalize_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn set_model_request(session_id: &str, config_id: &str, value: &str) -> (String, Value) {
+    if config_id == SESSION_MODEL_CONFIG_ID {
+        return (
+            "session/set_model".into(),
+            json!({
+                "sessionId": session_id,
+                "modelId": value,
+            }),
+        );
+    }
+    (
+        "session/set_config_option".into(),
+        json!({
+            "sessionId": session_id,
+            "configId": config_id,
+            "value": value,
+        }),
+    )
+}
+
+fn update_model_options_for_session(shared: &AcpShared, session_id: &str, value: &Value) {
+    let Some(options) = extract_model_options_from_value(value) else {
+        return;
+    };
+    shared
+        .model_options_by_session
+        .lock()
+        .insert(session_id.to_string(), options);
+}
+
+fn extract_model_options_from_value(value: &Value) -> Option<AdapterModelOptions> {
+    extract_config_options(value)
+        .and_then(|options| extract_config_model_options(&options))
+        .or_else(|| extract_session_model_options(value))
+}
+
+fn extract_config_options(value: &Value) -> Option<Vec<Value>> {
+    value
+        .get("configOptions")
+        .or_else(|| value.get("config_options"))
+        .or_else(|| {
+            value
+                .get("session")
+                .and_then(|session| session.get("configOptions"))
+        })
+        .or_else(|| {
+            value
+                .get("session")
+                .and_then(|session| session.get("config_options"))
+        })
+        .and_then(|options| options.as_array())
+        .map(|options| options.to_vec())
+}
+
+fn extract_config_model_options(config_options: &[Value]) -> Option<AdapterModelOptions> {
+    let option = config_options
+        .iter()
+        .find(|option| string_field(option, &["category"]) == Some("model"))
+        .or_else(|| {
+            config_options
+                .iter()
+                .find(|option| is_model_option_id(option))
+        })
+        .or_else(|| {
+            config_options
+                .iter()
+                .find(|option| is_model_option_name(option))
+        })?;
+    if string_field(option, &["type"]).is_some_and(|kind| kind != "select") {
+        return None;
+    }
+    let config_id = string_field(option, &["id", "optionId", "configId"])?.to_string();
+    let raw_choices = option
+        .get("options")
+        .or_else(|| option.get("choices"))
+        .or_else(|| option.get("enum"))
+        .and_then(|choices| choices.as_array())?;
+    let choices = raw_choices
+        .iter()
+        .filter_map(|choice| {
+            let id = string_field(choice, &["value", "id", "optionId"])?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = string_field(choice, &["name", "label", "title"])
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let description = string_field(choice, &["description"])
+                .filter(|description| !description.trim().is_empty())
+                .map(ToOwned::to_owned);
+            Some(AdapterModelChoice {
+                id: id.to_string(),
+                label,
+                description,
+            })
+        })
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return None;
+    }
+    Some(AdapterModelOptions {
+        config_id,
+        current_value: string_field(option, &["currentValue", "current_value", "value"])
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned),
+        choices,
+    })
+}
+
+fn extract_session_model_options(value: &Value) -> Option<AdapterModelOptions> {
+    let models = value.get("models").or_else(|| {
+        value
+            .get("session")
+            .and_then(|session| session.get("models"))
+    })?;
+    let raw_choices = models
+        .get("availableModels")
+        .or_else(|| models.get("available_models"))
+        .or_else(|| models.get("choices"))
+        .and_then(|choices| choices.as_array())?;
+    let choices = raw_choices
+        .iter()
+        .filter_map(|choice| {
+            let id = string_field(choice, &["modelId", "model_id", "id", "value"])?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = string_field(choice, &["name", "label", "title"])
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let description = string_field(choice, &["description"])
+                .filter(|description| !description.trim().is_empty())
+                .map(ToOwned::to_owned);
+            Some(AdapterModelChoice {
+                id: id.to_string(),
+                label,
+                description,
+            })
+        })
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return None;
+    }
+    Some(AdapterModelOptions {
+        config_id: SESSION_MODEL_CONFIG_ID.to_string(),
+        current_value: string_field(models, &["currentModelId", "current_model_id", "value"])
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned),
+        choices,
+    })
+}
+
+fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+}
+
+fn is_model_option_id(option: &Value) -> bool {
+    string_field(option, &["id", "optionId", "configId"]).is_some_and(|id| {
+        let id = id.trim();
+        id == "model" || id == "models"
+    })
+}
+
+fn is_model_option_name(option: &Value) -> bool {
+    string_field(option, &["name", "label", "title"]).is_some_and(|name| {
+        let name = name.trim().to_ascii_lowercase();
+        name == "model" || name == "models"
+    })
 }
 
 fn select_initialize_auth_method(
@@ -997,20 +1285,24 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
         fail_pending_waiters(&shared, "ACP agent disconnected".into());
         {
             let mut prompts = shared.in_flight_prompts.lock();
-            for (req_id, scope) in prompts.drain() {
+            for (req_id, (scope, session_id)) in prompts.drain() {
                 let _ = shared.event_sender.send(AdapterEvent::Error {
                     scope: Some(scope.clone()),
                     message: format!("ACP agent disconnected (pending request {req_id})"),
                 });
+                shared.usage_by_session.lock().remove(&session_id);
                 let _ = shared.event_sender.send(AdapterEvent::Finished {
                     scope: Some(scope),
                     success: false,
                     summary: "agent disconnected".into(),
+                    usage: None,
                 });
             }
         }
         shared.pending_permissions.lock().clear();
         shared.sessions_by_id.lock().clear();
+        shared.model_options_by_session.lock().clear();
+        shared.usage_by_session.lock().clear();
         let _ = shared.event_sender.send(AdapterEvent::StatusChange {
             scope: None,
             status: "stopped".into(),
@@ -1124,6 +1416,15 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
         .and_then(|p| p.get("update"))
         .cloned()
         .unwrap_or(Value::Null);
+    if let Some(session_id) = session_id.as_deref() {
+        update_model_options_for_session(shared, session_id, &update);
+        if let Some(usage) = extract_token_usage(&update) {
+            shared
+                .usage_by_session
+                .lock()
+                .insert(session_id.to_string(), normalized_usage(usage));
+        }
+    }
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
         Some("agent_message_chunk") => {
             if let Some(text) = extract_text_chunk(&update) {
@@ -1172,12 +1473,13 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         let remaining = guard.len();
         popped.map(|scope| (scope, remaining))
     };
-    if let Some((scope, remaining)) = popped {
+    if let Some(((scope, session_id), remaining)) = popped {
         eprintln!(
             "[joi:acp] session/prompt response id={} scope={} (in_flight remaining={})",
             id_key, scope.id, remaining
         );
         if let Some(error) = message.get("error") {
+            shared.usage_by_session.lock().remove(&session_id);
             let _ = shared.event_sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: json_value_to_string(error),
@@ -1186,9 +1488,15 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
                 scope: Some(scope),
                 success: false,
                 summary: json_value_to_string(error),
+                usage: None,
             });
             return;
         }
+        let result = message.get("result").cloned().unwrap_or(Value::Null);
+        let update_usage = shared.usage_by_session.lock().remove(&session_id);
+        let usage = extract_token_usage(&result)
+            .map(normalized_usage)
+            .or(update_usage);
         let stop_reason = message
             .get("result")
             .and_then(|r| r.get("stopReason"))
@@ -1199,6 +1507,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
             scope: Some(scope),
             success: stop_reason != "cancelled",
             summary: stop_reason,
+            usage,
         });
         return;
     }
@@ -1405,5 +1714,105 @@ mod tests {
         assert!(!is_auth_required_error(
             r#"{"code":-32000,"message":"different"}"#
         ));
+    }
+
+    #[test]
+    fn extract_model_options_reads_acp_config_options() {
+        let config_options = vec![json!({
+            "id": "model",
+            "category": "model",
+            "type": "select",
+            "currentValue": "anthropic/claude-sonnet",
+            "options": [
+                {
+                    "name": "Sonnet",
+                    "value": "anthropic/claude-sonnet",
+                    "description": "Balanced"
+                },
+                {
+                    "name": "Haiku",
+                    "value": "anthropic/claude-haiku"
+                }
+            ]
+        })];
+
+        let models = extract_config_model_options(&config_options).expect("model options");
+
+        assert_eq!(models.config_id, "model");
+        assert_eq!(
+            models.current_value.as_deref(),
+            Some("anthropic/claude-sonnet")
+        );
+        assert_eq!(models.choices.len(), 2);
+        assert_eq!(models.choices[0].id, "anthropic/claude-sonnet");
+        assert_eq!(models.choices[0].label, "Sonnet");
+        assert_eq!(models.choices[0].description.as_deref(), Some("Balanced"));
+    }
+
+    #[test]
+    fn extract_model_options_ignores_non_select_config() {
+        let config_options = vec![json!({
+            "id": "model",
+            "category": "model",
+            "type": "boolean",
+            "currentValue": true
+        })];
+
+        assert_eq!(extract_config_model_options(&config_options), None);
+    }
+
+    #[test]
+    fn extract_model_options_accepts_models_id_without_category() {
+        let config_options = vec![json!({
+            "id": "models",
+            "type": "select",
+            "currentValue": "fast",
+            "options": [
+                { "name": "Fast", "value": "fast" }
+            ]
+        })];
+
+        let models = extract_config_model_options(&config_options).expect("model options");
+
+        assert_eq!(models.config_id, "models");
+        assert_eq!(models.current_value.as_deref(), Some("fast"));
+        assert_eq!(models.choices[0].id, "fast");
+    }
+
+    #[test]
+    fn extract_model_options_reads_qoder_session_models() {
+        let session_new = json!({
+            "sessionId": "session_1",
+            "models": {
+                "currentModelId": "auto",
+                "availableModels": [
+                    { "modelId": "auto", "name": "Auto" },
+                    { "modelId": "efficient", "name": "Efficient" }
+                ]
+            }
+        });
+
+        let models = extract_model_options_from_value(&session_new).expect("model options");
+
+        assert_eq!(models.config_id, SESSION_MODEL_CONFIG_ID);
+        assert_eq!(models.current_value.as_deref(), Some("auto"));
+        assert_eq!(
+            models
+                .choices
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["auto", "efficient"]
+        );
+        assert_eq!(models.choices[1].label, "Efficient");
+    }
+
+    #[test]
+    fn set_model_request_uses_qoder_session_set_model_for_session_models() {
+        let (method, params) = set_model_request("session_1", SESSION_MODEL_CONFIG_ID, "efficient");
+
+        assert_eq!(method, "session/set_model");
+        assert_eq!(params["sessionId"], "session_1");
+        assert_eq!(params["modelId"], "efficient");
     }
 }

@@ -314,12 +314,17 @@ impl ServiceRuntime {
         Ok(())
     }
 
-    /// Create a fresh thread under `channel_id` titled `title` (no root
-    /// event). Returns the new thread row. The "or-get" half of §6.3's
+    /// Create a fresh thread under `channel_id`, rooted at a channel event.
+    /// Returns the new thread row. The "or-get" half of §6.3's
     /// `create_or_get_thread` lives in plugin-specific thread-map state
     /// (e.g., `service::am::scope`) — the runtime exposes only the
     /// stateless server-side primitive.
-    pub async fn create_thread(&self, channel_id: &str, title: &str) -> Result<Thread> {
+    pub async fn create_thread(
+        &self,
+        channel_id: &str,
+        root_event_id: &str,
+        title: &str,
+    ) -> Result<Thread> {
         let res: ThreadCreateResult = self
             .client
             .call(
@@ -327,7 +332,7 @@ impl ServiceRuntime {
                 ThreadCreateParams {
                     channel_id: channel_id.into(),
                     title: title.into(),
-                    root_event_id: None,
+                    root_event_id: root_event_id.into(),
                 },
             )
             .await

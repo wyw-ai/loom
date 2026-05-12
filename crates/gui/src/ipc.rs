@@ -9,17 +9,28 @@
 //!   deliberately avoid typed Rust structs here so schema drift stays
 //!   debuggable on the TypeScript side.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agent_runtime::discovery::{
+    detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
+    DetectedAgentProvider,
+};
 use proto::methods::method;
-use serde::Deserialize;
+use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::config::{self, DesktopConfig, Workspace};
+use crate::config::{
+    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount,
+    MachineAgentConfig, MachineConfig, Workspace,
+};
 use crate::forward;
 use crate::state::AppState;
 use crate::ws::Client;
+use crate::{account, avatar};
 
 // ---- workspace management -------------------------------------------------
 
@@ -36,7 +47,76 @@ pub struct SaveWorkspacesArgs {
 #[tauri::command]
 pub async fn workspaces_save(args: SaveWorkspacesArgs) -> Result<DesktopConfig, String> {
     config::save(&args.config).map_err(|e| e.to_string())?;
-    Ok(args.config)
+    Ok(config::load_or_init().map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+pub async fn account_get() -> Result<Option<HumanAccount>, String> {
+    Ok(config::load_or_init().map_err(stringify)?.account)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginArgs {
+    pub provider: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginResult {
+    pub account: HumanAccount,
+    pub config: DesktopConfig,
+}
+
+#[tauri::command]
+pub async fn account_login(
+    state: State<'_, AppState>,
+    args: AccountLoginArgs,
+) -> Result<AccountLoginResult, String> {
+    let provider = args.provider.trim().to_ascii_lowercase();
+    if provider != "buc" {
+        return Err(format!("unsupported account provider: {}", args.provider));
+    }
+
+    let account = account::login_buc().await.map_err(deep_stringify)?;
+    let avatar_account = account.clone();
+    tokio::spawn(async move {
+        if let Err(err) = avatar::prefetch_account_avatar(&avatar_account).await {
+            tracing::warn!(%err, "avatar prefetch failed");
+        }
+    });
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    cfg.account = Some(account.clone());
+    apply_account_identity(&mut cfg);
+    config::save(&cfg).map_err(stringify)?;
+    let cfg = config::load_or_init().map_err(stringify)?;
+    state.set(None).await;
+    Ok(AccountLoginResult {
+        account: cfg.account.clone().unwrap_or(account),
+        config: cfg,
+    })
+}
+
+#[tauri::command]
+pub async fn account_logout(state: State<'_, AppState>) -> Result<DesktopConfig, String> {
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    cfg.account = None;
+    config::save(&cfg).map_err(stringify)?;
+    state.set(None).await;
+    Ok(cfg)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarCachedUrlArgs {
+    pub url: String,
+}
+
+#[tauri::command]
+pub async fn avatar_cached_url(args: AvatarCachedUrlArgs) -> Result<String, String> {
+    avatar::cached_avatar_data_url(&args.url)
+        .await
+        .map_err(deep_stringify)
 }
 
 #[derive(Deserialize)]
@@ -44,9 +124,6 @@ pub async fn workspaces_save(args: SaveWorkspacesArgs) -> Result<DesktopConfig, 
 pub struct WorkspaceAddArgs {
     pub name: String,
     pub server_url: String,
-    pub actor_id: String,
-    #[serde(default)]
-    pub display_name: String,
     /// Mark the new workspace as active immediately. Default true — the
     /// usual "add and jump in" flow.
     #[serde(default = "default_activate")]
@@ -60,15 +137,23 @@ fn default_activate() -> bool {
 #[tauri::command]
 pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let account = cfg
+        .account
+        .clone()
+        .ok_or_else(|| "account login required before adding a human workspace".to_string())?;
     let id = config::generate_id();
     let ws = Workspace {
         id: id.clone(),
         name: args.name,
         server_url: args.server_url,
-        actor_id: args.actor_id,
-        display_name: args.display_name,
+        actor_id: account.actor_id.clone(),
+        display_name: account_display_name(&account),
     };
     cfg.workspaces.push(ws);
+    cfg.machines.push(config::default_machine_for_workspace(
+        &id,
+        Some(&account.actor_id),
+    ));
     if args.activate {
         cfg.active = Some(id);
     }
@@ -85,6 +170,8 @@ pub struct WorkspaceIdArgs {
 pub async fn workspace_remove(args: WorkspaceIdArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
     cfg.workspaces.retain(|w| w.id != args.id);
+    cfg.machines
+        .retain(|machine| machine.workspace_id.as_deref() != Some(args.id.as_str()));
     if cfg.active.as_deref() == Some(args.id.as_str()) {
         cfg.active = cfg.workspaces.first().map(|w| w.id.clone());
     }
@@ -117,7 +204,14 @@ pub async fn connect(
     state: State<'_, AppState>,
     args: ConnectArgs,
 ) -> Result<Value, String> {
-    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let account = cfg
+        .account
+        .clone()
+        .ok_or_else(|| "account login required before connecting as a human".to_string())?;
+    if apply_account_identity(&mut cfg) {
+        config::save(&cfg).map_err(stringify)?;
+    }
     let ws = cfg
         .workspaces
         .iter()
@@ -140,6 +234,9 @@ pub async fn connect(
         .open_connection(&ws.actor_id, Some(&ws.display_name))
         .await
         .map_err(deep_stringify)?;
+    upsert_human_actor(&client, &account)
+        .await
+        .map_err(deep_stringify)?;
 
     forward::spawn(app.clone(), Arc::clone(&client));
     state.set(Some(client)).await;
@@ -154,6 +251,32 @@ pub async fn connect(
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     state.set(None).await;
+    Ok(())
+}
+
+async fn upsert_human_actor(client: &Arc<Client>, account: &HumanAccount) -> anyhow::Result<()> {
+    client
+        .call_raw(
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": account.actor_id,
+                    "kind": "human",
+                    "displayName": account_display_name(account),
+                    "_meta": {
+                        "account": {
+                            "provider": account.provider,
+                            "staffId": account.staff_id,
+                            "nickname": account.nickname,
+                            "realName": account.real_name,
+                            "email": account.email,
+                        },
+                        "avatarUrl": account.avatar_url,
+                    },
+                },
+            })),
+        )
+        .await?;
     Ok(())
 }
 
@@ -321,12 +444,488 @@ pub async fn turn_close(state: State<'_, AppState>, params: Value) -> Result<Val
 
 #[tauri::command]
 pub async fn actor_list(state: State<'_, AppState>) -> Result<Value, String> {
-    state
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let value = state
         .client()
         .await?
         .call_raw(method::ACTOR_LIST, None)
         .await
+        .map_err(stringify)?;
+    Ok(filter_actor_list_for_active_context(value, &cfg))
+}
+
+#[tauri::command]
+pub async fn actor_upsert(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ACTOR_UPSERT, Some(params))
+        .await
         .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn actor_delete(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ACTOR_DELETE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+// ---- local agent / machine management -------------------------------------
+
+#[tauri::command]
+pub async fn agent_list() -> Result<AgentListResult, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let server_url = active_server_url(&cfg);
+    let mut agents = Vec::new();
+    for machine in cfg
+        .machines
+        .iter()
+        .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
+    {
+        agents.extend(machine_info(machine, server_url).map_err(stringify)?.agents);
+    }
+    Ok(AgentListResult { agents })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCreateArgs {
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    pub provider_id: String,
+    #[serde(default)]
+    pub actor_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub autostart: bool,
+}
+
+#[tauri::command]
+pub async fn agent_create(args: AgentCreateArgs) -> Result<AgentInfo, String> {
+    Err(format!(
+        "agent creation is daemon-only; create this agent on a machine profile{}",
+        args.machine_id
+            .as_deref()
+            .map(|machine| format!(" ({machine})"))
+            .unwrap_or_default()
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRemoveArgs {
+    pub actor_id: String,
+}
+
+#[tauri::command]
+pub async fn agent_remove(
+    state: State<'_, AppState>,
+    args: AgentRemoveArgs,
+) -> Result<AgentListResult, String> {
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let mut removed = false;
+    for machine in cfg.machines.iter_mut().filter(|machine| {
+        config::machine_belongs_to_workspace_and_owner(
+            machine,
+            active_workspace_id.as_deref(),
+            active_owner_actor_id.as_deref(),
+        )
+    }) {
+        let before = machine.agents.len();
+        machine
+            .agents
+            .retain(|agent| agent.actor_id != args.actor_id);
+        removed |= machine.agents.len() != before;
+    }
+    if !removed {
+        return Err(format!(
+            "daemon-configured agent not found: {}",
+            args.actor_id
+        ));
+    }
+    config::save(&cfg).map_err(stringify)?;
+    delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
+    agent_list().await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUpdateArgs {
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    pub actor_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub autostart: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn agent_update(args: AgentUpdateArgs) -> Result<AgentInfo, String> {
+    if let Some(info) = update_machine_agent_in_config(&args).map_err(stringify)? {
+        return Ok(info);
+    }
+    Err(format!(
+        "daemon-configured agent not found: {}",
+        args.actor_id
+    ))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub setup_status: String,
+    pub connection_status: String,
+    pub connection_actor_id: String,
+    pub data_root: String,
+    pub config_dir: String,
+    pub agent_count: usize,
+    pub online_agent_count: usize,
+    pub providers: Vec<MachineAgentProviderInfo>,
+    pub agents: Vec<AgentInfo>,
+    pub serve_command: String,
+    pub setup_script: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineAgentProviderInfo {
+    pub id: String,
+    pub name: String,
+    pub transport_kind: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub actor_count: usize,
+    pub default_model: Option<String>,
+    pub model_choices: Vec<AgentModelChoice>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MachineListResult {
+    pub machines: Vec<MachineInfo>,
+}
+
+#[tauri::command]
+pub async fn machine_list(state: State<'_, AppState>) -> Result<MachineListResult, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    machines_from_config(&cfg, state.try_client().await).await
+}
+
+#[tauri::command]
+pub async fn machine_check(state: State<'_, AppState>) -> Result<MachineListResult, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let client = match state.try_client().await {
+        Some(client) => Some(client),
+        None => temporary_machine_check_client(&cfg).await,
+    };
+    machines_from_config(&cfg, client).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCreateArgs {
+    pub name: String,
+    #[serde(default)]
+    pub data_root: String,
+}
+
+#[tauri::command]
+pub async fn machine_create(
+    state: State<'_, AppState>,
+    args: MachineCreateArgs,
+) -> Result<MachineListResult, String> {
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err("machine name is required".into());
+    }
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let workspace_dir = workspace_id
+        .as_deref()
+        .map(slugify)
+        .unwrap_or_else(|| "unassigned".into());
+    let machine_id = config::generate_machine_id();
+    let dir_slug = format!(
+        "{}_{}",
+        slugify(name),
+        machine_id.trim_start_matches("machine_")
+    );
+    let data_root_key = owner_actor_id
+        .as_deref()
+        .map(|owner| format!("{}/{}", slugify(owner), dir_slug))
+        .unwrap_or_else(|| dir_slug.clone());
+    let (data_root_expr, data_root) = machine_path_input(
+        args.data_root.trim(),
+        config::machine_data_root_expr(&workspace_dir, &data_root_key),
+    )
+    .map_err(stringify)?;
+    std::fs::create_dir_all(&data_root)
+        .map_err(|e| format!("create data root {}: {e}", data_root.display()))?;
+
+    cfg.machines.push(MachineConfig {
+        workspace_id,
+        owner_actor_id,
+        id: machine_id,
+        name: name.to_string(),
+        kind: "local".into(),
+        data_root: data_root_expr,
+        agents: Vec::new(),
+    });
+    config::save(&cfg).map_err(stringify)?;
+    machines_from_config(&cfg, state.try_client().await).await
+}
+
+fn machine_path_input(input: &str, default_expr: String) -> anyhow::Result<(String, PathBuf)> {
+    let raw = if input.is_empty() {
+        default_expr
+    } else {
+        input.to_string()
+    };
+    let path = normalize_local_path(config::expand_home(&raw))?;
+    Ok((config::home_path_expr(&path), path))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRemoveArgs {
+    pub machine_id: String,
+}
+
+#[tauri::command]
+pub async fn machine_remove(
+    state: State<'_, AppState>,
+    args: MachineRemoveArgs,
+) -> Result<MachineListResult, String> {
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_machine_count = cfg
+        .machines
+        .iter()
+        .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
+        .count();
+    if active_machine_count <= 1 {
+        return Err("last machine cannot be removed".into());
+    }
+    let before = cfg.machines.len();
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let server_url = active_server_url(&cfg).to_string();
+    let actor_ids = cfg
+        .machines
+        .iter()
+        .find(|machine| {
+            machine.id == args.machine_id
+                && config::machine_belongs_to_workspace_and_owner(
+                    machine,
+                    active_workspace_id.as_deref(),
+                    active_owner_actor_id.as_deref(),
+                )
+        })
+        .map(|machine| actor_ids_for_machine(machine, &server_url))
+        .unwrap_or_default();
+    cfg.machines.retain(|machine| {
+        machine.id != args.machine_id
+            || !config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
+    });
+    if cfg.machines.len() == before {
+        return Err(format!("unknown machine id: {}", args.machine_id));
+    }
+    config::save(&cfg).map_err(stringify)?;
+    delete_actors_from_server(state.try_client().await, &actor_ids).await;
+    machines_from_config(&cfg, state.try_client().await).await
+}
+#[tauri::command]
+pub async fn machine_agent_create(
+    state: State<'_, AppState>,
+    args: AgentCreateArgs,
+) -> Result<MachineListResult, String> {
+    let machine_id = args
+        .machine_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if machine_id.is_empty() {
+        return Err("machine id is required".into());
+    }
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err("agent name is required".into());
+    }
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let actor_id = actor_id_from_input(&args.actor_id, name).map_err(stringify)?;
+    let machine_index = cfg
+        .machines
+        .iter()
+        .position(|machine| {
+            machine.id == machine_id
+                && config::machine_belongs_to_workspace_and_owner(
+                    machine,
+                    active_workspace_id.as_deref(),
+                    active_owner_actor_id.as_deref(),
+                )
+        })
+        .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
+    if cfg.machines[machine_index]
+        .agents
+        .iter()
+        .any(|agent| agent.actor_id == actor_id)
+    {
+        return Err(format!("agent actor already exists: {actor_id}"));
+    }
+    let providers = detect_agent_cli_providers();
+    if !providers
+        .iter()
+        .any(|provider| provider.id == args.provider_id)
+    {
+        return Err(format!(
+            "provider `{}` is not available on PATH for daemon mode",
+            args.provider_id
+        ));
+    }
+    let actor_id_for_upsert = actor_id.clone();
+    cfg.machines[machine_index].agents.push(MachineAgentConfig {
+        provider_id: args.provider_id,
+        actor_id,
+        name: name.to_string(),
+        description: args.description.trim().to_string(),
+        model: args.model.trim().to_string(),
+        reasoning_effort: args.reasoning_effort.trim().to_string(),
+        autostart: args.autostart,
+    });
+    config::save(&cfg).map_err(stringify)?;
+    if let Some(client) = state.try_client().await {
+        let _ = client
+            .call_raw(
+                method::ACTOR_UPSERT,
+                Some(json!({
+                    "actor": {
+                        "id": actor_id_for_upsert,
+                        "kind": "agent",
+                        "displayName": name,
+                    }
+                })),
+            )
+            .await;
+    }
+    machines_from_config(&cfg, state.try_client().await).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineAgentRemoveArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+}
+
+#[tauri::command]
+pub async fn machine_agent_remove(
+    state: State<'_, AppState>,
+    args: MachineAgentRemoveArgs,
+) -> Result<MachineListResult, String> {
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let machine = cfg
+        .machines
+        .iter_mut()
+        .find(|machine| {
+            machine.id == args.machine_id
+                && config::machine_belongs_to_workspace_and_owner(
+                    machine,
+                    active_workspace_id.as_deref(),
+                    active_owner_actor_id.as_deref(),
+                )
+        })
+        .ok_or_else(|| format!("unknown machine id: {}", args.machine_id))?;
+    let before = machine.agents.len();
+    machine
+        .agents
+        .retain(|agent| agent.actor_id != args.actor_id);
+    if machine.agents.len() == before {
+        return Err(format!(
+            "daemon-configured agent not found: {}",
+            args.actor_id
+        ));
+    }
+    config::save(&cfg).map_err(stringify)?;
+    delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
+    machines_from_config(&cfg, state.try_client().await).await
+}
+
+async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[String]) {
+    let Some(client) = client else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    for actor_id in actor_ids {
+        let actor_id = actor_id.trim();
+        if actor_id.is_empty() || !seen.insert(actor_id.to_string()) {
+            continue;
+        }
+        if let Err(err) = client
+            .call_raw(
+                method::ACTOR_DELETE,
+                Some(json!({
+                    "actorId": actor_id,
+                })),
+            )
+            .await
+        {
+            tracing::warn!(%actor_id, %err, "failed to delete actor from server");
+        }
+    }
+}
+
+fn actor_ids_for_machine(machine: &MachineConfig, server_url: &str) -> Vec<String> {
+    let mut actor_ids = vec![machine_connection_actor_id(machine)];
+    actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
+    match machine_info(machine, server_url) {
+        Ok(info) => {
+            actor_ids.extend(info.agents.into_iter().map(|agent| agent.spec.actor.id));
+        }
+        Err(err) => {
+            tracing::warn!(
+                machine_id = %machine.id,
+                %err,
+                "failed to read machine agents while deleting machine; falling back to config agents"
+            );
+            actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
+        }
+    }
+    actor_ids.sort();
+    actor_ids.dedup();
+    actor_ids
 }
 
 fn stringify(e: anyhow::Error) -> String {
@@ -340,4 +939,469 @@ fn stringify(e: anyhow::Error) -> String {
 /// only the top-level "ws connect ws://…" wrapper we add in ws.rs.
 fn deep_stringify(e: anyhow::Error) -> String {
     format!("{:#}", e)
+}
+
+async fn machines_from_config(
+    cfg: &DesktopConfig,
+    client: Option<Arc<Client>>,
+) -> Result<MachineListResult, String> {
+    let server_url = active_server_url(cfg);
+
+    let mut machines = Vec::new();
+    for machine in cfg
+        .machines
+        .iter()
+        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
+    {
+        machines.push(machine_info(machine, server_url).map_err(stringify)?);
+    }
+    let mut result = MachineListResult { machines };
+    apply_connection_status(&mut result, client).await;
+    Ok(result)
+}
+
+async fn temporary_machine_check_client(cfg: &DesktopConfig) -> Option<Arc<Client>> {
+    let client = Client::connect(active_server_url(cfg)).await.ok()?;
+    client
+        .initialize("joi-gui-machine-check", env!("CARGO_PKG_VERSION"))
+        .await
+        .ok()?;
+    Some(client)
+}
+
+fn active_server_url(cfg: &DesktopConfig) -> &str {
+    config::active_workspace_id(cfg)
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .map(|workspace| workspace.server_url.as_str())
+        .unwrap_or("ws://127.0.0.1:7878/rpc")
+}
+
+async fn apply_connection_status(result: &mut MachineListResult, client: Option<Arc<Client>>) {
+    let Some(client) = client else {
+        for machine in &mut result.machines {
+            machine.connection_status = "notConnected".into();
+        }
+        return;
+    };
+
+    let actor_ids: Vec<String> = result
+        .machines
+        .iter()
+        .flat_map(|machine| {
+            std::iter::once(machine.connection_actor_id.clone()).chain(
+                machine
+                    .agents
+                    .iter()
+                    .map(|agent| agent.spec.actor.id.clone()),
+            )
+        })
+        .collect();
+    if actor_ids.is_empty() {
+        for machine in &mut result.machines {
+            machine.connection_status = "offline".into();
+        }
+        return;
+    }
+
+    let Ok(value) = client
+        .call_raw(
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": actor_ids })),
+        )
+        .await
+    else {
+        for machine in &mut result.machines {
+            machine.connection_status = "unavailable".into();
+        }
+        return;
+    };
+    let live = actor_ids_from_connection_list(&value);
+
+    for machine in &mut result.machines {
+        machine.online_agent_count = 0;
+        for agent in &mut machine.agents {
+            if live.contains(&agent.spec.actor.id) {
+                agent.status = "online".into();
+                machine.online_agent_count += 1;
+            } else {
+                agent.status = "registered".into();
+            }
+        }
+        if live.contains(&machine.connection_actor_id) {
+            machine.connection_status = "online".into();
+            machine.status = "online".into();
+        } else {
+            machine.connection_status = "offline".into();
+            machine.status = machine.setup_status.clone();
+        }
+    }
+}
+
+fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
+    value
+        .get("actorIds")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
+    let allowed_agents = cfg
+        .machines
+        .iter()
+        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
+        .flat_map(|machine| machine.agents.iter().map(|agent| agent.actor_id.clone()))
+        .collect::<HashSet<_>>();
+
+    let Some(actors) = value.get_mut("actors").and_then(Value::as_array_mut) else {
+        return value;
+    };
+
+    actors.retain(|actor| {
+        let kind = actor
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind != "agent" {
+            return true;
+        }
+        actor
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| allowed_agents.contains(id))
+    });
+
+    value
+}
+
+fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<MachineInfo> {
+    let data_root = if machine.data_root.trim().is_empty() {
+        config::default_agent_data_root()
+    } else {
+        config::expand_home(&machine.data_root)
+    };
+    let detected_providers = detect_agent_cli_providers();
+    let mut providers = detected_providers
+        .iter()
+        .map(detected_provider_summary)
+        .collect::<Vec<_>>();
+    for provider in &mut providers {
+        provider.actor_count += machine
+            .agents
+            .iter()
+            .filter(|agent| agent.provider_id == provider.id)
+            .count();
+    }
+    let machine_agent_defs = machine
+        .agents
+        .iter()
+        .map(machine_agent_definition)
+        .collect::<Vec<_>>();
+    let provider_specs =
+        provider_specs_from_agent_definitions(&detected_providers, &machine_agent_defs);
+    let agents: Vec<AgentInfo> = provider_specs
+        .into_iter()
+        .flat_map(|provider| provider.into_agent_specs())
+        .map(|spec| AgentInfo {
+            spec,
+            status: "registered".into(),
+            pid: None,
+            session_id: None,
+        })
+        .collect();
+    let setup_status = if providers.is_empty() {
+        "noCli"
+    } else if agents.is_empty() {
+        "ready"
+    } else {
+        "configured"
+    };
+    let connection_actor_id = machine_connection_actor_id(machine);
+    let data_root_arg = shell_path_arg(&data_root);
+    let serve_command = format!(
+        "JOI_AGENT_DATA_ROOT={} joi --server {} daemon --machine-id {}",
+        data_root_arg,
+        shell_arg(server_url),
+        shell_arg(&machine.id),
+    );
+    let setup_script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport JOI_AGENT_DATA_ROOT={}\nexec joi --server {} daemon --machine-id {}\n",
+        shell_path_arg(&data_root),
+        shell_path_arg(&data_root),
+        shell_arg(server_url),
+        shell_arg(&machine.id),
+    );
+
+    Ok(MachineInfo {
+        id: machine.id.clone(),
+        name: machine.name.clone(),
+        kind: machine.kind.clone(),
+        status: setup_status.into(),
+        setup_status: setup_status.into(),
+        connection_status: "notConnected".into(),
+        connection_actor_id,
+        data_root: config::home_path_expr(&data_root),
+        config_dir: config::home_path_expr(&config::config_dir()),
+        agent_count: agents.len(),
+        online_agent_count: 0,
+        providers,
+        agents,
+        serve_command,
+        setup_script,
+    })
+}
+
+fn machine_connection_actor_id(machine: &MachineConfig) -> String {
+    format!("actor_service_{}", machine.id)
+}
+
+fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn shell_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "-_./:=@".contains(ch))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_path_arg(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(home) {
+            if rest.as_os_str().is_empty() {
+                return "\"${HOME}\"".into();
+            }
+            return format!(
+                "\"${{HOME}}/{}\"",
+                shell_double_quote(&rest.display().to_string())
+            );
+        }
+    }
+    shell_arg(&path.display().to_string())
+}
+
+fn shell_double_quote(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
+fn detected_provider_summary(provider: &DetectedAgentProvider) -> MachineAgentProviderInfo {
+    MachineAgentProviderInfo {
+        id: provider.id.clone(),
+        name: provider.display_name.clone(),
+        transport_kind: provider.transport_kind.clone(),
+        command: provider.command.clone(),
+        args: provider.args.clone(),
+        actor_count: 0,
+        default_model: provider.default_model.clone(),
+        model_choices: provider.model_choices.clone(),
+    }
+}
+
+fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
+    AgentDefinition {
+        provider_id: agent.provider_id.clone(),
+        actor_id: agent.actor_id.clone(),
+        display_name: agent.name.clone(),
+        description: non_empty(agent.description.trim()),
+        model: non_empty(agent.model.trim()),
+        reasoning_effort: non_empty(agent.reasoning_effort.trim()),
+        autostart: agent.autostart,
+    }
+}
+
+fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Option<AgentInfo>> {
+    let Some(machine_id) = args
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let mut cfg = config::load_or_init()?;
+    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let Some(machine_index) = cfg.machines.iter().position(|machine| {
+        machine.id == machine_id
+            && config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
+    }) else {
+        return Ok(None);
+    };
+    let Some(agent_index) = cfg.machines[machine_index]
+        .agents
+        .iter()
+        .position(|agent| agent.actor_id == args.actor_id)
+    else {
+        return Ok(None);
+    };
+
+    {
+        let agent = &mut cfg.machines[machine_index].agents[agent_index];
+        if let Some(provider_id) = args.provider_id.as_deref() {
+            agent.provider_id = provider_id.trim().to_string();
+        }
+        if let Some(display_name) = args.display_name.as_deref() {
+            agent.name = display_name.trim().to_string();
+        }
+        if let Some(description) = args.description.as_deref() {
+            agent.description = description.trim().to_string();
+        }
+        if let Some(model) = args.model.as_deref() {
+            agent.model = model.trim().to_string();
+        }
+        if let Some(reasoning_effort) = args.reasoning_effort.as_deref() {
+            agent.reasoning_effort = reasoning_effort.trim().to_string();
+        }
+        if let Some(autostart) = args.autostart {
+            agent.autostart = autostart;
+        }
+    }
+
+    config::save(&cfg)?;
+    let server_url = active_server_url(&cfg).to_string();
+    let machine = machine_info(&cfg.machines[machine_index], &server_url)?;
+    Ok(machine
+        .agents
+        .into_iter()
+        .find(|agent| agent.spec.actor.id == args.actor_id))
+}
+
+fn actor_id_from_input(value: &str, display_name: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        return Ok(format!("actor_agent_{}_{}", slugify(display_name), suffix));
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return Ok(trimmed.to_string());
+    }
+    anyhow::bail!("actor id contains unsupported characters")
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn slugify(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_sep = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_sep = false;
+        } else if !last_sep && !out.is_empty() {
+            out.push('_');
+            last_sep = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "agent".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_account() -> HumanAccount {
+        config::normalize_human_account(HumanAccount {
+            provider: "buc".into(),
+            staff_id: "88084".into(),
+            nickname: "星楚".into(),
+            real_name: "陈博俊".into(),
+            email: String::new(),
+            actor_id: String::new(),
+            avatar_url: String::new(),
+        })
+    }
+
+    fn test_machine(id: &str, owner_actor_id: Option<&str>, agent_actor_id: &str) -> MachineConfig {
+        MachineConfig {
+            workspace_id: Some("default".into()),
+            owner_actor_id: owner_actor_id.map(ToString::to_string),
+            id: id.into(),
+            name: id.into(),
+            kind: "local".into(),
+            data_root: "~/.agentx".into(),
+            agents: vec![MachineAgentConfig {
+                provider_id: "codex".into(),
+                actor_id: agent_actor_id.into(),
+                name: agent_actor_id.into(),
+                description: String::new(),
+                model: String::new(),
+                reasoning_effort: String::new(),
+                autostart: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn actor_list_filter_hides_agents_from_other_machine_owners() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+            machines: vec![
+                test_machine("mine", Some(account.actor_id.as_str()), "actor_agent_mine"),
+                test_machine("other", Some("actor_human_other"), "actor_agent_other"),
+            ],
+        };
+        let value = json!({
+            "actors": [
+                { "id": account.actor_id, "kind": "human", "displayName": "星楚" },
+                { "id": "actor_agent_mine", "kind": "agent", "displayName": "Mine" },
+                { "id": "actor_agent_other", "kind": "agent", "displayName": "Other" },
+                { "id": "actor_service_other", "kind": "service", "displayName": "Other Service" }
+            ]
+        });
+
+        let filtered = filter_actor_list_for_active_context(value, &cfg);
+        let actor_ids = filtered["actors"]
+            .as_array()
+            .expect("actors")
+            .iter()
+            .filter_map(|actor| actor["id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(actor_ids.contains(&"actor_agent_mine"));
+        assert!(!actor_ids.contains(&"actor_agent_other"));
+        assert!(actor_ids.contains(&"actor_service_other"));
+    }
 }

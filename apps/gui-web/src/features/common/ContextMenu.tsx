@@ -39,11 +39,11 @@ export function ContextMenuHost() {
       ref={ref}
       role="menu"
       style={{ left: x, top: y, width }}
-      className="fixed z-[60] rounded-md border border-border bg-elevated py-1 shadow-[0_8px_24px_rgba(0,0,0,.45)]"
+      className="fixed z-[60] border-2 border-black bg-white py-1 shadow-brutal"
     >
       {menu.items.map((it, i) =>
         it.kind === "divider" ? (
-          <div key={i} className="my-1 h-px bg-border" />
+          <div key={i} className="my-1 h-0.5 bg-black" />
         ) : (
           <button
             key={i}
@@ -53,10 +53,10 @@ export function ContextMenuHost() {
               close();
             }}
             className={clsx(
-              "flex w-full items-center px-3 py-1.5 text-sm",
+              "flex w-full items-center px-3 py-1.5 text-sm font-bold",
               it.danger
-                ? "text-danger hover:bg-danger/10"
-                : "text-secondary hover:bg-hover hover:text-primary",
+                ? "text-black hover:bg-danger"
+                : "text-black hover:bg-brutal-yellow",
               it.disabled && "opacity-50",
             )}
           >

@@ -8,6 +8,8 @@ import {
   Copy,
   CornerDownRight,
   Fingerprint,
+  Bookmark,
+  BarChart3,
   XCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -29,6 +31,7 @@ import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
+import { ActorAvatar } from "@/features/common/ActorAvatar";
 
 export interface BubbleReplyContext {
   actorId: string;
@@ -64,7 +67,7 @@ export function Bubble({
     return (
       <div
         id={domId}
-        className="my-1 scroll-mt-16 text-center text-xs italic text-muted"
+      className="my-1 scroll-mt-16 text-center font-mono text-xs italic text-black/40"
       >
         {bubble.text}
       </div>
@@ -138,7 +141,7 @@ export function Bubble({
   return (
     <div
       id={domId}
-      className="group relative flex scroll-mt-16 gap-3 rounded-md px-2 py-1 transition-colors hover:bg-hover focus-within:bg-hover"
+      className="group relative flex scroll-mt-16 gap-3 px-2 py-1 transition-colors hover:bg-brutal-cream focus-within:bg-brutal-cream"
       onContextMenu={onContextMenu}
     >
       <div className="w-10 shrink-0">
@@ -147,9 +150,9 @@ export function Bubble({
             type="button"
             onClick={() => void revealId()}
             title={actorId}
-            className="block rounded-full outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="block outline-none focus-visible:ring-2 focus-visible:ring-black"
           >
-            <Avatar actorId={actorId} displayName={displayName} />
+            <ActorAvatar actor={actor} id={actorId} label={displayName} size={36} />
           </button>
         )}
       </div>
@@ -161,17 +164,17 @@ export function Bubble({
               onClick={() => void revealId()}
               title={actorId}
               className={clsx(
-                "text-sm font-semibold outline-none hover:underline focus-visible:underline",
+                "text-sm font-black outline-none hover:underline focus-visible:underline",
                 isSelf ? "text-primary" : roleColor(actorId),
               )}
             >
               {displayName}
             </button>
-            <span className="text-[11px] text-muted">
+            <span className="font-mono text-[11px] text-black/40">
               {formatChatTime(bubble.ts)}
             </span>
             {bubble.delivery === "pending" && (
-              <span className="text-[11px] text-muted">sending…</span>
+              <span className="font-mono text-[11px] text-black/40">sending...</span>
             )}
           </header>
         )}
@@ -180,7 +183,7 @@ export function Bubble({
           <button
             type="button"
             disabled={replyContext.missing}
-            className="mb-0.5 flex max-w-full items-center gap-1.5 rounded-sm text-left text-xs text-muted hover:text-secondary disabled:cursor-default disabled:hover:text-muted"
+            className="mb-0.5 flex max-w-full items-center gap-1.5 text-left text-xs text-black/45 hover:text-black/70 disabled:cursor-default disabled:hover:text-black/45"
             onClick={jumpToReply}
             title={replyContext.preview}
           >
@@ -204,18 +207,25 @@ export function Bubble({
         )}
 
         <Body bubble={bubble} />
+        <MessageMeta meta={bubble.meta} />
       </div>
 
       {/* Hover toolbar — floats just above the top-right, Discord-style.
           It mirrors the context menu for the fast reply/copy path. */}
-      <div
-        className="pointer-events-none absolute -top-3 right-3 flex items-center gap-0.5 rounded-md border border-border bg-elevated px-0.5 py-0.5 opacity-0 shadow-md transition-opacity duration-75 group-hover:pointer-events-auto group-hover:opacity-100"
-      >
+      <div className="pointer-events-none absolute -top-3 right-3 flex items-center gap-0.5 border-2 border-black bg-white px-0.5 py-0.5 opacity-0 shadow-brutal-sm transition-opacity duration-75 group-hover:pointer-events-auto group-hover:opacity-100">
+        <button
+          type="button"
+          title="Save message"
+          onClick={() => pushToast("info", "message saved")}
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
+        >
+          <Bookmark size={13} />
+        </button>
         <button
           type="button"
           title="Reply"
           onClick={replyToThis}
-          className="flex h-6 w-6 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
         >
           <CornerDownRight size={14} />
         </button>
@@ -223,7 +233,7 @@ export function Bubble({
           type="button"
           title="Copy text"
           onClick={() => void copyText()}
-          className="flex h-6 w-6 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
         >
           <Copy size={14} />
         </button>
@@ -231,7 +241,7 @@ export function Bubble({
           type="button"
           title="Copy actor id"
           onClick={() => void revealId()}
-          className="flex h-6 w-6 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
+          className="flex h-6 w-6 items-center justify-center text-black/70 hover:bg-brutal-yellow hover:text-black"
         >
           <Fingerprint size={14} />
         </button>
@@ -247,30 +257,11 @@ function previewText(text: string, handoffTarget?: string): string {
   return `${head}${body}` || "(no text)";
 }
 
-function Avatar({
-  actorId,
-  displayName,
-}: {
-  actorId: string;
-  displayName: string;
-}) {
-  const base = displayName && displayName !== actorId ? displayName : actorId;
-  const initials = base.slice(0, 2).toUpperCase();
-  return (
-    <div
-      className="flex h-9 w-9 items-center justify-center rounded-full bg-elevated text-xs font-semibold text-secondary"
-      aria-label={actorId}
-    >
-      {initials}
-    </div>
-  );
-}
-
 function roleColor(actorId: string): string {
-  if (actorId.startsWith("actor_agent_")) return "text-role-agent";
-  if (actorId.startsWith("actor_service_")) return "text-role-service";
-  if (actorId === "system") return "text-muted";
-  return "text-role-human";
+  if (actorId.startsWith("actor_agent_")) return "text-black";
+  if (actorId.startsWith("actor_service_")) return "text-black/70";
+  if (actorId === "system") return "text-black/45";
+  return "text-black";
 }
 
 function Body({ bubble }: { bubble: BubbleT }) {
@@ -300,9 +291,9 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
   const targetActor = useActors((s) => s.byId[target]);
   const targetName = targetActor?.displayName || target;
   return (
-    <div className="text-sm text-secondary">
-      <span className="text-muted">→ handoff →</span>{" "}
-      <span className="text-role-agent" title={target}>
+    <div className="text-sm text-black/70">
+      <span className="text-black/45">handoff {"->"}</span>{" "}
+      <span className="bg-mention px-1 font-black text-black" title={target}>
         @{targetName}
       </span>
       {bubble.text ? <>: {bubble.text}</> : null}
@@ -312,10 +303,278 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
 
 function MarkdownText({ text }: { text: string }) {
   return (
-    <div className="prose-chat text-sm leading-6 text-primary">
+    <div className="prose-chat text-sm leading-6 text-black">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
     </div>
   );
+}
+
+interface PromptStatsMeta {
+  char_count: number;
+  byte_count: number;
+  approx_token_count: number;
+}
+
+interface PromptBreakdownSection {
+  key: string;
+  label: string;
+  char_count: number;
+  byte_count: number;
+  approx_token_count: number;
+  percentage: number;
+}
+
+interface TokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  total_cost_usd?: number;
+  estimated?: boolean;
+}
+
+interface TokenUsageMeta {
+  increment?: TokenUsage;
+  cumulative?: TokenUsage;
+}
+
+function MessageMeta({ meta }: { meta?: Record<string, unknown> }) {
+  const stats = getPromptStats(meta);
+  const breakdown = getPromptBreakdown(meta);
+  const tokenUsage = getTokenUsage(meta);
+  if (!stats && !tokenUsage) return null;
+
+  return (
+    <div className="mt-1 max-w-2xl text-[11px] text-black/45">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono">
+        <BarChart3 size={12} className="text-black/35" />
+        {tokenUsage?.increment && (
+          <span>
+            {`usage ${formatTokenUsage(tokenUsage.increment, true)}`}
+            {tokenUsage.cumulative
+              ? ` · total ${formatTokenUsage(tokenUsage.cumulative, false)}`
+              : ""}
+          </span>
+        )}
+        {stats && (
+          <span>{`prompt ctx ~${formatCompactCount(stats.approx_token_count)} tok · ${formatBytes(stats.byte_count)}`}</span>
+        )}
+      </div>
+      {breakdown.length > 0 && (
+        <details className="mt-1 max-w-xl">
+          <summary className="cursor-pointer select-none font-mono text-[11px] text-black/45 hover:text-black/70">
+            Context breakdown
+          </summary>
+          <div className="mt-1 border-l-2 border-black/20 pl-2">
+            <div className="flex h-2 overflow-hidden border border-black/20 bg-black/5">
+              {breakdown.map((section) => (
+                <div
+                  key={section.key}
+                  className="h-full"
+                  title={`${section.label}: ~${formatCompactCount(section.approx_token_count)} tok`}
+                  style={{
+                    width: `${Math.max(section.percentage, 2)}%`,
+                    background: contextSectionColor(section.key),
+                  }}
+                />
+              ))}
+            </div>
+            <div className="mt-1 grid gap-1">
+              {breakdown.map((section) => (
+                <div
+                  key={section.key}
+                  className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 font-mono text-[11px]"
+                >
+                  <span className="min-w-0 truncate text-black/55">
+                    <span
+                      className="mr-1 inline-block h-2 w-2 border border-black/20 align-[-1px]"
+                      style={{ background: contextSectionColor(section.key) }}
+                    />
+                    {section.label}
+                  </span>
+                  <span className="text-black/45">
+                    {`~${formatCompactCount(section.approx_token_count)} tok · ${formatPercentage(section.percentage)}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function getPromptStats(
+  meta?: Record<string, unknown>,
+): PromptStatsMeta | null {
+  const stats = asRecord(meta?.prompt_stats) ?? asRecord(meta?.promptStats);
+  if (!stats) return null;
+  const char_count = asNumber(stats.char_count ?? stats.charCount);
+  const byte_count = asNumber(stats.byte_count ?? stats.byteCount);
+  const approx_token_count = asNumber(
+    stats.approx_token_count ?? stats.approxTokenCount,
+  );
+  if (
+    char_count === null ||
+    byte_count === null ||
+    approx_token_count === null
+  ) {
+    return null;
+  }
+  return { char_count, byte_count, approx_token_count };
+}
+
+function getPromptBreakdown(
+  meta?: Record<string, unknown>,
+): PromptBreakdownSection[] {
+  const breakdown =
+    asRecord(meta?.prompt_breakdown) ?? asRecord(meta?.promptBreakdown);
+  const rawSections = breakdown?.sections;
+  if (!Array.isArray(rawSections)) return [];
+  return rawSections
+    .map((raw) => {
+      const section = asRecord(raw);
+      if (!section) return null;
+      const key = asStringValue(section.key);
+      const label = asStringValue(section.label);
+      const char_count = asNumber(section.char_count ?? section.charCount);
+      const byte_count = asNumber(section.byte_count ?? section.byteCount);
+      const approx_token_count = asNumber(
+        section.approx_token_count ?? section.approxTokenCount,
+      );
+      const percentage = asNumber(section.percentage);
+      if (
+        !key ||
+        !label ||
+        char_count === null ||
+        byte_count === null ||
+        approx_token_count === null ||
+        percentage === null
+      ) {
+        return null;
+      }
+      return {
+        key,
+        label,
+        char_count,
+        byte_count,
+        approx_token_count,
+        percentage,
+      };
+    })
+    .filter((section): section is PromptBreakdownSection => Boolean(section));
+}
+
+function getTokenUsage(meta?: Record<string, unknown>): TokenUsageMeta | null {
+  const usage = asRecord(meta?.token_usage) ?? asRecord(meta?.tokenUsage);
+  if (!usage) return null;
+  const increment = parseUsage(usage.increment);
+  const cumulative = parseUsage(usage.cumulative);
+  if (!increment && !cumulative) return null;
+  return { increment: increment ?? undefined, cumulative: cumulative ?? undefined };
+}
+
+function parseUsage(raw: unknown): TokenUsage | null {
+  const usage = asRecord(raw);
+  if (!usage) return null;
+  const parsed: TokenUsage = {
+    input_tokens: asOptionalNumber(usage.input_tokens ?? usage.inputTokens),
+    output_tokens: asOptionalNumber(usage.output_tokens ?? usage.outputTokens),
+    total_tokens: asOptionalNumber(usage.total_tokens ?? usage.totalTokens),
+    total_cost_usd: asOptionalNumber(usage.total_cost_usd ?? usage.totalCostUsd),
+    estimated: usage.estimated === true,
+  };
+  if (
+    parsed.input_tokens === undefined &&
+    parsed.output_tokens === undefined &&
+    parsed.total_tokens === undefined &&
+    parsed.total_cost_usd === undefined
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatTokenUsage(usage: TokenUsage, includeDelta: boolean): string {
+  const total =
+    usage.total_tokens ??
+    sumDefined([usage.input_tokens, usage.output_tokens]);
+  const prefix = includeDelta ? "+" : "";
+  const approx = usage.estimated ? "~" : "";
+  const cost =
+    typeof usage.total_cost_usd === "number"
+      ? ` · $${usage.total_cost_usd.toFixed(4)}`
+      : "";
+  if (typeof total !== "number") return cost.trim().replace(/^· /, "") || "n/a";
+  return `${prefix}${approx}${formatCompactCount(total)} tok${cost}`;
+}
+
+function sumDefined(values: Array<number | undefined>): number | undefined {
+  let total = 0;
+  let seen = false;
+  for (const value of values) {
+    if (typeof value !== "number") continue;
+    total += value;
+    seen = true;
+  }
+  return seen ? total : undefined;
+}
+
+function contextSectionColor(key: string): string {
+  switch (key) {
+    case "identity":
+      return "var(--brutal-cyan)";
+    case "soul":
+      return "var(--brutal-lavender)";
+    case "bootstrap_memory":
+    case "turn_memory":
+      return "var(--brutal-lime)";
+    case "scope_bootstrap":
+      return "var(--brutal-orange)";
+    case "user_message":
+      return "var(--brutal-pink)";
+    default:
+      return "var(--brutal-yellow)";
+  }
+}
+
+function formatCompactCount(value: number): string {
+  if (value >= 1_000_000) return `${trimFixed(value / 1_000_000)}m`;
+  if (value >= 1_000) return `${trimFixed(value / 1_000)}k`;
+  return String(Math.round(value));
+}
+
+function trimFixed(value: number): string {
+  return value.toFixed(value >= 10 ? 0 : 1).replace(/\.0$/, "");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${trimFixed(bytes / 1024 / 1024)} MB`;
+  if (bytes >= 1024) return `${trimFixed(bytes / 1024)} KB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function formatPercentage(value: number): string {
+  if (value >= 10) return `${Math.round(value)}%`;
+  return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asStringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
@@ -324,7 +583,10 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
   const pushToast = useUI((s) => s.pushToast);
   const disabled = bubble.acknowledged === true;
 
-  const respond = async (optionId: string, kind: "accepted" | "declined") => {
+  const respond = async (
+    optionId: string,
+    kind: "accepted" | "declined" | "answered",
+  ) => {
     if (!currentScope || !selfId) return;
     try {
       await ipc.eventAppend({
@@ -355,8 +617,12 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
   const status = bubble.actionStatus ?? (disabled ? "accepted" : "pending");
   const statusTone = actionStatusTone(status);
   const StatusIcon = statusTone.icon;
+  const statusLabel =
+    status === "answered" && bubble.actionSelectedLabel
+      ? `Selected: ${bubble.actionSelectedLabel}`
+      : statusTone.label;
   const [expanded, setExpanded] = useState(() => !disabled);
-  const cardShell = "mt-1 w-full max-w-3xl overflow-hidden rounded-md border shadow-sm";
+  const cardShell = "mt-1 w-full max-w-3xl overflow-hidden border-2 border-black bg-white shadow-brutal-sm";
   const bodyShell = "px-3 pb-3 pt-2";
   const hasStructuredBody =
     bubble.actionReason || bubble.actionCommand || bubble.actionRawInput;
@@ -377,7 +643,7 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
           <button
             type="button"
             onClick={() => setExpanded(false)}
-            className="flex h-5 w-5 items-center justify-center rounded text-muted hover:bg-hover hover:text-primary"
+            className="flex h-5 w-5 items-center justify-center text-black/45 hover:bg-brutal-yellow hover:text-black"
           >
             <ChevronDown size={14} />
           </button>
@@ -389,16 +655,16 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         size={15}
         className={clsx("justify-self-center", statusTone.iconClass)}
       />
-      <div className="min-w-0 truncate text-sm font-semibold text-primary">
+      <div className="min-w-0 truncate text-sm font-black text-black">
         {actionTitle}
       </div>
       <span
         className={clsx(
-          "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
+          "max-w-[14rem] shrink-0 truncate border border-black px-1.5 py-0.5 text-[11px] font-black",
           statusTone.badge,
         )}
       >
-        {statusTone.label}
+        {statusLabel}
       </span>
     </div>
   );
@@ -430,8 +696,8 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
       {hasStructuredBody ? (
         <div className={clsx(bodyShell, "space-y-2")}>
           {bubble.actionReason && (
-            <div className="text-sm text-secondary">
-              <div className="mb-0.5 text-[11px] font-semibold uppercase text-muted">
+            <div className="text-sm text-black/70">
+              <div className="mb-0.5 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Reason
               </div>
               <div className="whitespace-pre-wrap">{bubble.actionReason}</div>
@@ -439,20 +705,20 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
           )}
           {bubble.actionCommand && (
             <div>
-              <div className="mb-1 text-[11px] font-semibold uppercase text-muted">
+              <div className="mb-1 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Command
               </div>
-              <code className="block overflow-x-auto rounded bg-elevated/80 px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
+              <code className="block overflow-x-auto border-2 border-black bg-brutal-cream px-2 py-1.5 font-mono text-xs leading-5 text-black/70">
                 {bubble.actionCommand}
               </code>
             </div>
           )}
           {bubble.actionRawInput && (
             <div>
-              <div className="mb-1 text-[11px] font-semibold uppercase text-muted">
+              <div className="mb-1 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Raw input
               </div>
-              <code className="block overflow-x-auto whitespace-pre rounded bg-elevated/80 px-2 py-1.5 font-mono text-xs leading-5 text-secondary">
+              <code className="block overflow-x-auto whitespace-pre border-2 border-black bg-brutal-cream px-2 py-1.5 font-mono text-xs leading-5 text-black/70">
                 {bubble.actionRawInput}
               </code>
             </div>
@@ -460,7 +726,7 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         </div>
       ) : (
         <div className={bodyShell}>
-          <div className="text-sm text-primary whitespace-pre-wrap">
+          <div className="whitespace-pre-wrap text-sm text-black">
             {bubble.text}
           </div>
         </div>
@@ -469,17 +735,20 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         <div className="flex flex-wrap gap-2 px-3 pb-3">
           {choices.map((c) => {
             const isDecline = /reject|decline|cancel|abort|no/i.test(c.label);
+            const kind = isQuestionRequest(bubble.requestType)
+              ? "answered"
+              : isDecline
+                ? "declined"
+                : "accepted";
             return (
               <button
                 key={c.id}
-                onClick={() =>
-                  void respond(c.id, isDecline ? "declined" : "accepted")
-                }
+                onClick={() => void respond(c.id, kind)}
                 className={clsx(
-                  "rounded px-3 py-1 text-xs font-medium",
+                  "btn-brutal-sm px-3 py-1 text-xs font-black",
                   isDecline
-                    ? "bg-elevated text-secondary hover:bg-hover"
-                    : "bg-accent text-accent-contrast hover:bg-accent-hover",
+                    ? "bg-white"
+                    : "bg-brutal-pink",
                 )}
               >
                 {c.label}
@@ -493,29 +762,42 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
 }
 
 function actionStatusTone(status: NonNullable<BubbleT["actionStatus"]>) {
+  if (status === "answered") {
+    return {
+      label: "Answered",
+      icon: CheckCircle2,
+      iconClass: "text-black",
+      card: "bg-brutal-yellow",
+      badge: "bg-white text-black",
+    };
+  }
   if (status === "accepted") {
     return {
       label: "Approved",
       icon: CheckCircle2,
-      iconClass: "text-success",
-      card: "border-[rgba(59,165,93,0.35)] bg-[rgba(59,165,93,0.12)]",
-      badge: "bg-[rgba(59,165,93,0.16)] text-success",
+      iconClass: "text-black",
+      card: "bg-brutal-lime",
+      badge: "bg-white text-black",
     };
   }
   if (status === "declined") {
     return {
       label: "Rejected",
       icon: XCircle,
-      iconClass: "text-danger",
-      card: "border-[rgba(237,66,69,0.35)] bg-[rgba(237,66,69,0.12)]",
-      badge: "bg-[rgba(237,66,69,0.16)] text-danger",
+      iconClass: "text-black",
+      card: "bg-danger",
+      badge: "bg-white text-black",
     };
   }
   return {
     label: "Waiting",
     icon: Clock3,
-    iconClass: "text-warning",
-    card: "border-[rgba(242,177,74,0.35)] bg-[rgba(242,177,74,0.12)]",
-    badge: "bg-[rgba(242,177,74,0.16)] text-warning",
+    iconClass: "text-black",
+    card: "bg-brutal-yellow",
+    badge: "bg-white text-black",
   };
+}
+
+function isQuestionRequest(requestType?: string): boolean {
+  return requestType === "question" || requestType === "human_decision";
 }

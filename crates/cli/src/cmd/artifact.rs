@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
+use proto::types::{ScopeKind, ScopeRef};
 use serde_json::json;
 
 use crate::client::Client;
@@ -16,6 +17,8 @@ pub async fn publish(
     media_type: Option<String>,
     text: Option<String>,
     file: Option<PathBuf>,
+    scope_id: Option<String>,
+    is_channel: bool,
 ) -> Result<()> {
     let body = match (text, file) {
         (Some(_), Some(_)) => bail!("--text and --file are mutually exclusive"),
@@ -35,8 +38,17 @@ pub async fn publish(
         }
     };
     let media_type = media_type.unwrap_or_else(|| "text/markdown".into());
+    let scope = scope_id.map(|id| ScopeRef {
+        kind: if is_channel {
+            ScopeKind::Channel
+        } else {
+            ScopeKind::Thread
+        },
+        id,
+    });
     let params = json!({
         "createdBy": actor_id,
+        "scope": scope,
         "ingress": {
             "kind": "inline_text",
             "name": name,

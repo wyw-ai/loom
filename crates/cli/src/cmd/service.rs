@@ -16,6 +16,7 @@ use proto::methods::ServiceSpec;
 
 use std::sync::Arc;
 
+use crate::config;
 use crate::service::scheduler::SchedulerPlugin;
 use crate::service::{state, ServiceHost};
 
@@ -23,14 +24,7 @@ pub(crate) fn default_specs_dir() -> PathBuf {
     if let Ok(s) = std::env::var("JOI_SERVICE_SPECS") {
         return PathBuf::from(s);
     }
-    dirs::config_dir()
-        .map(|p| p.join("joi").join("services"))
-        .unwrap_or_else(|| {
-            PathBuf::from(".")
-                .join(".config")
-                .join("joi")
-                .join("services")
-        })
+    config::service_specs_dir()
 }
 
 /// Load every ServiceSpec under `dir`. Accepts two layouts:
@@ -200,8 +194,8 @@ pub fn start(
     use proto::methods::ServiceLifecycle;
 
     let dir = specs_dir.unwrap_or_else(default_specs_dir);
-    let specs = load_specs(&dir)
-        .with_context(|| format!("load ServiceSpecs from {}", dir.display()))?;
+    let specs =
+        load_specs(&dir).with_context(|| format!("load ServiceSpecs from {}", dir.display()))?;
     let spec = specs
         .into_iter()
         .find(|s| s.id == spec_id)
@@ -214,13 +208,18 @@ pub fn start(
         );
     }
     let params_value: serde_json::Value = match params {
-        Some(s) => serde_json::from_str(&s)
-            .with_context(|| format!("--params must be valid JSON: {s}"))?,
+        Some(s) => {
+            serde_json::from_str(&s).with_context(|| format!("--params must be valid JSON: {s}"))?
+        }
         None => serde_json::json!({}),
     };
     if let Some(schema) = spec.params_schema.as_ref() {
-        validate_params(&params_value, schema)
-            .with_context(|| format!("--params failed ServiceSpec.params_schema for `{}`", spec.id))?;
+        validate_params(&params_value, schema).with_context(|| {
+            format!(
+                "--params failed ServiceSpec.params_schema for `{}`",
+                spec.id
+            )
+        })?;
     }
     let req = crate::service::instance::InstanceRequest {
         version: 1,
@@ -311,7 +310,10 @@ pub fn status(spec_id: Option<String>) -> Result<()> {
         });
         crate::render::print_json(&payload);
     } else if summary.is_empty() {
-        println!("no active thread-bound instances under {}", data_root.display());
+        println!(
+            "no active thread-bound instances under {}",
+            data_root.display()
+        );
     } else {
         for (s, ids) in &summary {
             if ids.is_empty() {
@@ -355,7 +357,9 @@ fn validate_params(params: &serde_json::Value, schema: &serde_json::Value) -> Re
     if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
         for (key, decl) in props {
             let Some(value) = obj.get(key) else { continue };
-            let Some(want) = decl.get("type").and_then(|v| v.as_str()) else { continue };
+            let Some(want) = decl.get("type").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let ok = match want {
                 "string" => value.is_string(),
                 "number" => value.is_f64() || value.is_i64() || value.is_u64(),
@@ -404,7 +408,9 @@ mod params_schema_tests {
     #[test]
     fn err_when_required_missing() {
         let schema = json!({"required": ["mr_url"]});
-        let err = validate_params(&json!({}), &schema).unwrap_err().to_string();
+        let err = validate_params(&json!({}), &schema)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("missing required"), "{err}");
         assert!(err.contains("mr_url"), "{err}");
     }

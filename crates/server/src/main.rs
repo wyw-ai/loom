@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
 
     // Stream broadcaster (store events -> stream/update notifications).
     ws::spawn_stream_broadcaster(state.clone());
+    spawn_reminder_worker(state.clone());
 
     let app = Router::new()
         .route("/rpc", get(ws::ws_upgrade))
@@ -75,6 +76,19 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_reminder_worker(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let fired = state.store.fire_due_reminders();
+            for reminder in fired {
+                tracing::debug!(reminder = %reminder.id, "reminder processed");
+            }
+        }
+    });
 }
 
 fn init_tracing() {

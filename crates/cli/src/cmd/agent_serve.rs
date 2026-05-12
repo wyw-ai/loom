@@ -1,11 +1,10 @@
-//! `joi agent serve` — external agent runtime client (v1 phase E3c).
+//! Daemon agent worker internals.
 //!
-//! Loads `AgentSpec` JSON files from `~/.config/joi/agents/` (override with
-//! `--specs`), and for each spec opens a dedicated WebSocket to the joi server
-//! and supervises that one agent through the same `agent-runtime` adapter trait
-//! used by ACP/command transports.
+//! `joi daemon` synthesizes `AgentSpec`s from the desktop machine config and
+//! uses this module to open a dedicated WebSocket per agent, then supervise
+//! that one agent through the shared `agent-runtime` adapter trait.
 //!
-//! Architecture (per docs/architecture.md §6):
+//! Architecture (per docs/architecture-v1-agent-client.md §6):
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
 //!   * `connection/open` with `actorKind = "agent"` binds the connection to the
 //!     agent's actor id; the server's actor-inbox delivery (see
@@ -31,7 +30,7 @@ use proto::methods::{
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus,
+    ActorKind, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,12 +41,14 @@ use tokio::time::{sleep, Duration};
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
+use agent_runtime::usage;
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
-    validate_bundle_current, Adapter, AdapterEvent, AdapterPrompt,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, TokenUsage,
 };
 
 use crate::client::Client;
+use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
@@ -68,40 +69,14 @@ pub async fn run(
     let total_loaded = specs.len();
     if !allow_actors.is_empty() {
         let allow: HashSet<&str> = allow_actors.iter().map(String::as_str).collect();
-        let (kept, skipped): (Vec<_>, Vec<_>) = specs
-            .into_iter()
-            .partition(|s| allow.contains(s.actor.id.as_str()));
-        specs = kept;
-        let skipped_ids: Vec<&str> = skipped.iter().map(|s| s.actor.id.as_str()).collect();
-        let unknown: Vec<&str> = allow_actors
-            .iter()
-            .map(String::as_str)
-            .filter(|id| !specs.iter().any(|s| s.actor.id == *id))
-            .collect();
-        eprintln!(
-            "joi agent serve: --allow-actors filter active; loaded {} of {} agent(s){}{}",
-            specs.len(),
-            total_loaded,
-            if skipped_ids.is_empty() {
-                String::new()
-            } else {
-                format!("; skipped: {}", skipped_ids.join(","))
-            },
-            if unknown.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; warning: requested ids with no matching spec: {}",
-                    unknown.join(",")
-                )
-            },
-        );
+        specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
     if specs.is_empty() {
         return Err(anyhow!(
-            "no agent specs to serve under {} (loaded {}, after --allow-actors filter: 0)",
+            "no agent specs to serve under {} (loaded {}, after --allow-actors filter: {})",
             specs_dir.display(),
             total_loaded,
+            specs.len(),
         ));
     }
 
@@ -116,27 +91,16 @@ pub async fn run(
         let root = data_root.clone();
         let actor = spec.actor.id.clone();
         let specs_dir_for_task = specs_dir.clone();
-        let initial_spec = spec.clone();
         handles.push(tokio::spawn(async move {
             let mut attempt = 0u32;
-            // Local-fs reload marker — bumped by `joi agent reload`.
-            // We snapshot the epoch before each worker spawn and a
-            // dedicated watcher aborts the worker when the file
-            // advances past that snapshot. Next loop iter then
-            // re-loads the spec from disk before respawning.
             let marker = crate::cmd::reload::agent_marker_path(&root, &actor);
-            let mut last_spec = initial_spec;
+            let mut last_spec = spec;
             loop {
                 attempt = attempt.saturating_add(1);
                 let delay = reconnect_delay(attempt);
-                // Re-read spec before each spawn so a `reload` picks
-                // up edits to <specs_dir>/<actor>.json without a host
-                // restart. On parse error fall back to the last good
-                // spec — operators shouldn't lose a running worker
-                // because of a typo.
                 let spec_for_run = match reload_spec(&specs_dir_for_task, &actor) {
-                    Ok(Some(s)) => {
-                        last_spec = s;
+                    Ok(Some(next)) => {
+                        last_spec = next;
                         last_spec.clone()
                     }
                     Ok(None) => last_spec.clone(),
@@ -148,15 +112,11 @@ pub async fn run(
                     }
                 };
                 let baseline_epoch = crate::cmd::reload::read_epoch(&marker);
-
-                let server_clone = server.clone();
-                let root_clone = root.clone();
                 let worker = tokio::spawn(run_agent_worker(
                     spec_for_run,
-                    server_clone,
-                    root_clone,
+                    server.clone(),
+                    root.clone(),
                 ));
-
                 let watcher_marker = marker.clone();
                 let worker_abort = worker.abort_handle();
                 let actor_for_watch = actor.clone();
@@ -177,7 +137,6 @@ pub async fn run(
                 let join_result = worker.await;
                 watcher.abort();
                 let _ = watcher.await;
-
                 match join_result {
                     Ok(Ok(())) => {
                         attempt = 0;
@@ -192,32 +151,71 @@ pub async fn run(
                             delay.as_secs()
                         );
                     }
+                    Err(join_err) if join_err.is_cancelled() => {
+                        attempt = 0;
+                        eprintln!("[{actor}] worker aborted for reload; respawning");
+                        continue;
+                    }
                     Err(join_err) => {
-                        if join_err.is_cancelled() {
-                            // Cancelled by the reload watcher — no
-                            // backoff, respawn promptly.
-                            attempt = 0;
-                            eprintln!("[{actor}] worker aborted for reload; respawning");
-                            continue;
-                        } else {
-                            eprintln!(
-                                "[{actor}] worker task panicked: {join_err}; reconnecting in {}s",
-                                delay.as_secs()
-                            );
-                        }
+                        eprintln!(
+                            "[{actor}] worker task panicked: {join_err}; reconnecting in {}s",
+                            delay.as_secs()
+                        );
                     }
                 }
                 sleep(delay).await;
             }
         }));
     }
-    eprintln!("joi agent serve: ready (ctrl-c to stop)");
-    let _ = tokio::signal::ctrl_c().await;
-    eprintln!("\njoi agent serve: shutting down");
-    for h in handles {
-        h.abort();
+
+    futures_util::future::pending::<()>().await;
+    #[allow(unreachable_code)]
+    {
+        for handle in handles {
+            handle.abort();
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+pub fn spawn_agent_worker_loop(
+    spec: AgentSpec,
+    server_url: String,
+    data_root: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    let actor = spec.actor.id.clone();
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let delay = reconnect_delay(attempt);
+            match run_agent_worker(spec.clone(), server_url.clone(), data_root.clone()).await {
+                Ok(()) => {
+                    attempt = 0;
+                    eprintln!(
+                        "[{actor}] worker disconnected; reconnecting in {}s",
+                        delay.as_secs()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[{actor}] worker exited with error: {e}; reconnecting in {}s",
+                        delay.as_secs()
+                    );
+                }
+            }
+            sleep(delay).await;
+        }
+    })
+}
+
+pub fn spawn_machine_host_loop(
+    host: MachineHostSpec,
+    server_url: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_machine_host_loop(host, server_url).await;
+    })
 }
 
 fn reconnect_delay(attempt: u32) -> Duration {
@@ -225,39 +223,30 @@ fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs((RECONNECT_BASE_DELAY_SECS << shift).min(RECONNECT_MAX_DELAY_SECS))
 }
 
-/// The path to *this* joi binary. Used as the `command` for the
-/// auto-injected `joi-memory` MCP server entry; falls back to the bare
-/// name `"joi"` (hoping it's on PATH) if we can't resolve our own exe.
-fn current_joi_binary() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .or_else(|| Some(PathBuf::from("joi")))
-}
-
-fn default_specs_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+pub(crate) fn default_data_root_pub() -> PathBuf {
+    default_data_root()
 }
 
 fn default_data_root() -> PathBuf {
-    for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            if !value.is_empty() {
-                return PathBuf::from(value);
-            }
+    if let Ok(s) = std::env::var("JOI_AGENT_DATA_ROOT") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
         }
     }
-    dirs::home_dir()
-        .map(|d| d.join(".agentx"))
-        .unwrap_or_else(|| PathBuf::from(".agentx"))
+    dirs::data_dir()
+        .map(|d| d.join("joi").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".joi").join("agents-data"))
 }
 
-/// Crate-public alias for `default_data_root`. Other `cmd::` modules
-/// (e.g. `cmd::agent::reload`) need to resolve the same path so the
-/// reload marker lands where this host will look for it.
-pub(crate) fn default_data_root_pub() -> PathBuf {
-    default_data_root()
+fn default_specs_dir() -> PathBuf {
+    if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    dirs::config_dir()
+        .map(|d| d.join("joi").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
 }
 
 fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
@@ -281,20 +270,15 @@ fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
         };
         let text = std::fs::read_to_string(&target)
             .with_context(|| format!("read {}", target.display()))?;
-        warn_deprecated_transport_fields(&text, &target);
         match serde_json::from_str::<AgentSpec>(&text) {
             Ok(spec) => out.push(spec),
             Err(e) => eprintln!("[warn] skipping {}: {}", target.display(), e),
         }
     }
+    out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
     Ok(out)
 }
 
-/// Re-read an AgentSpec for `actor_id` from `specs_dir`. Tries the
-/// nested layout `<dir>/<actor_id>/spec.json` first, falling back to
-/// the legacy flat `<dir>/<actor_id>.json`. `Ok(None)` if neither
-/// exists (deleted between startup and reload — supervisor keeps the
-/// last known good spec). `Err` on real I/O or parse errors.
 fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
     let nested = specs_dir.join(actor_id).join("spec.json");
     let flat = specs_dir.join(format!("{actor_id}.json"));
@@ -310,49 +294,84 @@ fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
     };
-    warn_deprecated_transport_fields(&text, &path);
-    let spec: AgentSpec = serde_json::from_str(&text)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let spec: AgentSpec =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(spec))
 }
 
-fn warn_deprecated_transport_fields(text: &str, path: &Path) {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
-    if value
-        .get("transport")
-        .and_then(|transport| transport.get("cwd"))
-        .is_some()
-    {
-        eprintln!(
-            "[warn] {}: transport.cwd is ignored; Joi computes ACP session cwd \
-             from the target channel/thread workspace",
-            path.display()
-        );
-    }
+/// The path to *this* joi binary. Used as the `command` for the
+/// auto-injected `joi-memory` MCP server entry; falls back to the bare
+/// name `"joi"` (hoping it's on PATH) if we can't resolve our own exe.
+fn current_joi_binary() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .or_else(|| Some(PathBuf::from("joi")))
+}
 
-    let transport = value
-        .get("transport")
-        .and_then(|transport| transport.as_object());
-    let command = transport
-        .and_then(|transport| transport.get("command"))
-        .and_then(|command| command.as_str());
-    const ZED_QODERCLI_ACP_VERSION: &str = "0.1.48";
-    let qodercli_pin = transport
-        .and_then(|transport| transport.get("args"))
-        .and_then(|args| args.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|arg| arg.as_str())
-        .find_map(|arg| arg.strip_prefix("@qoder-ai/qodercli@"));
-    if command == Some("npx") && qodercli_pin.is_some_and(|pin| pin != ZED_QODERCLI_ACP_VERSION) {
-        eprintln!(
-            "[warn] {}: pinned @qoder-ai/qodercli version differs from Zed \
-             registry ({ZED_QODERCLI_ACP_VERSION}); Qoder ACP auth may fail \
-             even when Zed works",
-            path.display(),
-        );
+#[derive(Debug, Clone)]
+pub struct MachineHostSpec {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub display_name: String,
+}
+
+async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
+    let mut attempt = 0u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let delay = reconnect_delay(attempt);
+        match run_machine_host_once(&host, &server_url).await {
+            Ok(()) => {
+                attempt = 0;
+                eprintln!(
+                    "[{}] machine host disconnected; reconnecting in {}s",
+                    host.machine_id,
+                    delay.as_secs()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] machine host exited with error: {e:#}; reconnecting in {}s",
+                    host.machine_id,
+                    delay.as_secs()
+                );
+            }
+        }
+        sleep(delay).await;
+    }
+}
+
+async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Result<()> {
+    let client = Client::connect(server_url).await?;
+    client.initialize().await?;
+    let _: Value = client
+        .call(
+            method::ACTOR_UPSERT,
+            json!({
+                "actor": {
+                    "id": &host.actor_id,
+                    "kind": "service",
+                    "displayName": &host.display_name,
+                    "_meta": {
+                        "role": "machine",
+                        "machineId": &host.machine_id,
+                    },
+                },
+            }),
+        )
+        .await
+        .with_context(|| format!("actor/upsert for machine {}", host.machine_id))?;
+    client
+        .open_connection_as(&host.actor_id, "service", Some(&host.display_name))
+        .await?;
+    eprintln!(
+        "[{}] machine host connected to {} as {}",
+        host.machine_id, server_url, host.actor_id
+    );
+
+    loop {
+        sleep(Duration::from_secs(15)).await;
+        let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
     }
 }
 
@@ -373,24 +392,9 @@ struct ScopePaths {
     channel_root: PathBuf,
     channel_shared: PathBuf,
     channel_artifacts: PathBuf,
-    /// `channels/<cid>/threads/<tid>/shared/` — only meaningful when the
-    /// scope kind is Thread. For Channel scopes this still resolves so
-    /// callers can compute it, but agent_serve does not auto-provision it.
-    thread_shared: Option<PathBuf>,
     agent_root: PathBuf,
     workspace: PathBuf,
-    /// Shared (per-scope) skills directory: `workspaces/<kind>/<id>/skills/`.
-    /// All actors mounted into the same scope project this same dir into
-    /// their own workspace as `<workspace>/skills`.
     skills: PathBuf,
-    /// Per-actor skill projection root inside the actor workspace:
-    /// `<workspace>/.joi/skills/<actor_id>/`. The agent's own bundle
-    /// `skills/` dir is symlinked here so that when the actor is moved
-    /// between workspaces (e.g. handed off into a thread) its private
-    /// skills travel with it without polluting the shared scope dir.
-    actor_skills: PathBuf,
-    /// `<workspace>/.joi/state/` — scope.json + cursors live here.
-    state_dir: PathBuf,
     logs: PathBuf,
 }
 
@@ -424,25 +428,12 @@ impl AgentPaths {
         let channel_shared = channel_root.join("shared");
         let channel_artifacts = channel_shared.join("artifacts");
         let agent_root = channel_root.join("agents").join(actor_id);
-        let workspace = agent_root.join("workspace");
-        let thread_shared = match scope_ref.kind {
-            ScopeKind::Thread => Some(
-                channel_root
-                    .join("threads")
-                    .join(&scope_ref.id)
-                    .join("shared"),
-            ),
-            ScopeKind::Channel => None,
-        };
         ScopePaths {
             channel_root,
             channel_shared,
             channel_artifacts,
-            thread_shared,
             skills: self.scope_skills_dir(scope_ref),
-            actor_skills: workspace.join(".joi").join("skills").join(actor_id),
-            state_dir: workspace.join(".joi").join("state"),
-            workspace,
+            workspace: agent_root.join("workspace"),
             logs: agent_root.join("logs"),
             agent_root,
         }
@@ -458,16 +449,20 @@ impl AgentPaths {
         std::fs::create_dir_all(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
         if spec.identity.is_some() || spec.memory.is_some() {
-            let identity_file = spec
-                .identity
-                .as_ref()
+            let identity = spec.identity.as_ref();
+            let identity_file = identity
                 .map(|s| s.files.identity.as_str())
                 .unwrap_or("identity.md");
-            let soul_file = spec
-                .identity
-                .as_ref()
-                .map(|s| s.files.soul.as_str())
-                .unwrap_or("soul.md");
+            let soul_file = identity.map(|s| s.files.soul.as_str()).unwrap_or("soul.md");
+            let description = identity
+                .and_then(|s| s.description.as_deref())
+                .unwrap_or("");
+            let identity_seed = identity
+                .and_then(|s| s.scaffold.as_ref())
+                .and_then(|s| s.identity.as_deref());
+            let soul_seed = identity
+                .and_then(|s| s.scaffold.as_ref())
+                .and_then(|s| s.soul.as_deref());
             let memory_root = spec
                 .memory
                 .as_ref()
@@ -478,10 +473,12 @@ impl AgentPaths {
                     profile_dir: &self.profile,
                     actor_id,
                     display_name: &spec.actor.display_name,
-                    description: "",
+                    description,
                     identity_file,
                     soul_file,
                     memory_root,
+                    identity_seed,
+                    soul_seed,
                 })
             {
                 tracing::warn!(actor = %actor_id, %e, "failed to scaffold profile");
@@ -533,21 +530,13 @@ impl AgentPaths {
         actor_id: &str,
         channel_id: &str,
         scope_ref: &ScopeRef,
-        bundle_paths: Option<&BundlePaths>,
     ) -> std::io::Result<ScopePaths> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         std::fs::create_dir_all(&scope.workspace)?;
         std::fs::create_dir_all(&scope.logs)?;
         std::fs::create_dir_all(&scope.channel_artifacts)?;
-        if let Some(thread_shared) = scope.thread_shared.as_ref() {
-            std::fs::create_dir_all(thread_shared)?;
-        }
-        std::fs::create_dir_all(&scope.state_dir)?;
         ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
-        ensure_actor_skills_link(&scope.actor_skills, bundle_paths)?;
         agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
-        write_scope_json(&scope, actor_id, channel_id, scope_ref)?;
-        project_mounts(&scope)?;
         Ok(scope)
     }
 
@@ -576,12 +565,9 @@ impl AgentPaths {
             "agent.bundle".into(),
             self.bundle_current.display().to_string(),
         );
-        let skill_path = self.bundle_current.join("SKILL.md");
-        if let Ok(skill_body) = std::fs::read_to_string(&skill_path) {
-            vars.insert("agent.skillBody".into(), skill_body);
-        } else {
-            vars.insert("agent.skillBody".into(), String::new());
-        }
+        let skill_body =
+            std::fs::read_to_string(self.bundle_current.join("SKILL.md")).unwrap_or_default();
+        vars.insert("agent.skillBody".into(), skill_body);
         vars.insert(
             "channel.root".into(),
             scope.channel_root.display().to_string(),
@@ -594,11 +580,6 @@ impl AgentPaths {
             "channel.sharedArtifacts".into(),
             scope.channel_artifacts.display().to_string(),
         );
-        if let Some(thread_shared) = scope.thread_shared.as_ref() {
-            vars.insert("thread.shared".into(), thread_shared.display().to_string());
-        }
-        vars.insert("agent.actorSkills".into(), scope.actor_skills.display().to_string());
-        vars.insert("agent.stateDir".into(), scope.state_dir.display().to_string());
         vars
     }
 
@@ -608,11 +589,27 @@ impl AgentPaths {
         channel_id: &str,
         scope_ref: &ScopeRef,
         server_url: &str,
+        active: Option<&ActiveTurn>,
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut env = BTreeMap::new();
         env.insert("JOI_SERVER".into(), server_url.to_string());
+        if let Some(socket) = daemon_ipc::env_socket_path() {
+            env.insert(
+                daemon_ipc::ENV_DAEMON_SOCKET.into(),
+                socket.display().to_string(),
+            );
+        }
         env.insert("JOI_ACTOR".into(), actor_id.to_string());
+        env.insert("JOI_SCOPE_ID".into(), scope_ref.id.clone());
+        env.insert(
+            "JOI_SCOPE_KIND".into(),
+            scope_kind_name(scope_ref.kind).to_string(),
+        );
+        if let Some(active) = active {
+            env.insert("JOI_TURN_ID".into(), active.id.clone());
+            env.insert("JOI_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+        }
         env.insert(
             "JOI_AGENT_PROFILE".into(),
             self.profile.display().to_string(),
@@ -651,28 +648,6 @@ impl AgentPaths {
             "JOI_SCOPE_SKILLS_DIR".into(),
             scope.skills.display().to_string(),
         );
-        env.insert(
-            "JOI_AGENT_SKILLS_DIR".into(),
-            scope.actor_skills.display().to_string(),
-        );
-        env.insert(
-            "JOI_SCOPE_WORKSPACE_DIR".into(),
-            scope.workspace.display().to_string(),
-        );
-        env.insert(
-            "JOI_CHANNEL_WORKSPACE_DIR".into(),
-            scope.channel_shared.display().to_string(),
-        );
-        if let Some(thread_shared) = scope.thread_shared.as_ref() {
-            env.insert(
-                "JOI_THREAD_WORKSPACE_DIR".into(),
-                thread_shared.display().to_string(),
-            );
-        }
-        env.insert("JOI_CHANNEL_ID".into(), channel_id.to_string());
-        env.insert("JOI_SCOPE_KIND".into(), scope_kind_name(scope_ref.kind).to_string());
-        env.insert("JOI_SCOPE_ID".into(), scope_ref.id.clone());
-        env.insert("JOI_SCOPE_STATE_DIR".into(), scope.state_dir.display().to_string());
         env
     }
 
@@ -701,406 +676,6 @@ fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::
         Err(_) => remove_path_if_exists(&link_path)?,
     }
     symlink_path(skills_target, &link_path)
-}
-
-/// Project the agent's own bundle `skills/` directory under
-/// `<workspace>/.joi/skills/<actor_id>/`. When the bundle has no skills
-/// directory we still ensure the parent dir exists so callers can drop a
-/// note there explaining why the projection is empty.
-fn ensure_actor_skills_link(actor_skills: &Path, bundle_paths: Option<&BundlePaths>) -> std::io::Result<()> {
-    if let Some(parent) = actor_skills.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let Some(bundle) = bundle_paths else {
-        // No bundle declared — clear any stale link so we don't point at a
-        // path that no longer exists, but leave the parent dir behind.
-        if actor_skills.exists() || std::fs::read_link(actor_skills).is_ok() {
-            remove_path_if_exists(actor_skills)?;
-        }
-        return Ok(());
-    };
-    let target = bundle.current.join("skills");
-    if !target.exists() {
-        // Bundle is installed but ships no skills/ subdir: nothing to project.
-        if std::fs::read_link(actor_skills).is_ok() {
-            remove_path_if_exists(actor_skills)?;
-        }
-        return Ok(());
-    }
-    match std::fs::read_link(actor_skills) {
-        Ok(existing) if existing == target => return Ok(()),
-        Ok(_) => remove_path_if_exists(actor_skills)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => remove_path_if_exists(actor_skills)?,
-    }
-    symlink_path(&target, actor_skills)
-}
-
-/// Write `<workspace>/.joi/state/scope.json` describing the actor's view
-/// of the current scope. Skills and external observers can read this to
-/// learn who they are, what scope they're mounted into, and which mounts
-/// the operator declared.
-///
-/// The function preserves `mounts` and `resident_threads` arrays/objects
-/// from any existing per-actor scope.json on disk — those keys are
-/// written by thread bootstrap / discovery / artifact triggers (see
-/// design §4.2.1 + §4.7), and `ensure_scope` runs every turn, so we
-/// must not clobber them. When the per-actor file does not yet declare
-/// them, we *seed* from the canonical files written by
-/// `joi thread create --resident-as / --bootstrap-artifact`:
-///
-/// * `mounts` come from the thread-shared scope.json
-///   (`channels/<cid>/threads/<tid>/shared/.joi/state/scope.json`).
-/// * `resident_threads` come from the channel-shared scope.json
-///   (`channels/<cid>/shared/.joi/state/scope.json`).
-///
-/// The canonical fields (actor_id, channel_id, scope, paths) are
-/// always rewritten from the current inputs.
-fn write_scope_json(
-    scope: &ScopePaths,
-    actor_id: &str,
-    channel_id: &str,
-    scope_ref: &ScopeRef,
-) -> std::io::Result<()> {
-    use serde_json::{json, Value};
-    let path = scope.state_dir.join("scope.json");
-    let (mut mounts, mut resident_threads) = match std::fs::read_to_string(&path) {
-        Ok(prev) => match serde_json::from_str::<Value>(&prev) {
-            Ok(v) => (
-                v.get("mounts").cloned().unwrap_or_else(|| Value::Array(vec![])),
-                v.get("resident_threads")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-            ),
-            Err(_) => (Value::Array(vec![]), Value::Object(serde_json::Map::new())),
-        },
-        Err(_) => (Value::Array(vec![]), Value::Object(serde_json::Map::new())),
-    };
-    // Seed mounts from the thread-shared scope.json on first ensure.
-    if matches!(scope_ref.kind, ScopeKind::Thread)
-        && mounts.as_array().map(|a| a.is_empty()).unwrap_or(true)
-    {
-        if let Some(thread_shared) = scope.thread_shared.as_ref() {
-            let canonical = thread_shared.join(".joi").join("state").join("scope.json");
-            if let Ok(body) = std::fs::read_to_string(&canonical) {
-                if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                    if let Some(arr) = v.get("mounts").cloned() {
-                        if arr.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                            mounts = arr;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Seed resident_threads from the channel-shared scope.json.
-    if resident_threads
-        .as_object()
-        .map(|o| o.is_empty())
-        .unwrap_or(true)
-    {
-        let canonical = scope
-            .channel_shared
-            .join(".joi")
-            .join("state")
-            .join("scope.json");
-        if let Ok(body) = std::fs::read_to_string(&canonical) {
-            if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                if let Some(rt) = v.get("resident_threads").cloned() {
-                    if rt.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-                        resident_threads = rt;
-                    }
-                }
-            }
-        }
-    }
-    let payload = json!({
-        "actor_id": actor_id,
-        "channel_id": channel_id,
-        "scope": {
-            "kind": scope_kind_name(scope_ref.kind),
-            "id": scope_ref.id,
-        },
-        "paths": {
-            "workspace": scope.workspace.display().to_string(),
-            "channel_shared": scope.channel_shared.display().to_string(),
-            "thread_shared": scope.thread_shared.as_ref().map(|p| p.display().to_string()),
-            "scope_skills": scope.skills.display().to_string(),
-            "actor_skills": scope.actor_skills.display().to_string(),
-            "logs": scope.logs.display().to_string(),
-        },
-        "mounts": mounts,
-        "resident_threads": resident_threads,
-    });
-    let body = serde_json::to_string_pretty(&payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    std::fs::write(&path, body)
-}
-
-/// Mount declaration parsed out of scope.json. See design §4.2.1.
-#[derive(Debug, Clone)]
-struct MountDecl {
-    name: String,
-    from: String,
-    to: String,
-    #[allow(dead_code)] // honored by callers that want to refuse writes; runtime defaults to symlink.
-    readonly: bool,
-    /// Optional git ref. When the resolved source is a bare git repository,
-    /// `apply_mount` runs `git worktree add` against this ref instead of
-    /// creating a symlink. Defaults to `HEAD`.
-    git_ref: Option<String>,
-}
-
-/// Project every mount listed in `<workspace>/.joi/state/scope.json` into
-/// the scope workspace as a symlink. Best-effort: a single broken mount
-/// logs a warning but does not fail the worker, so a stale clone manifest
-/// can never lock an actor out of its scope.
-fn project_mounts(scope: &ScopePaths) -> std::io::Result<()> {
-    let path = scope.state_dir.join("scope.json");
-    let body = match std::fs::read_to_string(&path) {
-        Ok(b) => b,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::warn!(%err, "scope.json is not valid JSON; skipping mount projection");
-            return Ok(());
-        }
-    };
-    let Some(arr) = parsed.get("mounts").and_then(|v| v.as_array()) else {
-        return Ok(());
-    };
-    for entry in arr {
-        let mount = match parse_mount(entry) {
-            Ok(m) => m,
-            Err(err) => {
-                tracing::warn!(%err, ?entry, "invalid mount entry; skipping");
-                continue;
-            }
-        };
-        if let Err(err) = apply_mount(&scope.workspace, &scope.channel_shared, &mount) {
-            tracing::warn!(%err, name = %mount.name, from = %mount.from, to = %mount.to, "failed to apply mount");
-        }
-    }
-    Ok(())
-}
-
-fn parse_mount(value: &serde_json::Value) -> Result<MountDecl, String> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| "mount entry must be an object".to_string())?;
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "mount.name missing".to_string())?
-        .to_string();
-    let from = obj
-        .get("from")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "mount.from missing".to_string())?
-        .to_string();
-    let to = obj
-        .get("to")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "mount.to missing".to_string())?
-        .to_string();
-    let readonly = obj
-        .get("readonly")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let git_ref = obj
-        .get("ref")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    Ok(MountDecl {
-        name,
-        from,
-        to,
-        readonly,
-        git_ref,
-    })
-}
-
-fn apply_mount(workspace: &Path, channel_shared: &Path, mount: &MountDecl) -> std::io::Result<()> {
-    let dest = sanitize_workspace_relative(workspace, &mount.to)?;
-    let source = resolve_mount_source(&mount.from, channel_shared)?;
-    if !source.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("mount source `{}` does not exist", source.display()),
-        ));
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if is_bare_git_repo(&source) {
-        return apply_git_worktree_mount(&source, &dest, mount);
-    }
-    match std::fs::read_link(&dest) {
-        Ok(existing) if existing == source => return Ok(()),
-        Ok(_) => remove_path_if_exists(&dest)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => remove_path_if_exists(&dest)?,
-    }
-    symlink_path(&source, &dest)
-}
-
-fn is_bare_git_repo(p: &Path) -> bool {
-    p.is_dir() && p.join("HEAD").is_file() && !p.join(".git").exists()
-}
-
-/// Materialise a writable worktree at `dest` using `git worktree add`.
-/// If the destination already contains a worktree linked to `bare`, this
-/// is a no-op. The branch name is derived from the dest leaf so multiple
-/// threads can checkout the same ref without colliding.
-fn apply_git_worktree_mount(
-    bare: &Path,
-    dest: &Path,
-    mount: &MountDecl,
-) -> std::io::Result<()> {
-    if dest.join(".git").exists() {
-        // Best-effort idempotence: assume an existing worktree is fine.
-        return Ok(());
-    }
-    if dest.exists() {
-        // A symlink left over from an earlier projection or stale dir.
-        remove_path_if_exists(dest)?;
-    }
-    let git_ref = mount.git_ref.as_deref().unwrap_or("HEAD");
-    let leaf = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("joi-thread");
-    let branch = format!("joi/{leaf}");
-    // Try creating a new branch from the requested ref. If the branch
-    // already exists (re-projection across restarts), retry without -b.
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(bare)
-        .arg("worktree")
-        .arg("add")
-        .arg("-B")
-        .arg(&branch)
-        .arg(dest)
-        .arg(git_ref)
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-    let status2 = std::process::Command::new("git")
-        .arg("-C")
-        .arg(bare)
-        .arg("worktree")
-        .arg("add")
-        .arg("--detach")
-        .arg(dest)
-        .arg(git_ref)
-        .status()?;
-    if status2.success() {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!(
-            "git worktree add failed for mount `{}` (bare={}, dest={}, ref={})",
-            mount.name,
-            bare.display(),
-            dest.display(),
-            git_ref
-        ),
-    ))
-}
-
-fn sanitize_workspace_relative(workspace: &Path, rel: &str) -> std::io::Result<PathBuf> {
-    use std::path::Component;
-    let p = Path::new(rel);
-    if p.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("mount.to must be relative to workspace, got `{rel}`"),
-        ));
-    }
-    for comp in p.components() {
-        match comp {
-            Component::ParentDir => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("mount.to must not contain `..`: `{rel}`"),
-                ));
-            }
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("mount.to must be a relative path: `{rel}`"),
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(workspace.join(p))
-}
-
-fn resolve_mount_source(uri: &str, channel_shared: &Path) -> std::io::Result<PathBuf> {
-    if let Some(rest) = uri.strip_prefix("channel://") {
-        return Ok(channel_shared.join(strip_leading_slash(rest)));
-    }
-    if let Some(rest) = uri.strip_prefix("thread://") {
-        // Cross-thread mounts require ACL plumbing not yet implemented.
-        let _ = rest;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "thread:// mounts require ACL approval (not yet implemented)",
-        ));
-    }
-    if let Some(rest) = uri.strip_prefix("service://") {
-        let (service_id, sub) = match rest.split_once('/') {
-            Some((s, r)) => (s, r),
-            None => (rest, ""),
-        };
-        if service_id.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("service:// mount missing service id: `{uri}`"),
-            ));
-        }
-        let decoded_service = percent_decode_path_component(service_id);
-        let data_root = crate::service::state::default_data_root();
-        return Ok(crate::service::state::state_dir(&data_root, &decoded_service)
-            .join(percent_decode_path_component(sub).as_str()));
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!("mount.from must use channel:// service:// or thread:// scheme: `{uri}`"),
-    ))
-}
-
-fn strip_leading_slash(s: &str) -> &str {
-    s.strip_prefix('/').unwrap_or(s)
-}
-
-/// Naive percent-decode for path segments. Accepts the small set of
-/// characters that appear in our service ids / repo slugs (e.g. `/`,
-/// `%2F`). Invalid escapes fall through verbatim.
-fn percent_decode_path_component(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 fn ensure_bundle(
@@ -1231,8 +806,11 @@ struct WorkerState {
     /// one-at-a-time when the scope's current turn closes.
     pending_triggers: Mutex<HashMap<String, VecDeque<Event>>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
-    /// `Finished` (and on any non-partial `Text` chunk).
+    /// `Finished`, once final usage metadata is available.
     text_buffer: Mutex<HashMap<String, String>>,
+    /// Provider session usage accumulated per scope. ACP, command, and
+    /// interactive transports all use scope as the session boundary here.
+    usage_totals: Mutex<HashMap<String, TokenUsage>>,
     /// Per-scope first-prompt-seeded set; first prompt for a given scope on a
     /// freshly-started agent gets the bootstrap manifest prepended.
     seeded: Mutex<HashSet<String>>,
@@ -1247,8 +825,8 @@ struct WorkerState {
     seen_events: Mutex<HashSet<String>>,
     /// action.request event id → underlying ACP request id.
     action_map: Mutex<HashMap<String, String>>,
-    /// action.request event id for Joi-owned model selection prompts.
-    model_action_map: Mutex<HashSet<String>>,
+    /// action.request event id → metadata for Joi-owned model selection prompts.
+    model_action_map: Mutex<HashMap<String, ModelActionRequest>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
@@ -1259,6 +837,8 @@ struct ActiveTurn {
     id: String,
     scope: ScopeRef,
     trigger_event_id: String,
+    prompt_stats: PromptStats,
+    prompt_breakdown: PromptBreakdown,
     /// Actor that triggered the current turn — needed when emitting a
     /// `action.request` so we can hand the choice back to them.
     trigger_actor: String,
@@ -1267,6 +847,53 @@ struct ActiveTurn {
     /// Finished(cancelled) arrives so that stale completion cannot close the
     /// next turn in the same scope.
     cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptStats {
+    char_count: usize,
+    byte_count: usize,
+    approx_token_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptBreakdown {
+    sections: Vec<PromptBreakdownSection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptBreakdownSection {
+    key: String,
+    label: String,
+    char_count: usize,
+    byte_count: usize,
+    approx_token_count: u64,
+    percentage: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PromptTelemetry {
+    content: String,
+    stats: PromptStats,
+    breakdown: PromptBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TokenUsageMeta {
+    increment: TokenUsage,
+    cumulative: TokenUsage,
+}
+
+#[derive(Debug, Clone)]
+struct ModelActionRequest {
+    source: ModelActionSource,
+    choices: Vec<AgentModelChoice>,
+}
+
+#[derive(Debug, Clone)]
+enum ModelActionSource {
+    Spec,
+    Adapter { config_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1284,7 +911,7 @@ impl WorkerState {
         agent_server_url: String,
     ) -> Self {
         let selected_model = load_model_state(&profile_dir)
-            .filter(|model| model_is_allowed(&spec, model))
+            .filter(|model| persisted_model_is_allowed(&spec, model))
             .or_else(|| default_model_for_spec(&spec));
         Self {
             actor_id,
@@ -1295,11 +922,12 @@ impl WorkerState {
             active_turns: Mutex::new(HashMap::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
+            usage_totals: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
             seen_events: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
-            model_action_map: Mutex::new(HashSet::new()),
+            model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
         }
     }
@@ -1371,6 +999,13 @@ impl WorkerState {
         buf.remove(turn_id).filter(|s| !s.is_empty())
     }
 
+    fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
+        let mut totals = self.usage_totals.lock().expect("usage_totals poisoned");
+        let total = totals.entry(scope_id.to_string()).or_default();
+        usage::add_usage(total, increment);
+        usage::normalized_usage(total.clone())
+    }
+
     fn take_seed_slot(&self, scope_id: &str) -> bool {
         self.seeded
             .lock()
@@ -1425,23 +1060,39 @@ impl WorkerState {
                 self.actor_id
             ));
         }
+        self.set_current_model_unchecked(model)
+    }
+
+    fn set_current_model_unchecked(&self, model: String) -> Result<()> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err(anyhow!("model cannot be empty for {}", self.actor_id));
+        }
         persist_model_state(&self.profile_dir, &model)?;
         *self.selected_model.lock().expect("selected_model poisoned") = Some(model);
         Ok(())
     }
 
-    fn record_model_action_request(&self, event_id: String) {
+    fn record_model_action_request(&self, event_id: String, request: ModelActionRequest) {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .insert(event_id);
+            .insert(event_id, request);
+    }
+
+    fn lookup_model_action_request(&self, event_id: &str) -> Option<ModelActionRequest> {
+        self.model_action_map
+            .lock()
+            .expect("model_action_map poisoned")
+            .get(event_id)
+            .cloned()
     }
 
     fn is_model_action_request(&self, event_id: &str) -> bool {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .contains(event_id)
+            .contains_key(event_id)
     }
 
     fn forget_model_action_request(&self, event_id: &str) {
@@ -1512,6 +1163,25 @@ fn model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
     model_choices_for_spec(spec)
         .iter()
         .any(|choice| choice.id == model)
+}
+
+fn persisted_model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    if transport_supports_runtime_model_options(spec) {
+        return true;
+    }
+    let choices = model_choices_for_spec(spec);
+    if choices.is_empty() {
+        return true;
+    }
+    choices.iter().any(|choice| choice.id == model)
+}
+
+fn transport_supports_runtime_model_options(spec: &AgentSpec) -> bool {
+    spec.transport.kind == "acp_stdio"
 }
 
 fn model_choices_for_spec(spec: &AgentSpec) -> Vec<AgentModelChoice> {
@@ -1649,6 +1319,15 @@ fn build_adapter(
     command_env
         .entry("JOI_SERVER".into())
         .or_insert_with(|| server_url.to_string());
+    if let Some(socket) = daemon_ipc::env_socket_path() {
+        let socket = socket.display().to_string();
+        process_env
+            .entry(daemon_ipc::ENV_DAEMON_SOCKET.into())
+            .or_insert_with(|| socket.clone());
+        command_env
+            .entry(daemon_ipc::ENV_DAEMON_SOCKET.into())
+            .or_insert(socket);
+    }
     process_env
         .entry("JOI_ACTOR".into())
         .or_insert_with(|| spec.actor.id.clone());
@@ -1801,7 +1480,9 @@ async fn notification_loop(
             continue;
         }
 
-        match handle_control_command(&client, &state, &event).await {
+        match handle_control_command(&client, &state, &adapter, &event_tx, &mut started, &event)
+            .await
+        {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
@@ -1846,12 +1527,22 @@ async fn handle_action_response(
         saw_response_relation = true;
         let request_event_id = relation.target.id.as_str();
         let echoed_request_id = action_request_id_from_response(event);
+        if echoed_request_id
+            .as_deref()
+            .is_some_and(is_joi_tool_request_id)
+        {
+            eprintln!(
+                "[{}] action.response {} is for a joi human-interaction tool {}; leaving it for the waiting tool process",
+                state.actor_id, event.id, request_event_id
+            );
+            return Ok(());
+        }
         if state.is_model_action_request(request_event_id)
             || echoed_request_id
                 .as_deref()
                 .is_some_and(|id| id.starts_with("joi:model:"))
         {
-            handle_model_action_response(client, state, event, request_event_id).await?;
+            handle_model_action_response(client, state, adapter, event, request_event_id).await?;
             return Ok(());
         }
         let request_id = match state.lookup_action_request(request_event_id) {
@@ -1867,7 +1558,7 @@ async fn handle_action_response(
                 None => {
                     eprintln!(
                         "[{}] action.response {} ignored: no pending ACP request for {} \
-                         (agent serve may have restarted after the action.request)",
+                         (joi daemon may have restarted after the action.request)",
                         state.actor_id, event.id, request_event_id
                     );
                     continue;
@@ -1917,9 +1608,14 @@ fn action_request_id_from_response(event: &Event) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn is_joi_tool_request_id(id: &str) -> bool {
+    id.starts_with("joi:question:") || id.starts_with("joi:approval:")
+}
+
 async fn handle_model_action_response(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
     event: &Event,
     request_event_id: &str,
 ) -> Result<()> {
@@ -1938,7 +1634,21 @@ async fn handle_model_action_response(
         return Ok(());
     }
 
-    let Some(choice) = state.model_choice(&option_id) else {
+    let request = state
+        .lookup_model_action_request(request_event_id)
+        .unwrap_or_else(|| ModelActionRequest {
+            source: ModelActionSource::Spec,
+            choices: state.model_choices(),
+        });
+
+    let choice = request
+        .choices
+        .iter()
+        .find(|choice| choice.id == option_id)
+        .cloned()
+        .or_else(|| state.model_choice(&option_id));
+
+    let Some(choice) = choice else {
         eprintln!(
             "[{}] model action.response {} ignored: unknown model `{}`",
             state.actor_id, event.id, option_id
@@ -1946,10 +1656,22 @@ async fn handle_model_action_response(
         state.forget_model_action_request(request_event_id);
         return Ok(());
     };
-    state.set_current_model(option_id.clone())?;
+
+    if let Err(err) =
+        apply_model_selection(state, adapter, event, &request.source, &option_id).await
+    {
+        state.forget_model_action_request(request_event_id);
+        append_model_selection_failure(client, state, event, &choice, &option_id, &err).await?;
+        eprintln!(
+            "[{}] failed to select model `{}` via {}: {}",
+            state.actor_id, option_id, event.id, err
+        );
+        return Ok(());
+    }
     state.forget_model_action_request(request_event_id);
 
     let label = model_choice_label(&choice);
+    let text = model_selection_success_text(&request.source, label, &option_id);
     append_event(
         client,
         "content.add",
@@ -1958,15 +1680,83 @@ async fn handle_model_action_response(
         None,
         json!({
             "contentType": "text/markdown",
-            "text": format!("Model set to `{label}`. New ACP sessions for this agent will use `{option_id}`.")
+            "text": text
         }),
         vec![responds_to(&event.id)],
+        None,
     )
     .await?;
     eprintln!(
         "[{}] selected model `{}` via {}",
         state.actor_id, option_id, event.id
     );
+    Ok(())
+}
+
+fn model_selection_success_text(
+    source: &ModelActionSource,
+    label: &str,
+    option_id: &str,
+) -> String {
+    match source {
+        ModelActionSource::Adapter { .. } => format!(
+            "Model set to `{label}` (`{option_id}`). It has been applied to the current ACP session and saved for future sessions."
+        ),
+        ModelActionSource::Spec => format!(
+            "Model set to `{label}` (`{option_id}`). It is saved for this agent and will be used when Joi creates a new ACP session."
+        ),
+    }
+}
+
+async fn apply_model_selection(
+    state: &WorkerState,
+    adapter: &Arc<dyn Adapter>,
+    event: &Event,
+    source: &ModelActionSource,
+    option_id: &str,
+) -> Result<()> {
+    match source {
+        ModelActionSource::Spec => {
+            state.set_current_model(option_id.to_string())?;
+        }
+        ModelActionSource::Adapter { config_id } => {
+            adapter
+                .set_model_option(
+                    event.scope.clone(),
+                    config_id.clone(),
+                    option_id.to_string(),
+                )
+                .await
+                .map_err(|err| anyhow!("ACP session/set_config_option failed: {err}"))?;
+            state.set_current_model_unchecked(option_id.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn append_model_selection_failure(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    event: &Event,
+    choice: &AgentModelChoice,
+    option_id: &str,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let label = model_choice_label(choice);
+    append_event(
+        client,
+        "content.add",
+        &state.actor_id,
+        &event.scope,
+        None,
+        json!({
+            "contentType": "text/markdown",
+            "text": format!("Failed to set model `{label}` (`{option_id}`): `{err}`.")
+        }),
+        vec![responds_to(&event.id)],
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2026,24 +1816,87 @@ fn is_for_us(event: &Event, actor_id: &str) -> bool {
 async fn handle_control_command(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
     trigger: &Event,
 ) -> Result<bool> {
     match render_prompt(trigger).trim() {
         "/model" | "/models" => {
-            open_model_picker(client, state, trigger).await?;
+            let adapter_start_error =
+                try_ensure_adapter_started(state, adapter, event_tx, started).await;
+            open_model_picker(client, state, adapter, trigger, adapter_start_error).await?;
             Ok(true)
         }
         _ => Ok(false),
     }
 }
 
+async fn try_ensure_adapter_started(
+    state: &WorkerState,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
+) -> Option<String> {
+    if *started {
+        return None;
+    }
+    eprintln!(
+        "[{}] starting adapter for control command (ACP cold-start can take 30-60s)…",
+        state.actor_id
+    );
+    match adapter.start(event_tx.clone()).await {
+        Ok(_) => {
+            *started = true;
+            eprintln!("[{}] adapter ready", state.actor_id);
+            None
+        }
+        Err(err) => {
+            eprintln!(
+                "[{}] adapter start failed for control command: {}",
+                state.actor_id, err
+            );
+            Some(err)
+        }
+    }
+}
+
 async fn open_model_picker(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
     trigger: &Event,
+    adapter_start_error: Option<String>,
 ) -> Result<()> {
-    let choices = state.model_choices();
+    let mut adapter_error = adapter_start_error;
+    let adapter_options = if adapter_error.is_none() {
+        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None).await {
+            Ok(prompt) => match adapter.list_model_options(prompt).await {
+                Ok(options) => options,
+                Err(err) => {
+                    eprintln!(
+                        "[{}] failed to load ACP model options: {}",
+                        state.actor_id, err
+                    );
+                    adapter_error = Some(err);
+                    None
+                }
+            },
+            Err(err) => {
+                adapter_error = Some(err.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (choices, current, source, source_description) =
+        model_picker_choices(state, adapter_options);
     if choices.is_empty() {
+        let mut text = "No model choices are available. The ACP runtime did not return model config options, and this runtime definition does not define model choices.".to_string();
+        if let Some(err) = adapter_error {
+            text.push_str(&format!("\n\nACP model lookup failed: `{err}`"));
+        }
         append_event(
             client,
             "content.add",
@@ -2052,15 +1905,15 @@ async fn open_model_picker(
             None,
             json!({
                 "contentType": "text/markdown",
-                "text": "No model choices are configured for this agent. Add `models.choices` to the agent spec, then restart `joi agent serve`."
+                "text": text
             }),
             vec![responds_to(&trigger.id)],
+            None,
         )
         .await?;
         return Ok(());
     }
 
-    let current = state.current_model();
     let payload_choices = choices
         .iter()
         .map(|choice| {
@@ -2077,7 +1930,7 @@ async fn open_model_picker(
         "requestType": "joi.model.select",
         "title": format!("Choose model for @{}", state.actor_id),
         "description": format!(
-            "Current model: {current_label}\n\nThe selected model is saved for this agent and used when Joi creates ACP sessions."
+            "Current model: {current_label}\n\n{source_description}"
         ),
         "choices": payload_choices,
     });
@@ -2100,14 +1953,55 @@ async fn open_model_picker(
                 _meta: None,
             },
         ],
+        None,
     )
     .await?;
-    state.record_model_action_request(appended.event.id.clone());
+    state.record_model_action_request(
+        appended.event.id.clone(),
+        ModelActionRequest { source, choices },
+    );
     eprintln!(
         "[{}] opened model picker {} for {}",
         state.actor_id, appended.event.id, trigger.actor_id
     );
     Ok(())
+}
+
+fn model_picker_choices(
+    state: &WorkerState,
+    adapter_options: Option<AdapterModelOptions>,
+) -> (
+    Vec<AgentModelChoice>,
+    Option<String>,
+    ModelActionSource,
+    &'static str,
+) {
+    if let Some(options) = adapter_options.filter(|options| !options.choices.is_empty()) {
+        let choices = options
+            .choices
+            .into_iter()
+            .map(|choice| AgentModelChoice {
+                id: choice.id,
+                label: choice.label,
+                description: choice.description,
+            })
+            .collect();
+        return (
+            choices,
+            options.current_value.or_else(|| state.current_model()),
+            ModelActionSource::Adapter {
+                config_id: options.config_id,
+            },
+            "These choices came from the ACP runtime for this session. The selected model is saved locally and applied to the current ACP session.",
+        );
+    }
+
+    (
+        state.model_choices(),
+        state.current_model(),
+        ModelActionSource::Spec,
+        "These choices came from the runtime definition. The selected model is saved for this actor and used when Joi creates ACP sessions.",
+    )
 }
 
 fn responds_to(event_id: &str) -> Relation {
@@ -2160,69 +2054,22 @@ async fn dispatch_handoff(
                 }),
             )
             .await?;
+        let user_text = render_prompt(&trigger);
+        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
         let active = ActiveTurn {
             id: turn_res.turn.id.clone(),
             scope: trigger.scope.clone(),
             trigger_event_id: trigger.id.clone(),
+            prompt_stats: prompt.stats.clone(),
+            prompt_breakdown: prompt.breakdown.clone(),
             trigger_actor: trigger.actor_id.clone(),
             cancel_requested: false,
         };
         state.set_turn(active.clone());
 
-        let raw_user_text = render_prompt(&trigger);
-        let channel_id = resolve_channel_for_scope(client, state, &trigger.scope)
-            .await
-            .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", trigger.scope.id))?;
-        let scope_paths = {
-            let bundle_paths = state.paths.bundle_paths(&state.spec);
-            state
-                .paths
-                .ensure_scope(&state.actor_id, &channel_id, &trigger.scope, Some(&bundle_paths))?
-        };
-        let bundle_current_path = state.paths.bundle_paths(&state.spec).current;
-        // First-turn-per-scope is computed *before* compose_envelope_prompt
-        // because both the seed manifest and prompt_template.firstTurnPrefix
-        // need to fire on the same first turn. We piggy-back on the same
-        // `seeded` set: take_seed_slot returns true exactly once per scope.
-        let first_turn_for_scope = state.take_seed_slot(&trigger.scope.id);
-        let user_text = apply_handoff_trigger_prefix(
-            &state.spec,
-            &trigger,
-            &raw_user_text,
-            first_turn_for_scope,
-        );
-        let inner_prompt = compose_envelope_prompt(
-            client,
-            state,
-            &trigger.scope,
-            &user_text,
-            first_turn_for_scope,
-        )
-        .await;
-        let prompt = apply_prompt_template(
-            &state.spec,
-            &trigger,
-            &channel_id,
-            &scope_paths,
-            &bundle_current_path,
-            &inner_prompt,
-            first_turn_for_scope,
-        );
-        let adapter_prompt = AdapterPrompt {
-            scope: trigger.scope.clone(),
-            content: prompt,
-            model: state.current_model(),
-            cwd: scope_paths.workspace.clone(),
-            env: state.paths.scope_env(
-                &state.actor_id,
-                &channel_id,
-                &trigger.scope,
-                &state.agent_server_url,
-            ),
-            template_vars: state
-                .paths
-                .template_vars(&state.actor_id, &channel_id, &trigger.scope),
-        };
+        let adapter_prompt =
+            build_adapter_prompt(client, state, &trigger.scope, prompt.content, Some(&active))
+                .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
@@ -2244,6 +2091,37 @@ async fn dispatch_handoff(
             }
         }
     }
+}
+
+async fn build_adapter_prompt(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+    content: String,
+    active: Option<&ActiveTurn>,
+) -> Result<AdapterPrompt> {
+    let channel_id = resolve_channel_for_scope(client, state, scope)
+        .await
+        .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
+    let scope_paths = state
+        .paths
+        .ensure_scope(&state.actor_id, &channel_id, scope)?;
+    Ok(AdapterPrompt {
+        scope: scope.clone(),
+        content,
+        model: state.current_model(),
+        cwd: scope_paths.workspace,
+        env: state.paths.scope_env(
+            &state.actor_id,
+            &channel_id,
+            scope,
+            &state.agent_server_url,
+            active,
+        ),
+        template_vars: state
+            .paths
+            .template_vars(&state.actor_id, &channel_id, scope),
+    })
 }
 
 async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &ScopeRef) {
@@ -2273,167 +2151,6 @@ fn render_prompt(trigger: &Event) -> String {
     serde_json::to_string(&trigger.payload).unwrap_or_default()
 }
 
-/// Apply `AgentSpec.handoff.triggerPromptPrefix` (design §5.0). The prefix
-/// is callee-defined: when *anyone* hands off to this agent, the runtime
-/// silently glues the configured slash-command prefix onto the front of
-/// the user message side, so callers don't have to know e.g. that
-/// delivery activates via `/delivery`.
-fn apply_handoff_trigger_prefix(
-    spec: &proto::methods::AgentSpec,
-    trigger: &Event,
-    user_text: &str,
-    first_turn_for_scope: bool,
-) -> String {
-    let Some(handoff) = spec.handoff.as_ref() else {
-        return user_text.to_string();
-    };
-    if handoff.trigger_prompt_prefix.is_empty() {
-        return user_text.to_string();
-    }
-    // Only apply when *this* event is actually a handoff to us. A normal
-    // content.add from a human in the same scope shouldn't get a slash
-    // command stuffed into it.
-    if !is_handoff_targeting(trigger, &spec.actor.id) {
-        return user_text.to_string();
-    }
-    match handoff.apply_on {
-        proto::methods::HandoffApplyOn::FirstTurn if !first_turn_for_scope => {
-            return user_text.to_string()
-        }
-        _ => {}
-    }
-    format!("{}{}", handoff.trigger_prompt_prefix, user_text)
-}
-
-fn is_handoff_targeting(event: &Event, actor_id: &str) -> bool {
-    event.relations.iter().any(|rel| {
-        matches!(rel.kind, RelationKind::HandsOffTo)
-            && matches!(rel.target.kind, RefKind::Actor)
-            && rel.target.id == actor_id
-    })
-}
-
-/// Apply `AgentSpec.promptTemplate` (design §5). Lines from
-/// `everyTurnPrefix` / `firstTurnPrefix` (first turn for this scope only)
-/// are joined with newlines, prepended; `everyTurnSuffix` is appended.
-/// Each line goes through template-var substitution. Variables not bound
-/// here (or in `vars`) are left as literal `{name}` so missing values
-/// never collapse the prompt.
-fn apply_prompt_template(
-    spec: &proto::methods::AgentSpec,
-    trigger: &Event,
-    channel_id: &str,
-    scope_paths: &ScopePaths,
-    bundle_current: &Path,
-    inner_prompt: &str,
-    first_turn_for_scope: bool,
-) -> String {
-    let Some(tmpl) = spec.prompt_template.as_ref() else {
-        return inner_prompt.to_string();
-    };
-    let vars = build_template_vars(spec, trigger, channel_id, scope_paths, bundle_current, tmpl);
-    let render = |lines: &[String]| -> String {
-        lines
-            .iter()
-            .map(|line| substitute_vars(line, &vars))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let mut sections: Vec<String> = Vec::new();
-    if !tmpl.every_turn_prefix.is_empty() {
-        sections.push(render(&tmpl.every_turn_prefix));
-    }
-    if first_turn_for_scope && !tmpl.first_turn_prefix.is_empty() {
-        sections.push(render(&tmpl.first_turn_prefix));
-    }
-    sections.push(inner_prompt.to_string());
-    if !tmpl.every_turn_suffix.is_empty() {
-        sections.push(render(&tmpl.every_turn_suffix));
-    }
-    sections.join("\n\n")
-}
-
-fn build_template_vars(
-    spec: &proto::methods::AgentSpec,
-    trigger: &Event,
-    channel_id: &str,
-    scope_paths: &ScopePaths,
-    bundle_current: &Path,
-    tmpl: &proto::methods::PromptTemplateSpec,
-) -> std::collections::HashMap<String, String> {
-    use std::collections::HashMap;
-    let mut vars: HashMap<String, String> = HashMap::new();
-    vars.insert("actor.id".into(), spec.actor.id.clone());
-    vars.insert(
-        "scope.kind".into(),
-        match trigger.scope.kind {
-            ScopeKind::Channel => "channel".into(),
-            ScopeKind::Thread => "thread".into(),
-        },
-    );
-    vars.insert("scope.id".into(), trigger.scope.id.clone());
-    vars.insert("trigger.id".into(), trigger.id.clone());
-    vars.insert("trigger.actor_id".into(), trigger.actor_id.clone());
-    vars.insert("channel.id".into(), channel_id.to_string());
-    if matches!(trigger.scope.kind, ScopeKind::Thread) {
-        vars.insert("thread.id".into(), trigger.scope.id.clone());
-    } else {
-        vars.insert("thread.id".into(), String::new());
-    }
-    vars.insert(
-        "workspace.dir".into(),
-        scope_paths.workspace.display().to_string(),
-    );
-    vars.insert(
-        "scope.skills".into(),
-        scope_paths.skills.display().to_string(),
-    );
-    vars.insert(
-        "agent.actor_skills".into(),
-        scope_paths.actor_skills.display().to_string(),
-    );
-    if let Some(skill) = &tmpl.active_skill {
-        vars.insert("prompt.activeSkill".into(), skill.clone());
-    }
-    let bundle_current = bundle_current.to_path_buf();
-    vars.insert(
-        "agent.bundle".into(),
-        bundle_current.display().to_string(),
-    );
-    let skill_body = std::fs::read_to_string(bundle_current.join("SKILL.md"))
-        .unwrap_or_default();
-    vars.insert("agent.skillBody".into(), skill_body);
-    for (k, v) in &tmpl.vars {
-        vars.insert(format!("vars.{k}"), v.clone());
-    }
-    vars
-}
-
-fn substitute_vars(
-    line: &str,
-    vars: &std::collections::HashMap<String, String>,
-) -> String {
-    let mut out = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(close) = line[i + 1..].find('}') {
-                let key = &line[i + 1..i + 1 + close];
-                if let Some(value) = vars.get(key) {
-                    out.push_str(value);
-                    i += close + 2;
-                    continue;
-                }
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
-}
-
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
 /// configure identity / memory fall back to the pre-envelope shape.
@@ -2442,28 +2159,46 @@ async fn compose_envelope_prompt(
     state: &Arc<WorkerState>,
     scope: &ScopeRef,
     user_text: &str,
-    first_turn_for_scope: bool,
-) -> String {
-    let scope_bootstrap = if first_turn_for_scope {
-        seed_manifest(&state.actor_id, scope)
-    } else {
-        String::new()
-    };
+) -> PromptTelemetry {
+    let scope_bootstrap =
+        if state.take_seed_slot(&scope.id) || command_transport_without_resume(&state.spec) {
+            seed_manifest(&state.actor_id, scope)
+        } else {
+            String::new()
+        };
 
     let identity_spec = state.spec.identity.as_ref();
     let memory_spec = state.spec.memory.as_ref();
 
     if identity_spec.is_none() && memory_spec.is_none() {
-        return if scope_bootstrap.is_empty() {
-            user_text.to_string()
+        let sections = if scope_bootstrap.is_empty() {
+            vec![agent_runtime::PromptSection {
+                name: "user_message",
+                content: user_text.to_string(),
+            }]
         } else {
-            format!("{scope_bootstrap}\n\n=== User message ===\n{user_text}")
+            vec![
+                agent_runtime::PromptSection {
+                    name: "scope_bootstrap",
+                    content: scope_bootstrap.clone(),
+                },
+                agent_runtime::PromptSection {
+                    name: "user_message",
+                    content: format!("=== User message ===\n{user_text}"),
+                },
+            ]
         };
+        let content = sections
+            .iter()
+            .map(|section| section.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return prompt_telemetry(content, &sections);
     }
 
     let channel_id = resolve_channel_for_scope(client, state, scope).await;
 
-    let (prompt, _sections) =
+    let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             profile_dir: &state.profile_dir,
             identity_spec,
@@ -2473,7 +2208,71 @@ async fn compose_envelope_prompt(
             user_message: user_text,
             scope_bootstrap: &scope_bootstrap,
         });
-    prompt
+    prompt_telemetry(prompt, &sections)
+}
+
+fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) -> PromptTelemetry {
+    let stats = prompt_stats(&content);
+    let mut breakdown_sections: Vec<PromptBreakdownSection> = sections
+        .iter()
+        .filter(|section| !section.content.trim().is_empty())
+        .map(|section| {
+            let stats = prompt_stats(&section.content);
+            PromptBreakdownSection {
+                key: section.name.to_string(),
+                label: prompt_section_label(section.name).to_string(),
+                char_count: stats.char_count,
+                byte_count: stats.byte_count,
+                approx_token_count: stats.approx_token_count,
+                percentage: 0.0,
+            }
+        })
+        .collect();
+    let total_tokens = breakdown_sections
+        .iter()
+        .map(|section| section.approx_token_count)
+        .sum::<u64>()
+        .max(1) as f64;
+    for section in &mut breakdown_sections {
+        section.percentage = (section.approx_token_count as f64 / total_tokens) * 100.0;
+    }
+    PromptTelemetry {
+        content,
+        stats,
+        breakdown: PromptBreakdown {
+            sections: breakdown_sections,
+        },
+    }
+}
+
+fn prompt_stats(text: &str) -> PromptStats {
+    PromptStats {
+        char_count: text.chars().count(),
+        byte_count: text.len(),
+        approx_token_count: usage::estimate_tokens(text),
+    }
+}
+
+fn prompt_section_label(name: &str) -> &str {
+    match name {
+        "identity" => "Identity",
+        "soul" => "Soul",
+        "bootstrap_memory" => "Bootstrap Memory",
+        "turn_memory" => "Turn Memory",
+        "scope_bootstrap" => "Scope Bootstrap",
+        "user_message" => "Latest Message",
+        other => other,
+    }
+}
+
+fn command_transport_without_resume(spec: &AgentSpec) -> bool {
+    if spec.transport.kind != "command" {
+        return false;
+    }
+    match spec.transport.session.as_ref() {
+        Some(session) => session.first_run_capture.is_none() || session.resume_args.is_none(),
+        None => true,
+    }
 }
 
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
@@ -2528,15 +2327,26 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
     };
     format!(
         "=== System: Joi multi-actor context (auto-injected on session start) ===\n\
-         You are an agent driven by `joi agent serve`.\n\
+         You are an agent driven by `joi daemon`.\n\
          Identity:\n\
            actor id      = {actor_id}\n\
            current scope = {scope_kind}:{scope_id}\n\
          \n\
-         You can shell out to the `joi` CLI for read-only access. JOI_SERVER\n\
-         and JOI_ACTOR are already injected into your env, so commands like:\n\
+         You can shell out to the `joi` CLI for server access. JOI_SERVER,\n\
+         JOI_DAEMON_SOCKET, JOI_ACTOR, JOI_SCOPE_ID, JOI_SCOPE_KIND, JOI_TURN_ID, and JOI_TRIGGER_ACTOR are already injected into your env,\n\
+         so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
            joi --json artifact get <art_id|artifact://...>\n\
+           joi --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
+           joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
+         `joi ask-user-question` is for choices or missing input; its JSON\n\
+         output is the human's answer to your question, not an approval.\n\
+         `joi request-approval` is for approve/reject gates before risky work.\n\
+         continue the current task using `answer.optionId`, `answer.label`, or\n\
+         `answer.text`, and phrase follow-up messages as the user's answer.\n\
+         Message targets use `#<channel_id>` for channels and\n\
+         `#<channel_id>:<root_event_id>` for threads; use\n\
+         `joi --json thread list` to map a thread scope id to that target.\n\
          Use `--json` for machine-readable output and `joi <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\
@@ -2597,7 +2407,7 @@ async fn translate_one(
         AdapterEvent::Text {
             scope: _,
             content,
-            is_partial,
+            is_partial: _,
         } => {
             let Some(active) = active else {
                 tracing::warn!(actor = %actor_id, "Text event without matching active turn; dropping");
@@ -2614,19 +2424,6 @@ async fn translate_one(
                 json!({ "text": content }),
             )
             .await?;
-            if !is_partial {
-                if let Some(text) = state.take_text(&active.id) {
-                    flush_text(
-                        client,
-                        actor_id,
-                        &active.scope,
-                        &active.id,
-                        &active.trigger_event_id,
-                        text,
-                    )
-                    .await?;
-                }
-            }
         }
         AdapterEvent::ToolUse {
             scope: _,
@@ -2694,6 +2491,7 @@ async fn translate_one(
                 Some(&active.id),
                 payload,
                 relations,
+                None,
             )
             .await?;
             state.record_action_request(appended.event.id.clone(), id.clone());
@@ -2724,6 +2522,7 @@ async fn translate_one(
             scope,
             success,
             summary,
+            usage,
         } => {
             let Some(active) = active else {
                 tracing::warn!(
@@ -2736,6 +2535,7 @@ async fn translate_one(
             if active.cancel_requested {
                 let _ = state.take_text(&active.id);
             } else if let Some(text) = state.take_text(&active.id) {
+                let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
                 flush_text(
                     client,
                     actor_id,
@@ -2743,8 +2543,23 @@ async fn translate_one(
                     &active.id,
                     &active.trigger_event_id,
                     text,
+                    Some(meta),
                 )
                 .await?;
+            } else if !success {
+                if let Some(text) = failed_turn_text(&summary) {
+                    let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
+                    flush_text(
+                        client,
+                        actor_id,
+                        &active.scope,
+                        &active.id,
+                        &active.trigger_event_id,
+                        text,
+                        Some(meta),
+                    )
+                    .await?;
+                }
             }
             if !active.cancel_requested {
                 let status = if success {
@@ -2763,6 +2578,7 @@ async fn translate_one(
                         "stopReason": summary,
                     }),
                     vec![],
+                    None,
                 )
                 .await;
                 if let Err(e) = close_turn(client, &active.id, status).await {
@@ -2806,6 +2622,49 @@ async fn translate_one(
     Ok(())
 }
 
+fn failed_turn_text(summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(format!("Agent run failed:\n\n{summary}"))
+    }
+}
+
+fn build_turn_meta(
+    state: &WorkerState,
+    active: &ActiveTurn,
+    provider_usage: Option<&TokenUsage>,
+    output_text: &str,
+) -> Meta {
+    let increment = provider_usage
+        .cloned()
+        .map(usage::normalized_usage)
+        .unwrap_or_else(|| {
+            usage::estimated_usage(active.prompt_stats.approx_token_count, output_text)
+        });
+    let cumulative = state.accumulate_usage(&active.scope.id, &increment);
+    let usage_meta = TokenUsageMeta {
+        increment,
+        cumulative,
+    };
+
+    let mut meta = Meta::new();
+    meta.insert(
+        "prompt_stats".into(),
+        serde_json::to_value(&active.prompt_stats).unwrap_or(Value::Null),
+    );
+    meta.insert(
+        "prompt_breakdown".into(),
+        serde_json::to_value(&active.prompt_breakdown).unwrap_or(Value::Null),
+    );
+    meta.insert(
+        "token_usage".into(),
+        serde_json::to_value(&usage_meta).unwrap_or(Value::Null),
+    );
+    meta
+}
+
 async fn append_trace(
     client: &Arc<Client>,
     turn_id: &str,
@@ -2830,6 +2689,7 @@ async fn append_event(
     turn_id: Option<&str>,
     payload: Value,
     relations: Vec<Relation>,
+    meta: Option<Meta>,
 ) -> Result<EventAppendResult> {
     let mut input = json!({
         "type": kind,
@@ -2840,6 +2700,9 @@ async fn append_event(
     });
     if let Some(t) = turn_id {
         input["turnId"] = json!(t);
+    }
+    if let Some(meta) = meta {
+        input["_meta"] = serde_json::to_value(meta)?;
     }
     let res: EventAppendResult = client
         .call(method::EVENT_APPEND, json!({ "event": input }))
@@ -2855,6 +2718,7 @@ async fn flush_text(
     turn_id: &str,
     trigger_event_id: &str,
     text: String,
+    meta: Option<Meta>,
 ) -> Result<()> {
     let relations = if trigger_event_id.is_empty() {
         vec![]
@@ -2877,6 +2741,7 @@ async fn flush_text(
         Some(turn_id),
         json!({ "contentType": "text/markdown", "text": text }),
         relations,
+        meta,
     )
     .await
     .map(|_| ())
@@ -2952,6 +2817,20 @@ mod tests {
                 .as_nanos()
         ));
         path
+    }
+
+    fn empty_prompt_stats() -> PromptStats {
+        PromptStats {
+            char_count: 0,
+            byte_count: 0,
+            approx_token_count: 0,
+        }
+    }
+
+    fn empty_prompt_breakdown() -> PromptBreakdown {
+        PromptBreakdown {
+            sections: Vec::new(),
+        }
     }
 
     #[test]
@@ -3047,7 +2926,7 @@ mod tests {
         };
 
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None)
+            .ensure_scope("actor_demo", "chan_demo", &scope)
             .expect("ensure scope");
 
         assert_eq!(
@@ -3063,295 +2942,77 @@ mod tests {
     }
 
     #[test]
-    fn ensure_scope_provisions_thread_shared_state_and_actor_skills() {
-        let root = temp_path("scope-bootstrap");
-        let paths = AgentPaths::new(&root, "actor_demo");
-        let scope = ScopeRef {
-            kind: ScopeKind::Thread,
-            id: "thread_demo".into(),
-        };
-
-        // Seed a fake bundle skills dir so the actor-skill projection has
-        // a real target to link to.
-        let bundle_skills = paths.bundle_current.join("skills");
-        std::fs::create_dir_all(&bundle_skills).expect("seed bundle skills");
-        let bundle_paths = BundlePaths {
-            root: paths.bundle_root.clone(),
-            current: paths.bundle_current.clone(),
-            version: "test".into(),
-        };
-
-        let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, Some(&bundle_paths))
-            .expect("ensure scope");
-
-        // Thread-shared dir provisioned for thread scopes.
-        let thread_shared = scope_paths.thread_shared.clone().expect("thread shared");
-        assert!(thread_shared.is_dir());
-        assert_eq!(
-            thread_shared,
-            root.join("channels")
-                .join("chan_demo")
-                .join("threads")
-                .join("thread_demo")
-                .join("shared")
-        );
-
-        // .joi/state/scope.json bootstrapped with canonical fields.
-        let scope_json = scope_paths.state_dir.join("scope.json");
-        assert!(scope_json.is_file());
-        let body = std::fs::read_to_string(&scope_json).expect("read scope.json");
-        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse scope.json");
-        assert_eq!(parsed["actor_id"], "actor_demo");
-        assert_eq!(parsed["channel_id"], "chan_demo");
-        assert_eq!(parsed["scope"]["kind"], "thread");
-        assert_eq!(parsed["scope"]["id"], "thread_demo");
-        assert!(parsed["mounts"].is_array());
-
-        // Per-actor skill projection symlinks the bundle's skills/ dir
-        // into <workspace>/.joi/skills/<actor_id>/.
-        let actor_skill_link =
-            std::fs::read_link(&scope_paths.actor_skills).expect("actor skills link");
-        assert_eq!(actor_skill_link, bundle_skills);
-
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    fn handoff_event_to(actor: &str, scope: &ScopeRef) -> Event {
-        Event {
-            id: "evt_demo".into(),
-            kind: "content.add".into(),
-            actor_id: "actor_caller".into(),
-            scope: scope.clone(),
-            turn_id: None,
-            seq: 1,
-            occurred_at: chrono::Utc::now(),
-            payload: serde_json::json!({"text": "go fix this"}),
-            relations: vec![Relation {
-                kind: RelationKind::HandsOffTo,
-                target: Ref {
-                    kind: RefKind::Actor,
-                    id: actor.into(),
-                    _meta: None,
-                },
-                _meta: None,
-            }],
-            _meta: None,
-        }
-    }
-
-    #[test]
-    fn handoff_trigger_prefix_only_when_targeted_and_applies_per_policy() {
-        let scope = ScopeRef {
-            kind: ScopeKind::Thread,
-            id: "t1".into(),
-        };
-        let mut spec = sample_spec(None);
-        spec.handoff = Some(proto::methods::HandoffSpec {
-            trigger_prompt_prefix: "/delivery\n".into(),
-            apply_on: proto::methods::HandoffApplyOn::EveryTurn,
-        });
-        let trigger_for_us = handoff_event_to(&spec.actor.id, &scope);
-        assert_eq!(
-            apply_handoff_trigger_prefix(&spec, &trigger_for_us, "go", false),
-            "/delivery\ngo"
-        );
-
-        // Different target — no prefix.
-        let trigger_for_other = handoff_event_to("actor_other", &scope);
-        assert_eq!(
-            apply_handoff_trigger_prefix(&spec, &trigger_for_other, "go", false),
-            "go"
-        );
-
-        // first-turn only policy + first_turn=false → no prefix.
-        spec.handoff.as_mut().unwrap().apply_on = proto::methods::HandoffApplyOn::FirstTurn;
-        assert_eq!(
-            apply_handoff_trigger_prefix(&spec, &trigger_for_us, "go", false),
-            "go"
-        );
-        assert_eq!(
-            apply_handoff_trigger_prefix(&spec, &trigger_for_us, "go", true),
-            "/delivery\ngo"
-        );
-    }
-
-    #[test]
-    fn prompt_template_renders_with_vars_and_first_turn_section() {
-        let root = temp_path("prompt-tmpl");
-        let paths = AgentPaths::new(&root, "actor_demo");
-        let scope = ScopeRef {
-            kind: ScopeKind::Thread,
-            id: "thread_demo".into(),
-        };
-        let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None)
-            .unwrap();
-
-        let mut spec = sample_spec(None);
-        let mut vars = std::collections::BTreeMap::new();
-        vars.insert("project".into(), "joi".into());
-        spec.prompt_template = Some(proto::methods::PromptTemplateSpec {
-            active_skill: Some("delivery".into()),
-            every_turn_prefix: vec![
-                "actor: {actor.id}".into(),
-                "scope: {scope.kind}/{scope.id}".into(),
-                "trig: {trigger.id} from {trigger.actor_id}".into(),
-                "ws: {workspace.dir}".into(),
-                "skill: {prompt.activeSkill} project={vars.project}".into(),
-            ],
-            first_turn_prefix: vec!["FIRST".into()],
-            every_turn_suffix: vec!["END".into()],
-            vars,
-        });
-        let trigger = handoff_event_to(&spec.actor.id, &scope);
-        let bundle_dummy = root.join("bundle_dummy");
-
-        let out_first = apply_prompt_template(
-            &spec,
-            &trigger,
-            "chan_demo",
-            &scope_paths,
-            &bundle_dummy,
-            "USER MESSAGE",
-            true,
-        );
-        assert!(out_first.contains("actor: actor_demo"));
-        assert!(out_first.contains("scope: thread/thread_demo"));
-        assert!(out_first.contains("trig: evt_demo from actor_caller"));
-        assert!(out_first.contains("skill: delivery project=joi"));
-        assert!(out_first.contains("FIRST"));
-        assert!(out_first.contains("USER MESSAGE"));
-        assert!(out_first.trim_end().ends_with("END"));
-
-        // Subsequent turn omits firstTurnPrefix.
-        let out_next = apply_prompt_template(
-            &spec,
-            &trigger,
-            "chan_demo",
-            &scope_paths,
-            &bundle_dummy,
-            "USER MESSAGE",
-            false,
-        );
-        assert!(!out_next.contains("FIRST"));
-
-        // Unknown var stays as literal `{...}`.
-        spec.prompt_template
-            .as_mut()
-            .unwrap()
-            .every_turn_prefix
-            .push("missing: {nope.value}".into());
-        let out_missing = apply_prompt_template(
-            &spec,
-            &trigger,
-            "chan_demo",
-            &scope_paths,
-            &bundle_dummy,
-            "USER MESSAGE",
-            true,
-        );
-        assert!(out_missing.contains("missing: {nope.value}"));
-
-        // No template configured → passthrough.
-        spec.prompt_template = None;
-        assert_eq!(
-            apply_prompt_template(
-                &spec,
-                &trigger,
-                "chan_demo",
-                &scope_paths,
-                &bundle_dummy,
-                "RAW",
-                true
-            ),
-            "RAW"
-        );
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn project_mounts_creates_symlink_for_channel_uri() {
-        let root = temp_path("mount-channel");
-        let paths = AgentPaths::new(&root, "actor_demo");
-        let scope = ScopeRef {
-            kind: ScopeKind::Thread,
-            id: "thread_demo".into(),
-        };
-        let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None)
-            .expect("ensure scope");
-
-        // Seed a real path under channel.shared so the mount resolves.
-        let target = scope_paths.channel_shared.join("repos").join("cache");
-        std::fs::create_dir_all(&target).expect("seed channel target");
-
-        // Rewrite scope.json with a mount declaration, then re-run
-        // ensure_scope to trigger projection.
-        let mut current: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(scope_paths.state_dir.join("scope.json"))
-                .expect("read scope.json"),
-        )
-        .expect("parse scope.json");
-        current["mounts"] = serde_json::json!([
-            {
-                "name": "shared-repos",
-                "from": "channel:///repos/cache",
-                "to": "shared/repos",
-                "readonly": true
-            }
-        ]);
-        std::fs::write(
-            scope_paths.state_dir.join("scope.json"),
-            serde_json::to_string_pretty(&current).unwrap(),
-        )
-        .expect("write scope.json");
-
-        let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None)
-            .expect("re-ensure scope");
-
-        let link = scope_paths.workspace.join("shared").join("repos");
-        let resolved = std::fs::read_link(&link).expect("mount link");
-        assert_eq!(resolved, target);
-
-        // Mount survived the rewrite (preserved across ensure_scope calls).
-        let body = std::fs::read_to_string(scope_paths.state_dir.join("scope.json"))
-            .expect("read scope.json again");
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["mounts"][0]["name"], "shared-repos");
-
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn project_mounts_rejects_dotdot_and_absolute_to() {
-        let root = temp_path("mount-bad");
+    fn scope_env_includes_current_scope_identity() {
+        let root = temp_path("scope-env");
         let paths = AgentPaths::new(&root, "actor_demo");
         let scope = ScopeRef {
             kind: ScopeKind::Channel,
             id: "chan_demo".into(),
         };
-        let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None)
-            .expect("ensure scope");
-        std::fs::create_dir_all(scope_paths.channel_shared.join("seed")).expect("seed");
 
-        for bad in &["../escape", "/abs/dest"] {
-            let mount = MountDecl {
-                name: "bad".into(),
-                from: "channel:///seed".into(),
-                to: (*bad).into(),
-                readonly: false,
-                git_ref: None,
-            };
-            let err =
-                apply_mount(&scope_paths.workspace, &scope_paths.channel_shared, &mount)
-                    .expect_err("must reject");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        }
+        let active = ActiveTurn {
+            id: "turn_demo".into(),
+            scope: scope.clone(),
+            trigger_event_id: "evt_trigger".into(),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "human_alice".into(),
+            cancel_requested: false,
+        };
+        let env = paths.scope_env(
+            "actor_demo",
+            "chan_demo",
+            &scope,
+            "ws://127.0.0.1:7891/rpc",
+            Some(&active),
+        );
 
+        assert_eq!(
+            env.get("JOI_SCOPE_ID").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            env.get("JOI_SCOPE_KIND").map(String::as_str),
+            Some("channel")
+        );
+        assert_eq!(
+            env.get("AGENTX_CHANNEL_ID").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            env.get("JOI_TURN_ID").map(String::as_str),
+            Some("turn_demo")
+        );
+        assert_eq!(
+            env.get("JOI_TRIGGER_ACTOR").map(String::as_str),
+            Some("human_alice")
+        );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_transport_without_resume_tracks_session_capability() {
+        let no_session = sample_spec(None);
+        assert!(command_transport_without_resume(&no_session));
+
+        let mut resumable = sample_spec(None);
+        resumable.transport.session = Some(proto::methods::CommandSession {
+            first_run_capture: Some("stdout_json:.session_id".into()),
+            resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
+        });
+        assert!(!command_transport_without_resume(&resumable));
+
+        let mut acp = sample_spec(None);
+        acp.transport.kind = "acp_stdio".into();
+        assert!(!command_transport_without_resume(&acp));
+    }
+
+    #[test]
+    fn joi_human_interaction_request_ids_are_tool_local() {
+        assert!(is_joi_tool_request_id("joi:question:abc"));
+        assert!(is_joi_tool_request_id("joi:approval:abc"));
+        assert!(!is_joi_tool_request_id("joi:model:abc"));
+        assert!(!is_joi_tool_request_id("acp:permission:abc"));
     }
 
     #[test]
@@ -3384,6 +3045,8 @@ mod tests {
             id: "turn_1".into(),
             scope: scope.clone(),
             trigger_event_id: "evt_1".into(),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
             cancel_requested: false,
         });
@@ -3436,6 +3099,132 @@ mod tests {
         );
         assert!(model_is_allowed(&spec, "model_fast"));
         assert!(!model_is_allowed(&spec, "model_missing"));
+    }
+
+    #[test]
+    fn model_picker_prefers_adapter_choices_over_spec_choices() {
+        let mut spec = sample_spec(None);
+        spec.models = Some(AgentModelSpec {
+            default: Some("spec_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "spec_fast".into(),
+                label: "Spec Fast".into(),
+                description: None,
+            }],
+        });
+        let root = temp_path("model-picker-adapter");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let (choices, current, source, _) = model_picker_choices(
+            &state,
+            Some(AdapterModelOptions {
+                config_id: "model".into(),
+                current_value: Some("runtime_sonnet".into()),
+                choices: vec![agent_runtime::AdapterModelChoice {
+                    id: "runtime_sonnet".into(),
+                    label: "Runtime Sonnet".into(),
+                    description: None,
+                }],
+            }),
+        );
+
+        assert_eq!(
+            choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["runtime_sonnet"]
+        );
+        assert_eq!(current.as_deref(), Some("runtime_sonnet"));
+        assert!(matches!(source, ModelActionSource::Adapter { .. }));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persisted_model_loads_when_static_choices_are_absent() {
+        let root = temp_path("dynamic-model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("runtime_sonnet"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn acp_persisted_runtime_model_survives_static_choices() {
+        let root = temp_path("acp-dynamic-model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
+        let mut spec = sample_spec(None);
+        spec.transport.kind = "acp_stdio".into();
+        spec.models = Some(AgentModelSpec {
+            default: Some("spec_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "spec_fast".into(),
+                label: "Spec Fast".into(),
+                description: None,
+            }],
+        });
+
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("runtime_sonnet"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_persisted_model_still_respects_static_choices() {
+        let root = temp_path("command-static-model-state");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        std::fs::create_dir_all(&paths.profile).expect("create profile");
+        persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
+        let mut spec = sample_spec(None);
+        spec.models = Some(AgentModelSpec {
+            default: Some("spec_default".into()),
+            choices: vec![AgentModelChoice {
+                id: "spec_fast".into(),
+                label: "Spec Fast".into(),
+                description: None,
+            }],
+        });
+
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+
+        assert_eq!(state.current_model().as_deref(), Some("spec_default"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_turn_text_uses_non_empty_summary() {
+        assert_eq!(failed_turn_text("   "), None);
+        assert_eq!(
+            failed_turn_text("Not inside a trusted directory").as_deref(),
+            Some("Agent run failed:\n\nNot inside a trusted directory")
+        );
     }
 
     #[test]

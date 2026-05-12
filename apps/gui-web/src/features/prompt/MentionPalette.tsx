@@ -30,9 +30,7 @@ interface Props {
 
 // Returns the set of actor ids the @-menu is allowed to surface for the
 // current scope, or `null` when there's no restriction (public channel, or
-// thread whose parent is public — "公区"-like behavior). Mirrors
-// crates/cli/src/cmd/chat/app.rs::current_channel_membership_ctx +
-// publicly_addressable_actors.
+// thread whose parent is public).
 function resolveAllowedAgents(
   currentScope: ScopeRef | null,
   channels: Channel[],
@@ -56,15 +54,7 @@ function resolveAllowedAgents(
   const ch = channels.find((c) => c.id === channelId);
   if (!ch || ch.visibility !== "private") return null;
 
-  // Private — allow this channel's members + every member of any public
-  // channel we can see (the "公区" fallback).
-  const allow = new Set<string>(ch.members);
-  for (const c of channels) {
-    if (c.visibility === "public") {
-      for (const id of c.members) allow.add(id);
-    }
-  }
-  return allow;
+  return new Set<string>(ch.members);
 }
 
 export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
@@ -76,15 +66,18 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
     const threadsByChannel = useChannels((s) => s.threadsByChannel);
     const [statuses, setStatuses] = useState<Record<string, string>>({});
 
-    // actor/list carries every known actor, including humans that were just
-    // invited to a private channel. agent/list only contributes live status.
+    // actor/list carries every server-known actor. agent/list is the legacy
+    // local spec path; machine/list is the new machine-config path. Merge all
+    // three so freshly configured agents are addressable before the daemon has
+    // reconnected and upserted them on the server.
     useEffect(() => {
       let alive = true;
       (async () => {
         try {
-          const [al, ag] = await Promise.all([
+          const [al, ag, ml] = await Promise.all([
             ipc.actorList().catch(() => ({ actors: [] as never[] })),
             ipc.agentList().catch(() => ({ agents: [] as never[] })),
+            ipc.machineList().catch(() => ({ machines: [] as never[] })),
           ]);
           if (!alive) return;
           if (al.actors.length > 0) {
@@ -98,6 +91,17 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
             for (const a of ag.agents) next[a.spec.actor.id] = a.status;
             setStatuses(next);
           }
+          const machineAgents = ml.machines.flatMap((m) => m.agents);
+          if (machineAgents.length > 0) {
+            useActors
+              .getState()
+              .upsertMany(machineAgents.map((a) => a.spec.actor));
+            setStatuses((current) => {
+              const next = { ...current };
+              for (const a of machineAgents) next[a.spec.actor.id] = a.status;
+              return next;
+            });
+          }
         } catch {
           /* ignore — palette falls back to whatever's cached */
         }
@@ -109,9 +113,8 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
 
     const f = filter.toLowerCase();
     const items = useMemo(() => {
-      // In a private channel the pool is restricted to the channel's members
-      // plus actors reachable via public channels. Public channels/threads
-      // don't restrict — every known actor except self/system is addressable.
+      // In a private channel, keep the picker to current members. Explicit
+      // invitation belongs in the channel invite flow.
       const allow = resolveAllowedAgents(currentScope, channels, threadsByChannel);
 
       const list: Entry[] = [];

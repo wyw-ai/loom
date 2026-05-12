@@ -54,7 +54,7 @@ async fn pick_target(client: &Client) -> Result<String> {
     let mut rows: Vec<PickRow> = actors.actors.into_iter().map(PickRow::from_actor).collect();
     if rows.is_empty() {
         return Err(anyhow!(
-            "no actors known to the server (try `joi agent install <id>` first)"
+            "no actors known to the server (configure a machine agent and start `joi daemon` first)"
         ));
     }
     rows.sort_by(|a, b| a.kind_order().cmp(&b.kind_order()).then(a.id.cmp(&b.id)));

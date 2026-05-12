@@ -150,7 +150,7 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 - `Connection`：Endpoint 和服务器的一次在线连接。
 - `Runtime Session`：Endpoint 内部和模型、工具运行时之间的一次私有会话。
 - `Channel`：顶层共享作用域。
-- `Thread`：`Channel` 下的子作用域，用于局部收敛。
+- `Thread`：`Channel` 公共区某条 root event 下的子作用域，用于局部收敛。
 - `Turn`：某个 Actor 在一个作用域中的一次处理回合。
 - `Event`：不可变事实。
 - `Relation`：事件到事件、事件到 Actor、事件到 Artifact 的显式边。
@@ -179,7 +179,7 @@ Discord、Slack 一类产品证明了 `channel + thread + addressing` 的交互�
 比起直接把 `channel` 和 `thread` 写死，协议更适合统一成：
 
 - `Channel`：顶层作用域。
-- `Thread`：`Channel` 的子作用域。
+- `Thread`：`Channel` 公共区某条 root event 的子作用域，不继续嵌套。
 
 这样做的好处：
 

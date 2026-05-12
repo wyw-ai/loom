@@ -42,15 +42,14 @@ pub fn render_event(event: &Event) {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            // content.add carrying a HandsOffTo relation is a handoff —
-            // surface the target so the line reads `... ↪ → target: text`.
+            // content.add carrying a HandsOffTo relation is a handoff.
             let handoff_target = event
                 .relations
                 .iter()
                 .find(|r| matches!(r.kind, RelationKind::HandsOffTo))
                 .map(|r| r.target.id.as_str());
             match handoff_target {
-                Some(to) => println!("[{ts}] {actor} ↪ → {to}: {text}"),
+                Some(to) => println!("[{ts}] {actor} handoff -> {to}: {text}"),
                 None => println!("[{ts}] {actor}: {text}"),
             }
         }
@@ -84,6 +83,14 @@ pub fn render_event(event: &Event) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             println!("[{ts}] {actor} · turn closed ({status})");
+        }
+        "reminder.fire" => {
+            let title = event
+                .payload
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(reminder)");
+            println!("[{ts}] {actor} reminder: {title}");
         }
         other => {
             println!(

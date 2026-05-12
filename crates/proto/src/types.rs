@@ -10,9 +10,7 @@ pub type Meta = BTreeMap<String, Value>;
 #[serde(rename_all = "lowercase")]
 pub enum RefKind {
     Actor,
-    #[serde(alias = "space")]
     Channel,
-    #[serde(alias = "conversation")]
     Thread,
     Turn,
     Event,
@@ -23,16 +21,14 @@ pub enum RefKind {
 pub struct Ref {
     pub kind: RefKind,
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ScopeKind {
-    #[serde(alias = "space")]
     Channel,
-    #[serde(alias = "conversation")]
     Thread,
 }
 
@@ -59,7 +55,7 @@ pub struct Actor {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -94,7 +90,7 @@ pub struct Channel {
     /// the ACL gate is skipped; for `Private` channels it is authoritative.
     #[serde(default)]
     pub members: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -102,12 +98,10 @@ pub struct Channel {
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
-    #[serde(alias = "spaceId")]
     pub channel_id: String,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_event_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -132,7 +126,7 @@ pub struct Turn {
     pub opened_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<Timestamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -142,9 +136,7 @@ pub enum RelationKind {
     RepliesTo,
     /// "X is meant for actor Y." Machine-routing semantics only exist when a
     /// binding explicitly writes this relation; raw `@handle` text has no
-    /// protocol meaning by itself. The `targets` alias only keeps old journals
-    /// readable.
-    #[serde(alias = "targets")]
+    /// protocol meaning by itself.
     HandsOffTo,
     RespondsTo,
     AttachesArtifact,
@@ -154,7 +146,7 @@ pub enum RelationKind {
 pub struct Relation {
     pub kind: RelationKind,
     pub target: Ref,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -181,7 +173,7 @@ pub struct Event {
     pub payload: Value,
     #[serde(default)]
     pub relations: Vec<Relation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -204,7 +196,7 @@ pub struct Artifact {
     pub checksum: String,
     pub created_by: String,
     pub created_at: Timestamp,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -217,7 +209,7 @@ pub struct Membership {
     pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_read_event_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -236,7 +228,7 @@ pub struct Delivery {
     pub actor_id: String,
     pub state: DeliveryState,
     pub updated_at: Timestamp,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -257,7 +249,37 @@ pub struct Receipt {
     pub actor_id: String,
     pub kind: ReceiptKind,
     pub recorded_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ReminderStatus {
+    Scheduled,
+    Fired,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reminder {
+    pub id: String,
+    pub actor_id: String,
+    pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    pub fire_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
+    pub status: ReminderStatus,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -269,7 +291,7 @@ pub struct Endpoint {
     pub kind: String,
     #[serde(default)]
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -280,7 +302,7 @@ pub struct Connection {
     pub actor_id: String,
     pub endpoint_id: String,
     pub opened_at: Timestamp,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -290,7 +312,7 @@ pub struct PageInfo {
     pub has_more: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -307,7 +329,7 @@ pub mod payload {
         #[serde(default = "default_content_type")]
         pub content_type: String,
         pub text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
         pub _meta: Option<Meta>,
     }
 
@@ -405,7 +427,7 @@ pub mod trace {
         pub occurred_at: Timestamp,
         #[serde(default)]
         pub payload: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
         pub _meta: Option<Meta>,
     }
 }

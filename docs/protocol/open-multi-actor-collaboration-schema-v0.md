@@ -48,6 +48,7 @@
 - `Membership`
 - `Delivery`
 - `Receipt`
+- `Reminder`
 
 ### 3.2 Schema 层
 
@@ -74,6 +75,7 @@
 - Agent 可以通过 CLI、MCP 或 SDK 间接调用 schema。
 - 不同 binding 的交互手感可以不同，但提交给 server 的动作必须映射到同一套 schema 方法。
 - 文本里的 `@handle` 属于 binding 层输入语法；除非 binding 显式映射为 `hands_off_to`，schema 不为其赋予机器语义。
+- Binding 层对同一语义只保留一个 canonical 命名；不要求为了兼容旧拼法继续暴露同义 alias。
 
 ## 4. 默认绑定约定
 
@@ -194,8 +196,16 @@ v0 推荐 JSON-RPC 2.0 作为默认 binding 形状，理由是：
       "thread": { "create": true },
       "turn": { "explicit": true },
       "event": { "append": true },
+      "message": { "search": true },
       "artifact": { "publish": true, "get": true, "read": true },
       "handoff": { "create": true },
+      "reminder": {
+        "schedule": true,
+        "list": true,
+        "cancel": true,
+        "snooze": true,
+        "update": true
+      },
       "receipt": { "record": true }
     }
   }
@@ -221,8 +231,16 @@ v0 推荐 JSON-RPC 2.0 作为默认 binding 形状，理由是：
       "thread": { "create": true },
       "turn": { "explicit": true },
       "event": { "append": true },
+      "message": { "search": true },
       "artifact": { "publish": true, "get": true, "read": true },
       "handoff": { "create": true },
+      "reminder": {
+        "schedule": true,
+        "list": true,
+        "cancel": true,
+        "snooze": true,
+        "update": true
+      },
       "receipt": { "record": true }
     }
   }
@@ -248,8 +266,16 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
   "thread": { "create": true },
   "turn": { "explicit": true },
   "event": { "append": true },
+  "message": { "search": true },
   "artifact": { "publish": true, "get": true, "read": true },
   "handoff": { "create": true },
+  "reminder": {
+    "schedule": true,
+    "list": true,
+    "cancel": true,
+    "snooze": true,
+    "update": true
+  },
   "receipt": { "record": true }
 }
 ```
@@ -323,6 +349,9 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 ```
 
 ### 7.7 `Thread`
+
+`Thread` 是 channel 公共区某条 event 的讨论分支。`id` 是 server 内部索引；
+binding 层的 canonical target 使用 `#<channel_id>:<root_event_id>`。
 
 ```json
 {
@@ -457,7 +486,29 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 }
 ```
 
-### 7.16 `PageInfo`
+### 7.16 `Reminder`
+
+```json
+{
+  "id": "rem_123",
+  "actorId": "actor_agent_1",
+  "title": "follow up",
+  "scope": {
+    "kind": "thread",
+    "id": "thread_123"
+  },
+  "msgId": "evt_123",
+  "fireAt": "2026-04-19T04:20:00Z",
+  "repeat": "every:1h",
+  "status": "scheduled | fired | cancelled",
+  "createdAt": "2026-04-19T03:20:00Z",
+  "updatedAt": "2026-04-19T03:20:00Z",
+  "lastFiredAt": null,
+  "_meta": {}
+}
+```
+
+### 7.17 `PageInfo`
 
 ```json
 {
@@ -678,7 +729,7 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 用途：
 
-- 在某个 `Channel` 下创建新的 `Thread`。
+- 基于某个 `Channel` 公共区中的 `rootEventId` 创建新的 `Thread`。
 
 请求：
 
@@ -832,6 +883,59 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 }
 ```
 
+### 9.8.1 `message/search`
+
+用途：
+
+- 搜索当前连接 actor 可见的消息文本和标题。
+- `scope` 可选；传入时只搜该 scope，未传入时在调用方可见的所有 scope 中搜索。
+- 返回按时间倒序排列的 `Event` 列表。
+
+请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_msg_search_1",
+  "method": "message/search",
+  "params": {
+    "query": "keyword",
+    "scope": {
+      "kind": "thread",
+      "id": "thread_123"
+    },
+    "limit": 20
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_msg_search_1",
+  "result": {
+    "events": [
+      {
+        "id": "evt_123",
+        "type": "content.add",
+        "actorId": "actor_agent_1",
+        "scope": {
+          "kind": "thread",
+          "id": "thread_123"
+        },
+        "payload": {
+          "contentType": "text/markdown",
+          "text": "keyword"
+        },
+        "relations": []
+      }
+    ]
+  }
+}
+```
+
 ### 9.9 `turn/close`
 
 用途：
@@ -875,8 +979,10 @@ v0 推荐使用对象型 capability，而不是平铺字符串数组。
 
 - 发布共享 artifact，返回稳定的 artifact 对象。
 
-artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻址的共享对象。  
-把 artifact 挂到某个对话动作上，应通过 `event/append` 携带一条 `content.add` 加上 `attaches_artifact` relation 完成。
+artifact 可以在 publish 时带 `scope`，用于把文件落入该 scope 的 workspace
+投影；也可以不带 scope，只发布为可寻址共享对象。把 artifact 挂到某个对话动作上，
+应通过 `event/append` 携带一条 `content.add` 加上 `attaches_artifact` relation
+完成。
 
 请求：
 
@@ -892,7 +998,11 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
       "mediaType": "text/markdown",
       "text": "# report"
     },
-    "_meta": {}
+    "createdBy": "actor_agent_1",
+    "scope": {
+      "kind": "thread",
+      "id": "thread_123"
+    }
   }
 }
 ```
@@ -931,8 +1041,7 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
   "id": "req_art_get_1",
   "method": "artifact/get",
   "params": {
-    "artifactUri": "artifact://authority/art_123",
-    "includeEntries": true
+    "artifactUri": "artifact://authority/art_123"
   }
 }
 ```
@@ -972,7 +1081,6 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
   "method": "artifact/read",
   "params": {
     "artifactId": "art_123",
-    "entryPath": "report.md",
     "maxBytes": 65536
   }
 }
@@ -986,10 +1094,10 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
   "id": "req_art_read_1",
   "result": {
     "artifactId": "art_123",
-    "entryPath": "report.md",
     "mediaType": "text/markdown",
     "truncated": false,
-    "content": "# report"
+    "content": "# report",
+    "bytes": [35, 32, 114, 101, 112, 111, 114, 116]
   }
 }
 ```
@@ -1032,6 +1140,135 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
   }
 }
 ```
+
+### 9.13.1 `delivery/list`
+
+用途：
+
+- 拉取某个 actor 的 durable directed inbox。
+- 调用方必须已通过 `connection/open` 绑定到同一个 `actorId`；server 必须拒绝跨 actor
+  读取 inbox。
+- `message check` 可映射为 `delivery/list(state=pending)` 后对已处理事件
+  `receipt/record`。
+
+请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_delivery_list_1",
+  "method": "delivery/list",
+  "params": {
+    "actorId": "actor_agent_1",
+    "state": "pending",
+    "limit": 50,
+    "cursor": null
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_delivery_list_1",
+  "result": {
+    "deliveries": [
+      {
+        "delivery": {
+          "eventId": "evt_123",
+          "actorId": "actor_agent_1",
+          "state": "pending",
+          "updatedAt": "2026-04-19T03:20:02Z"
+        },
+        "event": {}
+      }
+    ],
+    "nextCursor": null
+  }
+}
+```
+
+### 9.14 `reminder/schedule`
+
+用途：
+
+- 创建一个由 `actorId` 拥有的提醒。
+- `fireAt` 与 `delaySeconds` 必须至少提供一个；同时提供时以 `fireAt` 为准。
+- `scope` 可选；带 scope 的提醒到期时会写入 `reminder.fire` 事件并 directed
+  delivery 给 `actorId`。
+
+请求：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_rem_schedule_1",
+  "method": "reminder/schedule",
+  "params": {
+    "actorId": "actor_agent_1",
+    "title": "follow up",
+    "scope": {
+      "kind": "thread",
+      "id": "thread_123"
+    },
+    "msgId": "evt_123",
+    "delaySeconds": 3600,
+    "repeat": "every:1h"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_rem_schedule_1",
+  "result": {
+    "reminder": {
+      "id": "rem_123",
+      "actorId": "actor_agent_1",
+      "title": "follow up",
+      "fireAt": "2026-04-19T04:20:00Z",
+      "status": "scheduled"
+    }
+  }
+}
+```
+
+### 9.14.1 `reminder/list`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_rem_list_1",
+  "method": "reminder/list",
+  "params": {
+    "actorId": "actor_agent_1",
+    "statuses": ["scheduled"],
+    "all": false
+  }
+}
+```
+
+响应为 `{ "reminders": [Reminder...] }`。
+
+### 9.14.2 `reminder/cancel`
+
+请求参数：`{ "actorId": "actor_agent_1", "id": "rem_123" }`。
+响应为 `{ "reminder": Reminder }`。
+
+### 9.14.3 `reminder/snooze`
+
+请求参数：`{ "actorId": "actor_agent_1", "id": "rem_123", "bySeconds": 600 }`。
+响应为 `{ "reminder": Reminder }`。
+
+### 9.14.4 `reminder/update`
+
+请求参数：`actorId`、`id` 必填，`title`、`fireAt`、`delaySeconds`、`repeat` 可选。
+响应为 `{ "reminder": Reminder }`。
 
 ### 9.15 `turn/trace.read`
 
@@ -1090,7 +1327,8 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
 
 ## 10. Artifact Ingress Schema
 
-不同 client interface 可以使用不同的 artifact ingress，但底层都应映射到同一个 `artifact/publish`。
+不同 client interface 可以使用不同的 artifact ingress，但底层都应映射到同一个
+`artifact/publish`。当前 v0 实现支持 `inline_text` 与 `file_bytes` 两种入口。
 
 ### 10.1 `inline_text`
 
@@ -1104,44 +1342,21 @@ artifact 不在 publish 时绑定到某个 scope；它只是被发布为可寻�
 }
 ```
 
-### 10.2 `workspace_path`
+### 10.2 `file_bytes`
 
 ```json
 {
-  "kind": "workspace_path",
-  "path": "build/report.md",
+  "kind": "file_bytes",
   "name": "report.md",
-  "_meta": {}
-}
-```
-
-### 10.3 `upload_token`
-
-```json
-{
-  "kind": "upload_token",
-  "uploadToken": "upload_123",
-  "name": "screenshot.png",
-  "_meta": {}
-}
-```
-
-### 10.4 `external_url`
-
-```json
-{
-  "kind": "external_url",
-  "url": "https://example.com/report.pdf",
-  "name": "report.pdf",
-  "_meta": {}
+  "mediaType": "text/markdown",
+  "bytes": [35, 32, 114, 101, 112, 111, 114, 116]
 }
 ```
 
 说明：
 
-- human UI 常用 `upload_token`
-- agent CLI 常用 `workspace_path`
-- agent MCP / SDK 常用 `inline_text` 或 `workspace_path`
+- agent CLI 的 `attachment upload` 会把本地文件读成 `file_bytes`。
+- agent CLI 的 `artifact publish --text` / `--file` 会映射为 `inline_text`。
 
 ## 11. Notification Schema
 
@@ -1271,6 +1486,7 @@ v0 定义两类 notification：
 ### 12.1 Scope 校验
 
 - `Thread.channelId` 必须指向已存在的 `Channel`。
+- `Thread.rootEventId` 必须指向 `Thread.channelId` 公共区内已存在的 `Event`。
 - `Event.scope` 只能是 `Channel` 或 `Thread`。
 - `Turn.scope` 必须与其下 `Event.scope` 保持一致。
 
@@ -1279,6 +1495,7 @@ v0 定义两类 notification：
 - `replies_to` 的目标必须是 `Event`。
 - `replies_to` 可以形成任意深度的 reply chain。
 - `Thread` 不可嵌套。
+- `thread/create.rootEventId` 不能指向 thread 内事件。
 - 在 `Thread` 内，`replies_to` 的目标必须满足其一：
   - 指向同一个 `Thread` 中的某个 `Event`
   - 指向该 `Thread.rootEventId`
@@ -1295,6 +1512,13 @@ v0 定义两类 notification：
 - server 必须返回稳定 `artifact.id` 与 `artifact.uri`。
 - `artifact/read` 只能读取 server 标记为可读的文本内容。
 
+### 12.5 Reminder 校验
+
+- `reminder/schedule` 必须提供非空 `title`。
+- `fireAt` 与 `delaySeconds` 至少提供一个；`delaySeconds` 必须为正数。
+- 带 `scope` 的 reminder 必须先通过 `actorId` 的 scope ACL 校验。
+- `cancel`、`snooze`、`update` 只能操作同一 `actorId` 名下的 reminder。
+
 ## 13. Binding Profiles
 
 ### 13.1 Human UI Binding
@@ -1307,10 +1531,12 @@ human UI 不需要向用户暴露 raw schema。
 | --- | --- |
 | 发送消息 | `event/append` |
 | 选择 agent 作为下一步处理者 | `event/append (content.add + hands_off_to)` |
-| 新开 thread / 局部讨论 | `thread/create` |
+| 搜索消息 | `message/search` |
+| 新开 thread / 局部讨论 | channel 公共区写 root event 后 `thread/create` |
 | 拖拽上传附件 | `artifact/publish` |
 | 在消息里附加附件卡片 | `event/append` + `attaches_artifact` |
 | 点击接受 handoff | `receipt/record` |
+| 创建 / 管理提醒 | `reminder/*` |
 | 查看历史 | `scope/read` |
 | 订阅实时更新 | `scope/subscribe` |
 
@@ -1329,11 +1555,29 @@ CLI 可以直接暴露接近 schema 的动作。
 
 | CLI 动作 | Schema 方法 |
 | --- | --- |
-| `event append ...` | `event/append` |
-| `artifact publish --source-path ...` | `artifact/publish` |
+| `message send --target '#<channel_id>:<root_event_id>'` | `thread/create`（必要时）+ `event/append` |
+| `message send --target '#<channel_id>'` | `event/append` |
+| `message send --target dm:<actor_id>` | `channel/create` / `channel/invite` / `event/append` |
+| `message read --target '#<channel_id>:<root_event_id>'` | `scope/read` |
+| `message search --query ...` | `message/search` |
+| `message check` | `delivery/list` + `receipt/record` |
+| `handoff <actor_id> --in <scope_id>` | `event/append (content.add + hands_off_to)` |
+| `attachment upload --target '#<channel_id>:<root_event_id>' --path ...` | `artifact/publish` |
+| `artifact publish --name ...` | `artifact/publish` |
 | `artifact get ...` | `artifact/get` |
 | `artifact read ...` | `artifact/read` |
-| `receipt record ...` | `receipt/record` |
+| `reminder schedule/list/cancel/snooze/update` | `reminder/*` |
+
+CLI target grammar 的 canonical 形式：
+
+- `#<channel_id>`
+- `#<channel_id>:<root_event_id>`
+- `dm:<actor_id>`
+
+`handoff` 与 `dm:<actor_id>` 是不同语义：前者是当前 scope 内的责任转移 /
+唤醒，后者是私聊目标。Binding 不保留 `dm:@actor` 等同义 alias。
+`#<channel_id>:<root_event_id>` 中的 root event 必须来自该 channel 公共区；
+thread 不能继续套 thread。
 
 ### 13.3 Agent MCP Binding
 
@@ -1345,9 +1589,11 @@ MCP tool 名可以与 schema 方法一一映射。
 | --- | --- |
 | `thread_create` | `thread/create` |
 | `event_append` | `event/append` |
+| `message_search` | `message/search` |
 | `artifact_publish` | `artifact/publish` |
 | `artifact_get` | `artifact/get` |
 | `artifact_read` | `artifact/read` |
+| `reminder_schedule` / `reminder_list` / `reminder_cancel` / `reminder_snooze` / `reminder_update` | `reminder/*` |
 | `receipt_record` | `receipt/record` |
 
 约束：
@@ -1387,10 +1633,17 @@ MCP tool 名可以与 schema 方法一一映射。
 - `scope/read`
 - `thread/create`
 - `event/append`
+- `message/search`
 - `artifact/publish`
 - `artifact/get`
 - `artifact/read`
 - `receipt/record`
+- `delivery/list`
+- `reminder/schedule`
+- `reminder/list`
+- `reminder/cancel`
+- `reminder/snooze`
+- `reminder/update`
 - `stream/update`
 - `turn/trace.read`
 - `turn/trace.update`
@@ -1407,6 +1660,7 @@ MCP tool 名可以与 schema 方法一一映射。
 - `Membership`
 - `Delivery`
 - `Receipt`
+- `Reminder`
 
 ## 16. 总结
 

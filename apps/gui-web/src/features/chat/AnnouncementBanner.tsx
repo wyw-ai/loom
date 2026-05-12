@@ -12,16 +12,16 @@ export function AnnouncementBanner({
   const actor = useActors((s) => s.byId[announcement.actorId]);
   const name = actor?.displayName || announcement.actorId;
   return (
-    <div className="flex gap-3 border-b border-warning/40 bg-warning/10 px-4 py-2 text-sm">
-      <Megaphone size={16} className="mt-0.5 shrink-0 text-warning" />
+    <div className="flex gap-3 border-b-2 border-black bg-brutal-yellow px-4 py-2 text-sm">
+      <Megaphone size={16} className="mt-0.5 shrink-0 text-black" />
       <div className="min-w-0 flex-1">
-        <div className="prose-announcement text-primary">
+        <div className="prose-announcement font-bold text-black">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>
             {announcement.text}
           </ReactMarkdown>
         </div>
-        <div className="mt-1 text-xs text-muted" title={announcement.actorId}>
-          @{name} · {new Date(announcement.ts).toLocaleString()}
+        <div className="mt-1 font-mono text-xs text-black/55" title={announcement.actorId}>
+          @{name} - {new Date(announcement.ts).toLocaleString()}
         </div>
       </div>
     </div>

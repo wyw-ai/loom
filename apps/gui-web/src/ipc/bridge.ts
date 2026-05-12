@@ -1,16 +1,52 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   Actor,
+  AgentInfo,
   Channel,
   DesktopConfig,
+  HumanAccount,
   JoiEvent,
+  MachineInfo,
   ScopeRef,
   StreamUpdate,
   Thread,
   TurnStreamDelta,
+  Workspace,
 } from "./types";
+
+function hasTauriRuntime() {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(
+      (window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__,
+    )
+  );
+}
+
+function invoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  if (!hasTauriRuntime()) {
+    return Promise.reject(
+      new Error(`Tauri runtime unavailable for ${command}`),
+    );
+  }
+  return tauriInvoke<T>(command, args);
+}
+
+function listen<T>(
+  event: string,
+  handler: (event: { payload: T }) => void,
+): Promise<UnlistenFn> {
+  if (!hasTauriRuntime()) {
+    return Promise.resolve(() => {});
+  }
+  return tauriListen<T>(event, handler);
+}
 
 // ---- workspace profile management ----
 
@@ -21,8 +57,6 @@ export async function workspacesList(): Promise<DesktopConfig> {
 export async function workspaceAdd(args: {
   name: string;
   serverUrl: string;
-  actorId: string;
-  displayName?: string;
   activate?: boolean;
 }): Promise<DesktopConfig> {
   return invoke("workspace_add", { args });
@@ -36,9 +70,33 @@ export async function setActiveWorkspace(id: string): Promise<DesktopConfig> {
   return invoke("set_active_workspace", { args: { id } });
 }
 
+// ---- local human account ----
+
+export async function accountGet(): Promise<HumanAccount | null> {
+  return invoke("account_get");
+}
+
+export async function accountLogin(provider: "buc"): Promise<{
+  account: HumanAccount;
+  config: DesktopConfig;
+}> {
+  return invoke("account_login", { args: { provider } });
+}
+
+export async function accountLogout(): Promise<DesktopConfig> {
+  return invoke("account_logout");
+}
+
+export async function avatarCachedUrl(url: string): Promise<string> {
+  return invoke("avatar_cached_url", { args: { url } });
+}
+
 // ---- connection ----
 
-export async function connect(workspaceId: string): Promise<unknown> {
+export async function connect(workspaceId: string): Promise<{
+  workspace: Workspace;
+  open: unknown;
+}> {
   return invoke("connect", { args: { workspaceId } });
 }
 
@@ -90,7 +148,7 @@ export async function channelRevoke(params: {
 export async function threadCreate(params: {
   channelId: string;
   title: string;
-  rootEventId?: string;
+  rootEventId: string;
 }): Promise<{ thread: Thread }> {
   return invoke("thread_create", { params });
 }
@@ -164,10 +222,91 @@ export async function actorList(): Promise<{ actors: Actor[] }> {
   return invoke("actor_list");
 }
 
+export async function actorUpsert(actor: Actor): Promise<{ actor: Actor }> {
+  return invoke("actor_upsert", { params: { actor } });
+}
+
+export async function actorDelete(actorId: string): Promise<{ deleted: boolean }> {
+  return invoke("actor_delete", { params: { actorId } });
+}
+
 export async function agentList(): Promise<{
-  agents: Array<{ spec: { actor: Actor }; status: string; pid?: number }>;
+  agents: AgentInfo[];
 }> {
   return invoke("agent_list");
+}
+
+export async function agentCreate(args: {
+  machineId?: string;
+  providerId: string;
+  actorId?: string;
+  name: string;
+  description?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+}): Promise<AgentInfo> {
+  return invoke("agent_create", { args });
+}
+
+export async function agentRemove(actorId: string): Promise<{
+  agents: AgentInfo[];
+}> {
+  return invoke("agent_remove", { args: { actorId } });
+}
+
+export async function agentUpdate(args: {
+  machineId?: string;
+  actorId: string;
+  displayName?: string;
+  description?: string;
+  providerId?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+}): Promise<AgentInfo> {
+  return invoke("agent_update", { args });
+}
+
+export async function machineList(): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_list");
+}
+
+export async function machineCheck(): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_check");
+}
+
+export async function machineCreate(args: {
+  name: string;
+  dataRoot?: string;
+}): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_create", { args });
+}
+
+export async function machineRemove(machineId: string): Promise<{
+  machines: MachineInfo[];
+}> {
+  return invoke("machine_remove", { args: { machineId } });
+}
+
+export async function machineAgentCreate(args: {
+  machineId: string;
+  providerId: string;
+  actorId?: string;
+  name: string;
+  description?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+}): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_agent_create", { args });
+}
+
+export async function machineAgentRemove(
+  machineId: string,
+  actorId: string,
+): Promise<{ machines: MachineInfo[] }> {
+  return invoke("machine_agent_remove", { args: { machineId, actorId } });
 }
 
 // ---- inbound (event listeners) ----

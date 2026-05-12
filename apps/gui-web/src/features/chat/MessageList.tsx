@@ -2,11 +2,20 @@ import { useEffect, useMemo, useRef } from "react";
 
 import type { Bubble as BubbleModel, ScopeRef } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
+import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
 import { Bubble, type BubbleReplyContext } from "./Bubble";
 
 export function MessageList({ scope }: { scope: ScopeRef }) {
   const scopeStore = useMessages((s) => s.byScope[scopeKey(scope)]);
+  const rootEventId = useChannels((s) => {
+    if (scope.kind !== "thread") return undefined;
+    for (const threads of Object.values(s.threadsByChannel)) {
+      const thread = threads.find((t) => t.id === scope.id);
+      if (thread?.rootEventId) return thread.rootEventId;
+    }
+    return undefined;
+  });
   const bubbles = scopeStore?.bubbles ?? [];
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -42,18 +51,19 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
   }
 
   return (
-    <div className="stable-scrollbar h-full overflow-y-scroll px-4 py-4">
+    <div className="stable-scrollbar h-full overflow-y-scroll bg-white px-4 py-5">
       {bubbles.length === 0 ? (
-        <div className="flex min-h-full items-center justify-center text-sm text-muted">
+        <div className="flex min-h-full items-center justify-center font-mono text-sm text-black/40">
           No messages yet. Say something.
         </div>
       ) : (
         groups.map((group, gi) => (
-          <div key={gi} className="mb-4 last:mb-0">
+          <div key={gi} className="mb-5 last:mb-0">
             {group.map((b, bi) => {
               const replyContext = buildReplyContext(
                 b.replyToEventId,
                 bubblesById,
+                rootEventId,
               );
               return (
                 <Bubble
@@ -76,8 +86,10 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
 function buildReplyContext(
   replyToEventId: string | undefined,
   bubblesById: Map<string, BubbleModel>,
+  threadRootEventId: string | undefined,
 ): BubbleReplyContext | undefined {
   if (!replyToEventId) return undefined;
+  if (replyToEventId === threadRootEventId) return undefined;
   const target = bubblesById.get(replyToEventId);
   if (!target) {
     return {

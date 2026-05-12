@@ -11,6 +11,7 @@ export interface Actor {
   kind: ActorKind;
   displayName?: string;
   capabilities?: unknown;
+  _meta?: Record<string, unknown>;
 }
 
 export type ChannelVisibility = "public" | "private";
@@ -70,6 +71,7 @@ export interface JoiEvent {
   occurredAt: string;
   payload: unknown;
   relations: Relation[];
+  _meta?: Record<string, unknown>;
 }
 
 export type TurnStatus = "open" | "closed" | "failed" | "cancelled";
@@ -110,16 +112,107 @@ export interface Workspace {
   displayName: string;
 }
 
+export interface HumanAccount {
+  provider: string;
+  staffId: string;
+  nickname: string;
+  realName: string;
+  email: string;
+  actorId: string;
+  avatarUrl: string;
+}
+
+export interface MachineConfig {
+  workspaceId?: string | null;
+  ownerActorId?: string | null;
+  id: string;
+  name: string;
+  kind: string;
+  dataRoot: string;
+  agents?: MachineAgentConfig[];
+}
+
+export interface MachineAgentConfig {
+  providerId: string;
+  actorId: string;
+  name: string;
+  description?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+}
+
 export interface DesktopConfig {
   active?: string | null;
+  account?: HumanAccount | null;
   workspaces: Workspace[];
+  machines?: MachineConfig[];
+}
+
+// ---- local agent / machine management ----
+
+export interface AgentTransport {
+  kind: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  model?: string | null;
+}
+
+export interface AgentSpec {
+  actor: Actor;
+  transport: AgentTransport;
+  autostart?: boolean;
+  models?: {
+    default?: string | null;
+    choices?: Array<{ id: string; label?: string; description?: string }>;
+  } | null;
+  identity?: {
+    description?: string | null;
+  } | null;
+}
+
+export interface AgentInfo {
+  spec: AgentSpec;
+  status: string;
+  pid?: number;
+  sessionId?: string;
+}
+
+export interface AgentProviderSummary {
+  id: string;
+  name: string;
+  transportKind: string;
+  command: string;
+  args?: string[];
+  actorCount: number;
+  defaultModel?: string | null;
+  modelChoices?: Array<{ id: string; label?: string; description?: string }>;
+}
+
+export interface MachineInfo {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  setupStatus: string;
+  connectionStatus: string;
+  connectionActorId: string;
+  dataRoot: string;
+  configDir: string;
+  agentCount: number;
+  onlineAgentCount: number;
+  providers: AgentProviderSummary[];
+  agents: AgentInfo[];
+  serveCommand: string;
+  setupScript: string;
 }
 
 // ---- bubble (front-end only) ----
 
 export type BubbleKind = "stream" | "static" | "actionRequest" | "system";
 export type DeliveryState = "na" | "pending" | "delivered";
-export type ActionStatus = "pending" | "accepted" | "declined";
+export type ActionStatus = "pending" | "answered" | "accepted" | "declined";
 
 export interface ActionChoice {
   id: string;
@@ -133,6 +226,7 @@ export interface Bubble {
   kind: BubbleKind;
   text: string;
   ts: string;
+  meta?: Record<string, unknown>;
   replyToEventId?: string;
   streaming: boolean;
   delivery: DeliveryState;
@@ -145,6 +239,7 @@ export interface Bubble {
   actionRawInput?: string;
   actionRequestId?: string;
   actionStatus?: ActionStatus;
+  actionSelectedLabel?: string;
   choices?: ActionChoice[];
   acknowledged?: boolean;
 }

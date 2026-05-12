@@ -1,21 +1,23 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import clsx from "clsx";
 import {
+  Bookmark,
   ChevronDown,
   ChevronRight,
-  Lock,
+  Hash,
+  Inbox,
+  type LucideIcon,
   MoreHorizontal,
   Plus,
+  Search,
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import type { Channel, Thread } from "@/ipc/types";
 import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
-import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { openScope } from "@/features/chat/scopeActions";
-import { ScopeIcon } from "@/features/common/ScopeIcon";
 import {
   openCreateChannel,
   openCreateThread,
@@ -28,48 +30,29 @@ import {
 
 export function ChannelsPane() {
   const channels = useChannels((s) => s.channels);
-  const workspaceName = useSession((s) => s.workspace?.name);
-  const toggleMembers = useUI((s) => s.toggleMembers);
   const view = useUI((s) => s.view);
   const setView = useUI((s) => s.setView);
+  const openModal = useUI((s) => s.openModal);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
-  const toggleInbox = () =>
-    setView(view === "inbox" ? "chat" : "inbox");
+  const title = view === "tasks" ? "Tasks" : view === "inbox" ? "Inbox" : "Chat";
 
   return (
-    <aside className="flex h-full w-60 shrink-0 flex-col overflow-hidden border-r border-border bg-sidebar">
-      <header className="flex h-12 items-center justify-between border-b border-border/60 px-3">
-        <h2 className="truncate text-sm font-semibold text-primary">
-          {workspaceName ?? "Workspace"}
-        </h2>
-        <button
-          aria-label="New channel"
-          title="New channel"
-          className="flex h-7 w-7 items-center justify-center rounded text-secondary hover:bg-hover hover:text-primary"
-          onClick={openCreateChannel}
-        >
-          <Plus size={16} />
-        </button>
+    <aside className="hidden h-full w-60 shrink-0 select-none flex-col border-r-2 border-black bg-brutal-cream text-black md:flex">
+      <header className="flex h-panel-header shrink-0 items-center border-b-2 border-black px-5">
+        <div className="text-lg font-black">{title}</div>
       </header>
 
-      <div className="stable-scrollbar min-h-0 flex-1 overflow-y-scroll py-2">
-        <div className="group flex items-center gap-1 px-2 pb-1">
-          <div className="flex flex-1 items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-muted">
-            <ChevronDown size={12} />
-            Channels
-          </div>
-          <button
-            aria-label="New channel"
-            title="New channel"
-            className="flex h-5 w-5 items-center justify-center rounded text-muted opacity-0 hover:bg-hover hover:text-primary group-hover:opacity-100"
-            onClick={openCreateChannel}
-          >
-            <Plus size={13} />
-          </button>
-        </div>
+      <div className="stable-scrollbar min-h-0 flex-1 overflow-y-auto px-2 py-3">
+        <SideButton icon={Search} label="Search" suffix="⌘K" onClick={() => openModal({ type: "quickSwitch" })} />
+        <SideButton icon={Inbox} label="Inbox" onClick={() => setView("inbox")} />
+        <SideButton icon={Bookmark} label="Saved" onClick={() => useUI.getState().pushToast("info", "Saved view is not backed by the current Joi protocol yet")} />
+
+        <SectionHeader label="Channels" count={channels.length} onAdd={openCreateChannel} />
         {channels.length === 0 ? (
-          <div className="px-4 py-2 text-xs text-muted">no channels yet</div>
+          <div className="border-2 border-dashed border-black/25 px-3 py-4 text-sm font-mono text-black/40">
+            no channels yet
+          </div>
         ) : (
           channels.map((c) => (
             <ChannelRow
@@ -82,33 +65,72 @@ export function ChannelsPane() {
             />
           ))
         )}
-      </div>
 
-      <footer className="flex h-12 items-center gap-2 border-t border-border/60 bg-elevated px-3 text-xs text-secondary">
-        <button
-          className="hover:text-primary"
-          onClick={() => {
-            // Members only render on the chat view — if the user is in
-            // Inbox and clicks Members, land them back on chat first so
-            // the toggle has somewhere to draw.
-            if (view !== "chat") setView("chat");
-            toggleMembers();
-          }}
-        >
-          Members
-        </button>
-        <span className="text-muted">·</span>
-        <button
-          className={clsx(
-            "hover:text-primary",
-            view === "inbox" && "text-warning",
-          )}
-          onClick={toggleInbox}
-        >
-          Inbox
-        </button>
-      </footer>
+        <SectionHeader label="Direct Messages" count={0} />
+      </div>
+      <div className="hidden h-2 cursor-col-resize border-t-2 border-black md:block" />
     </aside>
+  );
+}
+
+function SideButton({
+  icon: Icon,
+  label,
+  suffix,
+  count,
+  onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  suffix?: string;
+  count?: number;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      className="mb-1 flex w-full items-center gap-1.5 border-2 border-transparent px-2 py-1.5 text-left text-sm font-bold transition-colors hover:border-black hover:bg-white hover:shadow-brutal-sm"
+      onClick={onClick}
+    >
+      <Icon size={14} className="shrink-0" />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {suffix && <span className="font-mono text-xs text-black/40">{suffix}</span>}
+      {typeof count === "number" && (
+        <span className="font-mono text-[10px] text-black/40">{count}</span>
+      )}
+    </button>
+  );
+}
+
+function SectionHeader({
+  label,
+  count,
+  onAdd,
+}: {
+  label: string;
+  count: number;
+  onAdd?: () => void;
+}) {
+  return (
+    <div className="mb-1 mt-3 flex items-center justify-between px-2">
+      <button
+        type="button"
+        className="flex items-center gap-1 text-xs font-black uppercase tracking-widest text-black hover:text-black/70"
+      >
+        <ChevronDown size={12} />
+        {label}
+        <span className="font-mono text-black/40">{count}</span>
+      </button>
+      {onAdd && (
+        <button
+          className="btn-brutal-sm bg-white p-0.5"
+          aria-label={`New ${label.toLowerCase()}`}
+          title={`New ${label.toLowerCase()}`}
+          onClick={onAdd}
+        >
+          <Plus size={14} />
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -126,29 +148,23 @@ function ChannelRow({
   const replaceThreads = useChannels((s) => s.replaceThreads);
   const openContextMenu = useUI((s) => s.openContextMenu);
   const pushToast = useUI((s) => s.pushToast);
-
-  // Narrow selector: only re-render this row when the pending-action count
-  // for THIS channel changes. Thread rows subscribe to their own count
-  // below, so a new action.request in channel B does not rerender channel A.
   const channelBadge = useMessages(
     (s) => s.byScope[`channel:${channel.id}`]?.pendingActionIds.size ?? 0,
   );
 
   const isCurrent = (kind: "channel" | "thread", id: string) =>
     currentScope?.kind === kind && currentScope.id === id;
-
   const hasCurrentThread = threads.some((t) => isCurrent("thread", t.id));
   const showThreads = expanded || hasCurrentThread;
 
   useEffect(() => {
-    if (!showThreads) return;
-    if (threads.length > 0) return;
+    if (!showThreads || threads.length > 0) return;
     (async () => {
       try {
         const r = await ipc.threadList(channel.id);
         replaceThreads(channel.id, r.threads);
       } catch {
-        /* ignore — toast surfaced at higher layer if it matters */
+        /* higher-level flows surface errors where they matter */
       }
     })();
   }, [showThreads, threads.length, channel.id, replaceThreads]);
@@ -169,12 +185,12 @@ function ChannelRow({
       items: [
         {
           kind: "item",
-          label: "New thread…",
+          label: "New thread...",
           onClick: () => openCreateThread(channel.id),
         },
         {
           kind: "item",
-          label: "Invite actor…",
+          label: "Invite actor...",
           onClick: () => openInviteToChannel(channel),
         },
         {
@@ -185,12 +201,12 @@ function ChannelRow({
         { kind: "divider" },
         {
           kind: "item",
-          label: "Rename…",
+          label: "Edit channel...",
           onClick: () => openRenameChannel(channel),
         },
         {
           kind: "item",
-          label: "Delete…",
+          label: "Delete...",
           danger: true,
           onClick: () => openDeleteChannel(channel),
         },
@@ -198,26 +214,26 @@ function ChannelRow({
     });
   };
 
-  const channelContextMenu = (e: React.MouseEvent) => {
+  const channelContextMenu = (e: MouseEvent) => {
     e.preventDefault();
     openChannelMenu(e.clientX, e.clientY);
   };
 
   return (
-    <div className="mb-0.5 px-2">
+    <div className="mb-1">
       <div
         className={clsx(
-          "group/channel flex h-8 w-full items-center gap-1 rounded px-1 text-sm transition-colors",
+          "group/channel flex w-full items-center gap-1 border-2 px-1 py-1 text-sm font-bold transition-colors",
           isCurrent("channel", channel.id)
-            ? "bg-active text-primary"
-            : "text-secondary hover:bg-hover hover:text-primary",
+            ? "border-black bg-brutal-pink shadow-brutal-sm"
+            : "border-transparent hover:border-black hover:bg-white hover:shadow-brutal-sm",
         )}
         onContextMenu={channelContextMenu}
       >
         <button
           type="button"
           aria-label={showThreads ? "Collapse threads" : "Expand threads"}
-          className="flex h-6 w-5 shrink-0 items-center justify-center rounded text-muted hover:bg-active hover:text-secondary"
+          className="flex h-[22px] w-[18px] shrink-0 items-center justify-center text-black/70 hover:text-black"
           onClick={(e) => {
             e.stopPropagation();
             onToggle();
@@ -230,40 +246,19 @@ function ChannelRow({
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
           onClick={() => void openScope({ kind: "channel", id: channel.id })}
         >
-          {channel.visibility === "private" ? (
-            <Lock size={16} className="h-4 w-4 shrink-0 text-muted" />
-          ) : (
-            <ScopeIcon kind="channel" className="text-muted" />
-          )}
-          <span className="truncate">{channel.title}</span>
-          {channel.visibility === "public" && (
-            <span className="ml-1 rounded bg-elevated px-1 py-px text-[10px] uppercase leading-none text-muted">
-              Public
-            </span>
-          )}
+          <Hash size={15} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate">{channel.title}</span>
         </button>
         {channelBadge > 0 && (
-          <span className="min-w-[18px] shrink-0 rounded-full bg-danger px-1 text-center text-[10px] leading-[18px] text-white">
+          <span className="min-w-[18px] border border-black bg-danger px-1 text-center text-[10px] leading-[16px] text-black">
             {channelBadge}
           </span>
         )}
         <button
           type="button"
-          aria-label="New thread"
-          title="New thread"
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted opacity-0 hover:bg-active hover:text-primary group-hover/channel:opacity-100"
-          onClick={(e) => {
-            e.stopPropagation();
-            openCreateThread(channel.id);
-          }}
-        >
-          <Plus size={14} />
-        </button>
-        <button
-          type="button"
           aria-label="Channel actions"
           title="Channel actions"
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted opacity-0 hover:bg-active hover:text-primary group-hover/channel:opacity-100"
+          className="flex h-6 w-6 shrink-0 items-center justify-center opacity-0 hover:bg-white group-hover/channel:opacity-100"
           onClick={(e) => {
             e.stopPropagation();
             openChannelMenu(e.clientX, e.clientY);
@@ -274,9 +269,11 @@ function ChannelRow({
       </div>
 
       {showThreads && (
-        <div className="ml-[1.15rem] mt-0.5 border-l border-border/80 pl-2">
+        <div className="ml-5 mt-1 border-l-2 border-black/20 pl-2">
           {threads.length === 0 ? (
-            <div className="py-1 pl-2 text-xs text-muted">no threads</div>
+            <div className="py-1 pl-2 text-xs font-mono text-black/40">
+              no threads
+            </div>
           ) : (
             threads.map((t) => (
               <ThreadRow
@@ -291,12 +288,12 @@ function ChannelRow({
                     items: [
                       {
                         kind: "item",
-                        label: "Rename…",
+                        label: "Rename...",
                         onClick: () => openRenameThread(t),
                       },
                       {
                         kind: "item",
-                        label: "Delete…",
+                        label: "Delete...",
                         danger: true,
                         onClick: () => openDeleteThread(t),
                       },
@@ -313,14 +310,13 @@ function ChannelRow({
             ))
           )}
           <button
-            className="mt-0.5 flex h-7 w-full items-center gap-1.5 rounded px-2 text-xs text-muted hover:bg-hover hover:text-secondary"
+            className="mt-1 flex h-7 w-full items-center gap-1.5 border-2 border-transparent px-2 text-xs font-bold text-black/55 hover:border-black hover:bg-white hover:text-black"
             onClick={() => openCreateThread(channel.id)}
           >
             <Plus size={12} /> Create thread
           </button>
         </div>
       )}
-
     </div>
   );
 }
@@ -342,10 +338,10 @@ function ThreadRow({
   return (
     <div
       className={clsx(
-        "group/thread flex h-7 w-full items-center gap-1.5 rounded px-2 text-sm transition-colors",
+        "group/thread mb-1 flex h-7 w-full items-center gap-1 border-2 px-1 text-sm font-bold transition-colors",
         current
-          ? "bg-active text-primary"
-          : "text-secondary hover:bg-hover hover:text-primary",
+          ? "border-black bg-brutal-yellow shadow-brutal-sm"
+          : "border-transparent hover:border-black hover:bg-white",
       )}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -357,11 +353,11 @@ function ThreadRow({
         className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         onClick={onClick}
       >
-        <ScopeIcon kind="thread" className="text-muted" />
-        <span className="flex-1 truncate text-left">{thread.title}</span>
+        <span className="text-black/50">↳</span>
+        <span className="flex-1 truncate">{thread.title}</span>
       </button>
       {badge > 0 && (
-        <span className="min-w-[18px] rounded-full bg-danger px-1 text-center text-[10px] leading-[18px] text-white">
+        <span className="min-w-[18px] border border-black bg-danger px-1 text-center text-[10px] leading-[16px] text-black">
           {badge}
         </span>
       )}
@@ -369,7 +365,7 @@ function ThreadRow({
         type="button"
         aria-label="Thread actions"
         title="Thread actions"
-        className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted opacity-0 transition-opacity hover:bg-active hover:text-primary group-hover/thread:opacity-100"
+        className="flex h-5 w-5 shrink-0 items-center justify-center opacity-0 hover:bg-white group-hover/thread:opacity-100"
         onClick={(e) => {
           e.stopPropagation();
           onMenu(e.clientX, e.clientY);

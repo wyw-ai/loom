@@ -49,7 +49,7 @@ impl Subscriptions {
     /// becomes the actor-inbox owner depends on `actor_kind`:
     ///
     /// * `Agent` / `Service` — always takes over. Long-lived host processes
-    ///   (`joi agent serve`, `joi service serve`) claiming an actor means
+    ///   (`joi daemon`, `joi service serve`) claiming an actor means
     ///   "I am the runtime for this actor"; a restart after a crash needs
     ///   to win even if the previous WS hasn't been reaped yet (the old
     ///   conn's TCP close detection on the server side may lag the new
@@ -166,6 +166,36 @@ impl Subscriptions {
             .connections
             .get(connection_id)
             .and_then(|c| c.actor_id.clone())
+    }
+
+    pub fn connected_actor_ids(&self, actor_ids: &[String]) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut out = if actor_ids.is_empty() {
+            inner
+                .actor_conn
+                .iter()
+                .filter_map(|(actor_id, conn_id)| {
+                    inner
+                        .connections
+                        .contains_key(conn_id)
+                        .then(|| actor_id.clone())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            actor_ids
+                .iter()
+                .filter(|actor_id| {
+                    inner
+                        .actor_conn
+                        .get(*actor_id)
+                        .is_some_and(|conn_id| inner.connections.contains_key(conn_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Snapshot the set of connection ids currently subscribed to `scope`.
@@ -334,7 +364,7 @@ mod tests {
     fn service_kind_preempts_existing_live_binding() {
         // §9.4: a long-lived `joi service serve` restart must take over the
         // actor-inbox even if the previous WS hasn't been reaped yet — same
-        // contract as `joi agent serve`. Without preempt, the new host can't
+        // contract as `joi daemon`. Without preempt, the new host can't
         // receive any actor-inbox push until the old conn TCP-times out.
         let subs = Subscriptions::new();
         subs.add_connection(make_conn("conn_old"));

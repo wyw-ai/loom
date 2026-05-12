@@ -26,7 +26,6 @@ fn map_runtime_err(err: impl std::fmt::Display) -> ErrorObject {
     ErrorObject::new(ErrorCode::APP_RUNTIME_ERROR, err.to_string())
 }
 
-
 /// Log a scope-skills projection failure that follows a successful store
 /// mutation. We deliberately do NOT surface this as an RPC error: the
 /// authoritative state (channel/thread/membership) is already persisted, so
@@ -63,6 +62,7 @@ pub async fn dispatch(
         method::INITIALIZE => initialize(params),
         method::CONNECTION_OPEN => connection_open(state, connection_id, params),
         method::CONNECTION_CLOSE => connection_close(state, params),
+        method::CONNECTION_LIST => connection_list(state, params),
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::SCOPE_READ => scope_read(state, connection_id, params),
@@ -82,13 +82,20 @@ pub async fn dispatch(
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
         method::TURN_TRACE_APPEND => turn_trace_append(state, connection_id, params),
         method::EVENT_APPEND => event_append(state, params).await,
+        method::MESSAGE_SEARCH => message_search(state, connection_id, params),
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
         method::ARTIFACT_GET => artifact_get(state, params),
         method::ARTIFACT_READ => artifact_read(state, params),
         method::RECEIPT_RECORD => receipt_record(state, params),
+        method::REMINDER_SCHEDULE => reminder_schedule(state, params),
+        method::REMINDER_LIST => reminder_list(state, params),
+        method::REMINDER_CANCEL => reminder_cancel(state, params),
+        method::REMINDER_SNOOZE => reminder_snooze(state, params),
+        method::REMINDER_UPDATE => reminder_update(state, params),
         method::DELIVERY_LIST => delivery_list(state, connection_id, params),
         method::ACTOR_LIST => actor_list(state),
         method::ACTOR_UPSERT => actor_upsert(state, params),
+        method::ACTOR_DELETE => actor_delete(state, params),
         other => Err(ErrorObject::new(
             ErrorCode::METHOD_NOT_FOUND,
             format!("unknown method `{}`", other),
@@ -154,6 +161,17 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
     ok(ConnectionOpenResult {
         connection: connection.into(),
         actor,
+    })
+}
+
+fn connection_list(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ConnectionListParams = if params.is_some() {
+        parse_params(params)?
+    } else {
+        ConnectionListParams::default()
+    };
+    ok(ConnectionListResult {
+        actor_ids: state.subscriptions.connected_actor_ids(&p.actor_ids),
     })
 }
 
@@ -277,9 +295,10 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
         .create_channel(p.title, creator)
         .map_err(map_store_err)?;
     if let Some(actor_id) = channel.members.first() {
-        if let Err(e) = state
-            .scope_skills
-            .sync_actor_channel_membership(&state.store, &channel.id, actor_id)
+        if let Err(e) =
+            state
+                .scope_skills
+                .sync_actor_channel_membership(&state.store, &channel.id, actor_id)
         {
             warn_projection_failure("channel_create.sync_actor_channel_membership", e);
         }
@@ -323,9 +342,10 @@ fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .grant_channel(&p.channel_id, &p.actor_id)
         .map_err(map_store_err)?;
-    if let Err(e) = state
-        .scope_skills
-        .sync_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
+    if let Err(e) =
+        state
+            .scope_skills
+            .sync_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
     {
         warn_projection_failure("channel_invite.sync_actor_channel_membership", e);
     }
@@ -360,9 +380,10 @@ fn channel_revoke(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .revoke_channel(&p.channel_id, &p.actor_id)
         .map_err(map_store_err)?;
-    if let Err(e) = state
-        .scope_skills
-        .remove_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
+    if let Err(e) =
+        state
+            .scope_skills
+            .remove_actor_channel_membership(&state.store, &channel.id, &p.actor_id)
     {
         warn_projection_failure("channel_revoke.remove_actor_channel_membership", e);
     }
@@ -591,7 +612,7 @@ async fn turn_close(state: &AppState, connection_id: &str, params: Option<Value>
 
     // Journal the cancel as a `turn.close` event so channel members render a
     // system divider. The event is handed to the agent actor so external
-    // `joi agent serve` can cancel the actual adapter process; server itself
+    // `joi daemon` can cancel the actual adapter process; server itself
     // stays transport-agnostic.
     let close_payload = json!({
         "status": "cancelled",
@@ -709,6 +730,28 @@ async fn event_append(state: &AppState, params: Option<Value>) -> HandlerResult 
     ok(EventAppendResult { event })
 }
 
+fn message_search(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: MessageSearchParams = parse_params(params)?;
+    let actor_id = caller_actor(state, connection_id)?;
+    if p.query.trim().is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "query is empty",
+        ));
+    }
+    if let Some(scope) = p.scope.as_ref() {
+        state
+            .store
+            .check_scope_access(scope, &actor_id)
+            .map_err(map_store_err)?;
+    }
+    ok(MessageSearchResult {
+        events: state
+            .store
+            .search_messages(&actor_id, &p.query, p.scope.as_ref(), p.limit),
+    })
+}
+
 // ---- artifact ----
 
 fn artifact_publish(state: &AppState, params: Option<Value>) -> HandlerResult {
@@ -765,6 +808,78 @@ fn receipt_record(state: &AppState, params: Option<Value>) -> HandlerResult {
         .record_receipt(p.event_id, p.actor_id, p.kind)
         .map_err(map_store_err)?;
     ok(ReceiptRecordResult { receipt: r })
+}
+
+// ---- reminder ----
+
+fn reminder_schedule(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ReminderScheduleParams = parse_params(params)?;
+    let fire_at = match (p.fire_at, p.delay_seconds) {
+        (Some(fire_at), _) => fire_at,
+        (None, Some(delay)) if delay > 0 => Utc::now() + chrono::Duration::seconds(delay),
+        (None, Some(_)) => {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                "delaySeconds must be positive",
+            ))
+        }
+        (None, None) => {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                "fireAt or delaySeconds required",
+            ))
+        }
+    };
+    let reminder = state
+        .store
+        .schedule_reminder(p.actor_id, p.title, p.scope, p.msg_id, fire_at, p.repeat)
+        .map_err(map_store_err)?;
+    ok(ReminderScheduleResult { reminder })
+}
+
+fn reminder_list(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ReminderListParams = parse_params(params)?;
+    ok(ReminderListResult {
+        reminders: state.store.list_reminders(&p.actor_id, &p.statuses, p.all),
+    })
+}
+
+fn reminder_cancel(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ReminderIdParams = parse_params(params)?;
+    let reminder = state
+        .store
+        .cancel_reminder(&p.actor_id, &p.id)
+        .map_err(map_store_err)?;
+    ok(ReminderCancelResult { reminder })
+}
+
+fn reminder_snooze(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ReminderSnoozeParams = parse_params(params)?;
+    let reminder = state
+        .store
+        .snooze_reminder(&p.actor_id, &p.id, p.by_seconds)
+        .map_err(map_store_err)?;
+    ok(ReminderSnoozeResult { reminder })
+}
+
+fn reminder_update(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ReminderUpdateParams = parse_params(params)?;
+    let fire_at = match (p.fire_at, p.delay_seconds) {
+        (Some(fire_at), _) => Some(fire_at),
+        (None, Some(delay)) if delay > 0 => Some(Utc::now() + chrono::Duration::seconds(delay)),
+        (None, Some(_)) => {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                "delaySeconds must be positive",
+            ))
+        }
+        (None, None) => None,
+    };
+    let reminder = state
+        .store
+        .update_reminder(&p.actor_id, &p.id, p.title, fire_at, p.repeat)
+        .map_err(map_store_err)?;
+    ok(ReminderUpdateResult { reminder })
 }
 
 // ---- delivery/list (§9.2 durable actor inbox) ----
@@ -851,7 +966,7 @@ fn actor_list(state: &AppState) -> HandlerResult {
 
 /// Pre-register or update an actor row. `connection/open` already does an
 /// implicit upsert, but it stamps `kind = Human` if the caller forgets to
-/// pass `actorKind`. This dedicated RPC lets `joi agent serve` (and any
+/// pass `actorKind`. This dedicated RPC lets `joi daemon` (and any
 /// other operator) declare an agent's full `Actor` (id, kind, display,
 /// capabilities) before the agent ever opens its own connection — which
 /// is what makes the "invite this agent into the channel, agent connects
@@ -860,6 +975,15 @@ fn actor_upsert(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ActorUpsertParams = parse_params(params)?;
     let actor = state.store.upsert_actor(p.actor).map_err(map_store_err)?;
     ok(ActorUpsertResult { actor })
+}
+
+fn actor_delete(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ActorDeleteParams = parse_params(params)?;
+    let deleted = state
+        .store
+        .delete_actor(&p.actor_id)
+        .map_err(map_store_err)?;
+    ok(ActorDeleteResult { deleted })
 }
 
 #[allow(dead_code)]
@@ -928,6 +1052,43 @@ mod tests {
         .expect("connection/open");
     }
 
+    fn append_channel_root(
+        state: &AppState,
+        channel_id: &str,
+        actor_id: &str,
+        text: &str,
+    ) -> String {
+        state
+            .store
+            .append_event(
+                "content.add".into(),
+                actor_id.into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel_id.into(),
+                },
+                None,
+                json!({ "contentType": "text/markdown", "text": text }),
+                vec![],
+                None,
+            )
+            .expect("append root event")
+            .id
+    }
+
+    fn create_thread_under(
+        state: &AppState,
+        channel_id: &str,
+        actor_id: &str,
+        title: &str,
+    ) -> proto::types::Thread {
+        let root_event_id = append_channel_root(state, channel_id, actor_id, title);
+        state
+            .store
+            .create_thread(channel_id.into(), title.into(), root_event_id)
+            .expect("create thread")
+    }
+
     #[test]
     fn artifact_publish_rejects_inaccessible_scope() {
         let state = fresh_state("artifact-publish-acl");
@@ -983,10 +1144,7 @@ mod tests {
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
             .expect("create channel");
-        state
-            .store
-            .create_thread(channel.id.clone(), "child".into(), None)
-            .expect("create thread");
+        create_thread_under(&state, &channel.id, "actor_owner", "child");
         open_conn(&state, "conn_intruder", "actor_intruder").await;
 
         let err = dispatch(
@@ -1010,10 +1168,7 @@ mod tests {
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
             .expect("create channel");
-        state
-            .store
-            .create_thread(channel.id.clone(), "child".into(), None)
-            .expect("create thread");
+        create_thread_under(&state, &channel.id, "actor_owner", "child");
         open_conn(&state, "conn_owner", "actor_owner").await;
 
         let value = dispatch(
@@ -1039,13 +1194,16 @@ mod tests {
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
             .expect("create channel");
+        let root_event_id = append_channel_root(&state, &channel.id, "actor_owner", "sneaky");
         open_conn(&state, "conn_intruder", "actor_intruder").await;
 
         let err = dispatch(
             &state,
             "conn_intruder",
             method::THREAD_CREATE,
-            Some(json!({ "channelId": channel.id, "title": "sneaky" })),
+            Some(
+                json!({ "channelId": channel.id, "rootEventId": root_event_id, "title": "sneaky" }),
+            ),
         )
         .await
         .expect_err("thread/create should be denied");
@@ -1061,13 +1219,14 @@ mod tests {
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
             .expect("create channel");
+        let root_event_id = append_channel_root(&state, &channel.id, "actor_owner", "ok");
         open_conn(&state, "conn_owner", "actor_owner").await;
 
         let value = dispatch(
             &state,
             "conn_owner",
             method::THREAD_CREATE,
-            Some(json!({ "channelId": channel.id, "title": "ok" })),
+            Some(json!({ "channelId": channel.id, "rootEventId": root_event_id, "title": "ok" })),
         )
         .await
         .expect("thread/create should succeed");
@@ -1085,18 +1244,12 @@ mod tests {
             .store
             .create_channel("a".into(), Some("actor_alice".into()))
             .expect("create a");
-        let _t_a = state
-            .store
-            .create_thread(private_a.id.clone(), "in-a".into(), None)
-            .expect("thread in a");
+        let _t_a = create_thread_under(&state, &private_a.id, "actor_alice", "in-a");
         let private_b = state
             .store
             .create_channel("b".into(), Some("actor_bob".into()))
             .expect("create b");
-        let _t_b = state
-            .store
-            .create_thread(private_b.id.clone(), "in-b".into(), None)
-            .expect("thread in b");
+        let _t_b = create_thread_under(&state, &private_b.id, "actor_bob", "in-b");
 
         open_conn(&state, "conn_alice", "actor_alice").await;
         let value = dispatch(&state, "conn_alice", method::THREAD_LIST, None)
@@ -1117,10 +1270,7 @@ mod tests {
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
             .expect("create channel");
-        let thread = state
-            .store
-            .create_thread(channel.id.clone(), "doomed".into(), None)
-            .expect("create thread");
+        let thread = create_thread_under(&state, &channel.id, "actor_owner", "doomed");
         open_conn(&state, "conn_intruder", "actor_intruder").await;
 
         let err = dispatch(
@@ -1143,10 +1293,7 @@ mod tests {
             .store
             .create_channel("private".into(), Some("actor_owner".into()))
             .expect("create channel");
-        let thread = state
-            .store
-            .create_thread(channel.id.clone(), "orig".into(), None)
-            .expect("create thread");
+        let thread = create_thread_under(&state, &channel.id, "actor_owner", "orig");
         open_conn(&state, "conn_intruder", "actor_intruder").await;
 
         let err = dispatch(

@@ -12,17 +12,17 @@
 # 终端 1：启动 server
 cargo run -p joi-server
 
-# 终端 2：安装或注册 agent spec
+# 终端 2：安装或注册 provider spec
 cargo run -p joi-cli -- agent install claude-acp --actor-id actor_claude
 
-# 终端 3：跑 agent client；它会为每个 spec 起一条 ws 连接
+# 终端 3：跑 agent client；它会为每个 actor 起一条 ws 连接
 cargo run -p joi-cli -- agent serve
 
 # 终端 4：照常使用 chat
 cargo run -p joi-cli -- chat --in <thread_id>
 ```
 
-server 不再读取 agent spec，也不会 spawn agent 子进程。
+server 不再读取 provider spec，也不会 spawn agent 子进程。
 
 ---
 
@@ -471,16 +471,16 @@ client 管理的 actor 之一。
   上线。
 - **E3c**（`feat(cli): joi agent serve external runtime client`）：新增
   [`crates/cli/src/cmd/agent_serve.rs`](../crates/cli/src/cmd/agent_serve.rs)
-  实现 `joi agent serve [--specs <dir>]`：扫 `~/.config/joi/agents/`，每个 spec 起
-  一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
+  实现 `joi agent serve [--specs <dir>]`：扫 `~/.config/joi/agents/`，把 provider
+  spec 展开成 actor；每个 actor 起一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
   `hands_off_to` 翻译成 `turn/open` + `send_prompt` + 流式 trace + `turn/close`。
 
 ### Phase E4：清理 server ✅ 已合
 
 - 删除 `crates/server/src/runtime/`，server 不再依赖 `agent-runtime`。
-- 删除 server 侧 `agent/*` runtime RPC；agent spec 安装/注册/删除改为 CLI 本地写
+- 删除 server 侧 `agent/*` runtime RPC；provider spec 安装/注册/删除改为 CLI 本地写
   `~/.config/joi/agents/`。
-- 后续可把 `AgentSpec` / `AgentTransport` 从 `methods.rs` 移到独立 mod，进一步
+- 后续可把 `AgentProviderSpec` / `AgentSpec` / `AgentTransport` 从 `methods.rs` 移到独立 mod，进一步
   表明它们不属于 server runtime 协议。
 
 每个 phase 都满足"可灰度"：E1/E2 没有协议变更；E3 让 server 同时能跑两种部署模
@@ -538,8 +538,8 @@ client 管理的 actor 之一。
 | `AcpAdapter` 实现 | [crates/agent-runtime/src/acp.rs](../crates/agent-runtime/src/acp.rs) | ACP stdio transport |
 | `CommandAdapter` 实现 | [crates/agent-runtime/src/command.rs](../crates/agent-runtime/src/command.rs) | 一次性 CLI transport |
 | `action.response` 路由 | [crates/cli/src/cmd/agent_serve.rs](../crates/cli/src/cmd/agent_serve.rs) | agent client 调 `adapter.respond_action` |
-| `AgentSpec` / `AgentTransport` schema | [crates/proto/src/methods.rs:393-414](../crates/proto/src/methods.rs#L393-L414) | `transport.kind` 增加 `"command"`；`cwd` 从 spec 中移除，由 runtime 统一按 channel 计算 |
-| 现有 spec 范例 | [agents/actor_opencode.json](../agents/actor_opencode.json) | E3 阶段迁到 `~/.config/joi/agents/` |
+| `AgentProviderSpec` / `AgentTransport` schema | [crates/proto/src/methods.rs](../crates/proto/src/methods.rs) | provider spec 展开成 per-actor runtime spec；`cwd` 由 runtime 统一按 channel 计算 |
+| 现有 spec 范例 | [agents/opencode.json](../agents/opencode.json) | E3 阶段迁到 `~/.config/joi/agents/` |
 | Marketplace 编目 | [assets/marketplace.json](../assets/marketplace.json) | 编目格式不变；`joi agent install` 改由 cli 写本地文件 |
 | `connection/open` handler | [crates/server/src/handlers/mod.rs:98-135](../crates/server/src/handlers/mod.rs#L98-L135) | 不变；agent client 用同一接口上线每个被管理的 actor |
 

@@ -525,8 +525,7 @@ fn apply_plan(ctx: &Ctx, plan: &[PlanItem], force: bool, no_backup: bool) -> Res
             continue;
         }
         if let Some(parent) = item.target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
         }
         match item.category.as_str() {
             "session" => apply_session(item)?,
@@ -668,9 +667,11 @@ fn verify_plan(plan: &[PlanItem]) -> Result<()> {
     let mut report = VerifyReport::default();
     for item in plan {
         if !item.target.exists() {
-            report
-                .drift
-                .push(format!("[{}] missing target {}", item.category, item.target.display()));
+            report.drift.push(format!(
+                "[{}] missing target {}",
+                item.category,
+                item.target.display()
+            ));
             continue;
         }
         report.checked += 1;
@@ -713,10 +714,7 @@ fn verify_session(item: &PlanItem, report: &mut VerifyReport) {
             return;
         }
     };
-    let tgt_id = v
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
+    let tgt_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
     if tgt_id != src_id {
         report.drift.push(format!(
             "[session] id mismatch src={src_id} tgt={tgt_id} ({})",
@@ -736,9 +734,10 @@ fn verify_scope_json(item: &PlanItem, report: &mut VerifyReport) {
         serde_json::from_str::<Value>(&src_text),
         serde_json::from_str::<Value>(&tgt_text),
     ) else {
-        report
-            .drift
-            .push(format!("[scope-json] unparseable {}", item.target.display()));
+        report.drift.push(format!(
+            "[scope-json] unparseable {}",
+            item.target.display()
+        ));
         return;
     };
     if let (Some(src_obj), Some(tgt_obj)) = (src.as_object(), tgt.as_object()) {
@@ -858,8 +857,7 @@ mod tests {
         let ctx = ctx_for(&root);
         // Pre-populate target with a `mounts[]` written by an
         // operator/CLI; merge must NOT overwrite it.
-        let target = root
-            .join("data/channels/cid42/shared/.joi/state/scope.json");
+        let target = root.join("data/channels/cid42/shared/.joi/state/scope.json");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, r#"{"mounts":[{"name":"new"}]}"#).unwrap();
         let plan = plan_channel_scope(&ctx).unwrap();

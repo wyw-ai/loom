@@ -3,7 +3,7 @@
 // and the flow is easy to unit-test.
 
 import * as ipc from "@/ipc/bridge";
-import type { Channel, Thread } from "@/ipc/types";
+import type { Actor, Channel, Thread } from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
@@ -11,40 +11,62 @@ import { useUI } from "@/store/ui";
 import { openScope } from "@/features/chat/scopeActions";
 
 export function openCreateChannel() {
-  useUI.getState().openModal({
-    type: "input",
-    title: "New channel",
-    label: "Title",
-    placeholder: "e.g. design",
-    confirmLabel: "Create",
-    onSubmit: async (title) => {
-      const t = title.trim();
-      if (!t) return;
-      const actorId = useSession.getState().workspace?.actorId;
-      try {
-        const { channel } = await ipc.channelCreate({ title: t, actorId });
-        useChannels.getState().upsertChannel(channel);
-        await openScope({ kind: "channel", id: channel.id });
-      } catch (e) {
-        useUI
-          .getState()
-          .pushToast(
-            "error",
-            `create channel: ${e instanceof Error ? e.message : String(e)}`,
-          );
-      }
-    },
-  });
+  (async () => {
+    const actorItems = await loadActorItems();
+    useUI.getState().openModal({
+      type: "channelForm",
+      title: "Create channel",
+      initialTitle: "",
+      initialDescription: "",
+      confirmLabel: "Create Channel",
+      actorItems,
+      onSubmit: async ({ title, actorIds }) => {
+        const t = title.trim();
+        if (!t) return;
+        const actorId = useSession.getState().workspace?.actorId;
+        try {
+          const { channel } = await ipc.channelCreate({ title: t, actorId });
+          let latestChannel = channel;
+          useChannels.getState().upsertChannel(latestChannel);
+          for (const invitee of actorIds) {
+            try {
+              await upsertKnownActor(invitee);
+              const r = await ipc.channelInvite({
+                channelId: channel.id,
+                actorId: invitee,
+              });
+              latestChannel = r.channel;
+              useChannels.getState().upsertChannel(latestChannel);
+            } catch {
+              /* keep channel creation successful; invite can be retried */
+            }
+          }
+          await refreshChannelMembers(latestChannel.id);
+          await openScope({ kind: "channel", id: channel.id });
+        } catch (e) {
+          useUI
+            .getState()
+            .pushToast(
+              "error",
+              `create channel: ${e instanceof Error ? e.message : String(e)}`,
+            );
+        }
+      },
+    });
+  })();
 }
 
 export function openRenameChannel(channel: Channel) {
   useUI.getState().openModal({
-    type: "input",
-    title: `Rename #${channel.title}`,
-    label: "Title",
-    initial: channel.title,
-    confirmLabel: "Rename",
-    onSubmit: async (title) => {
+    type: "channelForm",
+    title: "Edit channel",
+    nameLabel: "Name",
+    initialTitle: channel.title,
+    initialDescription:
+      channel.title === "all" ? "General channel for all members" : "",
+    titleLocked: channel.title === "all",
+    confirmLabel: "Save Changes",
+    onSubmit: async ({ title }) => {
       const t = title.trim();
       if (!t || t === channel.title) return;
       try {
@@ -102,11 +124,10 @@ export function openInviteToChannel(channel: Channel) {
   // Pre-load actor directory so the picker has names, then show.
   (async () => {
     let actors: Array<{ id: string; label: string; hint: string }> = [];
+    const known = await loadKnownActors();
     try {
-      const r = await ipc.actorList();
-      useActors.getState().upsertMany(r.actors);
       const already = new Set(channel.members);
-      actors = r.actors
+      actors = known
         .filter((a) => !already.has(a.id))
         .map((a) => ({
           id: a.id,
@@ -118,7 +139,7 @@ export function openInviteToChannel(channel: Channel) {
         .getState()
         .pushToast(
           "error",
-          `actor/list: ${e instanceof Error ? e.message : String(e)}`,
+          `actor list: ${e instanceof Error ? e.message : String(e)}`,
         );
       return;
     }
@@ -134,6 +155,7 @@ export function openInviteToChannel(channel: Channel) {
       items: actors,
       onPick: async (actorId) => {
         try {
+          await upsertKnownActor(actorId);
           const r = await ipc.channelInvite({
             channelId: channel.id,
             actorId,
@@ -143,12 +165,7 @@ export function openInviteToChannel(channel: Channel) {
           // full Actor rows (displayName, kind, …). Refetch so the panel
           // shows the new invitee immediately without waiting for the user
           // to toggle/reopen the rail.
-          try {
-            const m = await ipc.channelMembers(channel.id);
-            useChannels.getState().replaceMembers(channel.id, m.members);
-          } catch {
-            /* leave stale — next open will refetch */
-          }
+          await refreshChannelMembers(channel.id);
           useUI
             .getState()
             .pushToast("info", `invited ${actorId} to #${channel.title}`);
@@ -175,8 +192,26 @@ export function openCreateThread(channelId: string) {
     onSubmit: async (title) => {
       const t = title.trim();
       if (!t) return;
+      const actorId = useSession.getState().workspace?.actorId;
+      if (!actorId) {
+        useUI
+          .getState()
+          .pushToast("error", "connect a workspace before creating a thread");
+        return;
+      }
       try {
-        const r = await ipc.threadCreate({ channelId, title: t });
+        const root = await ipc.eventAppend({
+          type: "content.add",
+          actorId,
+          scope: { kind: "channel", id: channelId },
+          payload: { contentType: "text/markdown", text: t },
+          relations: [],
+        });
+        const r = await ipc.threadCreate({
+          channelId,
+          rootEventId: root.event.id,
+          title: t,
+        });
         useChannels.getState().upsertThread(r.thread);
         await openScope({ kind: "thread", id: r.thread.id });
       } catch (e) {
@@ -189,6 +224,60 @@ export function openCreateThread(channelId: string) {
       }
     },
   });
+}
+
+async function loadActorItems(): Promise<
+  Array<{ id: string; label: string; hint?: string; kind?: string }>
+> {
+  const actors = await loadKnownActors();
+  return actors
+    .filter((a) => a.kind !== "service")
+    .map((a) => ({
+      id: a.id,
+      label: a.displayName || a.id,
+      hint: a.kind,
+      kind: a.kind,
+    }));
+}
+
+async function loadKnownActors(): Promise<Actor[]> {
+  const byId = new Map<string, Actor>();
+  try {
+    const r = await ipc.actorList();
+    for (const actor of r.actors) byId.set(actor.id, actor);
+  } catch {
+    /* machine-config agents below still give the picker useful options */
+  }
+  try {
+    const r = await ipc.machineList();
+    for (const agent of r.machines.flatMap((machine) => machine.agents)) {
+      byId.set(agent.spec.actor.id, agent.spec.actor);
+    }
+  } catch {
+    /* fall back to server actors only */
+  }
+  const actors = [...byId.values()];
+  useActors.getState().upsertMany(actors);
+  return actors;
+}
+
+async function upsertKnownActor(actorId: string) {
+  const actor = useActors.getState().byId[actorId];
+  if (!actor) return;
+  try {
+    await ipc.actorUpsert(actor);
+  } catch {
+    /* channel/invite will surface the connection error if the server is down */
+  }
+}
+
+async function refreshChannelMembers(channelId: string) {
+  try {
+    const m = await ipc.channelMembers(channelId);
+    useChannels.getState().replaceMembers(channelId, m.members);
+  } catch {
+    /* leave stale — next open will refetch */
+  }
 }
 
 export function openRenameThread(thread: Thread) {

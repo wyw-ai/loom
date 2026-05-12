@@ -1,0 +1,22 @@
+{
+  "provider": {
+    "id": "codex",
+    "displayName": "Codex ACP"
+  },
+  "transport": {
+    "kind": "acp_stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@zed-industries/codex-acp@0.10.0"
+    ],
+    "env": {}
+  },
+  "actors": [
+    {
+      "id": "actor_codex",
+      "displayName": "Codex",
+      "capabilities": {}
+    }
+  ]
+}

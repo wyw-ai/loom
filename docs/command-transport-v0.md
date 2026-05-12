@@ -88,6 +88,8 @@ pub enum CommandOutputFormat {
     Text,
     /// Anthropic Claude Code `--output-format stream-json` 格式。
     ClaudeStreamJson,
+    /// GitHub Copilot CLI `--output-format json` 的 JSONL session event 格式。
+    CopilotJson,
     /// OpenAI codex CLI `--output-format stream-json` 格式（占位，schema 待定）。
     CodexStreamJson,
     /// 通用：每行一条 JSON，按 `{"type":"text","text":"..."}` 这种 envelope 翻译。
@@ -110,10 +112,9 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
 
 ```json
 {
-  "actor": {
-    "id": "actor_claude_cmd",
-    "kind": "agent",
-    "displayName": "Claude (command mode)"
+  "provider": {
+    "id": "claude_cmd",
+    "displayName": "Claude Code Command"
   },
   "transport": {
     "kind": "command",
@@ -123,13 +124,21 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
       "ANTHROPIC_API_KEY": "{env.ANTHROPIC_API_KEY}"
     },
     "session": {
-      "first_run_capture": "stdout_json:.session_id",
-      "resume_args": ["--resume", "{session_id}", "-p"]
+      "firstRunCapture": "stdout_json:.session_id",
+      "resumeArgs": ["--resume", "{session_id}", "-p"]
     },
-    "output_format": "claude_stream_json",
-    "prompt_via": "args"
+    "outputFormat": "claude_stream_json",
+    "promptVia": "args"
   },
-  "autostart": true
+  "defaults": {
+    "autostart": true
+  },
+  "actors": [
+    {
+      "id": "actor_claude_cmd",
+      "displayName": "Claude (command mode)"
+    }
+  ]
 }
 ```
 
@@ -301,7 +310,7 @@ spec 里配置，由 runtime 固定设为当前 channel 下该 actor 的 workspa
 
 ### 5.2 空 prompt 的处理
 
-不应该出现"hand-off 事件没带文本"的情况——`joi agent serve` 的
+不应该出现"hand-off 事件没带文本"的情况——`joi daemon` 的
 `render_prompt` 会用 fallback（`text` → `message` → 整个 payload JSON）保证非空。
 但 adapter 要做防御性检查：
 
@@ -357,7 +366,17 @@ Anthropic Claude Code `--output-format stream-json` 输出长这样（每行一�
 stream-json 没有显式 flush，所以约定"`type=result` 之前所有的 text 都按 partial
 累积，遇到 result 时 emit 一次 `is_partial=false` 的空 text 强制 flush"。
 
-### 6.3 `codex_stream_json`
+### 6.3 `copilot_json`
+
+GitHub Copilot CLI `--output-format json --stream off` 输出 JSONL session
+events。joi 只把根 agent 的最后一条 `assistant.message.data.content` 当成最终
+回答发给用户；`tool.*`、`assistant.reasoning*`、带 `agentId` 的 sub-agent 事件
+都保留在子进程 stdout 日志里，不转换成用户可见消息。
+
+如果只收到 `assistant.message_delta.data.deltaContent` 而没有完整
+`assistant.message`，adapter 会把 delta 拼接后作为 fallback 输出。
+
+### 6.4 `codex_stream_json`
 
 OpenAI codex CLI 也支持 stream-json 但 schema 不同。具体 envelope 待确认；占位映
 射：
@@ -371,7 +390,7 @@ OpenAI codex CLI 也支持 stream-json 但 schema 不同。具体 envelope 待�
 
 E2 阶段实现时再根据实际 codex 输出 fix schema。
 
-### 6.4 `ndjson_lines`
+### 6.5 `ndjson_lines`
 
 最通用、给"自己写脚本"的人用：
 
@@ -394,13 +413,13 @@ E2 阶段实现时再根据实际 codex 输出 fix schema。
 
 不能 parse 的行被静默 drop（但写入 agent log），不会让一行错误格式毁了整次调用。
 
-### 6.5 子进程 stderr
+### 6.6 子进程 stderr
 
 不论 `output_format` 取何值，stderr 始终：
 
 - 行式追加到该 agent 的 log（`~/.local/share/joi/agents/<actor>/logs/run.log`）；
 - 不进 `AdapterEvent` 流；
-- 用户通过 `joi agent log <id>` 看。
+- 用户直接查看 daemon data root 下的 agent log 文件。
 
 例外：`first_run_capture: stderr_regex:...` 时，stderr 同时被 regex 扫描以抓
 session_id。
@@ -413,10 +432,9 @@ session_id。
 
 ```json
 {
-  "actor": {
-    "id": "actor_claude_cmd",
-    "kind": "agent",
-    "displayName": "Claude Code (command)"
+  "provider": {
+    "id": "claude_cmd",
+    "displayName": "Claude Code Command"
   },
   "transport": {
     "kind": "command",
@@ -424,13 +442,21 @@ session_id。
     "args": ["-p", "--output-format", "stream-json", "--verbose"],
     "env": {},
     "session": {
-      "first_run_capture": "stdout_json:.session_id",
-      "resume_args": ["--resume", "{session_id}", "-p", "--output-format", "stream-json", "--verbose"]
+      "firstRunCapture": "stdout_json:.session_id",
+      "resumeArgs": ["--resume", "{session_id}", "-p", "--output-format", "stream-json", "--verbose"]
     },
-    "output_format": "claude_stream_json",
-    "prompt_via": "args"
+    "outputFormat": "claude_stream_json",
+    "promptVia": "args"
   },
-  "autostart": true
+  "defaults": {
+    "autostart": true
+  },
+  "actors": [
+    {
+      "id": "actor_claude_cmd",
+      "displayName": "Claude Code (command)"
+    }
+  ]
 }
 ```
 
@@ -512,27 +538,34 @@ echo "{\"type\":\"done\",\"ok\":true}"
 
 ```json
 {
-  "actor": {
-    "id": "actor_echo",
-    "kind": "agent",
-    "displayName": "Echo Bot"
+  "provider": {
+    "id": "echo",
+    "displayName": "Echo Command"
   },
   "transport": {
     "kind": "command",
     "command": "/Users/me/agents/echo-back.sh",
     "args": [],
     "env": {},
-    "output_format": "ndjson_lines",
-    "prompt_via": "args"
+    "outputFormat": "ndjson_lines",
+    "promptVia": "args"
   },
-  "autostart": true
+  "defaults": {
+    "autostart": true
+  },
+  "actors": [
+    {
+      "id": "actor_echo",
+      "displayName": "Echo Bot"
+    }
+  ]
 }
 ```
 
 注意：
 
 - 没填 `session.*` → 不走 resume，每次都是 first-run。echo bot 本来就无状态。
-- `output_format: ndjson_lines` → 每行 JSON 按 §6.4 翻译。
+- `output_format: ndjson_lines` → 每行 JSON 按 §6.5 翻译。
 - `prompt_via: args` 默认 → prompt 作为 `$1` 传进来。
 
 ### 8.3 注入给脚本的 env vars
@@ -545,6 +578,8 @@ IP。也可以用 `JOI_AGENT_SERVER` 显式覆盖。
 | --- | --- |
 | `JOI_SERVER` | 子进程 shell out 回 joi 时使用的 WS URL |
 | `JOI_ACTOR` | 当前 agent 的 actor id |
+| `JOI_SCOPE_ID` | 当前 turn 的 thread/channel scope id |
+| `JOI_SCOPE_KIND` | 当前 turn 的 scope kind：`thread` 或 `channel` |
 | `JOI_AGENT_PROFILE` | per-actor profile 目录 |
 | `JOI_AGENT_BUNDLE_DIR` | 当前 bundle 目录 |
 | `AGENTX_CHANNEL_ID` | 当前 channel id |
@@ -554,7 +589,7 @@ IP。也可以用 `JOI_AGENT_SERVER` 显式覆盖。
 | `AGENTX_AGENT_ROOT` | 当前 channel 下该 agent 的私有根目录 |
 | `AGENTX_AGENT_WORKSPACE` | 当前 channel 下该 agent 的默认 workspace |
 | `AGENTX_AGENT_LOGS` | 当前 channel 下该 agent 的日志目录 |
-| `PATH` | 继承 `joi agent serve` 进程的 PATH |
+| `PATH` | 继承 `joi daemon` 进程的 PATH |
 
 ### 8.4 脚本里 shell out 回 joi
 
@@ -562,6 +597,7 @@ IP。也可以用 `JOI_AGENT_SERVER` 显式覆盖。
 
 ```bash
 joi --json event list --in "$JOI_SCOPE_ID" --limit 20
+joi --json event list --in "$JOI_SCOPE_ID" --channel --limit 20
 joi --json artifact publish --name plan.md --text "$plan_body"
 ```
 
@@ -601,6 +637,12 @@ ACP 有 `session/request_permission` → joi `action.request` 的反向通道。
 v0 决定：command transport 不发 `AdapterEvent::ActionRequest`，整个 turn 是"prompt
 进、结果出"的同步往返。如果某个 command CLI 真的需要权限审批，应该让它的开发者
 做成 ACP transport。
+
+agent 主动需要人参与时不走 adapter permission 通道，而是 shell out 到 Joi 的
+human-interaction 工具：`joi ask-user-question` 用于选择/补信息，
+`joi request-approval` 用于批准/拒绝。命令自己 append `action.request`，阻塞
+等待 `action.response`，然后把结果返回给当前 agent 进程；daemon worker 只广播
+这条响应，不把 `joi:question:*` / `joi:approval:*` 回传给 adapter。
 
 ### 9.4 Session id 不是 joi 的概念
 

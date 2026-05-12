@@ -227,7 +227,20 @@ async fn resolve_scope(
                 return Ok((ScopeKind::Thread, entry.thread_id.clone()));
             }
             let title = scope::thread_title(event, &key);
-            let thread = runtime.create_thread(channel_id, &title).await?;
+            let root_event_id = runtime
+                .append_content(
+                    ScopeRef {
+                        kind: ScopeKind::Channel,
+                        id: channel_id.into(),
+                    },
+                    title.clone(),
+                    vec![],
+                    None,
+                )
+                .await?;
+            let thread = runtime
+                .create_thread(channel_id, &root_event_id, &title)
+                .await?;
             chan_map.insert(
                 key,
                 scope::ThreadEntry {

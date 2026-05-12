@@ -17,7 +17,7 @@
 //!   * [`build_envelope`] — orchestrator. Reads identity / soul from the
 //!     profile dir, opens the memory store, runs the selector, renders
 //!     memory sections, then hands off to [`compose_prompt`]. This is what
-//!     both the server runtime and v1 `joi agent serve` call.
+//!     both the server runtime and daemon-managed agent workers call.
 
 /// A named, titled, rendered section. Exposed so callers (and tests) can
 /// inspect individual pieces, not just the final glued prompt.

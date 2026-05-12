@@ -18,12 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const LEGACY_TOKENS: &[&str] = &[
-    "dev-helper",
-    "dev_helper",
-    "servicectl",
-    "run-agent.sh",
-];
+const LEGACY_TOKENS: &[&str] = &["dev-helper", "dev_helper", "servicectl", "run-agent.sh"];
 
 /// Path prefixes (relative to the workspace root) where legacy
 /// tokens are still legitimately referenced. Anything outside this
@@ -53,13 +48,7 @@ const ALLOWED_PREFIXES: &[&str] = &[
 /// Directories to skip outright (build artefacts, vendored deps,
 /// node_modules, etc.). The walk is small (<5k files for this
 /// repo) so we don't bother with `.gitignore` parsing.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    ".vscode",
-    ".idea",
-];
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".vscode", ".idea"];
 
 fn workspace_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -84,11 +84,11 @@ graph LR
 ~/.config/joi/services/*.json
 ```
 
-service spec 与 agent spec 的关键差异：
+service spec 与 agent provider spec 的关键差异：
 
-- agent spec 隐式 `actor.kind = "agent"`。
+- agent provider spec 的 `actors[]` 隐式 `actor.kind = "agent"`。
 - service spec 必须显式声明 `actor.kind = "service"`，并允许同一 host 进程挂载多个不同 kind 的 service actor。
-- 其他公共字段，如 `id`、`displayName`、`autostart`，与 agent spec 对齐，便于复用 `crates/cli/src/cmd/agent_serve.rs` 的 spec 加载与 `--allow-*` 过滤逻辑。
+- service spec 是独立 schema；provider spec 先展开成 per-actor runtime spec，再复用 `crates/cli/src/cmd/agent_serve.rs` 的 adapter 调度逻辑。
 
 示例：
 
@@ -461,7 +461,8 @@ receipt/record(eventId, actorId, completed)
 
 `event/append` 已有 scope ACL；现在 thread create/list/update/delete 四个 handler 也按 caller-actor 校验 channel membership：
 
-- `thread/create`：caller 必须是目标 channel 的 member（公区 channel 短路）。
+- `thread/create`：caller 必须是目标 channel 的 member（公区 channel 短路），且
+  `rootEventId` 必须指向该 channel 公共区事件。
 - `thread/list`：silently filter，只返回 caller 可见 channel 下的 thread；与 `channel/list` 同形态。
 - `thread/update` / `thread/delete`：先解析 thread → channel，再校验 caller membership。
 - 实现位置：`crates/server/src/handlers/mod.rs::thread_create / thread_list / thread_update / thread_delete`，dispatch 层透传 `connection_id`。

@@ -52,6 +52,20 @@ pub async fn upsert(
     Ok(())
 }
 
+pub async fn delete(client: Arc<Client>, actor_id: String) -> Result<()> {
+    let res: ActorDeleteResult = client
+        .call(method::ACTOR_DELETE, json!({ "actorId": actor_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.deleted {
+        println!("actor deleted");
+    } else {
+        println!("actor not found");
+    }
+    Ok(())
+}
+
 fn parse_actor_kind(kind: &str) -> Result<ActorKind> {
     match kind.to_ascii_lowercase().as_str() {
         "human" => Ok(ActorKind::Human),

@@ -1,5 +1,15 @@
 import clsx from "clsx";
-import { Bell, Plus, Settings } from "lucide-react";
+import type { MouseEvent } from "react";
+import {
+  type LucideIcon,
+  MessageSquare,
+  Monitor,
+  Plus,
+  Settings,
+  SquareCheckBig,
+  TriangleAlert,
+  Users,
+} from "lucide-react";
 
 import { useInbox } from "@/store/inbox";
 import { useSession } from "@/store/session";
@@ -11,188 +21,194 @@ import {
   disconnectWorkspace,
 } from "@/features/workspaces/connect";
 import { openAddWorkspaceModal } from "@/features/workspaces/AddWorkspaceModal";
+import { openWorkspaceSwitcher } from "@/features/workspaces/WorkspaceSwitcher";
 import * as ipc from "@/ipc/bridge";
+
+type RailView = "chat" | "tasks" | "members" | "machines";
+
+const railItems: Array<{
+  view: RailView;
+  label: string;
+  icon: LucideIcon;
+}> = [
+  { view: "chat", label: "Chat", icon: MessageSquare },
+  { view: "tasks", label: "Tasks", icon: SquareCheckBig },
+  { view: "members", label: "Members", icon: Users },
+  { view: "machines", label: "Machines", icon: Monitor },
+];
 
 export function ServerRail() {
   const workspaces = useWorkspaces((s) => s.workspaces);
   const activeId = useWorkspaces((s) => s.activeId);
   const connectingId = useWorkspaces((s) => s.connectingId);
   const connection = useSession((s) => s.connection);
+  const pendingInboxItems = useInbox((s) => s.items.length);
   const unseen = useInbox((s) => s.items.filter((x) => !x.seen).length);
   const view = useUI((s) => s.view);
   const setView = useUI((s) => s.setView);
   const openContextMenu = useUI((s) => s.openContextMenu);
-  const pushToast = useUI((s) => s.pushToast);
 
-  const toggleInbox = () =>
-    setView(view === "inbox" ? "chat" : "inbox");
+  const activeWorkspace =
+    workspaces.find((w) => w.id === activeId) ?? workspaces[0] ?? null;
 
   return (
-    <nav className="flex h-full w-[72px] shrink-0 flex-col items-center gap-2 overflow-hidden border-r border-border bg-servers py-3">
-      {workspaces.map((w) => (
-        <WorkspaceDot
-          key={w.id}
-          workspace={w}
-          active={activeId === w.id && connection === "open"}
-          connecting={connectingId === w.id}
-          error={activeId === w.id && connection === "error"}
-          onClick={() => {
-            // Always land on the chat view — if the user bounced off to
-            // Inbox/Settings and then clicked the workspace icon, they
-            // expect to be back where the channels are.
-            setView("chat");
-            if (activeId === w.id && connection === "open") return;
-            void connectWorkspace(w.id);
-          }}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            openContextMenu({
-              x: e.clientX,
-              y: e.clientY,
-              items: [
-                {
-                  kind: "item",
-                  label: "Reconnect",
-                  onClick: () => void connectWorkspace(w.id),
-                },
-                {
-                  kind: "item",
-                  label: "Disconnect",
-                  disabled: activeId !== w.id || connection !== "open",
-                  onClick: () => void disconnectWorkspace(),
-                },
-                { kind: "divider" },
-                {
-                  kind: "item",
-                  label: "Remove…",
-                  danger: true,
-                  onClick: () =>
-                    confirmRemoveWorkspace(w.id, w.name),
-                },
-              ],
-            });
-          }}
-        />
-      ))}
-
-      <button
-        aria-label="Add workspace"
-        onClick={openAddWorkspaceModal}
-        className="flex h-12 w-12 items-center justify-center rounded-xl bg-elevated text-secondary transition-colors hover:bg-success hover:text-white"
-      >
-        <Plus size={22} />
-      </button>
-
-      {workspaces.length > 0 && <div className="my-1 h-px w-8 bg-border" />}
-
-      <button
-        aria-label="Inbox"
-        disabled={connection !== "open"}
-        className={clsx(
-          "relative flex h-12 w-12 items-center justify-center rounded-xl transition-colors",
-          view === "inbox"
-            ? "bg-warning/20 text-warning"
-            : "bg-elevated text-secondary hover:bg-warning/20 hover:text-warning",
-          connection !== "open" && "opacity-40",
+    <nav className="relative hidden h-full w-16 shrink-0 select-none flex-col items-center border-r-2 border-black bg-brutal-yellow md:flex">
+      <div className="flex h-panel-header w-full items-center justify-center border-b-2 border-black">
+        {activeWorkspace ? (
+          <WorkspaceButton
+            workspace={activeWorkspace}
+            active={activeId === activeWorkspace.id && connection === "open"}
+            connecting={connectingId === activeWorkspace.id}
+            onClick={openWorkspaceSwitcher}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              openContextMenu({
+                x: e.clientX,
+                y: e.clientY,
+                items: [
+                  {
+                    kind: "item",
+                    label: "Reconnect",
+                    onClick: () => void connectWorkspace(activeWorkspace.id),
+                  },
+                  {
+                    kind: "item",
+                    label: "Disconnect",
+                    disabled:
+                      activeId !== activeWorkspace.id || connection !== "open",
+                    onClick: () => void disconnectWorkspace(),
+                  },
+                  { kind: "divider" },
+                  {
+                    kind: "item",
+                    label: "Add workspace...",
+                    onClick: openAddWorkspaceModal,
+                  },
+                  {
+                    kind: "item",
+                    label: "Remove...",
+                    danger: true,
+                    onClick: () =>
+                      confirmRemoveWorkspace(
+                        activeWorkspace.id,
+                        activeWorkspace.name,
+                      ),
+                  },
+                ],
+              });
+            }}
+          />
+        ) : (
+          <button
+            aria-label="Add workspace"
+            className="btn-brutal h-10 w-10 bg-black text-brutal-yellow"
+            onClick={openAddWorkspaceModal}
+          >
+            <Plus size={18} />
+          </button>
         )}
-        onClick={toggleInbox}
-      >
-        <Bell size={20} />
-        {unseen > 0 && (
-          <span className="absolute -right-1 -top-1 min-w-[18px] rounded-full bg-danger px-1 text-center text-[10px] font-semibold leading-[18px] text-white">
-            {unseen > 99 ? "99+" : unseen}
-          </span>
-        )}
-      </button>
+      </div>
 
-      <div className="flex-1" />
+      <div className="flex w-full flex-1 flex-col items-center gap-1.5 py-2">
+        {railItems.map((item) => {
+          const Icon = item.icon;
+          const active = view === item.view;
+          return (
+            <button
+              key={item.view}
+              type="button"
+              title={item.label}
+              aria-label={item.label}
+              aria-pressed={active}
+              className={clsx(
+                "flex h-10 w-10 items-center justify-center border-2 transition-colors",
+                active
+                  ? "border-black bg-white shadow-brutal-sm"
+                  : "border-transparent hover:border-black hover:bg-white/70",
+              )}
+              onClick={() => setView(item.view)}
+            >
+              <Icon size={18} />
+            </button>
+          );
+        })}
+      </div>
+
+      {pendingInboxItems > 0 && (
+        <button
+          aria-label={`Pending action requests (${pendingInboxItems} pending${
+            unseen > 0 ? `, ${unseen} new` : ""
+          })`}
+          title="Pending action requests"
+          className={clsx(
+            "btn-brutal-sm relative mb-3 h-9 w-9 bg-brutal-orange",
+            view === "inbox" && "bg-white",
+          )}
+          onClick={() => setView(view === "inbox" ? "chat" : "inbox")}
+        >
+          <TriangleAlert size={18} />
+          {unseen > 0 && (
+            <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-black bg-brutal-orange" />
+          )}
+        </button>
+      )}
 
       <button
         aria-label="Settings"
-        className="flex h-12 w-12 items-center justify-center rounded-xl bg-elevated text-secondary transition-colors hover:bg-accent hover:text-accent-contrast"
-        onClick={() =>
-          pushToast("info", "Settings page not implemented yet")
-        }
+        title="Settings"
+        aria-pressed={view === "settings"}
+        className={clsx(
+          "mb-2 flex h-10 w-10 items-center justify-center border-2 transition-colors",
+          view === "settings"
+            ? "border-black bg-white shadow-brutal-sm"
+            : "border-transparent hover:border-black hover:bg-white/70",
+        )}
+        onClick={() => setView("settings")}
       >
-        <Settings size={20} />
+        <Settings size={18} />
       </button>
     </nav>
   );
 }
 
-function WorkspaceDot({
+function WorkspaceButton({
   workspace,
   active,
   connecting,
-  error,
   onClick,
   onContextMenu,
 }: {
   workspace: Workspace;
   active: boolean;
   connecting: boolean;
-  error: boolean;
   onClick: () => void;
-  onContextMenu: (e: React.MouseEvent) => void;
+  onContextMenu: (e: MouseEvent) => void;
 }) {
-  const initials =
+  const initial =
     workspace.name
       .split(/\s+/)
       .map((s) => s[0])
       .filter(Boolean)
-      .slice(0, 2)
+      .slice(0, 1)
       .join("")
-      .toUpperCase() || "W";
-
-  const dotColor = connecting
-    ? "bg-warning"
-    : error
-    ? "bg-danger"
-    : active
-    ? "bg-success"
-    : "bg-muted";
+      .toUpperCase() || "B";
 
   return (
-    <div className="group relative flex h-12 w-12 items-center justify-center">
+    <button
+      title={`${workspace.name}\n${workspace.serverUrl}`}
+      aria-label={`Switch server (current: ${workspace.name})`}
+      onClick={onClick}
+      onContextMenu={onContextMenu}
+      className="btn-brutal relative h-10 w-10 bg-black text-base font-black text-brutal-yellow"
+    >
+      {initial}
       <span
         className={clsx(
-          "pointer-events-none absolute -left-3 h-8 w-1 rounded-r bg-primary transition-opacity",
-          active ? "opacity-100" : "opacity-0 group-hover:opacity-40",
+          "absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-black",
+          connecting ? "bg-brutal-orange" : active ? "bg-brutal-lime" : "bg-white",
         )}
       />
-      <button
-        title={`${workspace.name}\n${workspace.serverUrl}`}
-        onClick={onClick}
-        onContextMenu={onContextMenu}
-        className={clsx(
-          "relative h-12 w-12 rounded-xl outline-none transition-transform focus-visible:ring-2 focus-visible:ring-accent",
-          !active && "hover:translate-y-[-1px]",
-        )}
-      >
-        <span
-          className={clsx(
-            "absolute inset-0 rounded-xl transition-colors",
-            active ? "bg-accent" : "bg-elevated group-hover:bg-accent",
-          )}
-        />
-        <span
-          className={clsx(
-            "relative z-10 flex h-full w-full items-center justify-center rounded-xl text-sm font-semibold transition-colors",
-            active
-              ? "text-accent-contrast"
-              : "text-secondary group-hover:text-accent-contrast",
-          )}
-        >
-          {initials}
-        </span>
-        <span
-          className={clsx(
-            "absolute -bottom-0.5 -right-0.5 z-20 h-3 w-3 rounded-full border-2 border-servers",
-            dotColor,
-          )}
-        />
-      </button>
-    </div>
+    </button>
   );
 }
 

@@ -146,8 +146,7 @@ fn read_event_body(args: &AppendArgs) -> Result<String> {
         return Ok(t.clone());
     }
     if let Some(p) = &args.file {
-        return std::fs::read_to_string(p)
-            .with_context(|| format!("read {}", p.display()));
+        return std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()));
     }
     if args.stdin {
         let mut buf = String::new();

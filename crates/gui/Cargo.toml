@@ -13,17 +13,21 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
 proto = { workspace = true }
+agent-runtime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }
+url = { workspace = true }
 
 [features]
 # Tauri 2 capability to open devtools, opt-in in dev builds.

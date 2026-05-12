@@ -3,7 +3,7 @@ import { create } from "zustand";
 import type { ScopeRef } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
 
-type View = "chat" | "inbox" | "settings";
+type View = "chat" | "tasks" | "members" | "machines" | "inbox" | "settings";
 
 export type ModalSpec =
   | {
@@ -29,6 +29,26 @@ export type ModalSpec =
       title: string;
       items: Array<{ id: string; label: string; hint?: string }>;
       onPick: (id: string) => void | Promise<void>;
+    }
+  | {
+      type: "channelForm";
+      title: string;
+      nameLabel?: string;
+      initialTitle?: string;
+      initialDescription?: string;
+      titleLocked?: boolean;
+      confirmLabel?: string;
+      actorItems?: Array<{ id: string; label: string; hint?: string; kind?: string }>;
+      onSubmit: (value: {
+        title: string;
+        description: string;
+        actorIds: string[];
+      }) => void | Promise<void>;
+    }
+  | {
+      type: "taskCreate";
+      title?: string;
+      onSubmit?: (titles: string[]) => void | Promise<void>;
     }
   | {
       type: "quickSwitch";

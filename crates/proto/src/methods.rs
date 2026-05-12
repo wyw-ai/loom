@@ -9,6 +9,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONNECTION_OPEN: &str = "connection/open";
     pub const CONNECTION_CLOSE: &str = "connection/close";
+    pub const CONNECTION_LIST: &str = "connection/list";
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const SCOPE_READ: &str = "scope/read";
@@ -29,16 +30,23 @@ pub mod method {
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
     pub const EVENT_APPEND: &str = "event/append";
+    pub const MESSAGE_SEARCH: &str = "message/search";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
     pub const ARTIFACT_READ: &str = "artifact/read";
     pub const RECEIPT_RECORD: &str = "receipt/record";
+    pub const REMINDER_SCHEDULE: &str = "reminder/schedule";
+    pub const REMINDER_LIST: &str = "reminder/list";
+    pub const REMINDER_CANCEL: &str = "reminder/cancel";
+    pub const REMINDER_SNOOZE: &str = "reminder/snooze";
+    pub const REMINDER_UPDATE: &str = "reminder/update";
     /// §9.2 Durable actor inbox. Caller (must be bound to `actorId`) lists
     /// deliveries pending against its inbox, with cursor pagination so a
     /// host can resume after restart without losing directed events.
     pub const DELIVERY_LIST: &str = "delivery/list";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
+    pub const ACTOR_DELETE: &str = "actor/delete";
 
     // outbound notification
     pub const STREAM_UPDATE: &str = "stream/update";
@@ -118,6 +126,23 @@ pub struct ConnectionCloseResult {
     pub closed: bool,
 }
 
+// ---- connection/list ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionListParams {
+    /// Optional actor id filter. Empty means every currently-bound actor.
+    #[serde(default)]
+    pub actor_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionListResult {
+    /// Actor ids that currently own a live actor inbox connection.
+    pub actor_ids: Vec<String>,
+}
+
 // ---- scope/subscribe ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +194,7 @@ pub struct ChannelCreateParams {
     pub title: String,
     /// When provided, the new channel is created `Private` and the creator
     /// is its sole initial member. When omitted, the channel is created
-    /// `Public` (legacy behavior, for back-compat with old callers).
+    /// `Public`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
 }
@@ -263,11 +288,9 @@ pub struct ChannelDeleteResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadCreateParams {
-    #[serde(alias = "spaceId")]
     pub channel_id: String,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_event_id: Option<String>,
+    pub root_event_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,7 +302,6 @@ pub struct ThreadCreateResult {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "spaceId")]
     pub channel_id: Option<String>,
 }
 
@@ -467,7 +489,7 @@ pub struct EventAppendInput {
     pub payload: Value,
     #[serde(default)]
     pub relations: Vec<Relation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
 
@@ -481,12 +503,34 @@ pub struct EventAppendResult {
     pub event: Event,
 }
 
+// ---- message/search ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSearchParams {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+fn default_search_limit() -> u32 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchResult {
+    pub events: Vec<Event>,
+}
+
 // ---- artifact/publish / get / read ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ArtifactIngress {
     InlineText(InlineTextIngress),
+    FileBytes(FileBytesIngress),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,8 +542,21 @@ pub struct InlineTextIngress {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileBytesIngress {
+    pub name: String,
+    #[serde(default = "default_octet_stream_media_type")]
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
 fn default_text_media_type() -> String {
     "text/markdown".into()
+}
+
+fn default_octet_stream_media_type() -> String {
+    "application/octet-stream".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,6 +606,92 @@ pub struct ArtifactReadResult {
     pub media_type: String,
     pub truncated: bool,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bytes: Vec<u8>,
+}
+
+// ---- reminder/schedule / list / cancel / snooze / update ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderScheduleParams {
+    pub actor_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderScheduleResult {
+    pub reminder: Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderListParams {
+    pub actor_id: String,
+    #[serde(default)]
+    pub statuses: Vec<ReminderStatus>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderListResult {
+    pub reminders: Vec<Reminder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderIdParams {
+    pub actor_id: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderCancelResult {
+    pub reminder: Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSnoozeParams {
+    pub actor_id: String,
+    pub id: String,
+    pub by_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderSnoozeResult {
+    pub reminder: Reminder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderUpdateParams {
+    pub actor_id: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderUpdateResult {
+    pub reminder: Reminder,
 }
 
 // ---- receipt/record ----
@@ -625,6 +768,18 @@ pub struct ActorUpsertResult {
     pub actor: Actor,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorDeleteParams {
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorDeleteResult {
+    pub deleted: bool,
+}
+
 // ---- agent/* ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,7 +797,7 @@ pub struct AgentTransport {
 
     // ---- command / interactive command transport only ----
     /// Optional default model for transports that expose a CLI-level model flag.
-    /// `joi agent serve` may override this with the actor's selected runtime
+    /// `joi daemon` may override this with the actor's selected runtime
     /// model; when an interactive command has an active model, the runtime
     /// appends `--model=<model>` to the provider argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -985,6 +1140,8 @@ pub enum CommandOutputFormat {
     Text,
     /// Anthropic Claude Code `--output-format stream-json` framing.
     ClaudeStreamJson,
+    /// GitHub Copilot CLI `--output-format json` JSONL session events.
+    CopilotJson,
     /// OpenAI codex CLI `--output-format stream-json` framing (placeholder).
     CodexStreamJson,
     /// Generic line-delimited JSON (each line carries `{"type": "...", ...}`).
@@ -1010,7 +1167,7 @@ pub struct AgentSpec {
     #[serde(default)]
     pub autostart: bool,
     /// Optional model menu for this actor. Joi treats these as runtime-level
-    /// model ids: `joi agent serve` can surface them through `/models` and
+    /// model ids: `joi daemon` can surface them through `/models` and
     /// pass the selected id to transports that support model selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<AgentModelSpec>,
@@ -1050,7 +1207,11 @@ pub struct AgentSpec {
     /// turn per scope only), and `everyTurnSuffix` lines, with template
     /// variable substitution. When absent the runtime falls back to the
     /// bare envelope shape used before the migration.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "promptTemplate")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "promptTemplate"
+    )]
     pub prompt_template: Option<PromptTemplateSpec>,
 }
 
@@ -1102,6 +1263,162 @@ pub struct PromptTemplateSpec {
     /// constants the spec author wants without polluting global names.
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
+}
+
+/// On-disk provider spec. A provider is one installed agent CLI/runtime
+/// (Claude Code, Codex, Qoder, ...). It may expose multiple runtime actors,
+/// each with its own identity, model, memory, profile, and workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderSpec {
+    pub provider: AgentProviderInfo,
+    pub transport: AgentTransport,
+    #[serde(default)]
+    pub defaults: AgentActorDefaults,
+    pub actors: Vec<AgentActorSpec>,
+}
+
+impl AgentProviderSpec {
+    pub fn into_agent_specs(self) -> Vec<AgentSpec> {
+        let AgentProviderSpec {
+            provider: _,
+            transport,
+            defaults,
+            actors,
+        } = self;
+        actors
+            .into_iter()
+            .map(|actor| {
+                let mut actor_models = actor.models.or_else(|| defaults.models.clone());
+                if let Some(model) = actor
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                {
+                    actor_models
+                        .get_or_insert_with(AgentModelSpec::default)
+                        .default = Some(model.to_string());
+                }
+                let display_name = actor
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&actor.id)
+                    .to_string();
+                AgentSpec {
+                    actor: Actor {
+                        id: actor.id,
+                        kind: ActorKind::Agent,
+                        display_name,
+                        capabilities: actor.capabilities,
+                        _meta: actor.meta,
+                    },
+                    transport: actor.transport.unwrap_or_else(|| transport.clone()),
+                    autostart: actor.autostart.unwrap_or(defaults.autostart),
+                    models: actor_models,
+                    bundle: actor.bundle.or_else(|| defaults.bundle.clone()),
+                    identity: merge_identity(defaults.identity.as_ref(), actor.identity),
+                    memory: actor.memory.or_else(|| defaults.memory.clone()),
+                    announcement: actor.announcement.or_else(|| defaults.announcement.clone()),
+                    handoff: None,
+                    prompt_template: None,
+                }
+            })
+            .collect()
+    }
+}
+
+fn merge_identity(
+    base: Option<&IdentitySpec>,
+    actor: Option<IdentitySpec>,
+) -> Option<IdentitySpec> {
+    match (base.cloned(), actor) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(actor)) => Some(actor),
+        (Some(base), Some(actor)) => Some(IdentitySpec {
+            files: if actor.files == IdentityFiles::default() {
+                base.files
+            } else {
+                actor.files
+            },
+            description: actor.description.or(base.description),
+            scaffold: merge_identity_scaffold(base.scaffold, actor.scaffold),
+        }),
+    }
+}
+
+fn merge_identity_scaffold(
+    base: Option<IdentityScaffoldSpec>,
+    actor: Option<IdentityScaffoldSpec>,
+) -> Option<IdentityScaffoldSpec> {
+    match (base, actor) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(actor)) => Some(actor),
+        (Some(base), Some(actor)) => Some(IdentityScaffoldSpec {
+            identity: actor.identity.or(base.identity),
+            soul: actor.soul.or(base.soul),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderInfo {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActorDefaults {
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AgentBundleSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentitySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<AnnouncementSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActorSpec {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub meta: Option<Meta>,
+    /// Optional transport override for this actor. Omit to share the provider
+    /// transport, which is the common "same CLI, multiple actors" path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<AgentTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart: Option<bool>,
+    /// Shorthand for setting `models.default` on this actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AgentBundleSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentitySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<AnnouncementSpec>,
 }
 
 // ---- models ----
@@ -1205,9 +1522,26 @@ pub enum BundleInstallMode {
 pub struct IdentitySpec {
     #[serde(default)]
     pub files: IdentityFiles,
+    /// Optional short role description used when scaffolding a missing
+    /// identity file. Existing files are never overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional first-run file contents for `identity.md` / `soul.md`.
+    /// Existing files still win, so operators can edit profiles safely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaffold: Option<IdentityScaffoldSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityScaffoldSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityFiles {
     /// Markdown path relative to `{agent.profile}` (or absolute). Default
@@ -1601,6 +1935,87 @@ pub mod stream_kind {
     /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
     /// channel. Carries `{ channelId, actorId }`.
     pub const CHANNEL_REVOKED: &str = "channel.revoked";
+}
+
+#[cfg(test)]
+mod agent_provider_spec_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_spec_expands_shared_transport_with_actor_overrides() {
+        let provider: AgentProviderSpec = serde_json::from_value(json!({
+            "provider": { "id": "codex", "displayName": "Codex" },
+            "transport": { "kind": "acp_stdio", "command": "npx", "args": ["-y", "codex-acp"] },
+            "defaults": {
+                "models": {
+                    "choices": [
+                        { "id": "gpt-5.5", "label": "GPT-5.5" },
+                        { "id": "gpt-5.4-mini", "label": "GPT-5.4 Mini" }
+                    ]
+                },
+                "identity": {
+                    "scaffold": { "soul": "# Shared style" }
+                }
+            },
+            "actors": [
+                {
+                    "id": "actor_codex_architect",
+                    "displayName": "Codex Architect",
+                    "model": "gpt-5.5",
+                    "identity": {
+                        "description": "System design reviewer",
+                        "scaffold": { "identity": "# Architect" }
+                    }
+                },
+                {
+                    "id": "actor_codex_fast",
+                    "displayName": "Codex Fast",
+                    "model": "gpt-5.4-mini"
+                }
+            ]
+        }))
+        .expect("parse provider spec");
+
+        let specs = provider.into_agent_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].actor.id, "actor_codex_architect");
+        assert_eq!(specs[0].actor.display_name, "Codex Architect");
+        assert!(matches!(specs[0].actor.kind, ActorKind::Agent));
+        assert_eq!(specs[1].actor.id, "actor_codex_fast");
+        assert_eq!(specs[0].transport.args, specs[1].transport.args);
+        assert_eq!(
+            specs[0].models.as_ref().and_then(|m| m.default.as_deref()),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            specs[1].models.as_ref().and_then(|m| m.default.as_deref()),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(
+            specs[0]
+                .identity
+                .as_ref()
+                .and_then(|i| i.description.as_deref()),
+            Some("System design reviewer")
+        );
+        assert_eq!(
+            specs[0]
+                .identity
+                .as_ref()
+                .and_then(|i| i.scaffold.as_ref())
+                .and_then(|s| s.soul.as_deref()),
+            Some("# Shared style")
+        );
+        assert_eq!(
+            specs[1]
+                .identity
+                .as_ref()
+                .and_then(|i| i.scaffold.as_ref())
+                .and_then(|s| s.soul.as_deref()),
+            Some("# Shared style")
+        );
+    }
 }
 
 #[cfg(test)]

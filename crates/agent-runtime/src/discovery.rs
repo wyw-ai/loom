@@ -25,10 +25,24 @@ pub struct DetectedAgentProvider {
     pub command: String,
     pub transport_kind: String,
     pub args: Vec<String>,
+    #[serde(default, skip)]
+    pub transport_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(default)]
     pub model_choices: Vec<AgentModelChoice>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderOverride {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,15 +122,48 @@ pub fn provider_specs_from_agent_definitions(
     specs
 }
 
+pub fn apply_provider_overrides(
+    mut providers: Vec<DetectedAgentProvider>,
+    overrides: &[AgentProviderOverride],
+) -> Vec<DetectedAgentProvider> {
+    for override_config in overrides {
+        let Some(provider) = providers
+            .iter_mut()
+            .find(|provider| provider.id == override_config.id)
+        else {
+            continue;
+        };
+        if let Some(command) = override_config
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            provider.command = command.to_string();
+        }
+        if let Some(args) = &override_config.args {
+            provider.args = args.clone();
+        }
+        provider.transport_env.extend(
+            override_config
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+    }
+    providers
+}
+
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
-        let mut env = BTreeMap::new();
+        let mut env = self.transport_env.clone();
         if self.id == "codex" {
             // Codex runs model-generated shell commands inside its own
             // sandbox. The Joi daemon socket is outside the actor workspace
             // and macOS Seatbelt denies AF_UNIX access there, so have `joi`
             // CLI calls use JOI_SERVER directly.
-            env.insert("JOI_NO_DAEMON".into(), "1".into());
+            env.entry("JOI_NO_DAEMON".into())
+                .or_insert_with(|| "1".into());
         }
         AgentTransport {
             kind: self.transport_kind.clone(),
@@ -216,6 +263,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
                 command: command.display().to_string(),
                 transport_kind: "command".into(),
                 args: provider_args(def, config_dir),
+                transport_env: BTreeMap::new(),
                 default_model,
                 model_choices,
             })
@@ -732,6 +780,7 @@ mod tests {
                 "--add-dir".into(),
                 "/tmp/joi-config".into(),
             ],
+            transport_env: BTreeMap::new(),
             default_model: None,
             model_choices: Vec::new(),
         };
@@ -770,6 +819,48 @@ mod tests {
                 .env
                 .get("JOI_NO_DAEMON")
                 .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn provider_overrides_replace_command_args_and_merge_env() {
+        let providers = vec![DetectedAgentProvider {
+            id: "codex".into(),
+            display_name: "Codex CLI".into(),
+            command: "/usr/bin/codex".into(),
+            transport_kind: "command".into(),
+            args: vec!["exec".into(), "--skip-git-repo-check".into()],
+            transport_env: BTreeMap::new(),
+            default_model: None,
+            model_choices: Vec::new(),
+        }];
+        let providers = apply_provider_overrides(
+            providers,
+            &[AgentProviderOverride {
+                id: "codex".into(),
+                command: Some("/bin/bash".into()),
+                args: Some(vec![
+                    "-lc".into(),
+                    "vpn && exec codex \"$@\"".into(),
+                    "joi-codex".into(),
+                ]),
+                env: BTreeMap::from([("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into())]),
+            }],
+        );
+        let provider = &providers[0];
+        assert_eq!(provider.command, "/bin/bash");
+        assert_eq!(
+            provider.args,
+            vec!["-lc", "vpn && exec codex \"$@\"", "joi-codex"]
+        );
+        let transport = provider.transport();
+        assert_eq!(
+            transport.env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            transport.env.get("JOI_NO_DAEMON").map(String::as_str),
             Some("1")
         );
     }

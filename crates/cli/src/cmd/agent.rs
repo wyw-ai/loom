@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use agent_runtime::discovery::{
-    detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
+    apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
+    AgentDefinition, AgentProviderOverride,
 };
 use anyhow::{Context, Result};
 use proto::methods::{AgentInfo, AgentListResult, AgentSpec};
@@ -12,7 +13,14 @@ use crate::{config, render};
 
 pub fn list() -> Result<()> {
     let cfg = load_desktop_config().unwrap_or_default();
-    let providers = detect_agent_cli_providers();
+    let detected_providers = detect_agent_cli_providers();
+    let provider_overrides = cfg
+        .machines
+        .iter()
+        .filter(|machine| machine_belongs_to_active_context(machine, &cfg))
+        .flat_map(|machine| machine.providers.iter().cloned())
+        .collect::<Vec<_>>();
+    let providers = apply_provider_overrides(detected_providers, &provider_overrides);
     let provider_ids = providers
         .iter()
         .map(|provider| provider.id.as_str())
@@ -110,6 +118,8 @@ struct MachineConfig {
     workspace_id: Option<String>,
     #[serde(default)]
     owner_actor_id: Option<String>,
+    #[serde(default)]
+    providers: Vec<AgentProviderOverride>,
     #[serde(default)]
     agents: Vec<MachineAgentConfig>,
 }

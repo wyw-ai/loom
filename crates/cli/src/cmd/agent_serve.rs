@@ -314,6 +314,7 @@ pub struct MachineHostSpec {
     pub machine_id: String,
     pub actor_id: String,
     pub display_name: String,
+    pub metadata: Value,
 }
 
 async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
@@ -353,10 +354,7 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
                     "id": &host.actor_id,
                     "kind": "service",
                     "displayName": &host.display_name,
-                    "_meta": {
-                        "role": "machine",
-                        "machineId": &host.machine_id,
-                    },
+                    "_meta": &host.metadata,
                 },
             }),
         )

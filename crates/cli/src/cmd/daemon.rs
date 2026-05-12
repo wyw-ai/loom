@@ -13,7 +13,7 @@ use agent_runtime::discovery::{
 };
 use anyhow::{anyhow, Context, Result};
 use proto::methods::AgentSpec;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::{sleep, Duration};
 
@@ -54,6 +54,7 @@ pub async fn run(
         machine_id: machine.id.clone(),
         actor_id: machine_connection_actor_id(&machine),
         display_name: machine.name.clone(),
+        metadata: machine_inventory_meta(&machine, &data_root, &providers),
     };
 
     let (socket_path, proxy_handle) = if no_ipc {
@@ -341,13 +342,15 @@ struct MachineConfig {
     owner_actor_id: Option<String>,
     id: String,
     name: String,
+    #[serde(default = "default_machine_kind")]
+    kind: String,
     #[serde(default)]
     data_root: String,
     #[serde(default)]
     agents: Vec<MachineAgentConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MachineAgentConfig {
     provider_id: String,
@@ -361,6 +364,30 @@ struct MachineAgentConfig {
     reasoning_effort: String,
     #[serde(default)]
     autostart: bool,
+}
+
+fn machine_inventory_meta(
+    machine: &MachineConfig,
+    data_root: &PathBuf,
+    providers: &[DetectedAgentProvider],
+) -> serde_json::Value {
+    json!({
+        "role": "machine",
+        "machineId": &machine.id,
+        "inventoryVersion": 1,
+        "workspaceId": &machine.workspace_id,
+        "ownerActorId": &machine.owner_actor_id,
+        "name": &machine.name,
+        "kind": &machine.kind,
+        "dataRoot": data_root.display().to_string(),
+        "configDir": config::config_dir().display().to_string(),
+        "providers": providers,
+        "agents": &machine.agents,
+    })
+}
+
+fn default_machine_kind() -> String {
+    "local".into()
 }
 
 fn load_desktop_config() -> Result<DesktopConfig> {
@@ -422,6 +449,7 @@ fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<Machin
                 owner_actor_id: None,
                 id: "local".into(),
                 name: "Local Machine".into(),
+                kind: default_machine_kind(),
                 data_root: default_agent_data_root_expr(),
                 agents: Vec::new(),
             })
@@ -528,6 +556,7 @@ mod tests {
             owner_actor_id: owner.map(ToString::to_string),
             id: id.into(),
             name: id.into(),
+            kind: default_machine_kind(),
             data_root: String::new(),
             agents: Vec::new(),
         }

@@ -2528,7 +2528,6 @@ async fn compose_envelope_prompt(
         .as_deref()
         .map(|channel_id| prompt_template_vars(state, trigger, channel_id))
         .unwrap_or_else(|| minimal_prompt_template_vars(state, trigger));
-    let user_text = apply_handoff_prefix(&state.spec, user_text, first_turn);
     let user_text = apply_prompt_template(
         state.spec.prompt_template.as_ref(),
         &template_vars,
@@ -2563,7 +2562,11 @@ async fn compose_envelope_prompt(
             .map(|section| section.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        return prompt_telemetry(content, &sections);
+        return apply_handoff_prefix_to_prompt(
+            &state.spec,
+            prompt_telemetry(content, &sections),
+            first_turn,
+        );
     }
 
     let (prompt, sections) =
@@ -2578,25 +2581,51 @@ async fn compose_envelope_prompt(
             user_message: &user_text,
             scope_bootstrap: &scope_bootstrap,
         });
-    prompt_telemetry(prompt, &sections)
+    apply_handoff_prefix_to_prompt(&state.spec, prompt_telemetry(prompt, &sections), first_turn)
 }
 
-fn apply_handoff_prefix(spec: &AgentSpec, user_text: &str, first_turn: bool) -> String {
-    let Some(handoff) = spec.handoff.as_ref() else {
-        return user_text.to_string();
+fn apply_handoff_prefix_to_prompt(
+    spec: &AgentSpec,
+    mut prompt: PromptTelemetry,
+    first_turn: bool,
+) -> PromptTelemetry {
+    let Some(prefix) = handoff_prefix_for_turn(spec, first_turn) else {
+        return prompt;
     };
+    if prompt.content.starts_with(prefix) {
+        return prompt;
+    }
+
+    prompt.content = format!("{prefix}{}", prompt.content);
+    prompt.stats = prompt_stats(&prompt.content);
+
+    let stats = prompt_stats(prefix);
+    prompt.breakdown.sections.insert(
+        0,
+        PromptBreakdownSection {
+            key: "handoff_prefix".to_string(),
+            label: "Handoff Prefix".to_string(),
+            char_count: stats.char_count,
+            byte_count: stats.byte_count,
+            approx_token_count: stats.approx_token_count,
+            percentage: 0.0,
+        },
+    );
+    recalculate_prompt_breakdown_percentages(&mut prompt.breakdown.sections);
+    prompt
+}
+
+fn handoff_prefix_for_turn(spec: &AgentSpec, first_turn: bool) -> Option<&str> {
+    let handoff = spec.handoff.as_ref()?;
     let prefix = handoff.trigger_prompt_prefix.as_str();
     if prefix.is_empty() {
-        return user_text.to_string();
+        return None;
     }
     let applies = match handoff.apply_on {
         HandoffApplyOn::EveryTurn => true,
         HandoffApplyOn::FirstTurn => first_turn,
     };
-    if !applies || user_text.starts_with(prefix) {
-        return user_text.to_string();
-    }
-    format!("{prefix}{user_text}")
+    applies.then_some(prefix)
 }
 
 fn apply_prompt_template(
@@ -2705,20 +2734,24 @@ fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) 
             }
         })
         .collect();
-    let total_tokens = breakdown_sections
-        .iter()
-        .map(|section| section.approx_token_count)
-        .sum::<u64>()
-        .max(1) as f64;
-    for section in &mut breakdown_sections {
-        section.percentage = (section.approx_token_count as f64 / total_tokens) * 100.0;
-    }
+    recalculate_prompt_breakdown_percentages(&mut breakdown_sections);
     PromptTelemetry {
         content,
         stats,
         breakdown: PromptBreakdown {
             sections: breakdown_sections,
         },
+    }
+}
+
+fn recalculate_prompt_breakdown_percentages(sections: &mut [PromptBreakdownSection]) {
+    let total_tokens = sections
+        .iter()
+        .map(|section| section.approx_token_count)
+        .sum::<u64>()
+        .max(1) as f64;
+    for section in sections {
+        section.percentage = (section.approx_token_count as f64 / total_tokens) * 100.0;
     }
 }
 
@@ -3560,13 +3593,27 @@ mod tests {
             trigger_prompt_prefix: "/router\n".into(),
             apply_on: HandoffApplyOn::EveryTurn,
         });
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "hello".into(),
+        }];
 
         assert_eq!(
-            apply_handoff_prefix(&spec, "hello", false),
+            apply_handoff_prefix_to_prompt(
+                &spec,
+                prompt_telemetry("hello".into(), &sections),
+                false,
+            )
+            .content,
             "/router\nhello"
         );
         assert_eq!(
-            apply_handoff_prefix(&spec, "/router\nhello", false),
+            apply_handoff_prefix_to_prompt(
+                &spec,
+                prompt_telemetry("/router\nhello".into(), &sections),
+                false,
+            )
+            .content,
             "/router\nhello"
         );
     }
@@ -3607,6 +3654,25 @@ mod tests {
         let later = apply_prompt_template(Some(&template), &vars, false, "hi");
         assert!(!later.contains("# Router skill"));
         assert!(later.contains("hi"));
+    }
+
+    #[test]
+    fn handoff_prefix_is_first_in_final_prompt() {
+        let mut spec = sample_spec(None);
+        spec.handoff = Some(HandoffSpec {
+            trigger_prompt_prefix: "/router\n".into(),
+            apply_on: HandoffApplyOn::EveryTurn,
+        });
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "=== User message ===\n[joi envelope]\nhello".into(),
+        }];
+        let prompt = prompt_telemetry(sections[0].content.clone(), &sections);
+
+        let prompt = apply_handoff_prefix_to_prompt(&spec, prompt, false);
+
+        assert!(prompt.content.starts_with("/router\n=== User message ==="));
+        assert_eq!(prompt.breakdown.sections[0].key, "handoff_prefix");
     }
 
     #[test]

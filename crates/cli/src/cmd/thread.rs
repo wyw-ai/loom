@@ -72,19 +72,59 @@ pub async fn create(
     Ok(())
 }
 
-pub async fn list(client: Arc<Client>, channel_id: Option<String>) -> Result<()> {
+pub async fn list(client: Arc<Client>, channel_id: Option<String>, archived: bool) -> Result<()> {
     let res: ThreadListResult = client
-        .call(method::THREAD_LIST, json!({ "channelId": channel_id }))
+        .call(
+            method::THREAD_LIST,
+            json!({ "channelId": channel_id, "archived": archived }),
+        )
         .await?;
     if render::is_json() {
         render::print_json(&res);
         return Ok(());
     }
     if res.threads.is_empty() {
-        println!("(no threads)");
+        println!(
+            "{}",
+            if archived {
+                "(no archived threads)"
+            } else {
+                "(no threads)"
+            }
+        );
     }
     for t in res.threads {
-        println!("{}\t{}\t{}", t.id, t.channel_id, t.title);
+        if archived {
+            println!(
+                "{}\t{}\t{}\t{}",
+                t.id,
+                t.channel_id,
+                t.archived_at
+                    .map(|ts| ts.to_rfc3339())
+                    .unwrap_or_else(|| "-".into()),
+                t.title
+            );
+        } else {
+            println!("{}\t{}\t{}", t.id, t.channel_id, t.title);
+        }
+    }
+    Ok(())
+}
+
+/// `joi thread archive <thread_id>` / `joi thread unarchive <thread_id>`.
+pub async fn archive(client: Arc<Client>, thread_id: String, archived: bool) -> Result<()> {
+    let res: ThreadArchiveResult = client
+        .call(
+            method::THREAD_ARCHIVE,
+            json!({ "threadId": thread_id, "archived": archived }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if archived {
+        println!("archived thread {}", res.thread.id);
+    } else {
+        println!("restored thread {}", res.thread.id);
     }
     Ok(())
 }

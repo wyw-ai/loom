@@ -1,6 +1,7 @@
 import { useEffect, useState, type MouseEvent } from "react";
 import clsx from "clsx";
 import {
+  Archive,
   Bookmark,
   ChevronDown,
   ChevronRight,
@@ -26,6 +27,8 @@ import {
   openInviteToChannel,
   openRenameChannel,
   openRenameThread,
+  archiveThread,
+  restoreThread,
 } from "./channelActions";
 
 export function ChannelsPane() {
@@ -147,9 +150,16 @@ function ChannelRow({
 }) {
   const currentScope = useChannels((s) => s.currentScope);
   const threads = useChannels((s) => s.threadsByChannel[channel.id] ?? []);
+  const archivedThreads = useChannels(
+    (s) => s.archivedThreadsByChannel[channel.id] ?? [],
+  );
   const replaceThreads = useChannels((s) => s.replaceThreads);
+  const replaceArchivedThreads = useChannels((s) => s.replaceArchivedThreads);
   const openContextMenu = useUI((s) => s.openContextMenu);
   const pushToast = useUI((s) => s.pushToast);
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
+  const [archiveExpanded, setArchiveExpanded] = useState(false);
+  const [archiveLoaded, setArchiveLoaded] = useState(false);
   const channelBadge = useMessages(
     (s) => s.byScope[`channel:${channel.id}`]?.pendingActionIds.size ?? 0,
   );
@@ -160,16 +170,30 @@ function ChannelRow({
   const showThreads = expanded ?? hasCurrentThread;
 
   useEffect(() => {
-    if (!showThreads || threads.length > 0) return;
+    if (!showThreads || threadsLoaded || threads.length > 0) return;
     (async () => {
       try {
         const r = await ipc.threadList(channel.id);
         replaceThreads(channel.id, r.threads);
+        setThreadsLoaded(true);
       } catch {
         /* higher-level flows surface errors where they matter */
       }
     })();
-  }, [showThreads, threads.length, channel.id, replaceThreads]);
+  }, [showThreads, threadsLoaded, threads.length, channel.id, replaceThreads]);
+
+  useEffect(() => {
+    if (!archiveExpanded || archiveLoaded) return;
+    (async () => {
+      try {
+        const r = await ipc.threadList(channel.id, { archived: true });
+        replaceArchivedThreads(channel.id, r.threads);
+        setArchiveLoaded(true);
+      } catch {
+        /* higher-level flows surface errors where they matter */
+      }
+    })();
+  }, [archiveExpanded, archiveLoaded, channel.id, replaceArchivedThreads]);
 
   const copyId = async (kind: "channel" | "thread", id: string) => {
     try {
@@ -295,6 +319,11 @@ function ChannelRow({
                       },
                       {
                         kind: "item",
+                        label: "Archive",
+                        onClick: () => void archiveThread(t),
+                      },
+                      {
+                        kind: "item",
                         label: "Delete...",
                         danger: true,
                         onClick: () => openDeleteThread(t),
@@ -317,6 +346,60 @@ function ChannelRow({
           >
             <Plus size={12} /> Create thread
           </button>
+          <div className="mt-1">
+            <button
+              className="flex h-7 w-full items-center gap-1.5 border-2 border-transparent px-2 text-xs font-bold text-black/55 hover:border-black hover:bg-white hover:text-black"
+              onClick={() => setArchiveExpanded((v) => !v)}
+            >
+              {archiveExpanded ? (
+                <ChevronDown size={12} />
+              ) : (
+                <ChevronRight size={12} />
+              )}
+              <Archive size={12} />
+              Archive Box
+              <span className="font-mono text-[10px] text-black/35">
+                {archivedThreads.length}
+              </span>
+            </button>
+            {archiveExpanded && (
+              <div className="ml-3 border-l-2 border-black/10 pl-2">
+                {archivedThreads.length === 0 ? (
+                  <div className="py-1 pl-2 text-xs font-mono text-black/35">
+                    no archived threads
+                  </div>
+                ) : (
+                  archivedThreads.map((t) => (
+                    <ThreadRow
+                      key={t.id}
+                      thread={t}
+                      current={isCurrent("thread", t.id)}
+                      onClick={() => void openScope({ kind: "thread", id: t.id })}
+                      onMenu={(x, y) =>
+                        openContextMenu({
+                          x,
+                          y,
+                          items: [
+                            {
+                              kind: "item",
+                              label: "Restore",
+                              onClick: () => void restoreThread(t),
+                            },
+                            { kind: "divider" },
+                            {
+                              kind: "item",
+                              label: "Copy thread id",
+                              onClick: () => void copyId("thread", t.id),
+                            },
+                          ],
+                        })
+                      }
+                    />
+                  ))
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

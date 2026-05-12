@@ -76,6 +76,7 @@ pub async fn dispatch(
         method::THREAD_CREATE => thread_create(state, connection_id, params),
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
+        method::THREAD_ARCHIVE => thread_archive(state, connection_id, params),
         method::THREAD_DELETE => thread_delete(state, connection_id, params),
         method::TASK_CREATE => task_create(state, connection_id, params),
         method::TASK_GET => task_get(state, connection_id, params),
@@ -497,7 +498,10 @@ fn thread_create(state: &AppState, connection_id: &str, params: Option<Value>) -
 }
 
 fn thread_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
-    let p: ThreadListParams = parse_params(params).unwrap_or(ThreadListParams { channel_id: None });
+    let p: ThreadListParams = parse_params(params).unwrap_or(ThreadListParams {
+        channel_id: None,
+        archived: false,
+    });
     let caller = state.subscriptions.actor_for_connection(connection_id);
     // Silently drop threads in channels the caller can't see — same shape
     // as channel_list. Unbound callers (no actor) only see public-channel
@@ -505,7 +509,7 @@ fn thread_list(state: &AppState, connection_id: &str, params: Option<Value>) -> 
     // or ids, just an empty list.
     let threads = state
         .store
-        .list_threads(p.channel_id.as_deref())
+        .list_threads_filtered(p.channel_id.as_deref(), p.archived)
         .into_iter()
         .filter(|t| match caller.as_deref() {
             Some(actor) => state.store.is_channel_member(&t.channel_id, actor),
@@ -541,6 +545,30 @@ fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -
         .update_thread(&p.thread_id, p.title)
         .map_err(map_store_err)?;
     ok(ThreadUpdateResult { thread })
+}
+
+fn thread_archive(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: ThreadArchiveParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot archive thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let thread = state
+        .store
+        .archive_thread(&p.thread_id, p.archived)
+        .map_err(map_store_err)?;
+    ok(ThreadArchiveResult { thread })
 }
 
 fn thread_delete(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {

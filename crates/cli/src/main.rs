@@ -567,6 +567,19 @@ enum ThreadCmd {
     List {
         #[arg(long)]
         channel: Option<String>,
+        /// Show the channel archive box instead of active threads.
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Move a thread to its channel archive box.
+    Archive { thread_id: String },
+    /// Restore a thread from its channel archive box.
+    #[command(alias = "restore", alias = "revert")]
+    Unarchive { thread_id: String },
+    /// List a channel's archive box, newest archived first.
+    ArchiveList {
+        #[arg(long)]
+        channel: String,
     },
     /// Delete a thread by id. Thread-bound services watching this
     /// thread (`bind.auto_stop_on=["thread.closed"]`, §4.7.3) reap
@@ -1278,7 +1291,18 @@ async fn main() -> Result<()> {
                 )
                 .await?
             }
-            ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
+            ThreadCmd::List { channel, archived } => {
+                cmd::thread::list(client, channel, archived).await?
+            }
+            ThreadCmd::Archive { thread_id } => {
+                cmd::thread::archive(client, thread_id, true).await?
+            }
+            ThreadCmd::Unarchive { thread_id } => {
+                cmd::thread::archive(client, thread_id, false).await?
+            }
+            ThreadCmd::ArchiveList { channel } => {
+                cmd::thread::list(client, Some(channel), true).await?
+            }
             ThreadCmd::Delete { thread_id } => cmd::thread::delete(client, thread_id).await?,
             ThreadCmd::Bootstrap {
                 thread_id,

@@ -55,6 +55,7 @@ fn main() {
             ipc::thread_list,
             ipc::thread_create,
             ipc::thread_update,
+            ipc::thread_archive,
             ipc::thread_delete,
             ipc::scope_subscribe,
             ipc::scope_unsubscribe,

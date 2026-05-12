@@ -709,6 +709,7 @@ mod tests {
                 channel_id: "ch_design".into(),
                 title: "demo".into(),
                 root_event_id: "evt_root".into(),
+                archived_at: None,
                 _meta: None,
             }],
         );
@@ -763,6 +764,7 @@ mod tests {
                 channel_id: "ch_lobby".into(),
                 title: "demo".into(),
                 root_event_id: "evt_root".into(),
+                archived_at: None,
                 _meta: None,
             }],
         );

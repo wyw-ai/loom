@@ -331,3 +331,33 @@ export function openDeleteThread(thread: Thread) {
     },
   });
 }
+
+export async function archiveThread(thread: Thread) {
+  try {
+    const r = await ipc.threadArchive({ threadId: thread.id, archived: true });
+    useChannels.getState().upsertThread(r.thread);
+    useUI.getState().pushToast("info", `archived "${thread.title}"`);
+  } catch (e) {
+    useUI
+      .getState()
+      .pushToast(
+        "error",
+        `archive thread: ${e instanceof Error ? e.message : String(e)}`,
+      );
+  }
+}
+
+export async function restoreThread(thread: Thread) {
+  try {
+    const r = await ipc.threadArchive({ threadId: thread.id, archived: false });
+    useChannels.getState().upsertThread(r.thread);
+    useUI.getState().pushToast("info", `restored "${thread.title}"`);
+  } catch (e) {
+    useUI
+      .getState()
+      .pushToast(
+        "error",
+        `restore thread: ${e instanceof Error ? e.message : String(e)}`,
+      );
+  }
+}

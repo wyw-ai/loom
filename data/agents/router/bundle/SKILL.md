@@ -539,6 +539,26 @@ payload.terminal_kind 取值：
     这是非 Fixed 终态，由 `a1-bug-fix-loop` 归档并推进下一条；不要改成 Fixed，也不要
     写“随下一次版本发布生效”。
 
+**终态归档强制步骤**：
+
+当你处理 `mr.final` 并已通过 mr-watcher payload / 必要的 `a1 repo mr get` 查询确认
+MR 真实处于 `merged` 或 `closed` 终态后，必须在本回合额外完成 thread 归档：
+
+1. 识别“本次任务产生的 thread”：
+   - 必须包含当前 `mr.final` 所在 thread。
+   - 若能解析 `feedback_id` / workitem id / MR id / repo branch，则用
+     `joi thread list --channel <channel_id> --json` 查找同一 channel 下同一任务链路的
+     sibling thread，例如 `bugfix-<id>`、`delivery-bugfix-<id>`、`delivery-task-<id>`、
+     `[bugfix:<id>] ...`、以及当前消息/历史中明确写出的承接旧 thread。
+   - 禁止归档常驻 thread：`a1-bug-fix-loop`、`bug-scan-desk`、`discovery-desk`
+     以及任何 role/desk/service/loop 类型 thread，除非 human 明确点名要求。
+2. 按**产生顺序（旧 → 新）**逐个执行 `joi thread archive <thread_id>`；不要并发归档。
+   Archive Box 按 `archivedAt` 倒序展示，因此旧 thread 必须先归档，新 thread 后归档。
+3. 若无法可靠判断某个 sibling 是否属于本次任务，不要归档该 sibling；只归档当前终态
+   thread，并在 channel 摘要里说明“未自动归档不确定的关联 thread=<id>”。
+4. channel 摘要必须包含归档结果，例如：
+   `MR <url> 已合并/关闭，已按产生顺序归档本次任务 thread：<old_id> → <new_id>。`
+
 mr-watcher 已自行从 state 中移除该 watch；除 bugfix-loop 的 merged 终态需要让
 delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。
 
@@ -620,3 +640,7 @@ delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。
 
 每回合的最后是 **一条** `joi handoff` / `joi say` / `joi artifact ...`（kbase
 更新）。不需要 `__JOI_DONE__`。一句中文都不输出也可以，前提是确实没事可做。
+
+例外：处理 `mr.final` 终态时，允许在最后一条 `joi say` / `joi handoff` 之前先按
+「终态归档强制步骤」执行多条 `joi thread archive <thread_id>`；这些归档命令是终态
+收口动作的一部分，不算对 worker/human 的额外消息。

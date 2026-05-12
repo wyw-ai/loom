@@ -60,7 +60,10 @@ pub fn agent_list() -> Result<()> {
         return Ok(());
     }
     if specs.is_empty() {
-        println!("(no agent specs in {})", super::agent::default_specs_dir().display());
+        println!(
+            "(no agent specs in {})",
+            super::agent::default_specs_dir().display()
+        );
         return Ok(());
     }
     println!("DIR: {}", super::agent::default_specs_dir().display());
@@ -78,8 +81,8 @@ pub fn agent_get(actor_id: String, raw: bool) -> Result<()> {
     if !path.exists() {
         bail!("agent spec not found: {}", path.display());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     if raw {
         print!("{text}");
         if !text.ends_with('\n') {
@@ -87,8 +90,8 @@ pub fn agent_get(actor_id: String, raw: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let mut value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     redact_value(&mut value);
     if render::is_json() {
         render::print_json(&value);
@@ -132,8 +135,8 @@ pub fn service_get(service_id: String, raw: bool) -> Result<()> {
     if !path.exists() {
         bail!("service spec not found: {}", path.display());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     if raw {
         print!("{text}");
         if !text.ends_with('\n') {
@@ -141,8 +144,8 @@ pub fn service_get(service_id: String, raw: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let mut value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     redact_value(&mut value);
     if render::is_json() {
         render::print_json(&value);

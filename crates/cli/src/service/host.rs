@@ -291,8 +291,8 @@ fn reload_one_spec(dir: &Path, spec_id: &str) -> Result<Option<ServiceSpec>> {
     } else {
         return Ok(None);
     };
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read spec {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read spec {}", path.display()))?;
     let mut spec: ServiceSpec = serde_json::from_str(&text)
         .with_context(|| format!("parse ServiceSpec {}", path.display()))?;
     spec.normalize();
@@ -520,24 +520,20 @@ async fn supervise_instances(
         //     Skips silently on transient RPC errors so the watcher
         //     stays panic-free.
         if watch_thread_closed && !active.is_empty() {
-            let visible = match thread_visibility_check(
-                &mut visibility,
-                &server_url,
-                &actor_id,
-                &spec_id,
-            )
-            .await
-            {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = ?e,
-                        "thread visibility check failed; deferring auto_stop_on=thread.closed",
-                    );
-                    None
-                }
-            };
+            let visible =
+                match thread_visibility_check(&mut visibility, &server_url, &actor_id, &spec_id)
+                    .await
+                {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(
+                            spec_id = %spec_id,
+                            error = ?e,
+                            "thread visibility check failed; deferring auto_stop_on=thread.closed",
+                        );
+                        None
+                    }
+                };
             if let Some(visible_set) = visible {
                 let closed: Vec<String> = active
                     .keys()
@@ -552,9 +548,7 @@ async fn supervise_instances(
                             "bound thread no longer visible; reaping (auto_stop_on=thread.closed)",
                         );
                         handle.abort();
-                        match super::instance::delete_request(
-                            &data_root, &spec_id, &instance_id,
-                        ) {
+                        match super::instance::delete_request(&data_root, &spec_id, &instance_id) {
                             Ok(_) => {}
                             Err(e) => tracing::warn!(
                                 spec_id = %spec_id,
@@ -629,7 +623,13 @@ async fn supervise_instances(
             let spec_path_c = resolve_spec_path(specs_dir.as_deref(), &spec_id);
             let join = tokio::spawn(async move {
                 if let Err(e) = run_one_instance(
-                    spec_c, plugin_c, server_c, data_c, shutdown_c, request, spec_path_c,
+                    spec_c,
+                    plugin_c,
+                    server_c,
+                    data_c,
+                    shutdown_c,
+                    request,
+                    spec_path_c,
                 )
                 .await
                 {
@@ -706,10 +706,7 @@ async fn thread_visibility_check(
 /// so the watcher's diff logic is unit-testable without a tokio
 /// runtime or filesystem.
 #[cfg(test)]
-fn diff_instances(
-    listed: &[String],
-    active: &HashSet<String>,
-) -> (Vec<String>, Vec<String>) {
+fn diff_instances(listed: &[String], active: &HashSet<String>) -> (Vec<String>, Vec<String>) {
     let listed_set: HashSet<&str> = listed.iter().map(String::as_str).collect();
     let to_spawn: Vec<String> = listed
         .iter()

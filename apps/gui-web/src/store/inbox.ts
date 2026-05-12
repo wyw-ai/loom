@@ -7,6 +7,7 @@ export interface InboxItem {
   scope: ScopeRef;
   title: string;
   description: string;
+  requestType?: string;
   reason?: string;
   command?: string;
   rawInput?: string;

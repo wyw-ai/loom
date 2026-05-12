@@ -194,6 +194,7 @@ distclean: clean
 # or directly with `cargo tauri dev|build` from crates/gui/.
 
 PNPM ?= pnpm
+GUI_NO_PROXY_HOSTS ?= localhost,127.0.0.1,::1
 
 .PHONY: gui-deps gui-dev gui-release gui-clean
 
@@ -201,7 +202,7 @@ gui-deps:
 	$(PNPM) --dir apps/gui-web install
 
 gui-dev:
-	cd crates/gui && $(CARGO) tauri dev
+	cd crates/gui && NO_PROXY="$(GUI_NO_PROXY_HOSTS),$${NO_PROXY}" no_proxy="$(GUI_NO_PROXY_HOSTS),$${no_proxy}" $(CARGO) tauri dev
 
 gui-release:
 	cd crates/gui && $(CARGO) tauri build

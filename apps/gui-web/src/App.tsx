@@ -15,11 +15,16 @@ import { MembersRail } from "@/features/members/MembersRail";
 import { ChatView } from "@/features/chat/ChatView";
 import { InboxPage } from "@/features/inbox/InboxPage";
 import { Landing } from "@/features/landing/Landing";
+import { TasksPage } from "@/features/tasks/TasksPage";
+import { MembersPage } from "@/features/members/MembersPage";
+import { MachinesPage } from "@/features/members/MachinesPage";
+import { SettingsPage } from "@/features/settings/SettingsPage";
 import { Toast } from "@/features/common/Toast";
 import { ModalHost } from "@/features/common/Modal";
 import { ContextMenuHost } from "@/features/common/ContextMenu";
 import { DisconnectedOverlay } from "@/features/common/DisconnectedOverlay";
 import { AddWorkspaceHost } from "@/features/workspaces/AddWorkspaceModal";
+import { WorkspaceSwitcherHost } from "@/features/workspaces/WorkspaceSwitcher";
 import { summarizeActionRequest } from "@/features/chat/actionRequestSummary";
 import { notifyDesktop } from "@/features/notifications/desktop";
 
@@ -75,17 +80,40 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "k") return;
+      e.preventDefault();
+
+      const ui = useUI.getState();
+      if (ui.modal) return;
+      ui.openModal({ type: "quickSwitch" });
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // When a workspace becomes active, run the "after connect" bootstrap:
   // pull channel list. The connect() call itself happens in ServerRail /
   // Landing (user-initiated) so we never auto-contact a server the user
   // hasn't asked us to touch.
   useEffect(() => {
     if (connection !== "open" || !workspace) return;
+    let alive = true;
+    const workspaceId = workspace.id;
+    const stillCurrent = () =>
+      alive &&
+      useSession.getState().connection === "open" &&
+      useSession.getState().workspace?.id === workspaceId;
+
     (async () => {
       try {
         const r = await ipc.channelList();
+        if (!stillCurrent()) return;
         useChannels.getState().replaceChannels(r.channels);
       } catch (e) {
+        if (!stillCurrent()) return;
         useUI
           .getState()
           .pushToast(
@@ -98,8 +126,27 @@ export function App() {
       // own-message bubbles render the right name.
       try {
         const r = await ipc.actorList();
+        if (!stillCurrent()) return;
+        useActors.getState().clear();
         useActors.getState().upsertMany(r.actors);
-        if (workspace.displayName) {
+        const account = useWorkspaces.getState().account;
+        if (account) {
+          useActors.getState().upsert({
+            id: account.actorId,
+            kind: "human",
+            displayName: account.nickname || account.realName || account.staffId,
+            _meta: {
+              account: {
+                provider: account.provider,
+                staffId: account.staffId,
+                nickname: account.nickname,
+                realName: account.realName,
+                email: account.email,
+              },
+              avatarUrl: account.avatarUrl,
+            },
+          });
+        } else if (workspace.displayName) {
           useActors.getState().upsert({
             id: workspace.actorId,
             kind: "human",
@@ -110,7 +157,10 @@ export function App() {
         /* best-effort — bubbles fall back to actorId */
       }
     })();
-  }, [connection, workspace]);
+    return () => {
+      alive = false;
+    };
+  }, [connection, workspace?.id]);
 
   function handleStream(u: {
     kind: string;
@@ -132,7 +182,17 @@ export function App() {
               members: string[];
             }
           | undefined;
-        if (channel) channels.upsertChannel(channel);
+        if (channel) {
+          const existing = channels.channels.find((c) => c.id === channel.id);
+          channels.upsertChannel(
+            existing
+              ? {
+                  ...channel,
+                  members: mergeMemberIds(existing.members, channel.members),
+                }
+              : channel,
+          );
+        }
         return;
       }
       case "event.created": {
@@ -153,11 +213,16 @@ export function App() {
           const p = summarizeActionRequest(
             (ev.payload ?? {}) as Record<string, unknown>,
           );
+          const payload = (ev.payload ?? {}) as Record<string, unknown>;
           inbox.add({
             requestEventId: ev.id,
             scope: ev.scope,
             title: p.title,
             description: p.description,
+            requestType:
+              typeof payload.requestType === "string"
+                ? payload.requestType
+                : undefined,
             reason: p.reason,
             command: p.command,
             rawInput: p.rawInput,
@@ -270,33 +335,39 @@ export function App() {
     }
   }
 
-  // When no workspace is bound yet, render the Landing page in place of the
-  // chat view. ServerRail still renders so the user can pick/add.
-  const showLanding = !workspace || connection === "idle";
+  // When no workspace is bound yet, render the Landing page only in the chat
+  // slot. Local admin pages such as Machines should remain reachable before a
+  // server connection exists.
+  const showLanding = view === "chat" && (!workspace || connection === "idle");
+  const fullWidthView =
+    view === "members" || view === "machines" || view === "settings";
 
   return (
     <div
       className="grid h-screen w-screen overflow-hidden text-primary"
       style={{
-        gridTemplateColumns: showLanding || !sidebarVisible
+        gridTemplateColumns: showLanding || fullWidthView || !sidebarVisible
           ? "72px minmax(0, 1fr)"
           : "72px 240px minmax(0, 1fr)",
       }}
     >
       <ServerRail />
-      {!showLanding && sidebarVisible && <ChannelsPane />}
+      {!showLanding && !fullWidthView && sidebarVisible && <ChannelsPane />}
       <main className="relative min-h-0 min-w-0 overflow-hidden bg-main">
         {showLanding ? (
           <Landing />
+        ) : view === "tasks" ? (
+          <TasksPage />
+        ) : view === "members" ? (
+          <MembersPage />
+        ) : view === "machines" ? (
+          <MachinesPage />
+        ) : view === "inbox" ? (
+          <InboxPage />
+        ) : view === "settings" ? (
+          <SettingsPage />
         ) : (
-          <>
-            <ChatView />
-            {view === "inbox" && (
-              <div className="absolute inset-0 z-10 bg-main">
-                <InboxPage />
-              </div>
-            )}
-          </>
+          <ChatView />
         )}
         {!showLanding && view === "chat" && membersVisible && <MembersRail />}
         {connection === "closed" && workspace && <DisconnectedOverlay />}
@@ -304,7 +375,21 @@ export function App() {
       <Toast />
       <ModalHost />
       <ContextMenuHost />
+      <WorkspaceSwitcherHost />
       <AddWorkspaceHost />
     </div>
   );
+}
+
+function mergeMemberIds(...memberLists: string[][]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const members of memberLists) {
+    for (const member of members) {
+      if (seen.has(member)) continue;
+      seen.add(member);
+      merged.push(member);
+    }
+  }
+  return merged;
 }

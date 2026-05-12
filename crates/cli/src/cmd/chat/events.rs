@@ -1433,7 +1433,8 @@ async fn handle_prompt_submit(
     value: String,
 ) {
     use proto::methods::{
-        ChannelCreateResult, ChannelUpdateResult, ThreadCreateResult, ThreadUpdateResult,
+        ChannelCreateResult, ChannelUpdateResult, EventAppendResult, ThreadCreateResult,
+        ThreadUpdateResult,
     };
     match kind {
         PromptKind::CreateChannel => {
@@ -1468,10 +1469,31 @@ async fn handle_prompt_submit(
             }
         }
         PromptKind::CreateThread { channel_id } => {
+            let root = client
+                .call::<_, EventAppendResult>(
+                    method::EVENT_APPEND,
+                    json!({
+                        "event": {
+                            "type": "content.add",
+                            "actorId": app.actor_id.clone(),
+                            "scope": { "kind": "channel", "id": channel_id.clone() },
+                            "payload": { "contentType": "text/markdown", "text": value.clone() },
+                            "relations": []
+                        }
+                    }),
+                )
+                .await;
+            let root_event_id = match root {
+                Ok(r) => r.event.id,
+                Err(e) => {
+                    app.set_status(format!("thread root event append failed: {}", e));
+                    return;
+                }
+            };
             let res = client
                 .call::<_, ThreadCreateResult>(
                     method::THREAD_CREATE,
-                    json!({ "channelId": channel_id, "title": value }),
+                    json!({ "channelId": channel_id, "rootEventId": root_event_id, "title": value }),
                 )
                 .await;
             match res {
@@ -2051,7 +2073,7 @@ async fn do_handoff_with_message(
     });
     let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
     match res {
-        Ok(_) => app.set_status(format!("handoff → {}", target)),
+        Ok(_) => app.set_status(format!("handoff -> {}", target)),
         Err(e) => app.set_status(format!("handoff failed: {}", e)),
     }
 }

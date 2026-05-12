@@ -86,7 +86,13 @@ export const useChannels = create<ChannelsState>((set) => ({
     // Piggyback onto member refreshes to keep the global actor directory
     // warm — Bubble headers and @-palette previews both read from it.
     useActors.getState().upsertMany(members);
+    const memberIds = members.map((member) => member.id);
     set((s) => ({
+      channels: s.channels.map((channel) =>
+        channel.id === channelId
+          ? { ...channel, members: memberIds }
+          : channel,
+      ),
       membersByChannel: { ...s.membersByChannel, [channelId]: members },
     }));
   },

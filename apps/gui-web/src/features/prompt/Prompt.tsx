@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CornerDownRight, X } from "lucide-react";
+import { CornerDownRight, ImagePlus, Paperclip, Send, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { ScopeRef } from "@/ipc/types";
+import type { Actor, Channel, ScopeRef, Thread } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
 import { useActors } from "@/store/actors";
+import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { SlashPalette, type SlashPaletteHandle } from "./SlashPalette";
@@ -30,6 +31,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   const drafts = useUI((s) => s.drafts);
   const setDraft = useUI((s) => s.setDraft);
   const actorsById = useActors((s) => s.byId);
+  const channels = useChannels((s) => s.channels);
+  const threadsByChannel = useChannels((s) => s.threadsByChannel);
   const reply = useUI((s) => s.replyTargets[currentScopeKey] ?? null);
   const replyAuthor = useActors((s) =>
     reply ? s.byId[reply.actorId] : undefined,
@@ -40,6 +43,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   const text = drafts[currentScopeKey] ?? "";
   const [sending, setSending] = useState(false);
   const [caret, setCaret] = useState(0);
+  const [asTask, setAsTask] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const slashRef = useRef<SlashPaletteHandle>(null);
   const mentionRef = useRef<MentionPaletteHandle>(null);
@@ -135,14 +139,45 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         }
       }
 
-      await ipc.eventAppend({
-        type: "content.add",
-        actorId: selfId,
+      const blockedHandoffs = privateChannelHandoffBlockers({
         scope,
-        payload: { contentType: "text/markdown", text: payloadText },
-        relations,
+        channels,
+        threadsByChannel,
+        actorsById,
+        actorIds: [...handoffTargets],
       });
+      if (blockedHandoffs.length > 0) {
+        pushToast("warn", blockedHandoffs[0]);
+        return;
+      }
+
+      await ipc.eventAppend(
+        asTask
+          ? {
+              type: "action.request",
+              actorId: selfId,
+              scope,
+              payload: {
+                requestType: "task",
+                title: firstLine(payloadText),
+                description: payloadText,
+                choices: [
+                  { id: "done", label: "Done" },
+                  { id: "cancel", label: "Cancel" },
+                ],
+              },
+              relations,
+            }
+          : {
+              type: "content.add",
+              actorId: selfId,
+              scope,
+              payload: { contentType: "text/markdown", text: payloadText },
+              relations,
+            },
+      );
       setDraft(scope, "");
+      setAsTask(false);
       setReply(scope, null);
     } catch (e) {
       pushToast("error", `send failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -232,7 +267,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   };
 
   return (
-    <div className="relative border-t border-border bg-main px-4 py-3">
+    <div className="relative border-t-2 border-black bg-white px-3 py-3">
       {slashOpen && (
         <SlashPalette
           ref={slashRef}
@@ -249,8 +284,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
       )}
 
       {reply && (
-        <div className="mb-2 flex items-center gap-2 rounded bg-elevated px-3 py-1 text-xs text-secondary">
-          <CornerDownRight size={12} className="text-muted" />
+        <div className="mb-2 flex items-center gap-2 border-2 border-black bg-brutal-cream px-3 py-1 text-xs font-bold text-black/70 shadow-brutal-sm">
+          <CornerDownRight size={12} className="text-black/45" />
           <span className="truncate">
             Replying to{" "}
             <span className="font-semibold text-primary">
@@ -259,7 +294,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
             : {reply.preview}
           </span>
           <button
-            className="ml-auto text-muted hover:text-danger"
+              className="ml-auto text-black/45 hover:text-danger"
             onClick={() => setReply(scope, null)}
           >
             <X size={12} />
@@ -267,7 +302,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         </div>
       )}
 
-      <div className="flex items-end gap-2 rounded bg-elevated px-3 py-2">
+      <div className="flex items-end gap-2 border-2 border-black bg-white px-3 py-2 shadow-brutal-sm">
         <textarea
           ref={taRef}
           value={text}
@@ -283,12 +318,46 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
           onCompositionEnd={onCompositionEnd}
           onKeyDown={onKeyDown}
           rows={Math.min(10, Math.max(3, text.split("\n").length + 1))}
-          className="flex-1 resize-none bg-transparent text-sm leading-6 outline-none placeholder:text-muted"
+          className="min-h-[44px] flex-1 resize-none bg-transparent text-sm leading-6 text-black outline-none placeholder:text-black/40"
           disabled={sending}
         />
       </div>
-      <div className="mt-1 px-1 text-[11px] text-muted">
-        Enter to send · Shift+Enter for newline · / for commands · @ for mentions
+      <div className="mt-2 flex items-center gap-2">
+        <button
+          type="button"
+          className="btn-brutal-sm bg-white p-1"
+          title="Attach image"
+          aria-label="Attach image"
+          onClick={() => pushToast("info", "image attachments are not backed by the current Joi protocol yet")}
+        >
+          <ImagePlus size={15} />
+        </button>
+        <button
+          type="button"
+          className="btn-brutal-sm bg-white p-1"
+          title="Attach file"
+          aria-label="Attach file"
+          onClick={() => pushToast("info", "file attachments are not backed by the current Joi protocol yet")}
+        >
+          <Paperclip size={15} />
+        </button>
+        <label className="ml-auto flex items-center gap-1.5 text-xs font-bold text-black/70">
+          <input
+            type="checkbox"
+            checked={asTask}
+            onChange={(e) => setAsTask(e.target.checked)}
+            className="h-3.5 w-3.5 accent-black"
+          />
+          As Task
+        </label>
+        <button
+          type="button"
+          disabled={!text.trim() || sending}
+          onClick={() => void send()}
+          className="btn-brutal-sm gap-1 bg-brutal-pink px-3 text-xs disabled:bg-black/10"
+        >
+          Send <Send size={13} />
+        </button>
       </div>
     </div>
   );
@@ -310,7 +379,7 @@ function findMentionTrigger(text: string, caret: number): MentionTrigger | null 
 
 function mentionTargets(
   text: string,
-  actorsById: Record<string, unknown>,
+  actorsById: Record<string, Actor>,
 ): string[] {
   const targets = new Set<string>();
   const re = /@([A-Za-z0-9._-]+)/g;
@@ -323,6 +392,51 @@ function mentionTargets(
   return [...targets];
 }
 
+function firstLine(value: string): string {
+  return value.split("\n").find(Boolean) ?? "Untitled task";
+}
+
 function isMentionWordChar(ch: string | undefined): boolean {
   return !!ch && /[A-Za-z0-9._-]/.test(ch);
+}
+
+function privateChannelHandoffBlockers({
+  scope,
+  channels,
+  threadsByChannel,
+  actorsById,
+  actorIds,
+}: {
+  scope: ScopeRef;
+  channels: Channel[];
+  threadsByChannel: Record<string, Thread[]>;
+  actorsById: Record<string, Actor>;
+  actorIds: string[];
+}): string[] {
+  const channel = resolveChannelForScope(scope, channels, threadsByChannel);
+  if (!channel || channel.visibility !== "private") return [];
+
+  const members = new Set(channel.members);
+  return actorIds
+    .filter((actorId) => !members.has(actorId))
+    .map((actorId) => {
+      const display = actorsById[actorId]?.displayName || actorId;
+      return `${display} is not in #${channel.title}. Invite them before handing off.`;
+    });
+}
+
+function resolveChannelForScope(
+  scope: ScopeRef,
+  channels: Channel[],
+  threadsByChannel: Record<string, Thread[]>,
+): Channel | null {
+  if (scope.kind === "channel") {
+    return channels.find((c) => c.id === scope.id) ?? null;
+  }
+  for (const [channelId, threads] of Object.entries(threadsByChannel)) {
+    if (threads.some((thread) => thread.id === scope.id)) {
+      return channels.find((c) => c.id === channelId) ?? null;
+    }
+  }
+  return null;
 }

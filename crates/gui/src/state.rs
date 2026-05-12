@@ -21,6 +21,10 @@ impl AppState {
             .ok_or_else(|| "not connected — call connect() first".to_string())
     }
 
+    pub async fn try_client(&self) -> Option<Arc<Client>> {
+        self.inner.lock().await.clone()
+    }
+
     pub async fn set(&self, client: Option<Arc<Client>>) {
         *self.inner.lock().await = client;
     }

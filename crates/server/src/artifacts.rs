@@ -48,6 +48,14 @@ impl ArtifactStore {
                 };
                 (t.name, media, t.text.into_bytes())
             }
+            ArtifactIngress::FileBytes(f) => {
+                let media = if f.media_type.is_empty() {
+                    "application/octet-stream".to_string()
+                } else {
+                    f.media_type
+                };
+                (f.name, media, f.bytes)
+            }
         };
         let safe_name = sanitize_name(&name);
         let path = dir.join(&safe_name);
@@ -101,6 +109,7 @@ impl ArtifactStore {
             media_type: artifact.media_type.clone(),
             truncated,
             content,
+            bytes: slice.to_vec(),
         })
     }
 

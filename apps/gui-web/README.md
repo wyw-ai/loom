@@ -18,6 +18,11 @@ make gui-dev
 `pnpm dev` here for the front-end on port 5173 and opens a native window
 pointed at it. Edits hot-reload.
 
+Direct `cargo run -p joi-gui` from the repo root is also supported for IDE
+restart loops: debug builds start this Vite dev server when port 5173 is not
+already reachable. The Tauri shell does not start `joi-server` or `joi daemon`;
+the user selects a configured workspace/server from the GUI.
+
 Production build: `make gui-release` → bundle in `crates/gui/target/release/bundle/`.
 
 ## Layout

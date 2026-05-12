@@ -78,22 +78,23 @@ pub fn write_request(root: &Path, req: &InstanceRequest) -> Result<PathBuf> {
     let instance_id = &req.scope.id;
     let dir = super::state::ensure_instance_state_dir(root, &req.spec_id, instance_id)?;
     let path = dir.join("request.json");
-    let body =
-        serde_json::to_string_pretty(req).context("serialize InstanceRequest")?;
-    fs::write(&path, body)
-        .with_context(|| format!("write {}", path.display()))?;
+    let body = serde_json::to_string_pretty(req).context("serialize InstanceRequest")?;
+    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
 /// Read the request file; returns `Ok(None)` if absent.
 #[allow(dead_code)]
-pub fn read_request(root: &Path, spec_id: &str, instance_id: &str) -> Result<Option<InstanceRequest>> {
+pub fn read_request(
+    root: &Path,
+    spec_id: &str,
+    instance_id: &str,
+) -> Result<Option<InstanceRequest>> {
     let path = request_path(root, spec_id, instance_id);
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let req: InstanceRequest = serde_json::from_str(&text)
         .with_context(|| format!("parse InstanceRequest at {}", path.display()))?;
     Ok(Some(req))

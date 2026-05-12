@@ -48,10 +48,7 @@ impl WsRef {
                     .actor_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("actor workspace requires --actor or JOI_ACTOR"))?;
-                channel_root
-                    .join("agents")
-                    .join(actor)
-                    .join("workspace")
+                channel_root.join("agents").join(actor).join("workspace")
             }
             WsKind::Channel => channel_root.join("shared"),
             WsKind::Thread => {
@@ -166,8 +163,8 @@ pub fn list(ws: WsRef, sub: Option<String>, recursive: bool) -> Result<()> {
         out
     } else {
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(&target)
-            .with_context(|| format!("read {}", target.display()))?
+        for entry in
+            std::fs::read_dir(&target).with_context(|| format!("read {}", target.display()))?
         {
             let entry = entry?;
             let mut name = entry.file_name().to_string_lossy().to_string();
@@ -212,8 +209,8 @@ pub fn read(ws: WsRef, rel: String, max_bytes: u64) -> Result<()> {
     if !target.exists() {
         bail!("not found: {}", target.display());
     }
-    let mut f = std::fs::File::open(&target)
-        .with_context(|| format!("open {}", target.display()))?;
+    let mut f =
+        std::fs::File::open(&target).with_context(|| format!("open {}", target.display()))?;
     let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024) as usize);
     let mut limited = (&mut f).take(max_bytes);
     limited.read_to_end(&mut buf)?;
@@ -224,12 +221,17 @@ pub fn read(ws: WsRef, rel: String, max_bytes: u64) -> Result<()> {
     Ok(())
 }
 
-pub fn write(ws: WsRef, rel: String, body_text: Option<String>, body_file: Option<PathBuf>, append: bool) -> Result<()> {
+pub fn write(
+    ws: WsRef,
+    rel: String,
+    body_text: Option<String>,
+    body_file: Option<PathBuf>,
+    append: bool,
+) -> Result<()> {
     let base = ws.resolve()?;
     let target = join_safe(&base, &rel)?;
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
     let body: Vec<u8> = match (body_text, body_file) {
         (Some(_), Some(_)) => bail!("--text and --file are mutually exclusive"),
@@ -271,13 +273,14 @@ pub fn rm(ws: WsRef, rel: String, recursive: bool) -> Result<()> {
     }
     if target.is_dir() {
         if !recursive {
-            bail!("{} is a directory (pass --recursive to remove)", target.display());
+            bail!(
+                "{} is a directory (pass --recursive to remove)",
+                target.display()
+            );
         }
-        std::fs::remove_dir_all(&target)
-            .with_context(|| format!("rm -r {}", target.display()))?;
+        std::fs::remove_dir_all(&target).with_context(|| format!("rm -r {}", target.display()))?;
     } else {
-        std::fs::remove_file(&target)
-            .with_context(|| format!("rm {}", target.display()))?;
+        std::fs::remove_file(&target).with_context(|| format!("rm {}", target.display()))?;
     }
     if render::is_json() {
         render::print_json(&serde_json::json!({"removed": target.display().to_string()}));

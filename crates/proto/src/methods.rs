@@ -23,6 +23,7 @@ pub mod method {
     pub const THREAD_CREATE: &str = "thread/create";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
+    pub const THREAD_ARCHIVE: &str = "thread/archive";
     pub const THREAD_DELETE: &str = "thread/delete";
     pub const TASK_CREATE: &str = "task/create";
     pub const TASK_GET: &str = "task/get";
@@ -314,6 +315,8 @@ pub struct ThreadCreateResult {
 pub struct ThreadListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +335,23 @@ pub struct ThreadUpdateParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadUpdateResult {
+    pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadArchiveParams {
+    pub thread_id: String,
+    #[serde(default = "default_archive_archived")]
+    pub archived: bool,
+}
+
+fn default_archive_archived() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadArchiveResult {
     pub thread: Thread,
 }
 
@@ -2060,6 +2080,7 @@ pub struct StreamUpdate {
 
 pub mod stream_kind {
     pub const THREAD_CREATED: &str = "thread.created";
+    pub const THREAD_UPDATED: &str = "thread.updated";
     pub const TASK_CHANGED: &str = "task.changed";
     pub const TASK_ASSIGNMENT_CHANGED: &str = "task_assignment.changed";
     /// Broadcast when a new channel is created. Public channels go to

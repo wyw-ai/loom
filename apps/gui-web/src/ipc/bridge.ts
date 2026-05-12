@@ -169,6 +169,13 @@ export async function threadUpdate(params: {
   return invoke("thread_update", { params });
 }
 
+export async function threadArchive(params: {
+  threadId: string;
+  archived?: boolean;
+}): Promise<{ thread: Thread }> {
+  return invoke("thread_archive", { params });
+}
+
 export async function threadDelete(params: {
   threadId: string;
 }): Promise<{ deleted: boolean }> {
@@ -177,8 +184,14 @@ export async function threadDelete(params: {
 
 export async function threadList(
   channelId?: string,
+  options?: { archived?: boolean },
 ): Promise<{ threads: Thread[] }> {
-  return invoke("thread_list", { params: channelId ? { channelId } : {} });
+  return invoke("thread_list", {
+    params: {
+      ...(channelId ? { channelId } : {}),
+      ...(options?.archived ? { archived: true } : {}),
+    },
+  });
 }
 
 export async function channelMembers(

@@ -391,6 +391,7 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::TurnOpened(t) => (sk::TURN_OPENED, json!({ "turn": t })),
         StoreEvent::TurnClosed(t) => (sk::TURN_CLOSED, json!({ "turn": t })),
         StoreEvent::ThreadCreated(t) => (sk::THREAD_CREATED, json!({ "thread": t })),
+        StoreEvent::ThreadUpdated(t) => (sk::THREAD_UPDATED, json!({ "thread": t })),
         StoreEvent::TaskChanged(t) => (sk::TASK_CHANGED, json!({ "task": t })),
         StoreEvent::TaskAssignmentChanged { assignment, task } => (
             sk::TASK_ASSIGNMENT_CHANGED,

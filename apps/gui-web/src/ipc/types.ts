@@ -28,6 +28,7 @@ export interface Thread {
   channelId: string;
   title: string;
   rootEventId?: string | null;
+  archivedAt?: string | null;
 }
 
 export type ScopeKind = "channel" | "thread";

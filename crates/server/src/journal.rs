@@ -52,6 +52,10 @@ pub enum Mutation {
         thread_id: String,
         title: String,
     },
+    ThreadArchive {
+        thread_id: String,
+        archived_at: Option<Timestamp>,
+    },
     ThreadDelete {
         thread_id: String,
     },
@@ -86,6 +90,7 @@ const LEGACY_VARIANTS: &[&str] = &[
     "artifact_create",
     "channel_grant",
     "channel_revoke",
+    "thread_archive",
 ];
 
 pub struct Journal {

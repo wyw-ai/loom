@@ -6,6 +6,7 @@ import { useActors } from "./actors";
 interface ChannelsState {
   channels: Channel[];
   threadsByChannel: Record<string, Thread[]>;
+  archivedThreadsByChannel: Record<string, Thread[]>;
   membersByChannel: Record<string, Actor[]>;
   currentScope: ScopeRef | null;
   selected: { channelId?: string; threadId?: string };
@@ -14,6 +15,7 @@ interface ChannelsState {
   upsertChannel: (c: Channel) => void;
   removeChannel: (id: string) => void;
   replaceThreads: (channelId: string, threads: Thread[]) => void;
+  replaceArchivedThreads: (channelId: string, threads: Thread[]) => void;
   upsertThread: (t: Thread) => void;
   removeThread: (channelId: string, threadId: string) => void;
   replaceMembers: (channelId: string, members: Actor[]) => void;
@@ -25,6 +27,7 @@ interface ChannelsState {
 export const useChannels = create<ChannelsState>((set) => ({
   channels: [],
   threadsByChannel: {},
+  archivedThreadsByChannel: {},
   membersByChannel: {},
   currentScope: null,
   selected: {},
@@ -42,10 +45,12 @@ export const useChannels = create<ChannelsState>((set) => ({
   removeChannel: (id) =>
     set((s) => {
       const { [id]: _, ...rest } = s.threadsByChannel;
-      const { [id]: __, ...restMembers } = s.membersByChannel;
+      const { [id]: __, ...restArchived } = s.archivedThreadsByChannel;
+      const { [id]: ___, ...restMembers } = s.membersByChannel;
       return {
         channels: s.channels.filter((c) => c.id !== id),
         threadsByChannel: rest,
+        archivedThreadsByChannel: restArchived,
         membersByChannel: restMembers,
       };
     }),
@@ -57,18 +62,32 @@ export const useChannels = create<ChannelsState>((set) => ({
         [channelId]: sortByTitle(threads),
       },
     })),
+  replaceArchivedThreads: (channelId, threads) =>
+    set((s) => ({
+      archivedThreadsByChannel: {
+        ...s.archivedThreadsByChannel,
+        [channelId]: sortByArchivedTime(threads),
+      },
+    })),
   upsertThread: (t) =>
     set((s) => {
-      const list = s.threadsByChannel[t.channelId] ?? [];
-      const existing = list.findIndex((x) => x.id === t.id);
-      const next =
-        existing >= 0
-          ? list.map((x) => (x.id === t.id ? { ...x, ...t } : x))
-          : [...list, t];
+      const active = (s.threadsByChannel[t.channelId] ?? []).filter(
+        (x) => x.id !== t.id,
+      );
+      const archived = (s.archivedThreadsByChannel[t.channelId] ?? []).filter(
+        (x) => x.id !== t.id,
+      );
+      const isArchived = Boolean(t.archivedAt);
       return {
         threadsByChannel: {
           ...s.threadsByChannel,
-          [t.channelId]: sortByTitle(next),
+          [t.channelId]: sortByTitle(isArchived ? active : [...active, t]),
+        },
+        archivedThreadsByChannel: {
+          ...s.archivedThreadsByChannel,
+          [t.channelId]: sortByArchivedTime(
+            isArchived ? [...archived, t] : archived,
+          ),
         },
       };
     }),
@@ -77,6 +96,12 @@ export const useChannels = create<ChannelsState>((set) => ({
       threadsByChannel: {
         ...s.threadsByChannel,
         [channelId]: (s.threadsByChannel[channelId] ?? []).filter(
+          (t) => t.id !== threadId,
+        ),
+      },
+      archivedThreadsByChannel: {
+        ...s.archivedThreadsByChannel,
+        [channelId]: (s.archivedThreadsByChannel[channelId] ?? []).filter(
           (t) => t.id !== threadId,
         ),
       },
@@ -103,4 +128,14 @@ export const useChannels = create<ChannelsState>((set) => ({
 
 function sortByTitle<T extends { title: string }>(xs: T[]): T[] {
   return [...xs].sort((a, b) => a.title.localeCompare(b.title));
+}
+
+function sortByArchivedTime<T extends { title: string; archivedAt?: string | null }>(
+  xs: T[],
+): T[] {
+  return [...xs].sort((a, b) => {
+    const at = a.archivedAt ? Date.parse(a.archivedAt) : 0;
+    const bt = b.archivedAt ? Date.parse(b.archivedAt) : 0;
+    return bt - at || a.title.localeCompare(b.title);
+  });
 }

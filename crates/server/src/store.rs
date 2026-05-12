@@ -37,6 +37,7 @@ pub enum StoreEvent {
         task: Task,
     },
     ChannelCreated(Channel),
+    ThreadUpdated(Thread),
     ArtifactPublished(Artifact),
     ReceiptRecorded(Receipt),
     DeliveryUpdated(Delivery),
@@ -67,6 +68,10 @@ impl StoreEvent {
             StoreEvent::ThreadCreated(c) => Some(ScopeRef {
                 kind: ScopeKind::Channel,
                 id: c.channel_id.clone(),
+            }),
+            StoreEvent::ThreadUpdated(t) => Some(ScopeRef {
+                kind: ScopeKind::Channel,
+                id: t.channel_id.clone(),
             }),
             StoreEvent::TaskChanged(t) => Some(ScopeRef {
                 kind: ScopeKind::Channel,
@@ -428,6 +433,7 @@ impl Store {
             channel_id,
             title,
             root_event_id,
+            archived_at: None,
             _meta: None,
         };
         self.journal
@@ -451,6 +457,28 @@ impl Store {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn list_threads_filtered(&self, channel_id: Option<&str>, archived: bool) -> Vec<Thread> {
+        let inner = self.inner.read();
+        let mut threads = inner
+            .threads
+            .values()
+            .filter(|t| match channel_id {
+                Some(id) => t.channel_id == id,
+                None => true,
+            })
+            .filter(|t| t.archived_at.is_some() == archived)
+            .cloned()
+            .collect::<Vec<_>>();
+        if archived {
+            threads.sort_by(|a, b| {
+                b.archived_at
+                    .cmp(&a.archived_at)
+                    .then_with(|| a.title.cmp(&b.title))
+            });
+        }
+        threads
     }
 
     pub fn get_thread(&self, id: &str) -> Option<Thread> {
@@ -480,7 +508,31 @@ impl Store {
             .get_mut(id)
             .ok_or_else(|| StoreError::NotFound(format!("thread {id}")))?;
         t.title = title;
-        Ok(t.clone())
+        let thread = t.clone();
+        drop(inner);
+        self.emit(StoreEvent::ThreadUpdated(thread.clone()));
+        Ok(thread)
+    }
+
+    pub fn archive_thread(&self, id: &str, archived: bool) -> StoreResult<Thread> {
+        if self.get_thread(id).is_none() {
+            return Err(StoreError::NotFound(format!("thread {id}")));
+        }
+        let archived_at = archived.then(Utc::now);
+        self.journal.append(&Mutation::ThreadArchive {
+            thread_id: id.to_string(),
+            archived_at,
+        })?;
+        let mut inner = self.inner.write();
+        let t = inner
+            .threads
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("thread {id}")))?;
+        t.archived_at = archived_at;
+        let thread = t.clone();
+        drop(inner);
+        self.emit(StoreEvent::ThreadUpdated(thread.clone()));
+        Ok(thread)
     }
 
     /// Hard-removes the thread row and the events_by_scope index for its
@@ -1691,6 +1743,14 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 t.title = title;
             }
         }
+        Mutation::ThreadArchive {
+            thread_id,
+            archived_at,
+        } => {
+            if let Some(t) = inner.threads.get_mut(&thread_id) {
+                t.archived_at = archived_at;
+            }
+        }
         Mutation::ThreadDelete { thread_id } => {
             inner.threads.remove(&thread_id);
             let scope = ScopeRef {
@@ -2023,6 +2083,66 @@ mod tests {
             .create_thread(ch.id.clone(), "second".into(), root_event_id)
             .expect_err("duplicate root must be rejected");
         assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn archive_thread_hides_from_default_list_and_replays() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let t1 = create_thread_under(&store, &ch.id, "actor_owner", "first");
+        let t2 = create_thread_under(&store, &ch.id, "actor_owner", "second");
+
+        let archived = store.archive_thread(&t1.id, true).expect("archive thread");
+        assert!(archived.archived_at.is_some());
+        assert_eq!(
+            store
+                .list_threads_filtered(Some(&ch.id), false)
+                .into_iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t2.id.clone()]
+        );
+        assert_eq!(
+            store
+                .list_threads_filtered(Some(&ch.id), true)
+                .into_iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t1.id.clone()]
+        );
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert!(replayed.get_thread(&t1.id).unwrap().archived_at.is_some());
+        assert_eq!(
+            replayed
+                .list_threads_filtered(Some(&ch.id), false)
+                .into_iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t2.id]
+        );
+    }
+
+    #[test]
+    fn unarchive_thread_returns_to_default_list() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let t = create_thread_under(&store, &ch.id, "actor_owner", "thread");
+
+        store.archive_thread(&t.id, true).expect("archive thread");
+        let restored = store.archive_thread(&t.id, false).expect("restore thread");
+
+        assert!(restored.archived_at.is_none());
+        assert_eq!(
+            store
+                .list_threads_filtered(Some(&ch.id), false)
+                .into_iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t.id]
+        );
+        assert!(store.list_threads_filtered(Some(&ch.id), true).is_empty());
     }
 
     #[test]

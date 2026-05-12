@@ -102,6 +102,8 @@ pub struct Thread {
     pub channel_id: String,
     pub title: String,
     pub root_event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }

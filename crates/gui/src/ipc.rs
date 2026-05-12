@@ -383,6 +383,16 @@ pub async fn thread_update(state: State<'_, AppState>, params: Value) -> Result<
 }
 
 #[tauri::command]
+pub async fn thread_archive(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_ARCHIVE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn thread_delete(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()

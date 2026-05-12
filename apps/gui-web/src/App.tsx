@@ -341,7 +341,14 @@ export function App() {
       }
       case "thread.created": {
         const thread = u.data.thread as
-          | { id: string; channelId: string; title: string }
+          | { id: string; channelId: string; title: string; archivedAt?: string | null }
+          | undefined;
+        if (thread) channels.upsertThread(thread);
+        return;
+      }
+      case "thread.updated": {
+        const thread = u.data.thread as
+          | { id: string; channelId: string; title: string; archivedAt?: string | null }
           | undefined;
         if (thread) channels.upsertThread(thread);
         return;

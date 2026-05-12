@@ -175,13 +175,13 @@ human 的短摘要。**禁止**在 channel 公共区写扫描日志或唤醒非�
       扫描结果只写本 thread，不要写 channel 公共区。"
    ```
 3. 等 `feedback-scanner` / `actor_a1_bug_triage` 回来后，只做记录/确认，不直接推进
-   discovery/delivery。逐条启动由
-   `a1-bug-fix-loop` 串行负责。
+   discovery/delivery。逐条启动由挂在 `bug-scan-desk` 上的
+   `a1-bug-fix-loop` 服务串行负责。
 4. 如果 human 是在 channel 触发扫描，router 可以在收到 scanner/triage 的后续
    结果后，用一行中文摘要回 channel；不要在同一回合既 handoff 又 say。
 
 > 后续 `bugfix ... MR 已合并`、`没有下一条 bug` 等 loop 事件，也留在
-> bug-scan / loop thread 的文件与事件里，由 `a1-bug-fix-loop` 判断下一步。
+> `bug-scan-desk` 的文件与事件里，由 `a1-bug-fix-loop` 服务判断下一步。
 
 ### feedback scanner / triage 回报后
 
@@ -572,7 +572,7 @@ MR 真实处于 `merged` 或 `closed` 终态后，必须在本回合额外完成
      `joi thread list --channel <channel_id> --json` 查找同一 channel 下同一任务链路的
      sibling thread，例如 `bugfix-<id>`、`[bugfixloop:<id>] ...`、以及当前消息/历史
      中明确写出的承接旧 thread。
-   - 禁止归档常驻 thread：`a1-bug-fix-loop`、`bug-scan-desk`、`discovery-desk`
+   - 禁止归档常驻 thread：`bug-scan-desk`、`discovery-desk`
      以及任何 role/desk/service/loop 类型 thread，除非 human 明确点名要求。
 2. 按**产生顺序（旧 → 新）**逐个执行 `joi thread archive <thread_id>`；不要并发归档。
    Archive Box 按 `archivedAt` 倒序展示，因此旧 thread 必须先归档，新 thread 后归档。

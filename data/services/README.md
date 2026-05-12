@@ -17,7 +17,7 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
 | `repo-cache`      | scheduler   | channel-level | cron `*/15 * * * *` | 仓库镜像（本地缓存） |
 | `repo-notes`      | command     | channel-level | 手动子命令           | a1 kbase 仓库笔记 |
 | `mr-detector`     | scheduler   | thread-bound  | cron + 自我完成      | `mr-event-*.json`（artifact-contracts §6） |
-| `a1-bug-fix-loop` | scheduler   | thread-bound  | cron `*/5 * * * *`  | bugfix loop status artifact |
+| `a1-bug-fix-loop` | scheduler   | thread-bound on `bug-scan-desk` | cron `*/5 * * * *`  | bugfix loop status artifact |
 | `feedback-scanner` | scheduler  | channel-level | remote-managed placeholder | feedback scanner service actor |
 | `mr-watcher`      | scheduler   | channel-level | remote-managed placeholder | MR watcher service actor |
 

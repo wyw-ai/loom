@@ -36,9 +36,9 @@ without side effects.
 
 ## Scope binding
 
-`thread_bound`. The intended host is a `bug-fix-loop` thread under
-`a1-dev-canfeng`. Pass `params.scanner_thread_id` to point at the
-scanner thread (typically `feedback-scan`) and `params.channel_id` to
-the parent channel. The loop creates per-bug bugfix threads via
+`thread_bound`. The intended host is the resident `bug-scan-desk`
+thread under `a1-dev-canfeng`; scanner and loop status live in the same
+thread. Pass `params.scanner_thread_id` as that `bug-scan-desk` thread
+and `params.channel_id` as the parent channel. The loop creates per-bug bugfix threads via
 `joi event append --channel --in <chan> ...` followed by
 `joi thread create --channel <chan> --root-event <anchor_event_id>`.

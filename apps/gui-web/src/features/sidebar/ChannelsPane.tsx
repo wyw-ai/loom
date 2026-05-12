@@ -33,12 +33,14 @@ export function ChannelsPane() {
   const view = useUI((s) => s.view);
   const setView = useUI((s) => s.setView);
   const openModal = useUI((s) => s.openModal);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean | undefined>>(
+    {},
+  );
 
   const title = view === "tasks" ? "Tasks" : view === "inbox" ? "Inbox" : "Chat";
 
   return (
-    <aside className="hidden h-full w-60 shrink-0 select-none flex-col border-r-2 border-black bg-brutal-cream text-black md:flex">
+    <aside className="hidden h-full min-h-0 w-60 shrink-0 select-none flex-col overflow-hidden border-r-2 border-black bg-brutal-cream text-black md:flex">
       <header className="flex h-panel-header shrink-0 items-center border-b-2 border-black px-5">
         <div className="text-lg font-black">{title}</div>
       </header>
@@ -58,9 +60,9 @@ export function ChannelsPane() {
             <ChannelRow
               key={c.id}
               channel={c}
-              expanded={!!expanded[c.id]}
-              onToggle={() =>
-                setExpanded((s) => ({ ...s, [c.id]: !s[c.id] }))
+              expanded={expanded[c.id]}
+              onToggle={(nextExpanded) =>
+                setExpanded((s) => ({ ...s, [c.id]: nextExpanded }))
               }
             />
           ))
@@ -140,8 +142,8 @@ function ChannelRow({
   onToggle,
 }: {
   channel: Channel;
-  expanded: boolean;
-  onToggle: () => void;
+  expanded?: boolean;
+  onToggle: (nextExpanded: boolean) => void;
 }) {
   const currentScope = useChannels((s) => s.currentScope);
   const threads = useChannels((s) => s.threadsByChannel[channel.id] ?? []);
@@ -155,7 +157,7 @@ function ChannelRow({
   const isCurrent = (kind: "channel" | "thread", id: string) =>
     currentScope?.kind === kind && currentScope.id === id;
   const hasCurrentThread = threads.some((t) => isCurrent("thread", t.id));
-  const showThreads = expanded || hasCurrentThread;
+  const showThreads = expanded ?? hasCurrentThread;
 
   useEffect(() => {
     if (!showThreads || threads.length > 0) return;
@@ -236,7 +238,7 @@ function ChannelRow({
           className="flex h-[22px] w-[18px] shrink-0 items-center justify-center text-black/70 hover:text-black"
           onClick={(e) => {
             e.stopPropagation();
-            onToggle();
+            onToggle(!showThreads);
           }}
         >
           {showThreads ? <ChevronDown size={13} /> : <ChevronRight size={13} />}

@@ -6,10 +6,11 @@ Each tick (default `*/5 * * * *`):
 
 1. Reads the newest `feedback-scan v1` event from the scanner thread.
 2. For every tracked bug currently `in_progress`, checks whether its
-   bugfix thread has published `mr-merged.v1` or a merged `mr-final.v1`.
-   If yes, comments on the corresponding Aone feedback, updates its
-   workitem status to `Fixed`, marks the local ledger `fixed`, and writes
-   the closure note in the resident scanner thread.
+   bugfix thread has published `mr-merged.v1`, `mr-final.v1`, or a closed
+   / withdrawn terminal signal from `mr-watcher`. Merged items are
+   commented back and marked `Fixed`; non-Fixed terminal items are
+   commented back and moved to a supported terminal status such as
+   `Won'tfix`, then archived so the next queued item can start.
 3. If the concurrency budget allows (`params.concurrency`, default 1),
    promotes the next `pending` feedback from the scanner artifact to
    `in_progress`:

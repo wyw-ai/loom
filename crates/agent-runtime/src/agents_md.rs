@@ -126,6 +126,21 @@ question, or requesting approval.\n\
 Keep progress updates short, state uncertainty when it matters, and include the\n\
 key evidence behind conclusions. If more context is needed, query Joi first.\n\
 \n\
+### Collaboration routing\n\
+\n\
+Human-to-actor handoffs are weak task signals: answer in the current scope\n\
+when the work is short or conversational. Do not create a thread for every\n\
+human `@actor` or `/handoff` message.\n\
+\n\
+Actor-to-actor handoffs are strong task-flow signals. When you delegate a\n\
+substantial subtask to another actor from a channel common area, create or\n\
+reuse a task thread first: post a short channel root message, create a thread\n\
+from that root event, then send the handoff inside that thread. If the current\n\
+scope is already the right thread, reuse it instead of creating another one.\n\
+After creating or choosing a thread, keep follow-up work, evidence, review\n\
+requests, and the final answer in that thread. The parent channel should get\n\
+at most a short pointer or summary.\n\
+\n\
 ### Read-only CLI\n\
 \n\
 Shell out to `joi --json ...` for server state. `--json` returns machine-\n\
@@ -205,6 +220,9 @@ mod tests {
         assert!(out.contains("JOI_SCOPE_ID"));
         assert!(out.contains("### Runtime contract"));
         assert!(out.contains("Do not call `joi message send` just to post"));
+        assert!(out.contains("Human-to-actor handoffs are weak task signals"));
+        assert!(out.contains("Actor-to-actor handoffs are strong task-flow signals"));
+        assert!(out.contains("keep follow-up work, evidence, review"));
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains(END_MARKER));
     }

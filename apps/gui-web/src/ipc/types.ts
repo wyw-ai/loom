@@ -221,6 +221,12 @@ export interface AgentInfo {
   sessionId?: string;
 }
 
+export interface MachineAgentInfo extends AgentInfo {
+  profilePath: string;
+  identityPath: string;
+  soulPath: string;
+}
+
 export interface AgentProviderSummary {
   id: string;
   name: string;
@@ -245,7 +251,7 @@ export interface MachineInfo {
   agentCount: number;
   onlineAgentCount: number;
   providers: AgentProviderSummary[];
-  agents: AgentInfo[];
+  agents: MachineAgentInfo[];
   serveCommand: string;
   setupScript: string;
 }

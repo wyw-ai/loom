@@ -1143,7 +1143,7 @@ pub enum CommandOutputFormat {
     /// Whole stdout collected → single `content.add` event at process exit.
     #[default]
     Text,
-    /// Anthropic Claude Code `--output-format stream-json` framing.
+    /// Claude Code / Qoder CLI `--output-format stream-json` framing.
     ClaudeStreamJson,
     /// GitHub Copilot CLI `--output-format json` JSONL session events.
     CopilotJson,

@@ -235,7 +235,8 @@ joi daemon --machine-id local --allow-actors actor_claude,actor_codex
 
 # 5. 人类侧照常使用 CLI 或 GUI。
 joi channel create --title "Demo"
-joi thread create --channel <channel_id> --title "Kickoff"
+root_event=$(joi --json event append --channel --in <channel_id> --type thread.opened --text "Kickoff" | jq -r '.event.id')
+joi thread create --channel <channel_id> --root-event "$root_event" --title "Kickoff"
 joi chat --in <thread_id>
 ```
 
@@ -480,13 +481,15 @@ daemon 合成的内置 runtime 默认开启 prompt 与 MCP 两条记忆投递路
   - [`docs/protocol/channel-workspace-model.md`](docs/protocol/channel-workspace-model.md)
     —— Channel / Thread / Turn / Event 数据模型
 - 实现层
-  - [`docs/architecture.md`](docs/architecture.md) —— v0 当前架构（默认拓扑）
   - [`docs/current-app-implementation.md`](docs/current-app-implementation.md)
-    —— v0 各 crate 实现现状
+    —— 当前 app 的 crate 划分与实现现状总览
+  - [`docs/architecture.md`](docs/architecture.md) —— 当前架构（进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理）
   - [`docs/architecture-v1-agent-client.md`](docs/architecture-v1-agent-client.md)
-    —— v1 拆分设计与 phase 切分（已落 E1–E3）
+    —— agent client 拆分、adapter 模型与 v1 部署方式
   - [`docs/command-transport-v0.md`](docs/command-transport-v0.md)
     —— Command transport schema + worked example
+  - [`docs/interactive-command-agent-transport-design.md`](docs/interactive-command-agent-transport-design.md)
+    —— interactive command transport 设计
 
 ## v0 不在范围内的事
 

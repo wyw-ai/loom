@@ -213,27 +213,8 @@ impl ScopeSkills {
 /// Applied to every `actor_id` / `scope_id` before it is joined into a
 /// filesystem path under the scope-skills root.
 fn validate_path_component(label: &str, value: &str) -> io::Result<()> {
-    if value.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{label} must not be empty"),
-        ));
-    }
-    if value == "." || value == ".." {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{label} must not be a path traversal token: {value:?}"),
-        ));
-    }
-    for ch in value.chars() {
-        if ch == '/' || ch == '\\' || ch == '\0' {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{label} must not contain path separators or NUL: {value:?}"),
-            ));
-        }
-    }
-    Ok(())
+    proto::path_component::validate_path_component(value, label)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
 trait ActorSkillSource {

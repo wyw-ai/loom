@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use proto::methods::{
-    method, ActorUpsertParams, ActorUpsertResult, DeliveryListParams, DeliveryListResult,
-    EventAppendInput, EventAppendParams, EventAppendResult, ThreadCreateParams, ThreadCreateResult,
+    method, ActorUpsertParams, ActorUpsertResult, ArtifactIngress, ArtifactPublishParams,
+    ArtifactPublishResult, DeliveryListParams, DeliveryListResult, EventAppendInput,
+    EventAppendParams, EventAppendResult, InlineTextIngress, ThreadCreateParams,
+    ThreadCreateResult,
 };
 use proto::types::{
     Actor, DeliveryState, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeRef, Thread,
@@ -35,6 +37,7 @@ use super::state::{self, DedupeStore};
 pub struct ServiceRuntime {
     service_id: String,
     actor_id: String,
+    instance_id: Option<String>,
     client: Arc<Client>,
     state_dir: PathBuf,
     dedupe: DedupeStore,
@@ -56,6 +59,30 @@ impl ServiceRuntime {
         Ok(Arc::new(Self {
             service_id,
             actor_id,
+            instance_id: None,
+            client,
+            state_dir,
+            dedupe,
+        }))
+    }
+
+    /// Variant of [`Self::start`] that scopes state to a single instance
+    /// (`<data_root>/services/<service_id>/instances/<instance_id>/`).
+    /// Used by `lifecycle = thread_bound` services so multiple instances
+    /// of the same spec can coexist with disjoint cursor/dedupe state.
+    pub fn start_instance(
+        service_id: String,
+        actor_id: String,
+        instance_id: String,
+        client: Arc<Client>,
+        data_root: &Path,
+    ) -> Result<Arc<Self>> {
+        let state_dir = state::ensure_instance_state_dir(data_root, &service_id, &instance_id)?;
+        let dedupe = DedupeStore::open(&state_dir)?;
+        Ok(Arc::new(Self {
+            service_id,
+            actor_id,
+            instance_id: Some(instance_id),
             client,
             state_dir,
             dedupe,
@@ -68,6 +95,14 @@ impl ServiceRuntime {
 
     pub fn actor_id(&self) -> &str {
         &self.actor_id
+    }
+
+    /// `Some(thread_id)` for thread-bound instances, `None` for the
+    /// channel-level singleton. Plugins that need to interpolate the
+    /// bound scope (e.g., scheduler's `{thread.id}` placeholder) read
+    /// this.
+    pub fn instance_id(&self) -> Option<&str> {
+        self.instance_id.as_deref()
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -149,6 +184,108 @@ impl ServiceRuntime {
             _meta: None,
         }];
         self.append_content(scope, text, relations, meta).await
+    }
+
+    /// Publish an artifact whose body is rendered verbatim from `text`
+    /// under `name`. `media_type` defaults to `application/json` to match
+    /// the §6 cross-agent contract artifacts (caller may override).
+    /// Returns `(artifact_id, artifact_uri)`.
+    pub async fn publish_artifact(
+        &self,
+        scope: ScopeRef,
+        name: impl Into<String>,
+        media_type: Option<String>,
+        text: impl Into<String>,
+    ) -> Result<(String, String)> {
+        let params = ArtifactPublishParams {
+            ingress: ArtifactIngress::InlineText(InlineTextIngress {
+                name: name.into(),
+                media_type: media_type.unwrap_or_else(|| "application/json".into()),
+                text: text.into(),
+            }),
+            created_by: self.actor_id.clone(),
+            scope: Some(scope),
+        };
+        let res: ArtifactPublishResult = self
+            .client
+            .call(method::ARTIFACT_PUBLISH, params)
+            .await
+            .context("artifact/publish")?;
+        Ok((res.artifact.id, res.artifact.uri))
+    }
+
+    /// Append an arbitrary-kind event whose payload is the given JSON
+    /// value, with optional `attaches_artifact` relation pointing at the
+    /// just-published artifact id. Used by §6 status.update + artifact
+    /// pairs (mr-detector, validation reports, etc.).
+    pub async fn append_status(
+        &self,
+        scope: ScopeRef,
+        kind: impl Into<String>,
+        payload: serde_json::Value,
+        artifact_id: Option<&str>,
+        meta: Option<Meta>,
+    ) -> Result<String> {
+        let relations = match artifact_id {
+            Some(id) => vec![Relation {
+                kind: RelationKind::AttachesArtifact,
+                target: Ref {
+                    kind: RefKind::Artifact,
+                    id: id.into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            None => Vec::new(),
+        };
+        let event = EventAppendInput {
+            kind: kind.into(),
+            actor_id: self.actor_id.clone(),
+            scope,
+            turn_id: None,
+            payload,
+            relations,
+            _meta: meta,
+        };
+        let res: EventAppendResult = self
+            .client
+            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .await
+            .context("event/append status.update")?;
+        Ok(res.event.id)
+    }
+
+    /// Publish a `service.self_complete` event into `scope` carrying the
+    /// originating service id and a free-form `reason`. Used by service
+    /// plugins (e.g., scheduler running a thread-bound bundle) when the
+    /// underlying source signals "this instance is done — auto_stop_on
+    /// owners should tear me down". The event is informational; the
+    /// actual stop decision belongs to whoever observes `auto_stop_on`.
+    pub async fn publish_self_complete(
+        &self,
+        scope: ScopeRef,
+        reason: impl Into<String>,
+    ) -> Result<String> {
+        let payload = json!({
+            "service_id": self.service_id,
+            "instance_id": self.instance_id,
+            "reason": reason.into(),
+        });
+        let event = EventAppendInput {
+            kind: "service.self_complete".into(),
+            actor_id: self.actor_id.clone(),
+            scope,
+            turn_id: None,
+            payload,
+            relations: Vec::new(),
+            _meta: None,
+        };
+        let res: EventAppendResult = self
+            .client
+            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .await
+            .context("event/append service.self_complete")?;
+        Ok(res.event.id)
     }
 
     /// Make sure this runtime's actor is a member of `channel_id`.

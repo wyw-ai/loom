@@ -297,6 +297,24 @@ impl Client {
         )
         .await
     }
+
+    pub async fn open_observer_connection_as(
+        &self,
+        actor_id: &str,
+        actor_kind: &str,
+        display_name: Option<&str>,
+    ) -> Result<Value> {
+        self.call_raw(
+            method::CONNECTION_OPEN,
+            Some(json!({
+                "actorId": actor_id,
+                "actorKind": actor_kind,
+                "displayName": display_name.unwrap_or(actor_id),
+                "claimInbox": false,
+            })),
+        )
+        .await
+    }
 }
 
 fn unix_url_path(url: &str) -> Option<&str> {

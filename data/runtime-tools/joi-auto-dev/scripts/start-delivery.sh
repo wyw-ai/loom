@@ -12,6 +12,7 @@ TASK_GOAL=""
 DOD=""
 CLONE_MANIFEST=""
 FEEDBACK_ID=""
+BUGFIX_SOURCE="auto"
 TITLE=""
 SOURCE_THREAD_ID=""
 WORK_ITEM_IDS=""
@@ -35,6 +36,7 @@ usage() {
     cat <<'EOF'
 usage: start-delivery.sh --channel-id <chan> --task-goal <art> --dod <art>
                          --clone-manifest <art> [--feedback-id <id>]
+                         [--bugfix-source auto|loop|direct]
                          [--title <title>] [--work-item-ids <ids>]
                          [--source-thread-id <thread>] [--as <actor>]
 
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --dod|--definition-of-done) DOD="$2"; shift 2;;
         --clone-manifest) CLONE_MANIFEST="$2"; shift 2;;
         --feedback-id) FEEDBACK_ID="$2"; shift 2;;
+        --bugfix-source) BUGFIX_SOURCE="$2"; shift 2;;
         --title) TITLE="$2"; shift 2;;
         --source-thread-id) SOURCE_THREAD_ID="$2"; shift 2;;
         --work-item-ids) WORK_ITEM_IDS="$2"; shift 2;;
@@ -63,6 +66,10 @@ done
 [[ -n "$TASK_GOAL" ]] || { echo "start-delivery: --task-goal required" >&2; exit 2; }
 [[ -n "$DOD" ]] || { echo "start-delivery: --dod required" >&2; exit 2; }
 [[ -n "$CLONE_MANIFEST" ]] || { echo "start-delivery: --clone-manifest required" >&2; exit 2; }
+case "$BUGFIX_SOURCE" in
+    auto|loop|direct) ;;
+    *) echo "start-delivery: --bugfix-source must be auto, loop, or direct" >&2; exit 2;;
+esac
 command -v "$JQ_BIN" >/dev/null || { echo "start-delivery: jq required" >&2; exit 3; }
 [[ -x "$JOI_BIN" ]] || { echo "start-delivery: joi binary not executable: $JOI_BIN" >&2; exit 3; }
 [[ -x "$PROVISION_SCRIPT" ]] || { echo "start-delivery: provision script not executable: $PROVISION_SCRIPT" >&2; exit 3; }
@@ -80,12 +87,28 @@ safe_title() {
     printf '%s' "${text:0:90}"
 }
 
+strip_thread_prefixes() {
+    local text="$1"
+    printf '%s' "$text" | sed -E 's/^(\[(bugfixloop|bugfix):[^]]+\][[:space:]]*|\[delivery\][[:space:]]*)+//'
+}
+
 thread_id_from_create() {
     "$JQ_BIN" -r '.thread.id // .thread_id // .id // empty'
 }
 
 event_id_from_send() {
     "$JQ_BIN" -r '.event.id // .id // empty'
+}
+
+source_thread_is_loop() {
+    [[ -n "$SOURCE_THREAD_ID" ]] || return 1
+    joi event list --in "$SOURCE_THREAD_ID" --limit 40 --json 2>/dev/null \
+        | "$JQ_BIN" -e '
+            (.events // .items // .)[]?
+            | select((.actorId // .actor_id // "") == "svc_a1_bug_fix_loop"
+                or ((.payload.text // "") | contains("bugfix-loop next"))
+                or ((.payload.text // "") | contains("bugfix_loop_item")))
+          ' >/dev/null 2>&1
 }
 
 if [[ -z "$TITLE" ]]; then
@@ -96,23 +119,38 @@ if [[ -z "$TITLE" ]]; then
 fi
 [[ -n "$TITLE" ]] || TITLE="delivery-task"
 TITLE=$(safe_title "$TITLE")
+TITLE=$(strip_thread_prefixes "$TITLE")
+[[ -n "$TITLE" ]] || TITLE="delivery-task"
 
 if [[ -n "$FEEDBACK_ID" ]]; then
-    THREAD_TITLE="[bugfix:${FEEDBACK_ID}] ${TITLE}"
+    if [[ "$BUGFIX_SOURCE" == "auto" ]]; then
+        if source_thread_is_loop; then
+            BUGFIX_SOURCE="loop"
+        else
+            BUGFIX_SOURCE="direct"
+        fi
+    fi
+    if [[ "$BUGFIX_SOURCE" == "loop" ]]; then
+        THREAD_TITLE="[bugfixloop:${FEEDBACK_ID}] ${TITLE}"
+    else
+        THREAD_TITLE="[bugfix:${FEEDBACK_ID}] ${TITLE}"
+    fi
 else
-    THREAD_TITLE="$TITLE"
+    THREAD_TITLE="[delivery] ${TITLE}"
 fi
 
 existing_thread=""
 if [[ -n "$FEEDBACK_ID" ]]; then
+    if [[ "$BUGFIX_SOURCE" == "loop" ]]; then
+        existing_prefix="[bugfixloop:${FEEDBACK_ID}]"
+    else
+        existing_prefix="[bugfix:${FEEDBACK_ID}]"
+    fi
     existing_thread=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null \
-        | "$JQ_BIN" -r --arg fid "$FEEDBACK_ID" '
+        | "$JQ_BIN" -r --arg prefix "$existing_prefix" '
             (.threads // .items // .)[]?
             | (.title // .name // "") as $title
-            | select(($title | startswith("[bugfix:" + $fid + "]"))
-                     or $title == ("delivery-bugfix-" + $fid)
-                     or $title == ("bugfix-deliver-" + $fid)
-                     or (($title | startswith("delivery-")) and ($title | contains($fid))))
+            | select($title | startswith($prefix))
             | (.id // .thread_id // .thread.id // empty)
         ' | head -n 1)
 fi

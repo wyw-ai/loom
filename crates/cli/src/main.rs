@@ -189,11 +189,23 @@ enum Cmd {
         #[command(subcommand)]
         sub: McpCmd,
     },
+    /// Apply a lesson-plan to an on-disk AgentSpec / ServiceSpec
+    /// after `approval.spec_apply` has been accepted.
+    Spec {
+        #[command(subcommand)]
+        sub: SpecCmd,
+    },
     /// Manage the long-lived service host (am bridge, scheduler, ...). See
     /// `docs/service-plugin-system-design.md` §11.
     Service {
         #[command(subcommand)]
         sub: ServiceCmd,
+    },
+    /// Read/write files under a scope's workspace directory. Local-only —
+    /// no server contact.
+    Workspace {
+        #[command(subcommand)]
+        sub: WorkspaceCmd,
     },
     /// Run the machine-scoped daemon: auto-detect supported local agent CLIs
     /// and host agents configured on the selected machine.
@@ -235,6 +247,136 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum SpecCmd {
+    /// Apply the lesson-plan attached to the action.request that was
+    /// accepted by the given `action.response` event. See
+    /// `crates/cli/src/cmd/spec_apply.rs` for the frontmatter contract.
+    Apply {
+        /// Event id of the `action.response` (kind = accepted) that
+        /// approved the lesson-plan.
+        #[arg(long = "action")]
+        action_event_id: String,
+        /// Don't write spec/bundle files or bump the reload epoch.
+        /// Prints the planned changes and exits.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCmd {
+    /// Print the resolved absolute path of the workspace (or a sub-path).
+    Path {
+        #[command(flatten)]
+        target: WsTarget,
+        /// Optional sub-path inside the workspace.
+        sub: Option<String>,
+    },
+    /// Show metadata about the workspace (kind, ids, path, exists).
+    Info {
+        #[command(flatten)]
+        target: WsTarget,
+    },
+    /// List entries in the workspace (or a sub-directory).
+    List {
+        #[command(flatten)]
+        target: WsTarget,
+        sub: Option<String>,
+        /// List recursively (relative paths only).
+        #[arg(long, short = 'r')]
+        recursive: bool,
+    },
+    /// Read a file from the workspace to stdout.
+    Read {
+        #[command(flatten)]
+        target: WsTarget,
+        path: String,
+        /// Cap the read at N bytes (default 4 MiB).
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+    /// Write a file into the workspace. Body comes from --text, --file,
+    /// or stdin (in that priority).
+    Write {
+        #[command(flatten)]
+        target: WsTarget,
+        path: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Append to an existing file instead of replacing.
+        #[arg(long)]
+        append: bool,
+    },
+    /// Remove a file (or directory with --recursive).
+    Rm {
+        #[command(flatten)]
+        target: WsTarget,
+        path: String,
+        #[arg(long, short = 'r')]
+        recursive: bool,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct WsTarget {
+    /// Channel id. Required for channel-shared, and for actor workspaces.
+    #[arg(long)]
+    channel: Option<String>,
+    /// Thread id. Required for thread-shared workspaces.
+    #[arg(long = "in")]
+    thread: Option<String>,
+    /// Actor id (defaults to JOI_ACTOR / current actor). Use --actor to
+    /// explicitly target a per-actor workspace.
+    #[arg(long, env = "JOI_ACTOR")]
+    actor: Option<String>,
+    /// Target the channel-shared area (`channels/<cid>/shared/`).
+    #[arg(long, conflicts_with_all = ["thread_shared", "actor_ws"])]
+    channel_shared: bool,
+    /// Target the thread-shared area (`channels/<cid>/threads/<tid>/shared/`).
+    #[arg(long, conflicts_with_all = ["channel_shared", "actor_ws"])]
+    thread_shared: bool,
+    /// Target the per-actor workspace (default if --actor given).
+    #[arg(long = "actor-ws", conflicts_with_all = ["channel_shared", "thread_shared"])]
+    actor_ws: bool,
+}
+
+impl WsTarget {
+    fn into_ref(self, default_actor: &str) -> Result<cmd::workspace::WsRef> {
+        use cmd::workspace::{WsKind, WsRef};
+        let kind = if self.channel_shared {
+            WsKind::Channel
+        } else if self.thread_shared {
+            WsKind::Thread
+        } else {
+            // Default: actor workspace.
+            WsKind::Actor
+        };
+        let channel_id = match (&self.channel, &self.thread, kind) {
+            (Some(c), _, _) => c.clone(),
+            (None, Some(_t), WsKind::Thread) => {
+                anyhow::bail!("--in <tid> requires --channel <cid> too (thread workspaces are nested under their channel)");
+            }
+            _ => anyhow::bail!("--channel <cid> is required"),
+        };
+        let actor_id = self.actor.clone().or_else(|| {
+            if matches!(kind, WsKind::Actor) {
+                Some(default_actor.to_string())
+            } else {
+                None
+            }
+        });
+        Ok(WsRef {
+            kind,
+            channel_id,
+            thread_id: self.thread.clone(),
+            actor_id,
+        })
+    }
+}
+
+#[derive(Subcommand, Debug)]
 enum ServiceCmd {
     /// Run as the service host: load every ServiceSpec under --specs and
     /// supervise each plugin instance over its own server connection.
@@ -268,6 +410,67 @@ enum ServiceCmd {
         /// the JSON payload `{sourceEvent, triggerId, scopeKind, scopeId}`.
         #[arg(long = "async-reply", hide = true)]
         async_reply: Option<String>,
+    },
+    /// Bump the reload-epoch marker for `service_id` so a running
+    /// `joi service serve` host re-reads the ServiceSpec and respawns
+    /// the supervised plugin instance(s). See design §7.1.
+    Reload { service_id: String },
+    /// Inspect ServiceSpec JSON files on disk (no server contact).
+    Spec {
+        #[command(subcommand)]
+        sub: ServiceSpecCmd,
+    },
+    /// Start a `lifecycle = thread_bound` instance by writing a
+    /// per-instance `request.json`. A running `joi service serve`
+    /// host watches the spec's `instances/` directory and dispatches
+    /// the plugin task on observation. See design §4.7.3.
+    Start {
+        /// ServiceSpec id (must declare `lifecycle = thread_bound`).
+        #[arg(long = "spec")]
+        spec_id: String,
+        /// Thread id to bind the instance to. v1's only supported
+        /// `bind.scope` is `thread`, so this becomes the instance id.
+        #[arg(long = "in")]
+        thread: String,
+        /// Optional channel id of the thread. Recorded in the request
+        /// so the host can resolve `{channel.id}` placeholders.
+        #[arg(long = "channel")]
+        channel: Option<String>,
+        /// JSON object validated against the spec's `params_schema`.
+        /// Defaults to `{}`.
+        #[arg(long = "params")]
+        params: Option<String>,
+        /// Override the specs directory (used to look up the spec for
+        /// validation). Defaults to `~/.config/joi/services/`.
+        #[arg(long)]
+        specs: Option<PathBuf>,
+    },
+    /// Stop a thread-bound instance by removing its `request.json`.
+    /// The host watcher tears down the plugin task on the next poll.
+    Stop {
+        #[arg(long = "spec")]
+        spec_id: String,
+        #[arg(long = "in")]
+        thread: String,
+    },
+    /// List active thread-bound instances. With `--spec`, scopes the
+    /// listing to a single ServiceSpec; without it, every spec under
+    /// the host data root is walked.
+    Status {
+        #[arg(long = "spec")]
+        spec_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceSpecCmd {
+    /// List every ServiceSpec under the specs directory.
+    List,
+    /// Print one ServiceSpec by id (secrets redacted unless --raw).
+    Get {
+        service_id: String,
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -340,10 +543,44 @@ enum ThreadCmd {
         root_event: String,
         #[arg(long, default_value = "Untitled")]
         title: String,
+        /// Record this thread under `resident_threads.<role>` in the
+        /// channel-shared scope.json so a router can address it by role.
+        /// See design §4.7.1.
+        #[arg(long = "resident-as")]
+        resident_as: Option<String>,
+        /// Read the artifact (id or `artifact://...` URI), derive a
+        /// `mounts[]` array, and write it to the thread-shared
+        /// scope.json so per-actor workspaces seed mounts on first
+        /// dispatch. See design §4.7.2.
+        #[arg(long = "bootstrap-artifact")]
+        bootstrap_artifact: Option<String>,
     },
     List {
         #[arg(long)]
         channel: Option<String>,
+    },
+    /// Delete a thread by id. Thread-bound services watching this
+    /// thread (`bind.auto_stop_on=["thread.closed"]`, §4.7.3) reap
+    /// their instances on the next watcher tick.
+    Delete { thread_id: String },
+    /// Bootstrap an *existing* thread from a clone-manifest (or explicit
+    /// mounts) artifact. Used when an already-open thread (e.g. a
+    /// bug-fix loop's bugfix thread) needs target/reference repo
+    /// worktrees added without creating a new thread. Writes
+    /// `scope.json.mounts` on the thread-shared scope so per-actor
+    /// `agent serve` workspaces seed mounts on next ensure_scope.
+    Bootstrap {
+        /// Thread id to bootstrap.
+        #[arg(long = "in")]
+        thread_id: String,
+        /// Channel id the thread belongs to. Required for resolving the
+        /// channel-rooted scope.json path on disk.
+        #[arg(long)]
+        channel: String,
+        /// Artifact id or `artifact://...` URI carrying the clone-manifest
+        /// or an explicit `mounts[]` payload.
+        #[arg(long = "bootstrap-artifact")]
+        bootstrap_artifact: String,
     },
 }
 
@@ -362,6 +599,56 @@ enum EventCmd {
         /// Cursor: only return events older than this event id.
         #[arg(long)]
         before: Option<String>,
+    },
+    /// Alias for `event list` — kept for parity with the design doc and
+    /// for the migrated services that prefer the `query` verb.
+    Query {
+        #[arg(long)]
+        r#in: String,
+        #[arg(long)]
+        channel: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Append an arbitrary event to a scope. Use --reply / --handoff /
+    /// --artifact-link to attach the corresponding relations; use --text
+    /// / --file / --stdin to provide the payload body. `joi say` /
+    /// `joi handoff` remain as ergonomic shortcuts for content.add.
+    Append {
+        /// Scope id (thread id by default; pass --channel to write into a channel scope).
+        #[arg(long)]
+        r#in: String,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Event type discriminator (e.g. content.add, status.update).
+        #[arg(long = "type", default_value = "content.add")]
+        event_type: String,
+        /// payload.contentType. Defaults to text/markdown to match
+        /// content.add's convention; ignored if no body is supplied.
+        #[arg(long = "content-type", default_value = "text/markdown")]
+        content_type: String,
+        /// Event body as inline text.
+        #[arg(long)]
+        text: Option<String>,
+        /// Event body read from this file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Event body read from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Add a `replies_to` relation pointing at this event id.
+        #[arg(long = "reply")]
+        reply: Option<String>,
+        /// Add a `hands_off_to` relation pointing at this actor id.
+        #[arg(long = "handoff")]
+        handoff: Option<String>,
+        /// Add one or more `attaches_artifact` relations targeting an artifact
+        /// (`art_…` or `artifact://…`). May be repeated.
+        #[arg(long = "artifact-link")]
+        artifact_link: Vec<String>,
     },
 }
 
@@ -553,6 +840,59 @@ enum ActionCmd {
 enum AgentCmd {
     /// List agents configured for daemon-managed machines.
     List,
+    /// Bump the reload-epoch marker for `actor_id` so a running
+    /// `joi agent serve` host re-reads the AgentSpec + bundle and
+    /// respawns the worker. See design §7.1.
+    Reload { actor_id: String },
+    /// Run as the v1 external agent client: load every AgentSpec under
+    /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
+    /// over its own server connection.
+    Serve {
+        /// Override the directory of AgentSpec JSON files.
+        #[arg(long)]
+        specs: Option<PathBuf>,
+        /// Comma-separated actor ids to load. Empty/omitted = load every
+        /// AgentSpec under --specs.
+        #[arg(long = "allow-actors", value_delimiter = ',')]
+        allow_actors: Vec<String>,
+    },
+    /// Inspect AgentSpec JSON files on disk (no server contact).
+    Spec {
+        #[command(subcommand)]
+        sub: AgentSpecCmd,
+    },
+    /// Inspect an installed agent's bundle directory (skills/, tools/, ...).
+    Bundle {
+        #[command(subcommand)]
+        sub: AgentBundleCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentSpecCmd {
+    /// List every AgentSpec under the specs directory.
+    List,
+    /// Print one AgentSpec by actor id (secrets redacted unless --raw).
+    Get {
+        actor_id: String,
+        /// Print the raw JSON without redacting token/secret/password fields.
+        #[arg(long)]
+        raw: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentBundleCmd {
+    /// Show bundle dir + optionally list/read a file inside it.
+    Get {
+        actor_id: String,
+        /// Read this file (relative to the bundle dir) and print to stdout.
+        #[arg(long)]
+        file: Option<String>,
+        /// List bundle contents (recursive) instead of just printing the dir.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[tokio::main]
@@ -587,11 +927,37 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Agent runtime hosting is daemon-only. `joi agent` is kept as an offline
-    // inspection namespace so it doesn't open an unused human connection.
+    // `agent serve` opens its own per-agent connections and never acts as the
+    // local human actor. Keep it as a compatibility path for repo-bundled
+    // AgentSpec actors while `joi daemon` hosts machine-configured agents.
+    if let Cmd::Agent {
+        sub: AgentCmd::Serve {
+            specs,
+            allow_actors,
+        },
+    } = args.cmd
+    {
+        return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
+    }
+
+    // `joi agent` local inspection commands should work without opening an
+    // unused human connection.
     if let Cmd::Agent { sub } = args.cmd {
         match sub {
             AgentCmd::List => cmd::agent::list()?,
+            AgentCmd::Reload { actor_id } => cmd::agent::reload(actor_id)?,
+            AgentCmd::Serve { .. } => unreachable!("handled above"),
+            AgentCmd::Spec { sub } => match sub {
+                AgentSpecCmd::List => cmd::spec::agent_list()?,
+                AgentSpecCmd::Get { actor_id, raw } => cmd::spec::agent_get(actor_id, raw)?,
+            },
+            AgentCmd::Bundle { sub } => match sub {
+                AgentBundleCmd::Get {
+                    actor_id,
+                    file,
+                    list,
+                } => cmd::spec::bundle_get(actor_id, file, list)?,
+            },
         }
         return Ok(());
     }
@@ -645,6 +1011,15 @@ async fn main() -> Result<()> {
         return cmd::service::validate(path.clone());
     }
 
+    // `service reload` is local-only — it bumps an on-disk marker that
+    // the supervising `joi service serve` host polls. No server contact.
+    if let Cmd::Service {
+        sub: ServiceCmd::Reload { service_id },
+    } = &args.cmd
+    {
+        return cmd::service::reload(service_id.clone());
+    }
+
     // `service am-handler` opens its own connection bound to the AM
     // service actor; bypass the human-actor `connection/open` below
     // (would otherwise pollute the actor table and fight the
@@ -659,6 +1034,101 @@ async fn main() -> Result<()> {
     } = args.cmd
     {
         return cmd::service::am_handler(cfg.server_url, service_id, specs, async_reply).await;
+    }
+
+    // `agent spec` / `agent bundle` / `service spec` are local-only —
+    // they read AgentSpec/ServiceSpec JSON files and bundle directories
+    // off the operator's disk. Short-circuit before the websocket dance
+    // so they work even when no joi-server is running.
+    if let Cmd::Service {
+        sub: ServiceCmd::Spec { sub },
+    } = args.cmd
+    {
+        return match sub {
+            ServiceSpecCmd::List => cmd::spec::service_list(),
+            ServiceSpecCmd::Get { service_id, raw } => cmd::spec::service_get(service_id, raw),
+        };
+    }
+
+    // `service start/stop/status` are local-only file-IO commands —
+    // they read/write/list per-instance `request.json` files under the
+    // host data root. The running `joi service serve` host is the
+    // observer; these commands themselves never touch the server.
+    if let Cmd::Service {
+        sub:
+            ServiceCmd::Start {
+                spec_id,
+                thread,
+                channel,
+                params,
+                specs,
+            },
+    } = args.cmd
+    {
+        return cmd::service::start(spec_id, thread, channel, params, specs);
+    }
+    if let Cmd::Service {
+        sub: ServiceCmd::Stop { spec_id, thread },
+    } = &args.cmd
+    {
+        return cmd::service::stop(spec_id.clone(), thread.clone());
+    }
+    if let Cmd::Service {
+        sub: ServiceCmd::Status { spec_id },
+    } = &args.cmd
+    {
+        return cmd::service::status(spec_id.clone());
+    }
+
+    // Workspace commands operate purely on the local filesystem layout
+    // shared with `agent serve` (see `cmd::workspace`). Never contact the
+    // server.
+    if let Cmd::Workspace { sub } = args.cmd {
+        let actor_default = cfg.actor_id.clone();
+        return match sub {
+            WorkspaceCmd::Path { target, sub } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::path(ws, sub)
+            }
+            WorkspaceCmd::Info { target } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::info(ws)
+            }
+            WorkspaceCmd::List {
+                target,
+                sub,
+                recursive,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::list(ws, sub, recursive)
+            }
+            WorkspaceCmd::Read {
+                target,
+                path,
+                max_bytes,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::read(ws, path, max_bytes)
+            }
+            WorkspaceCmd::Write {
+                target,
+                path,
+                text,
+                file,
+                append,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::write(ws, path, text, file, append)
+            }
+            WorkspaceCmd::Rm {
+                target,
+                path,
+                recursive,
+            } => {
+                let ws = target.into_ref(&actor_default)?;
+                cmd::workspace::rm(ws, path, recursive)
+            }
+        };
     }
 
     // `mcp memory` never talks to the joi server — it's spawned by the ACP
@@ -716,8 +1186,26 @@ async fn main() -> Result<()> {
                 channel,
                 root_event,
                 title,
-            } => cmd::thread::create(client, channel, root_event, title).await?,
+                resident_as,
+                bootstrap_artifact,
+            } => {
+                cmd::thread::create(
+                    client,
+                    channel,
+                    root_event,
+                    title,
+                    resident_as,
+                    bootstrap_artifact,
+                )
+                .await?
+            }
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
+            ThreadCmd::Delete { thread_id } => cmd::thread::delete(client, thread_id).await?,
+            ThreadCmd::Bootstrap {
+                thread_id,
+                channel,
+                bootstrap_artifact,
+            } => cmd::thread::bootstrap(client, channel, thread_id, bootstrap_artifact).await?,
         },
         Cmd::Say {
             text,
@@ -757,6 +1245,14 @@ async fn main() -> Result<()> {
             }
             ActionCmd::Decline { event_id, option } => {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, false).await?
+            }
+        },
+        Cmd::Spec { sub } => match sub {
+            SpecCmd::Apply {
+                action_event_id,
+                dry_run,
+            } => {
+                cmd::spec_apply::run(client, cfg.actor_id.clone(), action_event_id, dry_run).await?
             }
         },
         Cmd::AskUserQuestion {
@@ -824,6 +1320,42 @@ async fn main() -> Result<()> {
                 limit,
                 before,
             } => cmd::event::list(client, r#in, channel, limit, before).await?,
+            EventCmd::Query {
+                r#in,
+                channel,
+                limit,
+                before,
+            } => cmd::event::list(client, r#in, channel, limit, before).await?,
+            EventCmd::Append {
+                r#in,
+                channel,
+                event_type,
+                content_type,
+                text,
+                file,
+                stdin,
+                reply,
+                handoff,
+                artifact_link,
+            } => {
+                cmd::event::append(
+                    client,
+                    cmd::event::AppendArgs {
+                        actor_id: cfg.actor_id,
+                        scope_id: r#in,
+                        is_channel: channel,
+                        event_type,
+                        content_type,
+                        text,
+                        file,
+                        stdin,
+                        reply_to: reply,
+                        handoff_to: handoff,
+                        artifact_links: artifact_link,
+                    },
+                )
+                .await?
+            }
         },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,
@@ -928,6 +1460,7 @@ async fn main() -> Result<()> {
             cmd::chat::run(client, cfg.actor_id, scope_id, scope_kind).await?
         }
         Cmd::Service { .. } => unreachable!("handled before client setup"),
+        Cmd::Workspace { .. } => unreachable!("handled before client setup"),
         Cmd::Daemon { .. } => unreachable!("handled before client setup"),
     }
     Ok(())

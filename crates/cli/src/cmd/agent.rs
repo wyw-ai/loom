@@ -1,10 +1,11 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use agent_runtime::discovery::{
     detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
 };
 use anyhow::{Context, Result};
-use proto::methods::{AgentInfo, AgentListResult};
+use proto::methods::{AgentInfo, AgentListResult, AgentSpec};
 use serde::Deserialize;
 
 use crate::{config, render};
@@ -52,6 +53,28 @@ pub fn list() -> Result<()> {
             "{}\t{}\tstatus={}\tcommand={}",
             a.spec.actor.id, a.spec.actor.display_name, a.status, a.spec.transport.command,
         );
+    }
+    Ok(())
+}
+
+/// Bump the per-actor reload marker so a running legacy `joi agent serve`
+/// host re-reads the AgentSpec + bundle and respawns the worker.
+pub fn reload(actor_id: String) -> Result<()> {
+    let data_root = super::agent_serve::default_data_root_pub();
+    let path = super::reload::agent_marker_path(&data_root, &actor_id);
+    let epoch = super::reload::bump(&path)?;
+    if crate::render::is_json() {
+        crate::render::print_json(&serde_json::json!({
+            "actor_id": actor_id,
+            "marker": path.display().to_string(),
+            "epoch_ms": epoch,
+        }));
+    } else {
+        println!(
+            "reload requested  actor={actor_id}  epoch_ms={epoch}\n  marker={}",
+            path.display()
+        );
+        println!("(host will respawn on next poll cycle; if no compatible host is running this is a no-op)");
     }
     Ok(())
 }
@@ -152,4 +175,45 @@ fn non_empty(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+pub(crate) fn default_specs_dir() -> PathBuf {
+    if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    dirs::config_dir()
+        .map(|d| d.join("joi").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+}
+
+pub(crate) fn load_specs_at(dir: &Path) -> Result<Vec<AgentSpec>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let target = if file_type.is_dir() {
+            let nested = path.join("spec.json");
+            if !nested.exists() {
+                continue;
+            }
+            nested
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            path
+        } else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&target)
+            .with_context(|| format!("read agent spec {}", target.display()))?;
+        let spec: AgentSpec = serde_json::from_str(&text)
+            .with_context(|| format!("parse agent spec {}", target.display()))?;
+        out.push(spec);
+    }
+    out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
+    Ok(out)
 }

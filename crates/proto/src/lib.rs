@@ -1,6 +1,7 @@
 pub mod jsonrpc;
 pub mod marketplace;
 pub mod methods;
+pub mod path_component;
 pub mod types;
 
 pub use jsonrpc::{ErrorCode, ErrorObject, Notification, Request, Response, RpcEnvelope};

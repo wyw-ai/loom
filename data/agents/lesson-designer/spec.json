@@ -1,0 +1,118 @@
+{
+  "actor": {
+    "id": "actor_lesson_designer",
+    "kind": "agent",
+    "displayName": "\u6559\u7814\u5458"
+  },
+  "transport": {
+    "kind": "interactive_command",
+    "command": "claude",
+    "args": [],
+    "env": {},
+    "model": "claude-sonnet-4.6",
+    "provider": {
+      "kind": "claude",
+      "settings": {
+        "mode": "actor_profile"
+      }
+    },
+    "interactive": {
+      "session": {
+        "idStrategy": "joi_uuid_per_scope",
+        "newArgs": [
+          "--print",
+          "--permission-mode",
+          "bypassPermissions",
+          "{prompt}",
+          "--session-id",
+          "{session_id}"
+        ],
+        "resumeArgs": [
+          "--print",
+          "--permission-mode",
+          "bypassPermissions",
+          "{prompt}",
+          "--resume",
+          "{session_id}"
+        ],
+        "onMissing": "create",
+        "onSignatureChanged": "create",
+        "onResumeFailed": "fail"
+      },
+      "prompt": {
+        "template": "{joi_envelope}",
+        "completionContract": {
+          "sentinel": "__JOI_DONE__",
+          "instruction": "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it."
+        }
+      },
+      "completion": {
+        "detect": "sentinel",
+        "stripSentinel": true,
+        "idleTimeoutMs": 30000,
+        "maxTurnMs": 1800000
+      },
+      "output": {
+        "stripAnsi": true,
+        "stderr": "trace",
+        "streamPartial": true
+      },
+      "kill": {
+        "onComplete": {
+          "action": "sigterm",
+          "graceMs": 3000,
+          "fallback": "sigkill"
+        },
+        "onCancel": {
+          "action": "sigterm",
+          "graceMs": 1000,
+          "fallback": "sigkill"
+        },
+        "onTimeout": {
+          "action": "sigkill"
+        }
+      }
+    }
+  },
+  "autostart": false,
+  "bundle": {
+    "source": "data/agents/lesson-designer/bundle",
+    "version": "v1",
+    "installMode": "copy",
+    "root": "{agent.root}/bundles",
+    "current": "{agent.root}/bundles/current"
+  },
+  "handoff": {
+    "triggerPromptPrefix": "/lesson-designer\n",
+    "applyOn": "every-turn"
+  },
+  "promptTemplate": {
+    "activeSkill": "lesson-designer",
+    "everyTurnPrefix": [
+      "[joi handoff v1]",
+      "scope_kind: {scope.kind}",
+      "scope_id: {scope.id}",
+      "actor_id: {actor.id}",
+      "from_actor: {trigger.actor_id}",
+      "trigger_event_id: {trigger.id}",
+      "channel_id: {channel.id}",
+      "thread_id: {thread.id}",
+      "workspace_dir: {workspace.dir}",
+      "skills_dir: {scope.skills}",
+      "[/joi handoff v1]"
+    ],
+    "firstTurnPrefix": [
+      "[joi bootstrap]",
+      "Read your skill from {agent.bundle}/SKILL.md.",
+      "Read upstream task-goal.json / definition-of-done.json / lesson-plan.md from the trigger event's attaches_artifact list.",
+      "Use `joi event append` for user-visible replies and handoff.",
+      "Use `joi workspace read/write` for your mutable working state.",
+      "Use `joi artifact publish` for new or revised lesson-plan.md drafts.",
+      "Use `joi action request` for approvals when promoting a draft to the active lesson plan.",
+      "[/joi bootstrap]"
+    ],
+    "everyTurnSuffix": [
+      "When finished, emit the configured Joi completion sentinel."
+    ]
+  }
+}

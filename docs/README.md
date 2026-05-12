@@ -2,24 +2,32 @@
 
 ## 当前实现
 
-- [current-app-implementation.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/current-app-implementation.md)
-  当前 app 实现技术总览，适合先看
-- [architecture.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/architecture.md)
-  较早的架构说明与设计判断
-- [am-joi-bridge.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/am-joi-bridge.md)
-  用 `am listen` 把钉钉 bot 消息接入 Joi thread 并定向 handoff 给 agent
-- [service-plugin-system-design.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/service-plugin-system-design.md)
-  service/plugin host 方案设计，将 `am`、scheduler 等主动入口统一成 service actor 插件
+- [current-app-implementation.md](./current-app-implementation.md) —— 当前 app 实现技术总览，适合作为入口
+- [architecture.md](./architecture.md) —— 当前架构（进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理 / 代码边界）
+- [architecture-v1-agent-client.md](./architecture-v1-agent-client.md) —— agent client 拆分、adapter 模型与 v1 部署方式
+- [service-plugin-system-design.md](./service-plugin-system-design.md) —— service / plugin host 设计（runtime 引用此文档为权威规范）
+- [scheduler-plugin.md](./scheduler-plugin.md) —— `joi service serve` 内的 cron 任务插件
+- [am-joi-bridge.md](./am-joi-bridge.md) —— `am listen` 钉钉 bot 消息接入 Joi thread 的最小链路
+- [command-transport-v0.md](./command-transport-v0.md) —— Command Transport 协议规范（已落地）
+- [interactive-command-agent-transport-design.md](./interactive-command-agent-transport-design.md) —— interactive command transport 设计
+- [gui-desktop-design.md](./gui-desktop-design.md) —— Joi Desktop GUI 设计与设计 token 来源
 
-## 协议与设计
+## 频道 / actor 拓扑
 
-这些文档已从上游 `joi/docs` 收进当前项目，方便在一个 repo 里统一查看。
+- [channel-topology-design.md](./channel-topology-design.md) —— a1-dev-canfeng / classroom 两个生产 channel 的职责切分、thread 拓扑、actor 配置、工作流
+- [artifact-contracts.md](./artifact-contracts.md) —— 跨 actor 的 artifact JSON schema 与契约
 
-- [protocol/open-multi-actor-collaboration-protocol-v0.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/open-multi-actor-collaboration-protocol-v0.md)
-- [protocol/open-multi-actor-collaboration-schema-v0.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/open-multi-actor-collaboration-schema-v0.md)
-- [protocol/open-multi-actor-collaboration-research.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/open-multi-actor-collaboration-research.md)
-- [protocol/joi-multi-agent-mvp-share.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/joi-multi-agent-mvp-share.md)
-- [protocol/channel-workspace-model.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/channel-workspace-model.md)
-- [protocol/scheduler-context-share.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/scheduler-context-share.md)
-- [protocol/tool-execution-reply-overlap.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/tool-execution-reply-overlap.md)
-- [protocol/technical-spec.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/technical-spec.md)
+## 端到端验证
+
+- [e2e-runbook-local.md](./e2e-runbook-local.md) —— 本地 e2e runbook（spec_apply / mr-detector / classroom / a1-auto-dev / thread.closed）
+
+## 协议（来自上游 `joi/docs`）
+
+- [protocol/open-multi-actor-collaboration-protocol-v0.md](./protocol/open-multi-actor-collaboration-protocol-v0.md)
+- [protocol/open-multi-actor-collaboration-schema-v0.md](./protocol/open-multi-actor-collaboration-schema-v0.md)
+- [protocol/open-multi-actor-collaboration-research.md](./protocol/open-multi-actor-collaboration-research.md)
+- [protocol/joi-multi-agent-mvp-share.md](./protocol/joi-multi-agent-mvp-share.md)
+- [protocol/channel-workspace-model.md](./protocol/channel-workspace-model.md)
+- [protocol/scheduler-context-share.md](./protocol/scheduler-context-share.md)
+- [protocol/tool-execution-reply-overlap.md](./protocol/tool-execution-reply-overlap.md)
+- [protocol/technical-spec.md](./protocol/technical-spec.md)

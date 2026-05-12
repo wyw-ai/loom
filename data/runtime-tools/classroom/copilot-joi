@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -s "$HOME/.nvm/nvm.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$HOME/.nvm/nvm.sh"
+  nvm use 24 >/dev/null
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+set +e
+copilot "$@" >"$tmp" 2>&1
+status=$?
+set -e
+
+awk '
+  BEGIN { done = 0 }
+  {
+    line = $0
+    gsub(/\r/, "", line)
+    sub(/^[[:space:]]*[●•][[:space:]]*/, "", line)
+    if (line ~ /__JOI_DONE__|JOI_DONE/) {
+      sub(/[[:space:]]*(__JOI_DONE__|JOI_DONE).*/, "", line)
+      if (line !~ /^[[:space:]]*$/) print line
+      done = 1
+      next
+    }
+    if (!done) print line
+  }
+  END {
+    if (done) print "__JOI_DONE__"
+  }
+' "$tmp"
+
+exit "$status"

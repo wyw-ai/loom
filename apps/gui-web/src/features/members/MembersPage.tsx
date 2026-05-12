@@ -105,6 +105,8 @@ export function MembersPage() {
   const upsertMany = useActors((s) => s.upsertMany);
   const removeMany = useActors((s) => s.removeMany);
   const currentScope = useChannels((s) => s.currentScope);
+  const channels = useChannels((s) => s.channels);
+  const replaceMembers = useChannels((s) => s.replaceMembers);
   const activeWorkspaceId = useWorkspaces((s) => s.activeId);
   const sessionWorkspaceId = useSession((s) => s.workspace?.id ?? null);
   const setView = useUI((s) => s.setView);
@@ -164,6 +166,37 @@ export function MembersPage() {
       alive = false;
     };
   }, [activeWorkspaceId, sessionWorkspaceId, pushToast, upsertMany]);
+
+  useEffect(() => {
+    let alive = true;
+    const requestWorkspaceId = activeWorkspaceId;
+    const visibleChannels = channels;
+    if (visibleChannels.length === 0) return;
+
+    (async () => {
+      const results = await Promise.allSettled(
+        visibleChannels.map(async (channel) => ({
+          channelId: channel.id,
+          result: await ipc.channelMembers(channel.id),
+        })),
+      );
+      if (!alive || useWorkspaces.getState().activeId !== requestWorkspaceId) {
+        return;
+      }
+      for (const result of results) {
+        if (result.status !== "fulfilled") continue;
+        replaceMembers(result.value.channelId, result.value.result.members);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [
+    activeWorkspaceId,
+    channels.map((channel) => channel.id).join("\0"),
+    replaceMembers,
+  ]);
 
   const allAgents = useMemo(() => {
     const managedIds = new Set(agents.map((agent) => agent.actor.id));

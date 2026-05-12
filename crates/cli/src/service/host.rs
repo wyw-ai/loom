@@ -445,13 +445,16 @@ async fn run_one_instance(
 ///   active instance whose `instance_id` (= bound thread id) is no
 ///   longer in that list is treated as closed → reap (delete
 ///   request.json + drop the join handle), per §4.7.3.
+/// * If `joi service reload <spec.id>` bumps the reload marker, re-read
+///   the spec, abort active instance tasks, and let the next tick
+///   respawn still-requested instances with the new spec.
 /// * On `shutdown` notification, aborts every active task and exits.
 ///
 /// The watcher itself is panic-free: per-instance failures are
 /// logged and do not unwind the loop. Returning `Ok(())` is the only
 /// non-panic outcome.
 async fn supervise_instances(
-    spec: ServiceSpec,
+    mut spec: ServiceSpec,
     plugin: Arc<dyn ServicePlugin>,
     server_url: String,
     data_root: PathBuf,
@@ -460,12 +463,15 @@ async fn supervise_instances(
 ) -> Result<()> {
     let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
     let spec_id = spec.id.clone();
-    let actor_id = spec.actor.id.clone();
-    let watch_thread_closed = spec
-        .bind
+    let reload_marker = specs_dir
         .as_ref()
-        .map(|b| b.auto_stop_on.iter().any(|e| e == "thread.closed"))
-        .unwrap_or(false);
+        .map(|_| reload::service_marker_path(&data_root, &spec_id));
+    let mut seen_reload_epoch = reload_marker
+        .as_ref()
+        .map(|marker| reload::read_epoch(marker))
+        .unwrap_or_default();
+    let mut actor_id = spec.actor.id.clone();
+    let mut watch_thread_closed = watches_thread_closed(&spec);
 
     // Long-lived client used only for thread/list visibility checks
     // when auto_stop_on contains "thread.closed". Lazy-initialised so
@@ -481,6 +487,40 @@ async fn supervise_instances(
     loop {
         if *shutdown.borrow() {
             break;
+        }
+
+        if let (Some(dir), Some(marker)) = (specs_dir.as_ref(), reload_marker.as_ref()) {
+            let current_epoch = reload::read_epoch(marker);
+            if current_epoch > seen_reload_epoch {
+                seen_reload_epoch = current_epoch;
+                match reload_one_spec(dir, &spec_id) {
+                    Ok(Some(next)) => {
+                        spec = next;
+                        actor_id = spec.actor.id.clone();
+                        watch_thread_closed = watches_thread_closed(&spec);
+                        visibility = None;
+                        for (instance_id, handle) in active.drain() {
+                            tracing::info!(
+                                spec_id = %spec_id,
+                                instance_id = %instance_id,
+                                epoch_ms = current_epoch,
+                                "reload requested; aborting thread-bound instance",
+                            );
+                            handle.abort();
+                        }
+                    }
+                    Ok(None) => tracing::warn!(
+                        spec_id = %spec_id,
+                        dir = %dir.display(),
+                        "spec file missing on thread-bound reload; reusing last-known spec",
+                    ),
+                    Err(e) => tracing::warn!(
+                        spec_id = %spec_id,
+                        error = %e,
+                        "failed to re-read spec on thread-bound reload; reusing last-known spec",
+                    ),
+                }
+            }
         }
 
         // 1. Reap instances whose plugin task has finished naturally
@@ -656,6 +696,13 @@ async fn supervise_instances(
         handle.abort();
     }
     Ok(())
+}
+
+fn watches_thread_closed(spec: &ServiceSpec) -> bool {
+    spec.bind
+        .as_ref()
+        .map(|b| b.auto_stop_on.iter().any(|e| e == "thread.closed"))
+        .unwrap_or(false)
 }
 
 /// Open (lazily) a watcher-side WS client and ask the server which
@@ -848,5 +895,25 @@ mod tests {
         let (to_spawn, to_drop) = diff_instances(&listed, &active);
         assert!(to_spawn.is_empty());
         assert!(to_drop.is_empty());
+    }
+
+    #[test]
+    fn watches_thread_closed_tracks_bind_signal() {
+        let mut spec = minimal_spec("svc-a");
+        assert!(!watches_thread_closed(&spec));
+
+        spec.lifecycle = ServiceLifecycle::ThreadBound;
+        spec.bind = Some(proto::methods::ServiceBind {
+            scope: "thread".into(),
+            auto_stop_on: vec!["service.self_complete".into()],
+        });
+        assert!(!watches_thread_closed(&spec));
+
+        spec.bind
+            .as_mut()
+            .unwrap()
+            .auto_stop_on
+            .push("thread.closed".into());
+        assert!(watches_thread_closed(&spec));
     }
 }

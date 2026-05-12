@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration as ChronoDuration, Utc, Weekday};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use proto::types::trace::TraceFrame;
 use proto::types::*;
 use thiserror::Error;
@@ -31,6 +31,11 @@ pub enum StoreEvent {
     TurnOpened(Turn),
     TurnClosed(Turn),
     ThreadCreated(Thread),
+    TaskChanged(Task),
+    TaskAssignmentChanged {
+        assignment: TaskAssignment,
+        task: Task,
+    },
     ChannelCreated(Channel),
     ArtifactPublished(Artifact),
     ReceiptRecorded(Receipt),
@@ -63,6 +68,14 @@ impl StoreEvent {
                 kind: ScopeKind::Channel,
                 id: c.channel_id.clone(),
             }),
+            StoreEvent::TaskChanged(t) => Some(ScopeRef {
+                kind: ScopeKind::Channel,
+                id: t.channel_id.clone(),
+            }),
+            StoreEvent::TaskAssignmentChanged { task, .. } => Some(ScopeRef {
+                kind: ScopeKind::Channel,
+                id: task.channel_id.clone(),
+            }),
             StoreEvent::ArtifactPublished(_) => None,
             StoreEvent::ReceiptRecorded(_) => None,
             StoreEvent::DeliveryUpdated(_) => None,
@@ -85,6 +98,8 @@ struct Inner {
     actors: HashMap<String, Actor>,
     channels: HashMap<String, Channel>,
     threads: HashMap<String, Thread>,
+    tasks: HashMap<String, Task>,
+    assignments: HashMap<String, TaskAssignment>,
     turns: HashMap<String, Turn>,
     /// scope ref -> ordered events
     events_by_scope: HashMap<ScopeRef, Vec<String>>,
@@ -106,6 +121,7 @@ struct Inner {
 pub struct Store {
     journal: Arc<Journal>,
     inner: RwLock<Inner>,
+    structure_lock: Mutex<()>,
     broadcaster: broadcast::Sender<StoreEvent>,
 }
 
@@ -115,6 +131,7 @@ impl Store {
         let store = Arc::new(Self {
             journal: journal.clone(),
             inner: RwLock::new(Inner::default()),
+            structure_lock: Mutex::new(()),
             broadcaster: tx,
         });
         store.replay()?;
@@ -353,13 +370,37 @@ impl Store {
         self.journal.append(&Mutation::ChannelDelete {
             channel_id: id.to_string(),
         })?;
-        let removed = self.inner.write().channels.remove(id).is_some();
+        let removed = {
+            let mut inner = self.inner.write();
+            let removed = inner.channels.remove(id).is_some();
+            let task_ids: std::collections::HashSet<String> = inner
+                .tasks
+                .values()
+                .filter(|task| task.channel_id == id)
+                .map(|task| task.id.clone())
+                .collect();
+            inner.tasks.retain(|_, task| task.channel_id != id);
+            inner
+                .assignments
+                .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
+            removed
+        };
         Ok((removed, deleted_threads))
     }
 
     // -------- Threads --------
 
     pub fn create_thread(
+        &self,
+        channel_id: String,
+        title: String,
+        root_event_id: String,
+    ) -> StoreResult<Thread> {
+        let _guard = self.structure_lock.lock();
+        self.create_thread_locked(channel_id, title, root_event_id)
+    }
+
+    fn create_thread_locked(
         &self,
         channel_id: String,
         title: String,
@@ -460,7 +501,346 @@ impl Store {
             id: id.to_string(),
         };
         inner.events_by_scope.remove(&scope);
+        let task_ids: std::collections::HashSet<String> = inner
+            .tasks
+            .values()
+            .filter(|task| task.canonical_thread_id == id)
+            .map(|task| task.id.clone())
+            .collect();
+        inner.tasks.retain(|_, task| task.canonical_thread_id != id);
+        inner
+            .assignments
+            .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
         Ok(removed)
+    }
+
+    // -------- Tasks --------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task(
+        &self,
+        source_event_id: String,
+        title: Option<String>,
+        description: String,
+        requester_actor_id: String,
+        owner_actor_id: Option<String>,
+        status: Option<TaskStatus>,
+    ) -> StoreResult<Task> {
+        let _guard = self.structure_lock.lock();
+        let source = self
+            .get_event(&source_event_id)
+            .ok_or_else(|| StoreError::NotFound(format!("event {source_event_id}")))?;
+        if source.scope.kind != ScopeKind::Channel {
+            return Err(StoreError::InvalidState(format!(
+                "task source event {source_event_id} must be a top-level channel event"
+            )));
+        }
+        let channel_id = source.scope.id.clone();
+        if !self.is_channel_member(&channel_id, &requester_actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "actor {requester_actor_id} is not a member of channel {channel_id}"
+            )));
+        }
+        if let Some(owner) = owner_actor_id.as_ref() {
+            if !self.is_channel_member(&channel_id, owner) {
+                return Err(StoreError::InvalidState(format!(
+                    "task owner {owner} is not a member of channel {channel_id}"
+                )));
+            }
+        }
+        if self.find_task_by_source(&source_event_id).is_some() {
+            return Err(StoreError::Conflict(format!(
+                "task already exists for source event {source_event_id}"
+            )));
+        }
+
+        let task_title = title
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| event_title(&source));
+        let canonical_thread_id = match self.find_thread_by_root(&channel_id, &source_event_id) {
+            Some(thread) => thread.id,
+            None => match self.create_thread_locked(
+                channel_id.clone(),
+                task_title.clone(),
+                source_event_id.clone(),
+            ) {
+                Ok(thread) => thread.id,
+                Err(StoreError::Conflict(_)) => {
+                    self.find_thread_by_root(&channel_id, &source_event_id)
+                        .ok_or_else(|| {
+                            StoreError::Conflict(format!(
+                                "thread already exists for root event {source_event_id}"
+                            ))
+                        })?
+                        .id
+                }
+                Err(e) => return Err(e),
+            },
+        };
+
+        let now = Utc::now();
+        let number = self.next_task_number(&channel_id);
+        let task = Task {
+            id: format!("task_{}", short_id()),
+            number,
+            channel_id,
+            source_event_id,
+            canonical_thread_id,
+            title: task_title,
+            description,
+            requester_actor_id,
+            owner_actor_id: owner_actor_id.clone(),
+            status: status.unwrap_or(if owner_actor_id.is_some() {
+                TaskStatus::Claimed
+            } else {
+                TaskStatus::Todo
+            }),
+            result_summary: String::new(),
+            artifact_ids: Vec::new(),
+            assignment_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
+        self.inner
+            .write()
+            .tasks
+            .insert(task.id.clone(), task.clone());
+        self.emit(StoreEvent::TaskChanged(task.clone()));
+        Ok(task)
+    }
+
+    fn next_task_number(&self, channel_id: &str) -> u64 {
+        self.inner
+            .read()
+            .tasks
+            .values()
+            .filter(|task| task.channel_id == channel_id)
+            .map(|task| task.number)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    pub fn get_task(&self, id: &str) -> Option<Task> {
+        self.inner.read().tasks.get(id).cloned()
+    }
+
+    pub fn get_assignment(&self, id: &str) -> Option<TaskAssignment> {
+        self.inner.read().assignments.get(id).cloned()
+    }
+
+    pub fn list_task_assignments(&self, task_id: &str) -> Vec<TaskAssignment> {
+        let inner = self.inner.read();
+        let mut rows: Vec<TaskAssignment> = inner
+            .assignments
+            .values()
+            .filter(|assignment| assignment.task_id == task_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        rows
+    }
+
+    pub fn find_task_by_source(&self, source_event_id: &str) -> Option<Task> {
+        self.inner
+            .read()
+            .tasks
+            .values()
+            .find(|task| task.source_event_id == source_event_id)
+            .cloned()
+    }
+
+    pub fn list_tasks(
+        &self,
+        channel_id: Option<&str>,
+        source_event_id: Option<&str>,
+        owner_actor_id: Option<&str>,
+        statuses: &[TaskStatus],
+    ) -> Vec<Task> {
+        let inner = self.inner.read();
+        let mut rows: Vec<Task> = inner
+            .tasks
+            .values()
+            .filter(|task| channel_id.is_none_or(|id| task.channel_id == id))
+            .filter(|task| source_event_id.is_none_or(|id| task.source_event_id == id))
+            .filter(|task| {
+                owner_actor_id.is_none_or(|id| task.owner_actor_id.as_deref() == Some(id))
+            })
+            .filter(|task| statuses.is_empty() || statuses.contains(&task.status))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.channel_id
+                .cmp(&b.channel_id)
+                .then_with(|| a.number.cmp(&b.number))
+        });
+        rows
+    }
+
+    pub fn update_task(
+        &self,
+        task_id: &str,
+        status: Option<TaskStatus>,
+        owner_actor_id: Option<String>,
+        result_summary: Option<String>,
+        artifact_ids: Option<Vec<String>>,
+        append_artifact_ids: Vec<String>,
+    ) -> StoreResult<Task> {
+        let mut task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        if let Some(owner) = owner_actor_id {
+            if !self.is_channel_member(&task.channel_id, &owner) {
+                return Err(StoreError::InvalidState(format!(
+                    "task owner {owner} is not a member of channel {}",
+                    task.channel_id
+                )));
+            }
+            task.owner_actor_id = Some(owner);
+        }
+        if let Some(status) = status {
+            task.status = status;
+        }
+        if let Some(summary) = result_summary {
+            task.result_summary = summary;
+        }
+        if let Some(ids) = artifact_ids {
+            task.artifact_ids = unique_nonempty(ids);
+        }
+        for id in append_artifact_ids {
+            if !id.trim().is_empty() && !task.artifact_ids.iter().any(|x| x == &id) {
+                task.artifact_ids.push(id);
+            }
+        }
+        task.updated_at = Utc::now();
+        self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
+        self.inner
+            .write()
+            .tasks
+            .insert(task.id.clone(), task.clone());
+        self.emit(StoreEvent::TaskChanged(task.clone()));
+        Ok(task)
+    }
+
+    pub fn create_task_assignment(
+        &self,
+        task_id: &str,
+        from_actor_id: String,
+        to_actor_id: String,
+        assignment_type: TaskAssignmentType,
+        instruction: String,
+    ) -> StoreResult<(TaskAssignment, Task)> {
+        let mut task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        if !self.is_channel_member(&task.channel_id, &from_actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "assignment sender {from_actor_id} is not a member of channel {}",
+                task.channel_id
+            )));
+        }
+        if !self.is_channel_member(&task.channel_id, &to_actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "assignment recipient {to_actor_id} is not a member of channel {}",
+                task.channel_id
+            )));
+        }
+        let now = Utc::now();
+        let assignment = TaskAssignment {
+            id: format!("asgn_{}", short_id()),
+            task_id: task.id.clone(),
+            from_actor_id,
+            to_actor_id,
+            assignment_type,
+            instruction,
+            status: TaskAssignmentStatus::Pending,
+            result_event_id: None,
+            result_summary: String::new(),
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        task.assignment_ids.push(assignment.id.clone());
+        task.assignment_ids = unique_nonempty(task.assignment_ids);
+        if !matches!(
+            task.status,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
+        ) {
+            task.status = match assignment_type {
+                TaskAssignmentType::Review => TaskStatus::WaitingReview,
+                _ => TaskStatus::InProgress,
+            };
+        }
+        task.updated_at = now;
+        self.journal
+            .append(&Mutation::TaskAssignmentUpsert(assignment.clone()))?;
+        self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            inner
+                .assignments
+                .insert(assignment.id.clone(), assignment.clone());
+            inner.tasks.insert(task.id.clone(), task.clone());
+        }
+        self.emit(StoreEvent::TaskAssignmentChanged {
+            assignment: assignment.clone(),
+            task: task.clone(),
+        });
+        self.emit(StoreEvent::TaskChanged(task.clone()));
+        Ok((assignment, task))
+    }
+
+    pub fn update_task_assignment(
+        &self,
+        assignment_id: &str,
+        status: Option<TaskAssignmentStatus>,
+        result_event_id: Option<String>,
+        result_summary: Option<String>,
+    ) -> StoreResult<(TaskAssignment, Task)> {
+        let mut assignment = self
+            .get_assignment(assignment_id)
+            .ok_or_else(|| StoreError::NotFound(format!("assignment {assignment_id}")))?;
+        if let Some(event_id) = result_event_id.as_ref() {
+            if self.get_event(event_id).is_none() {
+                return Err(StoreError::NotFound(format!("event {event_id}")));
+            }
+        }
+        if let Some(status) = status {
+            assignment.status = status;
+        }
+        if let Some(event_id) = result_event_id {
+            assignment.result_event_id = Some(event_id);
+        }
+        if let Some(summary) = result_summary {
+            assignment.result_summary = summary;
+        }
+        assignment.updated_at = Utc::now();
+        let mut task = self
+            .get_task(&assignment.task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {}", assignment.task_id)))?;
+        task.updated_at = assignment.updated_at;
+        self.journal
+            .append(&Mutation::TaskAssignmentUpsert(assignment.clone()))?;
+        self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            inner
+                .assignments
+                .insert(assignment.id.clone(), assignment.clone());
+            inner.tasks.insert(task.id.clone(), task.clone());
+        }
+        self.emit(StoreEvent::TaskAssignmentChanged {
+            assignment: assignment.clone(),
+            task: task.clone(),
+        });
+        self.emit(StoreEvent::TaskChanged(task.clone()));
+        Ok((assignment, task))
     }
 
     // -------- Turns --------
@@ -1198,6 +1578,11 @@ fn apply(inner: &mut Inner, m: Mutation) {
             for channel in inner.channels.values_mut() {
                 channel.members.retain(|member| member != &actor_id);
             }
+            for task in inner.tasks.values_mut() {
+                if task.owner_actor_id.as_deref() == Some(&actor_id) {
+                    task.owner_actor_id = None;
+                }
+            }
             inner
                 .memberships
                 .retain(|(member_actor_id, _), _| member_actor_id != &actor_id);
@@ -1207,12 +1592,21 @@ fn apply(inner: &mut Inner, m: Mutation) {
             inner
                 .receipts
                 .retain(|(_, receipt_actor_id, _), _| receipt_actor_id != &actor_id);
+            inner.assignments.retain(|_, assignment| {
+                assignment.from_actor_id != actor_id && assignment.to_actor_id != actor_id
+            });
         }
         Mutation::ChannelCreate(c) => {
             inner.channels.insert(c.id.clone(), c);
         }
         Mutation::ThreadCreate(t) => {
             inner.threads.insert(t.id.clone(), t);
+        }
+        Mutation::TaskUpsert(t) => {
+            inner.tasks.insert(t.id.clone(), t);
+        }
+        Mutation::TaskAssignmentUpsert(a) => {
+            inner.assignments.insert(a.id.clone(), a);
         }
         Mutation::TurnOpen(t) => {
             inner.turns.insert(t.id.clone(), t);
@@ -1281,6 +1675,16 @@ fn apply(inner: &mut Inner, m: Mutation) {
         }
         Mutation::ChannelDelete { channel_id } => {
             inner.channels.remove(&channel_id);
+            let task_ids: std::collections::HashSet<String> = inner
+                .tasks
+                .values()
+                .filter(|task| task.channel_id == channel_id)
+                .map(|task| task.id.clone())
+                .collect();
+            inner.tasks.retain(|_, task| task.channel_id != channel_id);
+            inner
+                .assignments
+                .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
         }
         Mutation::ThreadUpdate { thread_id, title } => {
             if let Some(t) = inner.threads.get_mut(&thread_id) {
@@ -1294,6 +1698,18 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 id: thread_id,
             };
             inner.events_by_scope.remove(&scope);
+            let task_ids: std::collections::HashSet<String> = inner
+                .tasks
+                .values()
+                .filter(|task| task.canonical_thread_id == scope.id)
+                .map(|task| task.id.clone())
+                .collect();
+            inner
+                .tasks
+                .retain(|_, task| task.canonical_thread_id != scope.id);
+            inner
+                .assignments
+                .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
         }
         Mutation::ChannelGrant {
             channel_id,
@@ -1347,6 +1763,31 @@ fn event_search_text(event: &Event) -> String {
         parts.push(title);
     }
     parts.join("\n").to_ascii_lowercase()
+}
+
+fn event_title(event: &Event) -> String {
+    for key in ["title", "text", "message"] {
+        if let Some(value) = event.payload.get(key).and_then(|v| v.as_str()) {
+            if let Some(line) = value.lines().find(|line| !line.trim().is_empty()) {
+                return line.trim().chars().take(120).collect();
+            }
+        }
+    }
+    format!("Task from {}", event.id)
+}
+
+fn unique_nonempty(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in ids {
+        if id.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 fn next_repeat_after(from: chrono::DateTime<Utc>, rule: &str) -> Option<chrono::DateTime<Utc>> {
@@ -1437,6 +1878,7 @@ fn _meta_keep() -> BTreeMap<String, serde_json::Value> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
 
     /// Per-test journal file under the OS temp dir. We don't bother cleaning
     /// up — the file is tiny and lives in /tmp which the OS will sweep.
@@ -1581,6 +2023,202 @@ mod tests {
             .create_thread(ch.id.clone(), "second".into(), root_event_id)
             .expect_err("duplicate root must be rejected");
         assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_task_anchors_to_channel_event_and_creates_canonical_thread() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("tasks".into(), Some("actor_owner".into()))
+            .unwrap();
+        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "write docs");
+
+        let task = store
+            .create_task(
+                root_event_id.clone(),
+                None,
+                "write docs".into(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                None,
+            )
+            .expect("create task");
+
+        assert_eq!(task.number, 1);
+        assert_eq!(task.source_event_id, root_event_id);
+        assert_eq!(task.status, TaskStatus::Claimed);
+        let thread = store
+            .get_thread(&task.canonical_thread_id)
+            .expect("canonical thread");
+        assert_eq!(thread.root_event_id, task.source_event_id);
+        assert_eq!(thread.channel_id, ch.id);
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        let replayed_task = replayed.get_task(&task.id).expect("replayed task");
+        assert_eq!(replayed_task.canonical_thread_id, task.canonical_thread_id);
+    }
+
+    #[test]
+    fn create_task_rejects_thread_event_and_duplicate_source() {
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        let thread = create_thread_under(&store, &ch.id, "actor_owner", "root");
+        let thread_event = store
+            .append_event(
+                "content.add".into(),
+                "actor_owner".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: thread.id,
+                },
+                None,
+                serde_json::json!({ "text": "child" }),
+                vec![],
+                None,
+            )
+            .unwrap();
+        let err = store
+            .create_task(
+                thread_event.id,
+                None,
+                String::new(),
+                "actor_owner".into(),
+                None,
+                None,
+            )
+            .expect_err("thread event cannot anchor task");
+        assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
+
+        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "work");
+        store
+            .create_task(
+                root_event_id.clone(),
+                None,
+                String::new(),
+                "actor_owner".into(),
+                None,
+                None,
+            )
+            .unwrap();
+        let err = store
+            .create_task(
+                root_event_id,
+                None,
+                String::new(),
+                "actor_owner".into(),
+                None,
+                None,
+            )
+            .expect_err("source event is unique");
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_task_is_unique_under_concurrent_source_event_claims() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("race".into(), Some("actor_owner".into()))
+            .unwrap();
+        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "race task");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let root_event_id = root_event_id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.create_task(
+                        root_event_id,
+                        Some("race task".into()),
+                        String::new(),
+                        "actor_owner".into(),
+                        Some("actor_owner".into()),
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("task thread"))
+            .collect::<Vec<_>>();
+        let successes = results.iter().filter(|result| result.is_ok()).count();
+        let conflicts = results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::Conflict(_))))
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(conflicts, 1);
+        assert_eq!(store.list_tasks(Some(&ch.id), None, None, &[]).len(), 1);
+        assert_eq!(store.list_threads(Some(&ch.id)).len(), 1);
+    }
+
+    #[test]
+    fn task_assignment_result_round_trips_through_replay() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("review".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_reviewer").unwrap();
+        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let task = store
+            .create_task(
+                root_event_id,
+                Some("story".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+            )
+            .unwrap();
+        let (assignment, task) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story".into(),
+            )
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::WaitingReview);
+        let result_event = store
+            .append_event(
+                "content.add".into(),
+                "actor_reviewer".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: task.canonical_thread_id.clone(),
+                },
+                None,
+                serde_json::json!({ "text": "looks good" }),
+                vec![],
+                None,
+            )
+            .unwrap();
+        let (updated, _) = store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Completed),
+                Some(result_event.id.clone()),
+                Some("looks good".into()),
+            )
+            .unwrap();
+        assert_eq!(updated.status, TaskAssignmentStatus::Completed);
+        assert_eq!(
+            updated.result_event_id.as_deref(),
+            Some(result_event.id.as_str())
+        );
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        let replayed_assignment = replayed
+            .get_assignment(&assignment.id)
+            .expect("replayed assignment");
+        assert_eq!(replayed_assignment.result_summary, "looks good");
+        assert_eq!(replayed_assignment.status, TaskAssignmentStatus::Completed);
     }
 
     #[test]

@@ -406,6 +406,10 @@ impl AgentPaths {
         insert_current_time_env(&mut env);
         if let Some(active) = active {
             env.insert("JOI_TURN_ID".into(), active.id.clone());
+            env.insert(
+                "JOI_TRIGGER_EVENT_ID".into(),
+                active.trigger_event_id.clone(),
+            );
             env.insert("JOI_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
         }
         env.insert(
@@ -596,13 +600,11 @@ struct WorkerState {
     profile_dir: PathBuf,
     paths: AgentPaths,
     agent_server_url: String,
-    /// In-flight turn per scope. Same agent in multiple channels => multiple
-    /// concurrent turns, one per scope.id; same scope back-to-back is enforced
-    /// to be FIFO via `pending_triggers` below.
+    /// In-flight turn per scope. A worker owns one adapter instance, so handoff
+    /// prompts are serialized per actor even when they target different scopes.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
-    /// Per-scope queue of triggers received while the scope was busy. Drained
-    /// one-at-a-time when the scope's current turn closes.
-    pending_triggers: Mutex<HashMap<String, VecDeque<Event>>>,
+    /// Actor-wide FIFO of triggers received while this worker is busy.
+    pending_triggers: Mutex<VecDeque<Event>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
     /// `Finished`, once final usage metadata is available.
     text_buffer: Mutex<HashMap<String, String>>,
@@ -726,7 +728,7 @@ impl WorkerState {
             paths,
             agent_server_url,
             active_turns: Mutex::new(HashMap::new()),
-            pending_triggers: Mutex::new(HashMap::new()),
+            pending_triggers: Mutex::new(VecDeque::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
@@ -747,6 +749,15 @@ impl WorkerState {
             .cloned()
     }
 
+    fn any_current_turn(&self) -> Option<ActiveTurn> {
+        self.active_turns
+            .lock()
+            .expect("active_turns poisoned")
+            .values()
+            .next()
+            .cloned()
+    }
+
     fn set_turn(&self, turn: ActiveTurn) {
         self.active_turns
             .lock()
@@ -764,28 +775,22 @@ impl WorkerState {
         Some(turn.clone())
     }
 
-    /// Drop the active turn for `scope_id` and atomically pop the next queued
-    /// trigger (if any). Returning the trigger inside the same lock keeps a
-    /// racing `enqueue` from getting wedged behind the now-empty slot.
+    /// Drop the active turn for `scope_id` and pop the next actor-wide queued
+    /// trigger (if any).
     fn clear_turn(&self, scope_id: &str) -> Option<Event> {
         let mut active = self.active_turns.lock().expect("active_turns poisoned");
         active.remove(scope_id);
         drop(active);
-        let mut queues = self.pending_triggers.lock().expect("pending poisoned");
-        let q = queues.get_mut(scope_id)?;
-        let next = q.pop_front();
-        if q.is_empty() {
-            queues.remove(scope_id);
-        }
-        next
-    }
-
-    fn enqueue(&self, scope_id: &str, event: Event) {
         self.pending_triggers
             .lock()
             .expect("pending poisoned")
-            .entry(scope_id.to_string())
-            .or_default()
+            .pop_front()
+    }
+
+    fn enqueue(&self, _scope_id: &str, event: Event) {
+        self.pending_triggers
+            .lock()
+            .expect("pending poisoned")
             .push_back(event);
     }
 
@@ -1632,9 +1637,8 @@ async fn handle_turn_close(
 }
 
 fn is_for_us(event: &Event, actor_id: &str) -> bool {
-    if event.actor_id == actor_id {
-        return false; // self-loop
-    }
+    // Self-authored handoffs are intentional: agents use them to move a
+    // channel triage turn into the canonical task thread.
     event.relations.iter().any(|r| {
         matches!(r.kind, RelationKind::HandsOffTo)
             && r.target.kind == RefKind::Actor
@@ -1851,13 +1855,16 @@ async fn handle_handoff(
     adapter: &Arc<dyn Adapter>,
     trigger: &Event,
 ) -> Result<()> {
-    // Same-scope FIFO: if the scope already has a turn in flight, queue this
-    // trigger and let translate_one pick it up after `Finished`.
-    if state.current_turn(&trigger.scope.id).is_some() {
-        state.enqueue(&trigger.scope.id, trigger.clone());
+    let trigger = trigger.clone();
+    // Actor-wide FIFO: one worker owns one adapter instance, so a model-driven
+    // self-handoff from a channel triage turn into a task thread must wait
+    // until the current turn has closed.
+    if state.any_current_turn().is_some() {
+        let scope_id = trigger.scope.id.clone();
+        state.enqueue(&scope_id, trigger);
         return Ok(());
     }
-    dispatch_handoff(client, state, adapter, trigger.clone()).await
+    dispatch_handoff(client, state, adapter, trigger).await
 }
 
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
@@ -2064,9 +2071,33 @@ fn render_trigger_prompt_with_names(
         out.push_str(&target_labels.join(", "));
         out.push('\n');
     }
+    if let Some(task_context) = trigger_task_context(trigger) {
+        out.push_str(&task_context);
+    }
     out.push_str("Visible message:\n");
     out.push_str(&visible);
     out
+}
+
+fn trigger_task_context(trigger: &Event) -> Option<String> {
+    let meta = trigger
+        .payload
+        .get("_meta")
+        .and_then(|value| value.as_object())?;
+    let task_id = meta.get("taskId").and_then(|value| value.as_str())?;
+    let mut out = format!("Task id: {task_id}\n");
+    if let Some(number) = meta.get("taskNumber").and_then(|value| value.as_u64()) {
+        out.push_str(&format!("Task number: #{number}\n"));
+    }
+    if let Some(assignment_id) = meta.get("assignmentId").and_then(|value| value.as_str()) {
+        out.push_str(&format!("Assignment id: {assignment_id}\n"));
+    }
+    if let Some(expected) = meta.get("expectedOutput").and_then(|value| value.as_str()) {
+        out.push_str("Expected output: ");
+        out.push_str(expected);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 fn handoff_target_ids(trigger: &Event) -> Vec<String> {
@@ -2464,7 +2495,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            current scope = {scope_kind}:{scope_id}\n\
          \n\
          You can shell out to the `joi` CLI for server access. JOI_SERVER,\n\
-         JOI_DAEMON_SOCKET, JOI_ACTOR, JOI_SCOPE_ID, JOI_SCOPE_KIND, JOI_TURN_ID, and JOI_TRIGGER_ACTOR are already injected into your env,\n\
+         JOI_DAEMON_SOCKET, JOI_ACTOR, JOI_SCOPE_ID, JOI_SCOPE_KIND, JOI_TURN_ID, JOI_TRIGGER_EVENT_ID, and JOI_TRIGGER_ACTOR are already injected into your env,\n\
          so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
            joi --json artifact get <art_id|artifact://...>\n\
@@ -3114,6 +3145,10 @@ mod tests {
             Some("turn_demo")
         );
         assert_eq!(
+            env.get("JOI_TRIGGER_EVENT_ID").map(String::as_str),
+            Some("evt_trigger")
+        );
+        assert_eq!(
             env.get("JOI_TRIGGER_ACTOR").map(String::as_str),
             Some("human_alice")
         );
@@ -3182,6 +3217,71 @@ mod tests {
         assert!(prompt.contains("Delivery: explicit handoff to you"));
         assert!(prompt.contains("handoff -> G仔 (@actor_agent_g_1234):"));
         assert!(prompt.contains("Emma (@actor_agent_emma_142b6f2d)"));
+    }
+
+    #[test]
+    fn self_authored_handoff_to_local_actor_is_deliverable() {
+        let event = Event {
+            id: "evt_self_handoff".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_agent_emma".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_task".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "continue in the task thread" }),
+            relations: vec![Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: "actor_agent_emma".into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            _meta: None,
+        };
+
+        assert!(is_for_us(&event, "actor_agent_emma"));
+        assert!(!is_for_us(&event, "actor_agent_q"));
+    }
+
+    #[test]
+    fn self_authored_content_without_local_handoff_is_not_deliverable() {
+        let own_plain_message = Event {
+            id: "evt_self_plain".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_agent_emma".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_task".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "status update" }),
+            relations: Vec::new(),
+            _meta: None,
+        };
+        let handoff_to_other = Event {
+            id: "evt_handoff_other".into(),
+            relations: vec![Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: "actor_agent_q".into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            ..own_plain_message.clone()
+        };
+
+        assert!(!is_for_us(&own_plain_message, "actor_agent_emma"));
+        assert!(!is_for_us(&handoff_to_other, "actor_agent_emma"));
     }
 
     #[test]
@@ -3446,6 +3546,56 @@ mod tests {
         );
 
         assert_eq!(state.current_model().as_deref(), Some("model_fast"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worker_state_queues_triggers_actor_wide_across_scopes() {
+        let root = temp_path("actor-wide-queue");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let active_scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_triage".into(),
+        };
+        state.set_turn(ActiveTurn {
+            id: "turn_channel".into(),
+            scope: active_scope.clone(),
+            trigger_event_id: "evt_root".into(),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human".into(),
+            cancel_requested: false,
+        });
+        let queued = Event {
+            id: "evt_thread_handoff".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_demo".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_task".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "continue task" }),
+            relations: Vec::new(),
+            _meta: None,
+        };
+
+        assert!(state.any_current_turn().is_some());
+        state.enqueue(&queued.scope.id, queued.clone());
+        assert_eq!(
+            state.clear_turn(&active_scope.id).map(|event| event.id),
+            Some(queued.id)
+        );
+        assert!(state.any_current_turn().is_none());
         std::fs::remove_dir_all(root).ok();
     }
 }

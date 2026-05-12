@@ -10,6 +10,8 @@
   用 `am listen` 把钉钉 bot 消息接入 Joi thread 并定向 handoff 给 agent
 - [service-plugin-system-design.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/service-plugin-system-design.md)
   service/plugin host 方案设计，将 `am`、scheduler 等主动入口统一成 service actor 插件
+- [protocol/task-workflow.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/task-workflow.md)
+  channel 顶层消息上的 task / assignment 闭环模型和 CLI/RPC 用法
 
 ## 协议与设计
 

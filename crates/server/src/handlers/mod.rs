@@ -77,6 +77,14 @@ pub async fn dispatch(
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
         method::THREAD_DELETE => thread_delete(state, connection_id, params),
+        method::TASK_CREATE => task_create(state, connection_id, params),
+        method::TASK_GET => task_get(state, connection_id, params),
+        method::TASK_LIST => task_list(state, connection_id, params),
+        method::TASK_UPDATE => task_update(state, connection_id, params),
+        method::TASK_ASSIGNMENT_CREATE => {
+            task_assignment_create(state, connection_id, params).await
+        }
+        method::TASK_ASSIGNMENT_UPDATE => task_assignment_update(state, connection_id, params),
         method::TURN_OPEN => turn_open(state, params),
         method::TURN_CLOSE => turn_close(state, connection_id, params).await,
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
@@ -116,7 +124,7 @@ fn initialize(params: Option<Value>) -> HandlerResult {
         },
         server_capabilities: json!({
             "scopes": ["channel", "thread"],
-            "extensions": ["agent"],
+            "extensions": ["agent", "task"],
         }),
     };
     ok(res)
@@ -562,6 +570,231 @@ fn thread_delete(state: &AppState, connection_id: &str, params: Option<Value>) -
         }
     }
     ok(ThreadDeleteResult { deleted })
+}
+
+// ---- task ----
+
+fn ensure_task_access(state: &AppState, task: &Task, actor_id: &str) -> Result<(), ErrorObject> {
+    if state.store.is_channel_member(&task.channel_id, actor_id) {
+        Ok(())
+    } else {
+        Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {actor_id} cannot access task {} in channel {}",
+                task.id, task.channel_id
+            ),
+        ))
+    }
+}
+
+fn task_create(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskCreateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let source = state
+        .store
+        .get_event(&p.source_event_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "source event"))?;
+    state
+        .store
+        .check_scope_access(&source.scope, &caller)
+        .map_err(map_store_err)?;
+    let requester = p.requester_actor_id.unwrap_or(caller);
+    let task = state
+        .store
+        .create_task(
+            p.source_event_id,
+            p.title,
+            p.description,
+            requester,
+            p.owner_actor_id,
+            p.status,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskCreateResult { task })
+}
+
+fn task_get(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskGetParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let assignments = state.store.list_task_assignments(&task.id);
+    ok(TaskGetResult { task, assignments })
+}
+
+fn task_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskListParams = parse_params(params).unwrap_or_default();
+    let caller = caller_actor(state, connection_id)?;
+    if let Some(channel_id) = p.channel_id.as_ref() {
+        if !state.store.is_channel_member(channel_id, &caller) {
+            return Err(ErrorObject::new(
+                ErrorCode::APP_INVALID_STATE,
+                format!("actor {caller} cannot list tasks in channel {channel_id}"),
+            ));
+        }
+    }
+    let tasks = state
+        .store
+        .list_tasks(
+            p.channel_id.as_deref(),
+            p.source_event_id.as_deref(),
+            p.owner_actor_id.as_deref(),
+            &p.statuses,
+        )
+        .into_iter()
+        .filter(|task| state.store.is_channel_member(&task.channel_id, &caller))
+        .collect();
+    ok(TaskListResult { tasks })
+}
+
+fn task_update(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskUpdateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let task = state
+        .store
+        .update_task(
+            &p.task_id,
+            p.status,
+            p.owner_actor_id,
+            p.result_summary,
+            p.artifact_ids,
+            p.append_artifact_ids,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskUpdateResult { task })
+}
+
+async fn task_assignment_create(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskAssignmentCreateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let from = p.from_actor_id.unwrap_or(caller);
+    let (assignment, task) = state
+        .store
+        .create_task_assignment(
+            &p.task_id,
+            from.clone(),
+            p.to_actor_id.clone(),
+            p.assignment_type,
+            p.instruction.clone(),
+        )
+        .map_err(map_store_err)?;
+
+    let event = state
+        .store
+        .append_event(
+            "content.add".into(),
+            from,
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: task.canonical_thread_id.clone(),
+            },
+            None,
+            json!({
+                "contentType": "text/markdown",
+                "text": task_assignment_message(&task, &assignment),
+                "_meta": {
+                    "taskId": task.id,
+                    "taskNumber": task.number,
+                    "assignmentId": assignment.id,
+                    "assignmentType": assignment.assignment_type,
+                    "expectedOutput": "Update the assignment result and reply in this task thread."
+                }
+            }),
+            vec![
+                Relation {
+                    kind: RelationKind::HandsOffTo,
+                    target: Ref {
+                        kind: RefKind::Actor,
+                        id: assignment.to_actor_id.clone(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                },
+                Relation {
+                    kind: RelationKind::RelatesToTask,
+                    target: Ref {
+                        kind: RefKind::Task,
+                        id: task.id.clone(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                },
+                Relation {
+                    kind: RelationKind::RespondsTo,
+                    target: Ref {
+                        kind: RefKind::Event,
+                        id: task.source_event_id.clone(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                },
+            ],
+            None,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskAssignmentCreateResult {
+        assignment,
+        event,
+        task,
+    })
+}
+
+fn task_assignment_update(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskAssignmentUpdateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let assignment = state
+        .store
+        .get_assignment(&p.assignment_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "assignment"))?;
+    let task = state
+        .store
+        .get_task(&assignment.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let (assignment, task) = state
+        .store
+        .update_task_assignment(
+            &p.assignment_id,
+            p.status,
+            p.result_event_id,
+            p.result_summary,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskAssignmentUpdateResult { assignment, task })
+}
+
+fn task_assignment_message(task: &Task, assignment: &TaskAssignment) -> String {
+    format!(
+        "Task #{number}: {title}\n\nAssignment `{assignment_id}` ({assignment_type:?}) for @{to_actor}.\n\n{instruction}\n\nReturn your result in this thread and update the assignment when complete.",
+        number = task.number,
+        title = task.title,
+        assignment_id = assignment.id,
+        assignment_type = assignment.assignment_type,
+        to_actor = assignment.to_actor_id,
+        instruction = assignment.instruction.trim(),
+    )
 }
 
 // ---- turn ----
@@ -1135,6 +1368,74 @@ mod tests {
         .expect_err("artifact publish should fail");
 
         assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn task_assignment_create_handoffs_in_canonical_thread() {
+        let state = fresh_state("task-assignment-create");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        let channel = state
+            .store
+            .create_channel("tasks".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_reviewer")
+            .expect("grant reviewer");
+        let source_event_id =
+            append_channel_root(&state, &channel.id, "actor_owner", "write story");
+
+        let created = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_CREATE,
+            Some(json!({
+                "sourceEventId": source_event_id,
+                "title": "write story",
+                "ownerActorId": "actor_owner"
+            })),
+        )
+        .await
+        .expect("task/create");
+        let created: TaskCreateResult = serde_json::from_value(created).unwrap();
+
+        let assigned = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_ASSIGNMENT_CREATE,
+            Some(json!({
+                "taskId": created.task.id,
+                "toActorId": "actor_reviewer",
+                "type": "review",
+                "instruction": "review the story"
+            })),
+        )
+        .await
+        .expect("task/assignment.create");
+        let assigned: TaskAssignmentCreateResult = serde_json::from_value(assigned).unwrap();
+
+        assert_eq!(assigned.event.scope.kind, ScopeKind::Thread);
+        assert_eq!(assigned.event.scope.id, created.task.canonical_thread_id);
+        assert!(assigned.event.relations.iter().any(|relation| {
+            matches!(relation.kind, RelationKind::HandsOffTo)
+                && relation.target.kind == RefKind::Actor
+                && relation.target.id == "actor_reviewer"
+        }));
+        assert!(assigned.event.relations.iter().any(|relation| {
+            matches!(relation.kind, RelationKind::RelatesToTask)
+                && relation.target.kind == RefKind::Task
+                && relation.target.id == created.task.id
+        }));
+        let meta = assigned
+            .event
+            .payload
+            .get("_meta")
+            .and_then(|value| value.as_object())
+            .expect("task meta");
+        assert_eq!(
+            meta.get("assignmentId").and_then(|value| value.as_str()),
+            Some(assigned.assignment.id.as_str())
+        );
     }
 
     #[test]

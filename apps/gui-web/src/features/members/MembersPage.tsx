@@ -62,6 +62,7 @@ const REASONING_CHOICES = ["low", "medium", "high", "xhigh"];
 
 interface ManagedAgent {
   actor: Actor;
+  managed: boolean;
   status: string;
   machineId: string;
   machine: string;
@@ -164,14 +165,35 @@ export function MembersPage() {
     };
   }, [activeWorkspaceId, sessionWorkspaceId, pushToast, upsertMany]);
 
-  const allAgents = agents;
+  const allAgents = useMemo(() => {
+    const managedIds = new Set(agents.map((agent) => agent.actor.id));
+    const registryAgents = Object.values(actorsById)
+      .filter((actor) => actor.kind === "agent" && !managedIds.has(actor.id))
+      .sort((a, b) =>
+        (a.displayName || a.id).localeCompare(b.displayName || b.id),
+      )
+      .map(normalizeRegistryAgent);
+    return [...agents, ...registryAgents];
+  }, [agents, actorsById]);
   const humans = useMemo(
     () => Object.values(actorsById).filter((a) => a.kind === "human"),
     [actorsById],
   );
   const selected = allAgents.find((a) => a.actor.id === selectedId) ?? null;
 
+  useEffect(() => {
+    setSelectedId((current) =>
+      current && allAgents.some((agent) => agent.actor.id === current)
+        ? current
+        : allAgents[0]?.actor.id ?? null,
+    );
+  }, [allAgents]);
+
   const removeAgent = async (agent: ManagedAgent) => {
+    if (!agent.managed) {
+      pushToast("warn", "registry-only agents are managed by their remote serve");
+      return;
+    }
     const result = await ipc.machineAgentRemove(agent.machineId, agent.actor.id);
     removeMany([agent.actor.id]);
     applyMachineAgents(result.machines);
@@ -182,6 +204,10 @@ export function MembersPage() {
     agent: ManagedAgent,
     patch: AgentUpdatePatch,
   ) => {
+    if (!agent.managed) {
+      pushToast("warn", "registry-only agents are read-only in this workspace");
+      return;
+    }
     const updated = normalizeAgent(
       await ipc.agentUpdate({
         machineId: agent.machineId,
@@ -365,13 +391,17 @@ function AgentListRow({
         <span className="min-w-0 flex-1 truncate">
           {agent.actor.displayName || agent.actor.id}
         </span>
-        <span
-          className={clsx(
-            "h-2.5 w-2.5 shrink-0 rounded-full border border-black",
-            online ? "bg-brutal-lime" : "bg-black/20",
-          )}
-          title={online ? "online" : agent.status}
-        />
+        {agent.managed ? (
+          <span
+            className={clsx(
+              "h-2.5 w-2.5 shrink-0 rounded-full border border-black",
+              online ? "bg-brutal-lime" : "bg-black/20",
+            )}
+            title={online ? "online" : agent.status}
+          />
+        ) : (
+          <span className="font-mono text-[10px] text-black/45">registry</span>
+        )}
       </button>
     </>
   );
@@ -408,48 +438,54 @@ function AgentDetail({
         <button className="btn-brutal-sm gap-1 bg-white px-3 py-1.5 text-xs" onClick={onMessage}>
           <MessageSquare size={14} /> Message
         </button>
-        <button
-          className="btn-brutal-sm bg-white p-1.5"
-          title="Stop Agent"
-          onClick={() =>
-            ui.openModal({
-              type: "confirm",
-              title: `Stop ${agent.actor.displayName || agent.actor.id}?`,
-              body: "This agent is owned by the machine daemon. Stop or restart the daemon on the host computer to control the process.",
-              confirmLabel: "Got It",
-              danger: true,
-              onConfirm: () =>
-                ui.pushToast("warn", "agent process control belongs to joi daemon"),
-            })
-          }
-        >
-          <Square size={14} />
-        </button>
-        <button
-          className="btn-brutal-sm bg-white p-1.5"
-          title="Restart / Reset"
-          onClick={() =>
-            ui.pushToast("warn", "restart the owning `joi daemon` process")
-          }
-        >
-          <RotateCcw size={14} />
-        </button>
-        <button
-          className="btn-brutal-sm bg-white p-1.5"
-          title="Remove Agent"
-          onClick={() =>
-            ui.openModal({
-              type: "confirm",
-              title: `Remove ${agent.actor.displayName || agent.actor.id}?`,
-              body: "This removes the agent from its computer profile. It does not stop an already running daemon process.",
-              confirmLabel: "Remove",
-              danger: true,
-              onConfirm: onRemove,
-            })
-          }
-        >
-          <Trash2 size={14} />
-        </button>
+        {agent.managed ? (
+          <>
+            <button
+              className="btn-brutal-sm bg-white p-1.5"
+              title="Stop Agent"
+              onClick={() =>
+                ui.openModal({
+                  type: "confirm",
+                  title: `Stop ${agent.actor.displayName || agent.actor.id}?`,
+                  body: "This agent is owned by the machine daemon. Stop or restart the daemon on the host computer to control the process.",
+                  confirmLabel: "Got It",
+                  danger: true,
+                  onConfirm: () =>
+                    ui.pushToast("warn", "agent process control belongs to joi daemon"),
+                })
+              }
+            >
+              <Square size={14} />
+            </button>
+            <button
+              className="btn-brutal-sm bg-white p-1.5"
+              title="Restart / Reset"
+              onClick={() =>
+                ui.pushToast("warn", "restart the owning `joi daemon` process")
+              }
+            >
+              <RotateCcw size={14} />
+            </button>
+            <button
+              className="btn-brutal-sm bg-white p-1.5"
+              title="Remove Agent"
+              onClick={() =>
+                ui.openModal({
+                  type: "confirm",
+                  title: `Remove ${agent.actor.displayName || agent.actor.id}?`,
+                  body: "This removes the agent from its computer profile. It does not stop an already running daemon process.",
+                  confirmLabel: "Remove",
+                  danger: true,
+                  onConfirm: onRemove,
+                })
+              }
+            >
+              <Trash2 size={14} />
+            </button>
+          </>
+        ) : (
+          <span className="chip-brutal bg-white">registry</span>
+        )}
       </header>
 
       <div className="flex shrink-0 overflow-x-auto border-b-2 border-black bg-white scrollbar-none">
@@ -990,6 +1026,7 @@ function ProfileTab({
   onUpdate: (patch: AgentUpdatePatch) => Promise<void>;
 }) {
   const ui = useUI();
+  const canEdit = agent.managed;
   return (
     <div>
       <section className="flex gap-4 border-b border-black/10 p-5">
@@ -1006,42 +1043,56 @@ function ProfileTab({
         </div>
       </section>
 
-      <InfoSection title="Display Name" action="Edit display name">
-        <button
-          className="inline-flex items-center gap-2 hover:underline"
-          onClick={() =>
-            ui.openModal({
-              type: "input",
-              title: "Edit display name",
-              label: "Display name",
-              initial: agent.actor.displayName || agent.actor.id,
-              confirmLabel: "Save",
-              onSubmit: (displayName) => onUpdate({ displayName }),
-            })
-          }
-        >
-          {agent.actor.displayName || agent.actor.id}
-          <Edit3 size={13} className="text-black/40" />
-        </button>
+      <InfoSection
+        title="Display Name"
+        action={canEdit ? "Edit display name" : undefined}
+      >
+        {canEdit ? (
+          <button
+            className="inline-flex items-center gap-2 hover:underline"
+            onClick={() =>
+              ui.openModal({
+                type: "input",
+                title: "Edit display name",
+                label: "Display name",
+                initial: agent.actor.displayName || agent.actor.id,
+                confirmLabel: "Save",
+                onSubmit: (displayName) => onUpdate({ displayName }),
+              })
+            }
+          >
+            {agent.actor.displayName || agent.actor.id}
+            <Edit3 size={13} className="text-black/40" />
+          </button>
+        ) : (
+          <span>{agent.actor.displayName || agent.actor.id}</span>
+        )}
       </InfoSection>
 
-      <InfoSection title="Description" action="Edit description">
-        <button
-          className="inline-flex items-center gap-2 text-black/55 hover:text-black"
-          onClick={() =>
-            ui.openModal({
-              type: "input",
-              title: "Edit description",
-              label: "Description",
-              initial: agent.description,
-              confirmLabel: "Save",
-              onSubmit: (description) => onUpdate({ description }),
-            })
-          }
-        >
-          {agent.description || "No description"}
-          <Edit3 size={13} className="text-black/40" />
-        </button>
+      <InfoSection
+        title="Description"
+        action={canEdit ? "Edit description" : undefined}
+      >
+        {canEdit ? (
+          <button
+            className="inline-flex items-center gap-2 text-black/55 hover:text-black"
+            onClick={() =>
+              ui.openModal({
+                type: "input",
+                title: "Edit description",
+                label: "Description",
+                initial: agent.description,
+                confirmLabel: "Save",
+                onSubmit: (description) => onUpdate({ description }),
+              })
+            }
+          >
+            {agent.description || "No description"}
+            <Edit3 size={13} className="text-black/40" />
+          </button>
+        ) : (
+          <span className="text-black/55">{agent.description || "No description"}</span>
+        )}
       </InfoSection>
 
       <ActorProfileSection agent={agent} />
@@ -1104,6 +1155,16 @@ type ProfileFileKind = "identity" | "soul";
 function ActorProfileSection({ agent }: { agent: ManagedAgent }) {
   const pushToast = useUI((s) => s.pushToast);
   const [editing, setEditing] = useState<ProfileFileKind | null>(null);
+
+  if (!agent.managed || !agent.profilePath) {
+    return (
+      <InfoSection title="Actor Profile">
+        <span className="italic text-black/45">
+          Local profile files are only available for machine-managed agents.
+        </span>
+      </InfoSection>
+    );
+  }
 
   const copy = async (value: string, label: string) => {
     try {
@@ -1343,7 +1404,7 @@ function RuntimeConfigSection({
     <section className="border-b border-black/10 px-5 py-4">
       <div className="mb-2 flex items-center gap-2 text-xs font-black uppercase tracking-widest text-black/45">
         Runtime Configuration
-        {!editing && (
+        {agent.managed && !editing && (
           <button title="Edit runtime configuration" onClick={() => setEditing(true)}>
             <Edit3 size={13} />
           </button>
@@ -1619,6 +1680,7 @@ function normalizeAgent(
         : spec.transport.kind;
   return {
     actor,
+    managed: true,
     status: info.status,
     machineId: machine.id,
     machine: machine.name,
@@ -1650,6 +1712,36 @@ function normalizeAgent(
     command: spec.transport.command,
     args: spec.transport.args ?? [],
     autostart: !!spec.autostart,
+  };
+}
+
+function normalizeRegistryAgent(actor: Actor): ManagedAgent {
+  const meta = actor._meta ?? {};
+  const description =
+    typeof meta.description === "string" ? meta.description : "Registered server actor";
+  return {
+    actor,
+    managed: false,
+    status: "registered",
+    machineId: "",
+    machine: "Server registry",
+    dataRoot: "",
+    profilePath: "",
+    identityPath: "",
+    soulPath: "",
+    providerId: "registry",
+    provider: "Registry",
+    providers: [],
+    runtime: "server actor",
+    model: "n/a",
+    reasoningEffort: "",
+    description,
+    creator: "server",
+    created: "",
+    env: [],
+    command: "n/a",
+    args: [],
+    autostart: false,
   };
 }
 

@@ -143,10 +143,20 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
       const handoff = body.match(/^\/handoff\s+@(\S+)\s*(.*)$/s);
       const atMention = body.match(/^@(\S+)\s+(.+)$/s);
       if (handoff) {
-        addHandoff(handoff[1]);
+        const target = resolveActorToken(handoff[1], actorsById);
+        if (!target) {
+          pushToast("warn", `Unknown actor @${handoff[1]}`);
+          return;
+        }
+        addHandoff(target);
         payloadText = handoff[2];
       } else if (atMention) {
-        addHandoff(atMention[1]);
+        const target = resolveActorToken(atMention[1], actorsById);
+        if (!target) {
+          pushToast("warn", `Unknown actor @${atMention[1]}`);
+          return;
+        }
+        addHandoff(target);
         payloadText = atMention[2];
       }
 
@@ -537,7 +547,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
 
 function findMentionTrigger(text: string, caret: number): MentionTrigger | null {
   const before = text.slice(0, caret);
-  const match = before.match(/@([A-Za-z0-9._-]*)$/);
+  const match = before.match(/@([^\s@]*)$/u);
   if (!match) return null;
   const filter = match[1] ?? "";
   const start = before.length - filter.length - 1;
@@ -554,14 +564,38 @@ function mentionTargets(
   actorsById: Record<string, Actor>,
 ): string[] {
   const targets = new Set<string>();
-  const re = /@([A-Za-z0-9._-]+)/g;
+  const re = /@([A-Za-z0-9._:-]+)/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(text)) !== null) {
     if (isMentionWordChar(text[match.index - 1])) continue;
-    const actorId = match[1];
-    if (actorId && actorsById[actorId]) targets.add(actorId);
+    const actorId = match[1]
+      ? resolveActorToken(match[1], actorsById)
+      : null;
+    if (actorId) targets.add(actorId);
   }
   return [...targets];
+}
+
+function resolveActorToken(
+  token: string,
+  actorsById: Record<string, Actor>,
+): string | null {
+  const clean = token.trim();
+  if (!clean) return null;
+  if (actorsById[clean]) return clean;
+
+  const exactDisplayMatches = Object.values(actorsById).filter(
+    (actor) => (actor.displayName || actor.id) === clean,
+  );
+  if (exactDisplayMatches.length === 1) return exactDisplayMatches[0].id;
+
+  const lower = clean.toLowerCase();
+  const caseFoldedDisplayMatches = Object.values(actorsById).filter(
+    (actor) => (actor.displayName || actor.id).toLowerCase() === lower,
+  );
+  return caseFoldedDisplayMatches.length === 1
+    ? caseFoldedDisplayMatches[0].id
+    : null;
 }
 
 function firstLine(value: string): string {
@@ -569,7 +603,7 @@ function firstLine(value: string): string {
 }
 
 function isMentionWordChar(ch: string | undefined): boolean {
-  return !!ch && /[A-Za-z0-9._-]/.test(ch);
+  return !!ch && /[A-Za-z0-9._:-]/.test(ch);
 }
 
 function privateChannelHandoffBlockers({

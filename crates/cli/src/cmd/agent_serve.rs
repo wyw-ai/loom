@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
-    method, stream_kind, AgentModelChoice, AgentSpec, BundleInstallMode, EventAppendResult,
-    TurnOpenResult,
+    method, stream_kind, ActorListResult, AgentModelChoice, AgentSpec, BundleInstallMode,
+    EventAppendResult, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -402,6 +403,7 @@ impl AgentPaths {
             "JOI_SCOPE_KIND".into(),
             scope_kind_name(scope_ref.kind).to_string(),
         );
+        insert_current_time_env(&mut env);
         if let Some(active) = active {
             env.insert("JOI_TURN_ID".into(), active.id.clone());
             env.insert("JOI_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
@@ -626,6 +628,10 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
+    /// Actor id → display name cache used when rendering handoff prompts.
+    /// The server keeps actor rows authoritative; this cache is a fallback
+    /// when actor/list is temporarily unavailable.
+    actor_display_cache: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -709,6 +715,10 @@ impl WorkerState {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, model))
             .or_else(|| default_model_for_spec(&spec));
+        let mut actor_display_cache = HashMap::new();
+        if !spec.actor.display_name.trim().is_empty() {
+            actor_display_cache.insert(spec.actor.id.clone(), spec.actor.display_name.clone());
+        }
         Self {
             actor_id,
             spec,
@@ -725,6 +735,7 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
+            actor_display_cache: Mutex::new(actor_display_cache),
         }
     }
 
@@ -836,6 +847,25 @@ impl WorkerState {
         self.selected_model
             .lock()
             .expect("selected_model poisoned")
+            .clone()
+    }
+
+    fn cache_actor_displays(&self, actors: impl IntoIterator<Item = (String, String)>) {
+        let mut cache = self
+            .actor_display_cache
+            .lock()
+            .expect("actor_display_cache poisoned");
+        for (id, display) in actors {
+            if !id.trim().is_empty() && !display.trim().is_empty() {
+                cache.insert(id, display);
+            }
+        }
+    }
+
+    fn actor_display_snapshot(&self) -> HashMap<String, String> {
+        self.actor_display_cache
+            .lock()
+            .expect("actor_display_cache poisoned")
             .clone()
     }
 
@@ -1156,6 +1186,8 @@ fn build_adapter(
             .entry("JOI_AGENT_BUNDLE_VERSION".into())
             .or_insert_with(|| bundle_paths.version.clone());
     }
+    insert_static_local_time_env(&mut process_env);
+    insert_static_local_time_env(&mut command_env);
     let process_args: Vec<String> = spec
         .transport
         .args
@@ -1850,7 +1882,7 @@ async fn dispatch_handoff(
                 }),
             )
             .await?;
-        let user_text = render_prompt(&trigger);
+        let user_text = render_trigger_prompt(client, state, &trigger).await;
         let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
         let active = ActiveTurn {
             id: turn_res.turn.id.clone(),
@@ -1947,6 +1979,301 @@ fn render_prompt(trigger: &Event) -> String {
     serde_json::to_string(&trigger.payload).unwrap_or_default()
 }
 
+async fn render_trigger_prompt(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    trigger: &Event,
+) -> String {
+    let actor_names = actor_display_map_for_prompt(client, state).await;
+    render_trigger_prompt_with_names(
+        &state.actor_id,
+        &state.spec.actor.display_name,
+        trigger,
+        &actor_names,
+    )
+}
+
+async fn actor_display_map_for_prompt(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+) -> HashMap<String, String> {
+    match client
+        .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
+        .await
+    {
+        Ok(result) => {
+            state.cache_actor_displays(
+                result
+                    .actors
+                    .into_iter()
+                    .map(|actor| (actor.id, actor.display_name)),
+            );
+        }
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                %err,
+                "actor/list failed while rendering prompt; using cached actor display names",
+            );
+        }
+    }
+    state.actor_display_snapshot()
+}
+
+fn render_trigger_prompt_with_names(
+    local_actor_id: &str,
+    local_display_name: &str,
+    trigger: &Event,
+    actor_names: &HashMap<String, String>,
+) -> String {
+    let text = annotate_actor_mentions(&render_prompt(trigger), actor_names);
+    let from = actor_label(&trigger.actor_id, actor_names);
+    let me = actor_label_with_fallback(local_actor_id, local_display_name, actor_names);
+    let handoff_targets = handoff_target_ids(trigger);
+    let target_labels = handoff_targets
+        .iter()
+        .map(|id| actor_label(id, actor_names))
+        .collect::<Vec<_>>();
+    let delivery = if handoff_targets.iter().any(|id| id == local_actor_id) {
+        "explicit handoff to you"
+    } else if handoff_targets.is_empty() {
+        "scope message"
+    } else {
+        "explicit handoff to another actor"
+    };
+    let visible = if target_labels.is_empty() {
+        format!("{from}: {text}")
+    } else {
+        format!("handoff -> {}: {text}", target_labels.join(", "))
+    };
+    let scope_kind = scope_kind_name(trigger.scope.kind);
+
+    let mut out = format!(
+        "=== Latest Joi message ===\n\
+         Your actor: {me}\n\
+         From: {from}\n\
+         Scope: {scope_kind}:{scope_id}\n\
+         Event id: {event_id}\n\
+         Delivery: {delivery}\n",
+        scope_id = trigger.scope.id,
+        event_id = trigger.id,
+    );
+    if !target_labels.is_empty() {
+        out.push_str("Handoff target(s): ");
+        out.push_str(&target_labels.join(", "));
+        out.push('\n');
+    }
+    out.push_str("Visible message:\n");
+    out.push_str(&visible);
+    out
+}
+
+fn handoff_target_ids(trigger: &Event) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for relation in &trigger.relations {
+        if matches!(relation.kind, RelationKind::HandsOffTo)
+            && relation.target.kind == RefKind::Actor
+            && seen.insert(relation.target.id.clone())
+        {
+            targets.push(relation.target.id.clone());
+        }
+    }
+    targets
+}
+
+fn actor_label(actor_id: &str, actor_names: &HashMap<String, String>) -> String {
+    actor_label_with_fallback(actor_id, actor_id, actor_names)
+}
+
+fn actor_label_with_fallback(
+    actor_id: &str,
+    fallback_display: &str,
+    actor_names: &HashMap<String, String>,
+) -> String {
+    let display = actor_names
+        .get(actor_id)
+        .map(String::as_str)
+        .unwrap_or(fallback_display)
+        .trim();
+    if display.is_empty() || display == actor_id {
+        format!("@{actor_id}")
+    } else {
+        format!("{display} (@{actor_id})")
+    }
+}
+
+fn annotate_actor_mentions(text: &str, actor_names: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0;
+    while idx < text.len() {
+        let ch = text[idx..].chars().next().expect("idx is char boundary");
+        if ch == '@' {
+            let token_start = idx + ch.len_utf8();
+            let mut token_end = token_start;
+            for (offset, candidate) in text[token_start..].char_indices() {
+                if is_actor_ref_char(candidate) {
+                    token_end = token_start + offset + candidate.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if token_end > token_start {
+                let actor_id = &text[token_start..token_end];
+                if actor_names.contains_key(actor_id) {
+                    out.push_str(&actor_label(actor_id, actor_names));
+                    idx = token_end;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+fn is_actor_ref_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')
+}
+
+fn actor_identity_manifest(actor_id: &str, display_name: &str) -> String {
+    let mut actor_names = HashMap::new();
+    if !display_name.trim().is_empty() {
+        actor_names.insert(actor_id.to_string(), display_name.to_string());
+    }
+    let label = actor_label_with_fallback(actor_id, display_name, &actor_names);
+    format!(
+        "=== System: Joi actor identity ===\n\
+         You are {label}.\n\
+         Treat this as your stable runtime identity. Other @actors in the\n\
+         latest message are routing targets or people being discussed; they\n\
+         are not your identity."
+    )
+}
+
+#[derive(Debug, Clone)]
+struct LocalTimeInfo {
+    local_rfc3339: String,
+    utc_rfc3339: String,
+    utc_offset: String,
+    zone_abbrev: String,
+    timezone_name: Option<String>,
+}
+
+fn local_time_info() -> LocalTimeInfo {
+    let local = Local::now();
+    let utc = local.with_timezone(&Utc);
+    LocalTimeInfo {
+        local_rfc3339: local.to_rfc3339_opts(SecondsFormat::Secs, false),
+        utc_rfc3339: utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        utc_offset: local.format("%:z").to_string(),
+        zone_abbrev: local.format("%Z").to_string(),
+        timezone_name: local_timezone_name(),
+    }
+}
+
+fn local_time_manifest() -> String {
+    let info = local_time_info();
+    let timezone = timezone_label(&info);
+    format!(
+        "=== System: Local time context ===\n\
+         Current local time: {local}\n\
+         Current UTC time: {utc}\n\
+         Local timezone: {timezone}\n\
+         UTC offset: {offset}\n\
+         Joi protocol timestamps are RFC3339 UTC, often ending in `Z`.\n\
+         Convert those timestamps to the local timezone above before comparing\n\
+         them with GUI/chat timestamps or describing times to the user.",
+        local = info.local_rfc3339,
+        utc = info.utc_rfc3339,
+        timezone = timezone,
+        offset = info.utc_offset,
+    )
+}
+
+fn insert_static_local_time_env(env: &mut BTreeMap<String, String>) {
+    let info = local_time_info();
+    env.entry("JOI_LOCAL_TIMEZONE".into())
+        .or_insert_with(|| timezone_env_value(&info));
+    env.entry("JOI_LOCAL_TIMEZONE_LABEL".into())
+        .or_insert_with(|| timezone_label(&info));
+    env.entry("JOI_LOCAL_UTC_OFFSET".into())
+        .or_insert_with(|| info.utc_offset.clone());
+    if !info.zone_abbrev.is_empty() {
+        env.entry("JOI_LOCAL_TIMEZONE_ABBR".into())
+            .or_insert_with(|| info.zone_abbrev.clone());
+    }
+    if let Some(name) = info.timezone_name {
+        env.entry("TZ".into()).or_insert(name);
+    }
+}
+
+fn insert_current_time_env(env: &mut BTreeMap<String, String>) {
+    let info = local_time_info();
+    env.insert("JOI_CURRENT_TIME".into(), info.local_rfc3339.clone());
+    env.insert("JOI_CURRENT_TIME_UTC".into(), info.utc_rfc3339.clone());
+    env.insert("JOI_LOCAL_TIMEZONE".into(), timezone_env_value(&info));
+    env.insert("JOI_LOCAL_TIMEZONE_LABEL".into(), timezone_label(&info));
+    env.insert("JOI_LOCAL_UTC_OFFSET".into(), info.utc_offset.clone());
+    if !info.zone_abbrev.is_empty() {
+        env.insert("JOI_LOCAL_TIMEZONE_ABBR".into(), info.zone_abbrev.clone());
+    }
+    if let Some(name) = info.timezone_name {
+        env.insert("TZ".into(), name);
+    }
+}
+
+fn timezone_env_value(info: &LocalTimeInfo) -> String {
+    info.timezone_name
+        .clone()
+        .unwrap_or_else(|| info.utc_offset.clone())
+}
+
+fn timezone_label(info: &LocalTimeInfo) -> String {
+    match (
+        info.timezone_name.as_deref(),
+        info.zone_abbrev.trim().is_empty(),
+    ) {
+        (Some(name), false) => format!("{name} ({}, UTC{})", info.zone_abbrev, info.utc_offset),
+        (Some(name), true) => format!("{name} (UTC{})", info.utc_offset),
+        (None, false) => format!("{} (UTC{})", info.zone_abbrev, info.utc_offset),
+        (None, true) => format!("UTC{}", info.utc_offset),
+    }
+}
+
+fn local_timezone_name() -> Option<String> {
+    std::env::var("TZ")
+        .ok()
+        .and_then(|tz| normalize_timezone_value(&tz))
+        .or_else(timezone_from_localtime_link)
+}
+
+fn timezone_from_localtime_link() -> Option<String> {
+    let link = std::fs::read_link("/etc/localtime").ok()?;
+    let raw = link.to_string_lossy();
+    for marker in ["/zoneinfo/", "/usr/share/zoneinfo/"] {
+        if let Some((_, suffix)) = raw.split_once(marker) {
+            return normalize_timezone_value(suffix);
+        }
+    }
+    None
+}
+
+fn normalize_timezone_value(value: &str) -> Option<String> {
+    let mut value = value.trim().trim_start_matches(':').trim();
+    if let Some(stripped) = value.strip_prefix("posix/") {
+        value = stripped;
+    }
+    if let Some(stripped) = value.strip_prefix("right/") {
+        value = stripped;
+    }
+    if value.is_empty() || value == "localtime" || value.starts_with('/') || value.contains('\0') {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
 /// configure identity / memory fall back to the pre-envelope shape.
@@ -1956,6 +2283,8 @@ async fn compose_envelope_prompt(
     scope: &ScopeRef,
     user_text: &str,
 ) -> PromptTelemetry {
+    let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let runtime_context = local_time_manifest();
     let scope_bootstrap =
         if state.take_seed_slot(&scope.id) || command_transport_without_resume(&state.spec) {
             seed_manifest(&state.actor_id, scope)
@@ -1967,23 +2296,24 @@ async fn compose_envelope_prompt(
     let memory_spec = state.spec.memory.as_ref();
 
     if identity_spec.is_none() && memory_spec.is_none() {
-        let sections = if scope_bootstrap.is_empty() {
-            vec![agent_runtime::PromptSection {
-                name: "user_message",
-                content: user_text.to_string(),
-            }]
-        } else {
-            vec![
-                agent_runtime::PromptSection {
-                    name: "scope_bootstrap",
-                    content: scope_bootstrap.clone(),
-                },
-                agent_runtime::PromptSection {
-                    name: "user_message",
-                    content: format!("=== User message ===\n{user_text}"),
-                },
-            ]
-        };
+        let mut sections = vec![agent_runtime::PromptSection {
+            name: "actor_context",
+            content: actor_context.clone(),
+        }];
+        if !scope_bootstrap.is_empty() {
+            sections.push(agent_runtime::PromptSection {
+                name: "scope_bootstrap",
+                content: scope_bootstrap.clone(),
+            });
+        }
+        sections.push(agent_runtime::PromptSection {
+            name: "runtime_context",
+            content: runtime_context.clone(),
+        });
+        sections.push(agent_runtime::PromptSection {
+            name: "user_message",
+            content: format!("=== User message ===\n{user_text}"),
+        });
         let content = sections
             .iter()
             .map(|section| section.content.as_str())
@@ -1996,11 +2326,13 @@ async fn compose_envelope_prompt(
 
     let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
+            actor_context: &actor_context,
             profile_dir: &state.profile_dir,
             identity_spec,
             memory_spec,
             channel_id: channel_id.as_deref(),
             thread_context: "",
+            runtime_context: &runtime_context,
             user_message: user_text,
             scope_bootstrap: &scope_bootstrap,
         });
@@ -2051,10 +2383,12 @@ fn prompt_stats(text: &str) -> PromptStats {
 
 fn prompt_section_label(name: &str) -> &str {
     match name {
+        "actor_context" => "Actor Context",
         "identity" => "Identity",
         "soul" => "Soul",
         "bootstrap_memory" => "Bootstrap Memory",
         "turn_memory" => "Turn Memory",
+        "runtime_context" => "Runtime Context",
         "scope_bootstrap" => "Scope Bootstrap",
         "user_message" => "Latest Message",
         other => other,
@@ -2781,7 +3115,71 @@ mod tests {
             env.get("JOI_TRIGGER_ACTOR").map(String::as_str),
             Some("human_alice")
         );
+        assert!(env.get("JOI_CURRENT_TIME").is_some());
+        assert!(env.get("JOI_CURRENT_TIME_UTC").is_some());
+        assert!(env.get("JOI_LOCAL_UTC_OFFSET").is_some());
+        assert!(env.get("JOI_LOCAL_TIMEZONE").is_some());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_time_manifest_tells_agents_to_convert_utc_protocol_timestamps() {
+        let manifest = local_time_manifest();
+        assert!(manifest.contains("Current local time:"));
+        assert!(manifest.contains("Current UTC time:"));
+        assert!(manifest.contains("RFC3339 UTC"));
+        assert!(manifest.contains("GUI/chat timestamps"));
+    }
+
+    #[test]
+    fn actor_identity_manifest_names_local_actor_with_display_and_id() {
+        let manifest = actor_identity_manifest("actor_agent_g_1234", "G仔");
+
+        assert!(manifest.contains("You are G仔 (@actor_agent_g_1234)."));
+        assert!(manifest.contains("Other @actors"));
+    }
+
+    #[test]
+    fn trigger_prompt_restores_handoff_semantics_and_display_names() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_xingchu".into(), "星楚".into());
+        actor_names.insert("actor_agent_g_1234".into(), "G仔".into());
+        actor_names.insert("actor_agent_emma_142b6f2d".into(), "Emma".into());
+        let trigger = Event {
+            id: "evt_1".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_human_xingchu".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_story".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({
+                "contentType": "text/markdown",
+                "text": "生成一个童话小说，然后发给@actor_agent_emma_142b6f2d读下"
+            }),
+            relations: vec![Relation {
+                kind: RelationKind::HandsOffTo,
+                target: Ref {
+                    kind: RefKind::Actor,
+                    id: "actor_agent_g_1234".into(),
+                    _meta: None,
+                },
+                _meta: None,
+            }],
+            _meta: None,
+        };
+
+        let prompt =
+            render_trigger_prompt_with_names("actor_agent_g_1234", "G仔", &trigger, &actor_names);
+
+        assert!(prompt.contains("Your actor: G仔 (@actor_agent_g_1234)"));
+        assert!(prompt.contains("From: 星楚 (@actor_human_xingchu)"));
+        assert!(prompt.contains("Delivery: explicit handoff to you"));
+        assert!(prompt.contains("handoff -> G仔 (@actor_agent_g_1234):"));
+        assert!(prompt.contains("Emma (@actor_agent_emma_142b6f2d)"));
     }
 
     #[test]

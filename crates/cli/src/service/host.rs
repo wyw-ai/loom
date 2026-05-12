@@ -663,11 +663,13 @@ async fn supervise_instances(
 /// thread ids; the caller treats any active instance whose
 /// `instance_id` is missing from this set as "thread closed".
 ///
-/// On the first call, opens a fresh connection as `actor_id` and
-/// caches it in `slot`. Subsequent calls reuse the cached client. If
-/// the cached client has gone bad (e.g. server restarted), the caller
-/// sees the error, logs it, and we drop the slot so the next tick
-/// reconnects.
+/// On the first call, opens a fresh observer connection as `actor_id`
+/// and caches it in `slot`. The observer binds actor identity for
+/// `thread/list` authorization but does not claim the actor inbox, so it
+/// cannot preempt the service instance runtime. Subsequent calls reuse
+/// the cached client. If the cached client has gone bad (e.g. server
+/// restarted), the caller sees the error, logs it, and we drop the slot
+/// so the next tick reconnects.
 async fn thread_visibility_check(
     slot: &mut Option<Arc<crate::client::Client>>,
     server_url: &str,
@@ -682,9 +684,9 @@ async fn thread_visibility_check(
             .await
             .with_context(|| format!("watcher ws connect {server_url}"))?;
         client
-            .open_connection_as(actor_id, "service", None)
+            .open_observer_connection_as(actor_id, "service", None)
             .await
-            .with_context(|| format!("watcher connection/open as {actor_id}"))?;
+            .with_context(|| format!("watcher observer connection/open as {actor_id}"))?;
         *slot = Some(client);
     }
     let client = slot.as_ref().expect("just initialised");

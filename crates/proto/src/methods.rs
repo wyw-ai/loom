@@ -101,6 +101,11 @@ pub struct ConnectionOpenParams {
     pub actor_kind: Option<ActorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Whether this connection should become the actor-inbox owner.
+    /// Long-lived runtimes keep the default `true`; observer clients can
+    /// bind identity for authorization without preempting the runtime.
+    #[serde(default = "default_true")]
+    pub claim_inbox: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Endpoint>,
 }
@@ -1763,9 +1768,13 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<ServiceBind>,
     /// Optional JSON-Schema fragment describing `--params` accepted at
-    /// `joi service start --in <thread> --params {...}`. Currently only
-    /// surfaced for documentation; runtime does not enforce.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `joi service start --in <thread> --params {...}`. The CLI validates
+    /// start params against the shallow subset it supports.
+    #[serde(
+        default,
+        alias = "params_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub params_schema: Option<Value>,
     /// Plugin-specific configuration. Parsed by the plugin itself, not by
     /// the host. Schema is the plugin's contract (see §7 for am, §8 for
@@ -2201,6 +2210,26 @@ mod service_spec_tests {
         let mut spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
         spec.normalize();
         assert!(spec.params_schema.is_some());
+    }
+
+    #[test]
+    fn deserialize_accepts_top_level_snake_case_params_schema() {
+        let raw = json!({
+            "id": "x",
+            "kind": "scheduler",
+            "actor": {"id": "svc_x", "kind": "service"},
+            "params_schema": {"required": ["mr_url"]},
+            "config": {"jobs": []}
+        });
+        let spec: ServiceSpec = serde_json::from_value(raw).expect("parse");
+        assert_eq!(
+            spec.params_schema
+                .as_ref()
+                .and_then(|schema| schema.get("required"))
+                .and_then(|required| required.as_array())
+                .map(|required| required.len()),
+            Some(1)
+        );
     }
 
     #[test]

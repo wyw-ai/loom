@@ -46,7 +46,12 @@ impl Subscriptions {
 
     /// Bind this connection to `actor_id`. The connection always learns its
     /// actor identity (so it can send events as that actor); whether it also
-    /// becomes the actor-inbox owner depends on `actor_kind`:
+    /// becomes the actor-inbox owner depends on `claim_inbox` and
+    /// `actor_kind`:
+    ///
+    /// * `claim_inbox = false` — never take the inbox. Observer connections
+    ///   use this to authorize read-only RPCs as an actor without stealing
+    ///   runtime delivery.
     ///
     /// * `Agent` / `Service` — always takes over. Long-lived host processes
     ///   (`joi daemon`, `joi service serve`) claiming an actor means
@@ -65,10 +70,25 @@ impl Subscriptions {
     /// Stale entries (binding points at a conn no longer in `connections`)
     /// are evicted unconditionally, so a fresh host process after a clean
     /// shutdown also takes over.
-    pub fn bind_actor(&self, connection_id: &str, actor_id: String, actor_kind: ActorKind) {
+    pub fn bind_actor(
+        &self,
+        connection_id: &str,
+        actor_id: String,
+        actor_kind: ActorKind,
+        claim_inbox: bool,
+    ) {
         let mut inner = self.inner.write();
         if let Some(c) = inner.connections.get_mut(connection_id) {
             c.actor_id = Some(actor_id.clone());
+        }
+        if !claim_inbox {
+            tracing::debug!(
+                actor = %actor_id,
+                connection = %connection_id,
+                kind = ?actor_kind,
+                "actor connection bound as observer; inbox owner unchanged",
+            );
+            return;
         }
         let take_inbox = match inner.actor_conn.get(&actor_id) {
             None => true,
@@ -370,13 +390,13 @@ mod tests {
         subs.add_connection(make_conn("conn_old"));
         subs.add_connection(make_conn("conn_new"));
 
-        subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service);
+        subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service, true);
         assert_eq!(
             subs.inbox_owner("svc_am_bridge").as_deref(),
             Some("conn_old")
         );
 
-        subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Service);
+        subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Service, true);
         assert_eq!(
             subs.inbox_owner("svc_am_bridge").as_deref(),
             Some("conn_new"),
@@ -394,13 +414,44 @@ mod tests {
         subs.add_connection(make_conn("conn_host"));
         subs.add_connection(make_conn("conn_shell"));
 
-        subs.bind_actor("conn_host", "svc_am_bridge".into(), ActorKind::Service);
-        subs.bind_actor("conn_shell", "svc_am_bridge".into(), ActorKind::Human);
+        subs.bind_actor(
+            "conn_host",
+            "svc_am_bridge".into(),
+            ActorKind::Service,
+            true,
+        );
+        subs.bind_actor("conn_shell", "svc_am_bridge".into(), ActorKind::Human, true);
 
         assert_eq!(
             subs.inbox_owner("svc_am_bridge").as_deref(),
             Some("conn_host"),
             "human-kind shell must not preempt the long-lived service host",
+        );
+    }
+
+    #[test]
+    fn observer_connection_never_preempts_live_binding() {
+        let subs = Subscriptions::new();
+        subs.add_connection(make_conn("conn_host"));
+        subs.add_connection(make_conn("conn_observer"));
+
+        subs.bind_actor(
+            "conn_host",
+            "svc_mr_detector".into(),
+            ActorKind::Service,
+            true,
+        );
+        subs.bind_actor(
+            "conn_observer",
+            "svc_mr_detector".into(),
+            ActorKind::Service,
+            false,
+        );
+
+        assert_eq!(
+            subs.inbox_owner("svc_mr_detector").as_deref(),
+            Some("conn_host"),
+            "observer must share actor identity without stealing actor-inbox delivery",
         );
     }
 
@@ -411,11 +462,11 @@ mod tests {
         // a connection that is no longer in the table.
         let subs = Subscriptions::new();
         subs.add_connection(make_conn("conn_old"));
-        subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service);
+        subs.bind_actor("conn_old", "svc_am_bridge".into(), ActorKind::Service, true);
         subs.remove_connection("conn_old");
 
         subs.add_connection(make_conn("conn_new"));
-        subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Human);
+        subs.bind_actor("conn_new", "svc_am_bridge".into(), ActorKind::Human, true);
         assert_eq!(
             subs.inbox_owner("svc_am_bridge").as_deref(),
             Some("conn_new")
@@ -444,9 +495,9 @@ mod tests {
             actor_id: None,
             tx: tx_other,
         });
-        subs.bind_actor("conn_a", "actor_alice".into(), ActorKind::Human);
-        subs.bind_actor("conn_b", "actor_alice".into(), ActorKind::Human);
-        subs.bind_actor("conn_other", "actor_bob".into(), ActorKind::Human);
+        subs.bind_actor("conn_a", "actor_alice".into(), ActorKind::Human, true);
+        subs.bind_actor("conn_b", "actor_alice".into(), ActorKind::Human, true);
+        subs.bind_actor("conn_other", "actor_bob".into(), ActorKind::Human, true);
 
         let delivered = subs.send_to_actor_connections(
             "actor_alice",

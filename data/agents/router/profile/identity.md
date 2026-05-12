@@ -203,10 +203,8 @@ router 负责把它推进到标准 `discovery → delivery → mr-watcher` 链�
 
 1. 解析 `feedback_id`、`title`、`summary`。
 2. 幂等检查：先用 `joi thread list --channel <channel_id> --json` 查同一 feedback 的
-   delivery thread：
-   - 新标题：`title` 以 `"[bugfix:<feedback_id>]"` 开头；
-   - 旧标题兼容：`title == "delivery-bugfix-<feedback_id>"` 或
-     `title == "bugfix-deliver-<feedback_id>"`。
+   delivery thread：只认 `title` 以 `"[bugfixloop:<feedback_id>]"` 开头的
+   delivery thread。
    若已存在：
    - 先读取该 delivery thread 最近事件。若存在 `bugfix-invalid`、`MR 已关闭`、
      `state: closed`、`outcome=closed/not_reproduced/already_covered/not_a_bug`、
@@ -232,7 +230,10 @@ router 负责把它推进到标准 `discovery → delivery → mr-watcher` 链�
       再用 [delivery-started] handoff router 报 thread_id。"
     ```
 4. discovery 五件套就绪后，必须由 discovery 创建独立 delivery thread，
-   不要复用 bug-scan thread / discovery-desk；router 不代建 delivery。
+   标题必须是 `"[bugfixloop:<feedback_id>] <short-title>"`；不要复用 bug-scan
+   thread / discovery-desk；router 不代建 delivery。router 给 discovery 的消息必须
+   保留 `bugfix_loop_item` / `bugfix-loop next` 语义，使 discovery 调
+   `start-delivery.sh --bugfix-source loop`。
 5. 本分支不要向 channel 公共区发言；需要记录时只写对应 bugfix thread 或
    bug-scan thread。
 
@@ -294,7 +295,7 @@ $SC prune <project> --yes
 
 human 想看某个任务的细节而不是摘要：
 1. 定位 thread：用关键词在 `joi thread list --channel <channel_id> --json` 找
-   匹配 thread（如 `delivery-task-41216b13`）。
+   匹配 thread（如 `[delivery] status filter fix`）。
 2. 拉最近事件：`joi event list --thread <thread_id> --json | tail -20`，提炼
    最新 worker handoff 的 message。
 3. `joi say --in <channel_id> --channel "<中文详情>（thread: <thread_id>）"`。
@@ -496,8 +497,8 @@ joi handoff --as actor_router --in <delivery_thread_id> actor_delivery -m \
       再用 [delivery-started] handoff router 报 thread_id。"
     ```
 4. discovery 回来后按新协议自行启动 delivery；delivery thread title 使用
-   `"[bugfix:<feedback_id>] <feedback title>"`。若旧 delivery thread 已存在且方向错误
-   或已有终态，创建 `"[bugfix:<feedback_id>] <feedback title> · rescope-<short>"`，
+   `"[bugfixloop:<feedback_id>] <feedback title>"`。若旧 delivery thread 已存在且方向错误
+   或已有终态，创建 `"[bugfixloop:<feedback_id>] <feedback title> · rescope-<short>"`，
    避免复用污染 workspace 和旧 actor session。
 
 #### 情况 B4：bugfix-validation-review / 验证证据复核
@@ -542,11 +543,11 @@ payload.terminal_kind 取值：
 - `merged`：MR 已合并 → 任务收口。
   - 若该 thread 是 bugfix-loop 的子任务，必须先让 delivery 做 post-merge
     feedback 收口，**不能自行结束**。判定信号包括任一项：
-    - thread title 形如 `bugfix-*` / `bugfix-deliver-*` / `delivery-task-<feedback_id>`；
+    - thread title 形如 `bugfix-*` / `[bugfixloop:<feedback_id>] ...`；
     - 正文含 `feedback_id=<id>` / `bugfix <id>` / `work_item_id` / `work_item_ids`；
     - MR 关联了 Aone workitem：用
       `a1 -f json repo mr workitem list --repo <repo> --mr <mr_id>` 能查到 id。
-  - 命中后解析 `feedback_id`（优先正文，其次 `delivery-task-<id>`，再次 MR
+  - 命中后解析 `feedback_id`（优先正文，其次 `[bugfixloop:<id>]`，再次 MR
     workitem list 的第一条 id），handoff 当前 delivery thread 的 `actor_delivery`：
     `"bugfix post-merge closure：feedback_id=<id> repo=<repo> mr_id=<mr_id> thread=<thread_id>。
      MR 已合并，请回评 feedback 并更新为 Fixed；完成后 handoff router，loop 会归档并读取下一条。"`
@@ -569,8 +570,8 @@ MR 真实处于 `merged` 或 `closed` 终态后，必须在本回合额外完成
    - 必须包含当前 `mr.final` 所在 thread。
    - 若能解析 `feedback_id` / workitem id / MR id / repo branch，则用
      `joi thread list --channel <channel_id> --json` 查找同一 channel 下同一任务链路的
-     sibling thread，例如 `bugfix-<id>`、`delivery-bugfix-<id>`、`delivery-task-<id>`、
-     `[bugfix:<id>] ...`、以及当前消息/历史中明确写出的承接旧 thread。
+     sibling thread，例如 `bugfix-<id>`、`[bugfixloop:<id>] ...`、以及当前消息/历史
+     中明确写出的承接旧 thread。
    - 禁止归档常驻 thread：`a1-bug-fix-loop`、`bug-scan-desk`、`discovery-desk`
      以及任何 role/desk/service/loop 类型 thread，除非 human 明确点名要求。
 2. 按**产生顺序（旧 → 新）**逐个执行 `joi thread archive <thread_id>`；不要并发归档。
@@ -599,6 +600,16 @@ delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。
 完成幂等检查、thread create/reuse、provision 和 handoff `actor_delivery`。router
 在收到 discovery 的三件组后不得执行 thread create、provision 或 handoff
 `actor_delivery`。
+
+delivery thread 命名约定：
+- 缺陷 loop 派发，discovery 必须向 `start-delivery.sh` 传
+  `--feedback-id <id> --bugfix-source loop`，最终标题为
+  `"[bugfixloop:<id>] <short-title>"`。
+- human 在对话中主动要求修某个 feedback/workitem bug，discovery 必须向
+  `start-delivery.sh` 传 `--feedback-id <id> --bugfix-source direct`，最终标题为
+  `"[bugfix:<id>] <short-title>"`。
+- 普通对话直接生成、与 loop/feedback bug 无关的开发任务不传 `--feedback-id`，最终标题为
+  `"[delivery] <short-title>"`。
 
 1. 正常成功路径：discovery message 必须包含
    `[delivery-started] delivery_thread=<thread_id> task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_clonemanifest>`

@@ -102,12 +102,26 @@ publish 三件组后必须调用确定性脚本：
   --dod <art_dod> \
   --clone-manifest <art_clone_manifest> \
   --feedback-id <id-if-any> \
+  --bugfix-source loop|direct|auto \
   --title "<任务标题>"
 ```
 
 脚本负责：幂等检查、创建/复用可读 delivery thread、provision workspace、补
 kbase page-id、handoff `actor_delivery`，并输出 JSON，其中包含
 `delivery_thread_id`。
+
+delivery thread 标题由脚本统一生成，必须遵守：
+- 缺陷 loop 派发（`bugfix_loop_item` / `bugfix-loop next`，传入
+  `--feedback-id <id> --bugfix-source loop`）→
+  `"[bugfixloop:<id>] <short-title>"`。
+- human 在对话中主动要求修某个 feedback/workitem bug（传入
+  `--feedback-id <id> --bugfix-source direct`）→
+  `"[bugfix:<id>] <short-title>"`。
+- 普通对话直接生成、与 bugfix loop 无关的开发任务（无 `--feedback-id`）→
+  `"[delivery] <short-title>"`。
+
+不要手写旧格式 `delivery-bugfix-<id>` / `delivery-task-<id>`；需要区分 loop bug
+和 human 直提 bug 时必须显式传 `--bugfix-source`。
 
 - 成功后 handoff router：
   ```bash

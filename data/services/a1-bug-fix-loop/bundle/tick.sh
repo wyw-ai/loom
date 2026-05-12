@@ -222,21 +222,28 @@ update_bug_queue_item() {
 }
 
 find_delivery_thread_for_feedback() {
-    local fid="$1" list
+    local fid="$1" list found
     [[ "$DRY_RUN" -eq 1 ]] && return 0
     joi_avail || return 0
-    list=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null) || return 0
-    jq -r --arg fid "$fid" '
+
+    find_in_thread_json() {
+      jq -r --arg fid "$fid" '
       (.threads // .items // .)[]?
       | (.title // .name // "") as $title
-      | select(
-          ($title | startswith("[bugfix:" + $fid + "]"))
-          or $title == ("delivery-bugfix-" + $fid)
-          or $title == ("bugfix-deliver-" + $fid)
-          or $title == ("delivery-task-" + $fid)
-        )
+      | select($title | startswith("[bugfixloop:" + $fid + "]"))
       | (.id // .thread_id // .thread.id // empty)
-    ' <<<"$list" 2>/dev/null | head -n 1
+    ' 2>/dev/null | head -n 1
+    }
+
+    list=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    found=$(find_in_thread_json <<<"$list")
+    if [[ -n "$found" ]]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+
+    list=$(joi thread archive-list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    find_in_thread_json <<<"$list"
 }
 
 mr_is_merged() {
@@ -319,7 +326,7 @@ feedback_is_nonfixed_terminal() {
     local fid="$1" status
     status=$(feedback_status_value "$fid" || true)
     case "$status" in
-        Closed|已关闭|Close|关闭|Won\'t\ Fix|Won’t\ Fix|Wont\ Fix|不修复|无需修复|Not\ a\ Bug|Invalid|无效)
+        Closed|已关闭|Close|关闭|Won\'tfix|Won’tfix|Wontfix|Won\'t\ Fix|Won’t\ Fix|Wont\ Fix|不修复|无需修复|Not\ a\ Bug|Invalid|无效)
             printf 'true'
             ;;
         *)

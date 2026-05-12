@@ -1061,6 +1061,19 @@ fn expand_first_run_argv(
         .iter()
         .map(|a| expand_template(a, cfg, request, None, prompt))
         .collect();
+    if matches!(cfg.prompt_via, PromptVia::Args) {
+        let already = cfg.args.iter().any(|a| a.contains("{prompt}"));
+        if !already {
+            if let Some(pos) = prompt_flag_without_value(&argv) {
+                let mut model_args = Vec::new();
+                append_model_args(&mut model_args, cfg, request, None, prompt);
+                let model_len = model_args.len();
+                argv.splice(pos..pos, model_args);
+                argv.insert(pos + model_len + 1, prompt.to_string());
+                return argv;
+            }
+        }
+    }
     append_model_args(&mut argv, cfg, request, None, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
         // Only append when the template didn't already place {prompt} itself.
@@ -1083,6 +1096,19 @@ fn expand_argv(
         .iter()
         .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
+    if matches!(cfg.prompt_via, PromptVia::Args) {
+        let already = template.iter().any(|a| a.contains("{prompt}"));
+        if !already {
+            if let Some(pos) = prompt_flag_without_value(&argv) {
+                let mut model_args = Vec::new();
+                append_model_args(&mut model_args, cfg, request, session_id, prompt);
+                let model_len = model_args.len();
+                argv.splice(pos..pos, model_args);
+                argv.insert(pos + model_len + 1, prompt.to_string());
+                return argv;
+            }
+        }
+    }
     append_model_args(&mut argv, cfg, request, session_id, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
         let already = template.iter().any(|a| a.contains("{prompt}"));
@@ -1091,6 +1117,12 @@ fn expand_argv(
         }
     }
     argv
+}
+
+fn prompt_flag_without_value(argv: &[String]) -> Option<usize> {
+    argv.iter()
+        .rposition(|arg| matches!(arg.as_str(), "-p" | "--prompt"))
+        .filter(|pos| *pos + 1 == argv.len())
 }
 
 fn expand_template(
@@ -1244,6 +1276,28 @@ mod tests {
                 "-n".to_string(),
                 "--model".to_string(),
                 "model_a".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_inserts_model_args_before_prompt_flag_value() {
+        let mut cfg = cfg();
+        cfg.args = vec!["--json".into(), "-p".into()];
+        cfg.model_args = vec!["--model".into(), "{model}".into()];
+        let mut request = prompt("hello");
+        request.model = Some("model_a".into());
+
+        let argv = expand_first_run_argv(&cfg, &request, "hello");
+
+        assert_eq!(
+            argv,
+            vec![
+                "--json".to_string(),
+                "--model".to_string(),
+                "model_a".to_string(),
+                "-p".to_string(),
                 "hello".to_string(),
             ]
         );

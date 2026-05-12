@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use proto::methods::ServiceSpec;
 use tokio::sync::watch;
 
+use super::instance::InstanceRequest;
 use super::runtime::ServiceRuntime;
 
 /// Cancellation signal carried by the host. `true` means "shut down
@@ -33,11 +34,22 @@ pub struct ServiceContext {
     /// Validated spec for this plugin instance. `spec.kind` matches
     /// [`ServicePlugin::kind`].
     pub spec: ServiceSpec,
+    /// Filesystem path of the spec file this run was loaded from
+    /// (`<specs_dir>/<id>.json` or `<specs_dir>/<id>/spec.json`).
+    /// `None` for in-memory specs (programmatic [`ServiceHost::add_spec`]
+    /// without a source path). Plugins that resolve `{spec.dir}` /
+    /// `{bundle.dir}` placeholders look at the parent of this path.
+    pub spec_path: Option<std::path::PathBuf>,
     /// Substrate for talking to joi-server. See [`ServiceRuntime`].
     pub runtime: Arc<ServiceRuntime>,
     /// Cancellation signal from the host. Plugins observe it to exit
     /// cleanly on shutdown.
     pub shutdown: ShutdownSignal,
+    /// Per-instance request payload, present iff the host dispatched
+    /// this run as a `lifecycle = thread_bound` instance (§4.7.3).
+    /// `None` for the channel-level singleton path. Plugins that
+    /// honor `params` / `scope.thread_id` placeholders read it here.
+    pub instance: Option<InstanceRequest>,
 }
 
 #[async_trait]

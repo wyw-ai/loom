@@ -151,7 +151,7 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
     };
     state
         .subscriptions
-        .bind_actor(connection_id, actor_id.clone(), claim_kind);
+        .bind_actor(connection_id, actor_id.clone(), claim_kind, p.claim_inbox);
     let endpoint_id = format!(
         "ep_{}",
         p.endpoint

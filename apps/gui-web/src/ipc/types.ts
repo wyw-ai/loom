@@ -111,6 +111,23 @@ export interface Turn {
   triggerEventId?: string | null;
 }
 
+export type ReminderStatus = "scheduled" | "fired" | "cancelled";
+
+export interface Reminder {
+  id: string;
+  actorId: string;
+  title: string;
+  scope?: ScopeRef | null;
+  msgId?: string | null;
+  fireAt: string;
+  repeat?: string | null;
+  status: ReminderStatus;
+  createdAt: string;
+  updatedAt: string;
+  lastFiredAt?: string | null;
+  _meta?: Record<string, unknown>;
+}
+
 // ---- notification payloads the front-end consumes ----
 
 export interface StreamUpdate {

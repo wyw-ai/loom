@@ -473,6 +473,16 @@ pub async fn turn_close(state: State<'_, AppState>, params: Value) -> Result<Val
 }
 
 #[tauri::command]
+pub async fn reminder_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::REMINDER_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn actor_list(state: State<'_, AppState>) -> Result<Value, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
     let value = state

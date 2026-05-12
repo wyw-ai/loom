@@ -338,8 +338,8 @@ extract_mr_close_summary() {
       (.events // .items // .)[]?
       | select((.actorId // .actor_id // "") == "mr-watcher")
       | (.payload.text // "")
-      | select(test("terminal=true|state: merged|state: closed|已合并|MR 已关闭|已关闭/废弃|terminal_kind.*(merged|closed)"))
-    ' <<<"$list" 2>/dev/null | head -n 1)
+      | select(test("terminal=true|state:[[:space:]]*(merged|closed)|MR 已(合并|关闭)|terminal_kind.*(merged|closed)"))
+    ' <<<"$list" 2>/dev/null | tail -n 1)
     [[ -z "$text" ]] && return 0
     mr_id=$(grep -Eo 'codereview/[0-9]+' <<<"$text" | head -n 1 | cut -d/ -f2 || true)
     [[ -z "$mr_id" ]] && mr_id=$(grep -Eo 'MR[ #!]*[0-9]+' <<<"$text" | head -n 1 | grep -Eo '[0-9]+' || true)
@@ -355,17 +355,17 @@ extract_nonfixed_outcome() {
         return 0
     fi
     list=$(joi event list --in "$tid" --limit 200 --json 2>/dev/null) || { printf 'closed'; return; }
-    if jq -e '(.events // .items // .)[]? | (.payload.text // "") | test("bugfix-rescope|reproduced_cross_repo|scope_correction|target_repos|问题真实.*仓库|责任仓库|重新.*clone-manifest")' >/dev/null 2>&1 <<<"$list"; then
+    if jq -e '(.events // .items // .)[]? | (.payload.text // "") | select(test("bugfix-rescope|reproduced_cross_repo|scope_correction|target_repos|问题真实.*仓库|责任仓库|重新.*clone-manifest"))' >/dev/null 2>&1 <<<"$list"; then
         printf 'rescope'
-    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | test("not_reproduced|无法复现|未复现|没有复现|不复现")' >/dev/null 2>&1 <<<"$list"; then
+    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | select(test("not_reproduced|无法复现|未复现|没有复现|不复现"))' >/dev/null 2>&1 <<<"$list"; then
         printf 'not_reproduced'
-    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | test("不是[[:space:]]*bug|不是缺陷|缺陷不成立|not a bug|误修|瞎修")' >/dev/null 2>&1 <<<"$list"; then
+    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | select(test("不是[[:space:]]*bug|不是缺陷|缺陷不成立|not a bug|误修|瞎修"))' >/dev/null 2>&1 <<<"$list"; then
         printf 'not_a_bug'
-    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | test("已有修复|已经修复|already fixed|release .*正常|现网.*正常|当前版本.*正常|已覆盖")' >/dev/null 2>&1 <<<"$list"; then
+    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | select(test("已有修复|已经修复|already fixed|release .*正常|现网.*正常|当前版本.*正常|已覆盖"))' >/dev/null 2>&1 <<<"$list"; then
         printf 'already_covered'
-    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | test("撤回|关闭此任务|human 要求关闭|放弃|废弃|withdraw")' >/dev/null 2>&1 <<<"$list"; then
+    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | select(test("撤回|关闭此任务|human 要求关闭|放弃|废弃|withdraw"))' >/dev/null 2>&1 <<<"$list"; then
         printf 'withdrawn'
-    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | test("不修复|无需修复|won.?t fix|wontfix")' >/dev/null 2>&1 <<<"$list"; then
+    elif jq -e '(.events // .items // .)[]? | (.payload.text // "") | select(test("不修复|无需修复|won.?t fix|wontfix"))' >/dev/null 2>&1 <<<"$list"; then
         printf 'wontfix'
     else
         printf 'closed'
@@ -406,11 +406,11 @@ close_feedback_fixed() {
     msg+=" 已合并到目标分支。修复会随下一次版本发布生效。"
 
     a1 project workitem comment create "$fid" -m "$msg" >/dev/null 2>&1 || true
-    if a1 project workitem status "$fid" --to Fixed >/dev/null 2>&1; then
+    if a1 project workitem update "$fid" --status Fixed >/dev/null 2>&1; then
         printf 'closed'
         return 0
     fi
-    if a1 project workitem status "$fid" --to 已修复 >/dev/null 2>&1; then
+    if a1 project workitem update "$fid" --status 已修复 >/dev/null 2>&1; then
         printf 'closed'
         return 0
     fi
@@ -453,8 +453,8 @@ close_feedback_nonfixed() {
     msg+=" 已关闭或终止；不会按“下次版本发布生效”的修复口径处理。"
 
     a1 project workitem comment create "$fid" -m "$msg" >/dev/null 2>&1 || true
-    for status_result in Closed 已关闭 "Won't Fix" "Won’t Fix" 无需修复; do
-        if a1 project workitem status "$fid" --to "$status_result" >/dev/null 2>&1; then
+    for status_result in Won\'tfix Invalid ByDesign Worksforme Closed 已关闭 "Won't Fix" "Won’t Fix" 无需修复; do
+        if a1 project workitem update "$fid" --status "$status_result" >/dev/null 2>&1; then
             printf 'closed'
             return 0
         fi

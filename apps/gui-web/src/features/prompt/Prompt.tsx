@@ -371,7 +371,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   };
 
   return (
-    <div className="relative border-t-2 border-black bg-white px-3 py-3">
+    <div className="relative min-w-0 shrink-0 border-t-2 border-black bg-white px-3 py-3">
       {slashOpen && (
         <SlashPalette
           ref={slashRef}
@@ -398,7 +398,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
             : {reply.preview}
           </span>
           <button
-              className="ml-auto text-black/45 hover:text-danger"
+            className="ml-auto text-black/45 hover:text-danger"
             onClick={() => setReply(scope, null)}
           >
             <X size={12} />

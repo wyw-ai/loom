@@ -10,12 +10,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use proto::methods::{
-    AgentActorDefaults, AgentActorSpec, AgentModelChoice, AgentProviderInfo, AgentProviderSpec,
-    AgentTransport, CommandOutputFormat, CommandSession, IdentityFiles, IdentityScaffoldSpec,
-    IdentitySpec, PromptVia,
+    AgentActorDefaults, AgentActorSpec, AgentModelChoice, AgentModelSpec, AgentProviderInfo,
+    AgentProviderSpec, AgentTransport, CommandOutputFormat, CommandSession, IdentityFiles,
+    IdentityScaffoldSpec, IdentitySpec, PromptVia,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +125,7 @@ impl DetectedAgentProvider {
             env,
             auth_method: None,
             model: self.default_model.clone(),
+            model_args: model_args_for_provider(&self.id),
             session: command_session_for_provider(&self.id, &self.args),
             output_format: Some(command_output_format_for_provider(&self.id)),
             prompt_via: PromptVia::Args,
@@ -142,7 +143,7 @@ impl DetectedAgentProvider {
             transport: self.transport(),
             defaults: AgentActorDefaults {
                 autostart: false,
-                models: None,
+                models: model_spec(self.default_model.as_deref(), &self.model_choices),
                 bundle: None,
                 identity: None,
                 memory: None,
@@ -208,17 +209,209 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
         .iter()
         .filter_map(|def| {
             let command = find_command_in_path(def.candidates, &path)?;
+            let (default_model, model_choices) = model_choices_for_provider(def.id);
             Some(DetectedAgentProvider {
                 id: def.id.into(),
                 display_name: def.display_name.into(),
                 command: command.display().to_string(),
                 transport_kind: "command".into(),
                 args: provider_args(def, config_dir),
-                default_model: None,
-                model_choices: Vec::new(),
+                default_model,
+                model_choices,
             })
         })
         .collect()
+}
+
+fn model_args_for_provider(provider_id: &str) -> Vec<String> {
+    match provider_id {
+        "claude" | "qoder" | "copilot" | "codex" | "opencode" => {
+            vec!["--model".into(), "{model}".into()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn model_spec(default: Option<&str>, choices: &[AgentModelChoice]) -> Option<AgentModelSpec> {
+    if default.is_none() && choices.is_empty() {
+        return None;
+    }
+    Some(AgentModelSpec {
+        default: default.map(ToOwned::to_owned),
+        choices: choices.to_vec(),
+    })
+}
+
+fn model_choices_for_provider(provider_id: &str) -> (Option<String>, Vec<AgentModelChoice>) {
+    match provider_id {
+        "codex" => model_choices_from_codex_cache(),
+        "qoder" => model_choices_from_qoder_registry(),
+        "copilot" => static_model_choices(COPILOT_MODELS),
+        "claude" => static_model_choices(CLAUDE_MODELS),
+        "opencode" => static_model_choices(OPENCODE_MODELS),
+        _ => (None, Vec::new()),
+    }
+}
+
+const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("sonnet", "Sonnet"),
+    ("opus", "Opus"),
+    ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
+    ("claude-opus-4.7", "Claude Opus 4.7"),
+    ("claude-haiku-4.5", "Claude Haiku 4.5"),
+];
+
+const COPILOT_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.5", "GPT-5.5"),
+    ("gpt-5.4", "GPT-5.4"),
+    ("gpt-5.3-codex", "GPT-5.3 Codex"),
+    ("gpt-5.2-codex", "GPT-5.2 Codex"),
+    ("gpt-5.2", "GPT-5.2"),
+    ("gpt-5.1", "GPT-5.1"),
+    ("gpt-5.4-mini", "GPT-5.4 Mini"),
+    ("gpt-5-mini", "GPT-5 Mini"),
+    ("gpt-4.1", "GPT-4.1"),
+    ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
+    ("claude-sonnet-4.5", "Claude Sonnet 4.5"),
+    ("claude-haiku-4.5", "Claude Haiku 4.5"),
+    ("claude-opus-4.7", "Claude Opus 4.7"),
+    ("claude-opus-4.6", "Claude Opus 4.6"),
+    ("claude-opus-4.6-fast", "Claude Opus 4.6 Fast"),
+    ("claude-opus-4.5", "Claude Opus 4.5"),
+    ("claude-sonnet-4", "Claude Sonnet 4"),
+];
+
+const OPENCODE_MODELS: &[(&str, &str)] = &[
+    ("openai/gpt-5.5", "OpenAI GPT-5.5"),
+    ("openai/gpt-5.4", "OpenAI GPT-5.4"),
+    ("openai/gpt-5.4-mini", "OpenAI GPT-5.4 Mini"),
+    ("openai/gpt-5.3-codex", "OpenAI GPT-5.3 Codex"),
+    ("openai/gpt-5.3-codex-spark", "OpenAI GPT-5.3 Codex Spark"),
+    ("openai/gpt-5.2", "OpenAI GPT-5.2"),
+    ("opencode/big-pickle", "OpenCode Big Pickle"),
+    (
+        "opencode/deepseek-v4-flash-free",
+        "OpenCode DeepSeek V4 Flash Free",
+    ),
+    ("opencode/minimax-m2.5-free", "OpenCode MiniMax M2.5 Free"),
+];
+
+fn static_model_choices(models: &[(&str, &str)]) -> (Option<String>, Vec<AgentModelChoice>) {
+    let choices = models
+        .iter()
+        .map(|(id, label)| model_choice(id, label))
+        .collect::<Vec<_>>();
+    (models.first().map(|(id, _)| (*id).to_string()), choices)
+}
+
+fn model_choices_from_codex_cache() -> (Option<String>, Vec<AgentModelChoice>) {
+    let Some(path) = home_relative_path(".codex/models_cache.json") else {
+        return static_model_choices(CODEX_MODELS);
+    };
+    let Some(root) = read_json_file(&path) else {
+        return static_model_choices(CODEX_MODELS);
+    };
+    let choices = root
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| string_field(model, "visibility") == Some("list"))
+        .filter_map(|model| {
+            let id = string_field(model, "slug")?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = string_field(model, "display_name")
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or(id);
+            Some(model_choice(id, label))
+        })
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return static_model_choices(CODEX_MODELS);
+    }
+    (choices.first().map(|choice| choice.id.clone()), choices)
+}
+
+const CODEX_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.5", "GPT-5.5"),
+    ("gpt-5.4", "GPT-5.4"),
+    ("gpt-5.4-mini", "GPT-5.4 Mini"),
+    ("gpt-5.3-codex", "GPT-5.3 Codex"),
+    ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
+    ("gpt-5.2", "GPT-5.2"),
+];
+
+fn model_choices_from_qoder_registry() -> (Option<String>, Vec<AgentModelChoice>) {
+    let Some(path) = home_relative_path(".qoder/.auth/models") else {
+        return static_model_choices(QODER_MODELS);
+    };
+    let Some(root) = read_json_file(&path) else {
+        return static_model_choices(QODER_MODELS);
+    };
+    let choices = root
+        .get("assistant")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| model.get("enable").and_then(Value::as_bool).unwrap_or(true))
+        .filter_map(|model| {
+            let id = string_field(model, "key")?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = string_field(model, "display_name")
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or(id);
+            Some(model_choice(id, label))
+        })
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return static_model_choices(QODER_MODELS);
+    }
+    let default = root
+        .get("assistant")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|model| model.get("is_default").and_then(Value::as_bool) == Some(true))
+        .and_then(|model| string_field(model, "key"))
+        .map(ToOwned::to_owned)
+        .or_else(|| choices.first().map(|choice| choice.id.clone()));
+    (default, choices)
+}
+
+const QODER_MODELS: &[(&str, &str)] = &[
+    ("auto", "Auto"),
+    ("ultimate", "Ultimate"),
+    ("performance", "Performance"),
+    ("efficient", "Efficient"),
+    ("lite", "Lite"),
+];
+
+fn model_choice(id: &str, label: &str) -> AgentModelChoice {
+    AgentModelChoice {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: None,
+    }
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn home_relative_path(path: &str) -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(path))
 }
 
 fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {

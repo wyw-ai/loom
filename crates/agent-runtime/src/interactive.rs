@@ -34,6 +34,7 @@ pub struct InteractiveCommandConfig {
     pub base_args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub model: Option<String>,
+    pub model_args: Vec<String>,
     pub spec: InteractiveCommandSpec,
     pub provider: Option<InteractiveProviderSpec>,
     pub sessions_dir: PathBuf,
@@ -49,6 +50,7 @@ impl InteractiveCommandConfig {
         base_args: &[String],
         env: BTreeMap<String, String>,
         model: Option<String>,
+        model_args: Vec<String>,
         spec: InteractiveCommandSpec,
         provider: Option<InteractiveProviderSpec>,
         sessions_dir: PathBuf,
@@ -59,6 +61,10 @@ impl InteractiveCommandConfig {
         hasher.update(command.as_bytes());
         for a in base_args {
             hasher.update(b"\x00");
+            hasher.update(a.as_bytes());
+        }
+        for a in &model_args {
+            hasher.update(b"\x00model_arg\x00");
             hasher.update(a.as_bytes());
         }
         for a in &spec.session.new_args {
@@ -75,6 +81,7 @@ impl InteractiveCommandConfig {
             base_args: base_args.to_vec(),
             env,
             model,
+            model_args,
             spec,
             provider,
             sessions_dir,
@@ -532,7 +539,15 @@ fn append_provider_args(
         argv.push(settings);
     }
     if let Some(model) = active_model(cfg, prompt) {
-        argv.push(format!("--model={model}"));
+        let model_args = if cfg.model_args.is_empty() {
+            vec![format!("--model={model}")]
+        } else {
+            cfg.model_args
+                .iter()
+                .map(|arg| expand_template(arg, cfg, prompt, None, "").replace("{model}", &model))
+                .collect()
+        };
+        argv.extend(model_args);
     }
     Ok(())
 }
@@ -663,6 +678,10 @@ fn expand_template(
         .replace("{actor.id}", &cfg.actor_id)
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
+        .replace(
+            "{model}",
+            active_model(cfg, request).as_deref().unwrap_or(""),
+        )
         .replace("{prompt}", prompt);
     if let Some(sid) = session_id {
         out = out.replace("{session_id}", sid);
@@ -841,6 +860,7 @@ mod tests {
             &[],
             BTreeMap::new(),
             None,
+            Vec::new(),
             InteractiveCommandSpec {
                 session: proto::methods::InteractiveSessionSpec {
                     new_args: vec![
@@ -908,6 +928,20 @@ mod tests {
         assert_eq!(
             argv.last().map(String::as_str),
             Some("--model=claude-sonnet")
+        );
+    }
+
+    #[test]
+    fn argv_uses_configured_model_args_when_present() {
+        let mut cfg = cfg(std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4())));
+        cfg.model = Some("claude-sonnet".into());
+        cfg.model_args = vec!["--model".into(), "{model}".into()];
+        let req = prompt(scope(ScopeKind::Thread, "t"), "hello");
+        let mut argv = expand_argv(&cfg.spec.session.new_args, &cfg, &req, Some("sid"), "hello");
+        append_provider_args(&cfg, &req, &mut argv).unwrap();
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            ["--model".to_string(), "claude-sonnet".to_string()]
         );
     }
 

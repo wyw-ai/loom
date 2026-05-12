@@ -32,6 +32,7 @@ import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { ActorAvatar } from "@/features/common/ActorAvatar";
+import { ArtifactAttachments } from "./ArtifactAttachment";
 
 export interface BubbleReplyContext {
   actorId: string;
@@ -207,6 +208,7 @@ export function Bubble({
         )}
 
         <Body bubble={bubble} />
+        <ArtifactAttachments artifactIds={bubble.attachmentIds} />
         <MessageMeta meta={bubble.meta} />
       </div>
 

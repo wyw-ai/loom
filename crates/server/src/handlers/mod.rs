@@ -794,7 +794,7 @@ fn artifact_read(state: &AppState, params: Option<Value>) -> HandlerResult {
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "artifact"))?;
     let res = state
         .artifacts
-        .read(&artifact, p.max_bytes)
+        .read(&artifact, p.offset, p.max_bytes)
         .map_err(map_store_err)?;
     ok(res)
 }
@@ -1135,6 +1135,381 @@ mod tests {
         .expect_err("artifact publish should fail");
 
         assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
+    #[test]
+    fn artifact_read_supports_offset_chunks_and_preview_meta() {
+        let state = fresh_state("artifact-read-offset");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+
+        let published = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_owner",
+                "scope": { "kind": "channel", "id": channel.id },
+                "ingress": {
+                    "kind": "file_bytes",
+                    "name": "note.md",
+                    "mediaType": "application/octet-stream",
+                    "bytes": [48, 49, 50, 51, 52, 53]
+                }
+            })),
+        )
+        .expect("artifact publish");
+        let published: ArtifactPublishResult =
+            serde_json::from_value(published).expect("publish result");
+        assert_eq!(published.artifact.media_type, "text/markdown");
+        let meta = published.artifact._meta.as_ref().expect("artifact meta");
+        assert_eq!(meta.get("attachmentKind"), Some(&json!("text")));
+        assert_eq!(meta.get("previewable"), Some(&json!(true)));
+
+        let first = artifact_read(
+            &state,
+            Some(json!({
+                "artifactId": published.artifact.id,
+                "offset": 2,
+                "maxBytes": 3
+            })),
+        )
+        .expect("artifact read");
+        let first: ArtifactReadResult = serde_json::from_value(first).expect("read result");
+        assert_eq!(first.offset, 2);
+        assert_eq!(first.bytes, b"234".to_vec());
+        assert!(first.truncated);
+        assert_eq!(first.next_offset, Some(5));
+
+        let second = artifact_read(
+            &state,
+            Some(json!({
+                "artifactId": first.artifact_id,
+                "offset": first.next_offset,
+                "maxBytes": 3
+            })),
+        )
+        .expect("artifact read tail");
+        let second: ArtifactReadResult = serde_json::from_value(second).expect("read tail");
+        assert_eq!(second.bytes, b"5".to_vec());
+        assert!(!second.truncated);
+        assert_eq!(second.next_offset, None);
+    }
+
+    #[test]
+    fn artifact_publish_detects_image_attachment_meta_and_reads_chunks() {
+        let state = fresh_state("artifact-image-attachment");
+        let channel = state
+            .store
+            .create_channel("images".into(), Some("actor_owner".into()))
+            .expect("create channel");
+
+        let published = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_owner",
+                "scope": { "kind": "channel", "id": channel.id },
+                "ingress": {
+                    "kind": "file_bytes",
+                    "name": "avatar.bin",
+                    "mediaType": "application/octet-stream",
+                    "bytes": [137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3, 4, 5]
+                }
+            })),
+        )
+        .expect("artifact publish");
+        let published: ArtifactPublishResult =
+            serde_json::from_value(published).expect("publish result");
+        assert_eq!(published.artifact.media_type, "image/png");
+        let meta = published.artifact._meta.as_ref().expect("artifact meta");
+        assert_eq!(meta.get("attachmentKind"), Some(&json!("image")));
+        assert_eq!(meta.get("previewable"), Some(&json!(true)));
+
+        let chunk = artifact_read(
+            &state,
+            Some(json!({
+                "artifactId": published.artifact.id,
+                "offset": 8,
+                "maxBytes": 4
+            })),
+        )
+        .expect("artifact read image chunk");
+        let chunk: ArtifactReadResult = serde_json::from_value(chunk).expect("read result");
+        assert_eq!(chunk.offset, 8);
+        assert_eq!(chunk.bytes, vec![0, 1, 2, 3]);
+        assert!(chunk.truncated);
+        assert_eq!(chunk.next_offset, Some(12));
+
+        let tail = artifact_read(
+            &state,
+            Some(json!({
+                "artifactId": chunk.artifact_id,
+                "offset": chunk.next_offset,
+                "maxBytes": 4
+            })),
+        )
+        .expect("artifact read image tail");
+        let tail: ArtifactReadResult = serde_json::from_value(tail).expect("tail result");
+        assert_eq!(tail.bytes, vec![4, 5]);
+        assert!(!tail.truncated);
+        assert_eq!(tail.next_offset, None);
+    }
+
+    #[tokio::test]
+    async fn attachment_exchange_between_human_and_agent_round_trips() {
+        let state = fresh_state("attachment-exchange");
+        open_conn(&state, "conn_human", "actor_human").await;
+        open_conn(&state, "conn_agent", "actor_agent").await;
+
+        dispatch(
+            &state,
+            "conn_human",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_agent",
+                    "kind": "agent",
+                    "displayName": "Attachment Agent"
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert");
+
+        let channel = dispatch(
+            &state,
+            "conn_human",
+            method::CHANNEL_CREATE,
+            Some(json!({
+                "title": "attachment exchange",
+                "actorId": "actor_human"
+            })),
+        )
+        .await
+        .expect("channel/create");
+        let channel: ChannelCreateResult = serde_json::from_value(channel).expect("channel result");
+
+        dispatch(
+            &state,
+            "conn_human",
+            method::CHANNEL_INVITE,
+            Some(json!({
+                "channelId": channel.channel.id,
+                "actorId": "actor_agent"
+            })),
+        )
+        .await
+        .expect("channel/invite");
+
+        let root = dispatch(
+            &state,
+            "conn_human",
+            method::EVENT_APPEND,
+            Some(json!({
+                "event": {
+                    "type": "content.add",
+                    "actorId": "actor_human",
+                    "scope": { "kind": "channel", "id": channel.channel.id },
+                    "payload": {
+                        "contentType": "text/markdown",
+                        "text": "root for attachment exchange"
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("root event");
+        let root: EventAppendResult = serde_json::from_value(root).expect("root result");
+
+        let thread = dispatch(
+            &state,
+            "conn_human",
+            method::THREAD_CREATE,
+            Some(json!({
+                "channelId": channel.channel.id,
+                "rootEventId": root.event.id,
+                "title": "attachment thread"
+            })),
+        )
+        .await
+        .expect("thread/create");
+        let thread: ThreadCreateResult = serde_json::from_value(thread).expect("thread result");
+        let thread_scope = json!({ "kind": "thread", "id": thread.thread.id });
+        let human_payload = b"human upload payload line 1\nline 2\n".to_vec();
+
+        let human_artifact = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_human",
+                "scope": thread_scope.clone(),
+                "ingress": {
+                    "kind": "file_bytes",
+                    "name": "human.txt",
+                    "mediaType": "text/plain",
+                    "bytes": human_payload.clone()
+                }
+            })),
+        )
+        .expect("human artifact publish");
+        let human_artifact: ArtifactPublishResult =
+            serde_json::from_value(human_artifact).expect("human artifact result");
+
+        let human_event = dispatch(
+            &state,
+            "conn_human",
+            method::EVENT_APPEND,
+            Some(json!({
+                "event": {
+                    "type": "content.add",
+                    "actorId": "actor_human",
+                    "scope": thread_scope.clone(),
+                    "payload": {
+                        "contentType": "text/markdown",
+                        "text": "human attached file"
+                    },
+                    "relations": [
+                        {
+                            "kind": "attaches_artifact",
+                            "target": { "kind": "artifact", "id": human_artifact.artifact.id }
+                        },
+                        {
+                            "kind": "hands_off_to",
+                            "target": { "kind": "actor", "id": "actor_agent" }
+                        }
+                    ]
+                }
+            })),
+        )
+        .await
+        .expect("human event append");
+        let human_event: EventAppendResult =
+            serde_json::from_value(human_event).expect("human event result");
+        assert!(human_event.event.relations.iter().any(|relation| {
+            relation.kind == RelationKind::AttachesArtifact
+                && relation.target.id == human_artifact.artifact.id
+        }));
+        assert!(human_event.event.relations.iter().any(|relation| {
+            relation.kind == RelationKind::HandsOffTo && relation.target.id == "actor_agent"
+        }));
+
+        let offset_read = artifact_read(
+            &state,
+            Some(json!({
+                "artifactId": human_artifact.artifact.id,
+                "offset": 6,
+                "maxBytes": 6
+            })),
+        )
+        .expect("agent offset read");
+        let offset_read: ArtifactReadResult =
+            serde_json::from_value(offset_read).expect("offset read result");
+        assert_eq!(offset_read.offset, 6);
+        assert_eq!(offset_read.content, "upload");
+        assert!(offset_read.truncated);
+        assert_eq!(offset_read.next_offset, Some(12));
+
+        let mut downloaded = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let chunk = artifact_read(
+                &state,
+                Some(json!({
+                    "artifactId": human_artifact.artifact.id,
+                    "offset": offset,
+                    "maxBytes": 5
+                })),
+            )
+            .expect("chunked artifact read");
+            let chunk: ArtifactReadResult = serde_json::from_value(chunk).expect("chunk result");
+            downloaded.extend_from_slice(&chunk.bytes);
+            if !chunk.truncated {
+                break;
+            }
+            offset = chunk.next_offset.expect("next offset");
+        }
+        assert_eq!(downloaded, human_payload);
+
+        let agent_payload = b"agent file from actor_agent\n".to_vec();
+        let agent_artifact = artifact_publish(
+            &state,
+            Some(json!({
+                "createdBy": "actor_agent",
+                "scope": thread_scope.clone(),
+                "ingress": {
+                    "kind": "file_bytes",
+                    "name": "agent.txt",
+                    "mediaType": "text/plain",
+                    "bytes": agent_payload
+                }
+            })),
+        )
+        .expect("agent artifact publish");
+        let agent_artifact: ArtifactPublishResult =
+            serde_json::from_value(agent_artifact).expect("agent artifact result");
+
+        let agent_event = dispatch(
+            &state,
+            "conn_agent",
+            method::EVENT_APPEND,
+            Some(json!({
+                "event": {
+                    "type": "content.add",
+                    "actorId": "actor_agent",
+                    "scope": thread_scope.clone(),
+                    "payload": {
+                        "contentType": "text/markdown",
+                        "text": "agent sent file"
+                    },
+                    "relations": [
+                        {
+                            "kind": "attaches_artifact",
+                            "target": { "kind": "artifact", "id": agent_artifact.artifact.id }
+                        }
+                    ]
+                }
+            })),
+        )
+        .await
+        .expect("agent event append");
+        let agent_event: EventAppendResult =
+            serde_json::from_value(agent_event).expect("agent event result");
+        assert!(agent_event.event.relations.iter().any(|relation| {
+            relation.kind == RelationKind::AttachesArtifact
+                && relation.target.id == agent_artifact.artifact.id
+        }));
+
+        let history = dispatch(
+            &state,
+            "conn_human",
+            method::SCOPE_READ,
+            Some(json!({
+                "scope": thread_scope,
+                "limit": 100
+            })),
+        )
+        .await
+        .expect("scope/read");
+        let history: ScopeReadResult = serde_json::from_value(history).expect("history result");
+        assert!(history
+            .events
+            .iter()
+            .any(|event| event.id == human_event.event.id));
+        assert!(history
+            .events
+            .iter()
+            .any(|event| event.id == agent_event.event.id));
+
+        let agent_read = artifact_read(
+            &state,
+            Some(json!({
+                "artifactId": agent_artifact.artifact.id,
+                "maxBytes": 200
+            })),
+        )
+        .expect("human reads agent artifact");
+        let agent_read: ArtifactReadResult =
+            serde_json::from_value(agent_read).expect("agent artifact read result");
+        assert!(agent_read.content.contains("agent file from actor_agent"));
     }
 
     #[tokio::test]

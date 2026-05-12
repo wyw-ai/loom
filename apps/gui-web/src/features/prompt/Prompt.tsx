@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CornerDownRight, ImagePlus, Paperclip, Send, X } from "lucide-react";
+import {
+  CornerDownRight,
+  ImagePlus,
+  Loader2,
+  Paperclip,
+  Send,
+  X,
+} from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import type { Actor, Channel, ScopeRef, Thread } from "@/ipc/types";
@@ -13,16 +20,24 @@ import { MentionPalette, type MentionPaletteHandle } from "./MentionPalette";
 import { tryHandleSlash } from "./slashDispatch";
 
 const IME_ENTER_GUARD_MS = 300;
+const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
 type DraftRelation = {
-  kind: "hands_off_to" | "replies_to";
-  target: { kind: "actor" | "event"; id: string };
+  kind: "hands_off_to" | "replies_to" | "attaches_artifact";
+  target: { kind: "actor" | "event" | "artifact"; id: string };
 };
 
 interface MentionTrigger {
   start: number;
   end: number;
   filter: string;
+}
+
+interface PendingAttachment {
+  id: string;
+  file: File;
+  previewUrl?: string;
 }
 
 export function Prompt({ scope }: { scope: ScopeRef }) {
@@ -44,7 +59,11 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   const [sending, setSending] = useState(false);
   const [caret, setCaret] = useState(0);
   const [asTask, setAsTask] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const slashRef = useRef<SlashPaletteHandle>(null);
   const mentionRef = useRef<MentionPaletteHandle>(null);
   const composingRef = useRef(false);
@@ -76,15 +95,31 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
     return () => window.removeEventListener("joi:focus-prompt", onFocusPrompt);
   }, [currentScopeKey]);
 
+  useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
+
+  useEffect(() => {
+    return () => {
+      for (const attachment of pendingAttachmentsRef.current) {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      }
+    };
+  }, []);
+
   const send = async () => {
     if (!selfId) return;
     const body = text.trim();
-    if (!body) return;
+    if (!body && pendingAttachments.length === 0) return;
     setSending(true);
     try {
       // Dispatch slash verbs other than /handoff (which is handled inline
       // below so its body becomes a real content.add handoff event).
-      if (body.startsWith("/") && !body.startsWith("/handoff")) {
+      if (
+        pendingAttachments.length === 0 &&
+        body.startsWith("/") &&
+        !body.startsWith("/handoff")
+      ) {
         const result = await tryHandleSlash(body, { scope, actorId: selfId });
         if (result === "consumed") {
           setDraft(scope, "");
@@ -151,6 +186,18 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         return;
       }
 
+      const artifactIds = await publishPendingAttachments({
+        actorId: selfId,
+        scope,
+        attachments: pendingAttachments,
+      });
+      for (const artifactId of artifactIds) {
+        relations.push({
+          kind: "attaches_artifact",
+          target: { kind: "artifact", id: artifactId },
+        });
+      }
+
       await ipc.eventAppend(
         asTask
           ? {
@@ -177,6 +224,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
             },
       );
       setDraft(scope, "");
+      clearPendingAttachments();
       setAsTask(false);
       setReply(scope, null);
     } catch (e) {
@@ -266,6 +314,62 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
     });
   };
 
+  const addPendingFiles = (files: File[]) => {
+    if (files.length === 0) return;
+    const currentTotal = pendingAttachments.reduce(
+      (sum, attachment) => sum + attachment.file.size,
+      0,
+    );
+    let nextTotal = currentTotal;
+    const accepted: PendingAttachment[] = [];
+
+    for (const file of files) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        pushToast(
+          "warn",
+          `${file.name} exceeds ${formatBytes(MAX_ATTACHMENT_BYTES)}`,
+        );
+        continue;
+      }
+      if (nextTotal + file.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+        pushToast(
+          "warn",
+          `attachments exceed ${formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)}`,
+        );
+        continue;
+      }
+      nextTotal += file.size;
+      accepted.push({
+        id: crypto.randomUUID(),
+        file,
+        previewUrl: isImageFile(file)
+          ? URL.createObjectURL(file)
+          : undefined,
+      });
+    }
+
+    if (accepted.length > 0) {
+      setPendingAttachments((current) => [...current, ...accepted]);
+    }
+  };
+
+  const removePendingAttachment = (id: string) => {
+    setPendingAttachments((current) => {
+      const target = current.find((attachment) => attachment.id === id);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+      return current.filter((attachment) => attachment.id !== id);
+    });
+  };
+
+  const clearPendingAttachments = () => {
+    setPendingAttachments((current) => {
+      for (const attachment of current) {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      }
+      return [];
+    });
+  };
+
   return (
     <div className="relative border-t-2 border-black bg-white px-3 py-3">
       {slashOpen && (
@@ -322,13 +426,75 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
           disabled={sending}
         />
       </div>
+      {pendingAttachments.length > 0 && (
+        <div className="mt-2 grid gap-2">
+          {pendingAttachments.map((attachment) => (
+            <div
+              key={attachment.id}
+              className="flex min-w-0 items-center gap-3 border-2 border-black bg-brutal-cream px-3 py-2 shadow-brutal-sm"
+            >
+              {attachment.previewUrl ? (
+                <img
+                  src={attachment.previewUrl}
+                  alt=""
+                  className="h-10 w-10 shrink-0 border-2 border-black bg-white object-cover"
+                />
+              ) : (
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center border-2 border-black bg-white">
+                  <Paperclip size={16} />
+                </div>
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-black text-black">
+                  {attachment.file.name}
+                </div>
+                <div className="mt-0.5 font-mono text-[11px] text-black/45">
+                  {guessMediaType(attachment.file)} ·{" "}
+                  {formatBytes(attachment.file.size)}
+                </div>
+              </div>
+              <button
+                type="button"
+                title="Remove attachment"
+                onClick={() => removePendingAttachment(attachment.id)}
+                className="btn-brutal-sm bg-white p-1"
+                disabled={sending}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="mt-2 flex items-center gap-2">
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            addPendingFiles(Array.from(e.currentTarget.files ?? []));
+            e.currentTarget.value = "";
+          }}
+        />
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            addPendingFiles(Array.from(e.currentTarget.files ?? []));
+            e.currentTarget.value = "";
+          }}
+        />
         <button
           type="button"
           className="btn-brutal-sm bg-white p-1"
           title="Attach image"
           aria-label="Attach image"
-          onClick={() => pushToast("info", "image attachments are not backed by the current Joi protocol yet")}
+          disabled={sending}
+          onClick={() => imageInputRef.current?.click()}
         >
           <ImagePlus size={15} />
         </button>
@@ -337,7 +503,8 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
           className="btn-brutal-sm bg-white p-1"
           title="Attach file"
           aria-label="Attach file"
-          onClick={() => pushToast("info", "file attachments are not backed by the current Joi protocol yet")}
+          disabled={sending}
+          onClick={() => fileInputRef.current?.click()}
         >
           <Paperclip size={15} />
         </button>
@@ -352,11 +519,16 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         </label>
         <button
           type="button"
-          disabled={!text.trim() || sending}
+          disabled={(!text.trim() && pendingAttachments.length === 0) || sending}
           onClick={() => void send()}
           className="btn-brutal-sm gap-1 bg-brutal-pink px-3 text-xs disabled:bg-black/10"
         >
-          Send <Send size={13} />
+          {sending && pendingAttachments.length > 0 ? (
+            <Loader2 size={13} className="animate-spin" />
+          ) : (
+            <Send size={13} />
+          )}
+          Send
         </button>
       </div>
     </div>
@@ -439,4 +611,107 @@ function resolveChannelForScope(
     }
   }
   return null;
+}
+
+async function publishPendingAttachments({
+  actorId,
+  scope,
+  attachments,
+}: {
+  actorId: string;
+  scope: ScopeRef;
+  attachments: PendingAttachment[];
+}): Promise<string[]> {
+  const artifactIds: string[] = [];
+  for (const attachment of attachments) {
+    const bytes = await fileToBytes(attachment.file);
+    const res = await ipc.artifactPublish({
+      createdBy: actorId,
+      scope,
+      ingress: {
+        kind: "file_bytes",
+        name: attachment.file.name || "attachment",
+        mediaType: guessMediaType(attachment.file),
+        bytes,
+      },
+    });
+    artifactIds.push(res.artifact.id);
+  }
+  return artifactIds;
+}
+
+async function fileToBytes(file: File): Promise<number[]> {
+  return Array.from(new Uint8Array(await file.arrayBuffer()));
+}
+
+function isImageFile(file: File): boolean {
+  return guessMediaType(file).startsWith("image/");
+}
+
+function guessMediaType(file: File): string {
+  const explicit = file.type.trim();
+  if (explicit) return explicit;
+  const ext = file.name.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "svg":
+      return "image/svg+xml";
+    case "pdf":
+      return "application/pdf";
+    case "md":
+    case "markdown":
+      return "text/markdown";
+    case "json":
+      return "application/json";
+    case "yaml":
+    case "yml":
+      return "application/yaml";
+    case "csv":
+      return "text/csv";
+    case "html":
+    case "htm":
+      return "text/html";
+    case "css":
+      return "text/css";
+    case "js":
+    case "mjs":
+    case "cjs":
+      return "text/javascript";
+    case "txt":
+    case "log":
+    case "toml":
+    case "ini":
+    case "rs":
+    case "go":
+    case "py":
+    case "ts":
+    case "tsx":
+    case "jsx":
+    case "xml":
+      return "text/plain";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) {
+    return `${Math.max(0, Math.round(bytes))} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
 }

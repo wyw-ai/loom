@@ -130,7 +130,7 @@ joi --json actor list\n\
 joi --json agent list\n\
 joi --json reminder list\n\
 joi --json artifact get <art_id|artifact://...>\n\
-joi --json artifact read <art_id> [--max-bytes N]\n\
+joi --json artifact read <art_id> [--offset N] [--max-bytes N]\n\
 ```\n\
 \n\
 ### Write CLI\n\
@@ -151,6 +151,9 @@ joi --json ask-user-question --title \"Choose option\" --question \"Which option
     --choice a=A --choice b=B\n\
 joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
 joi --json attachment upload --target '#<channel_id>:<root_event_id>' --path <file>\n\
+joi --json message send --target '#<channel_id>:<root_event_id>' \\\n\
+    --text \"see attached\" --attachment-id <art_id>\n\
+joi --json attachment download --id <art_id> --output <file>\n\
 joi --json artifact publish --in <scope_id> [--channel] \\\n\
     --name <file> [--media-type <type>] (--text <body> | --file <path>)\n\
 joi --json reminder schedule --target '#<channel_id>:<root_event_id>' \\\n\
@@ -161,6 +164,11 @@ Use `dm:<actor_id>` for private messages. `handoff` is responsibility\n\
 transfer in the current scope, not a DM target, and aliases such as\n\
 `dm:@actor` are not supported. Thread targets are rooted at channel events;\n\
 thread-in-thread targets are not supported.\n\
+\n\
+Attachment workflow: upload local files with `attachment upload`, attach the\n\
+returned artifact id to a message with `message send --attachment-id`, and read\n\
+large text/binary artifacts incrementally with `artifact read --offset` or\n\
+download the full body with `attachment download`.\n\
 \n\
 Use `joi --help` and `joi <subcommand> --help` for the full surface.\n\
 {END_MARKER}"

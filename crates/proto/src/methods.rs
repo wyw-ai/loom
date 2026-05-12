@@ -591,6 +591,8 @@ pub struct ArtifactGetResult {
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactReadParams {
     pub artifact_id: String,
+    #[serde(default)]
+    pub offset: u64,
     #[serde(default = "default_max_bytes")]
     pub max_bytes: u64,
 }
@@ -604,7 +606,10 @@ fn default_max_bytes() -> u64 {
 pub struct ArtifactReadResult {
     pub artifact_id: String,
     pub media_type: String,
+    pub offset: u64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bytes: Vec<u8>,

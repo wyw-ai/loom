@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +25,12 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
+        if let Some(path) = file_rpc_url_path(url) {
+            return Self::connect_file_rpc(path).await;
+        }
+        if let Some(path) = unix_url_path(url) {
+            return Self::connect_unix_url(path).await;
+        }
         Self::connect_ws(url).await
     }
 
@@ -107,11 +113,95 @@ impl Client {
         Ok(Self::new(out_tx, pending, notif_rx))
     }
 
+    #[cfg(unix)]
+    async fn connect_unix_url(path: &str) -> Result<Arc<Self>> {
+        if path.is_empty() {
+            return Err(anyhow!("unix server URL is missing a socket path"));
+        }
+        Self::connect_daemon_socket(Path::new(path)).await
+    }
+
+    #[cfg(not(unix))]
+    async fn connect_unix_url(_path: &str) -> Result<Arc<Self>> {
+        Err(anyhow!(
+            "unix server URLs are only supported on Unix platforms"
+        ))
+    }
+
     #[cfg(not(unix))]
     pub async fn connect_daemon_socket(_path: &Path) -> Result<Arc<Self>> {
         Err(anyhow!(
             "joi daemon IPC is only supported on Unix platforms"
         ))
+    }
+
+    async fn connect_file_rpc(path: &str) -> Result<Arc<Self>> {
+        if path.is_empty() {
+            return Err(anyhow!("file-rpc server URL is missing a directory path"));
+        }
+        let root = PathBuf::from(path);
+        let client_id = format!(
+            "conn_file_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let client_dir = root.join("clients").join(client_id);
+        let in_dir = client_dir.join("in");
+        let out_dir = client_dir.join("out");
+        std::fs::create_dir_all(&in_dir)
+            .with_context(|| format!("create file-rpc input dir {}", in_dir.display()))?;
+        std::fs::create_dir_all(&out_dir)
+            .with_context(|| format!("create file-rpc output dir {}", out_dir.display()))?;
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+
+        tokio::spawn(async move {
+            let mut seq = 0_u64;
+            while let Some(frame) = out_rx.recv().await {
+                seq = seq.saturating_add(1);
+                if write_frame_file(&in_dir, seq, &frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let pending_r = pending.clone();
+        tokio::spawn(async move {
+            let mut seen = BTreeSet::new();
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&out_dir) {
+                    let mut files = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+                        .collect::<Vec<_>>();
+                    files.sort();
+                    for file in files {
+                        let Some(name) = file
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string)
+                        else {
+                            continue;
+                        };
+                        if !seen.insert(name) {
+                            continue;
+                        }
+                        if let Ok(text) = std::fs::read_to_string(&file) {
+                            dispatch_frame(text, &pending_r, &notif_tx).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        Ok(Self::new(out_tx, pending, notif_rx))
     }
 
     fn new(
@@ -207,6 +297,23 @@ impl Client {
         )
         .await
     }
+}
+
+fn unix_url_path(url: &str) -> Option<&str> {
+    url.strip_prefix("unix://")
+        .or_else(|| url.strip_prefix("unix:"))
+}
+
+fn file_rpc_url_path(url: &str) -> Option<&str> {
+    url.strip_prefix("file-rpc://")
+        .or_else(|| url.strip_prefix("file-rpc:"))
+}
+
+fn write_frame_file(dir: &Path, seq: u64, frame: &str) -> std::io::Result<()> {
+    let final_path = dir.join(format!("{seq:020}.json"));
+    let tmp_path = dir.join(format!("{seq:020}.json.tmp"));
+    std::fs::write(&tmp_path, frame)?;
+    std::fs::rename(tmp_path, final_path)
 }
 
 fn id_to_key(v: &Value) -> String {

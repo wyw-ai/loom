@@ -433,6 +433,36 @@ pub async fn event_append(state: State<'_, AppState>, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn artifact_publish(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_PUBLISH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn artifact_get(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_GET, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn artifact_read(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_READ, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn turn_close(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()

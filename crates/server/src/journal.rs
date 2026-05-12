@@ -22,6 +22,8 @@ pub enum Mutation {
     },
     ChannelCreate(Channel),
     ThreadCreate(Thread),
+    TaskUpsert(Task),
+    TaskAssignmentUpsert(TaskAssignment),
     TurnOpen(Turn),
     TurnClose {
         turn_id: String,
@@ -72,6 +74,8 @@ const LEGACY_VARIANTS: &[&str] = &[
     "actor_delete",
     "channel_create",
     "thread_create",
+    "task_upsert",
+    "task_assignment_upsert",
     "turn_open",
     "turn_close",
     "event_append",

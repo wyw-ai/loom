@@ -17,4 +17,5 @@ pub mod reminder;
 pub mod say;
 pub mod service;
 pub mod target;
+pub mod task;
 pub mod thread;

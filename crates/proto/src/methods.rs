@@ -24,6 +24,12 @@ pub mod method {
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_DELETE: &str = "thread/delete";
+    pub const TASK_CREATE: &str = "task/create";
+    pub const TASK_GET: &str = "task/get";
+    pub const TASK_LIST: &str = "task/list";
+    pub const TASK_UPDATE: &str = "task/update";
+    pub const TASK_ASSIGNMENT_CREATE: &str = "task/assignment.create";
+    pub const TASK_ASSIGNMENT_UPDATE: &str = "task/assignment.update";
     pub const TURN_OPEN: &str = "turn/open";
     pub const TURN_CLOSE: &str = "turn/close";
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
@@ -333,6 +339,122 @@ pub struct ThreadDeleteParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadDeleteResult {
     pub deleted: bool,
+}
+
+// ---- task/create / get / list / update ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCreateParams {
+    /// Top-level channel event that should own the task metadata.
+    pub source_event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCreateResult {
+    pub task: Task,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskGetParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskGetResult {
+    pub task: Task,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignments: Vec<TaskAssignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<TaskStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListResult {
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUpdateParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append_artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskUpdateResult {
+    pub task: Task,
+}
+
+// ---- task assignment ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignmentCreateParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_actor_id: Option<String>,
+    pub to_actor_id: String,
+    #[serde(rename = "type")]
+    pub assignment_type: TaskAssignmentType,
+    pub instruction: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAssignmentCreateResult {
+    pub assignment: TaskAssignment,
+    /// Handoff event written to the task's canonical thread.
+    pub event: Event,
+    pub task: Task,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignmentUpdateParams {
+    pub assignment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskAssignmentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAssignmentUpdateResult {
+    pub assignment: TaskAssignment,
+    pub task: Task,
 }
 
 // ---- turn/open / close ----
@@ -1774,6 +1896,8 @@ pub struct StreamUpdate {
 
 pub mod stream_kind {
     pub const THREAD_CREATED: &str = "thread.created";
+    pub const TASK_CHANGED: &str = "task.changed";
+    pub const TASK_ASSIGNMENT_CHANGED: &str = "task_assignment.changed";
     /// Broadcast when a new channel is created. Public channels go to
     /// all connections; private channels go to the creator only.
     pub const CHANNEL_CREATED: &str = "channel.created";

@@ -80,6 +80,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: ActionCmd,
     },
+    /// Create, claim, update, and delegate message-anchored tasks.
+    Task {
+        #[command(subcommand)]
+        sub: TaskCmd,
+    },
     /// Ask the triggering human to choose or provide input, then return the answer to this process.
     AskUserQuestion {
         /// Max seconds to wait for action.response.
@@ -362,6 +367,76 @@ enum EventCmd {
         /// Cursor: only return events older than this event id.
         #[arg(long)]
         before: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskCmd {
+    /// Create a task anchored to a top-level channel event.
+    Create {
+        #[arg(long = "source-event")]
+        source_event: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// List visible tasks.
+    List {
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long = "source-event")]
+        source_event: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long = "status", value_delimiter = ',')]
+        statuses: Vec<String>,
+    },
+    /// Show one task with assignment results.
+    Show { task_id: String },
+    /// Update status, owner, result summary, or attached artifact ids.
+    Update {
+        task_id: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long = "artifact-id")]
+        artifact_ids: Vec<String>,
+    },
+    /// Create an assignment and hand it off in the task's canonical thread.
+    Assign {
+        task_id: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long = "type", default_value = "other")]
+        assignment_type: String,
+        #[arg(long)]
+        instruction: String,
+    },
+    /// Update a task assignment result.
+    Assignment {
+        #[command(subcommand)]
+        sub: TaskAssignmentCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskAssignmentCmd {
+    Update {
+        assignment_id: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long = "result-event")]
+        result_event: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
     },
 }
 
@@ -758,6 +833,73 @@ async fn main() -> Result<()> {
             ActionCmd::Decline { event_id, option } => {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, false).await?
             }
+        },
+        Cmd::Task { sub } => match sub {
+            TaskCmd::Create {
+                source_event,
+                title,
+                description,
+                owner,
+                status,
+            } => {
+                cmd::task::create(
+                    client,
+                    cfg.actor_id,
+                    source_event,
+                    title,
+                    description,
+                    owner,
+                    status,
+                )
+                .await?
+            }
+            TaskCmd::List {
+                channel,
+                source_event,
+                owner,
+                statuses,
+            } => cmd::task::list(client, channel, source_event, owner, statuses).await?,
+            TaskCmd::Show { task_id } => cmd::task::show(client, task_id).await?,
+            TaskCmd::Update {
+                task_id,
+                status,
+                owner,
+                result,
+                artifact_ids,
+            } => cmd::task::update(client, task_id, status, owner, result, artifact_ids).await?,
+            TaskCmd::Assign {
+                task_id,
+                to,
+                assignment_type,
+                instruction,
+            } => {
+                cmd::task::assign(
+                    client,
+                    cfg.actor_id,
+                    task_id,
+                    to,
+                    assignment_type,
+                    instruction,
+                )
+                .await?
+            }
+            TaskCmd::Assignment { sub } => match sub {
+                TaskAssignmentCmd::Update {
+                    assignment_id,
+                    status,
+                    result_event,
+                    result,
+                } => {
+                    cmd::task::assignment_update(
+                        client,
+                        assignment_id,
+                        status,
+                        result_event,
+                        result,
+                    )
+                    .await?
+                }
+            },
         },
         Cmd::AskUserQuestion {
             timeout_seconds,

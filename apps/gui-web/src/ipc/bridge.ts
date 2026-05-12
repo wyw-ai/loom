@@ -15,6 +15,11 @@ import type {
   ReminderStatus,
   ScopeRef,
   StreamUpdate,
+  Task,
+  TaskAssignment,
+  TaskAssignmentStatus,
+  TaskAssignmentType,
+  TaskStatus,
   Thread,
   TurnStreamDelta,
   Workspace,
@@ -213,6 +218,63 @@ export async function eventAppend(input: {
   relations?: unknown[];
 }): Promise<{ event: JoiEvent }> {
   return invoke("event_append", { params: { event: input } });
+}
+
+export async function taskCreate(params: {
+  sourceEventId: string;
+  title?: string;
+  description?: string;
+  requesterActorId?: string;
+  ownerActorId?: string;
+  status?: TaskStatus;
+}): Promise<{ task: Task }> {
+  return invoke("task_create", { params });
+}
+
+export async function taskList(params?: {
+  channelId?: string;
+  sourceEventId?: string;
+  ownerActorId?: string;
+  statuses?: TaskStatus[];
+}): Promise<{ tasks: Task[] }> {
+  return invoke("task_list", { params: params ?? {} });
+}
+
+export async function taskGet(taskId: string): Promise<{
+  task: Task;
+  assignments: TaskAssignment[];
+}> {
+  return invoke("task_get", { params: { taskId } });
+}
+
+export async function taskUpdate(params: {
+  taskId: string;
+  status?: TaskStatus;
+  ownerActorId?: string;
+  resultSummary?: string;
+  artifactIds?: string[];
+  appendArtifactIds?: string[];
+}): Promise<{ task: Task }> {
+  return invoke("task_update", { params });
+}
+
+export async function taskAssignmentCreate(params: {
+  taskId: string;
+  fromActorId?: string;
+  toActorId: string;
+  type: TaskAssignmentType;
+  instruction: string;
+}): Promise<{ assignment: TaskAssignment; task: Task; event: JoiEvent }> {
+  return invoke("task_assignment_create", { params });
+}
+
+export async function taskAssignmentUpdate(params: {
+  assignmentId: string;
+  status?: TaskAssignmentStatus;
+  resultEventId?: string;
+  resultSummary?: string;
+}): Promise<{ assignment: TaskAssignment; task: Task }> {
+  return invoke("task_assignment_update", { params });
 }
 
 export async function artifactPublish(params: {

@@ -90,6 +90,7 @@ These variables are already set in your process env:\n\
 - `JOI_SCOPE_ID` — current thread or channel scope id for this turn.\n\
 - `JOI_SCOPE_KIND` — `thread` or `channel` for this turn.\n\
 - `JOI_TURN_ID` — current Joi turn id.\n\
+- `JOI_TRIGGER_EVENT_ID` — event id of the message that triggered this turn.\n\
 - `JOI_TRIGGER_ACTOR` — actor id of the human or agent that triggered this turn.\n\
 - `AGENTX_CHANNEL_ID` — channel id that owns the current scope.\n\
 \n\
@@ -128,9 +129,24 @@ key evidence behind conclusions. If more context is needed, query Joi first.\n\
 \n\
 ### Collaboration routing\n\
 \n\
-Human-to-actor handoffs are weak task signals: answer in the current scope\n\
-when the work is short or conversational. Do not create a thread for every\n\
-human `@actor` or `/handoff` message.\n\
+Human-to-actor handoffs in a channel common area start as a routing/triage\n\
+turn in that same channel. Decide whether the message is a simple reply or a\n\
+work item. For a simple reply, answer directly in the current scope. For work\n\
+that is complex, multi-turn, artifact-producing, or needs another actor, first\n\
+create or reuse a task anchored to `JOI_TRIGGER_EVENT_ID`; the server will\n\
+create or reuse the canonical thread for that root message. Keep substantive\n\
+work, progress, artifacts, reviews, and final results in that task thread.\n\
+The channel turn should only acknowledge that the task/thread was opened.\n\
+\n\
+When you open a task from a channel triage turn, use `joi --json task create\n\
+--source-event \"$JOI_TRIGGER_EVENT_ID\" --owner \"$JOI_ACTOR\" --status claimed`.\n\
+If task creation reports a conflict, use `joi --json task list --source-event\n\
+\"$JOI_TRIGGER_EVENT_ID\"` and reuse the existing task/thread. To continue work\n\
+in the thread, send a handoff to yourself in the canonical thread and finish\n\
+the channel turn with a short pointer.\n\
+\n\
+If the latest message already includes `Task id:` or `Assignment id:`, you are\n\
+already in a task flow; update task or assignment status with the task CLI.\n\
 \n\
 Actor-to-actor handoffs are strong task-flow signals. When you delegate a\n\
 substantial subtask to another actor from a channel common area, create or\n\
@@ -159,6 +175,8 @@ joi --json message read --target '#<channel_id>:<root_event_id>' --before <event
 joi --json message search --query \"keyword\" --target '#<channel_id>:<root_event_id>'\n\
 joi --json message check                               # drain directed inbox\n\
 joi --json thread list\n\
+joi --json task list [--source-event <event_id>]\n\
+joi --json task show <task_id>\n\
 joi --json channel list\n\
 joi --json actor list\n\
 joi --json agent list\n\
@@ -181,6 +199,10 @@ joi --json message send --target dm:<actor_id> <<'JOIMSG'\n\
 private note\n\
 JOIMSG\n\
 joi --json handoff <actor_id> --in <scope_id> --message \"please take this\"\n\
+joi --json task create --source-event <channel_event_id> --title \"work title\" --owner \"$JOI_ACTOR\"\n\
+joi --json task update <task_id> --status in_progress|waiting_review|done --result \"summary\"\n\
+joi --json task assign <task_id> --to <actor_id> --type review --instruction \"review this\"\n\
+joi --json task assignment update <assignment_id> --status completed --result \"review summary\"\n\
 joi --json ask-user-question --title \"Choose option\" --question \"Which option?\" \\\n\
     --choice a=A --choice b=B\n\
 joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
@@ -220,7 +242,9 @@ mod tests {
         assert!(out.contains("JOI_SCOPE_ID"));
         assert!(out.contains("### Runtime contract"));
         assert!(out.contains("Do not call `joi message send` just to post"));
-        assert!(out.contains("Human-to-actor handoffs are weak task signals"));
+        assert!(out.contains(
+            "Human-to-actor handoffs in a channel common area start as a routing/triage"
+        ));
         assert!(out.contains("Actor-to-actor handoffs are strong task-flow signals"));
         assert!(out.contains("keep follow-up work, evidence, review"));
         assert!(out.contains(BEGIN_MARKER));

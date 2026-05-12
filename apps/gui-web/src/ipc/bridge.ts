@@ -315,12 +315,33 @@ export async function agentUpdate(args: {
   return invoke("agent_update", { args });
 }
 
+export async function agentProfileFileRead(args: {
+  machineId: string;
+  actorId: string;
+  file: "identity" | "soul";
+}): Promise<{ path: string; text: string }> {
+  return invoke("agent_profile_file_read", { args });
+}
+
+export async function agentProfileFileWrite(args: {
+  machineId: string;
+  actorId: string;
+  file: "identity" | "soul";
+  text: string;
+}): Promise<{ path: string; text: string }> {
+  return invoke("agent_profile_file_write", { args });
+}
+
 export async function machineList(): Promise<{ machines: MachineInfo[] }> {
   return invoke("machine_list");
 }
 
 export async function machineCheck(): Promise<{ machines: MachineInfo[] }> {
   return invoke("machine_check");
+}
+
+export async function openLocalPath(path: string): Promise<void> {
+  return invoke("open_local_path", { args: { path } });
 }
 
 export async function machineCreate(args: {

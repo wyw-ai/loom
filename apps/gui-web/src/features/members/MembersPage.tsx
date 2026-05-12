@@ -6,8 +6,11 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
+  Copy,
   Edit3,
+  FileText,
   Folder,
+  FolderOpen,
   Hash,
   type LucideIcon,
   MessageSquare,
@@ -19,6 +22,7 @@ import {
   Trash2,
   Users,
   Workflow,
+  X,
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
@@ -27,6 +31,7 @@ import type {
   AgentInfo,
   AgentProviderSummary,
   JoiEvent,
+  MachineAgentInfo,
   MachineInfo,
   Reminder,
   ReminderStatus,
@@ -61,6 +66,9 @@ interface ManagedAgent {
   machineId: string;
   machine: string;
   dataRoot: string;
+  profilePath: string;
+  identityPath: string;
+  soulPath: string;
   providerId: string;
   provider: string;
   providers: AgentProviderSummary[];
@@ -88,7 +96,8 @@ interface AgentUpdatePatch {
 type AgentMachineContext = Pick<
   MachineInfo,
   "id" | "name" | "dataRoot" | "providers"
->;
+> &
+  Partial<Pick<MachineAgentInfo, "profilePath" | "identityPath" | "soulPath">>;
 
 export function MembersPage() {
   const actorsById = useActors((s) => s.byId);
@@ -184,6 +193,9 @@ export function MembersPage() {
         name: agent.machine,
         dataRoot: agent.dataRoot,
         providers: agent.providers,
+        profilePath: agent.profilePath,
+        identityPath: agent.identityPath,
+        soulPath: agent.soulPath,
       },
     );
     setAgents((xs) =>
@@ -1032,6 +1044,8 @@ function ProfileTab({
         </button>
       </InfoSection>
 
+      <ActorProfileSection agent={agent} />
+
       <InfoSection title="Info">
         <div className="grid max-w-2xl grid-cols-2 gap-5 text-sm">
           <div>
@@ -1081,6 +1095,212 @@ function ProfileTab({
       <InfoSection title="Created Agents (0)">
         <span className="italic text-black/45">No created agents</span>
       </InfoSection>
+    </div>
+  );
+}
+
+type ProfileFileKind = "identity" | "soul";
+
+function ActorProfileSection({ agent }: { agent: ManagedAgent }) {
+  const pushToast = useUI((s) => s.pushToast);
+  const [editing, setEditing] = useState<ProfileFileKind | null>(null);
+
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      pushToast("info", `${label} copied`);
+    } catch {
+      pushToast("info", value);
+    }
+  };
+
+  const openProfile = async () => {
+    try {
+      await ipc.openLocalPath(agent.profilePath);
+      pushToast("info", "profile opened");
+    } catch (e) {
+      pushToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <InfoSection title="Actor Profile">
+      <div className="max-w-4xl space-y-2">
+        <ProfilePathRow
+          label="Profile"
+          value={agent.profilePath}
+          onCopy={() => void copy(agent.profilePath, "profile path")}
+          onOpen={() => void openProfile()}
+        />
+        <ProfilePathRow
+          label="Identity"
+          value={agent.identityPath}
+          onCopy={() => void copy(agent.identityPath, "identity.md path")}
+          onEdit={() => setEditing("identity")}
+        />
+        <ProfilePathRow
+          label="Soul"
+          value={agent.soulPath}
+          onCopy={() => void copy(agent.soulPath, "soul.md path")}
+          onEdit={() => setEditing("soul")}
+        />
+      </div>
+      {editing && (
+        <ProfileFileEditor
+          agent={agent}
+          file={editing}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </InfoSection>
+  );
+}
+
+function ProfilePathRow({
+  label,
+  value,
+  onCopy,
+  onOpen,
+  onEdit,
+}: {
+  label: string;
+  value: string;
+  onCopy: () => void;
+  onOpen?: () => void;
+  onEdit?: () => void;
+}) {
+  return (
+    <div className="grid min-w-0 gap-2 md:grid-cols-[7rem_minmax(0,1fr)_auto]">
+      <div className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-black/45">
+        {label === "Profile" ? <Folder size={13} /> : <FileText size={13} />}
+        {label}
+      </div>
+      <div className="min-w-0 border border-black/20 bg-brutal-cream px-2 py-1.5 font-mono text-xs text-black/70">
+        <div className="truncate">{value}</div>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {onOpen && (
+          <button
+            className="btn-brutal-sm bg-white p-1.5"
+            title="Open profile folder"
+            onClick={onOpen}
+          >
+            <FolderOpen size={12} />
+          </button>
+        )}
+        <button
+          className="btn-brutal-sm bg-white p-1.5"
+          title={`Copy ${label.toLowerCase()} path`}
+          onClick={onCopy}
+        >
+          <Copy size={12} />
+        </button>
+        {onEdit && (
+          <button
+            className="btn-brutal-sm gap-1 bg-white px-2 py-1 text-[11px]"
+            onClick={onEdit}
+          >
+            <Edit3 size={12} /> Edit
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProfileFileEditor({
+  agent,
+  file,
+  onClose,
+}: {
+  agent: ManagedAgent;
+  file: ProfileFileKind;
+  onClose: () => void;
+}) {
+  const pushToast = useUI((s) => s.pushToast);
+  const [text, setText] = useState("");
+  const [path, setPath] = useState(file === "identity" ? agent.identityPath : agent.soulPath);
+  const [busy, setBusy] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setBusy(true);
+    ipc
+      .agentProfileFileRead({
+        machineId: agent.machineId,
+        actorId: agent.actor.id,
+        file,
+      })
+      .then((result) => {
+        if (!alive) return;
+        setText(result.text);
+        setPath(result.path);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        pushToast("error", e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (alive) setBusy(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agent.actor.id, agent.machineId, file, pushToast]);
+
+  const save = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await ipc.agentProfileFileWrite({
+        machineId: agent.machineId,
+        actorId: agent.actor.id,
+        file,
+        text,
+      });
+      pushToast("info", `${file}.md saved`);
+      setPath(result.path);
+      onClose();
+    } catch (e) {
+      pushToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4">
+      <section className="card-brutal w-[calc(100vw-2rem)] max-w-3xl p-5">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-lg font-black uppercase">
+              Edit {file === "identity" ? "Identity" : "Soul"}
+            </h2>
+            <div className="truncate font-mono text-xs text-black/45">{path}</div>
+          </div>
+          <button className="btn-brutal-sm bg-white p-1" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <textarea
+          className="h-[min(58vh,32rem)] w-full resize-none border-2 border-black bg-brutal-cream p-3 font-mono text-xs leading-5 outline-none focus:bg-white"
+          value={text}
+          disabled={busy}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <div className="mt-3 flex justify-end gap-2">
+          <button className="btn-brutal bg-white px-4 py-2 text-sm" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-brutal bg-brutal-pink px-4 py-2 text-sm disabled:bg-black/10"
+            disabled={busy}
+            onClick={() => void save()}
+          >
+            Save
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1329,6 +1549,18 @@ function WorkspaceTab({ agent }: { agent: ManagedAgent }) {
             <span className="text-black/45">data </span>
             {agent.dataRoot}
           </div>
+          <div className="truncate">
+            <span className="text-black/45">profile </span>
+            {agent.profilePath}
+          </div>
+          <div className="truncate">
+            <span className="text-black/45">identity </span>
+            {agent.identityPath}
+          </div>
+          <div className="truncate">
+            <span className="text-black/45">soul </span>
+            {agent.soulPath}
+          </div>
         </div>
       </InfoSection>
       <InfoSection title="Transport">
@@ -1365,7 +1597,7 @@ function ActivityTab({ agent }: { agent: ManagedAgent }) {
 }
 
 function normalizeAgent(
-  info: AgentInfo,
+  info: AgentInfo | MachineAgentInfo,
   machine: AgentMachineContext,
 ): ManagedAgent {
   const spec = info.spec;
@@ -1391,6 +1623,20 @@ function normalizeAgent(
     machineId: machine.id,
     machine: machine.name,
     dataRoot: machine.dataRoot,
+    profilePath:
+      "profilePath" in info
+        ? info.profilePath
+        : machine.profilePath ?? displayJoin(machine.dataRoot, "agents", actor.id, "profile"),
+    identityPath:
+      "identityPath" in info
+        ? info.identityPath
+        : machine.identityPath ??
+          displayJoin(machine.dataRoot, "agents", actor.id, "profile", "identity.md"),
+    soulPath:
+      "soulPath" in info
+        ? info.soulPath
+        : machine.soulPath ??
+          displayJoin(machine.dataRoot, "agents", actor.id, "profile", "soul.md"),
     providerId,
     provider,
     providers: machine.providers,
@@ -1405,6 +1651,10 @@ function normalizeAgent(
     args: spec.transport.args ?? [],
     autostart: !!spec.autostart,
   };
+}
+
+function displayJoin(root: string, ...parts: string[]) {
+  return [root.replace(/\/+$/, ""), ...parts].join("/");
 }
 
 function modelChoicesForProvider(provider: AgentProviderSummary | null | undefined) {

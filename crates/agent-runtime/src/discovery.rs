@@ -185,17 +185,17 @@ fn actor_spec_from_definition(
         model: definition.model.clone(),
         models: None,
         bundle: None,
-        identity: definition
-            .description
-            .as_ref()
-            .map(|description| IdentitySpec {
-                files: IdentityFiles::default(),
-                description: Some(description.clone()),
-                scaffold: Some(IdentityScaffoldSpec {
+        identity: Some(IdentitySpec {
+            files: IdentityFiles::default(),
+            description: definition.description.clone(),
+            scaffold: definition
+                .description
+                .as_ref()
+                .map(|description| IdentityScaffoldSpec {
                     identity: Some(description.clone()),
                     soul: None,
                 }),
-            }),
+        }),
         memory: None,
         announcement: None,
     }

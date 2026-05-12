@@ -107,6 +107,25 @@ channel and `#<channel_id>:<root_event_id>` for a thread. If you only have a\n\
 thread scope id, run `joi --json thread list` and find the row with that id;\n\
 its `channelId` and `rootEventId` form the message target.\n\
 \n\
+### Runtime contract\n\
+\n\
+Joi starts your turn only after the runtime has selected you for work. Treat\n\
+the latest `=== Latest Joi message ===` block in the prompt as the trigger for\n\
+the current turn. If it says `Delivery: explicit handoff to you`, the sender is\n\
+asking you to act. Raw `@actor` text by itself is not machine routing; rely on\n\
+Joi relations, delivery metadata, and CLI queries instead of parsing mentions.\n\
+\n\
+For a normal reply, write the final user-visible answer as your response. The\n\
+Joi runtime will publish it back to the current scope and link it to the\n\
+trigger event. Do not call `joi message send` just to post that normal final\n\
+answer, or you may duplicate the reply outside the turn. Use the CLI only for\n\
+extra collaboration actions: reading history, sending a separate DM or channel\n\
+message, handing work to another actor, publishing artifacts, asking the user a\n\
+question, or requesting approval.\n\
+\n\
+Keep progress updates short, state uncertainty when it matters, and include the\n\
+key evidence behind conclusions. If more context is needed, query Joi first.\n\
+\n\
 ### Read-only CLI\n\
 \n\
 Shell out to `joi --json ...` for server state. `--json` returns machine-\n\
@@ -184,6 +203,8 @@ mod tests {
         let out = update_block("", &joi_block("actor_demo"));
         assert!(out.contains("actor_demo"));
         assert!(out.contains("JOI_SCOPE_ID"));
+        assert!(out.contains("### Runtime contract"));
+        assert!(out.contains("Do not call `joi message send` just to post"));
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains(END_MARKER));
     }

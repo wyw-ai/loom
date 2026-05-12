@@ -2,117 +2,81 @@
   "actor": {
     "id": "actor_delivery",
     "kind": "agent",
-    "displayName": "交付"
-  },
-  "transport": {
-    "kind": "interactive_command",
-    "command": "claude",
-    "args": [],
-    "env": {},
-    "model": "claude-sonnet-4.6",
-    "provider": {
-      "kind": "claude",
-      "settings": {
-        "mode": "actor_profile"
-      }
-    },
-    "interactive": {
-      "session": {
-        "idStrategy": "joi_uuid_per_scope",
-        "newArgs": [
-          "--print",
-          "--permission-mode",
-          "bypassPermissions",
-          "{prompt}",
-          "--session-id",
-          "{session_id}"
-        ],
-        "resumeArgs": [
-          "--print",
-          "--permission-mode",
-          "bypassPermissions",
-          "{prompt}",
-          "--resume",
-          "{session_id}"
-        ],
-        "onMissing": "create",
-        "onSignatureChanged": "create",
-        "onResumeFailed": "fail"
-      },
-      "prompt": {
-        "template": "{joi_envelope}",
-        "completionContract": {
-          "sentinel": "__JOI_DONE__",
-          "instruction": "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it."
-        }
-      },
-      "completion": {
-        "detect": "sentinel",
-        "stripSentinel": true,
-        "idleTimeoutMs": 60000,
-        "maxTurnMs": 3600000
-      },
-      "output": {
-        "stripAnsi": true,
-        "stderr": "trace",
-        "streamPartial": true
-      },
-      "kill": {
-        "onComplete": {
-          "action": "sigterm",
-          "graceMs": 3000,
-          "fallback": "sigkill"
-        },
-        "onCancel": {
-          "action": "sigterm",
-          "graceMs": 1000,
-          "fallback": "sigkill"
-        },
-        "onTimeout": {
-          "action": "sigkill"
-        }
-      }
+    "displayName": "交付",
+    "_meta": {
+      "createdBy": "joi-daemon",
+      "providerId": "claude",
+      "providerName": "Claude Code",
+      "transportKind": "command"
     }
   },
-  "autostart": false,
-  "bundle": {
-    "source": "data/agents/delivery/bundle",
-    "version": "v1",
-    "installMode": "copy",
-    "root": "{agent.root}/bundles",
-    "current": "{agent.root}/bundles/current"
-  },
-  "handoff": {
-    "triggerPromptPrefix": "/delivery\n",
-    "applyOn": "every-turn"
-  },
-  "promptTemplate": {
-    "activeSkill": "delivery",
-    "everyTurnPrefix": [
-      "[joi handoff v1]",
-      "scope_kind: {scope.kind}",
-      "scope_id: {scope.id}",
-      "actor_id: {actor.id}",
-      "from_actor: {trigger.actor_id}",
-      "trigger_event_id: {trigger.id}",
-      "channel_id: {channel.id}",
-      "thread_id: {thread.id}",
-      "workspace_dir: {workspace.dir}",
-      "skills_dir: {scope.skills}",
-      "[/joi handoff v1]"
+  "transport": {
+    "kind": "command",
+    "command": "/home/canfeng/.local/bin/claude",
+    "args": [
+      "--add-dir",
+      "/home/canfeng/.joi-apps",
+      "--permission-mode",
+      "bypassPermissions",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "-p"
     ],
-    "firstTurnPrefix": [
-      "[joi bootstrap]",
-      "你的技能定义如下，请严格遵守：",
-      "----- BEGIN SKILL -----",
-      "{agent.skillBody}",
-      "----- END SKILL -----",
-      "Use `joi event append` (or `joi say` / `joi handoff`) for user-visible replies and handoff.",
-      "Do not embed the callee's slash command in your reply text; runtime injects it.",
-      "[/joi bootstrap]"
+    "env": {},
+    "model": "sonnet",
+    "modelArgs": [
+      "--model",
+      "{model}"
     ],
-    "everyTurnSuffix": [
-      "When finished, emit the configured Joi completion sentinel."
+    "session": {
+      "firstRunCapture": "stdout_json:.session_id",
+      "resumeArgs": [
+        "--add-dir",
+        "/home/canfeng/.joi-apps",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--resume",
+        "{session_id}",
+        "-p"
+      ]
+    },
+    "outputFormat": "claude_stream_json",
+    "promptVia": "args"
+  },
+  "autostart": true,
+  "models": {
+    "default": "claude-sonnet-4.6",
+    "choices": [
+      {
+        "id": "sonnet",
+        "label": "Sonnet"
+      },
+      {
+        "id": "opus",
+        "label": "Opus"
+      },
+      {
+        "id": "claude-sonnet-4.6",
+        "label": "Claude Sonnet 4.6"
+      },
+      {
+        "id": "claude-opus-4.7",
+        "label": "Claude Opus 4.7"
+      },
+      {
+        "id": "claude-haiku-4.5",
+        "label": "Claude Haiku 4.5"
+      }
     ]
+  },
+  "identity": {
+    "files": {
+      "identity": "identity.md",
+      "soul": "soul.md"
+    }
   }
 }

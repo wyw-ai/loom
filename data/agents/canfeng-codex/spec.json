@@ -1,8 +1,8 @@
 {
   "actor": {
-    "id": "actor_teacher",
+    "id": "canfeng-codex",
     "kind": "agent",
-    "displayName": "老师",
+    "displayName": "canfeng-codex",
     "_meta": {
       "createdBy": "joi-daemon",
       "providerId": "codex",

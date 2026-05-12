@@ -1,0 +1,14 @@
+{
+  "id": "mr-watcher",
+  "kind": "scheduler",
+  "actor": {
+    "id": "mr-watcher",
+    "kind": "service",
+    "displayName": "mr-watcher（MR观察器）"
+  },
+  "autostart": true,
+  "channelId": "chan_31f8fa85d909",
+  "config": {
+    "jobs": []
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "feedback-scanner",
+  "kind": "scheduler",
+  "actor": {
+    "id": "feedback-scanner",
+    "kind": "service",
+    "displayName": "feedback-scanner（缺陷扫描器）"
+  },
+  "autostart": true,
+  "channelId": "chan_31f8fa85d909",
+  "config": {
+    "jobs": []
+  }
+}

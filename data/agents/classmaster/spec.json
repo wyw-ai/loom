@@ -2,107 +2,67 @@
   "actor": {
     "id": "actor_classmaster",
     "kind": "agent",
-    "displayName": "班主任"
-  },
-  "transport": {
-    "kind": "interactive_command",
-    "command": "codex-joi",
-    "args": [],
-    "env": {},
-    "provider": {
-      "kind": "codex"
-    },
-    "interactive": {
-      "session": {
-        "idStrategy": "joi_uuid_per_scope",
-        "newArgs": [
-          "new",
-          "{session_id}",
-          "{prompt}"
-        ],
-        "resumeArgs": [
-          "resume",
-          "{session_id}",
-          "{prompt}"
-        ],
-        "onMissing": "create",
-        "onSignatureChanged": "create",
-        "onResumeFailed": "fail"
-      },
-      "prompt": {
-        "template": "{joi_envelope}",
-        "completionContract": {
-          "sentinel": "__JOI_DONE__",
-          "instruction": "When your final user-visible answer is complete, output the token __JOI_DONE__ as the final line. Do not output anything after it."
-        }
-      },
-      "completion": {
-        "detect": "sentinel",
-        "stripSentinel": true,
-        "idleTimeoutMs": 30000,
-        "maxTurnMs": 900000
-      },
-      "output": {
-        "stripAnsi": true,
-        "stderr": "trace",
-        "streamPartial": true
-      },
-      "kill": {
-        "onComplete": {
-          "action": "sigterm",
-          "graceMs": 3000,
-          "fallback": "sigkill"
-        },
-        "onCancel": {
-          "action": "sigterm",
-          "graceMs": 1000,
-          "fallback": "sigkill"
-        },
-        "onTimeout": {
-          "action": "sigkill"
-        }
-      }
+    "displayName": "班主任",
+    "_meta": {
+      "createdBy": "joi-daemon",
+      "providerId": "codex",
+      "providerName": "Codex CLI",
+      "transportKind": "command"
     }
   },
-  "autostart": false,
-  "bundle": {
-    "source": "data/agents/classmaster/bundle",
-    "version": "v1",
-    "installMode": "copy",
-    "root": "{agent.root}/bundles",
-    "current": "{agent.root}/bundles/current"
-  },
-  "handoff": {
-    "triggerPromptPrefix": "/classmaster\n",
-    "applyOn": "every-turn"
-  },
-  "promptTemplate": {
-    "activeSkill": "classmaster",
-    "everyTurnPrefix": [
-      "[joi handoff v1]",
-      "scope_kind: {scope.kind}",
-      "scope_id: {scope.id}",
-      "actor_id: {actor.id}",
-      "from_actor: {trigger.actor_id}",
-      "trigger_event_id: {trigger.id}",
-      "channel_id: {channel.id}",
-      "thread_id: {thread.id}",
-      "workspace_dir: {workspace.dir}",
-      "skills_dir: {scope.skills}",
-      "[/joi handoff v1]"
+  "transport": {
+    "kind": "command",
+    "command": "/bin/bash",
+    "args": [
+      "-lc",
+      "source ~/open-proxy >/dev/null && exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"",
+      "joi-codex"
     ],
-    "firstTurnPrefix": [
-      "[joi bootstrap]",
-      "你的技能定义如下，请严格遵守：",
-      "----- BEGIN SKILL -----",
-      "{agent.skillBody}",
-      "----- END SKILL -----",
-      "Use `joi event append` (or `joi say` / `joi handoff`) for user-visible replies and handoff.",
-      "Do not embed the callee's slash command in your reply text; runtime injects it.",
-      "[/joi bootstrap]"
+    "env": {
+      "JOI_NO_DAEMON": "1"
+    },
+    "model": "gpt-5.5",
+    "modelArgs": [
+      "--model",
+      "{model}"
     ],
-    "everyTurnSuffix": [
-      "When finished, emit the configured Joi completion sentinel."
+    "outputFormat": "codex_stream_json",
+    "promptVia": "args"
+  },
+  "autostart": true,
+  "models": {
+    "default": "gpt-5.5",
+    "choices": [
+      {
+        "id": "gpt-5.5",
+        "label": "GPT-5.5"
+      },
+      {
+        "id": "gpt-5.4",
+        "label": "gpt-5.4"
+      },
+      {
+        "id": "gpt-5.4-mini",
+        "label": "GPT-5.4-Mini"
+      },
+      {
+        "id": "gpt-5.3-codex",
+        "label": "gpt-5.3-codex"
+      },
+      {
+        "id": "gpt-5.3-codex-spark",
+        "label": "GPT-5.3-Codex-Spark"
+      },
+      {
+        "id": "gpt-5.2",
+        "label": "gpt-5.2"
+      }
     ]
+  },
+  "identity": {
+    "files": {
+      "identity": "identity.md",
+      "soul": "soul.md"
+    }
   }
 }

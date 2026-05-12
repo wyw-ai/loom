@@ -4,6 +4,8 @@ import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Actor,
   AgentInfo,
+  Artifact,
+  ArtifactReadResult,
   Channel,
   DesktopConfig,
   HumanAccount,
@@ -209,6 +211,35 @@ export async function eventAppend(input: {
   relations?: unknown[];
 }): Promise<{ event: JoiEvent }> {
   return invoke("event_append", { params: { event: input } });
+}
+
+export async function artifactPublish(params: {
+  createdBy: string;
+  scope?: ScopeRef;
+  ingress: {
+    kind: "inline_text" | "file_bytes";
+    name: string;
+    mediaType?: string;
+    text?: string;
+    bytes?: number[];
+  };
+}): Promise<{ artifact: Artifact }> {
+  return invoke("artifact_publish", { params });
+}
+
+export async function artifactGet(params: {
+  artifactId?: string;
+  artifactUri?: string;
+}): Promise<{ artifact: Artifact }> {
+  return invoke("artifact_get", { params });
+}
+
+export async function artifactRead(params: {
+  artifactId: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<ArtifactReadResult> {
+  return invoke("artifact_read", { params });
 }
 
 export async function turnClose(

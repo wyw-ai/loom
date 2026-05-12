@@ -13,6 +13,7 @@ mod ws;
 
 use std::sync::Arc;
 
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 use crate::state::AppState;
@@ -59,6 +60,9 @@ fn main() {
             ipc::scope_unsubscribe,
             ipc::scope_read,
             ipc::event_append,
+            ipc::artifact_publish,
+            ipc::artifact_get,
+            ipc::artifact_read,
             ipc::turn_close,
             ipc::actor_list,
             ipc::actor_upsert,

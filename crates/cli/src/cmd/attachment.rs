@@ -51,12 +51,13 @@ pub async fn view(
     client: Arc<Client>,
     artifact_id: String,
     output: PathBuf,
+    offset: u64,
     max_bytes: u64,
 ) -> Result<()> {
     let res: ArtifactReadResult = client
         .call(
             method::ARTIFACT_READ,
-            json!({ "artifactId": artifact_id, "maxBytes": max_bytes }),
+            json!({ "artifactId": artifact_id, "offset": offset, "maxBytes": max_bytes }),
         )
         .await?;
     std::fs::write(&output, &res.bytes).with_context(|| format!("write {}", output.display()))?;
@@ -66,10 +67,52 @@ pub async fn view(
         println!("{}", output.display());
         if res.truncated {
             eprintln!(
-                "(truncated to {} bytes; pass --max-bytes to fetch more)",
-                max_bytes
+                "(read {} bytes from offset {}; next offset {})",
+                res.bytes.len(),
+                res.offset,
+                res.next_offset
+                    .unwrap_or(res.offset + res.bytes.len() as u64)
             );
         }
+    }
+    Ok(())
+}
+
+pub async fn download(
+    client: Arc<Client>,
+    artifact_id: String,
+    output: PathBuf,
+    chunk_bytes: u64,
+) -> Result<()> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut offset = 0_u64;
+    let mut body = Vec::new();
+    loop {
+        let res: ArtifactReadResult = client
+            .call(
+                method::ARTIFACT_READ,
+                json!({
+                    "artifactId": artifact_id,
+                    "offset": offset,
+                    "maxBytes": chunk_bytes,
+                }),
+            )
+            .await?;
+        body.extend_from_slice(&res.bytes);
+        match res.next_offset {
+            Some(next) if res.truncated && next > offset => offset = next,
+            _ => break,
+        }
+    }
+    std::fs::write(&output, &body).with_context(|| format!("write {}", output.display()))?;
+    if render::is_json() {
+        render::print_json(&json!({
+            "artifactId": artifact_id,
+            "output": output,
+            "bytes": body.len(),
+        }));
+    } else {
+        println!("{}\t{} bytes", output.display(), body.len());
     }
     Ok(())
 }

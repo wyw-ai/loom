@@ -90,11 +90,16 @@ pub async fn get(client: Arc<Client>, id_or_uri: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn read(client: Arc<Client>, artifact_id: String, max_bytes: u64) -> Result<()> {
+pub async fn read(
+    client: Arc<Client>,
+    artifact_id: String,
+    offset: u64,
+    max_bytes: u64,
+) -> Result<()> {
     let res: ArtifactReadResult = client
         .call(
             method::ARTIFACT_READ,
-            json!({ "artifactId": artifact_id, "maxBytes": max_bytes }),
+            json!({ "artifactId": artifact_id, "offset": offset, "maxBytes": max_bytes }),
         )
         .await?;
     if render::is_json() {
@@ -107,8 +112,11 @@ pub async fn read(client: Arc<Client>, artifact_id: String, max_bytes: u64) -> R
     }
     if res.truncated {
         eprintln!(
-            "(truncated to {} bytes — pass --max-bytes to fetch more)",
-            max_bytes
+            "(read {} bytes from offset {}; next offset {})",
+            res.bytes.len(),
+            res.offset,
+            res.next_offset
+                .unwrap_or(res.offset + res.bytes.len() as u64)
         );
     }
     Ok(())

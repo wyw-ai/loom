@@ -1070,7 +1070,8 @@ artifact 可以在 publish 时带 `scope`，用于把文件落入该 scope 的 w
 
 用途：
 
-- 读取 artifact 中可读文本条目。
+- 从 artifact body 中按 byte offset 读取一段内容；文本预览可用 `content`，
+  二进制下载/图片预览可用 `bytes`。
 
 请求：
 
@@ -1081,7 +1082,8 @@ artifact 可以在 publish 时带 `scope`，用于把文件落入该 scope 的 w
   "method": "artifact/read",
   "params": {
     "artifactId": "art_123",
-    "maxBytes": 65536
+    "offset": 0,
+    "maxBytes": 4
   }
 }
 ```
@@ -1095,12 +1097,20 @@ artifact 可以在 publish 时带 `scope`，用于把文件落入该 scope 的 w
   "result": {
     "artifactId": "art_123",
     "mediaType": "text/markdown",
-    "truncated": false,
-    "content": "# report",
-    "bytes": [35, 32, 114, 101, 112, 111, 114, 116]
+    "offset": 0,
+    "truncated": true,
+    "nextOffset": 4,
+    "content": "# re",
+    "bytes": [35, 32, 114, 101]
   }
 }
 ```
+
+说明：
+
+- `offset` 默认 `0`，`maxBytes` 默认 `65536`。
+- 当 `truncated` 为 `true` 时，client 应使用 `nextOffset` 发起下一次
+  `artifact/read`，直到 `truncated=false`。
 
 ### 9.13 `receipt/record`
 

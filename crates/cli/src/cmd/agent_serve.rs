@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     method, stream_kind, AgentModelChoice, AgentSpec, BundleInstallMode, EventAppendResult,
-    TurnOpenResult,
+    HandoffApplyOn, PromptTemplateSpec, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -547,7 +547,24 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
+        let scope_kind = scope_kind_name(scope_ref.kind).to_string();
         let mut vars = BTreeMap::new();
+        vars.insert("actor.id".into(), actor_id.to_string());
+        vars.insert("scope.id".into(), scope_ref.id.clone());
+        vars.insert("scope.kind".into(), scope_kind);
+        vars.insert("channel.id".into(), channel_id.to_string());
+        vars.insert(
+            "thread.id".into(),
+            if matches!(scope_ref.kind, ScopeKind::Thread) {
+                scope_ref.id.clone()
+            } else {
+                String::new()
+            },
+        );
+        vars.insert(
+            "workspace.dir".into(),
+            scope.workspace.display().to_string(),
+        );
         vars.insert(
             "agent.workspace".into(),
             scope.workspace.display().to_string(),
@@ -1870,7 +1887,7 @@ async fn open_model_picker(
 ) -> Result<()> {
     let mut adapter_error = adapter_start_error;
     let adapter_options = if adapter_error.is_none() {
-        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None).await {
+        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None, None).await {
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
                 Err(err) => {
@@ -2055,7 +2072,7 @@ async fn dispatch_handoff(
             )
             .await?;
         let user_text = render_prompt(&trigger);
-        let prompt = compose_envelope_prompt(client, state, &trigger.scope, &user_text).await;
+        let prompt = compose_envelope_prompt(client, state, &trigger, &user_text).await;
         let active = ActiveTurn {
             id: turn_res.turn.id.clone(),
             scope: trigger.scope.clone(),
@@ -2067,9 +2084,15 @@ async fn dispatch_handoff(
         };
         state.set_turn(active.clone());
 
-        let adapter_prompt =
-            build_adapter_prompt(client, state, &trigger.scope, prompt.content, Some(&active))
-                .await?;
+        let adapter_prompt = build_adapter_prompt(
+            client,
+            state,
+            &trigger.scope,
+            prompt.content,
+            Some(&active),
+            Some(&trigger),
+        )
+        .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(()),
@@ -2099,6 +2122,7 @@ async fn build_adapter_prompt(
     scope: &ScopeRef,
     content: String,
     active: Option<&ActiveTurn>,
+    trigger: Option<&Event>,
 ) -> Result<AdapterPrompt> {
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
@@ -2106,6 +2130,10 @@ async fn build_adapter_prompt(
     let scope_paths = state
         .paths
         .ensure_scope(&state.actor_id, &channel_id, scope)?;
+    let mut template_vars = state
+        .paths
+        .template_vars(&state.actor_id, &channel_id, scope);
+    extend_prompt_template_vars(&mut template_vars, state, trigger);
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content,
@@ -2118,9 +2146,7 @@ async fn build_adapter_prompt(
             &state.agent_server_url,
             active,
         ),
-        template_vars: state
-            .paths
-            .template_vars(&state.actor_id, &channel_id, scope),
+        template_vars,
     })
 }
 
@@ -2157,15 +2183,28 @@ fn render_prompt(trigger: &Event) -> String {
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    scope: &ScopeRef,
+    trigger: &Event,
     user_text: &str,
 ) -> PromptTelemetry {
-    let scope_bootstrap =
-        if state.take_seed_slot(&scope.id) || command_transport_without_resume(&state.spec) {
-            seed_manifest(&state.actor_id, scope)
-        } else {
-            String::new()
-        };
+    let scope = &trigger.scope;
+    let first_turn = state.take_seed_slot(&scope.id);
+    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.spec) {
+        seed_manifest(&state.actor_id, scope)
+    } else {
+        String::new()
+    };
+    let channel_id = resolve_channel_for_scope(client, state, scope).await;
+    let template_vars = channel_id
+        .as_deref()
+        .map(|channel_id| prompt_template_vars(state, trigger, channel_id))
+        .unwrap_or_else(|| minimal_prompt_template_vars(state, trigger));
+    let user_text = apply_handoff_prefix(&state.spec, user_text, first_turn);
+    let user_text = apply_prompt_template(
+        state.spec.prompt_template.as_ref(),
+        &template_vars,
+        first_turn,
+        &user_text,
+    );
 
     let identity_spec = state.spec.identity.as_ref();
     let memory_spec = state.spec.memory.as_ref();
@@ -2184,7 +2223,7 @@ async fn compose_envelope_prompt(
                 },
                 agent_runtime::PromptSection {
                     name: "user_message",
-                    content: format!("=== User message ===\n{user_text}"),
+                    content: format!("=== User message ===\n{}", user_text),
                 },
             ]
         };
@@ -2196,8 +2235,6 @@ async fn compose_envelope_prompt(
         return prompt_telemetry(content, &sections);
     }
 
-    let channel_id = resolve_channel_for_scope(client, state, scope).await;
-
     let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             profile_dir: &state.profile_dir,
@@ -2205,10 +2242,117 @@ async fn compose_envelope_prompt(
             memory_spec,
             channel_id: channel_id.as_deref(),
             thread_context: "",
-            user_message: user_text,
+            user_message: &user_text,
             scope_bootstrap: &scope_bootstrap,
         });
     prompt_telemetry(prompt, &sections)
+}
+
+fn apply_handoff_prefix(spec: &AgentSpec, user_text: &str, first_turn: bool) -> String {
+    let Some(handoff) = spec.handoff.as_ref() else {
+        return user_text.to_string();
+    };
+    let prefix = handoff.trigger_prompt_prefix.as_str();
+    if prefix.is_empty() {
+        return user_text.to_string();
+    }
+    let applies = match handoff.apply_on {
+        HandoffApplyOn::EveryTurn => true,
+        HandoffApplyOn::FirstTurn => first_turn,
+    };
+    if !applies || user_text.starts_with(prefix) {
+        return user_text.to_string();
+    }
+    format!("{prefix}{user_text}")
+}
+
+fn apply_prompt_template(
+    template: Option<&PromptTemplateSpec>,
+    vars: &BTreeMap<String, String>,
+    first_turn: bool,
+    user_text: &str,
+) -> String {
+    let Some(template) = template else {
+        return user_text.to_string();
+    };
+    let mut sections = Vec::new();
+    sections.extend(
+        template
+            .every_turn_prefix
+            .iter()
+            .map(|line| expand_prompt_vars(line, vars)),
+    );
+    if first_turn {
+        sections.extend(
+            template
+                .first_turn_prefix
+                .iter()
+                .map(|line| expand_prompt_vars(line, vars)),
+        );
+    }
+    sections.push(user_text.to_string());
+    sections.extend(
+        template
+            .every_turn_suffix
+            .iter()
+            .map(|line| expand_prompt_vars(line, vars)),
+    );
+    sections
+        .into_iter()
+        .filter(|section| !section.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn prompt_template_vars(
+    state: &WorkerState,
+    trigger: &Event,
+    channel_id: &str,
+) -> BTreeMap<String, String> {
+    let mut vars = state
+        .paths
+        .template_vars(&state.actor_id, channel_id, &trigger.scope);
+    extend_prompt_template_vars(&mut vars, state, Some(trigger));
+    vars
+}
+
+fn minimal_prompt_template_vars(state: &WorkerState, trigger: &Event) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    vars.insert("actor.id".into(), state.actor_id.clone());
+    vars.insert("scope.id".into(), trigger.scope.id.clone());
+    vars.insert(
+        "scope.kind".into(),
+        scope_kind_name(trigger.scope.kind).to_string(),
+    );
+    extend_prompt_template_vars(&mut vars, state, Some(trigger));
+    vars
+}
+
+fn extend_prompt_template_vars(
+    vars: &mut BTreeMap<String, String>,
+    state: &WorkerState,
+    trigger: Option<&Event>,
+) {
+    if let Some(trigger) = trigger {
+        vars.insert("trigger.id".into(), trigger.id.clone());
+        vars.insert("trigger.actor_id".into(), trigger.actor_id.clone());
+    }
+    if let Some(template) = state.spec.prompt_template.as_ref() {
+        if let Some(active_skill) = template.active_skill.as_deref() {
+            vars.insert("prompt.activeSkill".into(), active_skill.to_string());
+        }
+        for (key, value) in &template.vars {
+            vars.insert(format!("vars.{key}"), value.clone());
+        }
+    }
+}
+
+fn expand_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = input.to_string();
+    for (key, value) in vars {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    out
 }
 
 fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) -> PromptTelemetry {
@@ -2771,7 +2915,9 @@ async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::methods::{AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport};
+    use proto::methods::{
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, HandoffSpec,
+    };
     use proto::types::{Actor, ActorKind};
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
@@ -3005,6 +3151,121 @@ mod tests {
         let mut acp = sample_spec(None);
         acp.transport.kind = "acp_stdio".into();
         assert!(!command_transport_without_resume(&acp));
+    }
+
+    #[test]
+    fn handoff_prefix_applies_to_every_turn() {
+        let mut spec = sample_spec(None);
+        spec.handoff = Some(HandoffSpec {
+            trigger_prompt_prefix: "/router\n".into(),
+            apply_on: HandoffApplyOn::EveryTurn,
+        });
+
+        assert_eq!(
+            apply_handoff_prefix(&spec, "hello", false),
+            "/router\nhello"
+        );
+        assert_eq!(
+            apply_handoff_prefix(&spec, "/router\nhello", false),
+            "/router\nhello"
+        );
+    }
+
+    #[test]
+    fn prompt_template_expands_runtime_vars_and_first_turn_prefix() {
+        let mut vars = BTreeMap::new();
+        vars.insert("actor.id".into(), "actor_router".into());
+        vars.insert("scope.kind".into(), "channel".into());
+        vars.insert("scope.id".into(), "chan_1".into());
+        vars.insert("workspace.dir".into(), "/tmp/work".into());
+        vars.insert("agent.skillBody".into(), "# Router skill".into());
+        vars.insert("prompt.activeSkill".into(), "router".into());
+        vars.insert("vars.mode".into(), "fast".into());
+        let template = PromptTemplateSpec {
+            active_skill: Some("router".into()),
+            every_turn_prefix: vec![
+                "[joi] {actor.id} {scope.kind}:{scope.id}".into(),
+                "workspace_dir: {workspace.dir}".into(),
+                "mode: {vars.mode}".into(),
+            ],
+            first_turn_prefix: vec![
+                "skill: {prompt.activeSkill}".into(),
+                "{agent.skillBody}".into(),
+            ],
+            every_turn_suffix: vec!["done".into()],
+            vars: BTreeMap::new(),
+        };
+
+        let first = apply_prompt_template(Some(&template), &vars, true, "/router\nhi");
+        assert!(first.contains("[joi] actor_router channel:chan_1"));
+        assert!(first.contains("workspace_dir: /tmp/work"));
+        assert!(first.contains("skill: router"));
+        assert!(first.contains("# Router skill"));
+        assert!(first.contains("/router\nhi"));
+        assert!(first.ends_with("done"));
+
+        let later = apply_prompt_template(Some(&template), &vars, false, "hi");
+        assert!(!later.contains("# Router skill"));
+        assert!(later.contains("hi"));
+    }
+
+    #[test]
+    fn prompt_template_vars_include_trigger_and_paths() {
+        let root = temp_path("prompt-template-vars");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let mut spec = sample_spec(None);
+        spec.prompt_template = Some(PromptTemplateSpec {
+            active_skill: Some("demo".into()),
+            vars: BTreeMap::from([("role".into(), "router".into())]),
+            ..Default::default()
+        });
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let trigger = Event {
+            id: "evt_trigger".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_human".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: chrono::Utc::now(),
+            payload: serde_json::json!({}),
+            relations: Vec::new(),
+            _meta: None,
+        };
+
+        let vars = prompt_template_vars(&state, &trigger, "chan_demo");
+
+        assert_eq!(vars.get("actor.id").map(String::as_str), Some("actor_demo"));
+        assert_eq!(
+            vars.get("channel.id").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            vars.get("trigger.id").map(String::as_str),
+            Some("evt_trigger")
+        );
+        assert_eq!(
+            vars.get("trigger.actor_id").map(String::as_str),
+            Some("actor_human")
+        );
+        assert_eq!(
+            vars.get("prompt.activeSkill").map(String::as_str),
+            Some("demo")
+        );
+        assert_eq!(vars.get("vars.role").map(String::as_str), Some("router"));
+        assert!(vars
+            .get("workspace.dir")
+            .is_some_and(|value| value.contains("chan_demo")));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

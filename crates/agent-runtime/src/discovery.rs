@@ -237,6 +237,8 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
         "qoder" => {
             append_add_dir_arg(&mut args, &joi_config_dir);
             args.push("--yolo".into());
+            args.push("--output-format".into());
+            args.push("stream-json".into());
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "copilot" => {
@@ -250,6 +252,7 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
         }
         "codex" => {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
+            args.push("--json".into());
             args.push("--sandbox".into());
             args.push("danger-full-access".into());
             args.push("-c".into());
@@ -267,8 +270,9 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
 
 fn command_output_format_for_provider(provider_id: &str) -> CommandOutputFormat {
     match provider_id {
-        "claude" => CommandOutputFormat::ClaudeStreamJson,
+        "claude" | "qoder" => CommandOutputFormat::ClaudeStreamJson,
         "copilot" => CommandOutputFormat::CopilotJson,
+        "codex" => CommandOutputFormat::CodexStreamJson,
         _ => CommandOutputFormat::Text,
     }
 }
@@ -458,8 +462,14 @@ mod tests {
             .expect("qoder provider");
         let mut expected = add_dir.clone();
         expected.push("--yolo");
+        expected.push("--output-format");
+        expected.push("stream-json");
         expected.push("-p");
         assert_eq!(qoder.args, expected);
+        assert_eq!(
+            qoder.transport().output_format,
+            Some(CommandOutputFormat::ClaudeStreamJson)
+        );
         let copilot = providers
             .iter()
             .find(|provider| provider.id == "copilot")
@@ -483,6 +493,7 @@ mod tests {
         let mut expected = vec![
             "exec",
             "--skip-git-repo-check",
+            "--json",
             "--sandbox",
             "danger-full-access",
             "-c",
@@ -490,6 +501,10 @@ mod tests {
         ];
         expected.extend(add_dir);
         assert_eq!(codex.args, expected);
+        assert_eq!(
+            codex.transport().output_format,
+            Some(CommandOutputFormat::CodexStreamJson)
+        );
         assert_eq!(
             codex
                 .transport()

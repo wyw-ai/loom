@@ -360,9 +360,14 @@ fn spawn_and_collect(
         )
     })?;
     let mut cmd = Command::new(&cfg.command);
+    let stdin = if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     cmd.args(argv)
         .current_dir(&prompt.cwd)
-        .stdin(Stdio::piped())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in expanded_env(cfg, prompt) {
@@ -443,7 +448,7 @@ fn spawn_and_collect(
             for line in r.lines().map_while(Result::ok) {
                 collected_stdout.push_str(&line);
                 collected_stdout.push('\n');
-                translate_codex_stream_line(&line, &prompt.scope, sender);
+                translate_codex_event_line(&line, &prompt.scope, sender);
             }
         }
     }
@@ -490,6 +495,15 @@ fn spawn_and_collect(
         }
         CommandOutputFormat::CopilotJson => {
             if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
+                let _ = sender.send(AdapterEvent::Text {
+                    scope: Some(prompt.scope.clone()),
+                    content,
+                    is_partial: false,
+                });
+            }
+        }
+        CommandOutputFormat::CodexStreamJson => {
+            if let Some(content) = extract_codex_json_final_text(&collected_stdout) {
                 let _ = sender.send(AdapterEvent::Text {
                     scope: Some(prompt.scope.clone()),
                     content,
@@ -648,29 +662,17 @@ fn translate_claude_stream_line(
     }
 }
 
-fn translate_codex_stream_line(
+fn translate_codex_event_line(
     line: &str,
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) {
-    // Placeholder per docs/command-transport-v0.md §6.3. The schema is not
-    // pinned yet; treat any `output_text.delta` we see as text and leave the
-    // rest for the next iteration.
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
     };
     if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
         match t {
-            "output_text.delta" => {
-                if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
-                        content: d.to_string(),
-                        is_partial: true,
-                    });
-                }
-            }
             "tool_call" => {
                 let name = v
                     .get("name")
@@ -684,9 +686,118 @@ fn translate_codex_stream_line(
                     input,
                 });
             }
+            "stream_error" => {
+                let message =
+                    string_at_paths(&v, &["/message", "/error/message", "/error", "/details"])
+                        .unwrap_or_else(|| "codex stream error".into());
+                let _ = sender.send(AdapterEvent::Error {
+                    scope: Some(scope.clone()),
+                    message,
+                });
+            }
             _ => {}
         }
     }
+}
+
+fn extract_codex_json_final_text(stdout: &str) -> Option<String> {
+    let mut final_text: Option<String> = None;
+    let mut streamed_text = String::new();
+
+    for line in stdout.lines() {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        match kind {
+            "task_complete" | "task.completed" | "turn_complete" | "turn.completed" => {
+                if let Some(text) = string_at_paths(
+                    &v,
+                    &["/last_agent_message", "/lastAgentMessage", "/message"],
+                )
+                .or_else(|| {
+                    v.get("last_agent_message")
+                        .and_then(codex_response_item_text)
+                })
+                .or_else(|| codex_content_text(v.get("last_agent_message")?))
+                .and_then(non_blank)
+                {
+                    final_text = Some(text);
+                }
+            }
+            "agent_message" | "agent.message" => {
+                if let Some(text) = codex_message_event_text(&v).and_then(non_blank) {
+                    final_text = Some(text);
+                }
+            }
+            "item_completed" | "item.completed" | "raw_response_item" | "raw.response_item" => {
+                if let Some(text) = v
+                    .get("item")
+                    .and_then(codex_response_item_text)
+                    .and_then(non_blank)
+                {
+                    final_text = Some(text);
+                }
+            }
+            "agent_message_content_delta" | "output_text.delta" => {
+                if let Some(delta) = string_at_paths(
+                    &v,
+                    &["/delta", "/text", "/content", "/data/delta", "/data/text"],
+                ) {
+                    streamed_text.push_str(&delta);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    final_text.or_else(|| non_blank(streamed_text))
+}
+
+fn codex_message_event_text(v: &Value) -> Option<String> {
+    string_at_paths(v, &["/message", "/text", "/content"])
+        .or_else(|| v.get("message").and_then(codex_response_item_text))
+        .or_else(|| v.pointer("/message/content").and_then(codex_content_text))
+        .or_else(|| v.get("content").and_then(codex_content_text))
+        .or_else(|| v.get("message").and_then(codex_content_text))
+}
+
+fn codex_response_item_text(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if item_type != "message" && item_type != "agent_message" {
+        return None;
+    }
+    if let Some(role) = item.get("role").and_then(Value::as_str) {
+        if role != "assistant" {
+            return None;
+        }
+    }
+    string_at_paths(item, &["/text", "/message"])
+        .or_else(|| item.get("content").and_then(codex_content_text))
+}
+
+fn codex_content_text(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    let arr = value.as_array()?;
+    let mut out = String::new();
+    for item in arr {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(
+            item_type,
+            "" | "output_text" | "final_answer" | "commentary" | "text"
+        ) {
+            continue;
+        }
+        if let Some(text) = string_at_paths(item, &["/text", "/content", "/delta"]) {
+            out.push_str(&text);
+        } else if let Some(content) = item.get("content").and_then(codex_content_text) {
+            out.push_str(&content);
+        }
+    }
+    non_blank(out)
 }
 
 fn extract_copilot_json_final_text(stdout: &str) -> Option<String> {
@@ -1160,6 +1271,65 @@ mod tests {
     }
 
     #[test]
+    fn codex_json_final_text_picks_task_complete_message() {
+        let stdout = r#"{"type":"session_configured","session_id":"s1"}
+{"type":"agent_message_content_delta","delta":"draft"}
+{"type":"task_complete","last_agent_message":"Final answer\n"}
+"#;
+
+        assert_eq!(
+            extract_codex_json_final_text(stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn codex_json_final_text_reads_completed_message_item() {
+        let stdout = r#"{"type":"item_completed","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"},{"type":"output_text","text":" world"}]}}
+"#;
+
+        assert_eq!(
+            extract_codex_json_final_text(stdout),
+            Some("Hello world".into())
+        );
+    }
+
+    #[test]
+    fn codex_json_final_text_reads_codex_0130_item_completed() {
+        let stdout = r#"Reading additional input from stdin...
+{"type":"thread.started","thread_id":"019e1a84-3d53-7512-b9ef-c7cfb437ae6b"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}
+"#;
+
+        assert_eq!(extract_codex_json_final_text(stdout), Some("OK".into()));
+    }
+
+    #[test]
+    fn codex_json_final_text_reads_nested_agent_message() {
+        let stdout = r#"{"type":"agent_message","message":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Nested answer"}]}}
+"#;
+
+        assert_eq!(
+            extract_codex_json_final_text(stdout),
+            Some("Nested answer".into())
+        );
+    }
+
+    #[test]
+    fn codex_json_final_text_falls_back_to_deltas() {
+        let stdout = r#"{"type":"agent_message_content_delta","delta":"hello"}
+{"type":"agent_message_content_delta","delta":" world"}
+"#;
+
+        assert_eq!(
+            extract_codex_json_final_text(stdout),
+            Some("hello world".into())
+        );
+    }
+
+    #[test]
     fn template_expands_scope_and_session_and_prompt() {
         let cfg = cfg();
         let request = prompt("hello world");
@@ -1188,6 +1358,23 @@ mod tests {
         let request = prompt("hi");
         let argv = expand_first_run_argv(&cfg, &request, "hi");
         assert_eq!(argv, vec!["--input", "hi"]);
+    }
+
+    #[tokio::test]
+    async fn args_prompt_does_not_pipe_stdin_to_child() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "if read -r _; then echo stdin-open; else echo stdin-closed; fi".into(),
+        ];
+        cfg.prompt_via = PromptVia::Args;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert_eq!(outcome.stdout.trim(), "stdin-closed");
     }
 
     #[test]

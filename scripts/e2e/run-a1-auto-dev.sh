@@ -211,10 +211,10 @@ done
 echo "clone-manifest = $manifest_id"
 
 # ------------------------------------------------------------------
-# 6. driver creates delivery thread bootstrapped from manifest;
-#    invites delivery + mr-detector service actor.
+# 6. legacy harness driver emulates discovery's delivery-thread startup
+#    from the manifest; live serve --ai does this inside actor_discovery.
 # ------------------------------------------------------------------
-step "6. create delivery thread (bootstrap-artifact)"
+step "6. emulate discovery delivery thread startup (bootstrap-artifact)"
 droot=$(thread_anchor "$ch" "anchor: delivery-rename-greeting")
 delth=$(j thread create --channel "$ch" --root-event "$droot" \
           --bootstrap-artifact "$manifest_id" \

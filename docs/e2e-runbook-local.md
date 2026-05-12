@@ -39,7 +39,7 @@ SKIP_LLM=1 scripts/e2e/run-all.sh
 | `run-mr-detector.sh` | M3：thread-bound mr-detector 发 `status.update` + `attaches_artifact` 事件 + merged 后 `service.self_complete`，host 删 `request.json`。|
 | `run-spec-apply.sh` | M5/O6：从合成 lesson-plan 走 `action.request → action.response → joi spec apply`，断言 `spec.json` 落盘、bundle write 落盘、`agent.config.changed` 携带 `reload_epoch_ms`、receipt artifact 发出。|
 | `run-classroom.sh` | M7 leg 1：真 LLM teacher 在 thread 里产 lesson-plan + 发 `action.request`；driver accept → spec apply → 断言同 M5。|
-| `run-a1-auto-dev.sh` | M7 leg 2：真 LLM router→discovery→delivery 三跳，driver 用 `joi thread create --bootstrap-artifact` 派生 delivery thread，最后串 thread-bound mr-detector 收尾。|
+| `run-a1-auto-dev.sh` | M7 leg 2：真 LLM router→discovery→delivery 三跳；新 serve 流程由 discovery 派生 delivery thread，最后串 thread-bound mr-detector 收尾。|
 | `run-thread-closed.sh` | M6：open 钉子的 mr-detector 在 thread 被关闭时被 host 收割（`auto_stop_on=thread.closed`，§4.7.3）。|
 
 > **执行顺序约束**：`run-thread-closed.sh` 重启 harness 用的是 *open*

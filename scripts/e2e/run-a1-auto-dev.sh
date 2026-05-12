@@ -36,6 +36,9 @@ USER_DISPLAY="E2E Human"
 
 j() { "$JOI" --as "$USER_ACTOR" --display "$USER_DISPLAY" --json "$@"; }
 step() { printf '\n=== %s ===\n' "$*"; }
+thread_anchor() {
+  j event append --channel --in "$1" --type thread.opened --text "$2" | jq -r '.event.id'
+}
 
 # ------------------------------------------------------------------
 # 1. channel + resident discovery thread + invitations
@@ -48,7 +51,8 @@ for a in actor_router actor_discovery actor_delivery svc_mr_detector; do
   j channel invite "$ch" "$a" >/dev/null 2>&1 || true
 done
 
-dth=$(j thread create --channel "$ch" --resident-as discovery \
+droot=$(thread_anchor "$ch" "anchor: discovery-resident")
+dth=$(j thread create --channel "$ch" --root-event "$droot" --resident-as discovery \
         --title "discovery-resident" | jq -r '.thread.id')
 echo "discovery thread = $dth"
 
@@ -211,7 +215,8 @@ echo "clone-manifest = $manifest_id"
 #    invites delivery + mr-detector service actor.
 # ------------------------------------------------------------------
 step "6. create delivery thread (bootstrap-artifact)"
-delth=$(j thread create --channel "$ch" \
+droot=$(thread_anchor "$ch" "anchor: delivery-rename-greeting")
+delth=$(j thread create --channel "$ch" --root-event "$droot" \
           --bootstrap-artifact "$manifest_id" \
           --title "delivery-rename-greeting" | jq -r '.thread.id')
 echo "delivery thread = $delth"

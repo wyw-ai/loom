@@ -6,6 +6,8 @@ import {
   ChevronRight,
   Copy,
   Cpu,
+  FileText,
+  FolderOpen,
   HardDrive,
   Monitor,
   Plus,
@@ -20,7 +22,12 @@ import {
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { AgentInfo, AgentProviderSummary, MachineInfo } from "@/ipc/types";
+import type {
+  AgentInfo,
+  AgentProviderSummary,
+  MachineAgentInfo,
+  MachineInfo,
+} from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useUI } from "@/store/ui";
 import { useWorkspaces } from "@/store/workspaces";
@@ -159,7 +166,7 @@ export function MachinesPage() {
     });
   };
 
-  const removeAgent = (machine: MachineInfo, agent: AgentInfo) => {
+  const removeAgent = (machine: MachineInfo, agent: MachineAgentInfo) => {
     openModal({
       type: "confirm",
       title: `Delete ${agent.spec.actor.displayName || agent.spec.actor.id}?`,
@@ -331,7 +338,7 @@ function ComputerDetail({
   onRefresh: () => void;
   onCreateAgent: () => void;
   onRemove: () => void;
-  onRemoveAgent: (agent: AgentInfo) => void;
+  onRemoveAgent: (agent: MachineAgentInfo) => void;
 }) {
   const pushToast = useUI((s) => s.pushToast);
   const [commandOpen, setCommandOpen] = useState(machine.connectionStatus !== "online");
@@ -538,35 +545,92 @@ function AgentRow({
   agent,
   onRemove,
 }: {
-  agent: AgentInfo;
+  agent: MachineAgentInfo;
   onRemove: () => void;
 }) {
+  const pushToast = useUI((s) => s.pushToast);
   const online = agent.status === "online";
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      pushToast("info", `${label} copied`);
+    } catch {
+      pushToast("info", value);
+    }
+  };
+  const openProfile = async () => {
+    try {
+      await ipc.openLocalPath(agent.profilePath);
+      pushToast("info", "profile opened");
+    } catch (e) {
+      pushToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
   return (
-    <div className="flex items-center gap-3 border-b border-black/10 px-3 py-2 last:border-b-0">
-      <PixelAvatar
-        id={agent.spec.actor.id}
-        label={agent.spec.actor.displayName}
-        size={24}
-      />
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-black">
-          {agent.spec.actor.displayName || agent.spec.actor.id}
+    <div className="border-b border-black/10 px-3 py-3 last:border-b-0">
+      <div className="flex items-center gap-3">
+        <PixelAvatar
+          id={agent.spec.actor.id}
+          label={agent.spec.actor.displayName}
+          size={24}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-black">
+            {agent.spec.actor.displayName || agent.spec.actor.id}
+          </div>
+          <div className="truncate font-mono text-[11px] text-black/45">
+            {agentProviderName(agent)} · {agentModelLabel(agent)}
+          </div>
         </div>
-        <div className="truncate font-mono text-[11px] text-black/45">
-          {agentProviderName(agent)} · {agentModelLabel(agent)}
+        <span
+          className={clsx(
+            "h-2.5 w-2.5 shrink-0 rounded-full border border-black",
+            online ? "bg-brutal-lime" : "bg-black/20",
+          )}
+          title={agent.status}
+        />
+        <button className="btn-brutal-sm bg-white p-1" onClick={onRemove}>
+          <Trash2 size={12} />
+        </button>
+      </div>
+      <div className="mt-2 grid min-w-0 gap-2 pl-9 md:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="flex min-w-0 items-center gap-2 border border-black/20 bg-brutal-cream px-2 py-1.5">
+          <HardDrive size={12} className="shrink-0 text-black/45" />
+          <span className="truncate font-mono text-[11px] text-black/65">
+            {agent.profilePath}
+          </span>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          <button
+            className="btn-brutal-sm bg-white p-1.5"
+            title="Open profile folder"
+            onClick={() => void openProfile()}
+          >
+            <FolderOpen size={12} />
+          </button>
+          <button
+            className="btn-brutal-sm bg-white p-1.5"
+            title="Copy profile path"
+            onClick={() => void copy(agent.profilePath, "profile path")}
+          >
+            <Copy size={12} />
+          </button>
+          <button
+            className="btn-brutal-sm gap-1 bg-white px-2 py-1 text-[11px]"
+            title={agent.identityPath}
+            onClick={() => void copy(agent.identityPath, "identity.md path")}
+          >
+            <FileText size={12} /> Identity
+          </button>
+          <button
+            className="btn-brutal-sm gap-1 bg-white px-2 py-1 text-[11px]"
+            title={agent.soulPath}
+            onClick={() => void copy(agent.soulPath, "soul.md path")}
+          >
+            <FileText size={12} /> Soul
+          </button>
         </div>
       </div>
-      <span
-        className={clsx(
-          "h-2.5 w-2.5 shrink-0 rounded-full border border-black",
-          online ? "bg-brutal-lime" : "bg-black/20",
-        )}
-        title={agent.status}
-      />
-      <button className="btn-brutal-sm bg-white p-1" onClick={onRemove}>
-        <Trash2 size={12} />
-      </button>
     </div>
   );
 }
@@ -830,12 +894,12 @@ function AddAgentDialog({
               onChange={(e) => setName(e.target.value)}
             />
           </Field>
-          <Field label={`Description (${description.length}/3000)`} optional>
+          <Field label={`Initial Identity (${description.length}/3000)`} optional>
             <textarea
               className="input-brutal w-full resize-none"
               maxLength={3000}
               rows={3}
-              placeholder="Leave blank for a general-purpose agent"
+              placeholder="Seed identity.md on first start"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
             />

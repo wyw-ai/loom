@@ -51,7 +51,7 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
   }
 
   return (
-    <div className="stable-scrollbar h-full overflow-y-scroll bg-white px-4 py-5">
+    <div className="stable-scrollbar h-full min-h-0 min-w-0 overflow-y-auto overflow-x-hidden bg-white px-4 py-5">
       {bubbles.length === 0 ? (
         <div className="flex min-h-full items-center justify-center font-mono text-sm text-black/40">
           No messages yet. Say something.

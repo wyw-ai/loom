@@ -39,4 +39,5 @@ without side effects.
 `a1-dev-canfeng`. Pass `params.scanner_thread_id` to point at the
 scanner thread (typically `feedback-scan`) and `params.channel_id` to
 the parent channel. The loop creates per-bug bugfix threads via
-`joi thread create --channel <chan>`.
+`joi event append --channel --in <chan> ...` followed by
+`joi thread create --channel <chan> --root-event <anchor_event_id>`.

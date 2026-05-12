@@ -32,6 +32,7 @@ import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { ActorAvatar } from "@/features/common/ActorAvatar";
+import { ArtifactAttachments } from "./ArtifactAttachment";
 
 export interface BubbleReplyContext {
   actorId: string;
@@ -67,7 +68,7 @@ export function Bubble({
     return (
       <div
         id={domId}
-      className="my-1 scroll-mt-16 text-center font-mono text-xs italic text-black/40"
+        className="my-1 break-words scroll-mt-16 text-center font-mono text-xs italic text-black/40"
       >
         {bubble.text}
       </div>
@@ -141,7 +142,7 @@ export function Bubble({
   return (
     <div
       id={domId}
-      className="group relative flex scroll-mt-16 gap-3 px-2 py-1 transition-colors hover:bg-brutal-cream focus-within:bg-brutal-cream"
+      className="group relative flex min-w-0 scroll-mt-16 gap-3 px-2 py-1 transition-colors hover:bg-brutal-cream focus-within:bg-brutal-cream"
       onContextMenu={onContextMenu}
     >
       <div className="w-10 shrink-0">
@@ -207,6 +208,7 @@ export function Bubble({
         )}
 
         <Body bubble={bubble} />
+        <ArtifactAttachments artifactIds={bubble.attachmentIds} />
         <MessageMeta meta={bubble.meta} />
       </div>
 
@@ -291,10 +293,13 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
   const targetActor = useActors((s) => s.byId[target]);
   const targetName = targetActor?.displayName || target;
   return (
-    <div className="text-sm text-black/70">
+    <div className="break-words text-sm text-black/70">
       <span className="text-black/45">handoff {"->"}</span>{" "}
       <span className="bg-mention px-1 font-black text-black" title={target}>
-        @{targetName}
+        {targetName}
+        <span className="ml-1 font-mono text-[11px] font-normal text-black/55">
+          (@{target})
+        </span>
       </span>
       {bubble.text ? <>: {bubble.text}</> : null}
     </div>
@@ -303,7 +308,7 @@ function HandoffBody({ bubble }: { bubble: BubbleT }) {
 
 function MarkdownText({ text }: { text: string }) {
   return (
-    <div className="prose-chat text-sm leading-6 text-black">
+    <div className="prose-chat min-w-0 max-w-full text-sm leading-6 text-black">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
     </div>
   );
@@ -622,7 +627,8 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
       ? `Selected: ${bubble.actionSelectedLabel}`
       : statusTone.label;
   const [expanded, setExpanded] = useState(() => !disabled);
-  const cardShell = "mt-1 w-full max-w-3xl overflow-hidden border-2 border-black bg-white shadow-brutal-sm";
+  const cardShell =
+    "mt-1 w-full min-w-0 max-w-3xl overflow-hidden border-2 border-black bg-white shadow-brutal-sm";
   const bodyShell = "px-3 pb-3 pt-2";
   const hasStructuredBody =
     bubble.actionReason || bubble.actionCommand || bubble.actionRawInput;
@@ -700,7 +706,9 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
               <div className="mb-0.5 text-[11px] font-black uppercase tracking-wider text-black/45">
                 Reason
               </div>
-              <div className="whitespace-pre-wrap">{bubble.actionReason}</div>
+              <div className="whitespace-pre-wrap break-words">
+                {bubble.actionReason}
+              </div>
             </div>
           )}
           {bubble.actionCommand && (
@@ -726,7 +734,7 @@ function ActionRequestBody({ bubble }: { bubble: BubbleT }) {
         </div>
       ) : (
         <div className={bodyShell}>
-          <div className="whitespace-pre-wrap text-sm text-black">
+          <div className="whitespace-pre-wrap break-words text-sm text-black">
             {bubble.text}
           </div>
         </div>

@@ -74,6 +74,31 @@ export interface JoiEvent {
   _meta?: Record<string, unknown>;
 }
 
+export type ArtifactKind = "file" | "directory";
+
+export interface Artifact {
+  id: string;
+  uri: string;
+  kind: ArtifactKind;
+  name: string;
+  mediaType: string;
+  size: number;
+  checksum: string;
+  createdBy: string;
+  createdAt: string;
+  _meta?: Record<string, unknown>;
+}
+
+export interface ArtifactReadResult {
+  artifactId: string;
+  mediaType: string;
+  offset: number;
+  truncated: boolean;
+  nextOffset?: number;
+  content: string;
+  bytes?: number[];
+}
+
 export type TurnStatus = "open" | "closed" | "failed" | "cancelled";
 
 export interface Turn {
@@ -84,6 +109,23 @@ export interface Turn {
   openedAt: string;
   closedAt?: string | null;
   triggerEventId?: string | null;
+}
+
+export type ReminderStatus = "scheduled" | "fired" | "cancelled";
+
+export interface Reminder {
+  id: string;
+  actorId: string;
+  title: string;
+  scope?: ScopeRef | null;
+  msgId?: string | null;
+  fireAt: string;
+  repeat?: string | null;
+  status: ReminderStatus;
+  createdAt: string;
+  updatedAt: string;
+  lastFiredAt?: string | null;
+  _meta?: Record<string, unknown>;
 }
 
 // ---- notification payloads the front-end consumes ----
@@ -179,6 +221,12 @@ export interface AgentInfo {
   sessionId?: string;
 }
 
+export interface MachineAgentInfo extends AgentInfo {
+  profilePath: string;
+  identityPath: string;
+  soulPath: string;
+}
+
 export interface AgentProviderSummary {
   id: string;
   name: string;
@@ -203,7 +251,7 @@ export interface MachineInfo {
   agentCount: number;
   onlineAgentCount: number;
   providers: AgentProviderSummary[];
-  agents: AgentInfo[];
+  agents: MachineAgentInfo[];
   serveCommand: string;
   setupScript: string;
 }
@@ -231,6 +279,7 @@ export interface Bubble {
   streaming: boolean;
   delivery: DeliveryState;
   handoffTarget?: string;
+  attachmentIds?: string[];
   // action.request bubbles only
   requestType?: string;
   actionTitle?: string;

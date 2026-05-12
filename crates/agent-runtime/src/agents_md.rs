@@ -107,6 +107,40 @@ channel and `#<channel_id>:<root_event_id>` for a thread. If you only have a\n\
 thread scope id, run `joi --json thread list` and find the row with that id;\n\
 its `channelId` and `rootEventId` form the message target.\n\
 \n\
+### Runtime contract\n\
+\n\
+Joi starts your turn only after the runtime has selected you for work. Treat\n\
+the latest `=== Latest Joi message ===` block in the prompt as the trigger for\n\
+the current turn. If it says `Delivery: explicit handoff to you`, the sender is\n\
+asking you to act. Raw `@actor` text by itself is not machine routing; rely on\n\
+Joi relations, delivery metadata, and CLI queries instead of parsing mentions.\n\
+\n\
+For a normal reply, write the final user-visible answer as your response. The\n\
+Joi runtime will publish it back to the current scope and link it to the\n\
+trigger event. Do not call `joi message send` just to post that normal final\n\
+answer, or you may duplicate the reply outside the turn. Use the CLI only for\n\
+extra collaboration actions: reading history, sending a separate DM or channel\n\
+message, handing work to another actor, publishing artifacts, asking the user a\n\
+question, or requesting approval.\n\
+\n\
+Keep progress updates short, state uncertainty when it matters, and include the\n\
+key evidence behind conclusions. If more context is needed, query Joi first.\n\
+\n\
+### Collaboration routing\n\
+\n\
+Human-to-actor handoffs are weak task signals: answer in the current scope\n\
+when the work is short or conversational. Do not create a thread for every\n\
+human `@actor` or `/handoff` message.\n\
+\n\
+Actor-to-actor handoffs are strong task-flow signals. When you delegate a\n\
+substantial subtask to another actor from a channel common area, create or\n\
+reuse a task thread first: post a short channel root message, create a thread\n\
+from that root event, then send the handoff inside that thread. If the current\n\
+scope is already the right thread, reuse it instead of creating another one.\n\
+After creating or choosing a thread, keep follow-up work, evidence, review\n\
+requests, and the final answer in that thread. The parent channel should get\n\
+at most a short pointer or summary.\n\
+\n\
 ### Read-only CLI\n\
 \n\
 Shell out to `joi --json ...` for server state. `--json` returns machine-\n\
@@ -130,7 +164,7 @@ joi --json actor list\n\
 joi --json agent list\n\
 joi --json reminder list\n\
 joi --json artifact get <art_id|artifact://...>\n\
-joi --json artifact read <art_id> [--max-bytes N]\n\
+joi --json artifact read <art_id> [--offset N] [--max-bytes N]\n\
 ```\n\
 \n\
 ### Write CLI\n\
@@ -151,6 +185,9 @@ joi --json ask-user-question --title \"Choose option\" --question \"Which option
     --choice a=A --choice b=B\n\
 joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
 joi --json attachment upload --target '#<channel_id>:<root_event_id>' --path <file>\n\
+joi --json message send --target '#<channel_id>:<root_event_id>' \\\n\
+    --text \"see attached\" --attachment-id <art_id>\n\
+joi --json attachment download --id <art_id> --output <file>\n\
 joi --json artifact publish --in <scope_id> [--channel] \\\n\
     --name <file> [--media-type <type>] (--text <body> | --file <path>)\n\
 joi --json reminder schedule --target '#<channel_id>:<root_event_id>' \\\n\
@@ -161,6 +198,11 @@ Use `dm:<actor_id>` for private messages. `handoff` is responsibility\n\
 transfer in the current scope, not a DM target, and aliases such as\n\
 `dm:@actor` are not supported. Thread targets are rooted at channel events;\n\
 thread-in-thread targets are not supported.\n\
+\n\
+Attachment workflow: upload local files with `attachment upload`, attach the\n\
+returned artifact id to a message with `message send --attachment-id`, and read\n\
+large text/binary artifacts incrementally with `artifact read --offset` or\n\
+download the full body with `attachment download`.\n\
 \n\
 Use `joi --help` and `joi <subcommand> --help` for the full surface.\n\
 {END_MARKER}"
@@ -176,6 +218,11 @@ mod tests {
         let out = update_block("", &joi_block("actor_demo"));
         assert!(out.contains("actor_demo"));
         assert!(out.contains("JOI_SCOPE_ID"));
+        assert!(out.contains("### Runtime contract"));
+        assert!(out.contains("Do not call `joi message send` just to post"));
+        assert!(out.contains("Human-to-actor handoffs are weak task signals"));
+        assert!(out.contains("Actor-to-actor handoffs are strong task-flow signals"));
+        assert!(out.contains("keep follow-up work, evidence, review"));
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains(END_MARKER));
     }

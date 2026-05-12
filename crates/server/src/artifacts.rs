@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -49,14 +50,17 @@ impl ArtifactStore {
                 (t.name, media, t.text.into_bytes())
             }
             ArtifactIngress::FileBytes(f) => {
-                let media = if f.media_type.is_empty() {
-                    "application/octet-stream".to_string()
+                let media = if f.media_type.is_empty() || f.media_type == "application/octet-stream"
+                {
+                    detect_media_type(&f.name, &f.bytes)
                 } else {
                     f.media_type
                 };
                 (f.name, media, f.bytes)
             }
         };
+        let artifact_kind = classify_artifact_kind(&media_type, &name);
+        let previewable = is_previewable_kind(artifact_kind);
         let safe_name = sanitize_name(&name);
         let path = dir.join(&safe_name);
         std::fs::write(&path, &bytes)?;
@@ -68,6 +72,19 @@ impl ArtifactStore {
             .as_ref()
             .map(|scope| self.save_workspace_copy(scope, &name, &bytes))
             .transpose()?;
+        let mut meta = Meta::new();
+        meta.insert("attachmentKind".into(), json!(artifact_kind));
+        meta.insert("previewable".into(), json!(previewable));
+        if let Some(workspace) = workspace_meta {
+            meta.insert("workspaceEntryId".into(), json!(workspace.entry_id));
+            meta.insert("workspaceFilename".into(), json!(workspace.filename));
+            meta.insert("workspacePath".into(), json!(workspace.path));
+            meta.insert(
+                "workspaceScopeKind".into(),
+                json!(scope_kind_name(workspace.kind)),
+            );
+            meta.insert("workspaceScopeId".into(), json!(workspace.scope_id));
+        }
         let artifact = Artifact {
             id,
             uri,
@@ -78,38 +95,42 @@ impl ArtifactStore {
             checksum,
             created_by,
             created_at: Utc::now(),
-            _meta: workspace_meta.map(|workspace| {
-                let mut meta = Meta::new();
-                meta.insert("workspaceEntryId".into(), json!(workspace.entry_id));
-                meta.insert("workspaceFilename".into(), json!(workspace.filename));
-                meta.insert("workspacePath".into(), json!(workspace.path));
-                meta.insert(
-                    "workspaceScopeKind".into(),
-                    json!(scope_kind_name(workspace.kind)),
-                );
-                meta.insert("workspaceScopeId".into(), json!(workspace.scope_id));
-                meta
-            }),
+            _meta: Some(meta),
         };
         store.put_artifact(artifact.clone())?;
         Ok(artifact)
     }
 
-    pub fn read(&self, artifact: &Artifact, max_bytes: u64) -> StoreResult<ArtifactReadResult> {
+    pub fn read(
+        &self,
+        artifact: &Artifact,
+        offset: u64,
+        max_bytes: u64,
+    ) -> StoreResult<ArtifactReadResult> {
         let safe = sanitize_name(&artifact.name);
         let path = self.root.join(&artifact.id).join(&safe);
-        let bytes = std::fs::read(&path)
+        let mut file = std::fs::File::open(&path)
             .map_err(|e| StoreError::NotFound(format!("artifact body {}: {}", artifact.id, e)))?;
+        let total = file.metadata().map_err(StoreError::Io)?.len();
         let max = max_bytes.max(1) as usize;
-        let truncated = bytes.len() > max;
-        let slice = if truncated { &bytes[..max] } else { &bytes[..] };
-        let content = String::from_utf8_lossy(slice).to_string();
+        let mut bytes = Vec::new();
+        if offset < total {
+            file.seek(SeekFrom::Start(offset)).map_err(StoreError::Io)?;
+            file.take(max as u64)
+                .read_to_end(&mut bytes)
+                .map_err(StoreError::Io)?;
+        }
+        let next = offset.saturating_add(bytes.len() as u64);
+        let truncated = next < total;
+        let content = String::from_utf8_lossy(&bytes).to_string();
         Ok(ArtifactReadResult {
             artifact_id: artifact.id.clone(),
             media_type: artifact.media_type.clone(),
+            offset,
             truncated,
+            next_offset: if truncated { Some(next) } else { None },
             content,
-            bytes: slice.to_vec(),
+            bytes,
         })
     }
 
@@ -184,6 +205,151 @@ fn extension_for(name: &str) -> String {
         .filter(|ext| !ext.is_empty())
         .map(|ext| format!(".{ext}"))
         .unwrap_or_else(|| ".txt".to_string())
+}
+
+fn detect_media_type(name: &str, bytes: &[u8]) -> String {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".into();
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg".into();
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif".into();
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp".into();
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf".into();
+    }
+    if let Some(media) = guess_media_type_from_name(name) {
+        if !media.starts_with("text/") && !is_structured_text_media(&media) {
+            return media;
+        }
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return guess_text_media_type(name);
+    }
+    guess_media_type_from_name(name).unwrap_or_else(|| "application/octet-stream".into())
+}
+
+fn guess_media_type_from_name(name: &str) -> Option<String> {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())?;
+    let media = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "md" | "markdown" => "text/markdown",
+        "txt" | "log" | "toml" | "ini" | "rs" | "go" | "py" | "ts" | "tsx" | "jsx" | "xml" => {
+            "text/plain"
+        }
+        _ => return None,
+    };
+    Some(media.into())
+}
+
+fn guess_text_media_type(name: &str) -> String {
+    guess_media_type_from_name(name)
+        .filter(|media| media.starts_with("text/") || is_structured_text_media(media))
+        .unwrap_or_else(|| "text/plain".into())
+}
+
+fn classify_artifact_kind(media_type: &str, name: &str) -> &'static str {
+    if media_type.starts_with("image/") {
+        "image"
+    } else if media_type.starts_with("audio/") {
+        "audio"
+    } else if media_type.starts_with("video/") {
+        "video"
+    } else if media_type == "application/pdf" {
+        "pdf"
+    } else if media_type.starts_with("text/")
+        || is_structured_text_media(media_type)
+        || has_text_preview_extension(name)
+    {
+        "text"
+    } else if has_archive_extension(name) {
+        "archive"
+    } else {
+        "file"
+    }
+}
+
+fn is_structured_text_media(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "application/json" | "application/yaml" | "application/xml"
+    ) || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+}
+
+fn is_previewable_kind(kind: &str) -> bool {
+    matches!(kind, "image" | "audio" | "video" | "pdf" | "text")
+}
+
+fn has_text_preview_extension(name: &str) -> bool {
+    matches!(
+        Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "txt"
+                | "md"
+                | "markdown"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "ini"
+                | "log"
+                | "csv"
+                | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "css"
+                | "html"
+                | "xml"
+                | "rs"
+                | "go"
+                | "py"
+        )
+    )
+}
+
+fn has_archive_extension(name: &str) -> bool {
+    matches!(
+        Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("zip" | "gz" | "tar" | "tgz" | "bz2" | "xz" | "7z" | "rar")
+    )
 }
 
 fn scope_kind_name(kind: ScopeKind) -> &'static str {

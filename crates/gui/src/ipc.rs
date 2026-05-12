@@ -18,7 +18,7 @@ use agent_runtime::discovery::{
     DetectedAgentProvider,
 };
 use proto::methods::method;
-use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice};
+use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
@@ -433,11 +433,51 @@ pub async fn event_append(state: State<'_, AppState>, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn artifact_publish(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_PUBLISH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn artifact_get(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_GET, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn artifact_read(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_READ, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn turn_close(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
         .await?
         .call_raw(method::TURN_CLOSE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn reminder_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::REMINDER_LIST, Some(params))
         .await
         .map_err(stringify)
 }
@@ -486,7 +526,13 @@ pub async fn agent_list() -> Result<AgentListResult, String> {
         .iter()
         .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
     {
-        agents.extend(machine_info(machine, server_url).map_err(stringify)?.agents);
+        agents.extend(
+            machine_info(machine, server_url)
+                .map_err(stringify)?
+                .agents
+                .into_iter()
+                .map(|agent| agent.info),
+        );
     }
     Ok(AgentListResult { agents })
 }
@@ -606,9 +652,19 @@ pub struct MachineInfo {
     pub agent_count: usize,
     pub online_agent_count: usize,
     pub providers: Vec<MachineAgentProviderInfo>,
-    pub agents: Vec<AgentInfo>,
+    pub agents: Vec<MachineAgentInfo>,
     pub serve_command: String,
     pub setup_script: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineAgentInfo {
+    #[serde(flatten)]
+    pub info: AgentInfo,
+    pub profile_path: String,
+    pub identity_path: String,
+    pub soul_path: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -643,6 +699,83 @@ pub async fn machine_check(state: State<'_, AppState>) -> Result<MachineListResu
         None => temporary_machine_check_client(&cfg).await,
     };
     machines_from_config(&cfg, client).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenLocalPathArgs {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Err("path is required".into());
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    if !path.exists() {
+        if path.extension().is_some() {
+            return Err(format!("path does not exist: {}", path.display()));
+        }
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("create directory {}: {e}", path.display()))?;
+    }
+    open_path_with_system(&path).map_err(stringify)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileFileReadArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub file: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileFileWriteArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub file: String,
+    pub text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileFileResult {
+    pub path: String,
+    pub text: String,
+}
+
+#[tauri::command]
+pub async fn agent_profile_file_read(
+    args: AgentProfileFileReadArgs,
+) -> Result<AgentProfileFileResult, String> {
+    let path = resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file)
+        .map_err(stringify)?;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    Ok(AgentProfileFileResult {
+        path: config::home_path_expr(&path),
+        text,
+    })
+}
+
+#[tauri::command]
+pub async fn agent_profile_file_write(
+    args: AgentProfileFileWriteArgs,
+) -> Result<AgentProfileFileResult, String> {
+    let path = resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file)
+        .map_err(stringify)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create directory {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, &args.text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(AgentProfileFileResult {
+        path: config::home_path_expr(&path),
+        text: args.text,
+    })
 }
 
 #[derive(Deserialize)]
@@ -783,7 +916,7 @@ pub async fn machine_agent_create(
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
     let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
-    let actor_id = actor_id_from_input(&args.actor_id, name).map_err(stringify)?;
+    let actor_id = actor_id_from_input(&args.actor_id, name, &machine_id).map_err(stringify)?;
     let machine_index = cfg
         .machines
         .iter()
@@ -912,7 +1045,11 @@ fn actor_ids_for_machine(machine: &MachineConfig, server_url: &str) -> Vec<Strin
     actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
     match machine_info(machine, server_url) {
         Ok(info) => {
-            actor_ids.extend(info.agents.into_iter().map(|agent| agent.spec.actor.id));
+            actor_ids.extend(
+                info.agents
+                    .into_iter()
+                    .map(|agent| agent.info.spec.actor.id),
+            );
         }
         Err(err) => {
             tracing::warn!(
@@ -992,7 +1129,7 @@ async fn apply_connection_status(result: &mut MachineListResult, client: Option<
                 machine
                     .agents
                     .iter()
-                    .map(|agent| agent.spec.actor.id.clone()),
+                    .map(|agent| agent.info.spec.actor.id.clone()),
             )
         })
         .collect();
@@ -1020,11 +1157,11 @@ async fn apply_connection_status(result: &mut MachineListResult, client: Option<
     for machine in &mut result.machines {
         machine.online_agent_count = 0;
         for agent in &mut machine.agents {
-            if live.contains(&agent.spec.actor.id) {
-                agent.status = "online".into();
+            if live.contains(&agent.info.spec.actor.id) {
+                agent.info.status = "online".into();
                 machine.online_agent_count += 1;
             } else {
-                agent.status = "registered".into();
+                agent.info.status = "registered".into();
             }
         }
         if live.contains(&machine.connection_actor_id) {
@@ -1101,14 +1238,22 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
         .collect::<Vec<_>>();
     let provider_specs =
         provider_specs_from_agent_definitions(&detected_providers, &machine_agent_defs);
-    let agents: Vec<AgentInfo> = provider_specs
+    let agents: Vec<MachineAgentInfo> = provider_specs
         .into_iter()
         .flat_map(|provider| provider.into_agent_specs())
-        .map(|spec| AgentInfo {
-            spec,
-            status: "registered".into(),
-            pid: None,
-            session_id: None,
+        .map(|spec| {
+            let paths = agent_profile_paths(&data_root, &spec);
+            MachineAgentInfo {
+                info: AgentInfo {
+                    spec,
+                    status: "registered".into(),
+                    pid: None,
+                    session_id: None,
+                },
+                profile_path: config::home_path_expr(&paths.profile),
+                identity_path: config::home_path_expr(&paths.identity),
+                soul_path: config::home_path_expr(&paths.soul),
+            }
         })
         .collect();
     let setup_status = if providers.is_empty() {
@@ -1153,6 +1298,78 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
     })
 }
 
+struct AgentProfilePaths {
+    profile: PathBuf,
+    identity: PathBuf,
+    soul: PathBuf,
+}
+
+fn agent_profile_paths(data_root: &Path, spec: &AgentSpec) -> AgentProfilePaths {
+    let profile = data_root
+        .join("agents")
+        .join(&spec.actor.id)
+        .join("profile");
+    let identity_file = spec
+        .identity
+        .as_ref()
+        .map(|identity| identity.files.identity.as_str())
+        .unwrap_or("identity.md");
+    let soul_file = spec
+        .identity
+        .as_ref()
+        .map(|identity| identity.files.soul.as_str())
+        .unwrap_or("soul.md");
+    AgentProfilePaths {
+        identity: resolve_profile_path(&profile, identity_file),
+        soul: resolve_profile_path(&profile, soul_file),
+        profile,
+    }
+}
+
+fn resolve_profile_path(profile: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        profile.join(path)
+    }
+}
+
+fn resolve_machine_agent_profile_file(
+    machine_id: &str,
+    actor_id: &str,
+    file: &str,
+) -> anyhow::Result<PathBuf> {
+    let cfg = config::load_or_init()?;
+    let machine = cfg
+        .machines
+        .iter()
+        .find(|machine| {
+            machine.id == machine_id && config::machine_belongs_to_active_workspace(machine, &cfg)
+        })
+        .ok_or_else(|| anyhow::anyhow!("unknown machine id: {machine_id}"))?;
+    let agent = machine
+        .agents
+        .iter()
+        .find(|agent| agent.actor_id == actor_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent actor id: {actor_id}"))?;
+    let file_name = match file.trim() {
+        "identity" => "identity.md",
+        "soul" => "soul.md",
+        other => return Err(anyhow::anyhow!("unknown profile file: {other}")),
+    };
+    let data_root = if machine.data_root.trim().is_empty() {
+        config::default_agent_data_root()
+    } else {
+        config::expand_home(&machine.data_root)
+    };
+    Ok(data_root
+        .join("agents")
+        .join(&agent.actor_id)
+        .join("profile")
+        .join(file_name))
+}
+
 fn machine_connection_actor_id(machine: &MachineConfig) -> String {
     format!("actor_service_{}", machine.id)
 }
@@ -1162,6 +1379,41 @@ fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
         Ok(path)
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn open_path_with_system(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    let status = command
+        .status()
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "open {} exited with status {status}",
+            path.display()
+        ))
     }
 }
 
@@ -1283,14 +1535,26 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
     Ok(machine
         .agents
         .into_iter()
-        .find(|agent| agent.spec.actor.id == args.actor_id))
+        .find(|agent| agent.info.spec.actor.id == args.actor_id)
+        .map(|agent| agent.info))
 }
 
-fn actor_id_from_input(value: &str, display_name: &str) -> anyhow::Result<String> {
+fn actor_id_from_input(
+    value: &str,
+    display_name: &str,
+    machine_id: &str,
+) -> anyhow::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        return Ok(format!("actor_agent_{}_{}", slugify(display_name), suffix));
+        let display_slug = slugify(display_name);
+        let machine_slug = compact_machine_slug(machine_id);
+        let stem = if display_slug == "agent" || display_slug.chars().count() < 2 {
+            machine_slug
+        } else {
+            display_slug
+        };
+        return Ok(format!("actor_agent_{}_{}", stem, suffix));
     }
     if trimmed
         .chars()
@@ -1299,6 +1563,15 @@ fn actor_id_from_input(value: &str, display_name: &str) -> anyhow::Result<String
         return Ok(trimmed.to_string());
     }
     anyhow::bail!("actor id contains unsupported characters")
+}
+
+fn compact_machine_slug(machine_id: &str) -> String {
+    let slug = slugify(machine_id);
+    let compact = slug
+        .strip_prefix("machine_")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(slug.as_str());
+    format!("machine_{compact}")
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -1363,6 +1636,28 @@ mod tests {
                 autostart: false,
             }],
         }
+    }
+
+    #[test]
+    fn generated_actor_id_uses_machine_stem_for_short_ascii_name_fragments() {
+        let id = actor_id_from_input("", "G仔", "machine_macbook_01").expect("actor id");
+
+        assert!(id.starts_with("actor_agent_machine_macbook_01_"));
+    }
+
+    #[test]
+    fn generated_actor_id_can_use_meaningful_display_slug() {
+        let id = actor_id_from_input("", "Reviewer", "machine_macbook_01").expect("actor id");
+
+        assert!(id.starts_with("actor_agent_reviewer_"));
+    }
+
+    #[test]
+    fn explicit_actor_id_is_preserved_when_valid() {
+        let id = actor_id_from_input("actor_agent_custom:01", "G仔", "machine_macbook_01")
+            .expect("actor id");
+
+        assert_eq!(id, "actor_agent_custom:01");
     }
 
     #[test]

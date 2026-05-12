@@ -28,6 +28,9 @@ USER_DISPLAY="E2E Human"
 "$JOI" who >/dev/null 2>&1 || { echo "joi-server not reachable at $JOI_SERVER" >&2; exit 2; }
 
 j() { "$JOI" --as "$USER_ACTOR" --display "$USER_DISPLAY" --json "$@"; }
+thread_anchor() {
+  j event append --channel --in "$1" --type thread.opened --text "$2" | jq -r '.event.id'
+}
 
 step() { printf '\n=== %s ===\n' "$*"; }
 
@@ -35,7 +38,8 @@ step "1. create channel + thread"
 ch=$(j channel create --title "e2e-mr-detector" | jq -r '.channel.id // .id')
 [ -n "$ch" ] && [ "$ch" != "null" ] || { echo "channel create returned no id" >&2; exit 1; }
 echo "channel = $ch"
-th=$(j thread create --channel "$ch" --title "mr-detector-smoke" | jq -r '.thread.id // .id')
+root=$(thread_anchor "$ch" "anchor: mr-detector-smoke")
+th=$(j thread create --channel "$ch" --root-event "$root" --title "mr-detector-smoke" | jq -r '.thread.id // .id')
 [ -n "$th" ] && [ "$th" != "null" ] || { echo "thread create returned no id" >&2; exit 1; }
 echo "thread = $th"
 

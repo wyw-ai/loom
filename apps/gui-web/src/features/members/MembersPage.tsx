@@ -2,19 +2,27 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import clsx from "clsx";
 import {
   BellRing,
+  CalendarClock,
   ChevronDown,
   ChevronRight,
+  Clock3,
+  Copy,
   Edit3,
+  FileText,
   Folder,
+  FolderOpen,
+  Hash,
   type LucideIcon,
   MessageSquare,
   Monitor,
   Plus,
+  RefreshCw,
   RotateCcw,
   Square,
   Trash2,
   Users,
   Workflow,
+  X,
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
@@ -22,12 +30,20 @@ import type {
   Actor,
   AgentInfo,
   AgentProviderSummary,
+  JoiEvent,
+  MachineAgentInfo,
   MachineInfo,
+  Reminder,
+  ReminderStatus,
+  ScopeRef,
 } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
+import { summarizeActionRequest } from "@/features/chat/actionRequestSummary";
+import { openScope } from "@/features/chat/scopeActions";
 import { ActorAvatar } from "@/features/common/ActorAvatar";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
+import { useMessages } from "@/store/messages";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { useWorkspaces } from "@/store/workspaces";
@@ -50,6 +66,9 @@ interface ManagedAgent {
   machineId: string;
   machine: string;
   dataRoot: string;
+  profilePath: string;
+  identityPath: string;
+  soulPath: string;
   providerId: string;
   provider: string;
   providers: AgentProviderSummary[];
@@ -77,7 +96,8 @@ interface AgentUpdatePatch {
 type AgentMachineContext = Pick<
   MachineInfo,
   "id" | "name" | "dataRoot" | "providers"
->;
+> &
+  Partial<Pick<MachineAgentInfo, "profilePath" | "identityPath" | "soulPath">>;
 
 export function MembersPage() {
   const actorsById = useActors((s) => s.byId);
@@ -173,6 +193,9 @@ export function MembersPage() {
         name: agent.machine,
         dataRoot: agent.dataRoot,
         providers: agent.providers,
+        profilePath: agent.profilePath,
+        identityPath: agent.identityPath,
+        soulPath: agent.soulPath,
       },
     );
     setAgents((xs) =>
@@ -442,17 +465,7 @@ function AgentDetail({
           <ProfileTab agent={agent} online={online} onUpdate={onUpdate} />
         )}
         {tab === "dms" && <EmptyTab label="No agent-to-agent DMs yet" />}
-        {tab === "reminders" && (
-          <div className="p-5">
-            <div className="border-2 border-dashed border-black/30 px-5 py-8 text-center">
-              <BellRing className="mx-auto mb-2 text-black/25" size={26} />
-              <div className="font-black">No pending reminders.</div>
-              <div className="mt-1 text-sm text-black/50">
-                Reminders appear here in real time as soon as the agent schedules them.
-              </div>
-            </div>
-          </div>
-        )}
+        {tab === "reminders" && <RemindersTab agent={agent} />}
         {tab === "workspace" && <WorkspaceTab agent={agent} />}
         {tab === "activity" && <ActivityTab agent={agent} />}
       </div>
@@ -483,6 +496,488 @@ function AgentTabButton({
       {label}
     </button>
   );
+}
+
+type ReminderFilter = ReminderStatus | "all";
+type ThreadsByChannel = ReturnType<typeof useChannels.getState>["threadsByChannel"];
+type ChannelList = ReturnType<typeof useChannels.getState>["channels"];
+
+interface LinkedMessagePreview {
+  actorId?: string;
+  text: string;
+  occurredAt?: string;
+  missing?: boolean;
+}
+
+const REMINDER_FILTERS: Array<{ id: ReminderFilter; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "scheduled", label: "Scheduled" },
+  { id: "fired", label: "Fired" },
+  { id: "cancelled", label: "Cancelled" },
+];
+
+function RemindersTab({ agent }: { agent: ManagedAgent }) {
+  const channels = useChannels((s) => s.channels);
+  const threadsByChannel = useChannels((s) => s.threadsByChannel);
+  const pushToast = useUI((s) => s.pushToast);
+  const setView = useUI((s) => s.setView);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [messagePreviews, setMessagePreviews] = useState<Record<string, LinkedMessagePreview>>({});
+  const [filter, setFilter] = useState<ReminderFilter>("all");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    let busy = false;
+    let previewCache: Record<string, LinkedMessagePreview> = {};
+
+    const load = async (showLoading: boolean) => {
+      if (busy) return;
+      busy = true;
+      if (showLoading) setLoading(true);
+      try {
+        const res = await ipc.reminderList({
+          actorId: agent.actor.id,
+          all: true,
+        });
+        const previews = await resolveLinkedMessagePreviews(
+          res.reminders,
+          previewCache,
+        );
+        if (!alive) return;
+        previewCache = { ...previewCache, ...previews };
+        setReminders(res.reminders);
+        setMessagePreviews(previewCache);
+        setError(null);
+      } catch (e) {
+        if (!alive) return;
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        busy = false;
+        if (alive && showLoading) setLoading(false);
+      }
+    };
+
+    setReminders([]);
+    setMessagePreviews({});
+    setError(null);
+    void load(true);
+    const timer = window.setInterval(() => void load(false), 8000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [agent.actor.id, refreshNonce]);
+
+  const counts = useMemo(() => {
+    const next: Record<ReminderFilter, number> = {
+      all: reminders.length,
+      scheduled: 0,
+      fired: 0,
+      cancelled: 0,
+    };
+    for (const reminder of reminders) next[reminder.status] += 1;
+    return next;
+  }, [reminders]);
+
+  const visible = useMemo(
+    () =>
+      reminders.filter((reminder) =>
+        filter === "all" ? true : reminder.status === filter,
+      ),
+    [filter, reminders],
+  );
+
+  const openLinkedScope = async (scope: ScopeRef | null | undefined) => {
+    if (!scope) return;
+    setView("chat");
+    try {
+      await openScope(scope);
+    } catch (e) {
+      pushToast("error", `open scope failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  return (
+    <div className="min-h-full bg-white">
+      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b-2 border-black bg-white px-5 py-3">
+        <div className="mr-auto min-w-0">
+          <div className="flex items-center gap-2 text-sm font-black">
+            <BellRing size={16} />
+            {counts.scheduled} scheduled
+          </div>
+          <div className="font-mono text-xs text-black/45">
+            {reminders.length} reminder{reminders.length === 1 ? "" : "s"} for {agent.actor.displayName || agent.actor.id}
+          </div>
+        </div>
+        <div role="radiogroup" aria-label="Filter reminders" className="flex flex-wrap gap-1">
+          {REMINDER_FILTERS.map((item) => (
+            <button
+              key={item.id}
+              role="radio"
+              aria-checked={filter === item.id}
+              className={clsx(
+                "btn-brutal-sm gap-1 px-2 py-1 text-xs",
+                filter === item.id ? "bg-brutal-yellow" : "bg-white",
+              )}
+              onClick={() => setFilter(item.id)}
+            >
+              {item.label}
+              <span className="font-mono text-[10px] text-black/55">{counts[item.id]}</span>
+            </button>
+          ))}
+        </div>
+        <button
+          className="btn-brutal-sm bg-white p-1.5"
+          title="Refresh reminders"
+          onClick={() => setRefreshNonce((value) => value + 1)}
+        >
+          <RefreshCw size={14} className={loading ? "animate-spin" : undefined} />
+        </button>
+      </div>
+
+      {error && (
+        <div className="mx-5 mt-4 border-2 border-black bg-danger px-3 py-2 text-sm font-bold">
+          reminder/list failed: {error}
+        </div>
+      )}
+
+      <div className="space-y-3 p-5">
+        {loading && reminders.length === 0 ? (
+          <div className="border-2 border-dashed border-black/30 px-5 py-8 text-center font-mono text-sm text-black/45">
+            Loading reminders...
+          </div>
+        ) : visible.length === 0 ? (
+          <div className="border-2 border-dashed border-black/30 px-5 py-8 text-center">
+            <BellRing className="mx-auto mb-2 text-black/25" size={26} />
+            <div className="font-black">
+              {reminders.length === 0 ? "No reminders found." : `No ${filter} reminders.`}
+            </div>
+            <div className="mt-1 text-sm text-black/50">
+              This list refreshes while the tab is open.
+            </div>
+          </div>
+        ) : (
+          visible.map((reminder) => {
+            const key = reminderMessageKey(reminder);
+            return (
+              <ReminderCard
+                key={reminder.id}
+                reminder={reminder}
+                channels={channels}
+                threadsByChannel={threadsByChannel}
+                messagePreview={key ? messagePreviews[key] : undefined}
+                onOpenScope={() => openLinkedScope(reminder.scope)}
+              />
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ReminderCard({
+  reminder,
+  channels,
+  threadsByChannel,
+  messagePreview,
+  onOpenScope,
+}: {
+  reminder: Reminder;
+  channels: ChannelList;
+  threadsByChannel: ThreadsByChannel;
+  messagePreview?: LinkedMessagePreview;
+  onOpenScope: () => void;
+}) {
+  const scopeInfo = describeReminderScope(reminder.scope, channels, threadsByChannel);
+  const ScopeIcon = scopeInfo.kind === "thread" ? MessageSquare : Hash;
+
+  return (
+    <article className="border-2 border-black bg-brutal-cream p-4 shadow-brutal-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={clsx("chip-brutal", reminderStatusClass(reminder.status))}>
+          {reminder.status}
+        </span>
+        <span className="font-mono text-[11px] text-black/45">{reminder.id}</span>
+        {reminder.repeat && (
+          <span className="chip-brutal bg-white">
+            <Clock3 size={11} />
+            {reminder.repeat}
+          </span>
+        )}
+      </div>
+
+      <div className="mt-3 text-base font-black leading-6">{reminder.title}</div>
+
+      <div className="mt-3 grid gap-2 lg:grid-cols-2">
+        <ReminderFact icon={CalendarClock} label="Fire At">
+          <div className="font-bold">{formatDateTime(reminder.fireAt)}</div>
+          <div className="font-mono text-[11px] text-black/45">{formatRelativeTime(reminder.fireAt)}</div>
+        </ReminderFact>
+        <ReminderFact icon={ScopeIcon} label="Scope">
+          <div className="font-bold">{scopeInfo.title}</div>
+          <div className="font-mono text-[11px] text-black/45">{scopeInfo.subtitle}</div>
+        </ReminderFact>
+      </div>
+
+      <div className="mt-3 border-2 border-black bg-white p-3">
+        <div className="mb-1 flex items-center gap-2 text-xs font-black uppercase tracking-widest text-black/45">
+          <MessageSquare size={13} />
+          Linked Message
+        </div>
+        {reminder.msgId ? (
+          <>
+            <div className="break-all font-mono text-[11px] text-black/50">{reminder.msgId}</div>
+            <div className={clsx("mt-2 text-sm", messagePreview?.missing ? "text-black/45" : "text-black")}>
+              {messagePreview?.text ?? "Message preview unavailable until this scope has recent history."}
+            </div>
+            {messagePreview?.actorId && (
+              <div className="mt-1 font-mono text-[11px] text-black/45">
+                by {messagePreview.actorId}
+                {messagePreview.occurredAt ? ` at ${formatDateTime(messagePreview.occurredAt)}` : ""}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="text-sm text-black/45">No message id linked to this reminder.</div>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <span className="font-mono text-[11px] text-black/45">
+          created {formatDateTime(reminder.createdAt)}
+        </span>
+        {reminder.lastFiredAt && (
+          <span className="font-mono text-[11px] text-black/45">
+            last fired {formatDateTime(reminder.lastFiredAt)}
+          </span>
+        )}
+        {reminder.scope && (
+          <button
+            className="btn-brutal-sm ml-auto gap-1 bg-white px-3 py-1.5 text-xs"
+            onClick={() => void onOpenScope()}
+          >
+            Open Scope
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
+function ReminderFact({
+  icon: Icon,
+  label,
+  children,
+}: {
+  icon: LucideIcon;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex min-w-0 gap-2 border-2 border-black bg-white p-3">
+      <Icon size={15} className="mt-0.5 shrink-0" />
+      <div className="min-w-0">
+        <div className="text-xs font-black uppercase tracking-widest text-black/45">{label}</div>
+        <div className="min-w-0 break-words text-sm">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+async function resolveLinkedMessagePreviews(
+  reminders: Reminder[],
+  existing: Record<string, LinkedMessagePreview> = {},
+): Promise<Record<string, LinkedMessagePreview>> {
+  const previews: Record<string, LinkedMessagePreview> = {};
+  const pending = new Map<string, { scope: ScopeRef; ids: Set<string> }>();
+
+  for (const reminder of reminders) {
+    const key = reminderMessageKey(reminder);
+    if (!key || !reminder.scope || !reminder.msgId) continue;
+    if (existing[key] && !existing[key].missing) {
+      previews[key] = existing[key];
+      continue;
+    }
+
+    const cached = readCachedMessagePreview(reminder);
+    if (cached) {
+      previews[key] = cached;
+      continue;
+    }
+
+    const scopeId = scopeKey(reminder.scope);
+    const group = pending.get(scopeId) ?? {
+      scope: reminder.scope,
+      ids: new Set<string>(),
+    };
+    group.ids.add(reminder.msgId);
+    pending.set(scopeId, group);
+  }
+
+  await Promise.all(
+    [...pending.values()].map(async ({ scope, ids }) => {
+      const found = new Set<string>();
+      try {
+        const res = await ipc.scopeRead(scope, 100);
+        for (const event of res.events) {
+          if (!ids.has(event.id)) continue;
+          found.add(event.id);
+          previews[`${scopeKey(scope)}:${event.id}`] = previewFromEvent(event);
+        }
+      } catch {
+        // Scope visibility can differ from the reminder owner. Keep the
+        // association visible even if the preview cannot be hydrated.
+      }
+
+      for (const id of ids) {
+        if (found.has(id)) continue;
+        previews[`${scopeKey(scope)}:${id}`] = {
+          text: "Message preview unavailable; showing the linked event id above.",
+          missing: true,
+        };
+      }
+    }),
+  );
+
+  return previews;
+}
+
+function readCachedMessagePreview(reminder: Reminder): LinkedMessagePreview | null {
+  if (!reminder.scope || !reminder.msgId) return null;
+  const scopeState = useMessages.getState().byScope[scopeKey(reminder.scope)];
+  const bubble = scopeState?.bubbles.find((item) => item.id === reminder.msgId);
+  if (!bubble) return null;
+  return {
+    actorId: bubble.actorId,
+    text: compactPreview(bubble.text),
+    occurredAt: bubble.ts,
+  };
+}
+
+function previewFromEvent(event: JoiEvent): LinkedMessagePreview {
+  const payload = (event.payload ?? {}) as Record<string, unknown>;
+  let text = asString(payload.text);
+
+  if (event.type === "action.request") {
+    const summary = summarizeActionRequest(payload);
+    text = [summary.title, summary.description].filter(Boolean).join(" - ");
+  } else if (!text) {
+    text = asString(payload.title) || asString(payload.body) || event.type;
+  }
+
+  return {
+    actorId: event.actorId,
+    text: compactPreview(text),
+    occurredAt: event.occurredAt,
+  };
+}
+
+function reminderMessageKey(reminder: Reminder): string | null {
+  if (!reminder.scope || !reminder.msgId) return null;
+  return `${scopeKey(reminder.scope)}:${reminder.msgId}`;
+}
+
+function describeReminderScope(
+  scope: ScopeRef | null | undefined,
+  channels: ChannelList,
+  threadsByChannel: ThreadsByChannel,
+): { kind: ScopeRef["kind"] | "none"; title: string; subtitle: string } {
+  if (!scope) {
+    return {
+      kind: "none",
+      title: "No scope",
+      subtitle: "fires without a channel/thread event",
+    };
+  }
+
+  if (scope.kind === "channel") {
+    const channel = channels.find((item) => item.id === scope.id);
+    return {
+      kind: "channel",
+      title: channel ? `#${channel.title}` : `#${scope.id}`,
+      subtitle: `channel ${scope.id}`,
+    };
+  }
+
+  for (const [channelId, threads] of Object.entries(threadsByChannel)) {
+    const thread = threads.find((item) => item.id === scope.id);
+    if (!thread) continue;
+    const channel = channels.find((item) => item.id === channelId);
+    return {
+      kind: "thread",
+      title: thread.title,
+      subtitle: channel
+        ? `thread ${scope.id} in #${channel.title}`
+        : `thread ${scope.id} in channel ${channelId}`,
+    };
+  }
+
+  return {
+    kind: "thread",
+    title: scope.id,
+    subtitle: `thread ${scope.id}`,
+  };
+}
+
+function reminderStatusClass(status: ReminderStatus): string {
+  switch (status) {
+    case "scheduled":
+      return "bg-brutal-yellow";
+    case "fired":
+      return "bg-brutal-lime";
+    case "cancelled":
+      return "bg-black text-white";
+  }
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatRelativeTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const diffMs = date.getTime() - Date.now();
+  const absSeconds = Math.max(1, Math.round(Math.abs(diffMs) / 1000));
+  const text = formatDuration(absSeconds);
+  if (absSeconds < 30) return "now";
+  return diffMs >= 0 ? `in ${text}` : `${text} ago`;
+}
+
+function formatDuration(seconds: number): string {
+  const units = [
+    { label: "d", value: 86400 },
+    { label: "h", value: 3600 },
+    { label: "m", value: 60 },
+  ];
+  for (const unit of units) {
+    if (seconds >= unit.value) {
+      return `${Math.round(seconds / unit.value)}${unit.label}`;
+    }
+  }
+  return `${seconds}s`;
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function compactPreview(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 180) return normalized || "Empty message";
+  return `${normalized.slice(0, 177)}...`;
 }
 
 function ProfileTab({
@@ -549,6 +1044,8 @@ function ProfileTab({
         </button>
       </InfoSection>
 
+      <ActorProfileSection agent={agent} />
+
       <InfoSection title="Info">
         <div className="grid max-w-2xl grid-cols-2 gap-5 text-sm">
           <div>
@@ -598,6 +1095,212 @@ function ProfileTab({
       <InfoSection title="Created Agents (0)">
         <span className="italic text-black/45">No created agents</span>
       </InfoSection>
+    </div>
+  );
+}
+
+type ProfileFileKind = "identity" | "soul";
+
+function ActorProfileSection({ agent }: { agent: ManagedAgent }) {
+  const pushToast = useUI((s) => s.pushToast);
+  const [editing, setEditing] = useState<ProfileFileKind | null>(null);
+
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      pushToast("info", `${label} copied`);
+    } catch {
+      pushToast("info", value);
+    }
+  };
+
+  const openProfile = async () => {
+    try {
+      await ipc.openLocalPath(agent.profilePath);
+      pushToast("info", "profile opened");
+    } catch (e) {
+      pushToast("error", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <InfoSection title="Actor Profile">
+      <div className="max-w-4xl space-y-2">
+        <ProfilePathRow
+          label="Profile"
+          value={agent.profilePath}
+          onCopy={() => void copy(agent.profilePath, "profile path")}
+          onOpen={() => void openProfile()}
+        />
+        <ProfilePathRow
+          label="Identity"
+          value={agent.identityPath}
+          onCopy={() => void copy(agent.identityPath, "identity.md path")}
+          onEdit={() => setEditing("identity")}
+        />
+        <ProfilePathRow
+          label="Soul"
+          value={agent.soulPath}
+          onCopy={() => void copy(agent.soulPath, "soul.md path")}
+          onEdit={() => setEditing("soul")}
+        />
+      </div>
+      {editing && (
+        <ProfileFileEditor
+          agent={agent}
+          file={editing}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </InfoSection>
+  );
+}
+
+function ProfilePathRow({
+  label,
+  value,
+  onCopy,
+  onOpen,
+  onEdit,
+}: {
+  label: string;
+  value: string;
+  onCopy: () => void;
+  onOpen?: () => void;
+  onEdit?: () => void;
+}) {
+  return (
+    <div className="grid min-w-0 gap-2 md:grid-cols-[7rem_minmax(0,1fr)_auto]">
+      <div className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-black/45">
+        {label === "Profile" ? <Folder size={13} /> : <FileText size={13} />}
+        {label}
+      </div>
+      <div className="min-w-0 border border-black/20 bg-brutal-cream px-2 py-1.5 font-mono text-xs text-black/70">
+        <div className="truncate">{value}</div>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {onOpen && (
+          <button
+            className="btn-brutal-sm bg-white p-1.5"
+            title="Open profile folder"
+            onClick={onOpen}
+          >
+            <FolderOpen size={12} />
+          </button>
+        )}
+        <button
+          className="btn-brutal-sm bg-white p-1.5"
+          title={`Copy ${label.toLowerCase()} path`}
+          onClick={onCopy}
+        >
+          <Copy size={12} />
+        </button>
+        {onEdit && (
+          <button
+            className="btn-brutal-sm gap-1 bg-white px-2 py-1 text-[11px]"
+            onClick={onEdit}
+          >
+            <Edit3 size={12} /> Edit
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProfileFileEditor({
+  agent,
+  file,
+  onClose,
+}: {
+  agent: ManagedAgent;
+  file: ProfileFileKind;
+  onClose: () => void;
+}) {
+  const pushToast = useUI((s) => s.pushToast);
+  const [text, setText] = useState("");
+  const [path, setPath] = useState(file === "identity" ? agent.identityPath : agent.soulPath);
+  const [busy, setBusy] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setBusy(true);
+    ipc
+      .agentProfileFileRead({
+        machineId: agent.machineId,
+        actorId: agent.actor.id,
+        file,
+      })
+      .then((result) => {
+        if (!alive) return;
+        setText(result.text);
+        setPath(result.path);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        pushToast("error", e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (alive) setBusy(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agent.actor.id, agent.machineId, file, pushToast]);
+
+  const save = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await ipc.agentProfileFileWrite({
+        machineId: agent.machineId,
+        actorId: agent.actor.id,
+        file,
+        text,
+      });
+      pushToast("info", `${file}.md saved`);
+      setPath(result.path);
+      onClose();
+    } catch (e) {
+      pushToast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4">
+      <section className="card-brutal w-[calc(100vw-2rem)] max-w-3xl p-5">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-lg font-black uppercase">
+              Edit {file === "identity" ? "Identity" : "Soul"}
+            </h2>
+            <div className="truncate font-mono text-xs text-black/45">{path}</div>
+          </div>
+          <button className="btn-brutal-sm bg-white p-1" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <textarea
+          className="h-[min(58vh,32rem)] w-full resize-none border-2 border-black bg-brutal-cream p-3 font-mono text-xs leading-5 outline-none focus:bg-white"
+          value={text}
+          disabled={busy}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <div className="mt-3 flex justify-end gap-2">
+          <button className="btn-brutal bg-white px-4 py-2 text-sm" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="btn-brutal bg-brutal-pink px-4 py-2 text-sm disabled:bg-black/10"
+            disabled={busy}
+            onClick={() => void save()}
+          >
+            Save
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -846,6 +1549,18 @@ function WorkspaceTab({ agent }: { agent: ManagedAgent }) {
             <span className="text-black/45">data </span>
             {agent.dataRoot}
           </div>
+          <div className="truncate">
+            <span className="text-black/45">profile </span>
+            {agent.profilePath}
+          </div>
+          <div className="truncate">
+            <span className="text-black/45">identity </span>
+            {agent.identityPath}
+          </div>
+          <div className="truncate">
+            <span className="text-black/45">soul </span>
+            {agent.soulPath}
+          </div>
         </div>
       </InfoSection>
       <InfoSection title="Transport">
@@ -882,7 +1597,7 @@ function ActivityTab({ agent }: { agent: ManagedAgent }) {
 }
 
 function normalizeAgent(
-  info: AgentInfo,
+  info: AgentInfo | MachineAgentInfo,
   machine: AgentMachineContext,
 ): ManagedAgent {
   const spec = info.spec;
@@ -908,6 +1623,20 @@ function normalizeAgent(
     machineId: machine.id,
     machine: machine.name,
     dataRoot: machine.dataRoot,
+    profilePath:
+      "profilePath" in info
+        ? info.profilePath
+        : machine.profilePath ?? displayJoin(machine.dataRoot, "agents", actor.id, "profile"),
+    identityPath:
+      "identityPath" in info
+        ? info.identityPath
+        : machine.identityPath ??
+          displayJoin(machine.dataRoot, "agents", actor.id, "profile", "identity.md"),
+    soulPath:
+      "soulPath" in info
+        ? info.soulPath
+        : machine.soulPath ??
+          displayJoin(machine.dataRoot, "agents", actor.id, "profile", "soul.md"),
     providerId,
     provider,
     providers: machine.providers,
@@ -922,6 +1651,10 @@ function normalizeAgent(
     args: spec.transport.args ?? [],
     autostart: !!spec.autostart,
   };
+}
+
+function displayJoin(root: string, ...parts: string[]) {
+  return [root.replace(/\/+$/, ""), ...parts].join("/");
 }
 
 function modelChoicesForProvider(provider: AgentProviderSummary | null | undefined) {

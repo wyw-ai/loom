@@ -544,7 +544,13 @@ if [[ $budget -gt 0 ]]; then
 
         bf_tid="(dry-run-thread)"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            if out=$(joi thread create --channel "$CHANNEL_ID" --title "bugfix-$fid" --json 2>/dev/null); then
+            root_event=""
+            if anchor=$(joi event append --as svc_a1_bug_fix_loop --channel --in "$CHANNEL_ID" \
+                --type thread.opened --text "anchor: bugfix-$fid" --json 2>/dev/null); then
+                root_event=$(jq -r '.event.id // ""' <<<"$anchor")
+            fi
+            if [[ -n "$root_event" ]] && out=$(joi thread create --channel "$CHANNEL_ID" \
+                --root-event "$root_event" --title "bugfix-$fid" --json 2>/dev/null); then
                 bf_tid=$(jq -r '.thread.id // .thread_id // .id // ""' <<<"$out")
             fi
             if [[ -n "$bf_tid" && "$bf_tid" != "(dry-run-thread)" ]]; then

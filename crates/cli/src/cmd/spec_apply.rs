@@ -470,6 +470,7 @@ async fn find_event(client: &Client, event_id: &str) -> Result<Option<Event>> {
 async fn read_artifact_text(client: &Client, artifact_id: &str) -> Result<String> {
     let params = ArtifactReadParams {
         artifact_id: artifact_id.into(),
+        offset: 0,
         max_bytes: 1024 * 1024,
     };
     let res: ArtifactReadResult = client

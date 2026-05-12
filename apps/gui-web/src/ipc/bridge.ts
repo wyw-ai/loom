@@ -4,11 +4,15 @@ import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Actor,
   AgentInfo,
+  Artifact,
+  ArtifactReadResult,
   Channel,
   DesktopConfig,
   HumanAccount,
   JoiEvent,
   MachineInfo,
+  Reminder,
+  ReminderStatus,
   ScopeRef,
   StreamUpdate,
   Thread,
@@ -211,11 +215,54 @@ export async function eventAppend(input: {
   return invoke("event_append", { params: { event: input } });
 }
 
+export async function artifactPublish(params: {
+  createdBy: string;
+  scope?: ScopeRef;
+  ingress: {
+    kind: "inline_text" | "file_bytes";
+    name: string;
+    mediaType?: string;
+    text?: string;
+    bytes?: number[];
+  };
+}): Promise<{ artifact: Artifact }> {
+  return invoke("artifact_publish", { params });
+}
+
+export async function artifactGet(params: {
+  artifactId?: string;
+  artifactUri?: string;
+}): Promise<{ artifact: Artifact }> {
+  return invoke("artifact_get", { params });
+}
+
+export async function artifactRead(params: {
+  artifactId: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<ArtifactReadResult> {
+  return invoke("artifact_read", { params });
+}
+
 export async function turnClose(
   turnId: string,
   status: "closed" | "cancelled" = "cancelled",
 ): Promise<unknown> {
   return invoke("turn_close", { params: { turnId, status } });
+}
+
+export async function reminderList(params: {
+  actorId: string;
+  statuses?: ReminderStatus[];
+  all?: boolean;
+}): Promise<{ reminders: Reminder[] }> {
+  return invoke("reminder_list", {
+    params: {
+      actorId: params.actorId,
+      statuses: params.statuses ?? [],
+      all: params.all ?? false,
+    },
+  });
 }
 
 export async function actorList(): Promise<{ actors: Actor[] }> {
@@ -268,12 +315,33 @@ export async function agentUpdate(args: {
   return invoke("agent_update", { args });
 }
 
+export async function agentProfileFileRead(args: {
+  machineId: string;
+  actorId: string;
+  file: "identity" | "soul";
+}): Promise<{ path: string; text: string }> {
+  return invoke("agent_profile_file_read", { args });
+}
+
+export async function agentProfileFileWrite(args: {
+  machineId: string;
+  actorId: string;
+  file: "identity" | "soul";
+  text: string;
+}): Promise<{ path: string; text: string }> {
+  return invoke("agent_profile_file_write", { args });
+}
+
 export async function machineList(): Promise<{ machines: MachineInfo[] }> {
   return invoke("machine_list");
 }
 
 export async function machineCheck(): Promise<{ machines: MachineInfo[] }> {
   return invoke("machine_check");
+}
+
+export async function openLocalPath(path: string): Promise<void> {
+  return invoke("open_local_path", { args: { path } });
 }
 
 export async function machineCreate(args: {

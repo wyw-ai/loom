@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import clsx from "clsx";
 
 import * as ipc from "@/ipc/bridge";
+import { useUI } from "@/store/ui";
 import { useWorkspaces } from "@/store/workspaces";
 import { connectWorkspace } from "./connect";
 
@@ -16,20 +17,17 @@ export function openAddWorkspaceModal() {
 
 export function AddWorkspaceHost() {
   const open = useWorkspaces((s) => s.addOpen);
+  const account = useWorkspaces((s) => s.account);
   const close = () => useWorkspaces.getState().setAddOpen(false);
 
   const [name, setName] = useState("");
   const [serverUrl, setServerUrl] = useState("ws://127.0.0.1:7878/rpc");
-  const [actorId, setActorId] = useState("");
-  const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
     setName("");
-    setActorId(suggestActorId());
-    setDisplayName("you");
     setServerUrl("ws://127.0.0.1:7878/rpc");
     setError(null);
   }, [open]);
@@ -48,8 +46,12 @@ export function AddWorkspaceHost() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (busy) return;
-    if (!name.trim() || !serverUrl.trim() || !actorId.trim()) {
-      setError("name, server URL and actor id are required");
+    if (!account) {
+      setError("account login is required before adding a workspace");
+      return;
+    }
+    if (!name.trim() || !serverUrl.trim()) {
+      setError("name and server URL are required");
       return;
     }
     setBusy(true);
@@ -58,8 +60,6 @@ export function AddWorkspaceHost() {
       const cfg = await ipc.workspaceAdd({
         name: name.trim(),
         serverUrl: serverUrl.trim(),
-        actorId: actorId.trim(),
-        displayName: displayName.trim() || actorId.trim(),
         activate: true,
       });
       useWorkspaces.getState().setConfig(cfg);
@@ -86,12 +86,34 @@ export function AddWorkspaceHost() {
         <h3 className="mb-1 text-base font-semibold text-primary">Add workspace</h3>
         <p className="mb-4 text-xs text-muted">
           Point at a running <code className="font-mono">joi-server</code>.
-          You can add several and switch between them in the left rail.
         </p>
+
+        <Field label="Account">
+          {account ? (
+            <div className="input-brutal min-h-[40px] truncate text-sm">
+              {account.nickname || account.realName || account.staffId}
+              <span className="ml-2 font-mono text-xs text-black/45">
+                {account.actorId}
+              </span>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="btn-brutal w-full justify-start bg-brutal-cyan px-3 py-2 text-sm"
+              onClick={() => {
+                close();
+                useUI.getState().setView("settings");
+              }}
+            >
+              Sign in first
+            </button>
+          )}
+        </Field>
 
         <Field label="Name">
           <input
             autoFocus
+            aria-label="Name"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Local dev"
@@ -101,28 +123,11 @@ export function AddWorkspaceHost() {
 
         <Field label="Server URL">
           <input
+            aria-label="Server URL"
             value={serverUrl}
             onChange={(e) => setServerUrl(e.target.value)}
             placeholder="ws://127.0.0.1:7878/rpc"
             className="w-full rounded border border-border bg-main px-3 py-2 text-sm text-primary outline-none focus:border-accent font-mono"
-          />
-        </Field>
-
-        <Field label="Actor id">
-          <input
-            value={actorId}
-            onChange={(e) => setActorId(e.target.value)}
-            placeholder="actor_human_abcdef12"
-            className="w-full rounded border border-border bg-main px-3 py-2 text-sm text-primary outline-none focus:border-accent font-mono"
-          />
-        </Field>
-
-        <Field label="Display name">
-          <input
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            placeholder="you"
-            className="w-full rounded border border-border bg-main px-3 py-2 text-sm text-primary outline-none focus:border-accent"
           />
         </Field>
 
@@ -142,7 +147,7 @@ export function AddWorkspaceHost() {
           </button>
           <button
             type="submit"
-            disabled={busy}
+            disabled={busy || !account}
             className={clsx(
               "rounded px-3 py-1 text-sm",
               "bg-accent text-accent-contrast hover:bg-accent-hover",
@@ -164,16 +169,11 @@ function Field({
   children: React.ReactNode;
 }) {
   return (
-    <label className="mb-3 block">
+    <div className="mb-3 block">
       <span className="mb-1 block text-[11px] uppercase tracking-wide text-muted">
         {label}
       </span>
       {children}
-    </label>
+    </div>
   );
-}
-
-function suggestActorId(): string {
-  const suffix = Math.random().toString(16).slice(2, 10);
-  return `actor_human_${suffix}`;
 }

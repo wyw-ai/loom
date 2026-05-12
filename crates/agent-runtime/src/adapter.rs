@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use proto::types::ScopeRef;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -39,6 +40,28 @@ pub trait Adapter: Send + Sync {
     /// a no-op or return an error if called.
     async fn respond_action(&self, request_id: String, option_id: String) -> Result<(), String>;
 
+    /// Return runtime-provided model options for this prompt scope, if the
+    /// transport exposes them. ACP surfaces these through `session/new`
+    /// configOptions; transports without a runtime model picker return `None`.
+    async fn list_model_options(
+        &self,
+        _prompt: AdapterPrompt,
+    ) -> Result<Option<AdapterModelOptions>, String> {
+        Ok(None)
+    }
+
+    /// Set a runtime-provided model option for an existing prompt scope. ACP
+    /// implements this as `session/set_config_option`; unsupported transports
+    /// return `None`.
+    async fn set_model_option(
+        &self,
+        _scope: ScopeRef,
+        _config_id: String,
+        _value: String,
+    ) -> Result<Option<AdapterModelOptions>, String> {
+        Ok(None)
+    }
+
     /// Cancel any in-flight prompt for `scope`. Idempotent — calling on a
     /// scope with no active prompt is a no-op. Implementations should NOT
     /// block on the cancellation completing; the eventual
@@ -58,6 +81,45 @@ pub struct AdapterPrompt {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub template_vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterModelOptions {
+    pub config_id: String,
+    pub current_value: Option<String>,
+    pub choices: Vec<AdapterModelChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterModelChoice {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub estimated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Emitted by every adapter back into the runtime.
@@ -89,6 +151,7 @@ pub enum AdapterEvent {
         scope: Option<ScopeRef>,
         success: bool,
         summary: String,
+        usage: Option<TokenUsage>,
     },
     Error {
         scope: Option<ScopeRef>,

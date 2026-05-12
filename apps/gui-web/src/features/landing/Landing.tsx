@@ -1,6 +1,8 @@
-import { Plus, Server } from "lucide-react";
+import { LogIn, Plus, Server } from "lucide-react";
 
+import * as ipc from "@/ipc/bridge";
 import { useSession } from "@/store/session";
+import { useUI } from "@/store/ui";
 import { useWorkspaces } from "@/store/workspaces";
 import { openAddWorkspaceModal } from "@/features/workspaces/AddWorkspaceModal";
 import { connectWorkspace } from "@/features/workspaces/connect";
@@ -10,6 +12,7 @@ export function Landing() {
   const connection = useSession((s) => s.connection);
   const error = useSession((s) => s.error);
   const connecting = useWorkspaces((s) => s.connectingId);
+  const account = useWorkspaces((s) => s.account);
 
   return (
     <div className="flex h-full flex-col items-center justify-center p-10">
@@ -28,7 +31,9 @@ export function Landing() {
           </div>
         </div>
 
-        {workspaces.length === 0 ? (
+        {!account ? (
+          <AccountRequired />
+        ) : workspaces.length === 0 ? (
           <EmptyState />
         ) : (
           <div className="rounded-lg border border-border bg-elevated">
@@ -74,6 +79,40 @@ export function Landing() {
           </p>
         )}
       </div>
+    </div>
+  );
+}
+
+function AccountRequired() {
+  const login = async () => {
+    try {
+      const result = await ipc.accountLogin("buc");
+      useWorkspaces.getState().setConfig(result.config);
+      useSession.getState().setWorkspace(null);
+      useSession.getState().setConnection("idle");
+      useUI.getState().pushToast("info", "account signed in");
+    } catch (err) {
+      useUI
+        .getState()
+        .pushToast(
+          "error",
+          err instanceof Error ? err.message : String(err),
+        );
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-dashed border-border bg-elevated/60 p-6 text-center">
+      <p className="mb-4 text-sm text-secondary">
+        Sign in before connecting so your human identity stays stable.
+      </p>
+      <button
+        onClick={() => void login()}
+        className="inline-flex items-center gap-2 rounded bg-accent px-4 py-2 text-sm text-accent-contrast hover:bg-accent-hover"
+      >
+        <LogIn size={16} />
+        Sign in with BUC
+      </button>
     </div>
   );
 }

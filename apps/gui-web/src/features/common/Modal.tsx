@@ -1,14 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import clsx from "clsx";
+import { Plus, Search, Trash2, X } from "lucide-react";
 
-import { useUI } from "@/store/ui";
+import { useUI, type ModalSpec } from "@/store/ui";
+import { PixelAvatar } from "./PixelAvatar";
 
 export function ModalHost() {
   const modal = useUI((s) => s.modal);
   const close = useUI((s) => s.closeModal);
 
-  // Esc closes globally. Enter is handled inside the specific modal so we
-  // don't steal it from input rendering.
   useEffect(() => {
     if (!modal) return;
     const onKey = (e: KeyboardEvent) => {
@@ -22,21 +22,48 @@ export function ModalHost() {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4"
       onClick={close}
     >
-      <div
-        className="w-[420px] max-w-[90vw] rounded-lg border border-border bg-elevated shadow-[0_8px_24px_rgba(0,0,0,.45)]"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div onClick={(e) => e.stopPropagation()}>
         {modal.type === "input" && <InputForm spec={modal} onDone={close} />}
         {modal.type === "confirm" && (
           <ConfirmForm spec={modal} onDone={close} />
         )}
         {modal.type === "picker" && <PickerForm spec={modal} onDone={close} />}
+        {modal.type === "channelForm" && (
+          <ChannelForm spec={modal} onDone={close} />
+        )}
+        {modal.type === "taskCreate" && (
+          <TaskCreateForm spec={modal} onDone={close} />
+        )}
         {modal.type === "quickSwitch" && <QuickSwitchForm onDone={close} />}
       </div>
     </div>
+  );
+}
+
+function ModalFrame({
+  title,
+  children,
+  onDone,
+  max = "max-w-md",
+}: {
+  title: string;
+  children: ReactNode;
+  onDone: () => void;
+  max?: string;
+}) {
+  return (
+    <section className={clsx("card-brutal w-[calc(100vw-2rem)] p-6", max)}>
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <h2 className="text-lg font-black uppercase text-black">{title}</h2>
+        <button className="btn-brutal-sm bg-white p-1" onClick={onDone}>
+          <X size={18} />
+        </button>
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -44,7 +71,7 @@ function InputForm({
   spec,
   onDone,
 }: {
-  spec: Extract<NonNullable<ReturnType<typeof useUI.getState>["modal"]>, { type: "input" }>;
+  spec: Extract<ModalSpec, { type: "input" }>;
   onDone: () => void;
 }) {
   const [value, setValue] = useState(spec.initial ?? "");
@@ -68,48 +95,34 @@ function InputForm({
   };
 
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        void submit();
-      }}
-      className="p-5"
-    >
-      <h3 className="mb-3 text-base font-semibold text-primary">{spec.title}</h3>
-      {spec.label && (
-        <label className="mb-1 block text-xs uppercase tracking-wide text-muted">
-          {spec.label}
-        </label>
-      )}
-      <input
-        ref={ref}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        placeholder={spec.placeholder}
-        className="w-full rounded border border-border bg-main px-3 py-2 text-sm text-primary outline-none focus:border-accent"
-      />
-      <div className="mt-4 flex justify-end gap-2">
-        <button
-          type="button"
-          onClick={onDone}
-          className="rounded px-3 py-1 text-sm text-secondary hover:text-primary"
-        >
-          Cancel
-        </button>
-        <button
-          type="submit"
-          disabled={busy}
-          className={clsx(
-            "rounded px-3 py-1 text-sm",
-            spec.danger
-              ? "bg-danger text-white hover:opacity-90"
-              : "bg-accent text-accent-contrast hover:bg-accent-hover",
-          )}
-        >
-          {spec.confirmLabel ?? "OK"}
-        </button>
-      </div>
-    </form>
+    <ModalFrame title={spec.title} onDone={onDone}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+        className="space-y-4"
+      >
+        {spec.label && (
+          <label className="block text-sm font-black uppercase tracking-wide text-black">
+            {spec.label}
+          </label>
+        )}
+        <input
+          ref={ref}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={spec.placeholder}
+          className="input-brutal w-full"
+        />
+        <FormActions
+          busy={busy}
+          danger={spec.danger}
+          confirmLabel={spec.confirmLabel ?? "OK"}
+          onCancel={onDone}
+        />
+      </form>
+    </ModalFrame>
   );
 }
 
@@ -117,7 +130,7 @@ function ConfirmForm({
   spec,
   onDone,
 }: {
-  spec: Extract<NonNullable<ReturnType<typeof useUI.getState>["modal"]>, { type: "confirm" }>;
+  spec: Extract<ModalSpec, { type: "confirm" }>;
   onDone: () => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -131,31 +144,26 @@ function ConfirmForm({
       setBusy(false);
     }
   };
+
   return (
-    <div className="p-5">
-      <h3 className="mb-2 text-base font-semibold text-primary">{spec.title}</h3>
-      <p className="text-sm text-secondary">{spec.body}</p>
-      <div className="mt-4 flex justify-end gap-2">
-        <button
-          onClick={onDone}
-          className="rounded px-3 py-1 text-sm text-secondary hover:text-primary"
-        >
+    <ModalFrame title={spec.title} onDone={onDone}>
+      <p className="text-sm leading-6 text-black/70">{spec.body}</p>
+      <div className="mt-5 flex justify-end gap-3">
+        <button className="btn-brutal bg-white px-4 py-2 text-sm" onClick={onDone}>
           Cancel
         </button>
         <button
           onClick={doIt}
           disabled={busy}
           className={clsx(
-            "rounded px-3 py-1 text-sm",
-            spec.danger
-              ? "bg-danger text-white hover:opacity-90"
-              : "bg-accent text-accent-contrast hover:bg-accent-hover",
+            "btn-brutal px-4 py-2 text-sm",
+            spec.danger ? "bg-danger" : "bg-brutal-pink",
           )}
         >
           {spec.confirmLabel ?? "Confirm"}
         </button>
       </div>
-    </div>
+    </ModalFrame>
   );
 }
 
@@ -163,7 +171,7 @@ function PickerForm({
   spec,
   onDone,
 }: {
-  spec: Extract<NonNullable<ReturnType<typeof useUI.getState>["modal"]>, { type: "picker" }>;
+  spec: Extract<ModalSpec, { type: "picker" }>;
   onDone: () => void;
 }) {
   const [filter, setFilter] = useState("");
@@ -174,45 +182,254 @@ function PickerForm({
       it.id.toLowerCase().includes(filter.toLowerCase()),
   );
   return (
-    <div className="p-5">
-      <h3 className="mb-3 text-base font-semibold text-primary">{spec.title}</h3>
-      <input
-        autoFocus
+    <ModalFrame title={spec.title} onDone={onDone}>
+      <SearchInput
         value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-        placeholder="Filter…"
-        className="w-full rounded border border-border bg-main px-3 py-2 text-sm text-primary outline-none focus:border-accent"
+        onChange={setFilter}
+        placeholder="Filter..."
+        autoFocus
       />
-      <ul className="mt-3 max-h-72 overflow-y-auto">
+      <ul className="mt-3 max-h-72 overflow-y-auto border-2 border-black bg-white">
         {items.length === 0 ? (
-          <li className="px-2 py-2 text-xs text-muted">no matches</li>
+          <li className="px-3 py-3 text-sm font-mono text-black/40">no matches</li>
         ) : (
           items.map((it) => (
-            <li key={it.id}>
+            <li key={it.id} className="border-b-2 border-black last:border-b-0">
               <button
                 onClick={async () => {
                   await spec.onPick(it.id);
                   onDone();
                 }}
-                className="flex w-full items-baseline gap-2 rounded px-2 py-1 text-left text-sm hover:bg-hover"
+                className="flex w-full items-baseline gap-2 px-3 py-2 text-left text-sm hover:bg-brutal-cream"
               >
-                <span className="text-primary">{it.label}</span>
-                {it.hint && <span className="text-xs text-muted">{it.hint}</span>}
-                <span className="ml-auto text-[11px] text-muted">{it.id}</span>
+                <span className="font-black text-black">{it.label}</span>
+                {it.hint && <span className="text-xs text-black/50">{it.hint}</span>}
+                <span className="ml-auto truncate font-mono text-[11px] text-black/40">
+                  {it.id}
+                </span>
               </button>
             </li>
           ))
         )}
       </ul>
-    </div>
+    </ModalFrame>
+  );
+}
+
+function ChannelForm({
+  spec,
+  onDone,
+}: {
+  spec: Extract<ModalSpec, { type: "channelForm" }>;
+  onDone: () => void;
+}) {
+  const [title, setTitle] = useState(spec.initialTitle ?? "");
+  const [description, setDescription] = useState(spec.initialDescription ?? "");
+  const [filter, setFilter] = useState("");
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [busy, setBusy] = useState(false);
+  const nameRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    nameRef.current?.focus();
+    nameRef.current?.select();
+  }, []);
+
+  const actors = spec.actorItems ?? [];
+  const filtered = actors.filter(
+    (a) =>
+      !filter ||
+      a.label.toLowerCase().includes(filter.toLowerCase()) ||
+      a.id.toLowerCase().includes(filter.toLowerCase()),
+  );
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await spec.onSubmit({
+        title,
+        description,
+        actorIds: Object.entries(selected)
+          .filter(([, on]) => on)
+          .map(([id]) => id),
+      });
+      onDone();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalFrame title={spec.title} onDone={onDone}>
+      <form
+        className="space-y-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <div>
+          <label className="mb-1 block text-sm font-black uppercase tracking-wide">
+            {spec.nameLabel ?? "Name"} <span className="text-brutal-pink">*</span>
+          </label>
+          <input
+            ref={nameRef}
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            disabled={spec.titleLocked}
+            placeholder="e.g. ai-research"
+            className="input-brutal w-full disabled:bg-black/5"
+          />
+          {spec.titleLocked && (
+            <div className="mt-1 font-mono text-xs text-black/45">
+              The #{title} channel cannot be renamed
+            </div>
+          )}
+        </div>
+
+        <div>
+          <label className="mb-1 block text-sm font-black uppercase tracking-wide">
+            Description <span className="text-black/40 normal-case">(optional)</span>
+          </label>
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="What is this channel about?"
+            rows={3}
+            className="input-brutal w-full resize-none"
+          />
+        </div>
+
+        {actors.length > 0 && (
+          <div>
+            <label className="mb-1 block text-sm font-black uppercase tracking-wide">
+              Initial members{" "}
+              <span className="text-black/40 normal-case">(optional)</span>
+            </label>
+            <SearchInput
+              value={filter}
+              onChange={setFilter}
+              placeholder="Search members by name"
+            />
+            <div className="mt-2 max-h-40 overflow-y-auto border-2 border-black bg-white">
+              <div className="border-b-2 border-black px-3 py-2 text-xs font-black uppercase tracking-widest text-black/50">
+                Agents
+              </div>
+              {filtered.map((actor) => (
+                <button
+                  key={actor.id}
+                  type="button"
+                  className={clsx(
+                    "flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-bold hover:bg-brutal-cream",
+                    selected[actor.id] && "bg-brutal-yellow",
+                  )}
+                  onClick={() =>
+                    setSelected((s) => ({ ...s, [actor.id]: !s[actor.id] }))
+                  }
+                >
+                  <PixelAvatar id={actor.id} label={actor.label} size={20} />
+                  <span className="min-w-0 flex-1 truncate">{actor.label}</span>
+                  <span className="text-[11px] text-black/45">{actor.hint}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <FormActions
+          busy={busy}
+          confirmLabel={spec.confirmLabel ?? "Save"}
+          onCancel={onDone}
+        />
+      </form>
+    </ModalFrame>
+  );
+}
+
+function TaskCreateForm({
+  spec,
+  onDone,
+}: {
+  spec: Extract<ModalSpec, { type: "taskCreate" }>;
+  onDone: () => void;
+}) {
+  const [titles, setTitles] = useState([""]);
+  const [busy, setBusy] = useState(false);
+  const count = titles.filter((x) => x.trim()).length;
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await spec.onSubmit?.(titles.filter((x) => x.trim()));
+      onDone();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalFrame title={count > 1 ? "Create tasks" : spec.title ?? "Create task"} onDone={onDone}>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        {titles.map((title, index) => (
+          <div key={index} className="flex items-center gap-2">
+            <input
+              autoFocus={index === 0}
+              value={title}
+              onChange={(e) =>
+                setTitles((xs) =>
+                  xs.map((x, i) => (i === index ? e.target.value : x)),
+                )
+              }
+              placeholder={`Task ${index + 1}`}
+              className="input-brutal min-w-0 flex-1"
+            />
+            {titles.length > 1 && (
+              <button
+                type="button"
+                className="btn-brutal-sm bg-white p-1"
+                onClick={() =>
+                  setTitles((xs) => xs.filter((_, i) => i !== index))
+                }
+              >
+                <Trash2 size={15} />
+              </button>
+            )}
+          </div>
+        ))}
+        <button
+          type="button"
+          className="btn-brutal-sm gap-1 bg-white px-2 text-xs"
+          onClick={() => setTitles((xs) => [...xs, ""])}
+        >
+          <Plus size={13} /> Add another
+        </button>
+        <FormActions
+          busy={busy}
+          confirmLabel={count > 1 ? `Create ${count} Tasks` : "Create Task"}
+          onCancel={onDone}
+        />
+      </form>
+    </ModalFrame>
   );
 }
 
 function QuickSwitchForm({ onDone }: { onDone: () => void }) {
-  // Lazy imports to keep the modal module free of store-cycle risk.
   const [filter, setFilter] = useState("");
   const [items, setItems] = useState<
-    Array<{ id: string; label: string; hint: string; scope: { kind: "channel" | "thread"; id: string } }>
+    Array<{
+      id: string;
+      label: string;
+      hint: string;
+      scope: { kind: "channel" | "thread"; id: string };
+    }>
   >([]);
 
   useEffect(() => {
@@ -224,7 +441,7 @@ function QuickSwitchForm({ onDone }: { onDone: () => void }) {
         rows.push({
           id: `channel:${ch.id}`,
           label: `# ${ch.title}`,
-          hint: ch.visibility === "private" ? "private" : "public",
+          hint: ch.visibility === "private" ? "private" : "channel",
           scope: { kind: "channel", id: ch.id },
         });
       }
@@ -243,24 +460,6 @@ function QuickSwitchForm({ onDone }: { onDone: () => void }) {
     })();
   }, []);
 
-  const go = async (scope: { kind: "channel" | "thread"; id: string }) => {
-    const { useChannels } = await import("@/store/channels");
-    const { useMessages } = await import("@/store/messages");
-    const { useUI } = await import("@/store/ui");
-    const ipc = await import("@/ipc/bridge");
-    useChannels.getState().setCurrentScope(scope);
-    useMessages.getState().ensureScope(scope);
-    useUI.getState().setView("chat");
-    try {
-      await ipc.scopeSubscribe(scope);
-      const r = await ipc.scopeRead(scope, 100);
-      useMessages.getState().ingestBackfill(scope, r.events);
-    } catch {
-      /* surfaced via toast elsewhere */
-    }
-    onDone();
-  };
-
   const filtered = items.filter(
     (it) =>
       !filter ||
@@ -268,32 +467,100 @@ function QuickSwitchForm({ onDone }: { onDone: () => void }) {
       it.hint.toLowerCase().includes(filter.toLowerCase()),
   );
 
+  const go = async (scope: { kind: "channel" | "thread"; id: string }) => {
+    const { openScope } = await import("@/features/chat/scopeActions");
+    const { useUI } = await import("@/store/ui");
+    await openScope(scope);
+    useUI.getState().setView("chat");
+    onDone();
+  };
+
   return (
-    <div className="p-5">
-      <h3 className="mb-3 text-base font-semibold text-primary">Quick switch</h3>
-      <input
+    <ModalFrame title="Quick switch" onDone={onDone}>
+      <SearchInput
         autoFocus
         value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-        placeholder="Jump to channel or thread…"
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && filtered[0]) void go(filtered[0].scope);
-        }}
-        className="w-full rounded border border-border bg-main px-3 py-2 text-sm text-primary outline-none focus:border-accent"
+        onChange={setFilter}
+        placeholder="Jump to channel or thread..."
+        onEnter={() => filtered[0] && void go(filtered[0].scope)}
       />
-      <ul className="mt-3 max-h-80 overflow-y-auto">
+      <ul className="mt-3 max-h-80 overflow-y-auto border-2 border-black bg-white">
         {filtered.slice(0, 50).map((it) => (
-          <li key={it.id}>
+          <li key={it.id} className="border-b-2 border-black last:border-b-0">
             <button
               onClick={() => void go(it.scope)}
-              className="flex w-full items-baseline gap-2 rounded px-2 py-1 text-left text-sm hover:bg-hover"
+              className="flex w-full items-baseline gap-2 px-3 py-2 text-left text-sm hover:bg-brutal-cream"
             >
-              <span className="text-primary">{it.label}</span>
-              <span className="text-xs text-muted">{it.hint}</span>
+              <span className="font-black">{it.label}</span>
+              <span className="text-xs text-black/45">{it.hint}</span>
             </button>
           </li>
         ))}
       </ul>
+    </ModalFrame>
+  );
+}
+
+function SearchInput({
+  value,
+  onChange,
+  placeholder,
+  autoFocus,
+  onEnter,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  autoFocus?: boolean;
+  onEnter?: () => void;
+}) {
+  return (
+    <div className="input-brutal flex items-center gap-2">
+      <Search size={14} className="shrink-0 text-black/45" />
+      <input
+        autoFocus={autoFocus}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onEnter?.();
+        }}
+        placeholder={placeholder}
+        className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-black/40"
+      />
+    </div>
+  );
+}
+
+function FormActions({
+  busy,
+  danger,
+  confirmLabel,
+  onCancel,
+}: {
+  busy: boolean;
+  danger?: boolean;
+  confirmLabel: string;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="flex justify-end gap-3 pt-2">
+      <button
+        type="button"
+        className="btn-brutal bg-white px-4 py-2 text-sm"
+        onClick={onCancel}
+      >
+        Cancel
+      </button>
+      <button
+        type="submit"
+        disabled={busy}
+        className={clsx(
+          "btn-brutal px-4 py-2 text-sm",
+          danger ? "bg-danger" : "bg-brutal-pink",
+        )}
+      >
+        {confirmLabel}
+      </button>
     </div>
   );
 }

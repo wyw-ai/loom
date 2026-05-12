@@ -25,6 +25,7 @@ use crate::render;
 pub async fn create(
     client: Arc<Client>,
     channel_id: String,
+    root_event_id: Option<String>,
     title: String,
     resident_as: Option<String>,
     bootstrap_artifact: Option<String>,
@@ -32,7 +33,7 @@ pub async fn create(
     let res: ThreadCreateResult = client
         .call(
             method::THREAD_CREATE,
-            json!({ "channelId": channel_id, "title": title }),
+            json!({ "channelId": channel_id, "rootEventId": root_event_id.unwrap_or_default(), "title": title }),
         )
         .await?;
     let thread_id = res.thread.id.clone();
@@ -132,18 +133,11 @@ pub async fn bootstrap(
     bootstrap_artifact: String,
 ) -> Result<()> {
     let res: ThreadListResult = client
-        .call(
-            method::THREAD_LIST,
-            json!({ "channelId": channel_id }),
-        )
+        .call(method::THREAD_LIST, json!({ "channelId": channel_id }))
         .await
         .with_context(|| format!("thread/list channel={channel_id}"))?;
     if !res.threads.iter().any(|t| t.id == thread_id) {
-        anyhow::bail!(
-            "thread {} not found in channel {}",
-            thread_id,
-            channel_id
-        );
+        anyhow::bail!("thread {} not found in channel {}", thread_id, channel_id);
     }
     let mounts = fetch_bootstrap_mounts(client.clone(), &bootstrap_artifact).await?;
     let count = mounts.len();
@@ -161,7 +155,6 @@ pub async fn bootstrap(
     }
     Ok(())
 }
-
 
 fn data_root() -> PathBuf {
     for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
@@ -200,11 +193,10 @@ fn thread_shared_scope_json(data_root: &Path, channel_id: &str, thread_id: &str)
 
 fn read_or_init_scope_json(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
-        Ok(body) => serde_json::from_str(&body)
-            .with_context(|| format!("parse {}", path.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(Value::Object(Map::new()))
+        Ok(body) => {
+            serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
 }
@@ -292,9 +284,8 @@ async fn fetch_bootstrap_mounts(client: Arc<Client>, uri_or_id: &str) -> Result<
             artifact_id
         );
     }
-    parse_bootstrap_mounts(&read.content).with_context(|| {
-        format!("parse bootstrap artifact {} as clone manifest", artifact_id)
-    })
+    parse_bootstrap_mounts(&read.content)
+        .with_context(|| format!("parse bootstrap artifact {} as clone manifest", artifact_id))
 }
 
 /// Accept either an explicit `{ "mounts": [...] }` payload or a
@@ -396,7 +387,10 @@ mod tests {
         let mounts = parse_bootstrap_mounts(body).expect("parse");
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0]["name"], "target-repo:aone/joi-apps");
-        assert_eq!(mounts[0]["from"], "service://repo-cache/cache/aone%2Fjoi-apps");
+        assert_eq!(
+            mounts[0]["from"],
+            "service://repo-cache/cache/aone%2Fjoi-apps"
+        );
         assert_eq!(mounts[0]["to"], "repos/joi-apps");
         assert_eq!(mounts[0]["readonly"], false);
         assert_eq!(mounts[1]["to"], "repos/custom");

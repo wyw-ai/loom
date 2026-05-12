@@ -1,12 +1,13 @@
 mod client;
 mod cmd;
 mod config;
+mod daemon_ipc;
 mod render;
 mod service;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::client::Client;
@@ -57,8 +58,7 @@ enum Cmd {
         #[arg(long)]
         reply: Option<String>,
     },
-    /// Hand off the turn to an agent: a `content.add` event carrying a
-    /// `HandsOffTo` relation pointing at the target actor.
+    /// Hand off the turn to an actor in a thread or channel.
     Handoff {
         /// Target actor id; omit to pick from a list of registered agents/humans.
         agent: Option<String>,
@@ -70,13 +70,77 @@ enum Cmd {
         #[arg(long, default_value = "")]
         message: String,
     },
+    /// Message commands using the canonical #channel/#channel:root-event/dm:actor grammar.
+    Message {
+        #[command(subcommand)]
+        sub: MessageCmd,
+    },
     /// Respond to an action.request event.
     Action {
         #[command(subcommand)]
         sub: ActionCmd,
     },
-    /// Manage agents. Run `joi agent example` for AgentSpec examples covering
-    /// acp_stdio, command, and interactive_command transports.
+    /// Ask the triggering human to choose or provide input, then return the answer to this process.
+    AskUserQuestion {
+        /// Max seconds to wait for action.response.
+        #[arg(long = "timeout-seconds")]
+        timeout_seconds: Option<u64>,
+        /// Scope id. Defaults to JOI_SCOPE_ID inside daemon-managed agent turns.
+        #[arg(long)]
+        r#in: Option<String>,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Actor id that should answer. Defaults to JOI_TRIGGER_ACTOR inside daemon turns.
+        #[arg(long)]
+        to: Option<String>,
+        /// Turn id to associate with the action.request. Defaults to JOI_TURN_ID.
+        #[arg(long = "turn-id")]
+        turn_id: Option<String>,
+        /// Short title shown in clients. JSON stdin may also provide header/title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Question text. If omitted, read the full question payload as JSON from stdin.
+        #[arg(long)]
+        question: Option<String>,
+        /// Choice formatted as id=label. Repeat for multiple choices.
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+        /// Mark the request as allowing free-form text for clients that support it.
+        #[arg(long = "allow-freeform")]
+        allow_freeform: bool,
+    },
+    /// Ask the triggering human to approve or reject a proposed action, then return the result.
+    RequestApproval {
+        /// Max seconds to wait for action.response.
+        #[arg(long = "timeout-seconds")]
+        timeout_seconds: Option<u64>,
+        /// Scope id. Defaults to JOI_SCOPE_ID inside daemon-managed agent turns.
+        #[arg(long)]
+        r#in: Option<String>,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
+        /// Actor id that should approve. Defaults to JOI_TRIGGER_ACTOR inside daemon turns.
+        #[arg(long)]
+        to: Option<String>,
+        /// Turn id to associate with the action.request. Defaults to JOI_TURN_ID.
+        #[arg(long = "turn-id")]
+        turn_id: Option<String>,
+        /// Short title shown in clients. JSON stdin may also provide title.
+        #[arg(long)]
+        title: Option<String>,
+        /// What the agent wants approval to do. If omitted, read JSON from stdin.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Label for the approving option.
+        #[arg(long = "approve-label")]
+        approve_label: Option<String>,
+        /// Label for the rejecting option.
+        #[arg(long = "reject-label")]
+        reject_label: Option<String>,
+    },
+    /// Inspect daemon-configured agents. Runtime hosting is done by `joi daemon`.
     Agent {
         #[command(subcommand)]
         sub: AgentCmd,
@@ -95,6 +159,16 @@ enum Cmd {
     Artifact {
         #[command(subcommand)]
         sub: ArtifactCmd,
+    },
+    /// Upload or download message attachments.
+    Attachment {
+        #[command(subcommand)]
+        sub: AttachmentCmd,
+    },
+    /// Schedule and manage reminders.
+    Reminder {
+        #[command(subcommand)]
+        sub: ReminderCmd,
     },
     /// Interactive chat REPL. Bind to a thread with `--in <tid>` or to a
     /// channel's common area with `--channel <cid>`. Omit both to launch
@@ -132,6 +206,39 @@ enum Cmd {
     Workspace {
         #[command(subcommand)]
         sub: WorkspaceCmd,
+    },
+    /// Run the machine-scoped daemon: auto-detect supported local agent CLIs
+    /// and host agents configured on the selected machine.
+    Daemon {
+        /// Machine id from the desktop machine config. Defaults to the active
+        /// workspace's first machine.
+        #[arg(long = "machine-id", env = "JOI_MACHINE_ID")]
+        machine_id: Option<String>,
+        /// Override the daemon data root. Defaults to the machine data root.
+        #[arg(long = "data-root", env = "JOI_AGENT_DATA_ROOT")]
+        data_root: Option<PathBuf>,
+        /// Comma-separated actor ids to load. Empty/omitted = load every
+        /// agent configured on the machine.
+        #[arg(long = "allow-actors", value_delimiter = ',')]
+        allow_actors: Vec<String>,
+        /// Print auto-detected local providers and exit.
+        #[arg(long = "list-providers")]
+        list_providers: bool,
+        /// Override the directory of ServiceSpec JSON files loaded by the
+        /// daemon. Defaults to `~/.config/joi/services/` or
+        /// `$JOI_SERVICE_SPECS`.
+        #[arg(long = "services")]
+        services: Option<PathBuf>,
+        /// Comma-separated service ids to load through the daemon. Empty or
+        /// omitted means load every ServiceSpec under --services.
+        #[arg(long = "allow-services", value_delimiter = ',')]
+        allow_services: Vec<String>,
+        /// Do not start the service host from this daemon.
+        #[arg(long = "no-services")]
+        no_services: bool,
+        /// Unix socket used by local `joi` CLI clients to reach this daemon.
+        #[arg(long = "socket", env = "JOI_DAEMON_SOCKET")]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -303,9 +410,7 @@ enum ServiceCmd {
     /// Bump the reload-epoch marker for `service_id` so a running
     /// `joi service serve` host re-reads the ServiceSpec and respawns
     /// the supervised plugin instance(s). See design §7.1.
-    Reload {
-        service_id: String,
-    },
+    Reload { service_id: String },
     /// Inspect ServiceSpec JSON files on disk (no server contact).
     Spec {
         #[command(subcommand)]
@@ -429,6 +534,9 @@ enum ThreadCmd {
     Create {
         #[arg(long)]
         channel: String,
+        /// Channel-scope event that anchors the thread.
+        #[arg(long = "root-event")]
+        root_event: Option<String>,
         #[arg(long, default_value = "Untitled")]
         title: String,
         /// Record this thread under `resident_threads.<role>` in the
@@ -450,9 +558,7 @@ enum ThreadCmd {
     /// Delete a thread by id. Thread-bound services watching this
     /// thread (`bind.auto_stop_on=["thread.closed"]`, §4.7.3) reap
     /// their instances on the next watcher tick.
-    Delete {
-        thread_id: String,
-    },
+    Delete { thread_id: String },
     /// Bootstrap an *existing* thread from a clone-manifest (or explicit
     /// mounts) artifact. Used when an already-open thread (e.g. a
     /// bug-fix loop's bugfix thread) needs target/reference repo
@@ -543,6 +649,44 @@ enum EventCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum MessageCmd {
+    /// Send a message to #channel, #channel:root-event, or dm:actor.
+    Send {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long = "attachment-id")]
+        attachment_ids: Vec<String>,
+    },
+    /// Read messages from #channel, #channel:root-event, or dm:actor.
+    Read {
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Drain this actor's pending directed inbox.
+    Check {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long = "no-ack")]
+        no_ack: bool,
+    },
+    /// Search visible message text.
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ActorCmd {
     /// List every actor the server knows about.
     List,
@@ -556,6 +700,8 @@ enum ActorCmd {
         #[arg(long)]
         display: Option<String>,
     },
+    /// Delete an actor row from the server registry.
+    Delete { actor_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -574,6 +720,12 @@ enum ArtifactCmd {
         /// Read body from a local file. Mutually exclusive with --text.
         #[arg(long, conflicts_with = "text")]
         file: Option<PathBuf>,
+        /// Optional scope id to associate with the artifact.
+        #[arg(long)]
+        r#in: Option<String>,
+        /// Treat --in as a channel id instead of a thread id.
+        #[arg(long)]
+        channel: bool,
     },
     /// Fetch artifact metadata by id (`art_…`) or by `artifact://` uri.
     Get { id_or_uri: String },
@@ -582,6 +734,74 @@ enum ArtifactCmd {
         artifact_id: String,
         #[arg(long, default_value_t = 65536)]
         max_bytes: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AttachmentCmd {
+    /// Upload a file and return an attachment/artifact id.
+    Upload {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long = "mime-type")]
+        mime_type: Option<String>,
+    },
+    /// Download an attachment/artifact body to a local file.
+    View {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReminderCmd {
+    Schedule {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "msg-id")]
+        msg_id: Option<String>,
+        #[arg(long = "delay-seconds")]
+        delay_seconds: Option<i64>,
+        #[arg(long = "fire-at")]
+        fire_at: Option<String>,
+        #[arg(long)]
+        repeat: Option<String>,
+    },
+    List {
+        #[arg(long = "status", value_delimiter = ',')]
+        status: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    Cancel {
+        #[arg(long)]
+        id: String,
+    },
+    Snooze {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        by: String,
+    },
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "in")]
+        in_after: Option<String>,
+        #[arg(long = "fire-at")]
+        fire_at: Option<String>,
+        #[arg(long = "cadence")]
+        repeat: Option<String>,
     },
 }
 
@@ -601,51 +821,12 @@ enum ActionCmd {
 
 #[derive(Subcommand, Debug)]
 enum AgentCmd {
-    /// List locally registered agents.
+    /// List agents configured for daemon-managed machines.
     List,
-    /// Show the bundled marketplace catalog.
-    Marketplace,
-    /// Install an agent from the bundled marketplace.
-    Install {
-        marketplace_id: String,
-        /// Local actor id to assign (defaults to `actor_<marketplace_id>`).
-        #[arg(long = "actor-id")]
-        local_actor_id: Option<String>,
-        #[arg(long = "name")]
-        display_name: Option<String>,
-        /// Force a specific distribution: auto (default), npx, uvx, binary.
-        #[arg(long)]
-        prefer: Option<String>,
-    },
-    /// Add a custom agent interactively.
-    Add,
-    /// Show AgentSpec examples for acp_stdio, command, and interactive_command transports.
-    Example,
-    /// Register an agent from a local JSON spec file.
-    Register {
-        path: PathBuf,
-    },
-    /// Remove a locally registered agent.
-    Remove {
-        actor_id: String,
-    },
-    Start {
-        actor_id: String,
-    },
-    Stop {
-        actor_id: String,
-    },
-    Log {
-        actor_id: String,
-        #[arg(long, default_value_t = 50)]
-        tail: u32,
-    },
     /// Bump the reload-epoch marker for `actor_id` so a running
     /// `joi agent serve` host re-reads the AgentSpec + bundle and
     /// respawns the worker. See design §7.1.
-    Reload {
-        actor_id: String,
-    },
+    Reload { actor_id: String },
     /// Run as the v1 external agent client: load every AgentSpec under
     /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
     /// over its own server connection.
@@ -730,8 +911,8 @@ async fn main() -> Result<()> {
     }
 
     // `agent serve` opens its own per-agent connections and never acts as the
-    // local human actor — bypass the up-front connection_open below so we
-    // don't pollute the server's actor table with an unused row.
+    // local human actor. Keep it as a compatibility path for repo-bundled
+    // AgentSpec actors while `joi daemon` hosts machine-configured agents.
     if let Cmd::Agent {
         sub: AgentCmd::Serve {
             specs,
@@ -742,25 +923,11 @@ async fn main() -> Result<()> {
         return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
     }
 
-    // Agent registry management is local to `joi agent serve`; the server is
-    // only the message bus.
+    // `joi agent` local inspection commands should work without opening an
+    // unused human connection.
     if let Cmd::Agent { sub } = args.cmd {
         match sub {
             AgentCmd::List => cmd::agent::list()?,
-            AgentCmd::Marketplace => cmd::agent::marketplace()?,
-            AgentCmd::Install {
-                marketplace_id,
-                local_actor_id,
-                display_name,
-                prefer,
-            } => cmd::agent::install(marketplace_id, local_actor_id, display_name, prefer)?,
-            AgentCmd::Add => cmd::agent::add()?,
-            AgentCmd::Example => cmd::agent::example(),
-            AgentCmd::Register { path } => cmd::agent::register(path)?,
-            AgentCmd::Remove { actor_id } => cmd::agent::remove(actor_id)?,
-            AgentCmd::Start { actor_id } => cmd::agent::start(actor_id)?,
-            AgentCmd::Stop { actor_id } => cmd::agent::stop(actor_id)?,
-            AgentCmd::Log { actor_id, tail } => cmd::agent::log(actor_id, tail)?,
             AgentCmd::Reload { actor_id } => cmd::agent::reload(actor_id)?,
             AgentCmd::Serve { .. } => unreachable!("handled above"),
             AgentCmd::Spec { sub } => match sub {
@@ -778,7 +945,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `service serve` follows the same shape as `agent serve`: it opens
+    // `service serve` follows the daemon worker shape: it opens
     // its own per-service connections (one per ServiceSpec, bound to the
     // service actor) and must not pollute the actor table with a human
     // entry. Same early-exit pattern.
@@ -790,6 +957,31 @@ async fn main() -> Result<()> {
     } = args.cmd
     {
         return cmd::service::serve(specs, cfg.server_url, allow_services).await;
+    }
+
+    if let Cmd::Daemon {
+        machine_id,
+        data_root,
+        allow_actors,
+        list_providers,
+        services,
+        allow_services,
+        no_services,
+        socket,
+    } = args.cmd
+    {
+        return cmd::daemon::run(
+            machine_id,
+            data_root,
+            allow_actors,
+            list_providers,
+            services,
+            allow_services,
+            no_services,
+            socket,
+            cfg.server_url,
+        )
+        .await;
     }
 
     // `service validate` is offline — no server contact needed.
@@ -947,7 +1139,7 @@ async fn main() -> Result<()> {
         return cmd::mcp_announcement::run(actor_id.clone(), server.clone()).await;
     }
 
-    let client = Client::connect(&cfg.server_url).await?;
+    let client = connect_client(&cfg.server_url, explicit_server_arg_present()).await?;
     client.initialize().await?;
     let _ = client
         .open_connection(&cfg.actor_id, Some(&cfg.display_name))
@@ -973,12 +1165,20 @@ async fn main() -> Result<()> {
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create {
                 channel,
+                root_event,
                 title,
                 resident_as,
                 bootstrap_artifact,
             } => {
-                cmd::thread::create(client, channel, title, resident_as, bootstrap_artifact)
-                    .await?
+                cmd::thread::create(
+                    client,
+                    channel,
+                    root_event,
+                    title,
+                    resident_as,
+                    bootstrap_artifact,
+                )
+                .await?
             }
             ThreadCmd::List { channel } => cmd::thread::list(client, channel).await?,
             ThreadCmd::Delete { thread_id } => cmd::thread::delete(client, thread_id).await?,
@@ -1000,6 +1200,26 @@ async fn main() -> Result<()> {
             channel,
             message,
         } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, channel, message).await?,
+        Cmd::Message { sub } => match sub {
+            MessageCmd::Send {
+                target,
+                text,
+                attachment_ids,
+            } => cmd::message::send(client, cfg.actor_id, target, text, attachment_ids).await?,
+            MessageCmd::Read {
+                target,
+                limit,
+                before,
+            } => cmd::message::read(client, cfg.actor_id, target, limit, before).await?,
+            MessageCmd::Check { limit, no_ack } => {
+                cmd::message::check(client, cfg.actor_id, limit, !no_ack).await?
+            }
+            MessageCmd::Search {
+                query,
+                target,
+                limit,
+            } => cmd::message::search(client, cfg.actor_id, query, target, limit).await?,
+        },
         Cmd::Action { sub } => match sub {
             ActionCmd::Accept { event_id, option } => {
                 cmd::action::respond(client, cfg.actor_id, event_id, option, true).await?
@@ -1012,8 +1232,66 @@ async fn main() -> Result<()> {
             SpecCmd::Apply {
                 action_event_id,
                 dry_run,
-            } => cmd::spec_apply::run(client, cfg.actor_id.clone(), action_event_id, dry_run).await?,
+            } => {
+                cmd::spec_apply::run(client, cfg.actor_id.clone(), action_event_id, dry_run).await?
+            }
         },
+        Cmd::AskUserQuestion {
+            timeout_seconds,
+            r#in,
+            channel,
+            to,
+            turn_id,
+            title,
+            question,
+            choices,
+            allow_freeform,
+        } => {
+            cmd::ask_user_question::run(
+                client,
+                cfg.actor_id,
+                cmd::ask_user_question::RunArgs {
+                    timeout_seconds,
+                    scope_id: r#in,
+                    is_channel: channel,
+                    to,
+                    turn_id,
+                    title,
+                    question,
+                    choices,
+                    allow_freeform,
+                },
+            )
+            .await?
+        }
+        Cmd::RequestApproval {
+            timeout_seconds,
+            r#in,
+            channel,
+            to,
+            turn_id,
+            title,
+            reason,
+            approve_label,
+            reject_label,
+        } => {
+            cmd::ask_user_question::run_approval(
+                client,
+                cfg.actor_id,
+                cmd::ask_user_question::ApprovalArgs {
+                    timeout_seconds,
+                    scope_id: r#in,
+                    is_channel: channel,
+                    to,
+                    turn_id,
+                    title,
+                    reason,
+                    approve_label,
+                    reject_label,
+                },
+            )
+            .await?
+        }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Event { sub } => match sub {
@@ -1067,6 +1345,7 @@ async fn main() -> Result<()> {
                 kind,
                 display,
             } => cmd::actor::upsert(client, actor_id, kind, display).await?,
+            ActorCmd::Delete { actor_id } => cmd::actor::delete(client, actor_id).await?,
         },
         Cmd::Artifact { sub } => match sub {
             ArtifactCmd::Publish {
@@ -1074,12 +1353,77 @@ async fn main() -> Result<()> {
                 media_type,
                 text,
                 file,
-            } => cmd::artifact::publish(client, cfg.actor_id, name, media_type, text, file).await?,
+                r#in,
+                channel,
+            } => {
+                cmd::artifact::publish(
+                    client,
+                    cfg.actor_id,
+                    name,
+                    media_type,
+                    text,
+                    file,
+                    r#in,
+                    channel,
+                )
+                .await?
+            }
             ArtifactCmd::Get { id_or_uri } => cmd::artifact::get(client, id_or_uri).await?,
             ArtifactCmd::Read {
                 artifact_id,
                 max_bytes,
             } => cmd::artifact::read(client, artifact_id, max_bytes).await?,
+        },
+        Cmd::Attachment { sub } => match sub {
+            AttachmentCmd::Upload {
+                target,
+                path,
+                mime_type,
+            } => cmd::attachment::upload(client, cfg.actor_id, target, path, mime_type).await?,
+            AttachmentCmd::View {
+                id,
+                output,
+                max_bytes,
+            } => cmd::attachment::view(client, id, output, max_bytes).await?,
+        },
+        Cmd::Reminder { sub } => match sub {
+            ReminderCmd::Schedule {
+                title,
+                target,
+                msg_id,
+                delay_seconds,
+                fire_at,
+                repeat,
+            } => {
+                cmd::reminder::schedule(
+                    client,
+                    cfg.actor_id,
+                    title,
+                    target,
+                    msg_id,
+                    delay_seconds,
+                    fire_at,
+                    repeat,
+                )
+                .await?
+            }
+            ReminderCmd::List { status, all } => {
+                cmd::reminder::list(client, cfg.actor_id, status, all).await?
+            }
+            ReminderCmd::Cancel { id } => cmd::reminder::cancel(client, cfg.actor_id, id).await?,
+            ReminderCmd::Snooze { id, by } => {
+                cmd::reminder::snooze(client, cfg.actor_id, id, by).await?
+            }
+            ReminderCmd::Update {
+                id,
+                title,
+                in_after,
+                fire_at,
+                repeat,
+            } => {
+                cmd::reminder::update(client, cfg.actor_id, id, title, in_after, fire_at, repeat)
+                    .await?
+            }
         },
         Cmd::Chat { r#in, channel } => {
             let (scope_id, scope_kind) = match (r#in, channel) {
@@ -1091,8 +1435,53 @@ async fn main() -> Result<()> {
         }
         Cmd::Service { .. } => unreachable!("handled before client setup"),
         Cmd::Workspace { .. } => unreachable!("handled before client setup"),
+        Cmd::Daemon { .. } => unreachable!("handled before client setup"),
     }
     Ok(())
+}
+
+async fn connect_client(
+    server_url: &str,
+    explicit_server_arg: bool,
+) -> Result<std::sync::Arc<Client>> {
+    if !explicit_server_arg && !daemon_ipc::daemon_disabled() {
+        if let Some(socket) = daemon_ipc::resolve_socket() {
+            let server_matches = socket
+                .server_url
+                .as_deref()
+                .map(|url| url == server_url)
+                .unwrap_or(socket.source == daemon_ipc::SocketSource::Env);
+            if server_matches {
+                match Client::connect_daemon_socket(&socket.path).await {
+                    Ok(client) => return Ok(client),
+                    Err(err) if socket.source == daemon_ipc::SocketSource::Discovery => {
+                        tracing::warn!(
+                            error = %err,
+                            socket = %socket.path.display(),
+                            "daemon socket unavailable; falling back to server URL"
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("connect daemon socket {}", socket.path.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Client::connect(server_url).await
+}
+
+fn explicit_server_arg_present() -> bool {
+    std::env::args_os().skip(1).any(|arg| {
+        arg == "--server"
+            || arg
+                .to_str()
+                .map(|value| value.starts_with("--server="))
+                .unwrap_or(false)
+    })
 }
 
 fn init_tracing() {

@@ -18,11 +18,10 @@ export function Toast() {
   return (
     <div
       className={clsx(
-        "pointer-events-none fixed bottom-6 left-1/2 -translate-x-1/2 rounded px-4 py-2 text-sm shadow-lg",
-        "bg-elevated border border-border",
-        toast.level === "error" && "text-danger",
-        toast.level === "warn" && "text-warning",
-        toast.level === "info" && "text-primary",
+        "pointer-events-none fixed bottom-6 left-1/2 z-[70] -translate-x-1/2 border-2 border-black px-4 py-2 text-sm font-bold shadow-brutal",
+        toast.level === "error" && "bg-danger text-black",
+        toast.level === "warn" && "bg-brutal-orange text-black",
+        toast.level === "info" && "bg-brutal-yellow text-black",
       )}
       role="status"
     >

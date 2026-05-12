@@ -275,7 +275,7 @@ fn fanout(state: &AppState, ev: StoreEvent) {
 
     // Actor-inbox delivery: when an EventCreated event hands off to an actor,
     // also push the same stream/update directly to that actor's connection
-    // (if any). This lets an external `joi agent serve` process learn about
+    // (if any). This lets a daemon-managed agent worker learn about
     // its work without having to subscribe to every channel/thread it might
     // care about. For non-event store events (turn open/close, threads, ...)
     // there's no hands_off_to to follow, so they only ride the scope fan-out.
@@ -303,7 +303,7 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                         // the actor-inbox path. Permission approvals are the
                         // exception: a GUI may be misconfigured with the same
                         // actor id as the agent runtime, but the response must
-                        // still reach the long-lived `joi agent serve`
+                        // still reach the long-lived daemon worker
                         // connection so it can unblock the ACP child.
                         let force_self = e.kind == "action.response"
                             && orig.kind == "action.request"

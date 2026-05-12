@@ -453,13 +453,13 @@ impl History {
             total_rows = total_rows.saturating_add(wrapped_rows(&header_line, width));
             out.push(header_line);
 
-            // Body. Handoff bubbles get a dedicated `|-> handoff -> ...`
+            // Body. Handoff bubbles get a dedicated `handoff -> ...`
             // line; stream bubbles go through the markdown renderer; other
             // static bubbles render their pre-formatted text verbatim.
             let body_rows: Vec<Vec<Span<'static>>> =
                 if let (BubbleKind::Static, Some(target)) = (&b.kind, b.handoff_target.as_ref()) {
                     let label = format!(
-                        "|-> handoff -> {} ({}): {}",
+                        "handoff -> {} ({}): {}",
                         display_for(target),
                         short_actor_ref(target),
                         display_text(&b.text)
@@ -1175,7 +1175,7 @@ mod tests {
         assert_eq!(rendered.lines.len(), 2);
         let body = line_text(&rendered.lines[1]);
         assert!(
-            body.contains("|-> handoff -> Coder (agent_opencode): please look"),
+            body.contains("handoff -> Coder (agent_opencode): please look"),
             "got: {body:?}"
         );
     }

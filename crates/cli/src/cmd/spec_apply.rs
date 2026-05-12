@@ -51,7 +51,12 @@ use crate::client::Client;
 const REQUEST_TYPE: &str = "approval.spec_apply";
 
 /// Entry point for `joi spec apply --action <event_id>`.
-pub async fn run(client: Arc<Client>, actor_id: String, action_event_id: String, dry_run: bool) -> Result<()> {
+pub async fn run(
+    client: Arc<Client>,
+    actor_id: String,
+    action_event_id: String,
+    dry_run: bool,
+) -> Result<()> {
     let response = find_event(&client, &action_event_id)
         .await?
         .ok_or_else(|| anyhow!("event {action_event_id} not found in any thread"))?;
@@ -97,8 +102,7 @@ pub async fn run(client: Arc<Client>, actor_id: String, action_event_id: String,
         .relations
         .iter()
         .find(|r| {
-            matches!(r.kind, RelationKind::AttachesArtifact)
-                && r.target.kind == RefKind::Artifact
+            matches!(r.kind, RelationKind::AttachesArtifact) && r.target.kind == RefKind::Artifact
         })
         .map(|r| r.target.id.clone())
         .ok_or_else(|| {
@@ -113,9 +117,8 @@ pub async fn run(client: Arc<Client>, actor_id: String, action_event_id: String,
         .with_context(|| format!("parse lesson-plan frontmatter (artifact {artifact_id})"))?;
 
     let plan = match frontmatter.get("spec_apply") {
-        Some(v) if !v.is_null() => SpecApplyPlan::from_value(v).with_context(|| {
-            format!("parse spec_apply block in lesson-plan {artifact_id}")
-        })?,
+        Some(v) if !v.is_null() => SpecApplyPlan::from_value(v)
+            .with_context(|| format!("parse spec_apply block in lesson-plan {artifact_id}"))?,
         _ => {
             println!(
                 "lesson-plan {artifact_id} has no spec_apply block — accepted but nothing to apply"
@@ -131,7 +134,11 @@ pub async fn run(client: Arc<Client>, actor_id: String, action_event_id: String,
     };
 
     if dry_run {
-        println!("dry-run preview for {} `{}`:", plan.target_kind_str(), plan.target_id);
+        println!(
+            "dry-run preview for {} `{}`:",
+            plan.target_kind_str(),
+            plan.target_id
+        );
         println!("{}", serde_json::to_string_pretty(&outcome)?);
         return Ok(());
     }
@@ -383,8 +390,7 @@ impl SpecApplyPlan {
                 if let Some(p) = dest.parent() {
                     std::fs::create_dir_all(p).ok();
                 }
-                std::fs::copy(&src, &dest)
-                    .with_context(|| format!("backup {}", src.display()))?;
+                std::fs::copy(&src, &dest).with_context(|| format!("backup {}", src.display()))?;
             }
         }
         Ok(backup_dir)
@@ -412,12 +418,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let tmp = path.with_extension(format!(
         "{}.tmp",
-        path.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("write")
+        path.extension().and_then(|s| s.to_str()).unwrap_or("write")
     ));
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -501,8 +506,7 @@ pub(crate) fn parse_lesson_plan_frontmatter(body: &str) -> Result<Map<String, Va
         .find("\n```")
         .ok_or_else(|| anyhow!("lesson-plan ```json block missing closing fence"))?;
     let json_text = &after_open[..close];
-    let v: Value = serde_json::from_str(json_text)
-        .context("parse lesson-plan frontmatter JSON")?;
+    let v: Value = serde_json::from_str(json_text).context("parse lesson-plan frontmatter JSON")?;
     match v {
         Value::Object(m) => Ok(m),
         _ => bail!("lesson-plan frontmatter is not a JSON object"),

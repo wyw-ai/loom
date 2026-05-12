@@ -78,8 +78,7 @@ impl ServicePlugin for SchedulerPlugin {
         let config: SchedulerConfig = if config_json.is_null() || config_json == json!({}) {
             SchedulerConfig::default()
         } else {
-            serde_json::from_value(config_json)
-                .context("parse spec.config as SchedulerConfig")?
+            serde_json::from_value(config_json).context("parse spec.config as SchedulerConfig")?
         };
         config.validate().context("validate scheduler config")?;
 
@@ -136,9 +135,7 @@ impl ServicePlugin for SchedulerPlugin {
             let self_complete = self_complete.clone();
             let job = Arc::new(job);
             joinset.spawn(async move {
-                if let Err(e) =
-                    run_job_loop(job.clone(), runtime, shutdown, self_complete).await
-                {
+                if let Err(e) = run_job_loop(job.clone(), runtime, shutdown, self_complete).await {
                     tracing::error!(
                         job = %job.id,
                         error = ?e,
@@ -399,9 +396,17 @@ async fn fire_once(
 
             if !dedupe_skip {
                 let id = if let Some(emit) = job.emit.as_ref() {
-                    emit_per_line(emit, body, &runtime, scope.clone(), job, fire_time, &body_hash)
-                        .await
-                        .with_context(|| format!("scheduler emit-per-line for job `{}`", job.id))?
+                    emit_per_line(
+                        emit,
+                        body,
+                        &runtime,
+                        scope.clone(),
+                        job,
+                        fire_time,
+                        &body_hash,
+                    )
+                    .await
+                    .with_context(|| format!("scheduler emit-per-line for job `{}`", job.id))?
                 } else {
                     let body_text = stringify_body(body);
                     let meta = build_meta(job, fire_time, &body_hash);
@@ -412,7 +417,12 @@ async fn fire_once(
                             .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
                     } else {
                         runtime
-                            .append_content(scope.clone(), body_text.clone(), Vec::new(), Some(meta))
+                            .append_content(
+                                scope.clone(),
+                                body_text.clone(),
+                                Vec::new(),
+                                Some(meta),
+                            )
                             .await
                             .with_context(|| format!("scheduler append for job `{}`", job.id))?
                     }
@@ -619,17 +629,19 @@ async fn emit_per_line(
             }
         };
         let name = render_artifact_name(&template, &payload);
-        let body_text = serde_json::to_string(&payload)
-            .with_context(|| "serialize artifact body")?;
+        let body_text =
+            serde_json::to_string(&payload).with_context(|| "serialize artifact body")?;
         let (artifact_id, _uri) = runtime
-            .publish_artifact(scope.clone(), name.clone(), Some("application/json".into()), body_text)
+            .publish_artifact(
+                scope.clone(),
+                name.clone(),
+                Some("application/json".into()),
+                body_text,
+            )
             .await
             .with_context(|| format!("publish_artifact for job `{}`", job.id))?;
         let mut meta = build_meta(job, fire_time, body_hash);
-        meta.insert(
-            "artifactName".into(),
-            Value::String(name.clone()),
-        );
+        meta.insert("artifactName".into(), Value::String(name.clone()));
         let event_id = runtime
             .append_status(
                 scope.clone(),
@@ -738,7 +750,8 @@ fn strip_self_complete(body: &[u8]) -> (Vec<u8>, Option<SelfCompleteSignal>) {
     if last_line.is_empty() || !last_line.starts_with('{') {
         return (body.to_vec(), None);
     }
-    let parsed: SelfCompleteSentinel = match serde_json::from_str::<SelfCompleteSentinel>(last_line) {
+    let parsed: SelfCompleteSentinel = match serde_json::from_str::<SelfCompleteSentinel>(last_line)
+    {
         Ok(p) if p.service_self_complete => p,
         _ => return (body.to_vec(), None),
     };

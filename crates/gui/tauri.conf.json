@@ -12,7 +12,7 @@
       "script": "pnpm build",
       "cwd": "../../apps/gui-web"
     },
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../../apps/gui-web/dist"
   },
   "app": {

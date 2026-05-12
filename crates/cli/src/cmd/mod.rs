@@ -20,5 +20,6 @@ pub mod service;
 pub mod spec;
 pub mod spec_apply;
 pub mod target;
+pub mod task;
 pub mod thread;
 pub mod workspace;

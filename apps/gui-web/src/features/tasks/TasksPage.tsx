@@ -16,15 +16,14 @@ import {
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { ScopeRef } from "@/ipc/types";
+import type { ScopeRef, Task, TaskStatus } from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
-import { useInbox } from "@/store/inbox";
-import { useMessages } from "@/store/messages";
 import { useSession } from "@/store/session";
+import { useTasks } from "@/store/tasks";
 import { useUI } from "@/store/ui";
 
-type Status = "todo" | "inProgress" | "inReview" | "done";
+type Status = TaskStatus;
 
 interface TaskItem {
   key: string;
@@ -33,6 +32,8 @@ interface TaskItem {
   creator: string;
   assignee: string;
   status: Status;
+  artifactCount: number;
+  assignmentCount: number;
 }
 
 const statuses: Array<{
@@ -41,31 +42,38 @@ const statuses: Array<{
   color: string;
 }> = [
   { id: "todo", label: "Todo", color: "bg-brutal-orange" },
-  { id: "inProgress", label: "In Progress", color: "bg-brutal-cyan" },
-  { id: "inReview", label: "In Review", color: "bg-brutal-lavender" },
+  { id: "claimed", label: "Claimed", color: "bg-brutal-yellow" },
+  { id: "in_progress", label: "In Progress", color: "bg-brutal-cyan" },
+  { id: "waiting_review", label: "In Review", color: "bg-brutal-lavender" },
   { id: "done", label: "Done", color: "bg-brutal-lime" },
+  { id: "failed", label: "Failed", color: "bg-brutal-pink" },
+  { id: "canceled", label: "Canceled", color: "bg-brutal-cream" },
 ];
 
 export function TasksPage() {
   const channels = useChannels((s) => s.channels);
+  const threadsByChannel = useChannels((s) => s.threadsByChannel);
   const currentScope = useChannels((s) => s.currentScope);
-  const messageScopes = useMessages((s) => s.byScope);
-  const inboxItems = useInbox((s) => s.items);
   const actors = useActors((s) => s.byId);
   const selfId = useSession((s) => s.workspace?.actorId);
+  const taskRows = useTasks((s) => s.tasks);
+  const upsertTask = useTasks((s) => s.upsertTask);
   const openModal = useUI((s) => s.openModal);
   const pushToast = useUI((s) => s.pushToast);
   const [mode, setMode] = useState<"board" | "list">("board");
   const [hidden, setHidden] = useState<Record<Status, boolean>>({
     todo: false,
-    inProgress: false,
-    inReview: false,
+    claimed: false,
+    in_progress: false,
+    waiting_review: false,
     done: true,
+    failed: true,
+    canceled: true,
   });
 
   const tasks = useMemo(
-    () => deriveTasks(messageScopes, inboxItems, actors),
-    [messageScopes, inboxItems, actors],
+    () => deriveTasks(taskRows, channels, actors),
+    [taskRows, channels, actors],
   );
 
   const createTasks = async (titles: string[]) => {
@@ -77,26 +85,46 @@ export function TasksPage() {
       pushToast("error", "select a channel or thread before creating tasks");
       return;
     }
-    await Promise.all(
-      titles.map((title) =>
-        ipc.eventAppend({
-          type: "action.request",
+    const channelScope = taskCreateScope(currentScope, threadsByChannel);
+    if (!channelScope) {
+      pushToast("error", "cannot resolve a channel for the selected thread");
+      return;
+    }
+    const created = await Promise.all(
+      titles.map(async (title) => {
+        const root = await ipc.eventAppend({
+          type: "content.add",
           actorId: selfId,
-          scope: currentScope,
+          scope: channelScope,
           payload: {
-            requestType: "task",
-            title,
-            description: title,
-            choices: [
-              { id: "done", label: "Done" },
-              { id: "cancel", label: "Cancel" },
-            ],
+            contentType: "text/markdown",
+            text: title,
           },
           relations: [],
-        }),
-      ),
+        });
+        const task = await ipc.taskCreate({
+          sourceEventId: root.event.id,
+          title,
+          description: title,
+          requesterActorId: selfId,
+          ownerActorId: selfId,
+          status: "claimed",
+        });
+        upsertTask(task.task);
+        return task.task;
+      }),
     );
-    pushToast("info", `${titles.length} task(s) created`);
+    pushToast("info", `${created.length} task(s) created`);
+  };
+
+  const claimTask = async (task: TaskItem) => {
+    if (!selfId) return;
+    const res = await ipc.taskUpdate({
+      taskId: task.key,
+      ownerActorId: selfId,
+      status: "claimed",
+    });
+    upsertTask(res.task);
   };
 
   return (
@@ -108,7 +136,7 @@ export function TasksPage() {
         <div className="min-w-0 flex-1">
           <div className="text-base font-black leading-tight">Tasks</div>
           <div className="font-mono text-xs text-black/50">
-            {tasks.length} task{tasks.length === 1 ? "" : "s"} from action requests
+            {tasks.length} task{tasks.length === 1 ? "" : "s"} anchored to channel messages
           </div>
         </div>
         <ModeButton
@@ -145,9 +173,9 @@ export function TasksPage() {
       </div>
 
       {mode === "board" ? (
-        <Board tasks={tasks} hidden={hidden} setHidden={setHidden} />
+        <Board tasks={tasks} hidden={hidden} setHidden={setHidden} onClaim={claimTask} />
       ) : (
-        <TaskList tasks={tasks} hidden={hidden} setHidden={setHidden} />
+        <TaskList tasks={tasks} hidden={hidden} setHidden={setHidden} onClaim={claimTask} />
       )}
     </div>
   );
@@ -184,10 +212,12 @@ function Board({
   tasks,
   hidden,
   setHidden,
+  onClaim,
 }: {
   tasks: TaskItem[];
   hidden: Record<Status, boolean>;
   setHidden: Dispatch<SetStateAction<Record<Status, boolean>>>;
+  onClaim: (task: TaskItem) => void;
 }) {
   return (
     <div className="stable-scrollbar flex min-h-0 flex-1 gap-4 overflow-auto bg-white p-4">
@@ -224,7 +254,9 @@ function Board({
                   No {status.label.toLowerCase()} tasks.
                 </div>
               ) : (
-                rows.map((task) => <TaskCard key={task.key} task={task} />)
+                rows.map((task) => (
+                  <TaskCard key={task.key} task={task} onClaim={onClaim} />
+                ))
               )}
             </div>
           </section>
@@ -238,10 +270,12 @@ function TaskList({
   tasks,
   hidden,
   setHidden,
+  onClaim,
 }: {
   tasks: TaskItem[];
   hidden: Record<Status, boolean>;
   setHidden: Dispatch<SetStateAction<Record<Status, boolean>>>;
+  onClaim: (task: TaskItem) => void;
 }) {
   return (
     <div className="stable-scrollbar min-h-0 flex-1 overflow-y-auto bg-white p-4">
@@ -263,7 +297,9 @@ function TaskList({
                   No {status.label.toLowerCase()} tasks.
                 </div>
               ) : (
-                rows.map((task) => <TaskCard key={task.key} task={task} wide />)
+                rows.map((task) => (
+                  <TaskCard key={task.key} task={task} wide onClaim={onClaim} />
+                ))
               )}
             </div>
           </section>
@@ -295,7 +331,15 @@ function StatusHeader({
   );
 }
 
-function TaskCard({ task, wide }: { task: TaskItem; wide?: boolean }) {
+function TaskCard({
+  task,
+  wide,
+  onClaim,
+}: {
+  task: TaskItem;
+  wide?: boolean;
+  onClaim: (task: TaskItem) => void;
+}) {
   return (
     <article
       className={clsx(
@@ -311,56 +355,60 @@ function TaskCard({ task, wide }: { task: TaskItem; wide?: boolean }) {
       <div className="mt-3 flex flex-wrap gap-2 font-mono text-[11px] text-black/45">
         <span>creator {task.creator}</span>
         <span>assignee {task.assignee}</span>
+        <span>{task.assignmentCount} assignment(s)</span>
+        <span>{task.artifactCount} artifact(s)</span>
       </div>
+      {task.assignee === "unassigned" && (
+        <button
+          className="btn-brutal-sm mt-3 bg-white px-2 py-1 text-[10px]"
+          onClick={() => onClaim(task)}
+        >
+          Claim
+        </button>
+      )}
     </article>
   );
 }
 
 function deriveTasks(
-  messageScopes: ReturnType<typeof useMessages.getState>["byScope"],
-  inboxItems: ReturnType<typeof useInbox.getState>["items"],
+  rows: Task[],
+  channels: Array<{ id: string; title: string }>,
   actors: ReturnType<typeof useActors.getState>["byId"],
 ): TaskItem[] {
-  const tasks = new Map<string, TaskItem>();
-  for (const item of inboxItems) {
-    tasks.set(item.requestEventId, {
-      key: item.requestEventId,
-      channel: item.scope.id,
-      title: item.title,
-      creator: "request",
-      assignee: "you",
-      status: "todo",
-    });
-  }
-  for (const [scopeKey, scopeState] of Object.entries(messageScopes)) {
-    const [, scopeId] = scopeKey.split(":");
-    for (const bubble of scopeState.bubbles) {
-      if (bubble.kind !== "actionRequest") continue;
-      const status =
-        bubble.actionStatus === "accepted" ||
-        bubble.actionStatus === "declined" ||
-        bubble.actionStatus === "answered"
-          ? "done"
-          : "todo";
-      tasks.set(bubble.id, {
-        key: bubble.id,
-        channel: scopeId || "unknown",
-        title: bubble.actionTitle || firstLine(bubble.text),
-        creator: actors[bubble.actorId]?.displayName || bubble.actorId,
-        assignee: "pending",
-        status,
-      });
-    }
-  }
-  return [...tasks.values()].sort((a, b) => a.title.localeCompare(b.title));
-}
-
-function firstLine(value: string): string {
-  return value.split("\n").find(Boolean) ?? "Untitled task";
+  return rows
+    .map((task) => ({
+      key: task.id,
+      channel:
+        channels.find((channel) => channel.id === task.channelId)?.title ??
+        task.channelId,
+      title: `#${task.number} ${task.title}`,
+      creator:
+        actors[task.requesterActorId]?.displayName || task.requesterActorId,
+      assignee: task.ownerActorId
+        ? actors[task.ownerActorId]?.displayName || task.ownerActorId
+        : "unassigned",
+      status: task.status,
+      artifactCount: task.artifactIds?.length ?? 0,
+      assignmentCount: task.assignmentIds?.length ?? 0,
+    }))
+    .sort((a, b) => a.title.localeCompare(b.title));
 }
 
 function scopeLabel(scope: ScopeRef | null, channels: Array<{ id: string; title: string }>) {
   if (!scope) return "No channel selected";
   if (scope.kind === "thread") return `thread ${scope.id}`;
   return channels.find((c) => c.id === scope.id)?.title ?? scope.id;
+}
+
+function taskCreateScope(
+  scope: ScopeRef,
+  threadsByChannel: ReturnType<typeof useChannels.getState>["threadsByChannel"],
+): ScopeRef | null {
+  if (scope.kind === "channel") return scope;
+  for (const [channelId, threads] of Object.entries(threadsByChannel)) {
+    if (threads.some((thread) => thread.id === scope.id)) {
+      return { kind: "channel", id: channelId };
+    }
+  }
+  return null;
 }

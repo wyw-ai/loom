@@ -58,7 +58,6 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
   const text = drafts[currentScopeKey] ?? "";
   const [sending, setSending] = useState(false);
   const [caret, setCaret] = useState(0);
-  const [asTask, setAsTask] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -160,10 +159,6 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         payloadText = atMention[2];
       }
 
-      for (const actorId of mentionTargets(payloadText, actorsById)) {
-        if (actorId !== selfId && actorId !== "system") addHandoff(actorId);
-      }
-
       if (reply?.eventId) {
         relations.push({
           kind: "replies_to",
@@ -208,34 +203,15 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         });
       }
 
-      await ipc.eventAppend(
-        asTask
-          ? {
-              type: "action.request",
-              actorId: selfId,
-              scope,
-              payload: {
-                requestType: "task",
-                title: firstLine(payloadText),
-                description: payloadText,
-                choices: [
-                  { id: "done", label: "Done" },
-                  { id: "cancel", label: "Cancel" },
-                ],
-              },
-              relations,
-            }
-          : {
-              type: "content.add",
-              actorId: selfId,
-              scope,
-              payload: { contentType: "text/markdown", text: payloadText },
-              relations,
-            },
-      );
+      await ipc.eventAppend({
+        type: "content.add",
+        actorId: selfId,
+        scope,
+        payload: { contentType: "text/markdown", text: payloadText },
+        relations,
+      });
       setDraft(scope, "");
       clearPendingAttachments();
-      setAsTask(false);
       setReply(scope, null);
     } catch (e) {
       pushToast("error", `send failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -518,20 +494,11 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         >
           <Paperclip size={15} />
         </button>
-        <label className="ml-auto flex items-center gap-1.5 text-xs font-bold text-black/70">
-          <input
-            type="checkbox"
-            checked={asTask}
-            onChange={(e) => setAsTask(e.target.checked)}
-            className="h-3.5 w-3.5 accent-black"
-          />
-          As Task
-        </label>
         <button
           type="button"
           disabled={(!text.trim() && pendingAttachments.length === 0) || sending}
           onClick={() => void send()}
-          className="btn-brutal-sm gap-1 bg-brutal-pink px-3 text-xs disabled:bg-black/10"
+          className="btn-brutal-sm ml-auto gap-1 bg-brutal-pink px-3 text-xs disabled:bg-black/10"
         >
           {sending && pendingAttachments.length > 0 ? (
             <Loader2 size={13} className="animate-spin" />
@@ -559,23 +526,6 @@ function findMentionTrigger(text: string, caret: number): MentionTrigger | null 
   };
 }
 
-function mentionTargets(
-  text: string,
-  actorsById: Record<string, Actor>,
-): string[] {
-  const targets = new Set<string>();
-  const re = /@([A-Za-z0-9._:-]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    if (isMentionWordChar(text[match.index - 1])) continue;
-    const actorId = match[1]
-      ? resolveActorToken(match[1], actorsById)
-      : null;
-    if (actorId) targets.add(actorId);
-  }
-  return [...targets];
-}
-
 function resolveActorToken(
   token: string,
   actorsById: Record<string, Actor>,
@@ -596,10 +546,6 @@ function resolveActorToken(
   return caseFoldedDisplayMatches.length === 1
     ? caseFoldedDisplayMatches[0].id
     : null;
-}
-
-function firstLine(value: string): string {
-  return value.split("\n").find(Boolean) ?? "Untitled task";
 }
 
 function isMentionWordChar(ch: string | undefined): boolean {

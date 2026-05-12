@@ -4,7 +4,8 @@ import type { Bubble as BubbleModel, ScopeRef } from "@/ipc/types";
 import { scopeKey } from "@/ipc/types";
 import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
-import { Bubble, type BubbleReplyContext } from "./Bubble";
+import { useTasks } from "@/store/tasks";
+import { Bubble, type BubbleReplyContext, type ThreadLink } from "./Bubble";
 
 export function MessageList({ scope }: { scope: ScopeRef }) {
   const scopeStore = useMessages((s) => s.byScope[scopeKey(scope)]);
@@ -16,6 +17,8 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
     }
     return undefined;
   });
+  const threadsByChannel = useChannels((s) => s.threadsByChannel);
+  const tasks = useTasks((s) => s.tasks);
   const bubbles = scopeStore?.bubbles ?? [];
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -28,6 +31,32 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
     for (const b of bubbles) index.set(b.id, b);
     return index;
   }, [bubbles]);
+  const threadLinksByRoot = useMemo(() => {
+    const links = new Map<string, ThreadLink>();
+    for (const [channelId, threads] of Object.entries(threadsByChannel)) {
+      for (const thread of threads) {
+        if (!thread.rootEventId) continue;
+        links.set(thread.rootEventId, {
+          channelId,
+          threadId: thread.id,
+          rootEventId: thread.rootEventId,
+          title: thread.title,
+        });
+      }
+    }
+    for (const task of tasks) {
+      const existing = links.get(task.sourceEventId);
+      links.set(task.sourceEventId, {
+        channelId: task.channelId,
+        threadId: task.canonicalThreadId,
+        rootEventId: task.sourceEventId,
+        title: existing?.title ?? task.title,
+        taskNumber: task.number,
+        taskStatus: task.status,
+      });
+    }
+    return links;
+  }, [threadsByChannel, tasks]);
 
   // Group consecutive same-actor bubbles within 5 minutes.
   const groups: Array<typeof bubbles> = [];
@@ -72,6 +101,7 @@ export function MessageList({ scope }: { scope: ScopeRef }) {
                   showHeader={bi === 0}
                   domId={domIdForBubble(b.id)}
                   replyContext={replyContext}
+                  threadLink={threadLinksByRoot.get(b.id)}
                 />
               );
             })}

@@ -391,6 +391,11 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::TurnOpened(t) => (sk::TURN_OPENED, json!({ "turn": t })),
         StoreEvent::TurnClosed(t) => (sk::TURN_CLOSED, json!({ "turn": t })),
         StoreEvent::ThreadCreated(t) => (sk::THREAD_CREATED, json!({ "thread": t })),
+        StoreEvent::TaskChanged(t) => (sk::TASK_CHANGED, json!({ "task": t })),
+        StoreEvent::TaskAssignmentChanged { assignment, task } => (
+            sk::TASK_ASSIGNMENT_CHANGED,
+            json!({ "assignment": assignment, "task": task }),
+        ),
         StoreEvent::ArtifactPublished(a) => (sk::ARTIFACT_PUBLISHED, json!({ "artifact": a })),
         StoreEvent::ReceiptRecorded(r) => (sk::RECEIPT_RECORDED, json!({ "receipt": r })),
         StoreEvent::DeliveryUpdated(d) => (sk::DELIVERY_UPDATED, json!({ "delivery": d })),
@@ -432,9 +437,11 @@ fn fanout(state: &AppState, ev: StoreEvent) {
     if let StoreEvent::EventCreated(e) = &ev {
         use proto::types::{RefKind, RelationKind};
         let mut already_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Don't double-send to an actor whose own connection is also a scope
-        // subscriber — that's a minor optimization but more importantly avoids
-        // self-loops when the agent emits its own events on the same scope.
+        // Don't double-send ordinary self-authored events to an actor whose
+        // own connection is also a scope subscriber. Explicit self-handoffs
+        // are handled as forced deliveries below because they are how an agent
+        // moves a triage turn into a newly-created task thread before it has
+        // subscribed to that thread.
         already_sent.insert(e.actor_id.clone());
 
         // Resolve targets up-front: explicit HandsOffTo plus the implicit
@@ -445,7 +452,8 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         for r in &e.relations {
             match r.kind {
                 RelationKind::HandsOffTo if r.target.kind == RefKind::Actor => {
-                    targets.push((r.target.id.clone(), "hands_off_to", false));
+                    let force_self = r.target.id == e.actor_id;
+                    targets.push((r.target.id.clone(), "hands_off_to", force_self));
                 }
                 RelationKind::RespondsTo if r.target.kind == RefKind::Event => {
                     if let Some(orig) = state.store.get_event(&r.target.id) {
@@ -467,7 +475,7 @@ fn fanout(state: &AppState, ev: StoreEvent) {
 
         for (target_id, reason, force_self) in targets {
             let dedupe_key = if force_self && target_id == e.actor_id {
-                format!("{target_id}:forced_action_response")
+                format!("{target_id}:forced:{reason}")
             } else {
                 target_id.clone()
             };
@@ -583,11 +591,52 @@ fn broadcast_filtered(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use proto::types::{Ref, RefKind, Relation, RelationKind};
     use tokio::sync::oneshot;
 
+    use crate::artifacts::ArtifactStore;
+    use crate::journal::Journal;
+    use crate::scope_skills::ScopeSkills;
+    use crate::store::Store;
+    use crate::subscribe::Subscriptions;
+
     use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "joi-ws-tests-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos()
+        ));
+        path
+    }
+
+    fn fresh_state(name: &str) -> AppState {
+        let root = temp_path(name);
+        std::fs::create_dir_all(&root).expect("create root");
+        let journal = Journal::open(root.join("journal.jsonl")).expect("open journal");
+        let store = Store::open(journal).expect("open store");
+        let subscriptions = Subscriptions::new();
+        let artifacts = Arc::new(
+            ArtifactStore::new(root.join("artifacts"), root.join("workspaces"))
+                .expect("artifact store"),
+        );
+        let scope_skills = Arc::new(
+            ScopeSkills::new(root.join("workspaces"), root.join("agents")).expect("scope skills"),
+        );
+        AppState {
+            store,
+            subscriptions,
+            artifacts,
+            scope_skills,
+        }
+    }
 
     #[tokio::test]
     async fn cleanup_connection_releases_writer_after_registry_removal() {
@@ -612,5 +661,74 @@ mod tests {
             .expect("writer should exit once the last sender is dropped")
             .expect("writer close signal should be delivered");
         assert!(!subscriptions.send_to_connection("conn_test", "frame".into()));
+    }
+
+    #[test]
+    fn fanout_delivers_explicit_self_handoff_through_actor_inbox() {
+        let state = fresh_state("self-handoff-inbox");
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_emma".into(),
+            actor_id: Some("actor_agent_emma".into()),
+            tx,
+        });
+
+        let channel = state
+            .store
+            .create_channel("story".into(), None)
+            .expect("channel");
+        let root = state
+            .store
+            .append_event(
+                "content.add".into(),
+                "actor_human".into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel.id.clone(),
+                },
+                None,
+                json!({ "text": "@Emma write a story" }),
+                Vec::new(),
+                None,
+            )
+            .expect("root event");
+        let thread = state
+            .store
+            .create_thread(channel.id.clone(), "story task".into(), root.id)
+            .expect("thread");
+        let handoff = state
+            .store
+            .append_event(
+                "content.add".into(),
+                "actor_agent_emma".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: thread.id,
+                },
+                None,
+                json!({ "text": "continue in task thread" }),
+                vec![Relation {
+                    kind: RelationKind::HandsOffTo,
+                    target: Ref {
+                        kind: RefKind::Actor,
+                        id: "actor_agent_emma".into(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                }],
+                None,
+            )
+            .expect("self handoff");
+
+        fanout(&state, StoreEvent::EventCreated(handoff.clone()));
+
+        let frame = rx.try_recv().expect("self handoff actor-inbox frame");
+        let value: Value = serde_json::from_str(&frame).expect("json notification");
+        assert_eq!(value["method"], method::STREAM_UPDATE);
+        assert_eq!(
+            value["params"]["kind"],
+            proto::methods::stream_kind::EVENT_CREATED
+        );
+        assert_eq!(value["params"]["data"]["event"]["id"], handoff.id);
     }
 }

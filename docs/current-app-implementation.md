@@ -17,6 +17,8 @@ agent runtime。
 
 - `Channel` 是长期协作空间。
 - `Thread` 是 channel 公共区某条 root event 下的任务分支，不支持嵌套。
+- `Task` 是挂在 channel 顶层消息上的工作状态维度，自动关联该消息的
+  canonical thread。
 - 人、agent、service 都是 `Actor`。
 - 协作事实通过 `Event` 进入 timeline。
 - agent 的一次执行被组织为 `Turn`。
@@ -34,6 +36,7 @@ agent runtime。
 - actor 连接登记
 - scope 订阅
 - channel / thread / turn / event / relation 存储
+- task / assignment 状态存储
 - delivery / receipt 记录
 - artifact 存储
 - event fanout
@@ -70,6 +73,7 @@ GUI 和 chat CLI 是人类交互层。它们负责：
 - 创建和浏览 channel / thread
 - 追加 message event
 - 显式 handoff 给 agent
+- 创建、领取和追踪 task
 - 渲染 timeline / artifact / receipt / trace
 - 回应 permission request
 
@@ -95,7 +99,9 @@ workspace 已经按 channel 细分。ACP `session/new.cwd` 和 command subproces
 3. worker 通过 `actor/upsert` 和 `connection/open` 出现在 actor registry 中。
 4. 人类消息通过 `HandsOffTo` relation 指向 agent。
 5. server 记录 event / delivery 并 fanout。
-6. worker 收到 event 后打开 turn。
+6. worker 收到 channel 公区里的显式 handoff 后，先在原 channel scope 打开判断
+   turn。模型决定直接回复，还是把这条 root event claim 成 task 并转到
+   canonical thread。
 7. worker 构造 channel-aware prompt 并调用 adapter。
 8. worker 把内容、trace、action request、turn close 写回 server。
 

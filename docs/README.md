@@ -11,6 +11,7 @@
 - [command-transport-v0.md](./command-transport-v0.md) —— Command Transport 协议规范（已落地）
 - [interactive-command-agent-transport-design.md](./interactive-command-agent-transport-design.md) —— interactive command transport 设计
 - [gui-desktop-design.md](./gui-desktop-design.md) —— Joi Desktop GUI 设计与设计 token 来源
+- [protocol/task-workflow.md](./protocol/task-workflow.md) —— channel 顶层消息上的 task / assignment 闭环模型和 CLI/RPC 用法
 
 ## 频道 / actor 拓扑
 

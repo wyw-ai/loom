@@ -10,6 +10,7 @@ import {
   Fingerprint,
   Bookmark,
   BarChart3,
+  MessageSquare,
   XCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -26,13 +27,14 @@ function formatChatTime(ts: string | number): string {
   }
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
-import { scopeKey, type Bubble as BubbleT } from "@/ipc/types";
+import { scopeKey, type Bubble as BubbleT, type TaskStatus } from "@/ipc/types";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useSession } from "@/store/session";
 import { useUI } from "@/store/ui";
 import { ActorAvatar } from "@/features/common/ActorAvatar";
 import { ArtifactAttachments } from "./ArtifactAttachment";
+import { openScope } from "./scopeActions";
 
 export interface BubbleReplyContext {
   actorId: string;
@@ -41,16 +43,27 @@ export interface BubbleReplyContext {
   missing?: boolean;
 }
 
+export interface ThreadLink {
+  channelId: string;
+  threadId: string;
+  rootEventId: string;
+  title: string;
+  taskNumber?: number;
+  taskStatus?: TaskStatus;
+}
+
 export function Bubble({
   bubble,
   showHeader,
   domId,
   replyContext,
+  threadLink,
 }: {
   bubble: BubbleT;
   showHeader: boolean;
   domId: string;
   replyContext?: BubbleReplyContext;
+  threadLink?: ThreadLink;
 }) {
   const actorId = bubble.actorId;
   const selfId = useSession((s) => s.workspace?.actorId);
@@ -209,6 +222,7 @@ export function Bubble({
 
         <Body bubble={bubble} />
         <ArtifactAttachments artifactIds={bubble.attachmentIds} />
+        {threadLink && <RootThreadLink link={threadLink} />}
         <MessageMeta meta={bubble.meta} />
       </div>
 
@@ -250,6 +264,47 @@ export function Bubble({
       </div>
     </div>
   );
+}
+
+function RootThreadLink({ link }: { link: ThreadLink }) {
+  const label = link.taskNumber
+    ? `Task #${link.taskNumber} · ${statusLabel(link.taskStatus)}`
+    : "Thread";
+  return (
+    <button
+      type="button"
+      className="mt-2 flex max-w-full items-center gap-2 border-2 border-black bg-brutal-cyan px-2 py-1 text-left text-xs font-black shadow-brutal-sm hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-none"
+      onClick={() => void openScope({ kind: "thread", id: link.threadId })}
+      title={`#${link.channelId}:${link.rootEventId}`}
+    >
+      <MessageSquare size={13} className="shrink-0" />
+      <span className="shrink-0">{label}</span>
+      <span className="min-w-0 truncate font-mono font-bold text-black/65">
+        #{link.channelId}:{link.rootEventId}
+      </span>
+    </button>
+  );
+}
+
+function statusLabel(status?: TaskStatus): string {
+  switch (status) {
+    case "todo":
+      return "todo";
+    case "claimed":
+      return "claimed";
+    case "in_progress":
+      return "in progress";
+    case "waiting_review":
+      return "in review";
+    case "done":
+      return "done";
+    case "failed":
+      return "failed";
+    case "canceled":
+      return "canceled";
+    default:
+      return "thread";
+  }
 }
 
 function previewText(text: string, handoffTarget?: string): string {

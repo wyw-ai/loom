@@ -15,8 +15,9 @@ import * as ipc from "@/ipc/bridge";
 import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
 import { useSession } from "@/store/session";
+import { useTasks } from "@/store/tasks";
 import { useUI } from "@/store/ui";
-import { scopeKey } from "@/ipc/types";
+import { scopeKey, type ScopeRef, type TaskStatus } from "@/ipc/types";
 import { MessageList } from "./MessageList";
 import { openScope } from "./scopeActions";
 import { Prompt } from "@/features/prompt/Prompt";
@@ -25,7 +26,6 @@ import { StreamingStatusBar } from "./StreamingStatusBar";
 import { openRenameChannel } from "@/features/sidebar/channelActions";
 
 type MainTab = "chat" | "tasks";
-type TaskStatus = "todo" | "inProgress" | "inReview" | "done";
 
 export function ChatView() {
   const scope = useChannels((s) => s.currentScope);
@@ -59,6 +59,7 @@ export function ChatView() {
               ? "Private channel"
               : "Channel workspace",
         parentChannel: null,
+        rootEventId: null,
         channel: ch ?? null,
       };
     }
@@ -66,10 +67,12 @@ export function ChatView() {
     let parentChannel:
       | { id: string; title: string; visibility: "public" | "private" }
       | null = null;
+    let rootEventId: string | null = null;
     for (const [chId, ts] of Object.entries(threads)) {
       const t = ts.find((x) => x.id === scope.id);
       if (t) {
         title = t.title;
+        rootEventId = t.rootEventId ?? null;
         const ch = channels.find((c) => c.id === chId);
         if (ch) {
           parentChannel = {
@@ -84,7 +87,13 @@ export function ChatView() {
     return {
       kind: "thread" as const,
       title,
-      subtitle: parentChannel ? `Thread in #${parentChannel.title}` : "Thread",
+      subtitle:
+        parentChannel && rootEventId
+          ? `in #${parentChannel.id}:${rootEventId}`
+          : parentChannel
+            ? `in #${parentChannel.id}`
+            : "Thread",
+      rootEventId,
       parentChannel,
       channel: parentChannel
         ? channels.find((c) => c.id === parentChannel.id) ?? null
@@ -138,7 +147,9 @@ export function ChatView() {
                 })
               }
             >
-              in #{header.parentChannel.title}
+              {header.rootEventId
+                ? `#${header.parentChannel.id}:${header.rootEventId}`
+                : `#${header.parentChannel.id}`}
             </button>
           )}
         </div>
@@ -242,31 +253,32 @@ function TabButton({
 function ChannelTasksPanel() {
   const [filter, setFilter] = useState<TaskStatus | "all">("all");
   const scope = useChannels((s) => s.currentScope);
+  const threadsByChannel = useChannels((s) => s.threadsByChannel);
   const selfId = useSession((s) => s.workspace?.actorId);
-  const scopeStoreAll = useMessages((s) => s.byScope);
+  const taskRows = useTasks((s) => s.tasks);
+  const upsertTask = useTasks((s) => s.upsertTask);
   const ui = useUI();
   const tasks = useMemo(() => {
     if (!scope) return [];
-    const store = scopeStoreAll[scopeKey(scope)];
-    return (store?.bubbles ?? [])
-      .filter((bubble) => bubble.kind === "actionRequest")
+    return taskRows
+      .filter((task) =>
+        scope.kind === "channel"
+          ? task.channelId === scope.id
+          : task.canonicalThreadId === scope.id,
+      )
       .map((bubble) => ({
         id: bubble.id,
-        title: bubble.actionTitle || bubble.text.split("\n").find(Boolean) || "Untitled task",
-        status:
-          bubble.actionStatus === "accepted" ||
-          bubble.actionStatus === "declined" ||
-          bubble.actionStatus === "answered"
-            ? ("done" as TaskStatus)
-            : ("todo" as TaskStatus),
+        title: `#${bubble.number} ${bubble.title}`,
+        status: bubble.status,
       }))
       .filter((task) => filter === "all" || task.status === filter);
-  }, [filter, scope, scopeStoreAll]);
+  }, [filter, scope, taskRows]);
   const filters: Array<[TaskStatus | "all", string]> = [
     ["all", "All"],
     ["todo", "Todo"],
-    ["inProgress", "In Progress"],
-    ["inReview", "In Review"],
+    ["claimed", "Claimed"],
+    ["in_progress", "In Progress"],
+    ["waiting_review", "In Review"],
     ["done", "Done"],
   ];
 
@@ -308,26 +320,36 @@ function ChannelTasksPanel() {
                   ui.pushToast("error", "connect and select a channel first");
                   return;
                 }
-                await Promise.all(
-                  titles.map((title) =>
-                    ipc.eventAppend({
-                      type: "action.request",
+                const channelScope = taskCreateScope(scope, threadsByChannel);
+                if (!channelScope) {
+                  ui.pushToast("error", "cannot resolve channel for this thread");
+                  return;
+                }
+                const created = await Promise.all(
+                  titles.map(async (title) => {
+                    const root = await ipc.eventAppend({
+                      type: "content.add",
                       actorId: selfId,
-                      scope,
+                      scope: channelScope,
                       payload: {
-                        requestType: "task",
-                        title,
-                        description: title,
-                        choices: [
-                          { id: "done", label: "Done" },
-                          { id: "cancel", label: "Cancel" },
-                        ],
+                        contentType: "text/markdown",
+                        text: title,
                       },
                       relations: [],
-                    }),
-                  ),
+                    });
+                    const task = await ipc.taskCreate({
+                      sourceEventId: root.event.id,
+                      title,
+                      description: title,
+                      requesterActorId: selfId,
+                      ownerActorId: selfId,
+                      status: "claimed",
+                    });
+                    upsertTask(task.task);
+                    return task.task;
+                  }),
                 );
-                ui.pushToast("info", `${titles.length} task(s) created`);
+                ui.pushToast("info", `${created.length} task(s) created`);
               },
             })
           }
@@ -359,4 +381,17 @@ function ChannelTasksPanel() {
       </div>
     </div>
   );
+}
+
+function taskCreateScope(
+  scope: ScopeRef,
+  threadsByChannel: ReturnType<typeof useChannels.getState>["threadsByChannel"],
+): ScopeRef | null {
+  if (scope.kind === "channel") return scope;
+  for (const [channelId, threads] of Object.entries(threadsByChannel)) {
+    if (threads.some((thread) => thread.id === scope.id)) {
+      return { kind: "channel", id: channelId };
+    }
+  }
+  return null;
 }

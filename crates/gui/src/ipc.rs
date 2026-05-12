@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_runtime::discovery::{
-    detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
-    DetectedAgentProvider,
+    apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
+    AgentDefinition, DetectedAgentProvider,
 };
 use proto::methods::method;
 use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec};
@@ -893,6 +893,7 @@ pub async fn machine_create(
         name: name.to_string(),
         kind: "local".into(),
         data_root: data_root_expr,
+        providers: Vec::new(),
         agents: Vec::new(),
     });
     config::save(&cfg).map_err(stringify)?;
@@ -1468,7 +1469,8 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
     } else {
         config::expand_home(&machine.data_root)
     };
-    let detected_providers = detect_agent_cli_providers();
+    let detected_providers =
+        apply_provider_overrides(detect_agent_cli_providers(), &machine.providers);
     let mut providers = detected_providers
         .iter()
         .map(detected_provider_summary)
@@ -1875,6 +1877,7 @@ mod tests {
             name: id.into(),
             kind: "local".into(),
             data_root: "~/.agentx".into(),
+            providers: Vec::new(),
             agents: vec![MachineAgentConfig {
                 provider_id: "codex".into(),
                 actor_id: agent_actor_id.into(),

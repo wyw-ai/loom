@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use agent_runtime::discovery::{
-    detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
-    DetectedAgentProvider,
+    apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
+    AgentDefinition, AgentProviderOverride, DetectedAgentProvider,
 };
 use anyhow::{anyhow, Context, Result};
 use proto::methods::AgentSpec;
@@ -36,14 +36,15 @@ pub async fn run(
     no_ipc: bool,
     server_url: String,
 ) -> Result<()> {
-    let providers = detect_agent_cli_providers();
+    let detected_providers = detect_agent_cli_providers();
     if list_providers {
-        print_providers(&providers);
+        print_providers(&detected_providers);
         return Ok(());
     }
 
     let cfg = load_desktop_config().unwrap_or_default();
     let machine = select_machine(&cfg, machine_id.as_deref())?;
+    let providers = apply_provider_overrides(detected_providers, &machine.providers);
     let selected_machine_id = machine.id.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
     std::fs::create_dir_all(&data_root)
@@ -174,7 +175,7 @@ fn load_machine_specs(
 ) -> Result<MachineSpecs> {
     let cfg = load_desktop_config().unwrap_or_default();
     let machine = select_machine(&cfg, machine_id)?;
-    let providers = detect_agent_cli_providers();
+    let providers = apply_provider_overrides(detect_agent_cli_providers(), &machine.providers);
     let definitions = machine
         .agents
         .iter()
@@ -347,6 +348,8 @@ struct MachineConfig {
     #[serde(default)]
     data_root: String,
     #[serde(default)]
+    providers: Vec<AgentProviderOverride>,
+    #[serde(default)]
     agents: Vec<MachineAgentConfig>,
 }
 
@@ -451,6 +454,7 @@ fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<Machin
                 name: "Local Machine".into(),
                 kind: default_machine_kind(),
                 data_root: default_agent_data_root_expr(),
+                providers: Vec::new(),
                 agents: Vec::new(),
             })
         })
@@ -558,6 +562,7 @@ mod tests {
             name: id.into(),
             kind: default_machine_kind(),
             data_root: String::new(),
+            providers: Vec::new(),
             agents: Vec::new(),
         }
     }

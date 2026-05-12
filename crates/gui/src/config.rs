@@ -30,6 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
+use agent_runtime::discovery::AgentProviderOverride;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -76,6 +77,8 @@ pub struct MachineConfig {
     #[serde(default = "default_machine_kind")]
     pub kind: String,
     pub data_root: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<AgentProviderOverride>,
     #[serde(default)]
     pub agents: Vec<MachineAgentConfig>,
 }
@@ -352,6 +355,7 @@ pub fn default_machine_for_workspace(
         name: "Local Machine".into(),
         kind: default_machine_kind(),
         data_root: machine_data_root_expr(&workspace_key, &data_key),
+        providers: Vec::new(),
         agents: Vec::new(),
     }
 }
@@ -441,6 +445,7 @@ fn default_machine() -> MachineConfig {
         name: "Local Machine".into(),
         kind: default_machine_kind(),
         data_root: default_agent_data_root_expr(),
+        providers: Vec::new(),
         agents: Vec::new(),
     }
 }

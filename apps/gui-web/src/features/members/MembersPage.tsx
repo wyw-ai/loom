@@ -28,6 +28,7 @@ import {
 import * as ipc from "@/ipc/bridge";
 import type {
   Actor,
+  ActorKind,
   AgentInfo,
   AgentProviderSummary,
   JoiEvent,
@@ -40,7 +41,6 @@ import type {
 import { scopeKey } from "@/ipc/types";
 import { summarizeActionRequest } from "@/features/chat/actionRequestSummary";
 import { openScope } from "@/features/chat/scopeActions";
-import { ActorAvatar } from "@/features/common/ActorAvatar";
 import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
@@ -116,8 +116,7 @@ export function MembersPage() {
   const [agents, setAgents] = useState<ManagedAgent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [tab, setTab] = useState<AgentTab>("profile");
-  const [agentsOpen, setAgentsOpen] = useState(true);
-  const [humansOpen, setHumansOpen] = useState(true);
+  const [openKinds, setOpenKinds] = useState<Record<string, boolean>>({});
 
   const applyMachineAgents = (machines: MachineInfo[]) => {
     const rows = machines.flatMap((machine) =>
@@ -198,29 +197,29 @@ export function MembersPage() {
     replaceMembers,
   ]);
 
-  const allAgents = useMemo(() => {
+  const allMembers = useMemo(() => {
     const managedIds = new Set(agents.map((agent) => agent.actor.id));
-    const registryAgents = Object.values(actorsById)
-      .filter((actor) => actor.kind === "agent" && !managedIds.has(actor.id))
+    const registryActors = Object.values(actorsById)
+      .filter((actor) => !managedIds.has(actor.id))
       .sort((a, b) =>
         (a.displayName || a.id).localeCompare(b.displayName || b.id),
       )
-      .map(normalizeRegistryAgent);
-    return [...agents, ...registryAgents];
+      .map(normalizeRegistryActor);
+    return [...agents, ...registryActors];
   }, [agents, actorsById]);
-  const humans = useMemo(
-    () => Object.values(actorsById).filter((a) => a.kind === "human"),
-    [actorsById],
+  const memberSections = useMemo(
+    () => groupMembersByKind(allMembers),
+    [allMembers],
   );
-  const selected = allAgents.find((a) => a.actor.id === selectedId) ?? null;
+  const selected = allMembers.find((a) => a.actor.id === selectedId) ?? null;
 
   useEffect(() => {
     setSelectedId((current) =>
-      current && allAgents.some((agent) => agent.actor.id === current)
+      current && allMembers.some((agent) => agent.actor.id === current)
         ? current
-        : allAgents[0]?.actor.id ?? null,
+        : allMembers[0]?.actor.id ?? null,
     );
-  }, [allAgents]);
+  }, [allMembers]);
 
   const removeAgent = async (agent: ManagedAgent) => {
     if (!agent.managed) {
@@ -268,7 +267,7 @@ export function MembersPage() {
     if (!selected) return;
     setView("chat");
     if (!currentScope) {
-      pushToast("info", "Pick a channel before messaging an agent");
+      pushToast("info", "Pick a channel before messaging this member");
       return;
     }
     setDraft(currentScope, `@${selected.actor.id} `);
@@ -286,56 +285,58 @@ export function MembersPage() {
           <div className="text-lg font-black">Members</div>
         </header>
         <div className="stable-scrollbar min-h-0 flex-1 overflow-y-auto px-2 py-3">
-          <GroupHeader
-            label="Agents"
-            count={allAgents.length}
-            open={agentsOpen}
-            onToggle={() => setAgentsOpen((x) => !x)}
-            onAdd={() => setView("machines")}
-          />
-          {agentsOpen &&
-            allAgents.map((agent) => (
-              <AgentListRow
-                key={agent.actor.id}
-                agent={agent}
-                active={agent.actor.id === selectedId}
-                onClick={() => {
-                  setSelectedId(agent.actor.id);
-                  setTab("profile");
-                }}
-              />
-            ))}
+          {memberSections.map((section) => {
+            const open = openKinds[section.kind] ?? true;
+            return (
+              <div key={section.kind}>
+                <GroupHeader
+                  label={actorKindPlural(section.kind)}
+                  count={section.members.length}
+                  open={open}
+                  onToggle={() =>
+                    setOpenKinds((state) => ({
+                      ...state,
+                      [section.kind]: !(state[section.kind] ?? true),
+                    }))
+                  }
+                  onAdd={
+                    section.kind === "agent"
+                      ? () => setView("machines")
+                      : section.kind === "human"
+                        ? () =>
+                            openModal({
+                              type: "input",
+                              title: "Invite human",
+                              label: "Email or actor id",
+                              placeholder: "name@example.com",
+                              confirmLabel: "Invite",
+                              onSubmit: (value) =>
+                                pushToast("info", `invite staged for ${value}`),
+                            })
+                        : undefined
+                  }
+                />
+                {open &&
+                  section.members.map((member) => (
+                    <AgentListRow
+                      key={member.actor.id}
+                      agent={member}
+                      active={member.actor.id === selectedId}
+                      onClick={() => {
+                        setSelectedId(member.actor.id);
+                        setTab("profile");
+                      }}
+                    />
+                  ))}
+              </div>
+            );
+          })}
 
-          <GroupHeader
-            label="Humans"
-            count={humans.length}
-            open={humansOpen}
-            onToggle={() => setHumansOpen((x) => !x)}
-            onAdd={() =>
-              openModal({
-                type: "input",
-                title: "Invite human",
-                label: "Email or actor id",
-                placeholder: "name@example.com",
-                confirmLabel: "Invite",
-                onSubmit: (value) =>
-                  pushToast("info", `invite staged for ${value}`),
-              })
-            }
-          />
-          {humansOpen &&
-            humans.map((human) => (
-              <button
-                key={human.id}
-                className="mb-1 flex w-full items-center gap-2 border-2 border-transparent px-2 py-2 text-left text-sm font-bold hover:border-black hover:bg-white hover:shadow-brutal-sm"
-              >
-                <ActorAvatar actor={human} size={20} />
-                <span className="min-w-0 flex-1 truncate">
-                  {human.displayName || human.id}
-                </span>
-                <span className="font-mono text-[11px] text-black/40">human</span>
-              </button>
-            ))}
+          {memberSections.length === 0 && (
+            <div className="px-3 py-6 text-center font-mono text-xs text-black/40">
+              No actors found
+            </div>
+          )}
         </div>
       </aside>
 
@@ -351,7 +352,7 @@ export function MembersPage() {
           />
         ) : (
           <div className="flex h-full items-center justify-center text-lg font-black uppercase text-black/40">
-            Select an agent
+            Select a member
           </div>
         )}
       </main>
@@ -371,7 +372,7 @@ function GroupHeader({
   count: number;
   open: boolean;
   onToggle: () => void;
-  onAdd: () => void;
+  onAdd?: () => void;
 }) {
   return (
     <div className="mb-1 mt-2 flex items-center justify-between px-2">
@@ -384,9 +385,11 @@ function GroupHeader({
         {label}
         <span className="font-mono text-black/40">{count}</span>
       </button>
-      <button className="btn-brutal-sm bg-white p-0.5" onClick={onAdd}>
-        <Plus size={14} />
-      </button>
+      {onAdd && (
+        <button className="btn-brutal-sm bg-white p-0.5" onClick={onAdd}>
+          <Plus size={14} />
+        </button>
+      )}
     </div>
   );
 }
@@ -433,7 +436,9 @@ function AgentListRow({
             title={online ? "online" : agent.status}
           />
         ) : (
-          <span className="font-mono text-[10px] text-black/45">registry</span>
+          <span className="font-mono text-[10px] text-black/45">
+            {agent.actor.kind}
+          </span>
         )}
       </button>
     </>
@@ -1690,6 +1695,47 @@ function ActivityTab({ agent }: { agent: ManagedAgent }) {
   );
 }
 
+function groupMembersByKind(members: ManagedAgent[]) {
+  const byKind = new Map<ActorKind, ManagedAgent[]>();
+  for (const member of members) {
+    const rows = byKind.get(member.actor.kind) ?? [];
+    rows.push(member);
+    byKind.set(member.actor.kind, rows);
+  }
+  return [...byKind.entries()]
+    .sort(([left], [right]) => actorKindOrder(left) - actorKindOrder(right))
+    .map(([kind, rows]) => ({
+      kind,
+      members: rows.sort((a, b) =>
+        (a.actor.displayName || a.actor.id).localeCompare(
+          b.actor.displayName || b.actor.id,
+        ),
+      ),
+    }));
+}
+
+function actorKindOrder(kind: ActorKind): number {
+  switch (kind) {
+    case "agent":
+      return 0;
+    case "service":
+      return 1;
+    case "human":
+      return 2;
+  }
+}
+
+function actorKindPlural(kind: ActorKind): string {
+  switch (kind) {
+    case "agent":
+      return "Agents";
+    case "service":
+      return "Services";
+    case "human":
+      return "Humans";
+  }
+}
+
 function normalizeAgent(
   info: AgentInfo | MachineAgentInfo,
   machine: AgentMachineContext,
@@ -1748,10 +1794,12 @@ function normalizeAgent(
   };
 }
 
-function normalizeRegistryAgent(actor: Actor): ManagedAgent {
+function normalizeRegistryActor(actor: Actor): ManagedAgent {
   const meta = actor._meta ?? {};
   const description =
-    typeof meta.description === "string" ? meta.description : "Registered server actor";
+    typeof meta.description === "string"
+      ? meta.description
+      : `Registered server ${actor.kind}`;
   return {
     actor,
     managed: false,

@@ -238,7 +238,7 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
         e.preventDefault();
         return;
       }
-      // If a palette is open, Enter commits the first match instead of
+      // If a palette is open, Enter commits the active match instead of
       // sending. This matches Discord and fixes the "@agent<Enter> sent
       // the literal text" bug.
       if (slashOpen && slashRef.current?.pickFirst()) {
@@ -251,6 +251,11 @@ export function Prompt({ scope }: { scope: ScopeRef }) {
       }
       e.preventDefault();
       void send();
+      return;
+    }
+    if (atOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      mentionRef.current?.moveSelection(e.key === "ArrowDown" ? 1 : -1);
       return;
     }
     if (e.key === "Escape") {

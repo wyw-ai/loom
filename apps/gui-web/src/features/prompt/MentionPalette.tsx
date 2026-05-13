@@ -3,6 +3,7 @@ import {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -21,6 +22,7 @@ interface Entry {
 
 export interface MentionPaletteHandle {
   pickFirst: () => boolean;
+  moveSelection: (delta: number) => boolean;
 }
 
 interface Props {
@@ -65,6 +67,8 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
     const channels = useChannels((s) => s.channels);
     const threadsByChannel = useChannels((s) => s.threadsByChannel);
     const [statuses, setStatuses] = useState<Record<string, string>>({});
+    const [selectedIndex, setSelectedIndex] = useState(0);
+    const selectedRef = useRef<HTMLButtonElement | null>(null);
 
     // actor/list carries every server-known actor. agent/list is the legacy
     // local spec path; machine/list is the new machine-config path. Merge all
@@ -143,16 +147,37 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
       return list;
     }, [actorsById, statuses, f, selfId, currentScope, channels, threadsByChannel]);
 
+    useEffect(() => {
+      setSelectedIndex(0);
+    }, [filter]);
+
+    useEffect(() => {
+      setSelectedIndex((current) =>
+        items.length === 0 ? 0 : Math.min(current, items.length - 1),
+      );
+    }, [items.length]);
+
+    useEffect(() => {
+      selectedRef.current?.scrollIntoView({ block: "nearest" });
+    }, [selectedIndex]);
+
     useImperativeHandle(
       ref,
       () => ({
         pickFirst: () => {
           if (items.length === 0) return false;
-          onPick(items[0].id);
+          onPick(items[Math.min(selectedIndex, items.length - 1)].id);
+          return true;
+        },
+        moveSelection: (delta: number) => {
+          if (items.length === 0) return false;
+          setSelectedIndex((current) =>
+            (current + delta + items.length) % items.length,
+          );
           return true;
         },
       }),
-      [items, onPick],
+      [items, onPick, selectedIndex],
     );
 
     if (items.length === 0) return null;
@@ -160,15 +185,17 @@ export const MentionPalette = forwardRef<MentionPaletteHandle, Props>(
     return (
       <div className="absolute bottom-full left-0 right-0 mb-2 max-h-72 overflow-y-auto rounded-md border border-border bg-elevated px-1 py-1 shadow-lg">
         <div className="px-2 pb-1 pt-1 text-[11px] font-semibold uppercase tracking-wide text-muted">
-          Mention an actor · Enter to pick first
+          Mention an actor · ↑/↓ to choose · Enter to pick
         </div>
         {items.map((e, i) => (
           <button
             key={e.id}
+            ref={i === selectedIndex ? selectedRef : undefined}
             className={
               "flex w-full items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-hover " +
-              (i === 0 ? "bg-hover/60" : "")
+              (i === selectedIndex ? "bg-hover" : "")
             }
+            onMouseEnter={() => setSelectedIndex(i)}
             onClick={() => onPick(e.id)}
           >
             <span className={actorRoleClass(e.kind)}>{e.display}</span>

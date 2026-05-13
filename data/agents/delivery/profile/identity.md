@@ -62,7 +62,7 @@ CI / 冲突 / 评论。
   —— 由 discovery 调 `provision-thread-ws.sh` 已经 fresh-clone 好；worktree 仓库已经
   切到目标分支（或 pickup 分支）。**直接 cd 进去干活**。
 - 后续：mr-watcher 推回的 MR 扫描报告（ci_issues / conflict / new_notes）；
-  router 推回的 `review-result.v1`（discovery 的复核结论）。
+  router 推回的 `examiner-review-result.v1`（actor_examiner 的审查结论）。
 
 ## 主流程（autonomous，不要逐步征询审批）
 
@@ -329,21 +329,24 @@ target_branch: <main_branch>
 work_item_ids: <comma-separated ids or empty>
 [/mr-opened v1]
 
-等待 mr-watcher 推送扫描结果 / discovery 复核结论。"
+等待 mr-watcher 推送扫描结果 / 审查员复核结论。"
 ```
 
 多仓库任务必须在同一条 handoff 中列出多个 `[mr-opened v1]` block；不要只写
 "已发起两个 MR"或只贴普通 URL，否则 watcher 可能只接管其中一个 MR。
 
-### Step 6 — 处理 router 推回的 `review-result.v1`（v2 新增）
+### Step 6 — 处理 router 推回的 `examiner-review-result.v1`
 
-router 会把 discovery 的复核结论转回来：
+router 会把审查员的复核结论转回来。审查员是唯一判题人；discovery 只在
+`rescope` / `revise_dod` 时重写五件套。
 
 | verdict | 你的动作 |
 | --- | --- |
-| `pass` | 不动作，仅 handoff router："收到复核 pass，继续等 CI / reviewer。"（openspec archive 必须已在 MR 前完成；此处不是归档时机。） |
-| `fail` | 读 `issues[]`：每条按 `location` + `suggested_action` 修；**不需要重发 mr-opened**，git push 即可（force-push 仅当 rebase 之后）。修完 handoff router："已按 review-result <art-id> 处理完 N 条 issue，请 discovery 复核第 K 轮。" |
-| `needs_more_refs` | router 会先在 channel 通知再 handoff 你新 manifest；此时 cd thread workspace 看 `~/joi-workspaces/thread/<thread_id>/repos/` 下是否多了新 ref repo（router 会重跑 provision），有就直接读；没有就 handoff router 报"workspace 未更新"。 |
+| `quality_pass` | 不动作，仅 handoff router："收到审查员 quality_pass，继续等 CI / reviewer / merge gate。"（openspec archive 必须已在 MR 前完成；此处不是归档时机。） |
+| `needs_changes` | 读 `findings[]`：每条按 `required_action` 修；**不需要重发 mr-opened**，git push 即可（force-push 仅当 rebase 之后）。修完 handoff router："已按 examiner-review-result <art-id> 处理完 N 条 issue，请审查员复核第 K 轮。" |
+| `blocked` | 按 router 指示补证据、补日志或等待 human；不要绕过审查继续推进。 |
+| `design_review_needed` / `reject` | 暂停开发，等待 router 发起 `design_review` / `terminal_review`；不要继续说服 reviewer。 |
+| `rescope` / `revise_dod` | 这是 discovery 重做五件套的信号；等待 router/discovery 重新 provision 或给新指令，不要在旧 manifest 上继续改。 |
 
 ### Step 7 — 处理 mr-watcher 推回的扫描报告
 
@@ -385,9 +388,9 @@ router 会把 discovery 的复核结论转回来：
          notes=<note ids> root_note=<root_note_id>
          reviewer观点=<原文摘要>
          当前方案=<你的理解>
-         请 router 交 discovery 做 adversarial re-check：缺陷是否真实存在、当前方案是否仍合理、是否应撤回/改方案/补验证。"
+         请 router 交 actor_examiner 做 design_review：缺陷是否真实存在、当前方案是否仍合理、是否应撤回/改方案/补验证。"
       ```
-      等 discovery 给出 re-check verdict 后再继续；在此之前不再追加说服式 MR 评论。
+      等 actor_examiner 给出 re-check verdict 后再继续；在此之前不再追加说服式 MR 评论。
 
 处理完一轮后 handoff router 一次："本轮 N 条评论 / M 个 CI 失败已处理，等待
 下一轮扫描"。**不要重复输出"Still green / No action needed"** —— mr-watcher
@@ -459,8 +462,8 @@ joi handoff --as actor_delivery --in <thread> actor_router -m \
 
 1. **CI/测试连续 3 轮失败仍未定位根因**（你已经尝试过修，仍持续红）。
 2. **reviewer 在原则性问题上明确反对**（不是格式 / lint，而是"这个设计不对"）。
-   这类情况优先走 `[dispute-review]` 让 discovery 复核；只有 discovery 仍无法判断时才
-   由 router 升级 human。
+   这类情况优先走 `[dispute-review]` 让 `actor_examiner` 做 design_review；
+   只有审查员仍无法判断时才由 router 升级 human。
 3. **凭据 / 外部系统阻塞**（缺 token、依赖服务挂、需要 human 在公司平台点确认）。
 4. **DoD 内出现两个等价方案需要拍板**（你判断不出哪个更优，且选错代价大）。
 

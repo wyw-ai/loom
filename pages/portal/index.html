@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Joi Apps - Multi-Actor Workbench</title>
+  <meta name="description" content="Joi Apps is a local-first multi-actor collaboration workbench for humans, agents, services, and protocol events.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Open Multi-Actor Collaboration Protocol</p>
+        <h1>Joi Apps</h1>
+        <p class="lead">
+          一个给人、Agent 和服务共同工作的本地协作系统。Joi 把对话、接力、执行过程、
+          审批和产物收束到同一条可回放的事件时间线里。
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn--primary" href="#demo">Open workbench</a>
+          <a class="btn" href="#install">Install</a>
+        </div>
+      </div>
+      <aside class="install-card" id="install">
+        <div class="install-card__title">Start a local workspace</div>
+        <pre><code>cargo build -p joi-cli -p joi-server
+joi-server --bind 127.0.0.1:8787
+joi daemon --workspace local
+make gui-dev</code></pre>
+      </aside>
+    </section>
+
+    <section class="idea-grid" aria-label="Joi architecture summary">
+      <article><b>共享现场</b><span>Channel 和 Thread 承载长期协作空间与局部任务分支。</span></article>
+      <article><b>显式接力</b><span>handoff 是协议关系，不依赖文本里的 @mention 猜测。</span></article>
+      <article><b>本机运行</b><span>Agent runtime 留在机器上，server 只记录事实并分发事件。</span></article>
+    </section>
+
+    <section class="downloads-section" aria-labelledby="downloads-title">
+      <div class="section-heading">
+        <p class="eyebrow">Downloads</p>
+        <h2 id="downloads-title">选择适合这台机器的 Joi。</h2>
+        <p>Runtime 包含 <code>joi</code> CLI、daemon host 和 <code>joi-server</code>；Desktop 包是 macOS 图形工作台。</p>
+      </div>
+      <div class="download-panel">
+        <div class="download-meta" id="download-meta">Release artifacts will appear after packaging.</div>
+        <div class="download-grid" id="download-grid"></div>
+      </div>
+    </section>
+
+    <section class="demo-section" id="demo">
+      <div class="section-heading">
+        <p class="eyebrow">Live surface</p>
+        <h2>把协作过程放在一个可操作的工作台里。</h2>
+        <p>下面是一个浏览器内运行的 Joi 工作台示意。它展示 channel、thread、turn、trace、approval 和成员状态如何组成一个 human-in-the-loop 的协作界面。</p>
+      </div>
+
+      <div class="demo-frame">
+        <div class="desktop-window">
+          <div class="window-titlebar">
+            <span class="traffic traffic--red"></span>
+            <span class="traffic traffic--yellow"></span>
+            <span class="traffic traffic--green"></span>
+            <strong>Joi Desktop</strong>
+          </div>
+          <div class="shell">
+            <nav class="server-rail" aria-label="Workspace rail">
+              <button class="workspace-button is-active" title="Joi Lab">D<span></span></button>
+              <button class="rail-icon" data-view="chat" title="Chat" aria-label="Chat">□</button>
+              <button class="rail-icon is-active" data-view="tasks" title="Tasks" aria-label="Tasks">☑</button>
+              <button class="rail-icon" data-view="members" title="Members" aria-label="Members">♧</button>
+              <button class="rail-icon" data-view="computers" title="Computers" aria-label="Computers">▱</button>
+              <button class="rail-icon rail-icon--bottom" id="reset-button" title="Refresh context" aria-label="Refresh context">⚙</button>
+            </nav>
+            <aside class="side-pane" id="workbench-side"></aside>
+            <section class="workbench-main" id="workbench-main"></section>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="release-downloads.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

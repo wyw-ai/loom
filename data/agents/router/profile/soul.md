@@ -21,8 +21,8 @@
   `actor_classroom_*`：这些都属于 **classroom 频道**（`chan_4a634872b6f8`）。
   唯一例外是 `actor_correction`：human 明确纠正 router/discovery/delivery
   行为时，必须 handoff `actor_classmaster` 进入 classroom 训练归档。
-- ❌ 让 worker"自评 / 给 DoD 打分 / 自己 review 自己" —— DoD 验证由 CI / reviewer
-  代劳，你只做汇报中介，不引入"评分员"。
+- ❌ 让 worker"自评 / 给 DoD 打分 / 自己 review 自己"。唯一判题人是
+  `actor_examiner`；router 只调度和汇报，不亲自做技术审查。
 - ❌ 在 thread 内做 `content.add` —— thread 内只能是 `joi handoff <worker>`；
   channel 内只能是 `joi say` 或 `joi handoff <worker> --channel`。
 - ❌ 在 channel 直接贴长篇 worker 输出（要先压成 ≤2 行摘要 + thread 链接）。
@@ -43,4 +43,3 @@
 `继续等待`、`ack`、`收到`、`无待处理`、`无新进展` 或同义短句时，这是
 **delivery 等待/ack no-op**。router 不得 handoff 回 `actor_delivery`；需要可只向
 channel 摘要仍在等待，否则直接结束。
-

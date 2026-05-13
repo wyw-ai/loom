@@ -186,13 +186,21 @@ provision_out=$("$PROVISION_SCRIPT" --manifest "$manifest_norm" --chan "$CHANNEL
 kbase_lines=""
 while IFS= read -r repo; do
     [[ -n "$repo" ]] || continue
-    page="MISSING"
+    pages="MISSING"
     if command -v "$A1_BIN" >/dev/null 2>&1; then
-        page=$("$A1_BIN" -f json kbase search "$repo" --repo-ids 74121 --top 1 2>/dev/null \
-            | "$JQ_BIN" -r '.items[0].page_id // .items[0].id // .data[0].page_id // empty' 2>/dev/null || true)
-        [[ -n "$page" ]] || page="MISSING"
+        pages=$("$A1_BIN" -f json kbase search "[$repo]" --repo-ids 74121 --top 50 2>/dev/null \
+            | "$JQ_BIN" -r --arg prefix "[$repo] " '
+                [(.items // .data // [])[]
+                 | {id:(.page_id // .pageId // .id // ""), title:(.title // .name // .page_name // .pageName // "")}
+                 | select(.id != "")
+                 | select(.title | startswith($prefix))]
+                | if length == 0 then empty
+                  else map(.id + "(" + (.title | gsub("[\r\n]"; " ") | gsub("[()]"; " ")) + ")") | join(" ")
+                  end
+              ' 2>/dev/null || true)
+        [[ -n "$pages" ]] || pages="MISSING"
     fi
-    kbase_lines+="- ${repo}: ${page}"$'\n'
+    kbase_lines+="- ${repo}: ${pages}"$'\n'
 done < <("$JQ_BIN" -r '.repos[]? | select((.mode // .role // "worktree") == "worktree") | .repo' "$manifest_norm")
 [[ -n "$kbase_lines" ]] || kbase_lines="- MISSING: MISSING"$'\n'
 
@@ -201,7 +209,7 @@ delivery 启动：feedback_id=${FEEDBACK_ID:-} work_item_ids=${WORK_ITEM_IDS:-${
 source_thread=${SOURCE_THREAD_ID:-}
 workspace=~/joi-workspaces/thread/${DELIVERY_THREAD_ID}/repos/（已 provision，请 cd 进去干活；禁止动 shared/repos 与 channel-level workspace）
 target-repos 开发规范（kbase 74121 page-id 列表）：
-${kbase_lines}编码每个 repo 前先 a1 kbase page view 74121 <page-id> 读规范；MISSING 的请回报 router 补。
+${kbase_lines}编码每个 repo 前先逐个执行 a1 kbase page view 74121 <page-id> 读取该 repo 的全部研发规范，并保存到 workspace 的 repo-specs/<group>__<repo>/；MISSING 的请回报 router 补。规范源头始终是 kbase，workspace 文件只是本次读取快照。
 EOF
 )
 handoff_out=$(joi handoff actor_delivery --in "$DELIVERY_THREAD_ID" --message "$msg" --json)

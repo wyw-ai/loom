@@ -1,8 +1,8 @@
 # a1-dev-canfeng 审查员 Actor 设计
 
-> 状态：设计草案。目标是为 `a1-dev-canfeng` 增加一个统一的质量审查角色，
-> 提升 discovery 产物和 MR 交付质量，同时避免 handoff 循环、状态 owner 混乱和
-> 多 actor 互相拉扯。
+> 状态：已落地为当前方案。最终角色分工和状态机见
+> [a1-dev-canfeng-final-actors.md](./a1-dev-canfeng-final-actors.md)。本文保留
+> 审查员 actor 的详细设计背景和 gate 说明。
 
 ## 1. 结论
 
@@ -153,12 +153,10 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 ### 5.1 `spec_review`
 
 触发：discovery 完成 `task-goal.json`、`definition-of-done.json`、`clone-manifest.json`
-并启动 delivery 之后。
+并发出 `[discovery-ready]` 之后、启动 delivery 之前。
 
-触发方式：新增 `spec-review-watcher` service 监听 `discovery-desk`，发现完整五件套
-和 `[delivery-started]` 后，在 `discovery-desk` handoff `actor_examiner`。
-
-该 service 只负责触发，不负责判断、暂停 delivery 或修改状态。
+触发方式：router 收到 discovery 的 `[discovery-ready]` 后，在同一 thread handoff
+`actor_examiner gate=spec_review`。不再新增独立 `spec-review-watcher` service。
 
 审查问题：
 
@@ -170,8 +168,8 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 - 是否缺关键仓库、测试环境、发布/依赖说明。
 - 是否存在架构或权限风险。
 
-建议：`spec_review` 不阻塞 discovery 启动 delivery。delivery 可以先开工，但 router
-收到 blocker 后应暂停关键改动或要求 rescope。
+`spec_review` 是 delivery 启动前硬门禁。未通过时 discovery 只能修订五件套或等待
+human/terminal 裁决，不能启动 delivery。
 
 ### 5.2 `mr_review`
 
@@ -187,6 +185,22 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 - reviewer 评论是否已合理处理。
 - MR 描述、关联 workitem、openspec archive 是否完整。
 - 是否存在安全、兼容、发布风险。
+
+`mr_review` 必须是真实代码审查，不只是流程留痕。examiner 必须读取 MR diff 和关键
+上下文；对能定位到文件行的具体问题，优先使用 Code MR 行级评论：
+
+```bash
+A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create \
+  --repo <repo> --mr <mr_id> --file <changed/file> --line <new_line> \
+  -m "<问题、影响、建议>"
+```
+
+MR 顶层 `[examiner-result]` 只作为结构化结论和 mr-watcher 路由信号，不替代行级
+code review。没有可执行代码问题时，examiner 应明确说明依据，而不是为了协作留空泛评论。
+
+discussion 需要分类处理。代码、DoD、安全、测试、兼容性、发布风险相关且仍有明确动作的
+discussion 可以阻塞；开放性、行政性、超出当前题范围或无明确改动要求的问题只记录为
+platform note，不应机械打回 delivery。
 
 `mr_review` 替代当前由 discovery 默认承担的 MR 复核。discovery 仍负责出题和
 rescope，但不再是默认判题人。
@@ -309,15 +323,16 @@ MR 通过拆成四层，不混用：
 | 层级 | 含义 | owner |
 | --- | --- | --- |
 | `quality_pass` | 审查员确认 MR 满足目标、DoD、代码质量 | examiner |
-| `approve` | 在 MR 平台上 approve | examiner 可执行，但需 policy 开关 |
+| `approve` | 在 MR 平台上 approve | router 在 examiner `quality_pass` 后执行；失败则请求有效 reviewer/human |
 | `merge_ready` | 已具备合并条件 | router 汇报，human 或 merge policy 决定 |
 | `merged` | MR 真实合并 | mr-watcher / status API 事实 |
 
 第一阶段建议：
 
 - examiner 可以发“审查通过”评论。
-- examiner 可以在 `allow_examiner_approve=true` 时执行 approve。
+- router 可以在 examiner `quality_pass` 后执行 approve。
 - examiner 不执行 merge。
+- router 不执行 merge。
 - merge 仍为 human gate；未来可新增 `merge-service`，按白名单和策略执行。
 
 ### 7.2 MR 废弃/关闭
@@ -411,7 +426,7 @@ MR 对应 feedback 标 Fixed。
 6. `advisory` 不阻塞 delivery。
 7. `needs_changes` 只允许通过 MR 评论由 mr-watcher 指向 delivery；`rescope` / `revise_dod` 只允许由 router 指向 discovery。
 8. 若 examiner 输出缺少 `evidence` 或 `impact`，router 不得按 blocker 处理。
-9. 如果 Code 平台 `test=false` / CI failed / discussion unresolved / readyToMerge=false，examiner 不得输出 `quality_pass`；必须输出 `blocked` / `needs_changes` 或升级 human gate。
+9. 如果 Code 平台 `test=false` / CI failed，examiner 不得输出 `quality_pass`；discussion unresolved / readyToMerge=false 必须拆因，只有代码、DoD、安全、测试、兼容性、发布风险相关的阻塞项才挡质量结论。开放性或非代码问题记录为 platform note，不能机械打回 delivery。
 
 ## 9. 与现有 actor 的迁移
 
@@ -498,34 +513,18 @@ MR 对应 feedback 标 Fixed。
 
 - 不做架构/代码/MR 质量判断。
 
-## 10. 新增 service：`spec-review-watcher`
+## 10. spec_review 触发方式
 
-建议新增一个 channel-level scheduler 或 event-poll service：
+当前方案不新增 `spec-review-watcher`。`spec_review` 由 router 直接触发：
 
 ```text
-service id: spec-review-watcher
-actor id: svc_spec_review_watcher
-scope: channel_singleton
-channelId: chan_31f8fa85d909
+actor_discovery [discovery-ready]
+  -> actor_router
+  -> actor_examiner gate=spec_review
 ```
 
-职责：
-
-- 轮询 `discovery-desk`。
-- 发现同一任务完整 artifacts：
-  - `task-goal.json`
-  - `definition-of-done.json`
-  - `clone-manifest.json`
-  - `[delivery-started]`
-- 幂等检查是否已有同 task/artifact hash 的 `spec_review`。
-- handoff `actor_examiner`。
-
-禁止：
-
-- 不暂停 delivery。
-- 不判断 pass/fail。
-- 不改 workspace。
-- 不创建 delivery thread。
+这样可以保证 delivery 启动前必经 spec 审查，也避免新增 service 带来的重复触发和
+状态 owner 混乱。
 
 ## 11. 实施顺序
 
@@ -533,7 +532,7 @@ channelId: chan_31f8fa85d909
 
 - 新增 `actor_examiner` spec/profile。
 - router 在 MR opened 后 handoff examiner `mr_review`。
-- `spec-review-watcher` 触发 `spec_review`。
+- router 在 `[discovery-ready]` 后触发 `spec_review`。
 - examiner 只输出 artifact 和 MR 评论，不 approve、不 close、不改 feedback。
 
 ### Phase 2：替换 discovery MR 复核

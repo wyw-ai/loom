@@ -11,8 +11,8 @@
 #      "fixed"; tracked bugs whose MR / feedback reached a non-fixed terminal
 #      state (closed, withdrawn, not-a-bug, already-covered) become "closed".
 #   3. If concurrency budget allows, pick the next "pending" bug,
-#      create a bugfix thread (joi thread create), bootstrap repos,
-#      handoff to actor_a1_bug_triage, persist tracking row.
+#      create a bugfix thread and handoff router. Router must drive
+#      discovery -> examiner spec_review -> delivery, not discovery -> delivery directly.
 #   4. If no pending bug exists and the scanner thread is stale (>=24h),
 #      handoff feedback-scanner inside the resident scanner thread.
 #   5. Emit one bug-fix-loop-status.v1 line (the running ledger).
@@ -600,7 +600,7 @@ if [[ $budget -gt 0 ]]; then
                     --message "bugfix-loop next：feedback_id=${fid}
 title=${title}
 summary=${summary}
-请按存量 bug 修复闭环推进：先让 discovery 产出 task-goal/DoD/clone-manifest，再新建/启动 delivery，后续 MR watcher 终态由 delivery 回评并更新 feedback 状态；loop 只负责监工和归档。" >/dev/null 2>&1 || true
+请按存量 bug 修复闭环推进：router 先 handoff discovery 产出 task-goal/DoD/clone-manifest；discovery 必须 [discovery-ready] 回 router；router 再启动 actor_examiner gate=spec_review；只有 spec_review 通过后，router 才要求 discovery 创建/provision delivery 并 handoff actor_delivery。后续 MR watcher 终态由 delivery 回评并更新 feedback 状态；loop 只负责监工和归档。" >/dev/null 2>&1 || true
             fi
             if a1_avail; then
                 a1 feedback claim "$fid" --note "已进入 bug-fix loop：$bf_tid" >/dev/null 2>&1 || true

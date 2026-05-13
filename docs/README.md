@@ -16,6 +16,7 @@
 ## 频道 / actor 拓扑
 
 - [channel-topology-design.md](./channel-topology-design.md) —— a1-dev-canfeng / classroom 两个生产 channel 的职责切分、thread 拓扑、actor 配置、工作流
+- [a1-dev-canfeng-final-actors.md](./a1-dev-canfeng-final-actors.md) —— a1-dev-canfeng 当前生效的最终 actor 分工、状态机、审查 gate 和 MR 推进规则
 - [examiner-actor-design.md](./examiner-actor-design.md) —— a1-dev-canfeng 审查员 actor 设计：五件套审查、MR 审查、终态策略和 handoff 边界
 - [artifact-contracts.md](./artifact-contracts.md) —— 跨 actor 的 artifact JSON schema 与契约
 

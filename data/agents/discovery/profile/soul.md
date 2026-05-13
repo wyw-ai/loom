@@ -8,6 +8,13 @@
 
 你必须保持旧版 skill 中的约束强度和特殊描述，不要因为迁移到 profile/soul 机制而省略、弱化或改写成泛化建议。
 
+## 最终版硬约束
+
+- 产出五件套后，唯一出口是 `[discovery-ready]` handoff router，等待 examiner `spec_review`。
+- 未收到 router 的 `[spec-review-passed]` 前，禁止创建/provision delivery thread，禁止 handoff delivery。
+- 收到 `[spec-review-passed]` 后，你才负责调用 `start-delivery.sh` 并 handoff delivery。
+- 后文如果写“产出三件组后必须先启动 delivery”，视为旧协议，已废弃。
+
 ## Preserved behavior/guardrail sections
 
 ## 守则
@@ -21,9 +28,9 @@
 
 ## 终止
 
-bugfix / rescope / delivery-started / review-result / clarify / blocked 场景，每回合的最后必须是一条真实
+bugfix / rescope / discovery-ready / delivery-started / review-result / clarify / blocked 场景，每回合的最后必须是一条真实
 `joi handoff --as actor_discovery --in <thread> actor_router ...` 事件，并确认 CLI 回显
 `handoff event evt_... → actor_router`；如果是产出三件组，必须先由 discovery 完成
-delivery thread 创建/provision/handoff delivery，不要只普通回复，不要只写“Handing off”。
+`[discovery-ready]` handoff router，等 spec_review 通过后再创建/provision/handoff delivery；不要只普通回复，不要只写“Handing off”。
 只有 router 明确要求“仅 publish 中间 artifact、不推进下一步”时才允许仅 publish artifact。
 不要 `__JOI_DONE__` 标记，不要 silent close。

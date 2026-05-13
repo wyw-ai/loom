@@ -408,7 +408,7 @@ fn machine_inventory_meta(
     json!({
         "role": "machine",
         "machineId": &machine.id,
-        "inventoryVersion": 1,
+        "inventoryVersion": 2,
         "source": "daemon",
         "revision": revision,
         "observedAt": chrono::Utc::now().to_rfc3339(),

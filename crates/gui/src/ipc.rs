@@ -1183,34 +1183,23 @@ async fn machines_from_config(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteMachineMeta {
-    #[serde(default)]
     role: String,
-    #[serde(default)]
+    source: String,
     inventory_version: u64,
-    #[serde(default)]
     machine_id: String,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
     owner_actor_id: Option<String>,
-    #[serde(default)]
     name: String,
-    #[serde(default)]
     kind: String,
-    #[serde(default)]
     data_root: String,
-    #[serde(default)]
     config_dir: String,
-    #[serde(default)]
     providers: Vec<DetectedAgentProvider>,
-    #[serde(default)]
     agents: Vec<MachineAgentConfig>,
-    #[serde(default)]
     capabilities: Vec<String>,
-    #[serde(default)]
     revision: u64,
-    #[serde(default)]
-    observed_at: Option<String>,
+    observed_at: String,
 }
 
 async fn merge_server_machine_inventory(
@@ -1261,34 +1250,24 @@ fn server_machine_info_from_actor(
     let meta_value = actor.get("_meta")?.clone();
     let meta: RemoteMachineMeta = serde_json::from_value(meta_value).ok()?;
     if meta.role != "machine"
-        || meta.inventory_version == 0
+        || meta.source != "daemon"
+        || meta.inventory_version != 2
+        || meta.machine_id.trim().is_empty()
+        || meta.name.trim().is_empty()
+        || meta.kind.trim().is_empty()
+        || meta.data_root.trim().is_empty()
+        || meta.config_dir.trim().is_empty()
+        || meta.capabilities.is_empty()
+        || meta.revision == 0
+        || meta.observed_at.trim().is_empty()
         || !remote_machine_belongs_to_active_context(&meta, cfg)
     {
         return None;
     }
     let connection_actor_id = actor.get("id")?.as_str()?.to_string();
-    let machine_id = if meta.machine_id.trim().is_empty() {
-        connection_actor_id
-            .strip_prefix("actor_service_")
-            .unwrap_or(connection_actor_id.as_str())
-            .to_string()
-    } else {
-        meta.machine_id.clone()
-    };
-    let name = if meta.name.trim().is_empty() {
-        actor
-            .get("displayName")
-            .and_then(Value::as_str)
-            .unwrap_or(machine_id.as_str())
-            .to_string()
-    } else {
-        meta.name.clone()
-    };
-    let kind = if meta.kind.trim().is_empty() {
-        "remote".to_string()
-    } else {
-        meta.kind.clone()
-    };
+    let machine_id = meta.machine_id.clone();
+    let name = meta.name.clone();
+    let kind = meta.kind.clone();
     let data_root = PathBuf::from(&meta.data_root);
     let mut providers = meta
         .providers
@@ -1354,13 +1333,9 @@ fn server_machine_info_from_actor(
         kind,
         source: "server_inventory".into(),
         read_only: true,
-        capabilities: if meta.capabilities.is_empty() {
-            vec!["inventory.read".into(), "connection.status".into()]
-        } else {
-            meta.capabilities
-        },
+        capabilities: meta.capabilities,
         inventory_revision: meta.revision,
-        inventory_observed_at: meta.observed_at,
+        inventory_observed_at: Some(meta.observed_at),
         status: setup_status.into(),
         setup_status: setup_status.into(),
         connection_status: "notConnected".into(),

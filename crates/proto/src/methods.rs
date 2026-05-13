@@ -51,6 +51,11 @@ pub mod method {
     /// deliveries pending against its inbox, with cursor pagination so a
     /// host can resume after restart without losing directed events.
     pub const DELIVERY_LIST: &str = "delivery/list";
+    /// GUI/client asks the server to route an operation to the owning machine
+    /// daemon. The server delivers it to `actor_service_<machineId>` and waits
+    /// for `machine/command.result`.
+    pub const MACHINE_COMMAND: &str = "machine/command";
+    pub const MACHINE_COMMAND_RESULT: &str = "machine/command.result";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
     pub const ACTOR_DELETE: &str = "actor/delete";
@@ -905,6 +910,49 @@ pub struct DeliveryListResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
+
+// ---- machine/command + machine/command.result ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandParams {
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_actor_id: Option<String>,
+    #[serde(default)]
+    pub command: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandResult {
+    pub command_id: String,
+    pub machine_id: String,
+    pub machine_actor_id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandResultParams {
+    pub command_id: String,
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_actor_id: Option<String>,
+    pub ok: bool,
+    #[serde(default)]
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub type MachineCommandResponse = MachineCommandResult;
 
 // ---- actor/list + actor/upsert ----
 

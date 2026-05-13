@@ -340,13 +340,15 @@ discovery 复核 verdict=pass 且 mr-watcher 没有新事项后，归档变更�
 1. **CI 失败**：拉日志 `a1 ci job log ...`，定位、修复、push、等下一轮 watcher。
 2. **冲突**：`git fetch && git rebase origin/<main>`，解决，force-push。
 3. **MR 已可合并**：扫描报告出现 `ready_to_merge=true` / "MR 已可合并" 时，
-   直接执行合并并 handoff router：
+   **绝不执行合并**，也不要调用 `a1 repo mr merge`。MR 合并是 human-owned
+   变更状态，不属于 delivery/router/discovery 的自治动作；即使 human 说“可以合并”，
+   也应由 human 自己完成合并，agent 不代点 merge。只允许 handoff router 做公共通报：
    ```bash
-   a1 -f json repo mr merge --repo <r> <id>
    joi handoff --as actor_delivery --in <thread> actor_router -m \
-     "MR <id> 已通过检查并已执行合并，等待 mr-watcher 终态收口。"
+     "[mr-ready-human-gate] MR <repo> !<id> 已通过检查，ready_to_merge=true。
+      delivery/router/discovery 不会执行合并；请在 channel 等待 human 自行决定并操作。"
    ```
-   如果 merge 命令失败，把失败原因中文 handoff router，不要静默结束。
+   即使 status API 显示 readyToMerge=true，也不能自行 merge。
 4. **新评论**：
     ```bash
     a1 -f json repo mr comment list --repo <r> --mr <id>
@@ -402,29 +404,42 @@ discovery 复核 verdict=pass 且 mr-watcher 没有新事项后，归档变更�
 3. 不要启动新的 bug，不要 handoff scanner/orchestrator；下一条由
    `a1-bug-fix-loop` 读取队列文件后决定。
 
-如果收到的是 `terminal_kind=closed` / `MR 已关闭` / `关闭此任务`，或 router 明确告知
-`[bugfix-invalid]` / `withdraw`：
+如果收到的是 `terminal_kind=closed` / `MR 已关闭`，说明 MR 已经由外部动作进入终态；
+按非 Fixed 终态收口 feedback，不要再改 MR 状态。
 
-1. 先处理 MR 本身：如果 MR 仍是 opened，必须主动关闭/废弃 MR，不能仅回复“等待审批”。
-   关闭前/后在 root note（若有）或 MR 评论下用中文说明真实结论，例如“经复核缺陷不成立 /
-   当前版本已有能力覆盖 / 本 MR 已撤回”。关闭命令优先使用：
-   ```bash
-   a1 repo mr close --repo <repo> <mr_id>
-   ```
-   如果关闭失败，把 stderr 原样 handoff router；不要假装已收口。
-2. 这不是 Fixed。若有关联 feedback，必须在 feedback 下说明非 Fixed 结论，**不要**
-   写“随下一次版本发布生效”。
-3. 若 feedback 状态尚未关闭，优先尝试更新为 `Closed`；不可用时再尝试 `已关闭` /
-   `Won't Fix` / `无需修复`。若状态更新失败，把 stderr handoff router。
-4. handoff router：
-   ```bash
-   joi handoff --as actor_delivery --in <thread> actor_router -m \
-     "feedback <id> 已按非 Fixed 终态收口：outcome=<not_a_bug|already_covered|withdrawn|closed>；
-      MR <repo> !<mr_id> 已关闭，bugfix-loop 可以归档并推进下一条。"
-   ```
+如果 router 明确告知 `[human-withdraw]`，且正文包含 human 原话摘要 / 确认人 / 原因，
+才允许关闭/废弃仍处于 opened 的 MR。关闭前/后在 root note（若有）或 MR 评论下用中文
+说明真实结论，例如“human 确认缺陷不成立 / 当前版本已有能力覆盖 / 本 MR 撤回”。关闭命令：
+    ```bash
+    a1 repo mr close --repo <repo> <mr_id>
+    ```
+如果关闭失败，把 stderr 原样 handoff router；不要假装已收口。
+
+如果收到 `[bugfix-invalid]` / `withdraw` 但没有 human 显式确认，**不要关闭 MR**；
+handoff router 请求 human gate：
+
+```bash
+joi handoff --as actor_delivery --in <thread> actor_router -m \
+  "[need-human-withdraw] MR <repo> !<mr_id> 需要关闭/废弃，但当前消息没有 human 显式确认。
+   delivery 不会自动关闭 MR；请在 channel 征询 human。"
+```
+
+非 Fixed 终态收口规则：
+
+1. 这不是 Fixed。若有关联 feedback，必须在 feedback 下说明非 Fixed 结论，**不要**
+    写“随下一次版本发布生效”。
+2. 若 feedback 状态尚未关闭，优先尝试更新为 `Closed`；不可用时再尝试 `已关闭` /
+    `Won't Fix` / `无需修复`。若状态更新失败，把 stderr handoff router。
+3. handoff router：
+    ```bash
+    joi handoff --as actor_delivery --in <thread> actor_router -m \
+      "feedback <id> 已按非 Fixed 终态收口：outcome=<not_a_bug|already_covered|withdrawn|closed>；
+       MR <repo> !<mr_id> state=<closed|external_closed|left_open_waiting_human>；
+       bugfix-loop 可以按当前终态归档或等待 human gate。"
+    ```
 
 如果 discovery/human 的结论使你移除了本 MR 的核心能力/flag/行为，且剩余 diff
-没有独立业务价值，也按 `withdraw` 处理：关闭 MR，而不是把它当“已修订，等待审批”。
+没有独立业务价值，也不能自行关闭 MR；先 handoff router 请求 human 确认是否废弃。
 
 ## 半自主：什么时候可以 handoff router 让 router 询 human
 

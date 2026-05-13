@@ -184,8 +184,9 @@ verdict 含义：
 - `revise`：缺陷真实但当前方案/验证不足，需要改 MR 或补验证。
 - `withdraw`：缺陷不成立、需求/方案已被证伪、用户明确决定该 MR 没有继续意义，
   或所谓“修订”会把本 MR 的核心能力/flag/行为全部移除，剩余改动没有独立交付价值。
-  这种情况不是等待审批的 opened MR，必须关闭/撤回 MR，并要求 delivery 在根 note
-  下说明“经复核撤回/废弃”的原因。
+  discovery 只能给出“建议撤回/废弃”的复核结论；**不能**要求 delivery 直接关闭 MR。
+  router 必须先在 channel 请求 human 显式确认。只有 human 确认后，delivery 才能执行
+  MR close 并在根 note 下说明“经 human 确认撤回/废弃”的原因。
 - `need_human`：需要 API owner / human 决策，不能由 actor 自行判断。
 
 ### A3. 已有 MR / 手工分支后置分析（posthoc_existing_mr）

@@ -314,7 +314,7 @@ pub struct MachineHostSpec {
     pub machine_id: String,
     pub actor_id: String,
     pub display_name: String,
-    pub metadata: Value,
+    pub metadata: Arc<Mutex<Value>>,
 }
 
 async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
@@ -346,20 +346,7 @@ async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
 async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Result<()> {
     let client = Client::connect(server_url).await?;
     client.initialize().await?;
-    let _: Value = client
-        .call(
-            method::ACTOR_UPSERT,
-            json!({
-                "actor": {
-                    "id": &host.actor_id,
-                    "kind": "service",
-                    "displayName": &host.display_name,
-                    "_meta": &host.metadata,
-                },
-            }),
-        )
-        .await
-        .with_context(|| format!("actor/upsert for machine {}", host.machine_id))?;
+    upsert_machine_actor(&client, host).await?;
     client
         .open_connection_as(&host.actor_id, "service", Some(&host.display_name))
         .await?;
@@ -370,8 +357,28 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
 
     loop {
         sleep(Duration::from_secs(15)).await;
+        upsert_machine_actor(&client, host).await?;
         let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
     }
+}
+
+async fn upsert_machine_actor(client: &Client, host: &MachineHostSpec) -> Result<()> {
+    let metadata = host.metadata.lock().unwrap().clone();
+    let _: Value = client
+        .call(
+            method::ACTOR_UPSERT,
+            json!({
+                "actor": {
+                    "id": &host.actor_id,
+                    "kind": "service",
+                    "displayName": &host.display_name,
+                    "_meta": metadata,
+                },
+            }),
+        )
+        .await
+        .with_context(|| format!("actor/upsert for machine {}", host.machine_id))?;
+    Ok(())
 }
 
 /// Actor-level state plus channel-scoped workspaces under the AgentX root.

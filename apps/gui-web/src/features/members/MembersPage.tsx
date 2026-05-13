@@ -96,7 +96,7 @@ interface AgentUpdatePatch {
 
 type AgentMachineContext = Pick<
   MachineInfo,
-  "id" | "name" | "dataRoot" | "providers"
+  "id" | "name" | "dataRoot" | "providers" | "readOnly"
 > &
   Partial<Pick<MachineAgentInfo, "profilePath" | "identityPath" | "soulPath">>;
 
@@ -251,6 +251,7 @@ export function MembersPage() {
         name: agent.machine,
         dataRoot: agent.dataRoot,
         providers: agent.providers,
+        readOnly: !agent.managed,
         profilePath: agent.profilePath,
         identityPath: agent.identityPath,
         soulPath: agent.soulPath,
@@ -1759,7 +1760,7 @@ function normalizeAgent(
         : spec.transport.kind;
   return {
     actor,
-    managed: true,
+    managed: !machine.readOnly,
     status: info.status,
     machineId: machine.id,
     machine: machine.name,

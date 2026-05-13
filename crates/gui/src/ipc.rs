@@ -719,6 +719,11 @@ pub struct MachineInfo {
     pub id: String,
     pub name: String,
     pub kind: String,
+    pub source: String,
+    pub read_only: bool,
+    pub capabilities: Vec<String>,
+    pub inventory_revision: u64,
+    pub inventory_observed_at: Option<String>,
     pub status: String,
     pub setup_status: String,
     pub connection_status: String,
@@ -1200,6 +1205,12 @@ struct RemoteMachineMeta {
     providers: Vec<DetectedAgentProvider>,
     #[serde(default)]
     agents: Vec<MachineAgentConfig>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    observed_at: Option<String>,
 }
 
 async fn merge_server_machine_inventory(
@@ -1221,8 +1232,21 @@ async fn merge_server_machine_inventory(
         let Some(machine) = server_machine_info_from_actor(actor, cfg, server_url) else {
             continue;
         };
-        if let Some(existing) = result.machines.iter_mut().find(|m| m.id == machine.id) {
-            *existing = machine;
+        if result
+            .machines
+            .iter()
+            .any(|m| m.id == machine.id && m.source == "local_config")
+        {
+            continue;
+        }
+        if let Some(existing) = result
+            .machines
+            .iter_mut()
+            .find(|m| m.id == machine.id && m.source == "server_inventory")
+        {
+            if machine.inventory_revision >= existing.inventory_revision {
+                *existing = machine;
+            }
         } else {
             result.machines.push(machine);
         }
@@ -1328,6 +1352,15 @@ fn server_machine_info_from_actor(
         id: machine_id,
         name,
         kind,
+        source: "server_inventory".into(),
+        read_only: true,
+        capabilities: if meta.capabilities.is_empty() {
+            vec!["inventory.read".into(), "connection.status".into()]
+        } else {
+            meta.capabilities
+        },
+        inventory_revision: meta.revision,
+        inventory_observed_at: meta.observed_at,
         status: setup_status.into(),
         setup_status: setup_status.into(),
         connection_status: "notConnected".into(),
@@ -1544,6 +1577,17 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
         id: machine.id.clone(),
         name: machine.name.clone(),
         kind: machine.kind.clone(),
+        source: "local_config".into(),
+        read_only: false,
+        capabilities: vec![
+            "inventory.read".into(),
+            "agent.create".into(),
+            "agent.remove".into(),
+            "profile.write".into(),
+            "machine.remove".into(),
+        ],
+        inventory_revision: 0,
+        inventory_observed_at: None,
         status: setup_status.into(),
         setup_status: setup_status.into(),
         connection_status: "notConnected".into(),

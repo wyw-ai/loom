@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{
     apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
@@ -51,11 +52,19 @@ pub async fn run(
         .with_context(|| format!("create data root {}", data_root.display()))?;
     std::env::set_var("JOI_AGENT_DATA_ROOT", &data_root);
 
+    let mut inventory_revision = 1u64;
+    let mut inventory_fingerprint = machine_inventory_fingerprint(&machine, &data_root, &providers);
+    let machine_inventory = Arc::new(Mutex::new(machine_inventory_meta(
+        &machine,
+        &data_root,
+        &providers,
+        inventory_revision,
+    )));
     let machine_host = MachineHostSpec {
         machine_id: machine.id.clone(),
         actor_id: machine_connection_actor_id(&machine),
         display_name: machine.name.clone(),
-        metadata: machine_inventory_meta(&machine, &data_root, &providers),
+        metadata: machine_inventory.clone(),
     };
 
     let (socket_path, proxy_handle) = if no_ipc {
@@ -104,6 +113,21 @@ pub async fn run(
             &mut warned_missing,
         ) {
             Ok(snapshot) => {
+                let next_fingerprint = machine_inventory_fingerprint(
+                    &snapshot.machine,
+                    &data_root,
+                    &snapshot.providers,
+                );
+                if next_fingerprint != inventory_fingerprint {
+                    inventory_revision = inventory_revision.saturating_add(1);
+                    inventory_fingerprint = next_fingerprint;
+                }
+                *machine_inventory.lock().unwrap() = machine_inventory_meta(
+                    &snapshot.machine,
+                    &data_root,
+                    &snapshot.providers,
+                    inventory_revision,
+                );
                 reconcile_agents(&mut running_agents, snapshot.specs, &server_url, &data_root)
             }
             Err(e) => eprintln!("joi daemon: reload failed: {e:#}"),
@@ -160,6 +184,8 @@ async fn shutdown_signal() {
 }
 
 struct MachineSpecs {
+    machine: MachineConfig,
+    providers: Vec<DetectedAgentProvider>,
     specs: Vec<AgentSpec>,
 }
 
@@ -197,7 +223,11 @@ fn load_machine_specs(
         specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
 
-    Ok(MachineSpecs { specs })
+    Ok(MachineSpecs {
+        machine,
+        providers,
+        specs,
+    })
 }
 
 fn reconcile_agents(
@@ -373,11 +403,34 @@ fn machine_inventory_meta(
     machine: &MachineConfig,
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
+    revision: u64,
 ) -> serde_json::Value {
     json!({
         "role": "machine",
         "machineId": &machine.id,
         "inventoryVersion": 1,
+        "source": "daemon",
+        "revision": revision,
+        "observedAt": chrono::Utc::now().to_rfc3339(),
+        "workspaceId": &machine.workspace_id,
+        "ownerActorId": &machine.owner_actor_id,
+        "name": &machine.name,
+        "kind": &machine.kind,
+        "dataRoot": data_root.display().to_string(),
+        "configDir": config::config_dir().display().to_string(),
+        "capabilities": ["inventory.read", "connection.status"],
+        "providers": providers,
+        "agents": &machine.agents,
+    })
+}
+
+fn machine_inventory_fingerprint(
+    machine: &MachineConfig,
+    data_root: &PathBuf,
+    providers: &[DetectedAgentProvider],
+) -> String {
+    serde_json::to_string(&json!({
+        "machineId": &machine.id,
         "workspaceId": &machine.workspace_id,
         "ownerActorId": &machine.owner_actor_id,
         "name": &machine.name,
@@ -386,7 +439,8 @@ fn machine_inventory_meta(
         "configDir": config::config_dir().display().to_string(),
         "providers": providers,
         "agents": &machine.agents,
-    })
+    }))
+    .unwrap_or_default()
 }
 
 fn default_machine_kind() -> String {

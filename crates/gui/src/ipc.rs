@@ -713,7 +713,7 @@ pub async fn agent_update(args: AgentUpdateArgs) -> Result<AgentInfo, String> {
     ))
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineInfo {
     pub id: String,
@@ -738,7 +738,7 @@ pub struct MachineInfo {
     pub setup_script: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineAgentInfo {
     #[serde(flatten)]
@@ -1297,24 +1297,19 @@ async fn merge_server_machine_inventory(
         let Some(machine) = server_machine_info_from_actor(actor, cfg, server_url) else {
             continue;
         };
-        if result
-            .machines
-            .iter()
-            .any(|m| m.id == machine.id && m.source == "local_config")
+        upsert_server_machine_info(&mut result.machines, machine);
+    }
+}
+
+fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, machine: MachineInfo) {
+    if let Some(existing) = machines.iter_mut().find(|m| m.id == machine.id) {
+        if existing.source == "local_config"
+            || machine.inventory_revision >= existing.inventory_revision
         {
-            continue;
+            *existing = machine;
         }
-        if let Some(existing) = result
-            .machines
-            .iter_mut()
-            .find(|m| m.id == machine.id && m.source == "server_inventory")
-        {
-            if machine.inventory_revision >= existing.inventory_revision {
-                *existing = machine;
-            }
-        } else {
-            result.machines.push(machine);
-        }
+    } else {
+        machines.push(machine);
     }
 }
 
@@ -2210,6 +2205,77 @@ mod tests {
         assert_eq!(
             machine.agents[0].profile_path,
             "/home/canfeng/.agentx/machine_remote/agents/actor_remote_agent/profile"
+        );
+    }
+
+    #[test]
+    fn server_machine_inventory_replaces_local_stub_with_same_id() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+            machines: vec![],
+        };
+        let actor = json!({
+            "id": "actor_service_machine_remote",
+            "kind": "service",
+            "displayName": "Remote Box",
+            "_meta": {
+                "role": "machine",
+                "source": "daemon",
+                "machineId": "machine_remote",
+                "inventoryVersion": 2,
+                "revision": 3,
+                "observedAt": "2026-05-13T10:50:00Z",
+                "workspaceId": "default",
+                "ownerActorId": account.actor_id,
+                "name": "Remote Box",
+                "kind": "remote",
+                "dataRoot": "/home/canfeng/.agentx/machine_remote",
+                "configDir": "/home/canfeng/.joi-apps",
+                "capabilities": ["inventory.read", "connection.status", "machine.command"],
+                "providers": [{
+                    "id": "claude",
+                    "displayName": "Claude Code",
+                    "command": "/usr/bin/claude",
+                    "transportKind": "command",
+                    "args": ["-p"],
+                    "defaultModel": "claude-sonnet-4.6",
+                    "modelChoices": []
+                }],
+                "agents": [{
+                    "providerId": "claude",
+                    "actorId": "actor_remote_agent",
+                    "name": "Remote Agent",
+                    "model": "claude-sonnet-4.6",
+                    "autostart": true
+                }]
+            }
+        });
+        let server_machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
+            .expect("server machine");
+        let mut local_stub = server_machine.clone();
+        local_stub.source = "local_config".into();
+        local_stub.inventory_revision = 0;
+        local_stub.agents.clear();
+        local_stub.agent_count = 0;
+        let mut machines = vec![local_stub];
+
+        upsert_server_machine_info(&mut machines, server_machine);
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].source, "server_inventory");
+        assert_eq!(machines[0].agent_count, 1);
+        assert_eq!(
+            machines[0].agents[0].info.spec.actor.id,
+            "actor_remote_agent"
         );
     }
 

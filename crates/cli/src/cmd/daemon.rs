@@ -47,6 +47,7 @@ pub async fn run(
     }
 
     let mut cfg = load_desktop_config_or_default_if_missing()?;
+    let repaired_desktop_config = repair_desktop_config_for_daemon(&mut cfg, &server_url);
     let (machine, restored_machine_config) = select_machine_for_daemon(
         &mut cfg,
         machine_id.as_deref(),
@@ -54,7 +55,7 @@ pub async fn run(
         &server_url,
     )
     .await?;
-    if restored_machine_config {
+    if repaired_desktop_config || restored_machine_config {
         save_desktop_config(&cfg)?;
     }
     let providers = apply_provider_overrides(detected_providers, &machine.providers);
@@ -250,6 +251,7 @@ fn refresh_machine_runtime(
         selected_machine,
         allow_actors,
         warned_missing,
+        server_url,
     )?;
     *selected_machine = snapshot.machine.clone();
     let next_fingerprint =
@@ -273,11 +275,13 @@ fn load_machine_specs(
     selected_machine: &MachineConfig,
     allow_actors: &[String],
     warned_missing: &mut HashSet<String>,
+    server_url: &str,
 ) -> Result<MachineSpecs> {
     let mut cfg = load_desktop_config_or_default_if_missing()?;
+    let repaired = repair_desktop_config_for_daemon(&mut cfg, server_url);
     let (machine_index, restored) =
         ensure_selected_machine_config(&mut cfg, selected_machine_id, selected_machine)?;
-    if restored {
+    if repaired || restored {
         save_desktop_config(&cfg)?;
     }
     let machine = cfg.machines[machine_index].clone();
@@ -294,6 +298,7 @@ fn load_machine_specs(
         .into_iter()
         .flat_map(|provider| provider.into_agent_specs())
         .collect::<Vec<_>>();
+    annotate_machine_agent_specs(&mut specs, &machine);
 
     if !allow_actors.is_empty() {
         let allow = allow_actors
@@ -361,6 +366,19 @@ fn reconcile_agents(
 
 fn spec_fingerprint(spec: &AgentSpec) -> String {
     serde_json::to_string(spec).unwrap_or_else(|_| format!("{spec:?}"))
+}
+
+fn annotate_machine_agent_specs(specs: &mut [AgentSpec], machine: &MachineConfig) {
+    for spec in specs {
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        meta.insert("machineId".into(), json!(machine.id.clone()));
+        if let Some(workspace_id) = machine.workspace_id.as_deref() {
+            meta.insert("workspaceId".into(), json!(workspace_id));
+        }
+        if let Some(owner_actor_id) = machine.owner_actor_id.as_deref() {
+            meta.insert("ownerActorId".into(), json!(owner_actor_id));
+        }
+    }
 }
 
 fn spawn_service_host(
@@ -798,16 +816,37 @@ struct DesktopConfig {
     machines: Vec<MachineConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HumanAccount {
     #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    staff_id: String,
+    #[serde(default)]
+    nickname: String,
+    #[serde(default)]
+    real_name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
     actor_id: String,
+    #[serde(default)]
+    avatar_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceConfig {
     id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    server_url: String,
+    #[serde(default)]
+    actor_id: String,
+    #[serde(default)]
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -948,6 +987,45 @@ fn save_desktop_config(cfg: &DesktopConfig) -> Result<()> {
     }
     let text = toml::to_string_pretty(cfg)?;
     std::fs::write(&path, text).with_context(|| format!("write desktop config {}", path.display()))
+}
+
+fn repair_desktop_config_for_daemon(cfg: &mut DesktopConfig, server_url: &str) -> bool {
+    let mut changed = false;
+    if cfg.active.is_none() {
+        if let Some(workspace) = cfg.workspaces.first() {
+            cfg.active = Some(workspace.id.clone());
+            changed = true;
+        }
+    }
+
+    let account_actor_id = active_account_actor_id(cfg).map(ToString::to_string);
+    let account_display_name = cfg.account.as_ref().map(account_display_name);
+    for workspace in &mut cfg.workspaces {
+        if workspace.name.trim().is_empty() {
+            workspace.name = "Local".into();
+            changed = true;
+        }
+        if workspace.server_url.trim().is_empty() {
+            workspace.server_url = server_url.to_string();
+            changed = true;
+        }
+        if workspace.actor_id.trim().is_empty() {
+            if let Some(actor_id) = account_actor_id.as_ref() {
+                workspace.actor_id = actor_id.clone();
+                changed = true;
+            }
+        }
+        if workspace.display_name.trim().is_empty() {
+            if let Some(display_name) = account_display_name.as_ref() {
+                workspace.display_name = display_name.clone();
+                changed = true;
+            } else if !workspace.actor_id.trim().is_empty() {
+                workspace.display_name = workspace.actor_id.clone();
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 async fn select_machine_for_daemon(
@@ -1148,6 +1226,20 @@ fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
         .filter(|actor_id| !actor_id.is_empty())
 }
 
+fn account_display_name(account: &HumanAccount) -> String {
+    [
+        account.nickname.as_str(),
+        account.real_name.as_str(),
+        account.staff_id.as_str(),
+        account.actor_id.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .unwrap_or("you")
+    .to_string()
+}
+
 fn active_or_data_root_owner_actor_id(
     cfg: &DesktopConfig,
     data_root: Option<&Path>,
@@ -1250,9 +1342,11 @@ mod tests {
             active: Some("ws_main".into()),
             account: Some(HumanAccount {
                 actor_id: owner.into(),
+                ..HumanAccount::default()
             }),
             workspaces: vec![WorkspaceConfig {
                 id: "ws_main".into(),
+                ..WorkspaceConfig::default()
             }],
             machines,
         }
@@ -1281,6 +1375,96 @@ mod tests {
             reasoning_effort: String::new(),
             autostart: true,
         }
+    }
+
+    #[test]
+    fn desktop_config_roundtrip_preserves_gui_identity_fields() {
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(HumanAccount {
+                provider: "buc".into(),
+                staff_id: "88084".into(),
+                nickname: "星楚".into(),
+                real_name: "陈博俊".into(),
+                email: String::new(),
+                actor_id: "actor_human_88084".into(),
+                avatar_url: "//work.alibaba-inc.com/photo/88084.140x140.jpg".into(),
+            }),
+            workspaces: vec![WorkspaceConfig {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: "actor_human_88084".into(),
+                display_name: "星楚".into(),
+            }],
+            machines: vec![machine("machine_2eabfd47", Some("actor_human_88084"))],
+        };
+
+        let text = toml::to_string_pretty(&cfg).expect("serialize desktop config");
+        assert!(text.contains("provider = \"buc\""));
+        assert!(text.contains("serverUrl = \"ws://127.0.0.1:7878/rpc\""));
+        assert!(text.contains("displayName = \"星楚\""));
+
+        let parsed: DesktopConfig = toml::from_str(&text).expect("parse desktop config");
+        assert_eq!(active_account_actor_id(&parsed), Some("actor_human_88084"));
+        assert_eq!(parsed.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
+        assert_eq!(parsed.workspaces[0].display_name, "星楚");
+    }
+
+    #[test]
+    fn repair_desktop_config_fills_workspace_fields_without_account() {
+        let mut cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: None,
+            workspaces: vec![WorkspaceConfig {
+                id: "default".into(),
+                ..WorkspaceConfig::default()
+            }],
+            machines: Vec::new(),
+        };
+
+        assert!(repair_desktop_config_for_daemon(
+            &mut cfg,
+            "ws://127.0.0.1:7878/rpc"
+        ));
+        assert_eq!(cfg.workspaces[0].name, "Local");
+        assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
+    }
+
+    #[test]
+    fn annotate_machine_agent_specs_adds_machine_context_to_actor_meta() {
+        let provider = DetectedAgentProvider {
+            id: "codex".into(),
+            display_name: "Codex CLI".into(),
+            command: "codex".into(),
+            transport_kind: "command".into(),
+            args: vec!["exec".into()],
+            transport_env: Default::default(),
+            default_model: Some("gpt-5.5".into()),
+            model_choices: Vec::new(),
+        };
+        let definition = AgentDefinition {
+            provider_id: "codex".into(),
+            actor_id: "actor_agent_machine_2eabfd47_4edb51c3".into(),
+            display_name: "蔻黛丝".into(),
+            description: None,
+            model: Some("gpt-5.5".into()),
+            reasoning_effort: Some("xhigh".into()),
+            autostart: false,
+        };
+        let mut specs = provider_specs_from_agent_definitions(&[provider], &[definition])
+            .into_iter()
+            .flat_map(|provider| provider.into_agent_specs())
+            .collect::<Vec<_>>();
+        let machine = machine("machine_2eabfd47", Some("actor_human_88084"));
+
+        annotate_machine_agent_specs(&mut specs, &machine);
+
+        let meta = specs[0].actor._meta.as_ref().expect("agent meta");
+        assert_eq!(meta["machineId"], json!("machine_2eabfd47"));
+        assert_eq!(meta["workspaceId"], json!("ws_main"));
+        assert_eq!(meta["ownerActorId"], json!("actor_human_88084"));
+        assert_eq!(meta["providerId"], json!("codex"));
     }
 
     #[test]
@@ -1330,6 +1514,7 @@ mod tests {
             account: None,
             workspaces: vec![WorkspaceConfig {
                 id: "ws_main".into(),
+                ..WorkspaceConfig::default()
             }],
             machines: Vec::new(),
         };
@@ -1377,6 +1562,7 @@ mod tests {
             account: None,
             workspaces: vec![WorkspaceConfig {
                 id: "ws_main".into(),
+                ..WorkspaceConfig::default()
             }],
             machines: Vec::new(),
         };

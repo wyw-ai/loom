@@ -18,7 +18,7 @@ use clap::Parser;
 
 use crate::artifacts::ArtifactStore;
 use crate::journal::Journal;
-use crate::machine_commands::MachineCommandBroker;
+use crate::machine_commands::MachineCommandWaiters;
 use crate::scope_skills::ScopeSkills;
 use crate::state::AppState;
 use crate::store::Store;
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
         args.data_dir.join("workspaces"),
         args.data_dir.join("agents"),
     )?);
-    let machine_commands = MachineCommandBroker::new();
+    let machine_commands = MachineCommandWaiters::new();
     scope_skills.reconcile(&store)?;
 
     let state = AppState {

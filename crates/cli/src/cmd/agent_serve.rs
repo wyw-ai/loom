@@ -363,28 +363,78 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
 
     let mut notifications = client.notifications.lock().await;
     let mut heartbeat = interval(Duration::from_secs(15));
+    let mut in_progress = HashSet::new();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 upsert_machine_actor(&client, host).await?;
+                drain_machine_commands(&client, host, &mut in_progress).await?;
                 let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
             }
             maybe_notification = notifications.recv() => {
                 let Some(notification) = maybe_notification else {
                     return Err(anyhow!("machine host notification stream closed"));
                 };
-                if notification.method == method::MACHINE_COMMAND {
-                    handle_machine_command_notification(&client, host, notification.params).await?;
+                if notification.method == method::MACHINE_COMMAND_NOTIFY
+                    || notification.method == method::MACHINE_COMMAND
+                {
+                    handle_machine_command_notification(&client, host, notification.params, &mut in_progress).await?;
                 }
             }
         }
     }
 }
 
+async fn drain_machine_commands(
+    client: &Client,
+    host: &MachineHostSpec,
+    in_progress: &mut HashSet<String>,
+) -> Result<()> {
+    let response: Value = client
+        .call_raw(
+            method::MACHINE_COMMAND_LIST,
+            Some(json!({
+                "machineId": host.machine_id,
+                "machineActorId": host.actor_id,
+                "statuses": ["queued", "delivered"],
+                "limit": 50,
+            })),
+        )
+        .await?;
+    let Some(commands) = response.get("commands").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for command in commands {
+        handle_machine_command_notification(
+            client,
+            host,
+            Some(machine_command_payload_from_record(command)),
+            in_progress,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn machine_command_payload_from_record(command: &Value) -> Value {
+    json!({
+        "commandId": command.get("commandId").cloned().unwrap_or(Value::Null),
+        "machineId": command.get("machineId").cloned().unwrap_or(Value::Null),
+        "machineActorId": command.get("machineActorId").cloned().unwrap_or(Value::Null),
+        "requestedBy": command.get("requestedBy").cloned().unwrap_or(Value::Null),
+        "workspaceId": command.get("workspaceId").cloned().unwrap_or(Value::Null),
+        "operation": command.get("operation").cloned().unwrap_or(Value::Null),
+        "payload": command.get("payload").cloned().unwrap_or(Value::Null),
+        "command": command.get("payload").cloned().unwrap_or(Value::Null),
+        "ifInventoryRevision": command.get("ifInventoryRevision").cloned().unwrap_or(Value::Null),
+    })
+}
+
 async fn handle_machine_command_notification(
     client: &Client,
     host: &MachineHostSpec,
     params: Option<Value>,
+    in_progress: &mut HashSet<String>,
 ) -> Result<()> {
     let Some(payload) = params else {
         return Ok(());
@@ -408,6 +458,9 @@ async fn handle_machine_command_notification(
         tracing::warn!("machine command notification without commandId");
         return Ok(());
     }
+    if !in_progress.insert(command_id.clone()) {
+        return Ok(());
+    }
 
     let result = if machine_id != host.machine_id || machine_actor_id != host.actor_id {
         json!({
@@ -418,6 +471,16 @@ async fn handle_machine_command_notification(
             "error": "machine command target mismatch",
         })
     } else if let Some(command_tx) = &host.command_tx {
+        let _: Value = client
+            .call_raw(
+                method::MACHINE_COMMAND_ACK,
+                Some(json!({
+                    "commandId": command_id,
+                    "machineId": machine_id,
+                    "machineActorId": machine_actor_id,
+                })),
+            )
+            .await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if command_tx
             .send(MachineCommandTask {
@@ -466,6 +529,7 @@ async fn handle_machine_command_notification(
     let _: Value = client
         .call_raw(method::MACHINE_COMMAND_RESULT, Some(result))
         .await?;
+    in_progress.remove(&command_id);
     Ok(())
 }
 

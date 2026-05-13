@@ -703,7 +703,54 @@ pub struct AgentUpdateArgs {
 }
 
 #[tauri::command]
-pub async fn agent_update(args: AgentUpdateArgs) -> Result<AgentInfo, String> {
+pub async fn agent_update(
+    state: State<'_, AppState>,
+    args: AgentUpdateArgs,
+) -> Result<AgentInfo, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    if let Some(machine_id) = args
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|machine_id| !machine_id.is_empty())
+    {
+        if server_machine_by_id(&cfg, state.try_client().await, machine_id)
+            .await
+            .is_some()
+        {
+            let actor_id = args.actor_id.clone();
+            let output = run_remote_machine_command(
+                &state,
+                &cfg,
+                machine_id,
+                json!({
+                    "op": "agent.update",
+                    "actorId": actor_id,
+                    "displayName": args.display_name,
+                    "description": args.description,
+                    "providerId": args.provider_id,
+                    "model": args.model,
+                    "reasoningEffort": args.reasoning_effort,
+                    "autostart": args.autostart,
+                }),
+            )
+            .await?;
+            drop(output);
+            let remote = server_machine_by_id(&cfg, state.try_client().await, machine_id)
+                .await
+                .ok_or_else(|| {
+                    format!("machine inventory disappeared after update: {machine_id}")
+                })?;
+            return remote
+                .agents
+                .into_iter()
+                .find(|agent| agent.info.spec.actor.id == actor_id)
+                .map(|agent| agent.info)
+                .ok_or_else(|| {
+                    format!("updated agent not found in remote inventory: {}", actor_id)
+                });
+        }
+    }
     if let Some(info) = update_machine_agent_in_config(&args).map_err(stringify)? {
         return Ok(info);
     }
@@ -721,6 +768,8 @@ pub struct MachineInfo {
     pub kind: String,
     pub source: String,
     pub read_only: bool,
+    pub can_command: bool,
+    pub can_open_local_path: bool,
     pub capabilities: Vec<String>,
     pub inventory_revision: u64,
     pub inventory_observed_at: Option<String>,
@@ -820,6 +869,8 @@ pub struct AgentProfileFileWriteArgs {
     pub actor_id: String,
     pub file: String,
     pub text: String,
+    #[serde(default)]
+    pub base_sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -827,6 +878,8 @@ pub struct AgentProfileFileWriteArgs {
 pub struct AgentProfileFileResult {
     pub path: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[tauri::command]
@@ -834,35 +887,34 @@ pub async fn agent_profile_file_read(
     state: State<'_, AppState>,
     args: AgentProfileFileReadArgs,
 ) -> Result<AgentProfileFileResult, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
+        .await
+        .is_some()
+    {
+        let output = run_remote_machine_command(
+            &state,
+            &cfg,
+            &args.machine_id,
+            json!({
+                "op": "agent.profile.read",
+                "actorId": args.actor_id,
+                "file": args.file,
+            }),
+        )
+        .await?;
+        return profile_file_result_from_output(output);
+    }
     match resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file) {
         Ok(path) => {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             Ok(AgentProfileFileResult {
                 path: config::home_path_expr(&path),
                 text,
+                sha256: None,
             })
         }
-        Err(local_err) => {
-            let cfg = config::load_or_init().map_err(stringify)?;
-            if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
-                .await
-                .is_none()
-            {
-                return Err(stringify(local_err));
-            }
-            let output = run_remote_machine_command(
-                &state,
-                &cfg,
-                &args.machine_id,
-                json!({
-                    "op": "agent.profile.read",
-                    "actorId": args.actor_id,
-                    "file": args.file,
-                }),
-            )
-            .await?;
-            profile_file_result_from_output(output)
-        }
+        Err(local_err) => Err(stringify(local_err)),
     }
 }
 
@@ -871,6 +923,26 @@ pub async fn agent_profile_file_write(
     state: State<'_, AppState>,
     args: AgentProfileFileWriteArgs,
 ) -> Result<AgentProfileFileResult, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
+        .await
+        .is_some()
+    {
+        let output = run_remote_machine_command(
+            &state,
+            &cfg,
+            &args.machine_id,
+            json!({
+                "op": "agent.profile.write",
+                "actorId": args.actor_id,
+                "file": args.file,
+                "text": args.text,
+                "baseSha256": args.base_sha256,
+            }),
+        )
+        .await?;
+        return profile_file_result_from_output(output);
+    }
     match resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file) {
         Ok(path) => {
             if let Some(parent) = path.parent() {
@@ -882,30 +954,10 @@ pub async fn agent_profile_file_write(
             Ok(AgentProfileFileResult {
                 path: config::home_path_expr(&path),
                 text: args.text,
+                sha256: None,
             })
         }
-        Err(local_err) => {
-            let cfg = config::load_or_init().map_err(stringify)?;
-            if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
-                .await
-                .is_none()
-            {
-                return Err(stringify(local_err));
-            }
-            let output = run_remote_machine_command(
-                &state,
-                &cfg,
-                &args.machine_id,
-                json!({
-                    "op": "agent.profile.write",
-                    "actorId": args.actor_id,
-                    "file": args.file,
-                    "text": args.text,
-                }),
-            )
-            .await?;
-            profile_file_result_from_output(output)
-        }
+        Err(local_err) => Err(stringify(local_err)),
     }
 }
 
@@ -1049,15 +1101,10 @@ pub async fn machine_agent_create(
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
     let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let actor_id = actor_id_from_input(&args.actor_id, name, &machine_id).map_err(stringify)?;
-    let maybe_machine_index = cfg.machines.iter().position(|machine| {
-        machine.id == machine_id
-            && config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    });
-    let Some(machine_index) = maybe_machine_index else {
+    if server_machine_by_id(&cfg, state.try_client().await, &machine_id)
+        .await
+        .is_some()
+    {
         let output = run_remote_machine_command(
             &state,
             &cfg,
@@ -1076,6 +1123,17 @@ pub async fn machine_agent_create(
         .await?;
         drop(output);
         return machines_from_config(&cfg, state.try_client().await).await;
+    }
+    let maybe_machine_index = cfg.machines.iter().position(|machine| {
+        machine.id == machine_id
+            && config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
+    });
+    let Some(machine_index) = maybe_machine_index else {
+        return Err(format!("unknown machine id: {machine_id}"));
     };
     if cfg.machines[machine_index]
         .agents
@@ -1137,15 +1195,10 @@ pub async fn machine_agent_remove(
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
     let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
-    let maybe_machine = cfg.machines.iter_mut().find(|machine| {
-        machine.id == args.machine_id
-            && config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    });
-    let Some(machine) = maybe_machine else {
+    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
+        .await
+        .is_some()
+    {
         let output = run_remote_machine_command(
             &state,
             &cfg,
@@ -1158,6 +1211,17 @@ pub async fn machine_agent_remove(
         .await?;
         drop(output);
         return machines_from_config(&cfg, state.try_client().await).await;
+    }
+    let maybe_machine = cfg.machines.iter_mut().find(|machine| {
+        machine.id == args.machine_id
+            && config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
+    });
+    let Some(machine) = maybe_machine else {
+        return Err(format!("unknown machine id: {}", args.machine_id));
     };
     let before = machine.agents.len();
     machine
@@ -1341,18 +1405,32 @@ async fn run_remote_machine_command(
     let machine = server_machine_by_id(cfg, Some(client.clone()), machine_id)
         .await
         .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
-    if machine.read_only {
+    if !machine.can_command {
         return Err(format!(
             "machine `{}` does not advertise machine.command capability",
             machine.id
         ));
     }
+    let operation = command
+        .get("op")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|op| !op.is_empty())
+        .ok_or_else(|| "machine command op is required".to_string())?
+        .to_string();
+    let if_inventory_revision = if is_mutating_machine_operation(&operation) {
+        Some(machine.inventory_revision)
+    } else {
+        None
+    };
     let value = client
         .call_raw(
             method::MACHINE_COMMAND,
             Some(json!({
                 "machineId": machine.id,
                 "machineActorId": machine.connection_actor_id,
+                "workspaceId": config::active_workspace_id(cfg),
+                "ifInventoryRevision": if_inventory_revision,
                 "command": command,
                 "timeoutMs": 30_000,
             })),
@@ -1369,6 +1447,13 @@ async fn run_remote_machine_command(
     Ok(value.get("output").cloned().unwrap_or(Value::Null))
 }
 
+fn is_mutating_machine_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "agent.create" | "agent.update" | "agent.remove" | "agent.profile.write"
+    )
+}
+
 fn profile_file_result_from_output(output: Value) -> Result<AgentProfileFileResult, String> {
     let path = output
         .get("path")
@@ -1380,7 +1465,11 @@ fn profile_file_result_from_output(output: Value) -> Result<AgentProfileFileResu
         .and_then(Value::as_str)
         .ok_or_else(|| "remote profile result missing text".to_string())?
         .to_string();
-    Ok(AgentProfileFileResult { path, text })
+    let sha256 = output
+        .get("sha256")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Ok(AgentProfileFileResult { path, text, sha256 })
 }
 
 fn server_machine_info_from_actor(
@@ -1468,16 +1557,19 @@ fn server_machine_info_from_actor(
         shell_arg(&machine_id),
     );
 
-    let read_only = !meta
+    let can_command = meta
         .capabilities
         .iter()
         .any(|capability| capability == "machine.command");
+    let read_only = !can_command;
     Some(MachineInfo {
         id: machine_id,
         name,
         kind,
         source: "server_inventory".into(),
         read_only,
+        can_command,
+        can_open_local_path: false,
         capabilities: meta.capabilities,
         inventory_revision: meta.revision,
         inventory_observed_at: Some(meta.observed_at),
@@ -1699,6 +1791,8 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
         kind: machine.kind.clone(),
         source: "local_config".into(),
         read_only: false,
+        can_command: false,
+        can_open_local_path: true,
         capabilities: vec![
             "inventory.read".into(),
             "agent.create".into(),

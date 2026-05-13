@@ -51,17 +51,21 @@ pub mod method {
     /// deliveries pending against its inbox, with cursor pagination so a
     /// host can resume after restart without losing directed events.
     pub const DELIVERY_LIST: &str = "delivery/list";
-    /// GUI/client asks the server to route an operation to the owning machine
-    /// daemon. The server delivers it to `actor_service_<machineId>` and waits
-    /// for `machine/command.result`.
+    /// Compatibility create-and-wait wrapper around the durable command API.
     pub const MACHINE_COMMAND: &str = "machine/command";
+    pub const MACHINE_COMMAND_CREATE: &str = "machine/command.create";
+    pub const MACHINE_COMMAND_GET: &str = "machine/command.get";
+    pub const MACHINE_COMMAND_LIST: &str = "machine/command.list";
+    pub const MACHINE_COMMAND_ACK: &str = "machine/command.ack";
     pub const MACHINE_COMMAND_RESULT: &str = "machine/command.result";
+    pub const MACHINE_COMMAND_CANCEL: &str = "machine/command.cancel";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
     pub const ACTOR_DELETE: &str = "actor/delete";
 
     // outbound notification
     pub const STREAM_UPDATE: &str = "stream/update";
+    pub const MACHINE_COMMAND_NOTIFY: &str = "machine/command.notify";
 }
 
 // ---- initialize ----
@@ -911,7 +915,7 @@ pub struct DeliveryListResult {
     pub next_cursor: Option<String>,
 }
 
-// ---- machine/command + machine/command.result ----
+// ---- machine command durable lifecycle ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -922,7 +926,86 @@ pub struct MachineCommandParams {
     #[serde(default)]
     pub command: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_inventory_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandCreateParams {
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub operation: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_inventory_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandCreateResult {
+    pub command: MachineCommand,
+    pub delivered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandGetParams {
+    pub command_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandGetResult {
+    pub command: MachineCommand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_actor_id: Option<String>,
+    #[serde(default)]
+    pub statuses: Vec<MachineCommandStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandListResult {
+    pub commands: Vec<MachineCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandAckParams {
+    pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandAckResult {
+    pub command: MachineCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,9 +1033,27 @@ pub struct MachineCommandResultParams {
     pub output: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_error: Option<MachineCommandError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<MachineCommandStatus>,
 }
 
 pub type MachineCommandResponse = MachineCommandResult;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandCancelParams {
+    pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandCancelResult {
+    pub command: MachineCommand,
+}
 
 // ---- actor/list + actor/upsert ----
 

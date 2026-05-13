@@ -16,6 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use proto::methods::AgentSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -415,8 +416,19 @@ fn machine_command_error_from_result(result: &Value, error: impl Into<String>) -
 }
 
 fn machine_command_error(mut result: Value, error: impl Into<String>) -> Value {
+    let message = error.into();
+    let code = if message.starts_with("profile_conflict:") {
+        "profile_conflict"
+    } else {
+        "machine_command_failed"
+    };
     result["ok"] = json!(false);
-    result["error"] = json!(error.into());
+    result["error"] = json!(message.clone());
+    result["structuredError"] = json!({
+        "code": code,
+        "message": message,
+        "retryable": false,
+    });
     result
 }
 
@@ -477,6 +489,53 @@ fn apply_machine_command(
             save_desktop_config(&cfg)?;
             Ok(json!({ "actorId": actor_id }))
         }
+        "agent.update" => {
+            let actor_id = required_str(command, "actorId")?;
+            let agent_index = cfg.machines[machine_index]
+                .agents
+                .iter()
+                .position(|agent| agent.actor_id == actor_id)
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let provider_id = optional_trimmed_str(command, "providerId");
+            if let Some(value) = provider_id.as_deref().filter(|value| !value.is_empty()) {
+                let providers = apply_provider_overrides(
+                    detect_agent_cli_providers(),
+                    &cfg.machines[machine_index].providers,
+                );
+                if !providers.iter().any(|provider| provider.id == value) {
+                    return Err(anyhow!(
+                        "provider `{}` is not available on the remote machine",
+                        value
+                    ));
+                }
+            }
+            let agent = &mut cfg.machines[machine_index].agents[agent_index];
+            if let Some(value) = optional_trimmed_str(command, "displayName") {
+                if !value.is_empty() {
+                    agent.name = value;
+                }
+            }
+            if let Some(value) = optional_trimmed_str(command, "description") {
+                agent.description = value;
+            }
+            if let Some(value) = provider_id {
+                if !value.is_empty() {
+                    agent.provider_id = value;
+                }
+            }
+            if let Some(value) = optional_trimmed_str(command, "model") {
+                agent.model = value;
+            }
+            if let Some(value) = optional_trimmed_str(command, "reasoningEffort") {
+                agent.reasoning_effort = value;
+            }
+            if let Some(value) = command.get("autostart").and_then(Value::as_bool) {
+                agent.autostart = value;
+            }
+            let updated = agent.clone();
+            save_desktop_config(&cfg)?;
+            Ok(json!({ "agent": updated }))
+        }
         "agent.profile.read" => {
             let actor_id = required_str(command, "actorId")?;
             let file = required_str(command, "file")?;
@@ -487,9 +546,11 @@ fn apply_machine_command(
                 file,
             )?;
             let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let sha256 = sha256_text(&text);
             Ok(json!({
                 "path": path.display().to_string(),
                 "text": text,
+                "sha256": sha256,
             }))
         }
         "agent.profile.write" => {
@@ -499,12 +560,25 @@ fn apply_machine_command(
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("text is required"))?;
+            let base_sha256 = command
+                .get("baseSha256")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("profile.write requires baseSha256"))?;
             let path = resolve_machine_agent_profile_file(
                 &cfg.machines[machine_index],
                 data_root,
                 actor_id,
                 file,
             )?;
+            let current_text = std::fs::read_to_string(&path).unwrap_or_default();
+            let current_sha256 = sha256_text(&current_text);
+            if current_sha256 != base_sha256 {
+                return Err(anyhow!(
+                    "profile_conflict: current profile hash {current_sha256} does not match base {base_sha256}"
+                ));
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create directory {}", parent.display()))?;
@@ -513,6 +587,7 @@ fn apply_machine_command(
             Ok(json!({
                 "path": path.display().to_string(),
                 "text": text,
+                "sha256": sha256_text(text),
             }))
         }
         other => Err(anyhow!("unsupported machine command op: {other}")),
@@ -592,6 +667,20 @@ fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("{field} is required"))
+}
+
+fn optional_trimmed_str(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(ToString::to_string)
+}
+
+fn sha256_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn slugify(value: &str) -> String {

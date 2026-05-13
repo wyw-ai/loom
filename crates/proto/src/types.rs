@@ -324,6 +324,71 @@ pub struct Delivery {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
+pub enum MachineCommandStatus {
+    Queued,
+    Delivered,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+impl MachineCommandStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            MachineCommandStatus::Succeeded
+                | MachineCommandStatus::Failed
+                | MachineCommandStatus::Cancelled
+                | MachineCommandStatus::Expired
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommandError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCommand {
+    pub command_id: String,
+    pub machine_id: String,
+    pub machine_actor_id: String,
+    pub requested_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub operation: String,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_inventory_revision: Option<u64>,
+    pub status: MachineCommandStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<MachineCommandError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
 pub enum ReceiptKind {
     Seen,
     Read,

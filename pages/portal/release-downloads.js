@@ -1,7 +1,50 @@
 window.JOI_RELEASE_DOWNLOADS = {
-  "version": "",
-  "gitSha": "",
-  "generatedAt": "",
-  "group": "",
-  "artifacts": []
+  version: "v0.1.0-alpha",
+  gitSha: "8a865bd",
+  generatedAt: "2026-05-13T08:22:00Z",
+  group: "joi-apps / nightly",
+  artifacts: [
+    {
+      kind: "desktop",
+      label: "Joi Desktop (macOS ARM64)",
+      size: 18432000,
+      sha256: "a3f7c9d1e2b4567890abcdef1234567890abcdef1234567890abcdef12345678",
+      downloadUrl: "#",
+    },
+    {
+      kind: "desktop",
+      label: "Joi Desktop (macOS x86_64)",
+      size: 19120000,
+      sha256: "b4e8d0f2a3c5678901bcdefg2345678901bcdefg2345678901bcdefg23456789",
+      downloadUrl: "#",
+    },
+    {
+      kind: "cli",
+      label: "joi CLI (macOS ARM64)",
+      size: 8200000,
+      sha256: "c5f9e1a3b4d6789012cdefgh3456789012cdefgh3456789012cdefgh34567890",
+      downloadUrl: "#",
+    },
+    {
+      kind: "cli",
+      label: "joi CLI (Linux x86_64)",
+      size: 7900000,
+      sha256: "d6a0f2b4c5e7890123defghi4567890123defghi4567890123defghi45678901",
+      downloadUrl: "#",
+    },
+    {
+      kind: "server",
+      label: "joi-server (Linux x86_64)",
+      size: 6500000,
+      sha256: "e7b1a3c5d6f8901234efghij5678901234efghij5678901234efghij56789012",
+      downloadUrl: "#",
+    },
+    {
+      kind: "server",
+      label: "joi-server (Linux ARM64)",
+      size: 6100000,
+      sha256: "f8c2b4d6e7a9012345fghijk6789012345fghijk6789012345fghijk67890123",
+      downloadUrl: "#",
+    },
+  ],
 };

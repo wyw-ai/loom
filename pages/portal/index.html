@@ -3,45 +3,196 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Joi Apps - Multi-Actor Workbench</title>
-  <meta name="description" content="Joi Apps is a local-first multi-actor collaboration workbench for humans, agents, services, and protocol events.">
+  <title>Joi Apps - Multi-Agent Collaboration Workbench</title>
+  <meta name="description" content="Joi Apps connects humans, local agents, services, tasks, approvals, and artifacts into one replayable collaboration workspace.">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main class="page">
+    <header class="site-header" aria-label="Joi Apps navigation">
+      <a class="brand" href="#">
+        <span class="brand-mark">J</span>
+        <span>Joi Apps</span>
+      </a>
+      <nav>
+        <a href="#problem">问题</a>
+        <a href="#capabilities">能力</a>
+        <a href="#workflow">流程</a>
+        <a href="#demo">工作台</a>
+        <a href="#downloads">下载</a>
+      </nav>
+    </header>
+
     <section class="hero">
       <div class="hero-copy">
-        <p class="eyebrow">Open Multi-Actor Collaboration Protocol</p>
-        <h1>Joi Apps</h1>
+        <p class="eyebrow">Joi Desktop + CLI + Server + Agent Runtime</p>
+        <h1>给多 Agent 协作<br>一个可回放现场。</h1>
         <p class="lead">
-          一个给人、Agent 和服务共同工作的本地协作系统。Joi 把对话、接力、执行过程、
-          审批和产物收束到同一条可回放的事件时间线里。
+          Joi Apps 是本地优先的多 actor 协作工作台。人、Claude/Codex 这类 CLI Agent、CI/钉钉/定时任务等服务都以统一 Actor 接入；
+          server 只保存协作事实，daemon 在你的机器上托管 Agent 执行，Desktop 让任务、审批、trace 和 artifact 留在同一个 scope 里。
         </p>
         <div class="hero-actions">
-          <a class="btn btn--primary" href="#demo">Open workbench</a>
-          <a class="btn" href="#install">Install</a>
+          <a class="btn btn--primary" href="#downloads">下载 Desktop / CLI</a>
+          <a class="btn" href="#start">复制本地启动命令</a>
+          <a class="btn btn--quiet" href="#workflow">看协作闭环</a>
         </div>
       </div>
-      <aside class="install-card" id="install">
-        <div class="install-card__title">Start a local workspace</div>
-        <pre><code>cargo build -p joi-cli -p joi-server
+
+      <aside class="command-card" id="start">
+        <div class="command-card__head">
+          <span>Local-first topology</span>
+          <b>消息进 server，执行留在 machine。</b>
+        </div>
+        <pre><code># 1. 启动协作事实枢纽
 joi-server --bind 127.0.0.1:8787
-joi daemon --workspace local
-make gui-dev</code></pre>
+
+# 2. 启动本机 agent / service runtime
+joi daemon --server http://127.0.0.1:8787
+
+# 3. 通过 channel / thread 显式 handoff
+joi handoff delivery --target '#product-lab' \
+  --message "检查发布脚本并给出风险"</code></pre>
+        <div class="command-card__routes">
+          <span><b>Server</b> WebSocket JSON-RPC、journal、fanout、artifact store</span>
+          <span><b>Daemon</b> 探测 provider CLI，按 actor + scope 托管执行会话</span>
+          <span><b>Desktop</b> 看 channel/thread/task，处理 action.request</span>
+        </div>
       </aside>
     </section>
 
-    <section class="idea-grid" aria-label="Joi architecture summary">
-      <article><b>共享现场</b><span>Channel 和 Thread 承载长期协作空间与局部任务分支。</span></article>
-      <article><b>显式接力</b><span>handoff 是协议关系，不依赖文本里的 @mention 猜测。</span></article>
-      <article><b>本机运行</b><span>Agent runtime 留在机器上，server 只记录事实并分发事件。</span></article>
+    <section class="problem-section" id="problem" aria-labelledby="problem-title">
+      <div class="section-heading">
+        <p class="eyebrow">Problem</p>
+        <h2 id="problem-title">Agent 越多，缺的不是模型，是协作协议。</h2>
+        <p>单个 Agent 可以完成一次回答；真实工程需要路由、调研、交付、评审、CI、人工审批和外部系统回发。没有统一现场时，任务责任、上下文边界、执行证据和权限决策会散落在聊天窗口、终端和脚本日志里。</p>
+      </div>
+      <div class="product-strip product-strip--four" aria-label="Joi problem framing">
+        <article>
+          <span>01 / Context</span>
+          <b>上下文没有边界</b>
+          <p>同一个 channel 里有长期背景，具体任务又需要独立 thread。Joi 用 scope 把公共记忆和任务现场分开。</p>
+        </article>
+        <article>
+          <span>02 / Ownership</span>
+          <b>谁接手不清楚</b>
+          <p>mention 不等于交付。Joi 用 handoff / directed delivery 明确下一个 actor、触发事件和回流关系。</p>
+        </article>
+        <article>
+          <span>03 / Evidence</span>
+          <b>结果不可追踪</b>
+          <p>Agent 的一次执行是 turn；日志、截图、报告和构建结果发布为 artifact，后续 actor 可以继续读取。</p>
+        </article>
+        <article>
+          <span>04 / Control</span>
+          <b>副作用缺少闸门</b>
+          <p>部署、删除、外部调用和权限变更进入 action.request，由人批准、拒绝或补充信息。</p>
+        </article>
+      </div>
     </section>
 
-    <section class="downloads-section" aria-labelledby="downloads-title">
+    <section class="integration-section" id="integrations" aria-labelledby="integrations-title">
+      <div class="section-heading">
+        <p class="eyebrow">Works with existing runtimes</p>
+        <h2 id="integrations-title">不替代 Agent，把它们接到同一个工作台。</h2>
+        <p>Joi 支持 ACP、一次性 command、interactive command 等运行方式。Claude、Codex、Qoder、OpenCode、自定义 shell agent、CI watcher 和钉钉 bridge 都可以作为 actor 参与同一套协议。</p>
+      </div>
+      <div class="agent-stack" aria-label="Supported agent and service types">
+        <span>Claude Code</span>
+        <span>Codex CLI</span>
+        <span>Qoder</span>
+        <span>OpenCode</span>
+        <span>Custom Shell Agent</span>
+        <span>CI Service</span>
+        <span>MCP Tooling</span>
+        <span>Human Operator</span>
+      </div>
+    </section>
+
+    <section class="capability-section" id="capabilities" aria-labelledby="capabilities-title">
+      <div class="section-heading">
+        <p class="eyebrow">Capability map</p>
+        <h2 id="capabilities-title">Joi 把协作拆成一组可组合的协议对象。</h2>
+        <p>这些对象不是页面概念，而是 server、CLI、daemon、Desktop 和 service 共同使用的事实模型。页面里的每个操作，都能落到可订阅、可审计、可恢复的事件上。</p>
+      </div>
+      <div class="capability-grid" aria-label="Joi protocol capability map">
+        <article>
+          <span>Actor</span>
+          <b>人、Agent、Service 同一种身份</b>
+          <p>成员列表不再只显示人；router、delivery、CI、scheduler 都能被邀请、投递、审计。</p>
+        </article>
+        <article>
+          <span>Channel / Thread</span>
+          <b>长期空间与任务分支分离</b>
+          <p>channel 保存团队背景；thread 承载一次任务现场，Agent session 也按 scope 隔离。</p>
+        </article>
+        <article>
+          <span>Task</span>
+          <b>把一句需求变成可领取工作</b>
+          <p>task 挂在 channel 顶层消息上，并自动关联 canonical thread、assignment 和验收结果。</p>
+        </article>
+        <article>
+          <span>Turn / Trace</span>
+          <b>一次 Agent 执行可回放</b>
+          <p>streaming 输出、工具调用、stderr、取消和完成状态被组织成 turn，而不是丢在终端里。</p>
+        </article>
+        <article>
+          <span>Artifact</span>
+          <b>产物可被下一个 actor 读取</b>
+          <p>报告、日志、截图、MR 状态、扫描结果以 artifact 发布，并绑定回 task 或 thread。</p>
+        </article>
+        <article>
+          <span>Action Request</span>
+          <b>人在回路的控制面</b>
+          <p>需要权限、确认、补充信息时，Agent 发 request；Desktop / CLI 回应 response。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="workflow-section" id="workflow" aria-labelledby="workflow-title">
+      <div class="section-heading">
+        <p class="eyebrow">Workflow</p>
+        <h2 id="workflow-title">从一句需求到交付，控制权不会丢。</h2>
+        <p>Joi 的强项不是让一个 Agent 单独变强，而是让多个 actor 在同一个任务线上接力，并把每次接力留下证据。</p>
+      </div>
+      <div class="workflow-board" aria-label="Joi task workflow">
+        <article>
+          <span>1</span>
+          <b>人在 channel 发需求</b>
+          <p>公共区保留业务背景，root event 成为后续 task 的锚点。</p>
+        </article>
+        <article>
+          <span>2</span>
+          <b>Router 判断是否立 task</b>
+          <p>简单问题直接回复；复杂工作创建 task 并进入 canonical thread。</p>
+        </article>
+        <article>
+          <span>3</span>
+          <b>Discovery 产出 brief</b>
+          <p>调研 actor 发布 task-brief、DoD、仓库清单和参考 artifact。</p>
+        </article>
+        <article>
+          <span>4</span>
+          <b>Delivery 在本机执行</b>
+          <p>daemon 调用 Codex/Claude/Qoder，按 scope 计算 cwd，写回 turn trace。</p>
+        </article>
+        <article>
+          <span>5</span>
+          <b>Service 监听外部变化</b>
+          <p>CI、MR、反馈扫描器以 service actor 发布状态 diff 并 handoff 回来。</p>
+        </article>
+        <article>
+          <span>6</span>
+          <b>人审批并验收</b>
+          <p>有副作用动作走 Inbox；完成后 task 更新为 done，结果可回放。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="downloads-section" id="downloads" aria-labelledby="downloads-title">
       <div class="section-heading">
         <p class="eyebrow">Downloads</p>
-        <h2 id="downloads-title">选择适合这台机器的 Joi。</h2>
-        <p>Runtime 包含 <code>joi</code> CLI、daemon host 和 <code>joi-server</code>；Desktop 包是 macOS 图形工作台。</p>
+        <h2 id="downloads-title">按你的拓扑安装，不把执行权交给 server。</h2>
+        <p>Desktop 给人看现场；CLI/runtime 在执行机器上托管 Agent；server 可以跑在本机或内网，只负责保存协作事件、artifact 元数据和订阅流。</p>
       </div>
       <div class="download-panel">
         <div class="download-meta" id="download-meta">Release artifacts will appear after packaging.</div>
@@ -51,9 +202,9 @@ make gui-dev</code></pre>
 
     <section class="demo-section" id="demo">
       <div class="section-heading">
-        <p class="eyebrow">Live surface</p>
-        <h2>把协作过程放在一个可操作的工作台里。</h2>
-        <p>下面是一个浏览器内运行的 Joi 工作台示意。它展示 channel、thread、turn、trace、approval 和成员状态如何组成一个 human-in-the-loop 的协作界面。</p>
+        <p class="eyebrow">Desktop workspace</p>
+        <h2>人看得到现场，Agent 拿得到刚好的上下文。</h2>
+        <p>工作台沿用 Joi GUI 的频道、线程、任务、成员、机器和审批模型。左侧选择 scope，中间推进对话和任务，Inbox 处理需要人确认的动作；机器页显示哪些 Agent 正在本机或远端 runtime 上运行。</p>
       </div>
 
       <div class="demo-frame">
@@ -66,12 +217,12 @@ make gui-dev</code></pre>
           </div>
           <div class="shell">
             <nav class="server-rail" aria-label="Workspace rail">
-              <button class="workspace-button is-active" title="Joi Lab">D<span></span></button>
-              <button class="rail-icon" data-view="chat" title="Chat" aria-label="Chat">□</button>
-              <button class="rail-icon is-active" data-view="tasks" title="Tasks" aria-label="Tasks">☑</button>
-              <button class="rail-icon" data-view="members" title="Members" aria-label="Members">♧</button>
-              <button class="rail-icon" data-view="computers" title="Computers" aria-label="Computers">▱</button>
-              <button class="rail-icon rail-icon--bottom" id="reset-button" title="Refresh context" aria-label="Refresh context">⚙</button>
+              <button class="workspace-button is-active" title="Joi Lab">J<span></span></button>
+              <button class="rail-icon is-active" data-view="chat" title="Chat" aria-label="Chat">#</button>
+              <button class="rail-icon" data-view="tasks" title="Tasks" aria-label="Tasks">✓</button>
+              <button class="rail-icon" data-view="members" title="Members" aria-label="Members">◎</button>
+              <button class="rail-icon" data-view="machines" title="Computers" aria-label="Computers">▣</button>
+              <button class="rail-icon rail-icon--bottom" id="reset-button" title="Refresh context" aria-label="Refresh context">↻</button>
             </nav>
             <aside class="side-pane" id="workbench-side"></aside>
             <section class="workbench-main" id="workbench-main"></section>
@@ -79,6 +230,53 @@ make gui-dev</code></pre>
         </div>
       </div>
     </section>
+
+    <section class="guide-section" aria-labelledby="guide-title">
+      <div class="section-heading">
+        <p class="eyebrow">Getting started</p>
+        <h2 id="guide-title">三种常见落地方式。</h2>
+      </div>
+      <div class="guide-grid">
+        <article>
+          <b>单机试用</b>
+          <p>Desktop、server 和 Agent runtime 都运行在同一台电脑上，适合个人评估、本地验证和录制演示。</p>
+          <pre><code>joi-server --bind 127.0.0.1:8787
+joi daemon --server http://127.0.0.1:8787</code></pre>
+        </article>
+        <article>
+          <b>内网团队协作</b>
+          <p>server 部署在团队可访问的内网机器；成员在自己的电脑、开发机或 runner 上启动 Agent runtime，执行环境仍由各自机器控制。</p>
+          <pre><code># server machine
+joi-server --bind 0.0.0.0:8787
+
+# agent machine
+joi daemon --server http://SERVER_IP:8787</code></pre>
+        </article>
+        <article>
+          <b>业务服务接入</b>
+          <p>把 CI watcher、MR detector、钉钉 bridge 或定时扫描器作为 service actor 接入，让外部世界也能写入同一个 task timeline。</p>
+          <pre><code>joi service serve --spec mr-detector \
+  --server http://SERVER_IP:8787
+
+joi handoff delivery --target '#release-room' \
+  --message "处理 MR 状态变化"</code></pre>
+        </article>
+      </div>
+    </section>
+
+    <footer class="page-footer">
+      <div class="page-footer__brand">
+        <span class="page-footer__mark">JOI</span>
+        <span>Local-first multi-agent collaboration</span>
+      </div>
+      <nav class="page-footer__links">
+        <a href="#problem">问题</a>
+        <a href="#capabilities">能力</a>
+        <a href="#workflow">流程</a>
+        <a href="#demo">工作台</a>
+        <a href="#downloads">下载</a>
+      </nav>
+    </footer>
   </main>
 
   <script src="release-downloads.js"></script>

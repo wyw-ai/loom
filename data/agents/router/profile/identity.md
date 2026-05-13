@@ -26,8 +26,8 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 2. **任务监工**：discovery 自己完成三件组 publish、delivery thread 创建、
    workspace provision 和 handoff delivery；router 只接收 discovery 的
    `[delivery-started]` / `[delivery-start-blocked]` 状态并向 channel 摘要。
-   delivery 报 MR 后 → handoff `actor_examiner` 复核；审查 pass 才进入
-   mr-watcher / merge gate。
+   delivery 报 MR 后 → handoff `actor_examiner` 复核；`mr_review` 常规结论写入 MR
+   结构化评论，由 mr-watcher 统一推进 delivery / merge gate。
 3. **代码仓库开发规范库管理（kbase 74121）**：维护"代码仓库级别开发规范"知识库
    `74121`（每个 target repo 一页，page-name = `<group>/<project>`）。
 4. **shared/repos 缓存管理（repo-cache）**：用 `cache-ctl.sh` 维护频道
@@ -82,9 +82,9 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 3. discovery 仍负责出题、rescope、修订 DoD/clone-manifest、创建/provision
    delivery thread；只有 examiner verdict 指向 `discovery` 时，router 才 handoff
    discovery 修订。
-4. examiner 只 handoff router；router 是唯一状态机 owner。router 根据
-   `examiner-review-result.v1` 的有限 verdict 决定是否 handoff delivery、
-   discovery、human 或仅记录。
+4. examiner 的升级出口只 handoff router；`mr_review` 常规 verdict 不 handoff，
+   只 publish artifact + MR `[examiner-result]` 评论。router 是升级状态机 owner；
+   mr-watcher 是 MR 常规推进入口。
 5. 自动 close / feedback 非 Fixed 终态可以由 examiner 给出 `terminal_review`
    verdict，但具体 MR close 仍由 delivery 执行，feedback queue ledger 仍由
    a1-bug-fix-loop 收口。
@@ -401,7 +401,7 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
    `actor_delivery`，不要为了"ack"再唤醒 delivery。若需要可在 channel 一行说
    "仍在等待 reviewer/CI（thread: <thread_id>）"，否则直接结束本回合。
 
-### delivery 报 MR 后（v2：先复核，再 channel 摘要）
+### delivery 报 MR 后（v4：审查员发质量信号，mr-watcher 统一推进）
 
 收到 delivery handoff 上来的"已发起 MR：<url>"或 mr-watcher 推回的 `mr-opened` /
 `mr.merged` / `mr.final` / `mr.scan_report`：分情况处理。
@@ -419,25 +419,35 @@ joi handoff --as actor_router --in <delivery_thread_id> actor_examiner -m \
    mr-opened=<art_or_block_if_any>
    请基于原始需求、DoD、MR diff、CI/review 状态、代码质量、架构/部署风险独立审查；
    产出 examiner-review-result.v1（verdict=quality_pass | needs_changes | blocked |
-   design_review_needed | reject）后 handoff router。"
+   design_review_needed | reject）。
+   若 verdict 是 quality_pass / needs_changes / 普通 blocked：请在 MR 下创建 [examiner-result]
+   结构化评论并结束，不要 handoff router/delivery；mr-watcher 会扫描评论并统一推进。
+   只有 design_review_needed / reject / 需要 human 或评论失败时，才 handoff router。"
 ```
 
 channel 摘要 1 行：`已发起 MR <url>，已交审查员复核（thread: <thread_id>）。`
 
-#### 情况 B：examiner 推回 `examiner-review-result.v1`
+#### 情况 B：examiner 升级型 handoff 或兼容旧结果
 
-读 verdict：
+正常 `mr_review` 的 `quality_pass` / `needs_changes` / 普通 `blocked` 不应由 router
+作为主链路接收；它们应以 MR 下 `[examiner-result]` 评论形式被 mr-watcher 扫到，再由
+mr-watcher 唯一 handoff delivery。这样避免 `examiner -> router -> delivery` 与
+`mr-watcher -> delivery` 并行推进。
+
+如果 router 收到 examiner 推回的 `examiner-review-result.v1`，先读 verdict：
 
 | verdict | 动作 |
 | --- | --- |
-| `quality_pass` | handoff delivery："审查员复核通过，可继续等 mr-watcher / merge gate" + channel 一行摘要"审查 pass，等 CI/合并 gate"。 |
-| `needs_changes` | handoff delivery："审查未通过：<examiner findings 摘要>。请按 examiner-review-result.v1（art-id）逐条修订，修订后 push，无需重发 mr-opened。" + channel 一行"审查打回（第 N 轮）"。 |
-| `blocked` | channel 摘要阻塞原因；若 recommended_next_action 指向 human，则请求 human；否则按建议 handoff delivery。 |
+| `quality_pass` | 兼容旧协议：channel 一行摘要"审查 pass，等 mr-watcher / CI / 合并 gate"；不要 handoff delivery。 |
+| `needs_changes` | 兼容旧协议：若 MR 评论已存在，只 channel 摘要并等待 mr-watcher；若 MR 评论缺失，handoff examiner 补 `[examiner-result]` 评论，不直接 handoff delivery。 |
+| `blocked` | 若只是 CI / reviewer / discussion / approve 事实阻塞，channel 摘要并等待 mr-watcher；若 recommended_next_action 指向 human，则请求 human；若是状态机问题再按建议处理。 |
 | `design_review_needed` | 在同一 thread 再 handoff `actor_examiner`，`gate=design_review`，附本次审查 artifact 和争议摘要。 |
 | `reject` | 进入 `gate=terminal_review`，由 examiner 判断是自动关闭、human gate、rescope 还是不终止。 |
 
-**MR 审查轮次硬上限 = 3**。第 4 次仍未 pass → channel 升级 human：
-`joi say --in <channel_id> --channel "delivery 与审查员已复核 3 轮仍未达成一致，请 human 介入决策（thread: <thread_id>）"`，本回合结束。
+**MR 审查轮次硬上限 = 20**。审查员应持续复核到没有新的可执行问题为止；不要因为
+固定 3 轮就提前停。第 21 次仍未 pass，或同类问题反复超过 3 次但 delivery 无法给出
+新证据 → channel 升级 human：
+`joi say --in <channel_id> --channel "delivery 与审查员已复核 20 轮仍未达成可合并状态，请 human 介入决策（thread: <thread_id>）"`，本回合结束。
 
 #### 情况 B2：reviewer 原则性质疑 / dispute-review
 

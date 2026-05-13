@@ -88,21 +88,27 @@ blocker = 证据明确 + 影响核心目标/架构安全/可验证性/可合并�
 | 事项 | 判断 | 裁决 | 执行 |
 | --- | --- | --- | --- |
 | 五件套质量 | `actor_examiner` | `actor_router` 按 verdict 调度 | discovery 修订或 delivery 继续 |
-| MR 质量通过 | `actor_examiner` | `actor_router` 记录和汇报 | examiner 可 comment/approve；merge 另设 gate |
+| MR 质量通过 | `actor_examiner` | mr-watcher 扫 MR 结构化评论；router 只处理升级 | examiner comment；approve 另设显式 gate，merge 另设 human gate |
 | MR 废弃/关闭 | `actor_examiner` | examiner policy 或 router/human gate | `actor_delivery` 执行 close |
 | feedback Fixed | MR merged 事实 + post-merge 证据 | loop/delivery 识别 | delivery/loop 回评和改状态 |
 | feedback 非 Fixed | `actor_examiner` / delivery / discovery 提出 | examiner policy 或 router/human gate | delivery/loop 回评和改状态 |
 | thread archive | router 判断终态 | router | router |
 
-### 3.4 router 是唯一调度器
+### 3.4 router 管升级，mr-watcher 管 MR 常规推进
 
-审查员的普通出口只有：
+审查员不得直接 handoff `actor_discovery` 或 `actor_delivery`。MR 常规审查出口是：
+
+```text
+actor_examiner -> MR [examiner-result] comment -> mr-watcher -> actor_delivery
+```
+
+升级审查出口是：
 
 ```text
 actor_examiner -> actor_router
 ```
 
-审查员不得直接 handoff `actor_discovery` 或 `actor_delivery`。这样可以避免：
+这样可以避免：
 
 ```text
 discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delivery
@@ -110,8 +116,8 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 
 这类循环。
 
-例外：审查员可以通过 `a1` 对 MR 发评论、approve；这是外部审查动作，不是 Joi
-handoff 调度。
+审查员可以通过 `a1` 对 MR 发结构化评论；approve 默认关闭，只能在 router/human
+明确打开 approve gate 后执行。
 
 ## 4. 审查员能力模型
 
@@ -267,9 +273,9 @@ human gate。
 
 | verdict | 含义 | router 动作 |
 | --- | --- | --- |
-| `quality_pass` | 代码质量和 DoD 通过 | 进入 approve/merge gate |
-| `needs_changes` | 需要 delivery 修改 | handoff delivery，附 artifact |
-| `blocked` | 缺权限、环境、依赖或外部系统 | channel 摘要或请求 human |
+| `quality_pass` | 代码质量、DoD 和 Code 平台硬 gate 均通过 | 常规路径不接收；由 MR 评论被 mr-watcher 扫描后进入 CI/reviewer/merge gate |
+| `needs_changes` | 需要 delivery 修改 | 常规路径不接收；由 MR 评论被 mr-watcher 扫描后 handoff delivery |
+| `blocked` | 缺权限、环境、依赖或外部系统 | 普通阻塞走 MR 评论 + mr-watcher；需要 human/状态机升级才 handoff router |
 | `design_review_needed` | 不是局部实现问题 | handoff examiner 进入 `design_review` |
 | `reject` | MR 不应继续 | 进入 `terminal_review` |
 
@@ -385,26 +391,27 @@ MR 对应 feedback 标 Fixed。
 
 ## 8. Handoff 防循环规则
 
-1. examiner 只 handoff router。
+1. examiner 不直接 handoff discovery/delivery；`mr_review` 常规 verdict 只发 artifact + MR `[examiner-result]` 评论。
 2. service 只触发 examiner，不触发 discovery/delivery。
-3. router 是唯一状态机 owner。
+3. mr-watcher 是 MR 常规推进入口；router 是升级状态机 owner。
 4. 每个 gate 有最大轮次：
 
 ```json
 {
   "max_examiner_rounds": {
     "spec_review": 2,
-    "mr_review": 3,
+    "mr_review": 20,
     "design_review": 2,
     "terminal_review": 1
   }
 }
 ```
 
-5. 超过轮次后 router 必须请求 human，而不是继续循环。
+5. `mr_review` 应持续复核到没有新的可执行问题为止；超过 20 轮后 router 必须请求 human，而不是继续循环。
 6. `advisory` 不阻塞 delivery。
-7. `needs_changes` 只允许指向 delivery；`rescope` / `revise_dod` 只允许指向 discovery。
+7. `needs_changes` 只允许通过 MR 评论由 mr-watcher 指向 delivery；`rescope` / `revise_dod` 只允许由 router 指向 discovery。
 8. 若 examiner 输出缺少 `evidence` 或 `impact`，router 不得按 blocker 处理。
+9. 如果 Code 平台 `test=false` / CI failed / discussion unresolved / readyToMerge=false，examiner 不得输出 `quality_pass`；必须输出 `blocked` / `needs_changes` 或升级 human gate。
 
 ## 9. 与现有 actor 的迁移
 
@@ -413,9 +420,9 @@ MR 对应 feedback 标 Fixed。
 新增职责：
 
 - 识别 examiner verdict。
-- 按有限状态转移调度 discovery/delivery/human。
+- 按有限状态转移调度升级型 discovery/delivery/human；不接管 `mr_review` 常规推进。
 - 维护每个 thread 的 examiner round count。
-- 在 channel 汇报审查结论。
+- 在 channel 汇报升级型审查结论。
 
 迁出职责：
 
@@ -463,12 +470,12 @@ MR 对应 feedback 标 Fixed。
 保留：
 
 - MR 状态、CI、评论、conflict、merged/closed 事实监听。
-- 推进 delivery 处理普通评论和 CI。
+- 推进 delivery 处理普通评论、CI 和 examiner 的 MR 结构化评论。
 
 新增：
 
-- 当 watcher 发现 readyToMerge 或 reviewer approve 时，可触发 router 启动
-  examiner `mr_review` 或 merge gate 汇报。
+- 扫描 `[examiner-result]`，把 `needs_changes` / 普通 `blocked` 作为唯一常规入口推给 delivery。
+- 当 watcher 发现 readyToMerge 或 reviewer approve 时，可触发 merge gate 汇报。
 
 不做：
 
@@ -570,4 +577,3 @@ channelId: chan_31f8fa85d909
 - 所有 gate 固定最大轮次。
 - Phase 1 只读运行，观察一段时间再打开 approve/auto terminal。
 - 自动 close / feedback terminal 只允许低风险白名单场景。
-

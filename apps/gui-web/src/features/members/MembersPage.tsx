@@ -63,6 +63,7 @@ const REASONING_CHOICES = ["low", "medium", "high", "xhigh"];
 interface ManagedAgent {
   actor: Actor;
   managed: boolean;
+  canOpenLocalPath: boolean;
   status: string;
   machineId: string;
   machine: string;
@@ -96,7 +97,7 @@ interface AgentUpdatePatch {
 
 type AgentMachineContext = Pick<
   MachineInfo,
-  "id" | "name" | "dataRoot" | "providers" | "readOnly"
+  "id" | "name" | "dataRoot" | "providers" | "readOnly" | "canOpenLocalPath"
 > &
   Partial<Pick<MachineAgentInfo, "profilePath" | "identityPath" | "soulPath">>;
 
@@ -252,6 +253,7 @@ export function MembersPage() {
         dataRoot: agent.dataRoot,
         providers: agent.providers,
         readOnly: !agent.managed,
+        canOpenLocalPath: agent.canOpenLocalPath,
         profilePath: agent.profilePath,
         identityPath: agent.identityPath,
         soulPath: agent.soulPath,
@@ -1215,6 +1217,10 @@ function ActorProfileSection({ agent }: { agent: ManagedAgent }) {
   };
 
   const openProfile = async () => {
+    if (!agent.canOpenLocalPath) {
+      pushToast("info", "Remote profile paths can be copied but not opened locally");
+      return;
+    }
     try {
       await ipc.openLocalPath(agent.profilePath);
       pushToast("info", "profile opened");
@@ -1230,7 +1236,7 @@ function ActorProfileSection({ agent }: { agent: ManagedAgent }) {
           label="Profile"
           value={agent.profilePath}
           onCopy={() => void copy(agent.profilePath, "profile path")}
-          onOpen={() => void openProfile()}
+          onOpen={agent.canOpenLocalPath ? () => void openProfile() : undefined}
         />
         <ProfilePathRow
           label="Identity"
@@ -1319,6 +1325,7 @@ function ProfileFileEditor({
 }) {
   const pushToast = useUI((s) => s.pushToast);
   const [text, setText] = useState("");
+  const [sha256, setSha256] = useState<string | null>(null);
   const [path, setPath] = useState(file === "identity" ? agent.identityPath : agent.soulPath);
   const [busy, setBusy] = useState(true);
 
@@ -1335,6 +1342,7 @@ function ProfileFileEditor({
         if (!alive) return;
         setText(result.text);
         setPath(result.path);
+        setSha256(result.sha256 ?? null);
       })
       .catch((e) => {
         if (!alive) return;
@@ -1357,9 +1365,11 @@ function ProfileFileEditor({
         actorId: agent.actor.id,
         file,
         text,
+        baseSha256: sha256,
       });
       pushToast("info", `${file}.md saved`);
       setPath(result.path);
+      setSha256(result.sha256 ?? sha256);
       onClose();
     } catch (e) {
       pushToast("error", e instanceof Error ? e.message : String(e));
@@ -1761,6 +1771,7 @@ function normalizeAgent(
   return {
     actor,
     managed: !machine.readOnly,
+    canOpenLocalPath: machine.canOpenLocalPath,
     status: info.status,
     machineId: machine.id,
     machine: machine.name,
@@ -1804,6 +1815,7 @@ function normalizeRegistryActor(actor: Actor): ManagedAgent {
   return {
     actor,
     managed: false,
+    canOpenLocalPath: false,
     status: "registered",
     machineId: "",
     machine: "Server registry",

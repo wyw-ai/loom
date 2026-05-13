@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::artifacts::ArtifactStore;
-use crate::machine_commands::MachineCommandBroker;
+use crate::machine_commands::MachineCommandWaiters;
 use crate::scope_skills::ScopeSkills;
 use crate::store::Store;
 use crate::subscribe::Subscriptions;
@@ -12,5 +12,5 @@ pub struct AppState {
     pub subscriptions: Arc<Subscriptions>,
     pub artifacts: Arc<ArtifactStore>,
     pub scope_skills: Arc<ScopeSkills>,
-    pub machine_commands: Arc<MachineCommandBroker>,
+    pub machine_commands: Arc<MachineCommandWaiters>,
 }

@@ -41,6 +41,7 @@ pub enum StoreEvent {
     ArtifactPublished(Artifact),
     ReceiptRecorded(Receipt),
     DeliveryUpdated(Delivery),
+    MachineCommandUpdated(MachineCommand),
     /// Turn-private trace frame. Carried on the same broadcast channel as
     /// scope events purely so the websocket layer can route it; the fanout
     /// must NOT broadcast it to scope subscribers — see `ws::fanout`.
@@ -84,6 +85,7 @@ impl StoreEvent {
             StoreEvent::ArtifactPublished(_) => None,
             StoreEvent::ReceiptRecorded(_) => None,
             StoreEvent::DeliveryUpdated(_) => None,
+            StoreEvent::MachineCommandUpdated(_) => None,
             // Trace frames are owner-private; ws fanout routes them by
             // turn owner, never by scope.
             StoreEvent::TraceAppended(_) => None,
@@ -114,6 +116,7 @@ struct Inner {
     /// implicit turn used when an event/append arrives with no turn_id, keyed by (actor_id, scope)
     memberships: HashMap<(String, ScopeRef), Membership>,
     deliveries: HashMap<(String, String), Delivery>,
+    machine_commands: HashMap<String, MachineCommand>,
     receipts: HashMap<(String, String, ReceiptKind), Receipt>,
     reminders: HashMap<String, Reminder>,
     artifacts: HashMap<String, Artifact>,
@@ -1298,6 +1301,50 @@ impl Store {
         rows
     }
 
+    // -------- Machine commands --------
+
+    pub fn upsert_machine_command(&self, command: MachineCommand) -> StoreResult<MachineCommand> {
+        self.journal
+            .append(&Mutation::MachineCommandUpsert(command.clone()))?;
+        let mut inner = self.inner.write();
+        apply(&mut inner, Mutation::MachineCommandUpsert(command.clone()));
+        drop(inner);
+        self.emit(StoreEvent::MachineCommandUpdated(command.clone()));
+        Ok(command)
+    }
+
+    pub fn get_machine_command(&self, command_id: &str) -> Option<MachineCommand> {
+        self.inner.read().machine_commands.get(command_id).cloned()
+    }
+
+    pub fn list_machine_commands(
+        &self,
+        machine_id: Option<&str>,
+        machine_actor_id: Option<&str>,
+        statuses: &[MachineCommandStatus],
+        requested_by: Option<&str>,
+        limit: usize,
+    ) -> Vec<MachineCommand> {
+        let mut rows: Vec<MachineCommand> = self
+            .inner
+            .read()
+            .machine_commands
+            .values()
+            .filter(|command| machine_id.is_none_or(|id| command.machine_id == id))
+            .filter(|command| machine_actor_id.is_none_or(|id| command.machine_actor_id == id))
+            .filter(|command| requested_by.is_none_or(|id| command.requested_by == id))
+            .filter(|command| statuses.is_empty() || statuses.contains(&command.status))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.command_id.cmp(&b.command_id))
+        });
+        rows.truncate(limit);
+        rows
+    }
+
     // -------- Membership / Delivery / Receipt --------
 
     pub fn touch_membership(
@@ -1697,6 +1744,11 @@ fn apply(inner: &mut Inner, m: Mutation) {
             inner
                 .deliveries
                 .insert((d.event_id.clone(), d.actor_id.clone()), d);
+        }
+        Mutation::MachineCommandUpsert(command) => {
+            inner
+                .machine_commands
+                .insert(command.command_id.clone(), command);
         }
         Mutation::ReceiptRecord(r) => {
             inner

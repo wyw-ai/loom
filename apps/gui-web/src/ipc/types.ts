@@ -305,6 +305,8 @@ export interface MachineInfo {
   kind: string;
   source: "local_config" | "server_inventory" | string;
   readOnly: boolean;
+  canCommand: boolean;
+  canOpenLocalPath: boolean;
   capabilities: string[];
   inventoryRevision: number;
   inventoryObservedAt?: string | null;

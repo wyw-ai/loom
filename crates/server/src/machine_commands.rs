@@ -5,12 +5,14 @@ use parking_lot::Mutex;
 use proto::methods::MachineCommandResultParams;
 use tokio::sync::oneshot;
 
+/// Non-authoritative wait handles for the legacy `machine/command` create+wait
+/// wrapper. Durable command/result state lives in `Store`.
 #[derive(Default)]
-pub struct MachineCommandBroker {
+pub struct MachineCommandWaiters {
     pending: Mutex<HashMap<String, oneshot::Sender<MachineCommandResultParams>>>,
 }
 
-impl MachineCommandBroker {
+impl MachineCommandWaiters {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }

@@ -400,6 +400,10 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::ArtifactPublished(a) => (sk::ARTIFACT_PUBLISHED, json!({ "artifact": a })),
         StoreEvent::ReceiptRecorded(r) => (sk::RECEIPT_RECORDED, json!({ "receipt": r })),
         StoreEvent::DeliveryUpdated(d) => (sk::DELIVERY_UPDATED, json!({ "delivery": d })),
+        StoreEvent::MachineCommandUpdated(command) => {
+            let _ = command.command_id.as_str();
+            return;
+        }
         StoreEvent::TraceAppended(_) => unreachable!("trace handled above"),
         StoreEvent::ChannelGranted { .. }
         | StoreEvent::ChannelRevoked { .. }
@@ -600,7 +604,7 @@ mod tests {
 
     use crate::artifacts::ArtifactStore;
     use crate::journal::Journal;
-    use crate::machine_commands::MachineCommandBroker;
+    use crate::machine_commands::MachineCommandWaiters;
     use crate::scope_skills::ScopeSkills;
     use crate::store::Store;
     use crate::subscribe::Subscriptions;
@@ -637,7 +641,7 @@ mod tests {
             subscriptions,
             artifacts,
             scope_skills,
-            machine_commands: MachineCommandBroker::new(),
+            machine_commands: MachineCommandWaiters::new(),
         }
     }
 

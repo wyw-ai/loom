@@ -103,7 +103,14 @@ pub async fn dispatch(
         method::REMINDER_UPDATE => reminder_update(state, params),
         method::DELIVERY_LIST => delivery_list(state, connection_id, params),
         method::MACHINE_COMMAND => machine_command(state, connection_id, params).await,
+        method::MACHINE_COMMAND_CREATE => {
+            machine_command_create(state, connection_id, params).await
+        }
+        method::MACHINE_COMMAND_GET => machine_command_get(state, connection_id, params),
+        method::MACHINE_COMMAND_LIST => machine_command_list(state, connection_id, params),
+        method::MACHINE_COMMAND_ACK => machine_command_ack(state, connection_id, params),
         method::MACHINE_COMMAND_RESULT => machine_command_result(state, connection_id, params),
+        method::MACHINE_COMMAND_CANCEL => machine_command_cancel(state, connection_id, params),
         method::ACTOR_LIST => actor_list(state),
         method::ACTOR_UPSERT => actor_upsert(state, params),
         method::ACTOR_DELETE => actor_delete(state, params),
@@ -1311,45 +1318,47 @@ async fn machine_command(
     params: Option<Value>,
 ) -> HandlerResult {
     let p: MachineCommandParams = parse_params(params)?;
-    let machine_id = p.machine_id.trim();
-    if machine_id.is_empty() {
-        return Err(ErrorObject::new(
-            ErrorCode::INVALID_PARAMS,
-            "machine id is required",
-        ));
-    }
-    let caller = caller_actor(state, connection_id)?;
-    let machine_actor_id = p
-        .machine_actor_id
-        .as_deref()
+    let operation = p
+        .command
+        .get("op")
+        .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| machine_connection_actor_id(machine_id));
-    validate_machine_actor(state, machine_id, &machine_actor_id, Some(&caller))?;
-
+        .filter(|op| !op.is_empty())
+        .ok_or_else(|| {
+            ErrorObject::new(ErrorCode::INVALID_PARAMS, "machine command op is required")
+        })?
+        .to_string();
     let command_id = format!("mcmd_{}", Uuid::new_v4().simple());
+    let create = MachineCommandCreateParams {
+        machine_id: p.machine_id,
+        machine_actor_id: p.machine_actor_id,
+        workspace_id: p.workspace_id,
+        operation,
+        payload: p.command,
+        if_inventory_revision: p.if_inventory_revision,
+        command_id: Some(command_id.clone()),
+        timeout_ms: p.timeout_ms,
+    };
+    let timeout_ms = create.timeout_ms.unwrap_or(30_000).clamp(1_000, 120_000);
     let rx = state.machine_commands.register(command_id.clone());
-    let delivered = state.subscriptions.send_to_actor(
-        &machine_actor_id,
-        method::MACHINE_COMMAND,
-        json!({
-            "commandId": command_id,
-            "machineId": machine_id,
-            "machineActorId": machine_actor_id,
-            "requestedBy": caller,
-            "command": p.command,
-        }),
-    );
+    let (command, _) = match create_machine_command(state, connection_id, create) {
+        Ok(value) => value,
+        Err(err) => {
+            state.machine_commands.cancel(&command_id);
+            return Err(err);
+        }
+    };
+    let delivered = notify_machine_command(state, command)?;
     if !delivered {
         state.machine_commands.cancel(&command_id);
+        // The command remains queued for daemon pull/reconnect; the wait wrapper
+        // reports that synchronous delivery was not possible.
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
-            format!("machine daemon is not connected: {machine_id}"),
+            "machine daemon is not connected; command is queued",
         ));
     }
 
-    let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1_000, 120_000);
     let result = match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await
     {
         Ok(Ok(result)) => result,
@@ -1367,15 +1376,132 @@ async fn machine_command(
             ));
         }
     };
+    let result_machine_id = result.machine_id.clone();
     let response = MachineCommandResponse {
         command_id: result.command_id,
         machine_id: result.machine_id,
-        machine_actor_id,
+        machine_actor_id: result
+            .machine_actor_id
+            .unwrap_or_else(|| machine_connection_actor_id(&result_machine_id)),
         ok: result.ok,
         output: result.output,
         error: result.error,
     };
     ok(response)
+}
+
+async fn machine_command_create(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: MachineCommandCreateParams = parse_params(params)?;
+    let (command, _) = create_machine_command(state, connection_id, p)?;
+    let command_id = command.command_id.clone();
+    let delivered = notify_machine_command(state, command.clone())?;
+    let command = state
+        .store
+        .get_machine_command(&command_id)
+        .unwrap_or(command);
+    ok(MachineCommandCreateResult { command, delivered })
+}
+
+fn machine_command_get(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: MachineCommandGetParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let command = state
+        .store
+        .get_machine_command(&p.command_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "machine command not found"))?;
+    authorize_machine_command_reader(&caller, &command)?;
+    ok(MachineCommandGetResult { command })
+}
+
+fn machine_command_list(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: MachineCommandListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let caller_is_machine = is_machine_actor(state, &caller);
+    let machine_actor_id = if caller_is_machine {
+        Some(caller.as_str())
+    } else {
+        p.machine_actor_id.as_deref()
+    };
+    let requested_by = if caller_is_machine {
+        p.requested_by.as_deref()
+    } else {
+        Some(caller.as_str())
+    };
+    let commands = state.store.list_machine_commands(
+        p.machine_id.as_deref(),
+        machine_actor_id,
+        &p.statuses,
+        requested_by,
+        p.limit.unwrap_or(100).clamp(1, 500),
+    );
+    ok(MachineCommandListResult { commands })
+}
+
+fn machine_command_ack(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: MachineCommandAckParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let mut command = state
+        .store
+        .get_machine_command(&p.command_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "machine command not found"))?;
+    let expected_actor = p
+        .machine_actor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(&command.machine_actor_id);
+    if caller != expected_actor || expected_actor != command.machine_actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor `{caller}` cannot ack command `{}`",
+                command.command_id
+            ),
+        ));
+    }
+    if let Some(machine_id) = p.machine_id.as_deref() {
+        if machine_id != command.machine_id {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                "ack machineId does not match command",
+            ));
+        }
+    }
+    validate_machine_actor(
+        state,
+        &command.machine_id,
+        &command.machine_actor_id,
+        None,
+        command.workspace_id.as_deref(),
+        None,
+        false,
+    )?;
+    if !command.status.is_terminal() {
+        command.status = MachineCommandStatus::Running;
+        command.attempts = command.attempts.saturating_add(1);
+        command.updated_at = Utc::now();
+        command = state
+            .store
+            .upsert_machine_command(command)
+            .map_err(map_store_err)?;
+    }
+    ok(MachineCommandAckResult { command })
 }
 
 fn machine_command_result(
@@ -1400,18 +1526,247 @@ fn machine_command_result(
             ),
         ));
     }
-    validate_machine_actor(state, &result.machine_id, &expected_actor, None)?;
-    if !state.machine_commands.complete(result) {
+    let mut command = state
+        .store
+        .get_machine_command(&result.command_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "unknown machine command"))?;
+    if command.machine_id != result.machine_id || command.machine_actor_id != expected_actor {
         return Err(ErrorObject::new(
-            ErrorCode::APP_NOT_FOUND,
-            "unknown or expired machine command",
+            ErrorCode::APP_INVALID_STATE,
+            "machine command result target mismatch",
         ));
     }
-    ok(json!({ "accepted": true }))
+    validate_machine_actor(
+        state,
+        &result.machine_id,
+        &expected_actor,
+        None,
+        command.workspace_id.as_deref(),
+        None,
+        false,
+    )?;
+    if command.status.is_terminal() {
+        return ok(json!({ "accepted": true, "command": command }));
+    }
+    let now = Utc::now();
+    command.status = result.status.unwrap_or(if result.ok {
+        MachineCommandStatus::Succeeded
+    } else {
+        MachineCommandStatus::Failed
+    });
+    if !command.status.is_terminal() {
+        command.status = if result.ok {
+            MachineCommandStatus::Succeeded
+        } else {
+            MachineCommandStatus::Failed
+        };
+    }
+    command.output = Some(result.output.clone());
+    command.error = result.structured_error.clone().or_else(|| {
+        result.error.as_ref().map(|message| MachineCommandError {
+            code: "machine_command_failed".into(),
+            message: message.clone(),
+            retryable: false,
+            details: None,
+        })
+    });
+    command.finished_at = Some(now);
+    command.updated_at = now;
+    let command = state
+        .store
+        .upsert_machine_command(command)
+        .map_err(map_store_err)?;
+    state.machine_commands.complete(result.clone());
+    ok(json!({ "accepted": true, "command": command }))
+}
+
+fn machine_command_cancel(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: MachineCommandCancelParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let mut command = state
+        .store
+        .get_machine_command(&p.command_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "machine command not found"))?;
+    authorize_machine_command_reader(&caller, &command)?;
+    if !command.status.is_terminal() {
+        command.status = MachineCommandStatus::Cancelled;
+        command.error = p.reason.map(|message| MachineCommandError {
+            code: "cancelled".into(),
+            message,
+            retryable: false,
+            details: None,
+        });
+        let now = Utc::now();
+        command.finished_at = Some(now);
+        command.updated_at = now;
+        command = state
+            .store
+            .upsert_machine_command(command)
+            .map_err(map_store_err)?;
+    }
+    state.machine_commands.cancel(&p.command_id);
+    ok(MachineCommandCancelResult { command })
 }
 
 fn machine_connection_actor_id(machine_id: &str) -> String {
     format!("actor_service_{}", machine_id)
+}
+
+fn create_machine_command(
+    state: &AppState,
+    connection_id: &str,
+    p: MachineCommandCreateParams,
+) -> Result<(MachineCommand, bool), ErrorObject> {
+    let machine_id = p.machine_id.trim();
+    if machine_id.is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "machine id is required",
+        ));
+    }
+    let operation = p.operation.trim();
+    if operation.is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "machine command operation is required",
+        ));
+    }
+    let caller = caller_actor(state, connection_id)?;
+    let machine_actor_id = p
+        .machine_actor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| machine_connection_actor_id(machine_id));
+    validate_machine_actor(
+        state,
+        machine_id,
+        &machine_actor_id,
+        Some(&caller),
+        p.workspace_id.as_deref(),
+        p.if_inventory_revision,
+        is_mutating_machine_operation(operation),
+    )?;
+    let now = Utc::now();
+    let command = MachineCommand {
+        command_id: p
+            .command_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("mcmd_{}", Uuid::new_v4().simple())),
+        machine_id: machine_id.to_string(),
+        machine_actor_id,
+        requested_by: caller,
+        workspace_id: p.workspace_id,
+        operation: operation.to_string(),
+        payload: p.payload,
+        if_inventory_revision: p.if_inventory_revision,
+        status: MachineCommandStatus::Queued,
+        deadline_at: p
+            .timeout_ms
+            .map(|ms| now + chrono::Duration::milliseconds(ms.clamp(1_000, 120_000) as i64)),
+        created_at: now,
+        updated_at: now,
+        attempts: 0,
+        output: None,
+        error: None,
+        finished_at: None,
+        _meta: None,
+    };
+    if state
+        .store
+        .get_machine_command(&command.command_id)
+        .is_some()
+    {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_CONFLICT,
+            format!("machine command already exists: {}", command.command_id),
+        ));
+    }
+    let command = state
+        .store
+        .upsert_machine_command(command)
+        .map_err(map_store_err)?;
+    Ok((command, false))
+}
+
+fn notify_machine_command(
+    state: &AppState,
+    mut command: MachineCommand,
+) -> Result<bool, ErrorObject> {
+    let delivered = state.subscriptions.send_to_actor(
+        &command.machine_actor_id,
+        method::MACHINE_COMMAND_NOTIFY,
+        machine_command_notification_payload(&command),
+    );
+    if delivered && command.status == MachineCommandStatus::Queued {
+        command.status = MachineCommandStatus::Delivered;
+        command.updated_at = Utc::now();
+        state
+            .store
+            .upsert_machine_command(command)
+            .map_err(map_store_err)?;
+    }
+    Ok(delivered)
+}
+
+fn machine_command_notification_payload(command: &MachineCommand) -> Value {
+    json!({
+        "commandId": command.command_id,
+        "machineId": command.machine_id,
+        "machineActorId": command.machine_actor_id,
+        "requestedBy": command.requested_by,
+        "workspaceId": command.workspace_id,
+        "operation": command.operation,
+        "payload": command.payload,
+        "command": command.payload,
+        "ifInventoryRevision": command.if_inventory_revision,
+    })
+}
+
+fn authorize_machine_command_reader(
+    caller: &str,
+    command: &MachineCommand,
+) -> Result<(), ErrorObject> {
+    if caller == command.requested_by || caller == command.machine_actor_id {
+        Ok(())
+    } else {
+        Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor `{caller}` cannot access command `{}`",
+                command.command_id
+            ),
+        ))
+    }
+}
+
+fn is_machine_actor(state: &AppState, actor_id: &str) -> bool {
+    state
+        .store
+        .get_actor(actor_id)
+        .and_then(|actor| actor._meta)
+        .and_then(|meta| {
+            meta.get("role")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .as_deref()
+        == Some("machine")
+}
+
+fn is_mutating_machine_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "agent.create" | "agent.update" | "agent.remove" | "agent.profile.write"
+    )
 }
 
 fn validate_machine_actor(
@@ -1419,6 +1774,9 @@ fn validate_machine_actor(
     machine_id: &str,
     machine_actor_id: &str,
     requester_actor_id: Option<&str>,
+    workspace_id: Option<&str>,
+    if_inventory_revision: Option<u64>,
+    require_revision: bool,
 ) -> Result<(), ErrorObject> {
     let actor = state.store.get_actor(machine_actor_id).ok_or_else(|| {
         ErrorObject::new(
@@ -1439,11 +1797,62 @@ fn validate_machine_actor(
         )
     })?;
     let role = meta.get("role").and_then(Value::as_str);
+    let source = meta.get("source").and_then(Value::as_str);
+    let inventory_version = meta.get("inventoryVersion").and_then(Value::as_u64);
     let meta_machine_id = meta.get("machineId").and_then(Value::as_str);
-    if role != Some("machine") || meta_machine_id != Some(machine_id) {
+    if role != Some("machine")
+        || source != Some("daemon")
+        || inventory_version != Some(2)
+        || meta_machine_id != Some(machine_id)
+    {
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
-            format!("actor `{machine_actor_id}` is not the machine daemon for `{machine_id}`"),
+            format!("actor `{machine_actor_id}` is not a daemon inventory v2 machine for `{machine_id}`"),
+        ));
+    }
+    let has_command_capability = meta
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some("machine.command"))
+        });
+    if !has_command_capability {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("machine `{machine_id}` does not advertise machine.command capability"),
+        ));
+    }
+    if let Some(expected_workspace_id) = meta
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+    {
+        if workspace_id != Some(expected_workspace_id) {
+            return Err(ErrorObject::new(
+                ErrorCode::APP_INVALID_STATE,
+                format!(
+                    "machine `{machine_id}` belongs to workspace `{expected_workspace_id}`, not `{}`",
+                    workspace_id.unwrap_or("<missing>")
+                ),
+            ));
+        }
+    }
+    if let Some(expected_revision) = if_inventory_revision {
+        let current_revision = meta.get("revision").and_then(Value::as_u64).unwrap_or(0);
+        if expected_revision != current_revision {
+            return Err(ErrorObject::new(
+                ErrorCode::APP_CONFLICT,
+                format!(
+                    "machine inventory revision mismatch: expected {expected_revision}, current {current_revision}"
+                ),
+            ));
+        }
+    } else if require_revision {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "mutating machine command requires ifInventoryRevision",
         ));
     }
     if let Some(requester_actor_id) = requester_actor_id {
@@ -1505,7 +1914,7 @@ mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crate::journal::Journal;
-    use crate::machine_commands::MachineCommandBroker;
+    use crate::machine_commands::MachineCommandWaiters;
     use crate::scope_skills::ScopeSkills;
     use crate::store::Store;
     use crate::subscribe::{Connection, Subscriptions};
@@ -1542,7 +1951,7 @@ mod tests {
             subscriptions,
             artifacts,
             scope_skills,
-            machine_commands: MachineCommandBroker::new(),
+            machine_commands: MachineCommandWaiters::new(),
         }
     }
 
@@ -2668,6 +3077,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_command_create_persists_for_daemon_pull() {
+        let state = fresh_state("machine-command-durable");
+        open_conn(&state, "conn_human", "actor_human").await;
+        dispatch(
+            &state,
+            "conn_human",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "source": "daemon",
+                        "inventoryVersion": 2,
+                        "machineId": "machine_remote",
+                        "workspaceId": "workspace_a",
+                        "ownerActorId": "actor_human",
+                        "capabilities": ["inventory.read", "machine.command"],
+                        "revision": 9
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine");
+
+        let value = dispatch(
+            &state,
+            "conn_human",
+            method::MACHINE_COMMAND_CREATE,
+            Some(json!({
+                "machineId": "machine_remote",
+                "machineActorId": "actor_service_machine_remote",
+                "workspaceId": "workspace_a",
+                "operation": "agent.remove",
+                "payload": { "op": "agent.remove", "actorId": "actor_agent" },
+                "ifInventoryRevision": 9
+            })),
+        )
+        .await
+        .expect("machine/command.create");
+        let created: MachineCommandCreateResult =
+            serde_json::from_value(value).expect("create result");
+        assert!(!created.delivered);
+        assert_eq!(created.command.status, MachineCommandStatus::Queued);
+
+        open_service_conn(&state, "conn_machine", "actor_service_machine_remote").await;
+        dispatch(
+            &state,
+            "conn_machine",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "source": "daemon",
+                        "inventoryVersion": 2,
+                        "machineId": "machine_remote",
+                        "workspaceId": "workspace_a",
+                        "ownerActorId": "actor_human",
+                        "capabilities": ["inventory.read", "machine.command"],
+                        "revision": 9
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine again");
+
+        let value = dispatch(
+            &state,
+            "conn_machine",
+            method::MACHINE_COMMAND_LIST,
+            Some(json!({
+                "machineId": "machine_remote",
+                "statuses": ["queued"]
+            })),
+        )
+        .await
+        .expect("machine/command.list");
+        let listed: MachineCommandListResult = serde_json::from_value(value).expect("list result");
+        assert_eq!(listed.commands.len(), 1);
+        assert_eq!(listed.commands[0].command_id, created.command.command_id);
+
+        let value = dispatch(
+            &state,
+            "conn_machine",
+            method::MACHINE_COMMAND_ACK,
+            Some(json!({
+                "commandId": created.command.command_id,
+                "machineId": "machine_remote",
+                "machineActorId": "actor_service_machine_remote"
+            })),
+        )
+        .await
+        .expect("machine/command.ack");
+        let acked: MachineCommandAckResult = serde_json::from_value(value).expect("ack result");
+        assert_eq!(acked.command.status, MachineCommandStatus::Running);
+
+        dispatch(
+            &state,
+            "conn_machine",
+            method::MACHINE_COMMAND_RESULT,
+            Some(json!({
+                "commandId": created.command.command_id,
+                "machineId": "machine_remote",
+                "machineActorId": "actor_service_machine_remote",
+                "ok": true,
+                "output": { "done": true }
+            })),
+        )
+        .await
+        .expect("machine/command.result");
+
+        let value = dispatch(
+            &state,
+            "conn_human",
+            method::MACHINE_COMMAND_GET,
+            Some(json!({ "commandId": created.command.command_id })),
+        )
+        .await
+        .expect("machine/command.get");
+        let fetched: MachineCommandGetResult = serde_json::from_value(value).expect("get result");
+        assert_eq!(fetched.command.status, MachineCommandStatus::Succeeded);
+        assert_eq!(
+            fetched
+                .command
+                .output
+                .and_then(|value| value.get("done").and_then(Value::as_bool).map(bool::from)),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn machine_command_routes_to_service_and_waits_for_result() {
         let state = fresh_state("machine-command-routes");
         open_conn(&state, "conn_human", "actor_human").await;
@@ -2684,7 +3232,11 @@ mod tests {
                     "displayName": "Remote Machine",
                     "_meta": {
                         "role": "machine",
-                        "machineId": "machine_remote"
+                        "source": "daemon",
+                        "inventoryVersion": 2,
+                        "machineId": "machine_remote",
+                        "capabilities": ["machine.command"],
+                        "revision": 7
                     }
                 }
             })),
@@ -2700,6 +3252,7 @@ mod tests {
                 method::MACHINE_COMMAND,
                 Some(json!({
                     "machineId": "machine_remote",
+                    "ifInventoryRevision": 7,
                     "command": { "op": "agent.remove", "actorId": "actor_agent" },
                     "timeoutMs": 5_000
                 })),
@@ -2713,7 +3266,7 @@ mod tests {
             .expect("machine command notification");
         let notification: proto::Notification =
             serde_json::from_str(&frame).expect("notification frame");
-        assert_eq!(notification.method, method::MACHINE_COMMAND);
+        assert_eq!(notification.method, method::MACHINE_COMMAND_NOTIFY);
         let params = notification.params.expect("notification params");
         let command_id = params
             .get("commandId")

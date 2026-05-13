@@ -472,6 +472,7 @@ function ComputerDetail({
                   key={agent.spec.actor.id}
                   agent={agent}
                   readOnly={readOnly}
+                  canOpenLocalPath={machine.canOpenLocalPath}
                   onRemove={() => onRemoveAgent(agent)}
                 />
               ))}
@@ -574,10 +575,12 @@ function RuntimeRow({
 function AgentRow({
   agent,
   readOnly,
+  canOpenLocalPath,
   onRemove,
 }: {
   agent: MachineAgentInfo;
   readOnly: boolean;
+  canOpenLocalPath: boolean;
   onRemove: () => void;
 }) {
   const pushToast = useUI((s) => s.pushToast);
@@ -591,8 +594,8 @@ function AgentRow({
     }
   };
   const openProfile = async () => {
-    if (readOnly) {
-      pushToast("warn", "remote profile files are read-only from this GUI");
+    if (!canOpenLocalPath) {
+      pushToast("warn", "Remote profile paths can be copied but not opened locally");
       return;
     }
     try {
@@ -648,9 +651,9 @@ function AgentRow({
         <div className="flex flex-wrap gap-1">
           <button
             className="btn-brutal-sm bg-white p-1.5"
-            disabled={readOnly}
+            disabled={!canOpenLocalPath}
             title={
-              readOnly
+              !canOpenLocalPath
                 ? "Remote profile paths cannot be opened locally"
                 : "Open profile folder"
             }

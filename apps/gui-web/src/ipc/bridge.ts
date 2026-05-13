@@ -394,7 +394,7 @@ export async function agentProfileFileRead(args: {
   machineId: string;
   actorId: string;
   file: "identity" | "soul";
-}): Promise<{ path: string; text: string }> {
+}): Promise<{ path: string; text: string; sha256?: string | null }> {
   return invoke("agent_profile_file_read", { args });
 }
 
@@ -403,7 +403,8 @@ export async function agentProfileFileWrite(args: {
   actorId: string;
   file: "identity" | "soul";
   text: string;
-}): Promise<{ path: string; text: string }> {
+  baseSha256?: string | null;
+}): Promise<{ path: string; text: string; sha256?: string | null }> {
   return invoke("agent_profile_file_write", { args });
 }
 

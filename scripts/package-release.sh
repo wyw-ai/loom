@@ -10,9 +10,13 @@ PNPM="${PNPM:-pnpm}"
 LINUX_BUILDER="${LINUX_BUILDER:-$CARGO}"
 DIST_DIR="${DIST_DIR:-dist}"
 PACKAGE_OUT_DIR="${PACKAGE_OUT_DIR:-$DIST_DIR/packages}"
+OSS_BASE_URL="${OSS_BASE_URL:-https://pre-ai.aone.alibaba-inc.com}"
+OSS_GROUP="${OSS_GROUP:-}"
+PORTAL_RELEASE_DATA="${PORTAL_RELEASE_DATA:-pages/portal/release-downloads.js}"
 PROFILE="release"
 SKIP_BUILD=0
 SKIP_GUI=0
+SKIP_UPLOAD=0
 
 usage() {
   cat <<'EOF'
@@ -23,8 +27,11 @@ Build and package Joi release artifacts in one command.
 Options:
   --skip-build       Package existing dist/release binaries without rebuilding.
   --skip-gui         Do not build/copy the macOS arm64 GUI dmg.
+  --skip-upload      Do not upload release artifacts to OSS.
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
   --out-dir DIR      Package output directory. Defaults to $PACKAGE_OUT_DIR or dist/packages.
+  --oss-base-url URL OSS manager origin. Defaults to $OSS_BASE_URL or pre-ai.
+  --oss-group GROUP  OSS group. Defaults to joi-apps/releases/<version>/<git-sha>.
   -h, --help         Show this help.
 
 Environment:
@@ -34,6 +41,9 @@ Environment:
   LINUX_BUILDER      Builder for Linux Rust targets. Defaults to $CARGO.
   DIST_DIR           Dist directory. Defaults to dist.
   PACKAGE_OUT_DIR    Package output directory. Defaults to dist/packages.
+  OSS_BASE_URL       OSS manager origin.
+  OSS_GROUP          OSS grouped upload path.
+  PORTAL_RELEASE_DATA Portal release data JS path.
 EOF
 }
 
@@ -47,12 +57,24 @@ while [[ $# -gt 0 ]]; do
       SKIP_GUI=1
       shift
       ;;
+    --skip-upload)
+      SKIP_UPLOAD=1
+      shift
+      ;;
     --dist-dir)
       DIST_DIR="${2:?missing value for --dist-dir}"
       shift 2
       ;;
     --out-dir)
       PACKAGE_OUT_DIR="${2:?missing value for --out-dir}"
+      shift 2
+      ;;
+    --oss-base-url)
+      OSS_BASE_URL="${2:?missing value for --oss-base-url}"
+      shift 2
+      ;;
+    --oss-group)
+      OSS_GROUP="${2:?missing value for --oss-group}"
       shift 2
       ;;
     -h | --help)
@@ -77,6 +99,9 @@ GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GENERATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/joi-package.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
+if [[ -z "$OSS_GROUP" ]]; then
+  OSS_GROUP="joi-apps/releases/$VERSION/$GIT_SHA"
+fi
 
 RUNTIME_TARGETS=(
   "aarch64-apple-darwin"
@@ -87,7 +112,7 @@ RUNTIME_TARGETS=(
 )
 
 log() {
-  printf '[package-release] %s\n' "$*"
+  printf '[package-release] %s\n' "$*" >&2
 }
 
 run_make() {
@@ -229,6 +254,151 @@ write_checksums() {
   log "wrote $sums"
 }
 
+upload_one_artifact() {
+  local path="$1"
+  local file_name
+  file_name="$(basename "$path")"
+
+  log "uploading $file_name to OSS group $OSS_GROUP"
+  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    -u http_proxy -u https_proxy -u all_proxy \
+    curl -fsSL \
+      -F "file=@$path" \
+      -F "group=$OSS_GROUP" \
+      -F "downloadFileName=$file_name" \
+      "$OSS_BASE_URL/api/v1/oss/grouped/upload" \
+    >"$TMP_DIR/upload-$file_name.json"
+
+  python3 - "$TMP_DIR/upload-$file_name.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    payload = json.load(f)
+
+if isinstance(payload, dict) and payload.get("success") is False:
+    raise SystemExit(payload.get("message") or "upload failed")
+
+data = payload.get("data", payload) if isinstance(payload, dict) else payload
+if not isinstance(data, dict):
+    raise SystemExit("upload response is not an object")
+
+url = data.get("downloadUrl")
+if not url:
+    raise SystemExit("upload response missing downloadUrl")
+
+print(url)
+PY
+}
+
+artifact_kind() {
+  case "$1" in
+    joi-runtime-*.tar.gz) printf 'runtime' ;;
+    joi-gui-*.dmg) printf 'gui' ;;
+    SHA256SUMS) printf 'checksums' ;;
+    manifest.txt) printf 'manifest' ;;
+    *) printf 'file' ;;
+  esac
+}
+
+artifact_label() {
+  local file_name="$1"
+  local label="$file_name"
+  label="${label#joi-runtime-$VERSION-}"
+  label="${label#joi-gui-$VERSION-}"
+  label="${label%.tar.gz}"
+  label="${label%.dmg}"
+  case "$file_name" in
+    SHA256SUMS) label="SHA256 checksums" ;;
+    manifest.txt) label="Release manifest" ;;
+  esac
+  printf '%s' "$label"
+}
+
+write_portal_release_data() {
+  local uploads_json="$1"
+  mkdir -p "$(dirname "$PORTAL_RELEASE_DATA")"
+  python3 - "$uploads_json" "$PORTAL_RELEASE_DATA" "$VERSION" "$GIT_SHA" "$GENERATED_AT" "$OSS_GROUP" <<'PY'
+import json
+import sys
+
+uploads_path, out_path, version, git_sha, generated_at, group = sys.argv[1:7]
+with open(uploads_path, "r", encoding="utf-8") as f:
+    uploads = json.load(f)
+
+payload = {
+    "version": version,
+    "gitSha": git_sha,
+    "generatedAt": generated_at,
+    "group": group,
+    "artifacts": uploads,
+}
+
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("window.JOI_RELEASE_DOWNLOADS = ")
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+    f.write(";\n")
+PY
+  log "wrote $PORTAL_RELEASE_DATA"
+  if [[ -d pages/build ]]; then
+    cp "$PORTAL_RELEASE_DATA" pages/build/release-downloads.js
+    log "updated pages/build/release-downloads.js"
+  fi
+}
+
+upload_artifacts() {
+  local uploads_json="$TMP_DIR/uploads.json"
+  local first=1
+  printf '[\n' >"$uploads_json"
+
+  local artifacts=()
+  while IFS= read -r artifact; do
+    artifacts+=("$artifact")
+  done < <(find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \
+    \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'SHA256SUMS' -o -name 'manifest.txt' \) \
+    | sort)
+
+  if [[ "${#artifacts[@]}" -eq 0 ]]; then
+    echo "no package artifacts found for upload" >&2
+    exit 1
+  fi
+
+  for artifact in "${artifacts[@]}"; do
+    local file_name url size sha kind label
+    file_name="$(basename "$artifact")"
+    url="$(upload_one_artifact "$artifact")"
+    size="$(wc -c <"$artifact" | tr -d ' ')"
+    sha="$(checksum_cmd "$artifact" | awk '{print $1}')"
+    kind="$(artifact_kind "$file_name")"
+    label="$(artifact_label "$file_name")"
+
+    if [[ "$first" -eq 0 ]]; then
+      printf ',\n' >>"$uploads_json"
+    fi
+    first=0
+    python3 - "$uploads_json" "$file_name" "$label" "$kind" "$size" "$sha" "$url" <<'PY'
+import json
+import sys
+
+_, file_name, label, kind, size, sha, url = sys.argv
+item = {
+    "fileName": file_name,
+    "label": label,
+    "kind": kind,
+    "size": int(size),
+    "sha256": sha,
+    "downloadUrl": url,
+}
+with open(sys.argv[1], "a", encoding="utf-8") as f:
+    f.write("  ")
+    json.dump(item, f, ensure_ascii=False)
+PY
+  done
+
+  printf '\n]\n' >>"$uploads_json"
+  write_portal_release_data "$uploads_json"
+}
+
 mkdir -p "$PACKAGE_OUT_DIR"
 rm -f "$PACKAGE_OUT_DIR"/joi-runtime-*.tar.gz \
   "$PACKAGE_OUT_DIR"/joi-gui-*.dmg \
@@ -254,5 +424,11 @@ fi
 
 write_manifest
 write_checksums
+
+if [[ "$SKIP_UPLOAD" -eq 0 ]]; then
+  upload_artifacts
+else
+  log "skipping OSS upload"
+fi
 
 log "done: $PACKAGE_OUT_DIR"

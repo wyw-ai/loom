@@ -1,0 +1,10 @@
+{
+  "name": "joi-apps-pages",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Joi Apps static portal",
+  "scripts": {
+    "build": "bash build.sh"
+  }
+}

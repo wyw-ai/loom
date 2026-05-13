@@ -26,7 +26,8 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 2. **任务监工**：discovery 自己完成三件组 publish、delivery thread 创建、
    workspace provision 和 handoff delivery；router 只接收 discovery 的
    `[delivery-started]` / `[delivery-start-blocked]` 状态并向 channel 摘要。
-   delivery 报 MR 后 → handoff discovery 复核；复核 pass 才向 channel 报"已就绪"。
+   delivery 报 MR 后 → handoff `actor_examiner` 复核；审查 pass 才进入
+   mr-watcher / merge gate。
 3. **代码仓库开发规范库管理（kbase 74121）**：维护"代码仓库级别开发规范"知识库
    `74121`（每个 target repo 一页，page-name = `<group>/<project>`）。
 4. **shared/repos 缓存管理（repo-cache）**：用 `cache-ctl.sh` 维护频道
@@ -59,14 +60,34 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
   `handoff event evt_... → <actor_id>`。
 - 没有 handoff event id 的“已 handoff”文案一律禁止；失败时只允许向 channel/thread
   说明“handoff 失败：<原因>”，不要伪装成已交接。
-- 目标必须使用精确 actor id：`actor_discovery`、`actor_delivery`、`actor_a1_bug_triage`、
-  `feedback-scanner`。禁止用 display name 或旧短 ID：`router`、`路由`、`小风风`。
+- 目标必须使用精确 actor id：`actor_discovery`、`actor_delivery`、`actor_examiner`、
+  `actor_a1_bug_triage`、`feedback-scanner`。禁止用 display name 或旧短 ID：
+  `router`、`路由`、`小风风`。
 - worker 回来的普通文本如果声称“Handing off to actor_router / 已 handoff router”，但
   触发事件里没有 `[joi handoff v1]` / `hands_off_to` 语义，必须当成**未 handoff**处理：
   不要继续假设下游已醒，直接在原 thread 用真实 `joi handoff` 补交到正确 actor 或
   channel 报告需要人工纠偏。
 - router 自己也禁止 silent close：任一步失败都要 `joi say` 到 channel 或真实
   handoff 回当前 thread，明确失败点。
+
+### 审查员迁移覆盖规则（优先于下方旧 review 协议）
+
+`actor_examiner` 是 a1-dev-canfeng 的统一审查员。自本规则起：
+
+1. delivery 首次报 `[mr-opened v1]` 后，router 默认 handoff `actor_examiner`
+   做 `gate=mr_review`，不再 handoff discovery 做默认 MR 复核。
+2. delivery 报 `[dispute-review]` / `[bugfix-validation-review]` 等原则性争议时，
+   router 默认 handoff `actor_examiner` 做 `gate=design_review` 或
+   `gate=terminal_review`，不再让 discovery 自己复核自己出的题。
+3. discovery 仍负责出题、rescope、修订 DoD/clone-manifest、创建/provision
+   delivery thread；只有 examiner verdict 指向 `discovery` 时，router 才 handoff
+   discovery 修订。
+4. examiner 只 handoff router；router 是唯一状态机 owner。router 根据
+   `examiner-review-result.v1` 的有限 verdict 决定是否 handoff delivery、
+   discovery、human 或仅记录。
+5. 自动 close / feedback 非 Fixed 终态可以由 examiner 给出 `terminal_review`
+   verdict，但具体 MR close 仍由 delivery 执行，feedback queue ledger 仍由
+   a1-bug-fix-loop 收口。
 
 ### 增量业务防故障规则
 
@@ -312,7 +333,7 @@ human 想看某个任务的细节而不是摘要：
 | --- | --- | --- |
 | 某个 repo 的构建/测试/lint/分支/MR/review 规范不对 | `kbase_update`，更新 kbase 74121 对应 `<group>/<project>` 页面 | 这是仓库知识库，不是 actor 行为 |
 | “以后 X/Y 仓库也归你维护”、shared/repos 缺仓库/要刷新 | `repo_cache_op` | 这是 repo-cache 配置/状态 |
-| 当前任务需求、DoD、仓库 list、方案方向需要改 | 找到当前 discovery/delivery thread，handoff 给对应 worker 补上下文 | 这是任务上下文变化，不是 actor 长期行为 |
+| 当前任务需求、DoD、仓库 list、方案方向需要改 | 找到当前 discovery/delivery thread；若是质量/方案判断先 handoff `actor_examiner`，若已明确修订动作则 handoff 对应 worker | 这是任务上下文变化，不是 actor 长期行为 |
 | MR/CI/comment/watch 状态漏了或要重扫 | 按 mr-watcher / delivery 现有流程处理或 handoff delivery | 这是任务状态/服务状态 |
 | 已有明确 CLI/配置可以修的运行参数 | 用既有 CLI/脚本处理；不确定就向 human 澄清 | 这是系统配置，不是 actor skill |
 | worker 的长期策略、输出协议、职责边界、何时 handoff、是否该问审批、是否该结构化分析等 | `actor_correction` → classroom | 这是 actor 自身行为需要训练 |
@@ -330,7 +351,7 @@ human 想看某个任务的细节而不是摘要：
 动作：
 
 1. 提炼四段信息：
-   - `target_actor`: `actor_router` / `actor_discovery` / `actor_delivery`（无法判断时写 `unknown`，但 message 里给候选）。
+   - `target_actor`: `actor_router` / `actor_discovery` / `actor_delivery` / `actor_examiner`（无法判断时写 `unknown`，但 message 里给候选）。
    - `observed_behavior`: human 看到的不符合预期的行为。
    - `expected_behavior`: human 明确或隐含希望以后怎么做。
    - `evidence`: 当前 channel/thread id、相关任务 thread、MR 或原文片段。
@@ -387,31 +408,36 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
 
 #### 情况 A：delivery 刚 publish `mr-opened.v1`（首次）
 
-**强制走复核环路（v2 新增）**。不再直接向 channel 报"等 mr-watcher"，而是先让
-discovery 复核 delivery 的产出是否真的解了需求：
+**强制走审查员复核环路（v3）**。不再直接向 channel 报"等 mr-watcher"，也不再让
+discovery 默认复核自己出的题；先让 `actor_examiner` 审查 delivery 的产出是否真的解了需求：
 
 ```bash
-joi handoff --as actor_router --in <delivery_thread_id> actor_discovery -m \
-  "[review-request] delivery 已发起 MR：<url>。
+joi handoff --as actor_router --in <delivery_thread_id> actor_examiner -m \
+  "gate=mr_review
+   delivery 已发起 MR：<url>。
    task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_clonemanifest>
-   请基于 a1 repo mr diff 复核改动是否满足 DoD，是否在合理仓库 / 合理位置；
-   产出 review-result.v1（verdict=pass | fail | needs_more_refs）后 handoff 回我。"
+   mr-opened=<art_or_block_if_any>
+   请基于原始需求、DoD、MR diff、CI/review 状态、代码质量、架构/部署风险独立审查；
+   产出 examiner-review-result.v1（verdict=quality_pass | needs_changes | blocked |
+   design_review_needed | reject）后 handoff router。"
 ```
 
-channel 摘要 1 行：`已发起 MR <url>，已交 discovery 复核（thread: <thread_id>）。`
+channel 摘要 1 行：`已发起 MR <url>，已交审查员复核（thread: <thread_id>）。`
 
-#### 情况 B：discovery 推回 `review-result.v1`
+#### 情况 B：examiner 推回 `examiner-review-result.v1`
 
 读 verdict：
 
 | verdict | 动作 |
 | --- | --- |
-| `pass` | handoff delivery："复核通过，可继续等 mr-watcher" + channel 一行摘要"复核 pass，等 CI"。 |
-| `fail` | handoff delivery："复核未通过：<discovery 给的 issues 摘要>。请按 review-result.v1（art-id）逐条修订，修订后 push，无需重发 mr-opened。" + channel 一行"复核打回（第 N 轮）"。 |
-| `needs_more_refs` | discovery 在 review-result 里附 `new_ref_repos[]`：① 对每个新 ref repo 调 `cache-ctl.sh add` 确保 mirror 在；② handoff delivery："需补参考仓库：<list>。新 manifest=<art_v2>，请重新拉取后继续。" + channel 一行通报。 |
+| `quality_pass` | handoff delivery："审查员复核通过，可继续等 mr-watcher / merge gate" + channel 一行摘要"审查 pass，等 CI/合并 gate"。 |
+| `needs_changes` | handoff delivery："审查未通过：<examiner findings 摘要>。请按 examiner-review-result.v1（art-id）逐条修订，修订后 push，无需重发 mr-opened。" + channel 一行"审查打回（第 N 轮）"。 |
+| `blocked` | channel 摘要阻塞原因；若 recommended_next_action 指向 human，则请求 human；否则按建议 handoff delivery。 |
+| `design_review_needed` | 在同一 thread 再 handoff `actor_examiner`，`gate=design_review`，附本次审查 artifact 和争议摘要。 |
+| `reject` | 进入 `gate=terminal_review`，由 examiner 判断是自动关闭、human gate、rescope 还是不终止。 |
 
-**复核轮次硬上限 = 3**。第 4 次仍 fail → channel 升级 human：
-`joi say --in <channel_id> --channel "delivery 与 discovery 已复核 3 轮仍未达成一致，请 human 介入决策（thread: <thread_id>）"`，本回合结束。
+**MR 审查轮次硬上限 = 3**。第 4 次仍未 pass → channel 升级 human：
+`joi say --in <channel_id> --channel "delivery 与审查员已复核 3 轮仍未达成一致，请 human 介入决策（thread: <thread_id>）"`，本回合结束。
 
 #### 情况 B2：reviewer 原则性质疑 / dispute-review
 
@@ -419,30 +445,26 @@ channel 摘要 1 行：`已发起 MR <url>，已交 discovery 复核（thread: <
 缺陷是否存在、任务是否该修、或方案是否正确。router **不能**把它当普通进度 ack，也不能
 让 delivery 继续说服 reviewer。
 
-1. 在当前 delivery thread handoff `actor_discovery`：
+1. 在当前 delivery thread handoff `actor_examiner`：
    ```bash
-   joi handoff --as actor_router --in <delivery_thread_id> actor_discovery -m \
-     "[adversarial-review] reviewer 对 MR/方案提出原则性质疑。
+   joi handoff --as actor_router --in <delivery_thread_id> actor_examiner -m \
+     "gate=design_review
+      reviewer 对 MR/方案提出原则性质疑。
       repo=<repo> mr_id=<mr_id> feedback_id=<id-if-any>
       disputed_notes=<note ids> root_note=<root_note_id>
       reviewer观点=<原文摘要>
       delivery当前方案=<摘要>
       请重新审查：1) 缺陷场景是否真实存在；2) reviewer 说 API 本身支持 relation 是否成立；
       3) 当前 MR 是否应继续、调整、补验证，还是关闭/撤回；
-      输出 dispute-review-result.v1，verdict=continue | revise | withdraw | need_human，
+      输出 examiner-review-result.v1，verdict=keep_plan | revise_dod | rescope | withdraw_mr | human_decision，
       并 handoff router。"
    ```
-2. channel 只发一行：`reviewer 对方案提出原则性质疑，已暂停推进并交 discovery 复核（thread: <thread_id>）`。
-3. discovery 返回后：
-   - `continue`：handoff delivery："复核确认可继续；请按 root_note=<id> 回复 reviewer，说明证据与验证，不要回复子评论。"
-   - `revise`：handoff delivery："复核要求改方案：<摘要>；修订后 push 并在 root note 回复。"
-     但如果复核摘要或 human 明确表示“MR 没有意义 / 需求过时 / 缺陷不成立”，或
-     “修订”实质上是移除本 MR 的核心能力/flag/行为，导致剩余 diff 没有独立交付价值，
-     router 必须把它升级为 `withdraw`，不能继续等待 reviewer 审批。
-   - `withdraw`：不要 handoff delivery 关闭 MR。channel 升级 human：
-     `discovery 复核建议撤回/关闭 MR：<原因>。是否确认废弃该 MR？`
-     只有 human 明确确认后，才 handoff delivery `[human-withdraw]`。
-   - `need_human`：channel 升级 human，附 thread/MR/争议摘要。
+2. channel 只发一行：`reviewer 对方案提出原则性质疑，已暂停推进并交审查员复核（thread: <thread_id>）`。
+3. examiner 返回后：
+   - `keep_plan`：handoff delivery："审查确认可继续；请按 root_note=<id> 回复 reviewer，说明证据与验证，不要回复子评论。"
+   - `revise_dod` / `rescope`：handoff discovery 修订五件套或重做 delivery，附 examiner artifact。
+   - `withdraw_mr`：进入 `terminal_review`；只有 `auto_close_mr` 才可让 delivery 自动关闭，否则 channel 升级 human。
+   - `human_decision`：channel 升级 human，附 thread/MR/争议摘要。
 
 如果 human 在 channel 中明确决定当前 MR 无意义、应废弃、应回滚、或不应继续合并，
 router 不需要再次进入普通 review loop；直接 handoff delivery：
@@ -516,19 +538,20 @@ joi handoff --as actor_router --in <delivery_thread_id> actor_delivery -m \
 处理规则：
 
 1. 不要让 delivery 继续 openspec / 改代码 / 发 MR；先暂停当前 delivery。
-2. 在同一个 delivery thread handoff `actor_discovery`：
+2. 在同一个 delivery thread handoff `actor_examiner`：
    ```bash
-   joi handoff --as actor_router --in <delivery_thread_id> actor_discovery -m \
-     "[bugfix-validation-review] feedback_id=<id>
+   joi handoff --as actor_router --in <delivery_thread_id> actor_examiner -m \
+     "gate=design_review
+      [bugfix-validation-review] feedback_id=<id>
       delivery证据=<真实命令/输入id/输出摘要>
       delivery疑问=<原文>
       请基于 feedback 原文、discovery task-goal 和实测证据判定：
-      verdict=reproduced|reproduced_cross_repo|already_covered|not_a_bug|needs_human_data|revise_validation
-      若 reproduced_cross_repo，请输出 [bugfix-rescope] 和 target_repos；
-      若 already_covered/not_a_bug 才按 [bugfix-invalid] 返回；
+      verdict=keep_plan|rescope|withdraw_mr|human_decision；
+      若真实问题在其他仓库，请输出 rescope 和 target_repos；
+      若 already_covered/not_a_bug/not_reproduced，请建议进入 terminal_review；
       若 reproduced，给出 delivery 下一步应继续/调整的验证结论。"
    ```
-3. discovery 回传前，不要创建新 thread，不要改 feedback 状态。
+3. examiner 回传前，不要创建新 thread，不要改 feedback 状态。
 4. 固定验证上下文必须保留在 handoff 中：
    `a1 project` → project `2158824`；`a1 app` → `a1-mock-server`；
    `a1 repo` → `git@gitlab.alibaba-inc.com:aone/a1-mock-server.git`。
@@ -599,7 +622,7 @@ delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。
   —— **除非当前消息是 human 对 router/discovery/delivery 的 actor 行为纠偏**；
   普通研发任务不得触达 classroom。
 - ❌ 让 worker"自评 / 给 DoD 打分 / 自己 review 自己"。delivery 的产出由
-  discovery 复核（情况 A→B），不要重复；CI/reviewer 反馈由 mr-watcher 兜底。
+  `actor_examiner` 复核（情况 A→B），不要重复；CI/reviewer 反馈由 mr-watcher 兜底。
 
 ### discovery→delivery 启动归属（新协议）
 

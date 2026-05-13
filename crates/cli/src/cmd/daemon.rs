@@ -15,7 +15,8 @@ use agent_runtime::discovery::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::AgentSpec;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::cmd::agent_serve::{self, MachineHostSpec};
@@ -60,11 +61,13 @@ pub async fn run(
         &providers,
         inventory_revision,
     )));
+    let (machine_command_tx, mut machine_command_rx) = mpsc::unbounded_channel();
     let machine_host = MachineHostSpec {
         machine_id: machine.id.clone(),
         actor_id: machine_connection_actor_id(&machine),
         display_name: machine.name.clone(),
         metadata: machine_inventory.clone(),
+        command_tx: Some(machine_command_tx),
     };
 
     let (socket_path, proxy_handle) = if no_ipc {
@@ -107,34 +110,51 @@ pub async fn run(
     eprintln!("joi daemon: ready (ctrl-c to stop)");
 
     loop {
-        match load_machine_specs(
-            Some(&selected_machine_id),
+        match refresh_machine_runtime(
+            &selected_machine_id,
             &allow_actors,
+            &data_root,
+            &server_url,
+            &machine_inventory,
+            &mut inventory_revision,
+            &mut inventory_fingerprint,
+            &mut running_agents,
             &mut warned_missing,
         ) {
-            Ok(snapshot) => {
-                let next_fingerprint = machine_inventory_fingerprint(
-                    &snapshot.machine,
-                    &data_root,
-                    &snapshot.providers,
-                );
-                if next_fingerprint != inventory_fingerprint {
-                    inventory_revision = inventory_revision.saturating_add(1);
-                    inventory_fingerprint = next_fingerprint;
-                }
-                *machine_inventory.lock().unwrap() = machine_inventory_meta(
-                    &snapshot.machine,
-                    &data_root,
-                    &snapshot.providers,
-                    inventory_revision,
-                );
-                reconcile_agents(&mut running_agents, snapshot.specs, &server_url, &data_root)
-            }
+            Ok(()) => {}
             Err(e) => eprintln!("joi daemon: reload failed: {e:#}"),
         }
 
         tokio::select! {
             _ = shutdown_signal() => break,
+            maybe_command = machine_command_rx.recv() => {
+                let Some(command) = maybe_command else {
+                    eprintln!("joi daemon: machine command channel closed");
+                    continue;
+                };
+                let result = handle_machine_command(&selected_machine_id, &data_root, command.payload);
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    if let Err(err) = refresh_machine_runtime(
+                        &selected_machine_id,
+                        &allow_actors,
+                        &data_root,
+                        &server_url,
+                        &machine_inventory,
+                        &mut inventory_revision,
+                        &mut inventory_fingerprint,
+                        &mut running_agents,
+                        &mut warned_missing,
+                    ) {
+                        let fallback = machine_command_error_from_result(
+                            &result,
+                            format!("machine command applied but runtime refresh failed: {err:#}"),
+                        );
+                        let _ = command.reply.send(fallback);
+                        continue;
+                    }
+                }
+                let _ = command.reply.send(result);
+            }
             _ = sleep(CONFIG_RELOAD_INTERVAL) => {}
         }
     }
@@ -192,6 +212,34 @@ struct MachineSpecs {
 struct RunningAgent {
     fingerprint: String,
     handle: tokio::task::JoinHandle<()>,
+}
+
+fn refresh_machine_runtime(
+    selected_machine_id: &str,
+    allow_actors: &[String],
+    data_root: &PathBuf,
+    server_url: &str,
+    machine_inventory: &Arc<Mutex<Value>>,
+    inventory_revision: &mut u64,
+    inventory_fingerprint: &mut String,
+    running_agents: &mut HashMap<String, RunningAgent>,
+    warned_missing: &mut HashSet<String>,
+) -> Result<()> {
+    let snapshot = load_machine_specs(Some(selected_machine_id), allow_actors, warned_missing)?;
+    let next_fingerprint =
+        machine_inventory_fingerprint(&snapshot.machine, data_root, &snapshot.providers);
+    if next_fingerprint != *inventory_fingerprint {
+        *inventory_revision = inventory_revision.saturating_add(1);
+        *inventory_fingerprint = next_fingerprint;
+    }
+    *machine_inventory.lock().unwrap() = machine_inventory_meta(
+        &snapshot.machine,
+        data_root,
+        &snapshot.providers,
+        *inventory_revision,
+    );
+    reconcile_agents(running_agents, snapshot.specs, server_url, data_root);
+    Ok(())
 }
 
 fn load_machine_specs(
@@ -317,6 +365,254 @@ fn print_providers(providers: &[DetectedAgentProvider]) {
     }
 }
 
+fn handle_machine_command(selected_machine_id: &str, data_root: &PathBuf, payload: Value) -> Value {
+    let command_id = payload
+        .get("commandId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let machine_id = payload
+        .get("machineId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let machine_actor_id = payload
+        .get("machineActorId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let result_prefix = || {
+        json!({
+            "commandId": command_id,
+            "machineId": machine_id,
+            "machineActorId": machine_actor_id,
+        })
+    };
+    if machine_id != selected_machine_id {
+        return machine_command_error(result_prefix(), "command targets a different machine");
+    }
+    let result = match apply_machine_command(selected_machine_id, data_root, &payload) {
+        Ok(output) => {
+            let mut result = result_prefix();
+            result["ok"] = json!(true);
+            result["output"] = output;
+            result
+        }
+        Err(err) => machine_command_error(result_prefix(), format!("{err:#}")),
+    };
+    result
+}
+
+fn machine_command_error_from_result(result: &Value, error: impl Into<String>) -> Value {
+    machine_command_error(
+        json!({
+            "commandId": result.get("commandId").cloned().unwrap_or(Value::Null),
+            "machineId": result.get("machineId").cloned().unwrap_or(Value::Null),
+            "machineActorId": result.get("machineActorId").cloned().unwrap_or(Value::Null),
+        }),
+        error,
+    )
+}
+
+fn machine_command_error(mut result: Value, error: impl Into<String>) -> Value {
+    result["ok"] = json!(false);
+    result["error"] = json!(error.into());
+    result
+}
+
+fn apply_machine_command(
+    selected_machine_id: &str,
+    data_root: &PathBuf,
+    payload: &Value,
+) -> Result<Value> {
+    let command = payload
+        .get("command")
+        .ok_or_else(|| anyhow!("missing command payload"))?;
+    let op = command
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("machine command op is required"))?;
+    let mut cfg = load_desktop_config()?;
+    let machine_index = cfg
+        .machines
+        .iter()
+        .position(|machine| machine.id == selected_machine_id)
+        .ok_or_else(|| anyhow!("unknown machine id: {selected_machine_id}"))?;
+
+    match op {
+        "agent.create" => {
+            let agent = agent_config_from_command(command, selected_machine_id)?;
+            if cfg.machines[machine_index]
+                .agents
+                .iter()
+                .any(|existing| existing.actor_id == agent.actor_id)
+            {
+                return Err(anyhow!("agent actor already exists: {}", agent.actor_id));
+            }
+            let providers = apply_provider_overrides(
+                detect_agent_cli_providers(),
+                &cfg.machines[machine_index].providers,
+            );
+            if !providers
+                .iter()
+                .any(|provider| provider.id == agent.provider_id)
+            {
+                return Err(anyhow!(
+                    "provider `{}` is not available on the remote machine",
+                    agent.provider_id
+                ));
+            }
+            cfg.machines[machine_index].agents.push(agent.clone());
+            save_desktop_config(&cfg)?;
+            Ok(json!({ "agent": agent }))
+        }
+        "agent.remove" => {
+            let actor_id = required_str(command, "actorId")?;
+            let machine = &mut cfg.machines[machine_index];
+            let before = machine.agents.len();
+            machine.agents.retain(|agent| agent.actor_id != actor_id);
+            if machine.agents.len() == before {
+                return Err(anyhow!("daemon-configured agent not found: {actor_id}"));
+            }
+            save_desktop_config(&cfg)?;
+            Ok(json!({ "actorId": actor_id }))
+        }
+        "agent.profile.read" => {
+            let actor_id = required_str(command, "actorId")?;
+            let file = required_str(command, "file")?;
+            let path = resolve_machine_agent_profile_file(
+                &cfg.machines[machine_index],
+                data_root,
+                actor_id,
+                file,
+            )?;
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            Ok(json!({
+                "path": path.display().to_string(),
+                "text": text,
+            }))
+        }
+        "agent.profile.write" => {
+            let actor_id = required_str(command, "actorId")?;
+            let file = required_str(command, "file")?;
+            let text = command
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("text is required"))?;
+            let path = resolve_machine_agent_profile_file(
+                &cfg.machines[machine_index],
+                data_root,
+                actor_id,
+                file,
+            )?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create directory {}", parent.display()))?;
+            }
+            std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+            Ok(json!({
+                "path": path.display().to_string(),
+                "text": text,
+            }))
+        }
+        other => Err(anyhow!("unsupported machine command op: {other}")),
+    }
+}
+
+fn agent_config_from_command(command: &Value, machine_id: &str) -> Result<MachineAgentConfig> {
+    let name = required_str(command, "name")?.trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("agent name is required"));
+    }
+    let actor_id = command
+        .get("actorId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("actor_agent_{}_{}", slugify(&name), machine_id));
+    Ok(MachineAgentConfig {
+        provider_id: required_str(command, "providerId")?.to_string(),
+        actor_id,
+        name,
+        description: command
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        model: command
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        reasoning_effort: command
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        autostart: command
+            .get("autostart")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn resolve_machine_agent_profile_file(
+    machine: &MachineConfig,
+    data_root: &PathBuf,
+    actor_id: &str,
+    file: &str,
+) -> Result<PathBuf> {
+    if !machine
+        .agents
+        .iter()
+        .any(|agent| agent.actor_id == actor_id)
+    {
+        return Err(anyhow!("unknown agent actor id: {actor_id}"));
+    }
+    let file_name = match file.trim() {
+        "identity" => "identity.md",
+        "soul" => "soul.md",
+        other => return Err(anyhow!("unknown profile file: {other}")),
+    };
+    Ok(data_root
+        .join("agents")
+        .join(actor_id)
+        .join("profile")
+        .join(file_name))
+}
+
+fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{field} is required"))
+}
+
+fn slugify(value: &str) -> String {
+    let slug: String = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        "agent".into()
+    } else {
+        slug.into()
+    }
+}
+
 fn warn_missing_providers_once(
     definitions: &[AgentDefinition],
     providers: &[DetectedAgentProvider],
@@ -340,7 +636,7 @@ fn warn_missing_providers_once(
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DesktopConfig {
     #[serde(default)]
     active: Option<String>,
@@ -352,19 +648,19 @@ struct DesktopConfig {
     machines: Vec<MachineConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HumanAccount {
     #[serde(default)]
     actor_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceConfig {
     id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MachineConfig {
     #[serde(default)]
@@ -418,7 +714,15 @@ fn machine_inventory_meta(
         "kind": &machine.kind,
         "dataRoot": data_root.display().to_string(),
         "configDir": config::config_dir().display().to_string(),
-        "capabilities": ["inventory.read", "connection.status"],
+        "capabilities": [
+            "inventory.read",
+            "connection.status",
+            "machine.command",
+            "agent.create",
+            "agent.remove",
+            "agent.profile.read",
+            "agent.profile.write"
+        ],
         "providers": providers,
         "agents": &machine.agents,
     })
@@ -453,6 +757,16 @@ fn load_desktop_config() -> Result<DesktopConfig> {
         .with_context(|| format!("read desktop config {}", path.display()))?;
     let cfg = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(cfg)
+}
+
+fn save_desktop_config(cfg: &DesktopConfig) -> Result<()> {
+    let path = config::config_dir().join("desktop.toml");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create config dir {}", parent.display()))?;
+    }
+    let text = toml::to_string_pretty(cfg)?;
+    std::fs::write(&path, text).with_context(|| format!("write desktop config {}", path.display()))
 }
 
 fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<MachineConfig> {

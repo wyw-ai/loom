@@ -600,6 +600,7 @@ mod tests {
 
     use crate::artifacts::ArtifactStore;
     use crate::journal::Journal;
+    use crate::machine_commands::MachineCommandBroker;
     use crate::scope_skills::ScopeSkills;
     use crate::store::Store;
     use crate::subscribe::Subscriptions;
@@ -636,6 +637,7 @@ mod tests {
             subscriptions,
             artifacts,
             scope_skills,
+            machine_commands: MachineCommandBroker::new(),
         }
     }
 

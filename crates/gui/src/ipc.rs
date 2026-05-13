@@ -831,32 +831,82 @@ pub struct AgentProfileFileResult {
 
 #[tauri::command]
 pub async fn agent_profile_file_read(
+    state: State<'_, AppState>,
     args: AgentProfileFileReadArgs,
 ) -> Result<AgentProfileFileResult, String> {
-    let path = resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file)
-        .map_err(stringify)?;
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    Ok(AgentProfileFileResult {
-        path: config::home_path_expr(&path),
-        text,
-    })
+    match resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file) {
+        Ok(path) => {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            Ok(AgentProfileFileResult {
+                path: config::home_path_expr(&path),
+                text,
+            })
+        }
+        Err(local_err) => {
+            let cfg = config::load_or_init().map_err(stringify)?;
+            if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
+                .await
+                .is_none()
+            {
+                return Err(stringify(local_err));
+            }
+            let output = run_remote_machine_command(
+                &state,
+                &cfg,
+                &args.machine_id,
+                json!({
+                    "op": "agent.profile.read",
+                    "actorId": args.actor_id,
+                    "file": args.file,
+                }),
+            )
+            .await?;
+            profile_file_result_from_output(output)
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn agent_profile_file_write(
+    state: State<'_, AppState>,
     args: AgentProfileFileWriteArgs,
 ) -> Result<AgentProfileFileResult, String> {
-    let path = resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file)
-        .map_err(stringify)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create directory {}: {e}", parent.display()))?;
+    match resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file) {
+        Ok(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create directory {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&path, &args.text)
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
+            Ok(AgentProfileFileResult {
+                path: config::home_path_expr(&path),
+                text: args.text,
+            })
+        }
+        Err(local_err) => {
+            let cfg = config::load_or_init().map_err(stringify)?;
+            if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
+                .await
+                .is_none()
+            {
+                return Err(stringify(local_err));
+            }
+            let output = run_remote_machine_command(
+                &state,
+                &cfg,
+                &args.machine_id,
+                json!({
+                    "op": "agent.profile.write",
+                    "actorId": args.actor_id,
+                    "file": args.file,
+                    "text": args.text,
+                }),
+            )
+            .await?;
+            profile_file_result_from_output(output)
+        }
     }
-    std::fs::write(&path, &args.text).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(AgentProfileFileResult {
-        path: config::home_path_expr(&path),
-        text: args.text,
-    })
 }
 
 #[derive(Deserialize)]
@@ -999,18 +1049,34 @@ pub async fn machine_agent_create(
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
     let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
     let actor_id = actor_id_from_input(&args.actor_id, name, &machine_id).map_err(stringify)?;
-    let machine_index = cfg
-        .machines
-        .iter()
-        .position(|machine| {
-            machine.id == machine_id
-                && config::machine_belongs_to_workspace_and_owner(
-                    machine,
-                    active_workspace_id.as_deref(),
-                    active_owner_actor_id.as_deref(),
-                )
-        })
-        .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
+    let maybe_machine_index = cfg.machines.iter().position(|machine| {
+        machine.id == machine_id
+            && config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
+    });
+    let Some(machine_index) = maybe_machine_index else {
+        let output = run_remote_machine_command(
+            &state,
+            &cfg,
+            &machine_id,
+            json!({
+                "op": "agent.create",
+                "providerId": args.provider_id,
+                "actorId": actor_id,
+                "name": name,
+                "description": args.description,
+                "model": args.model,
+                "reasoningEffort": args.reasoning_effort,
+                "autostart": args.autostart,
+            }),
+        )
+        .await?;
+        drop(output);
+        return machines_from_config(&cfg, state.try_client().await).await;
+    };
     if cfg.machines[machine_index]
         .agents
         .iter()
@@ -1071,18 +1137,28 @@ pub async fn machine_agent_remove(
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
     let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
-    let machine = cfg
-        .machines
-        .iter_mut()
-        .find(|machine| {
-            machine.id == args.machine_id
-                && config::machine_belongs_to_workspace_and_owner(
-                    machine,
-                    active_workspace_id.as_deref(),
-                    active_owner_actor_id.as_deref(),
-                )
-        })
-        .ok_or_else(|| format!("unknown machine id: {}", args.machine_id))?;
+    let maybe_machine = cfg.machines.iter_mut().find(|machine| {
+        machine.id == args.machine_id
+            && config::machine_belongs_to_workspace_and_owner(
+                machine,
+                active_workspace_id.as_deref(),
+                active_owner_actor_id.as_deref(),
+            )
+    });
+    let Some(machine) = maybe_machine else {
+        let output = run_remote_machine_command(
+            &state,
+            &cfg,
+            &args.machine_id,
+            json!({
+                "op": "agent.remove",
+                "actorId": args.actor_id,
+            }),
+        )
+        .await?;
+        drop(output);
+        return machines_from_config(&cfg, state.try_client().await).await;
+    };
     let before = machine.agents.len();
     machine
         .agents
@@ -1242,6 +1318,76 @@ async fn merge_server_machine_inventory(
     }
 }
 
+async fn server_machine_by_id(
+    cfg: &DesktopConfig,
+    client: Option<Arc<Client>>,
+    machine_id: &str,
+) -> Option<MachineInfo> {
+    let client = client?;
+    let server_url = active_server_url(cfg);
+    let value = client.call_raw(method::ACTOR_LIST, None).await.ok()?;
+    let actors = value.get("actors").and_then(Value::as_array)?;
+    actors
+        .iter()
+        .filter_map(|actor| server_machine_info_from_actor(actor, cfg, server_url))
+        .find(|machine| machine.id == machine_id)
+}
+
+async fn run_remote_machine_command(
+    state: &State<'_, AppState>,
+    cfg: &DesktopConfig,
+    machine_id: &str,
+    command: Value,
+) -> Result<Value, String> {
+    let client = state
+        .try_client()
+        .await
+        .ok_or_else(|| "connect to the workspace before managing a remote machine".to_string())?;
+    let machine = server_machine_by_id(cfg, Some(client.clone()), machine_id)
+        .await
+        .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
+    if machine.read_only {
+        return Err(format!(
+            "machine `{}` does not advertise machine.command capability",
+            machine.id
+        ));
+    }
+    let value = client
+        .call_raw(
+            method::MACHINE_COMMAND,
+            Some(json!({
+                "machineId": machine.id,
+                "machineActorId": machine.connection_actor_id,
+                "command": command,
+                "timeoutMs": 30_000,
+            })),
+        )
+        .await
+        .map_err(deep_stringify)?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("remote machine command failed");
+        return Err(error.to_string());
+    }
+    Ok(value.get("output").cloned().unwrap_or(Value::Null))
+}
+
+fn profile_file_result_from_output(output: Value) -> Result<AgentProfileFileResult, String> {
+    let path = output
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "remote profile result missing path".to_string())?
+        .to_string();
+    let text = output
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "remote profile result missing text".to_string())?
+        .to_string();
+    Ok(AgentProfileFileResult { path, text })
+}
+
 fn server_machine_info_from_actor(
     actor: &Value,
     cfg: &DesktopConfig,
@@ -1327,12 +1473,16 @@ fn server_machine_info_from_actor(
         shell_arg(&machine_id),
     );
 
+    let read_only = !meta
+        .capabilities
+        .iter()
+        .any(|capability| capability == "machine.command");
     Some(MachineInfo {
         id: machine_id,
         name,
         kind,
         source: "server_inventory".into(),
-        read_only: true,
+        read_only,
         capabilities: meta.capabilities,
         inventory_revision: meta.revision,
         inventory_observed_at: Some(meta.observed_at),
@@ -2013,7 +2163,7 @@ mod tests {
                 "kind": "remote",
                 "dataRoot": "/home/canfeng/.agentx/machine_remote",
                 "configDir": "/home/canfeng/.joi-apps",
-                "capabilities": ["inventory.read", "connection.status"],
+                "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",
                     "displayName": "Claude Code",
@@ -2038,12 +2188,13 @@ mod tests {
 
         assert_eq!(machine.id, "machine_remote");
         assert_eq!(machine.source, "server_inventory");
-        assert!(machine.read_only);
+        assert!(!machine.read_only);
         assert_eq!(
             machine.capabilities,
             vec![
                 "inventory.read".to_string(),
-                "connection.status".to_string()
+                "connection.status".to_string(),
+                "machine.command".to_string()
             ]
         );
         assert_eq!(machine.inventory_revision, 7);

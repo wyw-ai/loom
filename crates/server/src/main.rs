@@ -1,6 +1,7 @@
 mod artifacts;
 mod handlers;
 mod journal;
+mod machine_commands;
 mod scope_skills;
 mod state;
 mod store;
@@ -17,6 +18,7 @@ use clap::Parser;
 
 use crate::artifacts::ArtifactStore;
 use crate::journal::Journal;
+use crate::machine_commands::MachineCommandBroker;
 use crate::scope_skills::ScopeSkills;
 use crate::state::AppState;
 use crate::store::Store;
@@ -62,6 +64,7 @@ async fn main() -> Result<()> {
         args.data_dir.join("workspaces"),
         args.data_dir.join("agents"),
     )?);
+    let machine_commands = MachineCommandBroker::new();
     scope_skills.reconcile(&store)?;
 
     let state = AppState {
@@ -69,6 +72,7 @@ async fn main() -> Result<()> {
         subscriptions,
         artifacts,
         scope_skills,
+        machine_commands,
     };
 
     // Stream broadcaster (store events -> stream/update notifications).

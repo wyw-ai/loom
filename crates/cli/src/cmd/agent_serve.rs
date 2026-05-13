@@ -35,9 +35,9 @@ use proto::types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::time::{sleep, Duration};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, sleep, Duration};
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -309,12 +309,18 @@ fn current_joi_binary() -> Option<PathBuf> {
         .or_else(|| Some(PathBuf::from("joi")))
 }
 
-#[derive(Debug, Clone)]
+pub struct MachineCommandTask {
+    pub payload: Value,
+    pub reply: oneshot::Sender<Value>,
+}
+
+#[derive(Clone)]
 pub struct MachineHostSpec {
     pub machine_id: String,
     pub actor_id: String,
     pub display_name: String,
     pub metadata: Arc<Mutex<Value>>,
+    pub command_tx: Option<mpsc::UnboundedSender<MachineCommandTask>>,
 }
 
 async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
@@ -355,11 +361,112 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
         host.machine_id, server_url, host.actor_id
     );
 
+    let mut notifications = client.notifications.lock().await;
+    let mut heartbeat = interval(Duration::from_secs(15));
     loop {
-        sleep(Duration::from_secs(15)).await;
-        upsert_machine_actor(&client, host).await?;
-        let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                upsert_machine_actor(&client, host).await?;
+                let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
+            }
+            maybe_notification = notifications.recv() => {
+                let Some(notification) = maybe_notification else {
+                    return Err(anyhow!("machine host notification stream closed"));
+                };
+                if notification.method == method::MACHINE_COMMAND {
+                    handle_machine_command_notification(&client, host, notification.params).await?;
+                }
+            }
+        }
     }
+}
+
+async fn handle_machine_command_notification(
+    client: &Client,
+    host: &MachineHostSpec,
+    params: Option<Value>,
+) -> Result<()> {
+    let Some(payload) = params else {
+        return Ok(());
+    };
+    let command_id = payload
+        .get("commandId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let machine_id = payload
+        .get("machineId")
+        .and_then(Value::as_str)
+        .unwrap_or(&host.machine_id)
+        .to_string();
+    let machine_actor_id = payload
+        .get("machineActorId")
+        .and_then(Value::as_str)
+        .unwrap_or(&host.actor_id)
+        .to_string();
+    if command_id.trim().is_empty() {
+        tracing::warn!("machine command notification without commandId");
+        return Ok(());
+    }
+
+    let result = if machine_id != host.machine_id || machine_actor_id != host.actor_id {
+        json!({
+            "commandId": command_id,
+            "machineId": machine_id,
+            "machineActorId": machine_actor_id,
+            "ok": false,
+            "error": "machine command target mismatch",
+        })
+    } else if let Some(command_tx) = &host.command_tx {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if command_tx
+            .send(MachineCommandTask {
+                payload,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            json!({
+                "commandId": command_id,
+                "machineId": machine_id,
+                "machineActorId": machine_actor_id,
+                "ok": false,
+                "error": "machine command executor is unavailable",
+            })
+        } else {
+            match tokio::time::timeout(Duration::from_secs(30), reply_rx).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => json!({
+                    "commandId": command_id,
+                    "machineId": machine_id,
+                    "machineActorId": machine_actor_id,
+                    "ok": false,
+                    "error": "machine command executor dropped the reply channel",
+                }),
+                Err(_) => json!({
+                    "commandId": command_id,
+                    "machineId": machine_id,
+                    "machineActorId": machine_actor_id,
+                    "ok": false,
+                    "error": "machine command executor timed out",
+                }),
+            }
+        }
+    } else {
+        json!({
+            "commandId": command_id,
+            "machineId": machine_id,
+            "machineActorId": machine_actor_id,
+            "ok": false,
+            "error": "machine command executor is not configured",
+        })
+    };
+
+    upsert_machine_actor(client, host).await?;
+    let _: Value = client
+        .call_raw(method::MACHINE_COMMAND_RESULT, Some(result))
+        .await?;
+    Ok(())
 }
 
 async fn upsert_machine_actor(client: &Client, host: &MachineHostSpec) -> Result<()> {

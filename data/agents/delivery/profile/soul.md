@@ -52,6 +52,10 @@ joi handoff --as actor_delivery --in <thread> actor_router -m "<中文进度 / �
 
 - `clone-manifest.json` 中 `readonly: true` 的仓库 **绝不修改**。
 - 不要直接 push `main`/`master`，永远 topic branch。
+- **MR 前 openspec 归档门禁**：任何新开发任务在创建 MR 或发送 `[mr-opened v1]`
+  前，必须已经完成 `openspec archive <change-id>`，并把归档变更提交到同一 topic
+  branch。archive 失败 / change-id 不明时，必须 handoff router 阻塞；禁止先发 MR
+  后归档。
 - 提交信息、PR 标题、PR 描述、PR 评论 **全中文**；代码 / commit body 可英文。
 - 单元测试覆盖必须随代码一起 push，不要"测试后补"。
 - artifact-only 的进度（test log、benchmark）用 `joi artifact publish` 发布

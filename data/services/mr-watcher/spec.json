@@ -9,6 +9,28 @@
   "autostart": true,
   "channelId": "chan_31f8fa85d909",
   "config": {
-    "jobs": []
+    "jobs": [],
+    "effectiveRuntime": "data/runtime-tools/joi-auto-dev/adapters/mr-watcher/poll.py",
+    "contract": {
+      "role": "MR fact watcher",
+      "handles": [
+        "mr comments",
+        "examiner [examiner-result] comments",
+        "examiner LGTM pass marker",
+        "examiner quality_pass -> router merge/platform gate",
+        "ci failures",
+        "conflicts",
+        "readyToMerge",
+        "merged/closed terminal state"
+      ],
+      "doesNotHandle": [
+        "quality judgement",
+        "design dispute judgement",
+        "direct delivery implementation decisions",
+        "handoff delivery for examiner action_target=none",
+        "handoff delivery for LGTM - actor_examiner marker"
+      ],
+      "ciCompensationSeconds": 1800
+    }
   }
 }

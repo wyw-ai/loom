@@ -23,7 +23,9 @@
       "off",
       "-p"
     ],
-    "env": {},
+    "env": {
+      "PATH": "/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.cargo/bin:/home/canfeng/.local/bin:/home/canfeng/bin:/home/canfeng/joi-apps:/home/canfeng/canfeng-projects/a1/a1:/usr/local/bin:/usr/bin:/bin"
+    },
     "model": "gpt-5.5",
     "modelArgs": [
       "--model",

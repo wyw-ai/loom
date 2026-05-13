@@ -41,8 +41,11 @@ pub const ENV_CONFIG_DIR: &str = "JOI_CONFIG_DIR";
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub server_url: String,
+    #[serde(default)]
     pub actor_id: String,
     #[serde(default)]
     pub display_name: String,
@@ -314,11 +317,45 @@ pub fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
         .map(|account| account.actor_id.as_str())
 }
 
+pub fn active_owner_actor_id(cfg: &DesktopConfig) -> Option<String> {
+    if let Some(actor_id) = active_account_actor_id(cfg)
+        .map(str::trim)
+        .filter(|actor_id| !actor_id.is_empty())
+    {
+        return Some(actor_id.to_string());
+    }
+    if let Some(actor_id) = active_workspace_id(cfg)
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .map(|workspace| workspace.actor_id.trim())
+        .filter(|actor_id| !actor_id.is_empty())
+    {
+        return Some(actor_id.to_string());
+    }
+
+    let active_workspace_id = active_workspace_id(cfg);
+    let mut owners = cfg
+        .machines
+        .iter()
+        .filter(|machine| machine.workspace_id.as_deref() == active_workspace_id)
+        .filter_map(|machine| machine.owner_actor_id.as_deref())
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners.dedup();
+    if owners.len() == 1 {
+        Some(owners[0].to_string())
+    } else {
+        None
+    }
+}
+
 pub fn machine_belongs_to_active_workspace(machine: &MachineConfig, cfg: &DesktopConfig) -> bool {
+    let owner_actor_id = active_owner_actor_id(cfg);
     machine_belongs_to_workspace_and_owner(
         machine,
         active_workspace_id(cfg),
-        active_account_actor_id(cfg),
+        owner_actor_id.as_deref(),
     )
 }
 
@@ -398,6 +435,9 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
         cfg.active = Some(active_id.clone());
         changed = true;
     }
+    if repair_workspace_fields(&mut cfg) {
+        changed = true;
+    }
 
     for machine in &mut cfg.machines {
         if machine.workspace_id.is_none() {
@@ -409,7 +449,7 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
         }
     }
 
-    let active_owner_actor_id = active_account_actor_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = active_owner_actor_id(&cfg);
     let workspace_ids: Vec<String> = cfg
         .workspaces
         .iter()
@@ -435,6 +475,38 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
         save(&cfg).ok();
     }
     cfg
+}
+
+fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
+    let mut changed = false;
+    let account_display = cfg.account.as_ref().map(account_display_name);
+    let account_actor_id = active_account_actor_id(cfg).map(ToString::to_string);
+    for workspace in &mut cfg.workspaces {
+        if workspace.name.trim().is_empty() {
+            workspace.name = "Local".into();
+            changed = true;
+        }
+        if workspace.server_url.trim().is_empty() {
+            workspace.server_url = "ws://127.0.0.1:7878/rpc".into();
+            changed = true;
+        }
+        if workspace.actor_id.trim().is_empty() {
+            if let Some(actor_id) = account_actor_id.as_ref() {
+                workspace.actor_id = actor_id.clone();
+                changed = true;
+            }
+        }
+        if workspace.display_name.trim().is_empty() {
+            if let Some(display_name) = account_display.as_ref() {
+                workspace.display_name = display_name.clone();
+                changed = true;
+            } else if !workspace.actor_id.trim().is_empty() {
+                workspace.display_name = workspace.actor_id.clone();
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn default_machine() -> MachineConfig {
@@ -577,6 +649,58 @@ mod tests {
             &other_owner_machine,
             &cfg
         ));
+    }
+
+    #[test]
+    fn machine_filter_can_fallback_to_unique_machine_owner() {
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: None,
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: String::new(),
+                display_name: String::new(),
+            }],
+            machines: vec![default_machine_for_workspace(
+                "default",
+                Some("actor_human_88084"),
+            )],
+        };
+        let machine = default_machine_for_workspace("default", Some("actor_human_88084"));
+        let other_owner_machine = MachineConfig {
+            owner_actor_id: Some("actor_human_other".into()),
+            ..machine.clone()
+        };
+
+        assert_eq!(
+            active_owner_actor_id(&cfg).as_deref(),
+            Some("actor_human_88084")
+        );
+        assert!(machine_belongs_to_active_workspace(&machine, &cfg));
+        assert!(!machine_belongs_to_active_workspace(
+            &other_owner_machine,
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn workspace_fields_default_when_daemon_saved_lossy_config() {
+        let cfg: DesktopConfig = toml::from_str(
+            r#"
+active = "default"
+
+[[workspaces]]
+id = "default"
+"#,
+        )
+        .expect("parse lossy desktop config");
+
+        let mut cfg = cfg;
+        assert!(repair_workspace_fields(&mut cfg));
+        assert_eq!(cfg.workspaces[0].name, "Local");
+        assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
     }
 
     #[test]

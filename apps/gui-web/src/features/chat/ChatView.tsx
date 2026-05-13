@@ -31,6 +31,7 @@ export function ChatView() {
   const scope = useChannels((s) => s.currentScope);
   const channels = useChannels((s) => s.channels);
   const threads = useChannels((s) => s.threadsByChannel);
+  const archivedThreads = useChannels((s) => s.archivedThreadsByChannel);
   const membersByChannel = useChannels((s) => s.membersByChannel);
   const ensureScope = useMessages((s) => s.ensureScope);
   const scopeStoreAll = useMessages((s) => s.byScope);
@@ -64,26 +65,33 @@ export function ChatView() {
       };
     }
     let title = scope.id;
-    let parentChannel:
-      | { id: string; title: string; visibility: "public" | "private" }
-      | null = null;
-    let rootEventId: string | null = null;
-    for (const [chId, ts] of Object.entries(threads)) {
-      const t = ts.find((x) => x.id === scope.id);
-      if (t) {
-        title = t.title;
-        rootEventId = t.rootEventId ?? null;
+    const findThreadHeader = (entries: Array<[string, (typeof threads)[string]]>) => {
+      for (const [chId, ts] of entries) {
+        const t = ts.find((x) => x.id === scope.id);
+        if (!t) continue;
         const ch = channels.find((c) => c.id === chId);
-        if (ch) {
-          parentChannel = {
-            id: ch.id,
-            title: ch.title,
-            visibility: ch.visibility,
-          };
-        }
-        break;
+        return {
+          title: t.title,
+          rootEventId: t.rootEventId ?? null,
+          parentChannel: ch
+            ? {
+                id: ch.id,
+                title: ch.title,
+                visibility: ch.visibility,
+              }
+            : null,
+        };
       }
+      return null;
+    };
+    const threadHeader =
+      findThreadHeader(Object.entries(threads)) ??
+      findThreadHeader(Object.entries(archivedThreads));
+    if (threadHeader) {
+      title = threadHeader.title;
     }
+    const parentChannel = threadHeader?.parentChannel ?? null;
+    const rootEventId = threadHeader?.rootEventId ?? null;
     return {
       kind: "thread" as const,
       title,
@@ -99,7 +107,7 @@ export function ChatView() {
         ? channels.find((c) => c.id === parentChannel.id) ?? null
         : null,
     };
-  }, [scope, channels, threads]);
+  }, [scope, channels, threads, archivedThreads]);
 
   if (!scope) {
     return (

@@ -303,6 +303,11 @@ export interface MachineInfo {
   id: string;
   name: string;
   kind: string;
+  source: "local_config" | "server_inventory" | string;
+  readOnly: boolean;
+  capabilities: string[];
+  inventoryRevision: number;
+  inventoryObservedAt?: string | null;
   status: string;
   setupStatus: string;
   connectionStatus: string;

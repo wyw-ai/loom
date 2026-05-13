@@ -127,6 +127,10 @@ export function MachinesPage() {
   };
 
   const createAgent = async (machine: MachineInfo, input: AgentCreateInput) => {
+    if (machine.readOnly) {
+      pushToast("warn", "remote computers are read-only until server-mediated commands land");
+      return;
+    }
     const result = await ipc.machineAgentCreate({
       machineId: machine.id,
       providerId: input.providerId,
@@ -143,6 +147,10 @@ export function MachinesPage() {
   };
 
   const removeMachine = (machine: MachineInfo) => {
+    if (machine.readOnly) {
+      pushToast("warn", "remote computers are read-only until server-mediated commands land");
+      return;
+    }
     if (machines.length <= 1) {
       pushToast("warn", "At least one computer is required");
       return;
@@ -167,6 +175,10 @@ export function MachinesPage() {
   };
 
   const removeAgent = (machine: MachineInfo, agent: MachineAgentInfo) => {
+    if (machine.readOnly) {
+      pushToast("warn", "remote computers are read-only until server-mediated commands land");
+      return;
+    }
     openModal({
       type: "confirm",
       title: `Delete ${agent.spec.actor.displayName || agent.spec.actor.id}?`,
@@ -295,6 +307,7 @@ function ComputerListRow({
   onClick: () => void;
 }) {
   const online = machine.connectionStatus === "online";
+  const readOnly = machine.readOnly;
   return (
     <button
       className={clsx(
@@ -314,7 +327,12 @@ function ComputerListRow({
         {online ? <Wifi size={16} /> : <WifiOff size={16} />}
       </div>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-black">{machine.name}</div>
+        <div className="flex min-w-0 items-center gap-1">
+          <span className="truncate text-sm font-black">{machine.name}</span>
+          {readOnly && (
+            <span className="chip-brutal bg-white text-[9px]">read-only</span>
+          )}
+        </div>
         <div className="truncate font-mono text-[11px] text-black/45">
           daemon {online ? "online" : machine.connectionStatus}
         </div>
@@ -343,6 +361,7 @@ function ComputerDetail({
   const pushToast = useUI((s) => s.pushToast);
   const [commandOpen, setCommandOpen] = useState(machine.connectionStatus !== "online");
   const online = machine.connectionStatus === "online";
+  const readOnly = machine.readOnly;
   const runtimes = runtimeRows(machine);
 
   const copy = async (value: string, label: string) => {
@@ -366,7 +385,12 @@ function ComputerDetail({
           {online ? <Wifi size={18} /> : <WifiOff size={18} />}
         </div>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-base font-black">{machine.name}</div>
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-base font-black">{machine.name}</span>
+            {readOnly && (
+              <span className="chip-brutal bg-white text-[10px]">read-only</span>
+            )}
+          </div>
           <div className="truncate font-mono text-xs text-black/45">
             {machine.id} · daemon {online ? "connected" : machine.connectionStatus}
           </div>
@@ -380,11 +404,13 @@ function ComputerDetail({
         </button>
         <button
           className="btn-brutal-sm gap-1 bg-brutal-pink px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:bg-black/10"
-          disabled={machine.providers.length === 0}
+          disabled={readOnly || machine.providers.length === 0}
           title={
-            machine.providers.length === 0
-              ? "Install a supported runtime before creating agents"
-              : "Create agent"
+            readOnly
+              ? "Remote computers are read-only until server-mediated commands land"
+              : machine.providers.length === 0
+                ? "Install a supported runtime before creating agents"
+                : "Create agent"
           }
           onClick={onCreateAgent}
         >
@@ -404,6 +430,7 @@ function ComputerDetail({
         <InfoSection title="Info">
           <div className="grid max-w-4xl gap-4 text-sm md:grid-cols-2">
             <InfoCell icon={Server} label="Daemon Actor" value={machine.connectionActorId} />
+            <InfoCell icon={Server} label="Source" value={machine.source} />
             <InfoCell icon={HardDrive} label="Data Root" value={machine.dataRoot} />
             <InfoCell icon={Monitor} label="Kind" value={machine.kind} />
             <InfoCell icon={Cpu} label="Config" value={machine.configDir} />
@@ -428,7 +455,7 @@ function ComputerDetail({
             </button>
             <button
               className="btn-brutal-sm gap-1 bg-brutal-pink px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:bg-black/10"
-              disabled={machine.providers.length === 0}
+              disabled={readOnly || machine.providers.length === 0}
               onClick={onCreateAgent}
             >
               <UserPlus size={13} /> Create
@@ -444,6 +471,7 @@ function ComputerDetail({
                 <AgentRow
                   key={agent.spec.actor.id}
                   agent={agent}
+                  readOnly={readOnly}
                   onRemove={() => onRemoveAgent(agent)}
                 />
               ))}
@@ -462,40 +490,42 @@ function ComputerDetail({
           </div>
         </InfoSection>
 
-        <InfoSection title="Connect Computer">
-          <div className="max-w-4xl border-2 border-black bg-brutal-cream">
-            <div className="flex items-center gap-2 border-b-2 border-black bg-white px-3 py-2">
-              <Terminal size={14} />
-              <span className="text-xs font-black uppercase tracking-widest text-black/50">
-                Daemon Command
-              </span>
-              <button
-                className="btn-brutal-sm ml-auto gap-1 bg-brutal-pink px-2 py-1 text-xs"
-                onClick={() => void copy(machine.setupScript, "daemon script")}
-              >
-                <Copy size={12} /> Copy
-              </button>
-              <button
-                className="btn-brutal-sm bg-white px-2 py-1 text-xs"
-                onClick={() => setCommandOpen((open) => !open)}
-              >
-                {commandOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-              </button>
+        {!readOnly && (
+          <InfoSection title="Connect Computer">
+            <div className="max-w-4xl border-2 border-black bg-brutal-cream">
+              <div className="flex items-center gap-2 border-b-2 border-black bg-white px-3 py-2">
+                <Terminal size={14} />
+                <span className="text-xs font-black uppercase tracking-widest text-black/50">
+                  Daemon Command
+                </span>
+                <button
+                  className="btn-brutal-sm ml-auto gap-1 bg-brutal-pink px-2 py-1 text-xs"
+                  onClick={() => void copy(machine.setupScript, "daemon script")}
+                >
+                  <Copy size={12} /> Copy
+                </button>
+                <button
+                  className="btn-brutal-sm bg-white px-2 py-1 text-xs"
+                  onClick={() => setCommandOpen((open) => !open)}
+                >
+                  {commandOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                </button>
+              </div>
+              {commandOpen && (
+                <textarea
+                  className="block h-36 w-full resize-none border-0 bg-brutal-cream p-3 font-mono text-xs outline-none"
+                  readOnly
+                  value={machine.setupScript}
+                />
+              )}
             </div>
-            {commandOpen && (
-              <textarea
-                className="block h-36 w-full resize-none border-0 bg-brutal-cream p-3 font-mono text-xs outline-none"
-                readOnly
-                value={machine.setupScript}
-              />
-            )}
-          </div>
-        </InfoSection>
+          </InfoSection>
+        )}
 
         <InfoSection title="Actions">
           <button
             className="btn-brutal gap-2 bg-danger px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
-            disabled={!canRemove}
+            disabled={readOnly || !canRemove}
             onClick={onRemove}
           >
             <Trash2 size={14} /> Delete Computer
@@ -543,9 +573,11 @@ function RuntimeRow({
 
 function AgentRow({
   agent,
+  readOnly,
   onRemove,
 }: {
   agent: MachineAgentInfo;
+  readOnly: boolean;
   onRemove: () => void;
 }) {
   const pushToast = useUI((s) => s.pushToast);
@@ -559,6 +591,10 @@ function AgentRow({
     }
   };
   const openProfile = async () => {
+    if (readOnly) {
+      pushToast("warn", "remote profile files are read-only from this GUI");
+      return;
+    }
     try {
       await ipc.openLocalPath(agent.profilePath);
       pushToast("info", "profile opened");
@@ -589,7 +625,16 @@ function AgentRow({
           )}
           title={agent.status}
         />
-        <button className="btn-brutal-sm bg-white p-1" onClick={onRemove}>
+        <button
+          className="btn-brutal-sm bg-white p-1 disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={readOnly}
+          title={
+            readOnly
+              ? "Remote agents are read-only until server-mediated commands land"
+              : "Remove agent"
+          }
+          onClick={onRemove}
+        >
           <Trash2 size={12} />
         </button>
       </div>
@@ -603,7 +648,12 @@ function AgentRow({
         <div className="flex flex-wrap gap-1">
           <button
             className="btn-brutal-sm bg-white p-1.5"
-            title="Open profile folder"
+            disabled={readOnly}
+            title={
+              readOnly
+                ? "Remote profile paths cannot be opened locally"
+                : "Open profile folder"
+            }
             onClick={() => void openProfile()}
           >
             <FolderOpen size={12} />

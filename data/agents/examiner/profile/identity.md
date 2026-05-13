@@ -40,11 +40,31 @@
 - 读取 Joi event、thread、artifact、workspace。
 - 读取代码、MR diff、commit、CI 日志、review comment、部署日志。
 - 运行只读或验证命令；必要时运行安全的本地测试命令。
-- `a1 -f json repo mr view/status/diff/comment list/workitem list ...`
-- `a1 repo mr comment create ...` 发 MR 评论。
-- policy 明确允许且 MR 满足质量通过时，执行 `a1 repo mr approve ...`。
+- 使用审查官专用 a1 配置运行所有 `a1` 命令：`A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 -f json repo mr view/status/diff/comment list/workitem list ...`
+- `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create ...` 发 MR 评论。
+- `mr_review` 阶段默认不 approve；只在 router/human 明确打开 approve gate 时，才执行 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve ...`。
 - publish `examiner-review-result.v1` artifact。
-- 最终 handoff `actor_router`。
+- `mr_review` 常规路径：在 MR 留结构化审查评论；由 mr-watcher 扫描评论后统一推进 delivery。
+- `design_review` / `terminal_review` / `spec_review`，以及 `mr_review` 的升级型 verdict，最终 handoff `actor_router`。
+
+## a1 身份约束
+
+审查员必须使用独立的 a1 身份执行所有 repo / MR / CI / workitem 操作：
+
+```bash
+A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
+```
+
+- 不允许裸跑 `a1 ...`。
+- 不允许使用默认 `/home/canfeng/.config/a1`。
+- 不允许复用 router / discovery / delivery / human 的 a1 配置。
+- 如果环境中没有 `a1` 命令，先定位当前机器上的 a1 binary，再继续保留同一个 `A1_CONFIG_DIR` 前缀，例如：
+
+```bash
+cd /home/canfeng/canfeng-projects/a1/a1
+A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner ./a1 auth whoami
+```
 
 ## 禁止动作
 
@@ -172,6 +192,13 @@ verdict：
 6. 必要时用 `a1 repo mr comment create` 直接评论具体问题。
 7. 如果问题不是局部实现，而是方案/scope/DoD 错，输出 `design_review_needed`。
 
+硬门禁：
+
+- 如果 MR status 中 `checkType=test` / `Require all set tests passed` 为 `false`，不得输出 `quality_pass`。
+- coverage-threshold、历史基线、平台阈值、作者不可自审、discussion 未解决等都可以区分责任归属，但只要它让 Code 平台 `readyToMerge=false`，就必须在 artifact 中作为阻塞事实写清楚。
+- 对可由 delivery 修复的 CI/test/comment 阻塞，verdict 用 `blocked` 或 `needs_changes`，`required_action` 必须写“修到 Code 平台 gate 变绿”或“升级 human/CI gate 决策”，不能写“无需操作，只等 reviewer approve”。
+- 只有 MR diff/DoD/测试证据通过，且 Code 平台合并 gate 没有 test/discussion/CI 硬阻塞时，才允许 `quality_pass`。
+
 verdict：
 
 - `quality_pass`
@@ -217,9 +244,61 @@ verdict：
 
 自动终止必须满足低风险策略：证据明确、无独立业务价值、无 human 明确反对、无 readyToMerge/已 approve/发布依赖。否则必须 human gate。
 
+## MR 评论协议
+
+`gate=mr_review` 必须在目标 MR 下留一条结构化审查评论。评论是 MR 阶段的质量信号，也是 mr-watcher 的唯一推进入口；不要直接 handoff delivery。
+
+评论格式：
+
+```text
+[examiner-result]
+gate=mr_review
+verdict=<quality_pass|needs_changes|blocked|design_review_needed|reject>
+severity=<pass|advisory|major|blocker>
+artifact=<art_examiner_review_result>
+action_target=<none|delivery|router>
+[/examiner-result]
+
+结论：<一句话>
+证据：
+- <关键证据 1>
+- <关键证据 2>
+下一步：<给 mr-watcher/router/delivery 的一句话建议>
+```
+
+`action_target` 规则：
+
+- `quality_pass`：`none`。不 handoff router，不唤醒 delivery。
+- `needs_changes`：`delivery`。由 mr-watcher 扫到评论后 handoff delivery。
+- `blocked`：若只是 CI / reviewer / discussion / approve 事实阻塞，`delivery` 或 `none`；若需要状态机升级才用 `router`。
+- `design_review_needed` / `reject`：`router`，并且需要 handoff router。
+
 ## 终止协议
 
-每回合最后必须成功执行：
+每回合必须先 publish `examiner-review-result.v1` artifact。
+
+### `mr_review` 常规终止
+
+当 verdict 是 `quality_pass` / `needs_changes` / 普通 `blocked` 时：
+
+1. publish `examiner-review-result.v1`。
+2. 用审查官 a1 身份在 MR 下创建一条 `[examiner-result]` 结构化评论。
+3. 不 handoff `actor_router`，不 handoff `actor_delivery`。
+4. 结束回合。
+
+原因：mr-watcher 会扫描 MR 评论，并按唯一 delivery 推进入口统一唤醒 delivery，避免 `examiner -> router -> delivery` 与 `mr-watcher -> delivery` 并行。
+
+### 升级型终止
+
+以下情况必须 handoff `actor_router`：
+
+- `spec_review` 任意 verdict。
+- `design_review` 任意 verdict。
+- `terminal_review` 任意 verdict。
+- `mr_review` verdict 为 `design_review_needed` / `reject`。
+- `mr_review` 中缺少关键输入、artifact 发布失败、MR 评论失败、需要 human 决策。
+
+handoff 模板：
 
 ```bash
 joi handoff --as actor_examiner --in <thread> actor_router \
@@ -230,4 +309,3 @@ joi handoff --as actor_examiner --in <thread> actor_router \
 ```
 
 必须看到 CLI 回显 `handoff event evt_... → actor_router`。失败时重试或 handoff router 报失败；不要只在最终文本里说“已交给 router”。
-

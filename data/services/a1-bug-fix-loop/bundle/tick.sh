@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$HOME/joi-apps:$HOME/canfeng-projects/a1/a1:$PATH"
 
 DRY_RUN=0
 STATE_DIR=""
@@ -64,6 +64,11 @@ command -v jq >/dev/null 2>&1 || { echo "tick.sh: jq is required" >&2; exit 3; }
 mkdir -p "$STATE_DIR"
 STATE_FILE="$STATE_DIR/state.json"
 [[ -f "$STATE_FILE" ]] || echo '{"tracking":{}}' > "$STATE_FILE"
+
+LOCK_FILE="$STATE_DIR/loop.lock"
+exec 9>"$LOCK_FILE"
+flock 9
+
 QUEUE_DIR="${FEEDBACK_QUEUE_DIR:-$FEEDBACK_TRIAGE_STATE_DIR/feedback-queues/thread-$SCANNER_TID}"
 BUGS_FILE="$QUEUE_DIR/bugs.json"
 QUEUE_META_FILE="$QUEUE_DIR/scan-meta.json"
@@ -231,6 +236,31 @@ find_delivery_thread_for_feedback() {
       (.threads // .items // .)[]?
       | (.title // .name // "") as $title
       | select($title | startswith("[bugfixloop:" + $fid + "]"))
+      | (.id // .thread_id // .thread.id // empty)
+    ' 2>/dev/null | head -n 1
+    }
+
+    list=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    found=$(find_in_thread_json <<<"$list")
+    if [[ -n "$found" ]]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+
+    list=$(joi thread archive-list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    find_in_thread_json <<<"$list"
+}
+
+find_bugfix_thread_for_feedback() {
+    local fid="$1" list found
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    joi_avail || return 0
+
+    find_in_thread_json() {
+      jq -r --arg fid "$fid" '
+      (.threads // .items // .)[]?
+      | (.title // .name // "") as $title
+      | select($title == ("bugfix-" + $fid) or ($title | startswith("[bugfix:" + $fid + "]")))
       | (.id // .thread_id // .thread.id // empty)
     ' 2>/dev/null | head -n 1
     }
@@ -551,14 +581,19 @@ if [[ $budget -gt 0 ]]; then
 
         bf_tid="(dry-run-thread)"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            root_event=""
-            if anchor=$(joi event append --as svc_a1_bug_fix_loop --channel --in "$CHANNEL_ID" \
-                --type thread.opened --text "anchor: bugfix-$fid" --json 2>/dev/null); then
-                root_event=$(jq -r '.event.id // ""' <<<"$anchor")
-            fi
-            if [[ -n "$root_event" ]] && out=$(joi thread create --channel "$CHANNEL_ID" \
-                --root-event "$root_event" --title "bugfix-$fid" --json 2>/dev/null); then
-                bf_tid=$(jq -r '.thread.id // .thread_id // .id // ""' <<<"$out")
+            existing_tid=$(find_bugfix_thread_for_feedback "$fid" || true)
+            if [[ -n "$existing_tid" ]]; then
+                bf_tid="$existing_tid"
+            else
+                root_event=""
+                if anchor=$(joi event append --as svc_a1_bug_fix_loop --channel --in "$CHANNEL_ID" \
+                    --type thread.opened --text "anchor: bugfix-$fid" --json 2>/dev/null); then
+                    root_event=$(jq -r '.event.id // ""' <<<"$anchor")
+                fi
+                if [[ -n "$root_event" ]] && out=$(joi thread create --channel "$CHANNEL_ID" \
+                    --root-event "$root_event" --title "bugfix-$fid" --json 2>/dev/null); then
+                    bf_tid=$(jq -r '.thread.id // .thread_id // .id // ""' <<<"$out")
+                fi
             fi
             if [[ -n "$bf_tid" && "$bf_tid" != "(dry-run-thread)" ]]; then
                 joi handoff --as svc_a1_bug_fix_loop actor_router --in "$bf_tid" \

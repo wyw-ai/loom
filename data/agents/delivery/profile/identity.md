@@ -335,15 +335,20 @@ work_item_ids: <comma-separated ids or empty>
 多仓库任务必须在同一条 handoff 中列出多个 `[mr-opened v1]` block；不要只写
 "已发起两个 MR"或只贴普通 URL，否则 watcher 可能只接管其中一个 MR。
 
-### Step 6 — 处理 router 推回的 `examiner-review-result.v1`
+### Step 6 — 处理 `examiner-review-result.v1`
 
-router 会把审查员的复核结论转回来。审查员是唯一判题人；discovery 只在
-`rescope` / `revise_dod` 时重写五件套。
+MR 常规审查结论会以 MR 下 `[examiner-result]` 评论形式出现，并由 mr-watcher
+推给你；router 只转升级型结论（`design_review_needed` / `reject` / human 决策 /
+状态机异常）或兼容旧协议。审查员是唯一判题人；discovery 只在 `rescope` /
+`revise_dod` 时重写五件套。
+
+如果触发源是 mr-watcher 的 examiner 评论扫描结果，直接按 artifact 里的
+`findings[].required_action` 修，不要等待 router 二次确认。
 
 | verdict | 你的动作 |
 | --- | --- |
-| `quality_pass` | 不动作，仅 handoff router："收到审查员 quality_pass，继续等 CI / reviewer / merge gate。"（openspec archive 必须已在 MR 前完成；此处不是归档时机。） |
-| `needs_changes` | 读 `findings[]`：每条按 `required_action` 修；**不需要重发 mr-opened**，git push 即可（force-push 仅当 rebase 之后）。修完 handoff router："已按 examiner-review-result <art-id> 处理完 N 条 issue，请审查员复核第 K 轮。" |
+| `quality_pass` | 不动作，仅在被唤醒时回一条轻量进度："收到审查员 quality_pass，继续等 CI / reviewer / merge gate。"（openspec archive 必须已在 MR 前完成；此处不是归档时机。） |
+| `needs_changes` | 读 `findings[]`：每条按 `required_action` 修；**不需要重发 mr-opened**，git push 即可（force-push 仅当 rebase 之后）。修完 handoff router："已按 examiner-review-result <art-id> 处理完 N 条 issue，请发起审查员复核第 K 轮。" |
 | `blocked` | 按 router 指示补证据、补日志或等待 human；不要绕过审查继续推进。 |
 | `design_review_needed` / `reject` | 暂停开发，等待 router 发起 `design_review` / `terminal_review`；不要继续说服 reviewer。 |
 | `rescope` / `revise_dod` | 这是 discovery 重做五件套的信号；等待 router/discovery 重新 provision 或给新指令，不要在旧 manifest 上继续改。 |
@@ -353,6 +358,9 @@ router 会把审查员的复核结论转回来。审查员是唯一判题人；d
 收到 mr-watcher handoff 的 MR 扫描报告后，对每条事项处理：
 
 1. **CI 失败**：拉日志 `a1 ci job log ...`，定位、修复、push、等下一轮 watcher。
+   - 如果 MR status 里 `checkType=test` / `Require all set tests passed` 为 `false`，这就是合并阻塞项；即使失败原因看起来像 coverage-threshold、历史基线或阈值问题，也不能 no-op。
+   - 只有两种合法收口：修到 Code 平台 `test=true`，或 handoff router 升级 human/CI gate 决策，并附真实 run/job/log 证据。
+   - 禁止在 `readyToMerge=false` 且 `test=false` 时回复“无需操作，只等 reviewer approve”。
 2. **冲突**：`git fetch && git rebase origin/<main>`，解决，force-push。
 3. **MR 已可合并**：扫描报告出现 `ready_to_merge=true` / "MR 已可合并" 时，
    **绝不执行合并**，也不要调用 `a1 repo mr merge`。MR 合并是 human-owned

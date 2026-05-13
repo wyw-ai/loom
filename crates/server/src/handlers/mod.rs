@@ -1351,11 +1351,16 @@ async fn machine_command(
     let delivered = notify_machine_command(state, command)?;
     if !delivered {
         state.machine_commands.cancel(&command_id);
-        // The command remains queued for daemon pull/reconnect; the wait wrapper
-        // reports that synchronous delivery was not possible.
+        finish_legacy_machine_command(
+            state,
+            &command_id,
+            MachineCommandStatus::Cancelled,
+            "not_delivered",
+            "machine daemon is not connected; command cancelled",
+        )?;
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
-            "machine daemon is not connected; command is queued",
+            "machine daemon is not connected; command cancelled",
         ));
     }
 
@@ -1363,6 +1368,13 @@ async fn machine_command(
     {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
+            finish_legacy_machine_command(
+                state,
+                &command_id,
+                MachineCommandStatus::Cancelled,
+                "waiter_closed",
+                "machine command result waiter closed",
+            )?;
             return Err(ErrorObject::new(
                 ErrorCode::APP_RUNTIME_ERROR,
                 format!("machine command result channel closed: {command_id}"),
@@ -1370,6 +1382,13 @@ async fn machine_command(
         }
         Err(_) => {
             state.machine_commands.cancel(&command_id);
+            finish_legacy_machine_command(
+                state,
+                &command_id,
+                MachineCommandStatus::Expired,
+                "timeout",
+                "machine command timed out",
+            )?;
             return Err(ErrorObject::new(
                 ErrorCode::APP_RUNTIME_ERROR,
                 format!("machine command timed out: {command_id}"),
@@ -1388,6 +1407,36 @@ async fn machine_command(
         error: result.error,
     };
     ok(response)
+}
+
+fn finish_legacy_machine_command(
+    state: &AppState,
+    command_id: &str,
+    status: MachineCommandStatus,
+    code: &str,
+    message: &str,
+) -> Result<(), ErrorObject> {
+    let Some(mut command) = state.store.get_machine_command(command_id) else {
+        return Ok(());
+    };
+    if command.status.is_terminal() {
+        return Ok(());
+    }
+    let now = Utc::now();
+    command.status = status;
+    command.error = Some(MachineCommandError {
+        code: code.into(),
+        message: message.into(),
+        retryable: false,
+        details: None,
+    });
+    command.finished_at = Some(now);
+    command.updated_at = now;
+    state
+        .store
+        .upsert_machine_command(command)
+        .map_err(map_store_err)?;
+    Ok(())
 }
 
 async fn machine_command_create(
@@ -3212,6 +3261,65 @@ mod tests {
                 .output
                 .and_then(|value| value.get("done").and_then(Value::as_bool).map(bool::from)),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_machine_command_cancels_when_not_delivered() {
+        let state = fresh_state("machine-command-wrapper-cancel");
+        open_conn(&state, "conn_human", "actor_human").await;
+        dispatch(
+            &state,
+            "conn_human",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "source": "daemon",
+                        "inventoryVersion": 2,
+                        "machineId": "machine_remote",
+                        "ownerActorId": "actor_human",
+                        "capabilities": ["inventory.read", "machine.command"],
+                        "revision": 11
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine");
+
+        let err = dispatch(
+            &state,
+            "conn_human",
+            method::MACHINE_COMMAND,
+            Some(json!({
+                "machineId": "machine_remote",
+                "machineActorId": "actor_service_machine_remote",
+                "ifInventoryRevision": 11,
+                "command": { "op": "agent.remove", "actorId": "actor_agent" },
+                "timeoutMs": 5_000
+            })),
+        )
+        .await
+        .expect_err("wrapper should fail when daemon is offline");
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+
+        let commands = state.store.list_machine_commands(
+            Some("machine_remote"),
+            Some("actor_service_machine_remote"),
+            &[],
+            Some("actor_human"),
+            10,
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].status, MachineCommandStatus::Cancelled);
+        assert_eq!(
+            commands[0].error.as_ref().map(|error| error.code.as_str()),
+            Some("not_delivered")
         );
     }
 

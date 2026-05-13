@@ -396,7 +396,7 @@ async fn drain_machine_commands(
             Some(json!({
                 "machineId": host.machine_id,
                 "machineActorId": host.actor_id,
-                "statuses": ["queued", "delivered"],
+                "statuses": ["queued", "delivered", "running"],
                 "limit": 50,
             })),
         )

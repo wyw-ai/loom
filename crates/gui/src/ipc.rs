@@ -2002,14 +2002,18 @@ mod tests {
             "displayName": "Remote Box",
             "_meta": {
                 "role": "machine",
+                "source": "daemon",
                 "machineId": "machine_remote",
-                "inventoryVersion": 1,
+                "inventoryVersion": 2,
+                "revision": 7,
+                "observedAt": "2026-05-13T10:50:00Z",
                 "workspaceId": "default",
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
                 "dataRoot": "/home/canfeng/.agentx/machine_remote",
                 "configDir": "/home/canfeng/.joi-apps",
+                "capabilities": ["inventory.read", "connection.status"],
                 "providers": [{
                     "id": "claude",
                     "displayName": "Claude Code",
@@ -2033,6 +2037,20 @@ mod tests {
             .expect("server machine");
 
         assert_eq!(machine.id, "machine_remote");
+        assert_eq!(machine.source, "server_inventory");
+        assert!(machine.read_only);
+        assert_eq!(
+            machine.capabilities,
+            vec![
+                "inventory.read".to_string(),
+                "connection.status".to_string()
+            ]
+        );
+        assert_eq!(machine.inventory_revision, 7);
+        assert_eq!(
+            machine.inventory_observed_at.as_deref(),
+            Some("2026-05-13T10:50:00Z")
+        );
         assert_eq!(machine.connection_actor_id, "actor_service_machine_remote");
         assert_eq!(machine.agent_count, 1);
         assert_eq!(machine.providers[0].id, "claude");

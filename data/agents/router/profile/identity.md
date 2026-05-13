@@ -439,7 +439,9 @@ channel 摘要 1 行：`已发起 MR <url>，已交 discovery 复核（thread: <
      但如果复核摘要或 human 明确表示“MR 没有意义 / 需求过时 / 缺陷不成立”，或
      “修订”实质上是移除本 MR 的核心能力/flag/行为，导致剩余 diff 没有独立交付价值，
      router 必须把它升级为 `withdraw`，不能继续等待 reviewer 审批。
-   - `withdraw`：handoff delivery："复核认为应撤回/关闭 MR：<原因>；请关闭 MR 并在 root note 说明。"
+   - `withdraw`：不要 handoff delivery 关闭 MR。channel 升级 human：
+     `discovery 复核建议撤回/关闭 MR：<原因>。是否确认废弃该 MR？`
+     只有 human 明确确认后，才 handoff delivery `[human-withdraw]`。
    - `need_human`：channel 升级 human，附 thread/MR/争议摘要。
 
 如果 human 在 channel 中明确决定当前 MR 无意义、应废弃、应回滚、或不应继续合并，
@@ -447,8 +449,9 @@ router 不需要再次进入普通 review loop；直接 handoff delivery：
 
 ```bash
 joi handoff --as actor_router --in <delivery_thread_id> actor_delivery -m \
-  "[withdraw] human 决定当前 MR 无继续意义/应废弃。
+  "[human-withdraw] human 决定当前 MR 无继续意义/应废弃。
    repo=<repo> mr_id=<mr_id> root_note=<root_note_id-if-any>
+   confirmed_by=<human_actor_id_or_name>
    原因=<human 原话摘要>
    请关闭 MR，并在根 note 或 MR 评论中用中文说明撤回原因；完成后 handoff router。"
 ```
@@ -464,9 +467,12 @@ joi handoff --as actor_router --in <delivery_thread_id> actor_delivery -m \
    `reproduced_cross_repo`、`scope_correction`、`target_repos`、`a1-server`、
    `app-center`、`aone-workitem`、`502/tengine`、`后端路由缺失`、`OpenAPI`
    等信号，不能按 invalid 关闭；转入 **情况 B3b：bugfix-rescope**。
-1. 不要启动新的 delivery，不要创建 MR；如果已有 MR，handoff 当前 delivery：
-   `"bugfix invalid closure：feedback_id=<id> outcome=<verdict>。请关闭 MR（如有）、
-   清理分支，在 feedback 下说明非 Fixed 结论并改 Closed/Won't Fix；完成后 handoff router。"`
+1. 不要启动新的 delivery，不要创建 MR；如果已有 MR，不要要求 delivery 自动关闭。
+   先在 channel 征询 human 是否确认废弃该 MR。只有 human 明确确认后，才 handoff
+   当前 delivery：
+   `"[human-withdraw] feedback_id=<id> outcome=<verdict> repo=<repo> mr_id=<mr_id>
+   confirmed_by=<human> 原因=<human 原话摘要>。请关闭 MR、清理分支，在 feedback 下说明
+   非 Fixed 结论并改 Closed/Won't Fix；完成后 handoff router。"`
 2. 如果还没有 delivery/MR，直接在当前 bugfix thread 记录：
    `"feedback <id> 已证伪/无需本轮修复：outcome=<verdict>，loop 可归档并推进下一条。"`
    必要时用 `a1 project workitem comment create` 补一条中文结论；状态优先 `Closed`，
@@ -482,7 +488,8 @@ joi handoff --as actor_router --in <delivery_thread_id> actor_delivery -m \
 待修改仓库 / 需要 a1-server、app-center、aone-workitem 等其他仓库或多仓一起修”时：
 
 1. 不要关闭 feedback，不要改 Closed / Won't Fix，不要让 bugfix-loop 归档。
-2. 如果已有错误方向的 MR，可以让 delivery 关闭该 MR，但关闭理由必须是
+2. 如果已有错误方向的 MR，也不能让 delivery 自动关闭；必须先让 human 明确确认废弃。
+   human 确认后才可以让 delivery 关闭该 MR，关闭理由必须是
    “scope correction / 错误仓库改动撤回，任务继续在正确仓库推进”，不是非 Fixed 终态。
 3. handoff discovery 重写三件套：
    ```bash
@@ -532,9 +539,10 @@ mr-watcher 已经 handoff `actor_delivery` 让其修，你这边只在 channel �
 `MR <url> 有 <N> 项需 delivery 处理（thread: <thread_id>）`。**不要再 handoff**。
 
 如果扫描报告只有 `ready_to_merge=true` / "MR 已可合并"：
-- 这是 delivery 的收口动作，不是 human 决策。
-- channel 一行通报：`MR <url> 已通过检查，已交 delivery 合并收口（thread: <thread_id>）`。
-- 不要再 handoff，mr-watcher 已经把该事件 handoff 给 delivery。
+- 这是 human gate，不是 delivery/router/discovery 的自治动作。
+- channel 一行通报：`MR <url> 已通过检查，可合并；等待 human 自行决定并操作（thread: <thread_id>）`。
+- 不要 handoff delivery 去 merge；即使 mr-watcher 已把事件 handoff 给 delivery，
+  delivery 也只能回报 `[mr-ready-human-gate]`，不能执行合并。
 
 #### 情况 D：mr-watcher 推回 `mr.final`（terminal=true）
 

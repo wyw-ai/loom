@@ -195,6 +195,11 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u al
   -m "<问题、影响、建议>"
 ```
 
+`A1_CONFIG_DIR` selects the a1 auth store (`auth.yaml`); `--config` is not an
+auth-store selector. For approve/permission questions, always verify the real
+platform identity with the same prefix plus `a1 -f json auth whoami` and do not
+treat the directory name or an `auth.yaml` `user` label as identity.
+
 MR 顶层 `[examiner-result]` 只作为结构化结论和 mr-watcher 路由信号，不替代行级
 code review。没有可执行代码问题时，examiner 应明确说明依据，而不是为了协作留空泛评论。
 

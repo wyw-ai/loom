@@ -188,7 +188,7 @@ while IFS= read -r repo; do
     [[ -n "$repo" ]] || continue
     pages="MISSING"
     if command -v "$A1_BIN" >/dev/null 2>&1; then
-        pages=$("$A1_BIN" -f json kbase search "[$repo]" --repo-ids 74121 --top 50 2>/dev/null \
+        pages=$("$A1_BIN" -f json kbase search "$repo" --repo-ids 74121 --top 50 2>/dev/null \
             | "$JQ_BIN" -r --arg prefix "[$repo] " '
                 [(.items // .data // [])[]
                  | {id:(.page_id // .pageId // .id // ""), title:(.title // .name // .page_name // .pageName // "")}

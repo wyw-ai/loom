@@ -736,6 +736,10 @@ human 需要知道的异常升级。**不要再 handoff**。
   delivery 修代码。
 - 若 MR status 是 `test=true`、`approver_number=true`，且 examiner 已将剩余
   discussion 判为非代码/开放性/范围外 discussion，则 delivery 无需继续改代码。
+- 若 MR status 是 `test=true` 且 examiner 已给出 `quality_pass`，但
+  `approver_number=false` / “需等待 reviewer approve”，router 不得等待 human reviewer
+  作为默认动作；必须先用审查官专用 config 执行一次 approve。只有 approve 被平台拒绝
+  或审查官身份没有权限时，才请求 human/有效 reviewer 处理。
 - 若 `readyToMerge=false` 仅因 `discussion=false`，router 必须在 channel 或 thread
   明确请求 human/评论方/平台侧处理 discussion gate；不要再说“无新信息”，也不要
   handoff delivery。

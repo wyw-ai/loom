@@ -48,7 +48,7 @@ pub async fn run(
     let cfg = load_desktop_config().unwrap_or_default();
     let machine = select_machine(&cfg, machine_id.as_deref())?;
     let providers = apply_provider_overrides(detected_providers, &machine.providers);
-    let selected_machine_id = machine.id.clone();
+    let mut selected_machine_snapshot = machine.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
@@ -112,7 +112,7 @@ pub async fn run(
 
     loop {
         match refresh_machine_runtime(
-            &selected_machine_id,
+            &mut selected_machine_snapshot,
             &allow_actors,
             &data_root,
             &server_url,
@@ -133,10 +133,15 @@ pub async fn run(
                     eprintln!("joi daemon: machine command channel closed");
                     continue;
                 };
-                let result = handle_machine_command(&selected_machine_id, &data_root, command.payload);
+                let result = handle_machine_command(
+                    &selected_machine_snapshot,
+                    &data_root,
+                    &server_url,
+                    command.payload,
+                );
                 if result.get("ok").and_then(Value::as_bool) == Some(true) {
                     if let Err(err) = refresh_machine_runtime(
-                        &selected_machine_id,
+                        &mut selected_machine_snapshot,
                         &allow_actors,
                         &data_root,
                         &server_url,
@@ -216,7 +221,7 @@ struct RunningAgent {
 }
 
 fn refresh_machine_runtime(
-    selected_machine_id: &str,
+    selected_machine: &mut MachineConfig,
     allow_actors: &[String],
     data_root: &PathBuf,
     server_url: &str,
@@ -226,7 +231,8 @@ fn refresh_machine_runtime(
     running_agents: &mut HashMap<String, RunningAgent>,
     warned_missing: &mut HashSet<String>,
 ) -> Result<()> {
-    let snapshot = load_machine_specs(Some(selected_machine_id), allow_actors, warned_missing)?;
+    let snapshot = load_machine_specs(selected_machine, allow_actors, warned_missing, server_url)?;
+    *selected_machine = snapshot.machine.clone();
     let next_fingerprint =
         machine_inventory_fingerprint(&snapshot.machine, data_root, &snapshot.providers);
     if next_fingerprint != *inventory_fingerprint {
@@ -244,12 +250,32 @@ fn refresh_machine_runtime(
 }
 
 fn load_machine_specs(
-    machine_id: Option<&str>,
+    selected_machine: &MachineConfig,
     allow_actors: &[String],
     warned_missing: &mut HashSet<String>,
+    server_url: &str,
 ) -> Result<MachineSpecs> {
-    let cfg = load_desktop_config().unwrap_or_default();
-    let machine = select_machine(&cfg, machine_id)?;
+    let mut cfg = load_desktop_config().unwrap_or_default();
+    let machine = if let Some(machine) = cfg
+        .machines
+        .iter()
+        .find(|machine| machine.id == selected_machine.id)
+        .cloned()
+    {
+        machine
+    } else {
+        if warned_missing.insert(format!("machine:{}", selected_machine.id)) {
+            eprintln!(
+                "joi daemon: selected machine {} is missing from desktop.toml; restoring live runtime snapshot",
+                selected_machine.id
+            );
+        }
+        restore_selected_machine_context(&mut cfg, selected_machine, server_url, true);
+        if let Err(err) = save_desktop_config(&cfg) {
+            eprintln!("joi daemon: warning: failed to restore selected machine config: {err:#}");
+        }
+        selected_machine.clone()
+    };
     let providers = apply_provider_overrides(detect_agent_cli_providers(), &machine.providers);
     let definitions = machine
         .agents
@@ -366,7 +392,12 @@ fn print_providers(providers: &[DetectedAgentProvider]) {
     }
 }
 
-fn handle_machine_command(selected_machine_id: &str, data_root: &PathBuf, payload: Value) -> Value {
+fn handle_machine_command(
+    selected_machine: &MachineConfig,
+    data_root: &PathBuf,
+    server_url: &str,
+    payload: Value,
+) -> Value {
     let command_id = payload
         .get("commandId")
         .and_then(Value::as_str)
@@ -389,10 +420,10 @@ fn handle_machine_command(selected_machine_id: &str, data_root: &PathBuf, payloa
             "machineActorId": machine_actor_id,
         })
     };
-    if machine_id != selected_machine_id {
+    if machine_id != selected_machine.id {
         return machine_command_error(result_prefix(), "command targets a different machine");
     }
-    let result = match apply_machine_command(selected_machine_id, data_root, &payload) {
+    let result = match apply_machine_command(selected_machine, data_root, server_url, &payload) {
         Ok(output) => {
             let mut result = result_prefix();
             result["ok"] = json!(true);
@@ -433,8 +464,9 @@ fn machine_command_error(mut result: Value, error: impl Into<String>) -> Value {
 }
 
 fn apply_machine_command(
-    selected_machine_id: &str,
+    selected_machine: &MachineConfig,
     data_root: &PathBuf,
+    server_url: &str,
     payload: &Value,
 ) -> Result<Value> {
     let command = payload
@@ -445,15 +477,27 @@ fn apply_machine_command(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("machine command op is required"))?;
     let mut cfg = load_desktop_config()?;
-    let machine_index = cfg
+    let machine_index = if let Some(index) = cfg
         .machines
         .iter()
-        .position(|machine| machine.id == selected_machine_id)
-        .ok_or_else(|| anyhow!("unknown machine id: {selected_machine_id}"))?;
+        .position(|machine| machine.id == selected_machine.id)
+    {
+        index
+    } else {
+        eprintln!(
+            "joi daemon: selected machine {} disappeared from desktop.toml; restoring it before applying machine command",
+            selected_machine.id
+        );
+        restore_selected_machine_context(&mut cfg, selected_machine, server_url, true);
+        cfg.machines
+            .iter()
+            .position(|machine| machine.id == selected_machine.id)
+            .ok_or_else(|| anyhow!("failed to restore selected machine {}", selected_machine.id))?
+    };
 
     match op {
         "agent.create" => {
-            let agent = agent_config_from_command(command, selected_machine_id)?;
+            let agent = agent_config_from_command(command, &selected_machine.id)?;
             if cfg.machines[machine_index]
                 .agents
                 .iter()
@@ -741,12 +785,34 @@ struct DesktopConfig {
 #[serde(rename_all = "camelCase")]
 struct HumanAccount {
     #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    staff_id: String,
+    #[serde(default)]
+    nickname: String,
+    #[serde(default)]
+    real_name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
     actor_id: String,
+    #[serde(default)]
+    avatar_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceConfig {
+    #[serde(default)]
     id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    server_url: String,
+    #[serde(default)]
+    actor_id: String,
+    #[serde(default)]
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,6 +924,77 @@ fn save_desktop_config(cfg: &DesktopConfig) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("write desktop config {}", path.display()))
 }
 
+fn restore_selected_machine_context(
+    cfg: &mut DesktopConfig,
+    selected_machine: &MachineConfig,
+    server_url: &str,
+    force_active: bool,
+) -> bool {
+    let mut changed = false;
+    let workspace_id = selected_machine
+        .workspace_id
+        .as_deref()
+        .and_then(trimmed_non_empty);
+    let owner_actor_id = selected_machine
+        .owner_actor_id
+        .as_deref()
+        .and_then(trimmed_non_empty);
+
+    if let Some(owner_actor_id) = owner_actor_id {
+        match cfg.account.as_mut() {
+            Some(account) if account.actor_id.trim() == owner_actor_id => {
+                changed |= account.fill_missing_from_actor_id(owner_actor_id);
+            }
+            _ => {
+                cfg.account = Some(HumanAccount::from_actor_id(owner_actor_id));
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(workspace_id) = workspace_id {
+        let workspace_owner = owner_actor_id
+            .or_else(|| active_account_actor_id(cfg))
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if let Some(workspace) = cfg
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            changed |= workspace.fill_missing_context(server_url, &workspace_owner);
+        } else {
+            cfg.workspaces.push(WorkspaceConfig::from_context(
+                workspace_id,
+                server_url,
+                &workspace_owner,
+            ));
+            changed = true;
+        }
+
+        if force_active
+            && cfg.active.as_deref() != Some(workspace_id)
+            && active_workspace_can_be_recovered(cfg)
+        {
+            cfg.active = Some(workspace_id.to_string());
+            changed = true;
+        }
+    }
+
+    if let Some(machine) = cfg
+        .machines
+        .iter_mut()
+        .find(|machine| machine.id == selected_machine.id)
+    {
+        changed |= fill_missing_machine_context(machine, selected_machine);
+    } else {
+        cfg.machines.push(selected_machine.clone());
+        changed = true;
+    }
+
+    changed
+}
+
 fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<MachineConfig> {
     let active = active_workspace_id(cfg);
     let owner = active_account_actor_id(cfg);
@@ -946,6 +1083,153 @@ fn machine_belongs_to_owner(machine: &MachineConfig, owner_actor_id: Option<&str
     machine.owner_actor_id.as_deref() == owner_actor_id
 }
 
+fn active_workspace_can_be_recovered(cfg: &DesktopConfig) -> bool {
+    let Some(active_id) = cfg.active.as_deref().and_then(trimmed_non_empty) else {
+        return true;
+    };
+    let Some(active_workspace) = cfg
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == active_id)
+    else {
+        return true;
+    };
+    active_workspace.server_url.trim().is_empty()
+        || active_workspace.actor_id.trim().is_empty()
+        || active_workspace.display_name.trim().is_empty()
+}
+
+impl HumanAccount {
+    fn from_actor_id(actor_id: &str) -> Self {
+        let staff_id = human_staff_id_from_actor_id(actor_id).to_string();
+        Self {
+            provider: "unknown".into(),
+            staff_id: staff_id.clone(),
+            nickname: staff_id,
+            real_name: String::new(),
+            email: String::new(),
+            actor_id: actor_id.to_string(),
+            avatar_url: String::new(),
+        }
+    }
+
+    fn fill_missing_from_actor_id(&mut self, actor_id: &str) -> bool {
+        let mut changed = false;
+        let staff_id = human_staff_id_from_actor_id(actor_id);
+        if self.provider.trim().is_empty() {
+            self.provider = "unknown".into();
+            changed = true;
+        }
+        if self.staff_id.trim().is_empty() {
+            self.staff_id = staff_id.to_string();
+            changed = true;
+        }
+        if self.nickname.trim().is_empty() {
+            self.nickname = staff_id.to_string();
+            changed = true;
+        }
+        changed
+    }
+}
+
+impl WorkspaceConfig {
+    fn from_context(id: &str, server_url: &str, actor_id: &str) -> Self {
+        let display_name = if actor_id.trim().is_empty() {
+            id.to_string()
+        } else {
+            human_staff_id_from_actor_id(actor_id).to_string()
+        };
+        Self {
+            id: id.to_string(),
+            name: id.to_string(),
+            server_url: server_url.to_string(),
+            actor_id: actor_id.to_string(),
+            display_name,
+        }
+    }
+
+    fn fill_missing_context(&mut self, server_url: &str, actor_id: &str) -> bool {
+        let mut changed = false;
+        if self.name.trim().is_empty() {
+            self.name = self.id.clone();
+            changed = true;
+        }
+        if self.server_url.trim().is_empty() {
+            self.server_url = server_url.to_string();
+            changed = true;
+        }
+        if self.actor_id.trim().is_empty() && !actor_id.trim().is_empty() {
+            self.actor_id = actor_id.to_string();
+            changed = true;
+        }
+        if self.display_name.trim().is_empty() {
+            self.display_name = if self.actor_id.trim().is_empty() {
+                self.id.clone()
+            } else {
+                human_staff_id_from_actor_id(&self.actor_id).to_string()
+            };
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineConfig) -> bool {
+    let mut changed = false;
+    if machine
+        .workspace_id
+        .as_deref()
+        .and_then(trimmed_non_empty)
+        .is_none()
+        && fallback
+            .workspace_id
+            .as_deref()
+            .and_then(trimmed_non_empty)
+            .is_some()
+    {
+        machine.workspace_id = fallback.workspace_id.clone();
+        changed = true;
+    }
+    if machine
+        .owner_actor_id
+        .as_deref()
+        .and_then(trimmed_non_empty)
+        .is_none()
+        && fallback
+            .owner_actor_id
+            .as_deref()
+            .and_then(trimmed_non_empty)
+            .is_some()
+    {
+        machine.owner_actor_id = fallback.owner_actor_id.clone();
+        changed = true;
+    }
+    if machine.name.trim().is_empty() {
+        machine.name = fallback.name.clone();
+        changed = true;
+    }
+    if machine.kind.trim().is_empty() {
+        machine.kind = fallback.kind.clone();
+        changed = true;
+    }
+    if machine.data_root.trim().is_empty() {
+        machine.data_root = fallback.data_root.clone();
+        changed = true;
+    }
+    if machine.providers.is_empty() && !fallback.providers.is_empty() {
+        machine.providers = fallback.providers.clone();
+        changed = true;
+    }
+    changed
+}
+
+fn human_staff_id_from_actor_id(actor_id: &str) -> &str {
+    actor_id
+        .strip_prefix("actor_human_")
+        .unwrap_or(actor_id)
+        .trim()
+}
+
 fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
     AgentDefinition {
         provider_id: agent.provider_id.clone(),
@@ -994,6 +1278,15 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+fn trimmed_non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,12 +1294,12 @@ mod tests {
     fn cfg_with_owner(owner: &str, machines: Vec<MachineConfig>) -> DesktopConfig {
         DesktopConfig {
             active: Some("ws_main".into()),
-            account: Some(HumanAccount {
-                actor_id: owner.into(),
-            }),
-            workspaces: vec![WorkspaceConfig {
-                id: "ws_main".into(),
-            }],
+            account: Some(HumanAccount::from_actor_id(owner)),
+            workspaces: vec![WorkspaceConfig::from_context(
+                "ws_main",
+                "ws://127.0.0.1:19999/rpc",
+                owner,
+            )],
             machines,
         }
     }
@@ -1049,5 +1342,100 @@ mod tests {
         let err = select_machine(&cfg, Some("machine_other")).expect_err("owner mismatch");
 
         assert!(err.to_string().contains("active account"));
+    }
+
+    #[test]
+    fn restore_selected_machine_context_rehydrates_gui_context() {
+        let selected = MachineConfig {
+            workspace_id: Some("ws_remote".into()),
+            owner_actor_id: Some("actor_human_368136".into()),
+            id: "machine_remote_actor_human_368136".into(),
+            name: "Remote".into(),
+            kind: default_machine_kind(),
+            data_root: "~/.agentx/machines/ws_remote/actor_human_368136/local".into(),
+            providers: Vec::new(),
+            agents: vec![MachineAgentConfig {
+                provider_id: "claude".into(),
+                actor_id: "actor_agent_claude_1".into(),
+                name: "Claude".into(),
+                description: String::new(),
+                model: String::new(),
+                reasoning_effort: String::new(),
+                autostart: true,
+            }],
+        };
+        let mut cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: None,
+            workspaces: vec![WorkspaceConfig {
+                id: "default".into(),
+                name: String::new(),
+                server_url: String::new(),
+                actor_id: String::new(),
+                display_name: String::new(),
+            }],
+            machines: Vec::new(),
+        };
+
+        let changed =
+            restore_selected_machine_context(&mut cfg, &selected, "ws://127.0.0.1:19999/rpc", true);
+
+        assert!(changed);
+        assert_eq!(cfg.active.as_deref(), Some("ws_remote"));
+        assert_eq!(
+            cfg.account
+                .as_ref()
+                .map(|account| account.actor_id.as_str()),
+            Some("actor_human_368136")
+        );
+        let workspace = cfg
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "ws_remote")
+            .expect("workspace restored");
+        assert_eq!(workspace.actor_id, "actor_human_368136");
+        assert_eq!(workspace.server_url, "ws://127.0.0.1:19999/rpc");
+        assert!(cfg
+            .machines
+            .iter()
+            .any(|machine| machine.id == "machine_remote_actor_human_368136"));
+    }
+
+    #[test]
+    fn restore_selected_machine_context_does_not_steal_complete_active_workspace() {
+        let selected = MachineConfig {
+            workspace_id: Some("ws_server_a".into()),
+            owner_actor_id: Some("actor_human_368136".into()),
+            id: "machine_server_a_actor_human_368136".into(),
+            name: "Server A Machine".into(),
+            kind: default_machine_kind(),
+            data_root: "~/.agentx/machines/ws_server_a/actor_human_368136/local".into(),
+            providers: Vec::new(),
+            agents: Vec::new(),
+        };
+        let mut cfg = DesktopConfig {
+            active: Some("ws_local".into()),
+            account: Some(HumanAccount::from_actor_id("actor_human_368136")),
+            workspaces: vec![WorkspaceConfig::from_context(
+                "ws_local",
+                "ws://127.0.0.1:21999/rpc",
+                "actor_human_368136",
+            )],
+            machines: Vec::new(),
+        };
+
+        let changed =
+            restore_selected_machine_context(&mut cfg, &selected, "ws://server-a/rpc", true);
+
+        assert!(changed);
+        assert_eq!(cfg.active.as_deref(), Some("ws_local"));
+        assert!(cfg
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == "ws_server_a"));
+        assert!(cfg
+            .machines
+            .iter()
+            .any(|machine| machine.id == "machine_server_a_actor_human_368136"));
     }
 }

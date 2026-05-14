@@ -1542,20 +1542,7 @@ fn server_machine_info_from_actor(
     } else {
         "configured"
     };
-    let data_root_arg = shell_path_arg(&data_root);
-    let serve_command = format!(
-        "JOI_AGENT_DATA_ROOT={} joi --server {} daemon --machine-id {}",
-        data_root_arg,
-        shell_arg(server_url),
-        shell_arg(&machine_id),
-    );
-    let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport JOI_AGENT_DATA_ROOT={}\nexec joi --server {} daemon --machine-id {}\n",
-        shell_path_arg(&data_root),
-        shell_path_arg(&data_root),
-        shell_arg(server_url),
-        shell_arg(&machine_id),
-    );
+    let (serve_command, setup_script) = daemon_start_commands(&data_root, server_url, &machine_id);
 
     let can_command = meta
         .capabilities
@@ -1770,20 +1757,7 @@ fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<Mac
         "configured"
     };
     let connection_actor_id = machine_connection_actor_id(machine);
-    let data_root_arg = shell_path_arg(&data_root);
-    let serve_command = format!(
-        "JOI_AGENT_DATA_ROOT={} joi --server {} daemon --machine-id {}",
-        data_root_arg,
-        shell_arg(server_url),
-        shell_arg(&machine.id),
-    );
-    let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport JOI_AGENT_DATA_ROOT={}\nexec joi --server {} daemon --machine-id {}\n",
-        shell_path_arg(&data_root),
-        shell_path_arg(&data_root),
-        shell_arg(server_url),
-        shell_arg(&machine.id),
-    );
+    let (serve_command, setup_script) = daemon_start_commands(&data_root, server_url, &machine.id);
 
     Ok(MachineInfo {
         id: machine.id.clone(),
@@ -1960,6 +1934,74 @@ fn shell_path_arg(path: &Path) -> String {
         }
     }
     shell_arg(&path.display().to_string())
+}
+
+fn daemon_start_commands(data_root: &Path, server_url: &str, machine_id: &str) -> (String, String) {
+    let data_root_arg = shell_path_arg(data_root);
+    let joi_bin = preferred_joi_binary()
+        .map(|path| shell_path_arg(&path))
+        .unwrap_or_else(|| "joi".into());
+    let serve_command = format!(
+        "JOI_AGENT_DATA_ROOT={} {} --server {} daemon --machine-id {}",
+        data_root_arg,
+        joi_bin,
+        shell_arg(server_url),
+        shell_arg(machine_id),
+    );
+    let setup_script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport JOI_AGENT_DATA_ROOT={}\nif [[ -z \"${{JOI_BIN:-}}\" ]]; then\n  JOI_BIN={}\nfi\nif [[ ! -x \"$JOI_BIN\" ]]; then\n  if command -v \"$JOI_BIN\" >/dev/null 2>&1; then\n    JOI_BIN=\"$(command -v \"$JOI_BIN\")\"\n  else\n    JOI_BIN=\"$(command -v joi)\"\n  fi\nfi\nexec \"$JOI_BIN\" --server {} daemon --machine-id {}\n",
+        shell_path_arg(data_root),
+        shell_path_arg(data_root),
+        joi_bin,
+        shell_arg(server_url),
+        shell_arg(machine_id),
+    );
+    (serve_command, setup_script)
+}
+
+fn preferred_joi_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("JOI_BIN")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("joi"));
+            if dir.file_name().and_then(|name| name.to_str()) == Some("MacOS") {
+                if let Some(contents_dir) = dir.parent() {
+                    candidates.push(contents_dir.join("Resources").join("bin").join("joi"));
+                }
+            }
+        }
+    }
+    if let Some(triple) = host_runtime_target_triple() {
+        candidates.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("dist")
+                .join("release")
+                .join(triple)
+                .join("joi"),
+        );
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn host_runtime_target_triple() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        _ => None,
+    }
 }
 
 fn shell_double_quote(value: &str) -> String {

@@ -13,7 +13,12 @@
 - 产出五件套后，唯一出口是 `[discovery-ready]` handoff router，等待 examiner `spec_review`。
 - 未收到 router 的 `[spec-review-passed]` 前，禁止创建/provision delivery thread，禁止 handoff delivery。
 - 收到 `[spec-review-passed]` 后，你才负责调用 `start-delivery.sh` 并 handoff delivery。
+- 启动普通 delivery 时只能调用 `start-delivery.sh`。禁止手写
+  `joi event append --type thread.opened`、`joi thread create`、`joi handoff
+  actor_delivery` 组合来绕过脚本；脚本承担幂等锁、复用和 provision。
 - 后文如果写“产出三件组后必须先启动 delivery”，视为旧协议，已废弃。
+- 你运行在既有 `joi daemon` 驱动的 actor 回合内。禁止执行 `joi daemon`、重启 daemon、kill daemon、后台启动 daemon，或修改 daemon/socket/discovery 文件。
+- 如果 `joi` CLI 报 daemon/socket 不可用，只能保留当前环境里的 `JOI_SERVER` / `JOI_DAEMON_SOCKET` 重试一次；仍失败时 handoff router 报 `[discovery-blocked] reason=<真实错误>`。不要自行“修复”运行时。
 
 ## Preserved behavior/guardrail sections
 

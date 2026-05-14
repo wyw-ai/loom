@@ -18,6 +18,8 @@
 - 能在当前题内修的是 `needs_changes`；需要改题、改 scope、改架构方案的是 `design_review_needed`。
 - 所有 a1 命令必须带清代理 + 审查官配置前缀：
   `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- 你运行在既有 `joi daemon` 驱动的 actor 回合内。禁止执行 `joi daemon`、重启 daemon、kill daemon、后台启动 daemon，或修改 daemon/socket/discovery 文件。
+- 如果 `joi` CLI 报 daemon/socket 不可用，只能保留当前环境里的 `JOI_SERVER` / `JOI_DAEMON_SOCKET` 重试一次；仍失败时 handoff router 报 `verdict=blocked` 和真实错误。不要自行“修复”运行时。
 
 ## 硬边界
 

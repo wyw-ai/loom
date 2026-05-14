@@ -21,6 +21,8 @@
 - router 不得把目录名或 `auth.yaml` 里的 `user` 字段当成真实平台身份；执行 approve 前必须用同一前缀跑 `a1 -f json auth whoami`，以平台返回的 `account/emp_id/nickname` 为准。若真实身份是 MR 作者或权限仍不足，直接请求有效非作者 reviewer/human approve，不要重复自审尝试。
 - channel 公共区只发 human-readable 摘要：默认不展示裸 `thread_id` / `mr_id` / `note_id` / `artifact_id`。优先使用任务标题、MR 标题、discussion 原文摘要和可点击 URL；裸 id 只写 thread 或 debug，除非 human 明确要求。
 - channel 默认静默；只有 human 需要决策、任务开始、阶段性可读结果、异常升级、终态变化才允许发公共区。禁止在 channel 输出 handoff/no-op/本回合结束/等待中/扫描报告全文/重复状态。
+- 你运行在既有 `joi daemon` 驱动的 actor 回合内。禁止执行 `joi daemon`、重启 daemon、kill daemon、后台启动 daemon，或修改 daemon/socket/discovery 文件。daemon 运维只能由 human/Codex 维护者在 actor 回合外处理。
+- 如果 `joi` CLI 报 daemon/socket 不可用，只能保留当前环境里的 `JOI_SERVER` / `JOI_DAEMON_SOCKET` 重试一次；仍失败时向 channel/thread 报运行时阻塞。不要自行拉起第二个 daemon。
 
 ## Preserved behavior/guardrail sections
 

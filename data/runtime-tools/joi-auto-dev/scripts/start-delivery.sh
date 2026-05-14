@@ -18,7 +18,15 @@ SOURCE_THREAD_ID=""
 WORK_ITEM_IDS=""
 AS_ACTOR="${JOI_ACTOR:-actor_discovery}"
 JQ_BIN="${JQ_BIN:-jq}"
-A1_BIN="${A1_BIN:-a1}"
+if [[ -n "${A1_BIN:-}" ]]; then
+    A1_BIN="$A1_BIN"
+elif command -v a1 >/dev/null 2>&1; then
+    A1_BIN="$(command -v a1)"
+elif [[ -x /home/canfeng/canfeng-projects/a1/a1/a1 ]]; then
+    A1_BIN="/home/canfeng/canfeng-projects/a1/a1/a1"
+else
+    A1_BIN="a1"
+fi
 if [[ -n "${JOI_BIN:-}" ]]; then
     JOI_BIN="$JOI_BIN"
 elif command -v joi >/dev/null 2>&1; then
@@ -92,6 +100,11 @@ strip_thread_prefixes() {
     printf '%s' "$text" | sed -E 's/^(\[(bugfixloop|bugfix):[^]]+\][[:space:]]*|\[delivery\][[:space:]]*)+//'
 }
 
+lock_key() {
+    local text="$1"
+    printf '%s' "$text" | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+//; s/_+$//' | cut -c1-160
+}
+
 thread_id_from_create() {
     "$JQ_BIN" -r '.thread.id // .thread_id // .id // empty'
 }
@@ -139,6 +152,58 @@ else
     THREAD_TITLE="[delivery] ${TITLE}"
 fi
 
+LOCK_ROOT="${TMPDIR:-/tmp}/joi-start-delivery-locks"
+mkdir -p "$LOCK_ROOT"
+LOCK_DIR="${LOCK_ROOT}/$(lock_key "${CHANNEL_ID}_${THREAD_TITLE}").lock"
+LOCK_ACQUIRED=0
+for _ in $(seq 1 60); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_ACQUIRED=1
+        break
+    fi
+    sleep 1
+done
+[[ "$LOCK_ACQUIRED" == "1" ]] || { echo "start-delivery: timed out waiting for lock: $THREAD_TITLE" >&2; exit 5; }
+cleanup_lock() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
+
+thread_has_delivery_handoff() {
+    local tid="$1"
+    joi event list --in "$tid" --limit 20 --json 2>/dev/null \
+        | "$JQ_BIN" -e '
+            (.events // .items // .)[]?
+            | select((.actorId // .actor_id // "") == "actor_delivery"
+                or any((.relations // [])[]?; (.kind // "") == "hands_off_to"
+                    and ((.target.id // .target.actorId // "") == "actor_delivery")))
+          ' >/dev/null 2>&1
+}
+
+thread_has_delivery_activity() {
+    local tid="$1"
+    joi event list --in "$tid" --limit 20 --json 2>/dev/null \
+        | "$JQ_BIN" -e '
+            (.events // .items // .)[]?
+            | select((.actorId // .actor_id // "") == "actor_delivery")
+          ' >/dev/null 2>&1
+}
+
+pick_existing_thread() {
+    local first="" tid="" activity_match="" handoff_match=""
+    while IFS= read -r tid; do
+        [[ -n "$tid" ]] || continue
+        [[ -n "$first" ]] || first="$tid"
+        if [[ -z "$activity_match" ]] && thread_has_delivery_activity "$tid"; then
+            activity_match="$tid"
+        fi
+        if [[ -z "$handoff_match" ]] && thread_has_delivery_handoff "$tid"; then
+            handoff_match="$tid"
+        fi
+    done
+    printf '%s' "${activity_match:-${handoff_match:-$first}}"
+}
+
 existing_thread=""
 if [[ -n "$FEEDBACK_ID" ]]; then
     if [[ "$BUGFIX_SOURCE" == "loop" ]]; then
@@ -152,11 +217,24 @@ if [[ -n "$FEEDBACK_ID" ]]; then
             | (.title // .name // "") as $title
             | select($title | startswith($prefix))
             | (.id // .thread_id // .thread.id // empty)
-        ' | head -n 1)
+        ' | pick_existing_thread)
+else
+    existing_thread=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null \
+        | "$JQ_BIN" -r --arg title "$THREAD_TITLE" --arg legacy "$TITLE" '
+            (.threads // .items // .)[]?
+            | select(((.title // .name // "") == $title) or ((.title // .name // "") == $legacy))
+            | (.id // .thread_id // .thread.id // empty)
+        ' | pick_existing_thread)
 fi
 
+REUSED_THREAD=0
+SKIP_HANDOFF=0
 if [[ -n "$existing_thread" ]]; then
     DELIVERY_THREAD_ID="$existing_thread"
+    REUSED_THREAD=1
+    if thread_has_delivery_handoff "$DELIVERY_THREAD_ID"; then
+        SKIP_HANDOFF=1
+    fi
 else
     root_text="delivery-start: ${THREAD_TITLE}"
     root_out=$(joi event append --channel --in "$CHANNEL_ID" --type thread.opened --text "$root_text" --json)
@@ -187,13 +265,14 @@ kbase_lines=""
 while IFS= read -r repo; do
     [[ -n "$repo" ]] || continue
     pages="MISSING"
-    if command -v "$A1_BIN" >/dev/null 2>&1; then
-        pages=$("$A1_BIN" -f json kbase search "$repo" --repo-ids 74121 --top 50 2>/dev/null \
-            | "$JQ_BIN" -r --arg prefix "[$repo] " '
-                [(.items // .data // [])[]
-                 | {id:(.page_id // .pageId // .id // ""), title:(.title // .name // .page_name // .pageName // "")}
+    if [[ -x "$A1_BIN" ]] || command -v "$A1_BIN" >/dev/null 2>&1; then
+        pages=$("$A1_BIN" -f json kbase search "$repo 开发规范" --repo-ids 74121 --top 50 2>/dev/null \
+            | "$JQ_BIN" -r --arg repo "$repo" --arg prefix "[$repo] " '
+                [(.items // .data // .results // [])[]
+                 | {id:(.page_id // .pageId // .pageID // .id // ""),
+                    title:(.title // .name // .page_title // .pageTitle // .page_name // .pageName // "")}
                  | select(.id != "")
-                 | select(.title | startswith($prefix))]
+                 | select((.title == $repo) or (.title | startswith($prefix)))]
                 | if length == 0 then empty
                   else map(.id + "(" + (.title | gsub("[\r\n]"; " ") | gsub("[()]"; " ")) + ")") | join(" ")
                   end
@@ -212,8 +291,11 @@ target-repos 开发规范（kbase 74121 page-id 列表）：
 ${kbase_lines}编码每个 repo 前先逐个执行 a1 kbase page view 74121 <page-id> 读取该 repo 的全部研发规范，并保存到 workspace 的 repo-specs/<group>__<repo>/；MISSING 的请回报 router 补。规范源头始终是 kbase，workspace 文件只是本次读取快照。
 EOF
 )
-handoff_out=$(joi handoff actor_delivery --in "$DELIVERY_THREAD_ID" --message "$msg" --json)
-handoff_event_id=$("$JQ_BIN" -r '.event.id // .id // empty' <<<"$handoff_out")
+handoff_event_id=""
+if [[ "$SKIP_HANDOFF" != "1" ]]; then
+    handoff_out=$(joi handoff actor_delivery --in "$DELIVERY_THREAD_ID" --message "$msg" --json)
+    handoff_event_id=$("$JQ_BIN" -r '.event.id // .id // empty' <<<"$handoff_out")
+fi
 
 rm -f "$manifest_tmp" "$manifest_norm"
 
@@ -221,5 +303,7 @@ rm -f "$manifest_tmp" "$manifest_norm"
     --arg delivery_thread_id "$DELIVERY_THREAD_ID" \
     --arg handoff_event_id "$handoff_event_id" \
     --arg thread_title "$THREAD_TITLE" \
+    --argjson reused "$REUSED_THREAD" \
+    --argjson skipped_handoff "$SKIP_HANDOFF" \
     --argjson provision "$("$JQ_BIN" -s '.' <<<"$provision_out")" \
-    '{ok:true, delivery_thread_id:$delivery_thread_id, handoff_event_id:$handoff_event_id, thread_title:$thread_title, provision:$provision}'
+    '{ok:true, delivery_thread_id:$delivery_thread_id, handoff_event_id:$handoff_event_id, thread_title:$thread_title, reused_thread:$reused, skipped_handoff:$skipped_handoff, provision:$provision}'

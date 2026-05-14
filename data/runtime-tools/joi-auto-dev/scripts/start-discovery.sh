@@ -60,6 +60,11 @@ safe_title() {
     printf '%s' "${text:0:90}"
 }
 
+lock_key() {
+    local text="$1"
+    printf '%s' "$text" | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+//; s/_+$//' | cut -c1-160
+}
+
 event_id_from_send() {
     "$JQ_BIN" -r '.event.id // .id // empty'
 }
@@ -72,13 +77,72 @@ TITLE=$(safe_title "${TITLE:-discovery-task}")
 [[ -n "$TITLE" ]] || TITLE="discovery-task"
 THREAD_TITLE="[discovery] ${TITLE}"
 
-root_out=$(joi event append --channel --in "$CHANNEL_ID" --type thread.opened --text "discovery-start: ${TITLE}" --json)
-root_event_id=$(event_id_from_send <<<"$root_out")
-[[ -n "$root_event_id" ]] || { echo "start-discovery: failed to create root channel event" >&2; exit 4; }
+LOCK_ROOT="${TMPDIR:-/tmp}/joi-start-discovery-locks"
+mkdir -p "$LOCK_ROOT"
+LOCK_DIR="${LOCK_ROOT}/$(lock_key "${CHANNEL_ID}_${THREAD_TITLE}").lock"
+LOCK_ACQUIRED=0
+for _ in $(seq 1 60); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_ACQUIRED=1
+        break
+    fi
+    sleep 1
+done
+[[ "$LOCK_ACQUIRED" == "1" ]] || { echo "start-discovery: timed out waiting for lock: $THREAD_TITLE" >&2; exit 5; }
+cleanup_lock() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 
-thread_out=$(joi thread create --channel "$CHANNEL_ID" --root-event "$root_event_id" --title "$THREAD_TITLE" --json)
-DISCOVERY_THREAD_ID=$(thread_id_from_create <<<"$thread_out")
-[[ -n "$DISCOVERY_THREAD_ID" ]] || { echo "start-discovery: failed to create discovery thread" >&2; exit 4; }
+thread_has_target_handoff() {
+    local tid="$1"
+    joi event list --in "$tid" --limit 20 --json 2>/dev/null \
+        | "$JQ_BIN" -e --arg target "$TARGET_ACTOR" '
+            (.events // .items // .)[]?
+            | select((.actorId // .actor_id // "") == $target
+                or any((.relations // [])[]?; (.kind // "") == "hands_off_to"
+                    and ((.target.id // .target.actorId // "") == $target)))
+          ' >/dev/null 2>&1
+}
+
+pick_existing_thread() {
+    local first="" tid="" handoff_match=""
+    while IFS= read -r tid; do
+        [[ -n "$tid" ]] || continue
+        [[ -n "$first" ]] || first="$tid"
+        if [[ -z "$handoff_match" ]] && thread_has_target_handoff "$tid"; then
+            handoff_match="$tid"
+        fi
+    done
+    printf '%s' "${handoff_match:-$first}"
+}
+
+existing_thread=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null \
+    | "$JQ_BIN" -r --arg title "$THREAD_TITLE" --arg legacy "$TITLE" '
+        (.threads // .items // .)[]?
+        | select(((.title // .name // "") == $title) or ((.title // .name // "") == $legacy))
+        | (.id // .thread_id // .thread.id // empty)
+    ' | pick_existing_thread)
+
+root_event_id=""
+handoff_event_id=""
+REUSED_THREAD=0
+SKIP_HANDOFF=0
+if [[ -n "$existing_thread" ]]; then
+    DISCOVERY_THREAD_ID="$existing_thread"
+    REUSED_THREAD=1
+    if thread_has_target_handoff "$DISCOVERY_THREAD_ID"; then
+        SKIP_HANDOFF=1
+    fi
+else
+    root_out=$(joi event append --channel --in "$CHANNEL_ID" --type thread.opened --text "discovery-start: ${TITLE}" --json)
+    root_event_id=$(event_id_from_send <<<"$root_out")
+    [[ -n "$root_event_id" ]] || { echo "start-discovery: failed to create root channel event" >&2; exit 4; }
+
+    thread_out=$(joi thread create --channel "$CHANNEL_ID" --root-event "$root_event_id" --title "$THREAD_TITLE" --json)
+    DISCOVERY_THREAD_ID=$(thread_id_from_create <<<"$thread_out")
+    [[ -n "$DISCOVERY_THREAD_ID" ]] || { echo "start-discovery: failed to create discovery thread" >&2; exit 4; }
+fi
 
 thread_ws="${HOME}/joi-workspaces/thread/${DISCOVERY_THREAD_ID}"
 shared_root="${HOME}/.agentx/channels/${CHANNEL_ID}/shared/repos"
@@ -97,9 +161,11 @@ cat >"${thread_ws}/.joi/discovery-scope.json" <<EOF
 }
 EOF
 
-handoff_out=$(joi handoff "$TARGET_ACTOR" --in "$DISCOVERY_THREAD_ID" --message "$MESSAGE" --json)
-handoff_event_id=$(event_id_from_send <<<"$handoff_out")
-[[ -n "$handoff_event_id" ]] || { echo "start-discovery: failed to handoff ${TARGET_ACTOR}" >&2; exit 4; }
+if [[ "$SKIP_HANDOFF" != "1" ]]; then
+    handoff_out=$(joi handoff "$TARGET_ACTOR" --in "$DISCOVERY_THREAD_ID" --message "$MESSAGE" --json)
+    handoff_event_id=$(event_id_from_send <<<"$handoff_out")
+    [[ -n "$handoff_event_id" ]] || { echo "start-discovery: failed to handoff ${TARGET_ACTOR}" >&2; exit 4; }
+fi
 
 "$JQ_BIN" -nc \
     --arg thread_id "$DISCOVERY_THREAD_ID" \
@@ -107,11 +173,15 @@ handoff_event_id=$(event_id_from_send <<<"$handoff_out")
     --arg handoff_event_id "$handoff_event_id" \
     --arg title "$THREAD_TITLE" \
     --arg shared_repos "${thread_ws}/shared/repos" \
+    --argjson reused "$REUSED_THREAD" \
+    --argjson skipped_handoff "$SKIP_HANDOFF" \
     '{
       ok: true,
       discovery_thread_id: $thread_id,
       root_event_id: $root_event_id,
       handoff_event_id: $handoff_event_id,
       title: $title,
-      shared_repos: $shared_repos
+      shared_repos: $shared_repos,
+      reused_thread: $reused,
+      skipped_handoff: $skipped_handoff
     }'

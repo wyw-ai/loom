@@ -174,6 +174,11 @@ delivery MR 的默认质量复核人，也不再对 reviewer 原则性质疑做�
   --title "<任务标题>"
 ```
 
+普通 delivery 启动禁止手写 `joi event append --type thread.opened`、`joi thread
+create`、`joi handoff actor_delivery` 组合。即使你认为脚本参数麻烦，也必须使用
+`start-delivery.sh`，因为脚本负责同一 channel/title 的串行锁、已有 thread 复用、
+workspace provision 和重复 handoff 抑制。
+
 脚本负责：幂等检查、创建/复用可读 delivery thread、provision workspace、补
 kbase page-id 列表、handoff `actor_delivery`，并输出 JSON，其中包含
 `delivery_thread_id`。

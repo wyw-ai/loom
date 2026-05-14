@@ -39,6 +39,9 @@
     "category": "DeveloperTool",
     "shortDescription": "Joi multi-actor collaboration desktop client",
     "longDescription": "Desktop client for Joi — a Discord-styled GUI over the Joi WebSocket protocol, parallel to the `joi chat` TUI.",
+    "resources": {
+      "../../dist/release/aarch64-apple-darwin/joi": "bin/joi"
+    },
     "icon": ["icons/icon.png"]
   }
 }

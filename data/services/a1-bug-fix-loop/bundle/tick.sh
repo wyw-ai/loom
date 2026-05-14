@@ -276,6 +276,45 @@ find_bugfix_thread_for_feedback() {
     find_in_thread_json <<<"$list"
 }
 
+find_discovery_thread_for_feedback() {
+    local fid="$1" list found
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    joi_avail || return 0
+
+    find_in_thread_json() {
+      jq -r --arg fid "$fid" '
+      (.threads // .items // .)[]?
+      | (.title // .name // "") as $title
+      | select($title | startswith("[discovery] bugfix " + $fid + ":"))
+      | (.id // .thread_id // .thread.id // empty)
+    ' 2>/dev/null | head -n 1
+    }
+
+    list=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    found=$(find_in_thread_json <<<"$list")
+    if [[ -n "$found" ]]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+
+    list=$(joi thread archive-list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    find_in_thread_json <<<"$list"
+}
+
+archive_task_threads() {
+    local fid="$1" discovery_tid="${2:-}" bf_tid="${3:-}" delivery_tid="${4:-}"
+    [[ "$DRY_RUN" -eq 0 ]] || return 0
+    joi_avail || return 0
+    if [[ -z "$discovery_tid" || "$discovery_tid" == "null" ]]; then
+        discovery_tid=$(find_discovery_thread_for_feedback "$fid" || true)
+    fi
+    [[ -n "$discovery_tid" && "$discovery_tid" != "null" ]] && joi thread archive "$discovery_tid" >/dev/null 2>&1 || true
+    [[ -n "$bf_tid" && "$bf_tid" != "null" && "$bf_tid" != "$discovery_tid" ]] && joi thread archive "$bf_tid" >/dev/null 2>&1 || true
+    if [[ -n "$delivery_tid" && "$delivery_tid" != "null" && "$delivery_tid" != "$bf_tid" && "$delivery_tid" != "$discovery_tid" ]]; then
+        joi thread archive "$delivery_tid" >/dev/null 2>&1 || true
+    fi
+}
+
 mr_is_merged() {
     local tid="$1"
     local body
@@ -509,6 +548,7 @@ bugs=$(fetch_bugs)
 for fid in $(jq -r 'keys[]' <<<"$tracking"); do
     cur_status=$(jq -r --arg k "$fid" '.[$k].fix_status' <<<"$tracking")
     [[ "$cur_status" != "in_progress" ]] && continue
+    discovery_tid=$(jq -r --arg k "$fid" '.[$k].discovery_thread_id // ""' <<<"$tracking")
     bf_tid=$(jq -r --arg k "$fid" '.[$k].bugfix_thread_id // ""' <<<"$tracking")
     delivery_tid=$(jq -r --arg k "$fid" '.[$k].delivery_thread_id // ""' <<<"$tracking")
     if [[ -z "$delivery_tid" || "$delivery_tid" == "null" ]]; then
@@ -526,10 +566,12 @@ for fid in $(jq -r 'keys[]' <<<"$tracking"); do
         tracking=$(jq -c --arg k "$fid" --arg ts "$TICK_AT" --arg close_result "${close_result:-skipped}" \
             '.[$k].fix_status = "fixed"
              | .[$k].fixed_at = $ts
+             | .[$k].archived_at = $ts
              | .[$k].feedback_closed_at = $ts
              | .[$k].feedback_close_result = $close_result' <<<"$tracking")
+        archive_task_threads "$fid" "${discovery_tid:-}" "$bf_tid" "${delivery_tid:-}"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按 MR 终态收口：已回评并更新为 Fixed（result=${close_result:-skipped}）。" >/dev/null 2>&1 || true
+            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按 MR 终态收口：已回评并更新为 Fixed（result=${close_result:-skipped}），并已按产生顺序归档 discovery/bugfix/delivery thread。" >/dev/null 2>&1 || true
         fi
     elif [[ "$(mr_is_final_closed "$bf_tid")" == "true" || "$(mr_is_final_closed "$terminal_tid")" == "true" || "$(feedback_is_nonfixed_terminal "$fid")" == "true" ]]; then
         outcome=$(extract_nonfixed_outcome "$terminal_tid" || true)
@@ -555,8 +597,9 @@ for fid in $(jq -r 'keys[]' <<<"$tracking"); do
              | .[$k].archived_at = $ts
              | .[$k].feedback_closed_at = $ts
              | .[$k].feedback_close_result = $close_result' <<<"$tracking")
+        archive_task_threads "$fid" "${discovery_tid:-}" "$bf_tid" "${delivery_tid:-}"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按非 Fixed 终态归档：outcome=${outcome}（result=${close_result:-skipped}），继续处理下一条队列。" >/dev/null 2>&1 || true
+            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按非 Fixed 终态归档：outcome=${outcome}（result=${close_result:-skipped}），并已按产生顺序归档 discovery/bugfix/delivery thread，继续处理下一条队列。" >/dev/null 2>&1 || true
         fi
     fi
 done

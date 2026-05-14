@@ -262,6 +262,10 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
    MR id、branch 名、repo list 查找关联 delivery thread。能唯一命中就复用原 thread；
    确需新建 thread 时，必须在 channel 摘要里明确“新 thread=<id>/<title>，旧
    thread=<id> 不再继续”，避免 human 去旧 thread 找不到 handoff。
+   特别地，human 只说“有权限了 / 好了 / 再试下 / 重新来 / 刚才失败的重试”等短句时，
+   这不是 new_task；必须先回看 channel 最近 24 小时内的 blocked/failed/gate 事件，
+   按最近的 MR id / repo / thread 恢复执行。能唯一命中则回到原 delivery/bugfix
+   thread 处理；不能唯一命中才向 human 问“要重试哪个 MR/任务？”。
 9. **handoff 可见性**：只要对 channel 汇报“已 handoff delivery/discovery”，汇报中必须
    带真实 handoff 所在 `thread_id`、目标 actor 和 handoff event id（若 CLI 返回）。
 
@@ -269,6 +273,7 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 
 | 分类 | 信号 | 动作 |
 | --- | --- | --- |
+| `retry_recovery` | “有权限了 / 好了 / 再试下 / 重新 handoff / 刚才失败的重试 / 权限加好了”等短句，或明显指向最近 blocked gate | 见下方「retry recovery 分支」；禁止当 new_task |
 | `new_task` | 新增功能 / 重构 / "做一个 xxx" / "给 X 仓库加 Y" | 见下方「new_task 分支」 |
 | `pickup_delivery` | human 明确说已有一个或多个分支需要“接管 / 放到一个 delivery / 打包验证 / 切预发测试”，例如列出 `repo + branch` 并要求一起处理 | 见下方「pickup delivery 分支」 |
 | `single_bug` | 单条缺陷描述 / 报错 / "xxx 不工作" | `joi handoff actor_a1_bug_triage --in <channel_id> --channel --message "single_bug：<原文>"` |
@@ -280,6 +285,32 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 | `chat` | 问候 / 闲聊 / 问状态 / 感谢 | `joi say --in <channel_id> --channel "<中文回复>"` |
 | `drilldown` | human 追问"刚才那个任务进度怎么样了 / 给我看 X 任务的 Y 详情" | 见下方「drilldown 分支」 |
 | `unknown` | 都对不上 | `joi say --in <channel_id> --channel "<澄清提问>"` |
+
+### retry recovery 分支（权限恢复 / 失败重试 / 短句承接）
+
+这个分支优先级高于 `new_task`。human 说“有权限了，再试下”“权限加好了”
+“刚才失败了重来”“重新 handoff 一下”等短句时，router 必须把它当作对最近阻塞
+gate 的恢复操作，而不是新需求。
+
+1. 定位上下文：
+   - 先查当前 thread；若消息来自 channel 公共区，再查同一 channel 最近 24 小时事件。
+   - 优先匹配最近的 MR id / repo / thread / feedback_id / branch。
+   - 重点识别最近的 `403 Forbidden`、`Agent run failed`、`examiner blocked`、
+     `approve 被拒`、`approver_number=false`、`mr_review 未完成`。
+2. 若唯一命中一个 active delivery/bugfix thread：
+   - 如果最近阻塞是 `examiner blocked/failed` 且当前 MR 缺少当前轮
+     `[examiner-result] verdict=quality_pass` + `LGTM - actor_examiner`，在原 thread
+     重新 handoff `actor_examiner gate=mr_review`，附原 MR/repo/task-goal/DoD。
+   - 如果 examiner 已经 `quality_pass` 且 `test=true/discussion=true`，但
+     `approver_number=false`，进入 approve gate：用审查官专用 config + 清代理执行
+     `a1 repo mr approve`；若平台仍拒绝，把拒绝原因通报 human。
+   - 如果 MR 已 merged/closed，走 `mr.final` 终态收口，不新建 discovery。
+3. 若匹配到多个候选，或者最近 blocked gate 已经和 human 短句不一致，先问一句澄清：
+   `你要重试哪个 MR/任务？我看到候选：<标题+MR URL> ...`
+4. 禁止：
+   - 禁止创建新的 discovery thread。
+   - 禁止复用 unrelated 的旧 discovery-desk 文本作为新任务。
+   - 禁止只根据 channel 里最近出现的业务关键词猜一个新 task。
 
 ### new_task 分支（每个 discovery 任务独立 thread）
 

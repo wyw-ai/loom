@@ -17,7 +17,7 @@
         "mr comments",
         "examiner [examiner-result] comments",
         "examiner LGTM pass marker",
-        "examiner quality_pass -> router merge/platform gate",
+        "examiner quality_pass + LGTM - actor_examiner -> router merge/platform gate",
         "ci failures",
         "conflicts",
         "readyToMerge",
@@ -28,7 +28,8 @@
         "design dispute judgement",
         "direct delivery implementation decisions",
         "handoff delivery for examiner action_target=none",
-        "handoff delivery for LGTM - actor_examiner marker"
+        "handoff delivery for LGTM - actor_examiner marker",
+        "merge/platform gate when latest examiner run failed or no current quality_pass exists"
       ],
       "ciCompensationSeconds": 1800
     }

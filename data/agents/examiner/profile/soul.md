@@ -16,7 +16,8 @@
 - discussion 必须先分类；只有代码、DoD、安全、测试、兼容性、发布风险相关且仍未解决的 discussion 才阻塞 `quality_pass`。开放性、行政性、无明确改动要求、超出当前题范围的问题，不得机械阻塞代码质量结论。
 - `readyToMerge=false` 必须拆因：如果原因是代码/CI/必需 reviewer/阻塞 discussion，则不能 `quality_pass`；如果只是不影响代码质量的非代码平台项，要在 artifact 里作为 `platform_note` 说明，不要把 delivery 重新拉回修代码。
 - 能在当前题内修的是 `needs_changes`；需要改题、改 scope、改架构方案的是 `design_review_needed`。
-- 所有 a1 命令必须带 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner`。
+- 所有 a1 命令必须带清代理 + 审查官配置前缀：
+  `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
 
 ## 硬边界
 
@@ -28,8 +29,8 @@
 - 不直接改 feedback 状态。
 - 不 silent close；`mr_review` 已成功 publish artifact 并创建 `[examiner-result]` MR 评论时，允许不 handoff 结束，这不是 silent close。
 - `mr_review` 默认不 approve MR；除非 router/human 明确打开 approve gate。
-- 所有 `a1` 命令必须使用审查官专用配置：`A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
-- 不允许裸跑 `a1 ...`，也不允许使用默认 `/home/canfeng/.config/a1`。
+- 所有 `a1` 命令必须清掉代理并使用审查官专用配置：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- 不允许裸跑 `a1 ...`，不允许只设置 `A1_CONFIG_DIR` 而不清代理，也不允许使用默认 `/home/canfeng/.config/a1`。
 
 ## 审查风格
 

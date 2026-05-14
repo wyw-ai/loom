@@ -151,13 +151,15 @@ Keep approve and merge separate:
 - `approve`: router may execute platform approval if needed and permitted.
 - `merge`: router does not execute merge; human/platform performs merge.
 
-Approve command must use the dedicated config:
+Approve command must clear proxy and use the dedicated config:
 
 ```bash
-A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve <mr_id> --repo <repo>
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+  A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner \
+  a1 repo mr approve <mr_id> --repo <repo>
 ```
 
-Never use bare `a1 repo mr approve ...`.
+Never use bare `a1 repo mr approve ...`, and never set only `A1_CONFIG_DIR` without clearing proxy.
 
 ### design_review
 
@@ -238,11 +240,85 @@ Common fixes:
 1. Announce what actor/service boundary you are changing.
 2. Patch local source files first.
 3. If live behavior matters, sync to 187 effective directories.
-4. Restart only the affected process when needed.
+4. Restart only the affected process when needed; for daemon restarts, preserve the Node/npm PATH rules below.
 5. Verify with one live event, MR status, watcher one-shot, or daemon log.
 6. Update docs when the behavior changes, especially `docs/a1-dev-canfeng-final-actors.md`.
 
 Use `apply_patch` for local edits. For remote runtime-only scripts like `poll.py`, patch carefully and run `python3 -m py_compile` before restart.
+
+## Node/npm Provider Deployment
+
+This is a hard rule for all Node/npm-based providers, including `codex`, `copilot`, `claude`, and wrapper scripts that eventually execute npm-installed CLIs.
+
+The daemon is often started from a non-interactive shell, cron-like environment, or service wrapper. Do not rely on login shell PATH, nvm hooks, or `~/.zshrc`. On 187, a bad restart can make `node` resolve to `/usr/bin/node v12.22.9` while `codex` points at a Node 24 npm package, causing errors like:
+
+```text
+SyntaxError: Unexpected reserved word
+const childResult = await new Promise(...)
+```
+
+### Actor spec rule
+
+For every actor spec using an npm-installed CLI, make the transport command self-contained. If the command also sources proxy setup, source proxy first, then put the required Node bin directories at the front of `PATH` before running the CLI. This order matters: on 187, `~/open-proxy` can reset/reorder `PATH`, so `export PATH=Node24...; source ~/open-proxy; exec codex ...` is still broken.
+
+```json
+"args": [
+  "-lc",
+  "source ~/open-proxy >/dev/null; export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.local/bin:$PATH; exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"",
+  "joi-codex"
+]
+```
+
+Use the same pattern for Copilot/Claude wrappers if they are npm-provided or depend on npm-provided node binaries. The exact CLI can differ, but the PATH prefix must be in the actor spec, not only in the daemon startup command.
+
+Wrong order example:
+
+```bash
+export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:$PATH
+source ~/open-proxy >/dev/null
+exec codex ...
+```
+
+This can still fail with Node v12 because `open-proxy` may rewrite PATH after the export. Correct order:
+
+```bash
+source ~/open-proxy >/dev/null
+export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.local/bin:$PATH
+exec codex ...
+```
+
+### Daemon restart rule
+
+When restarting the daemon manually on 187, use a login bash wrapper so normal PATH is available for provider discovery:
+
+```bash
+cd /home/canfeng/joi-apps
+nohup bash -lc 'cd /home/canfeng/joi-apps && exec ./joi daemon --server ws://11.158.213.187:7878/rpc' \
+  > /tmp/joi-daemon-restart.log 2>&1 < /dev/null &
+```
+
+Do not start it with a plain non-login `nohup ./joi daemon ...` unless you have explicitly exported the provider PATH first.
+
+### Required deployment checks
+
+After every actor/provider deployment or daemon restart, run all three checks:
+
+```bash
+ssh canfeng@11.158.213.187 'bash -lc "command -v node; node -v; command -v codex || true; command -v copilot || true; command -v claude || true"'
+ssh canfeng@11.158.213.187 'source ~/open-proxy >/dev/null; export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.local/bin:$PATH; node -v; codex --version'
+ssh canfeng@11.158.213.187 'tail -80 /tmp/joi-daemon-restart.log | grep -E "skipping .* provider|connected to|actor_examiner|canfeng-codex"'
+ssh canfeng@11.158.213.187 'cd /home/canfeng/joi-apps && ./joi actor list | grep -E "actor_examiner|actor_router|actor_delivery|actor_discovery|canfeng-codex"'
+```
+
+If daemon logs contain `skipping actor_examiner because provider codex is not available on PATH`, the deployment is not valid even if files were synced correctly.
+
+For Codex actors, also run a minimal handoff healthcheck after restart:
+
+```bash
+joi handoff --as actor_router --in <thread_id> actor_examiner -m "healthcheck: 请只回复 OK，不运行任何命令。"
+```
+
+Do not start a real MR review until the healthcheck produces a normal actor response instead of `Agent run failed`.
 
 ## Remote Sync Patterns
 
@@ -259,6 +335,14 @@ discovery actor_discovery
 delivery actor_delivery
 examiner actor_examiner
 ```
+
+For actor specs, sync the repo file and the effective machine spec. Example:
+
+```bash
+tar cf - data/agents/examiner/spec.json | ssh canfeng@11.158.213.187 'cd /home/canfeng/joi-apps && tar xf - && root=/home/canfeng/.agentx/machines/ws_dd43dfa2/actor_human_368136/canfeng_s_workhome_2cc53184; cp data/agents/examiner/spec.json "$root/agents/actor_examiner/spec.json"'
+```
+
+When changing shared provider behavior, update sibling specs too. For example, a Codex PATH fix should usually touch both `data/agents/examiner/spec.json` and `data/agents/canfeng-codex/spec.json`.
 
 Daemon restart may be required for agent profile reload. Ensure provider PATH includes node v24, claude, codex, and copilot if restarting daemon.
 

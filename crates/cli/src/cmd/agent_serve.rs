@@ -1001,7 +1001,9 @@ struct WorkerState {
     /// In-flight turn per scope. A worker owns one adapter instance, so handoff
     /// prompts are serialized per actor even when they target different scopes.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
-    /// Actor-wide FIFO of triggers received while this worker is busy.
+    /// Actor-wide queue of triggers received while this worker is busy. Human
+    /// triggers are kept ahead of service callbacks so stale automation cannot
+    /// starve an explicit user handoff.
     pending_triggers: Mutex<VecDeque<Event>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
     /// `Finished`, once final usage metadata is available.
@@ -1186,10 +1188,28 @@ impl WorkerState {
     }
 
     fn enqueue(&self, _scope_id: &str, event: Event) {
+        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        if pending.iter().any(|queued| queued.id == event.id) {
+            return;
+        }
+        if is_priority_trigger(&event) {
+            let insert_at = pending
+                .iter()
+                .rposition(is_priority_trigger)
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            pending.insert(insert_at, event);
+        } else {
+            pending.push_back(event);
+        }
+    }
+
+    fn has_pending_event(&self, event_id: &str) -> bool {
         self.pending_triggers
             .lock()
             .expect("pending poisoned")
-            .push_back(event);
+            .iter()
+            .any(|event| event.id == event_id)
     }
 
     fn push_text(&self, turn_id: &str, chunk: &str) {
@@ -1338,6 +1358,10 @@ impl WorkerState {
             .expect("seen_events poisoned")
             .insert(event_id.to_string())
     }
+}
+
+fn is_priority_trigger(event: &Event) -> bool {
+    event.actor_id.starts_with("actor_human_") || matches!(event.scope.kind, ScopeKind::Channel)
 }
 
 fn model_state_path(profile_dir: &Path) -> PathBuf {
@@ -1778,16 +1802,17 @@ async fn notification_loop(
         }
 
         match handle_handoff(&client, &state, &adapter, &event).await {
-            Ok(()) => {
-                if let Err(e) = record_delivery_seen(&client, &state, &event).await {
+            Ok(HandoffOutcome::Dispatched(dispatched)) => {
+                if let Err(e) = record_delivery_seen(&client, &state, &dispatched).await {
                     tracing::warn!(
                         actor = %actor_id,
-                        event = %event.id,
+                        event = %dispatched.id,
                         %e,
                         "failed to record delivery receipt for handoff"
                     );
                 }
             }
+            Ok(HandoffOutcome::Queued) => {}
             Err(e) => eprintln!("[{actor_id}] failed to handle handoff: {e}"),
         }
     }
@@ -2125,6 +2150,9 @@ async fn drain_pending_inbox(
             continue;
         };
         if !state.remember_event(&event.id) {
+            if state.has_pending_event(&event.id) {
+                continue;
+            }
             record_delivery_seen(client, state, &event).await?;
             continue;
         }
@@ -2169,8 +2197,11 @@ async fn drain_pending_inbox(
                 "adapter start failed while draining pending inbox: {err}"
             ));
         }
-        handle_handoff(client, state, adapter, &event).await?;
-        record_delivery_seen(client, state, &event).await?;
+        if let HandoffOutcome::Dispatched(dispatched) =
+            handle_handoff(client, state, adapter, &event).await?
+        {
+            record_delivery_seen(client, state, &dispatched).await?;
+        }
     }
     Ok(())
 }
@@ -2413,12 +2444,17 @@ fn responds_to(event_id: &str) -> Relation {
     }
 }
 
+enum HandoffOutcome {
+    Dispatched(Event),
+    Queued,
+}
+
 async fn handle_handoff(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
     trigger: &Event,
-) -> Result<()> {
+) -> Result<HandoffOutcome> {
     let trigger = trigger.clone();
     // Actor-wide FIFO: one worker owns one adapter instance, so a model-driven
     // self-handoff from a channel triage turn into a task thread must wait
@@ -2426,9 +2462,11 @@ async fn handle_handoff(
     if state.any_current_turn().is_some() {
         let scope_id = trigger.scope.id.clone();
         state.enqueue(&scope_id, trigger);
-        return Ok(());
+        return Ok(HandoffOutcome::Queued);
     }
-    dispatch_handoff(client, state, adapter, trigger).await
+    dispatch_handoff(client, state, adapter, trigger)
+        .await
+        .map(HandoffOutcome::Dispatched)
 }
 
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
@@ -2441,7 +2479,7 @@ async fn dispatch_handoff(
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
     mut trigger: Event,
-) -> Result<()> {
+) -> Result<Event> {
     loop {
         subscribe_scope(client, state, &trigger.scope).await;
         let turn_res: TurnOpenResult = client
@@ -2478,9 +2516,17 @@ async fn dispatch_handoff(
         .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(trigger),
             Err(e) => {
                 let _ = close_turn(client, &active.id, TurnStatus::Failed).await;
+                if let Err(receipt_err) = record_delivery_seen(client, state, &trigger).await {
+                    tracing::warn!(
+                        actor = %state.actor_id,
+                        event = %trigger.id,
+                        %receipt_err,
+                        "failed to record delivery receipt for failed handoff dispatch"
+                    );
+                }
                 let scope_id = trigger.scope.id.clone();
                 match state.clear_turn(&scope_id) {
                     Some(next) => {
@@ -3511,8 +3557,18 @@ async fn translate_one(
                 .unwrap_or_else(|| active.scope.id.clone());
             let next_trigger = state.clear_turn(&scope_id);
             if let Some(next) = next_trigger {
-                if let Err(e) = dispatch_handoff(client, state, adapter, next).await {
-                    eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}");
+                match dispatch_handoff(client, state, adapter, next).await {
+                    Ok(dispatched) => {
+                        if let Err(e) = record_delivery_seen(client, state, &dispatched).await {
+                            tracing::warn!(
+                                actor = %actor_id,
+                                event = %dispatched.id,
+                                %e,
+                                "failed to record delivery receipt for queued handoff"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}"),
                 }
             }
         }
@@ -4516,11 +4572,104 @@ mod tests {
 
         assert!(state.any_current_turn().is_some());
         state.enqueue(&queued.scope.id, queued.clone());
+        assert!(state.has_pending_event(&queued.id));
         assert_eq!(
             state.clear_turn(&active_scope.id).map(|event| event.id),
             Some(queued.id)
         );
         assert!(state.any_current_turn().is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worker_state_prioritizes_human_triggers_without_reversing_human_fifo() {
+        let root = temp_path("actor-wide-priority-queue");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let active_scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_busy".into(),
+        };
+        state.set_turn(ActiveTurn {
+            id: "turn_busy".into(),
+            scope: active_scope.clone(),
+            trigger_event_id: "evt_busy".into(),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "mr-watcher".into(),
+            cancel_requested: false,
+        });
+
+        let service = Event {
+            id: "evt_service".into(),
+            kind: "content.add".into(),
+            actor_id: "mr-watcher".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_service".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "service callback" }),
+            relations: Vec::new(),
+            _meta: None,
+        };
+        let human_one = Event {
+            id: "evt_human_one".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_human_123".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_main".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "first human handoff" }),
+            relations: Vec::new(),
+            _meta: None,
+        };
+        let human_two = Event {
+            id: "evt_human_two".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_human_123".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_human".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "second human handoff" }),
+            relations: Vec::new(),
+            _meta: None,
+        };
+
+        state.enqueue(&service.scope.id, service.clone());
+        state.enqueue(&human_one.scope.id, human_one.clone());
+        state.enqueue(&human_two.scope.id, human_two.clone());
+        state.enqueue(&human_one.scope.id, human_one.clone());
+
+        assert_eq!(
+            state.clear_turn(&active_scope.id).map(|event| event.id),
+            Some(human_one.id)
+        );
+        assert_eq!(
+            state.clear_turn("chan_main").map(|event| event.id),
+            Some(human_two.id)
+        );
+        assert_eq!(
+            state.clear_turn("thread_human").map(|event| event.id),
+            Some(service.id)
+        );
+        assert!(state.clear_turn("thread_service").is_none());
         std::fs::remove_dir_all(root).ok();
     }
 }

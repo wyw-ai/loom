@@ -170,7 +170,7 @@ function ChannelRow({
   const showThreads = expanded ?? hasCurrentThread;
 
   useEffect(() => {
-    if (!showThreads || threadsLoaded || threads.length > 0) return;
+    if (!showThreads || threadsLoaded) return;
     (async () => {
       try {
         const r = await ipc.threadList(channel.id);
@@ -186,14 +186,25 @@ function ChannelRow({
     if (!archiveExpanded || archiveLoaded) return;
     (async () => {
       try {
-        const r = await ipc.threadList(channel.id, { archived: true });
-        replaceArchivedThreads(channel.id, r.threads);
+        const [active, archived] = await Promise.all([
+          ipc.threadList(channel.id),
+          ipc.threadList(channel.id, { archived: true }),
+        ]);
+        replaceThreads(channel.id, active.threads);
+        replaceArchivedThreads(channel.id, archived.threads);
+        setThreadsLoaded(true);
         setArchiveLoaded(true);
       } catch {
         /* higher-level flows surface errors where they matter */
       }
     })();
-  }, [archiveExpanded, archiveLoaded, channel.id, replaceArchivedThreads]);
+  }, [
+    archiveExpanded,
+    archiveLoaded,
+    channel.id,
+    replaceArchivedThreads,
+    replaceThreads,
+  ]);
 
   const copyId = async (kind: "channel" | "thread", id: string) => {
     try {

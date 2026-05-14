@@ -60,15 +60,34 @@ bug_candidate/new_task
 
 ## 主流程
 
-1. router 收到 human 或 bug-fix-loop 任务，handoff discovery。
+1. router 收到 human 或 bug-fix-loop 任务，使用 `start-discovery.sh` 创建独立
+   discovery thread 并 handoff discovery；不要复用 `discovery-desk` 承载任务细节。
 2. discovery 产出三件套并发 `[discovery-ready]`，不启动 delivery。
 3. router 启动 `actor_examiner gate=spec_review`。
 4. spec 通过后，router 要求 discovery 调 `start-delivery.sh` 启动 delivery。
 5. delivery 实现、验证、发 MR，handoff router 并附 `[mr-opened v1]`。
-6. router 启动 `actor_examiner gate=mr_review`。
+6. router 启动 `actor_examiner gate=mr_review`。MR 审查 handoff 的正文必须以
+   `/review [joi] gate=mr_review` 开头，让支持 review mode 的 agent 产品优先进入
+   代码审查模式；spec/design/terminal gate 不加 `/review`。
 7. examiner publish artifact，并在 MR 发 `[examiner-result]` 评论；常规结论不 handoff。
 8. mr-watcher 扫 MR 评论/CI/reviewer/终态，统一推进 delivery 或等待 human merge。
-9. MR merged 后，delivery 回评 feedback 并改 Fixed；loop 归档并取下一条。
+9. MR merged 后，delivery 或 bug-fix-loop 回评 feedback 并改 Fixed；loop 归档并取下一条。
+   bugfix-loop 任务的标准归档集合是 discovery thread、bugfix/loop anchor thread、
+   delivery thread，按这个产生顺序归档。
+
+## Discovery Thread Workspace
+
+每个 discovery 任务必须有独立 thread，避免旧任务正文、artifact 和 actor session
+污染新任务。独立 thread 仍然需要看见频道级只读大库：
+
+```text
+~/joi-workspaces/thread/<discovery_thread_id>/shared/repos
+  -> ~/.agentx/channels/<channel_id>/shared/repos
+```
+
+router 必须通过 `~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-discovery.sh`
+创建该 thread 和软链。discovery 只读 `shared/repos` 用于理解仓库结构、历史提交和
+分支状态；更新 repo cache 必须回到 router 走 `cache-ctl.sh`。
 
 ## Examiner Gate
 

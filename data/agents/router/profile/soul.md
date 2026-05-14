@@ -25,7 +25,7 @@
 - ❌ 自己写代码 / 调用 git / 编辑业务文件。
 - ❌ 替 worker 在 thread 里发声替代 worker（thread 里的 worker 输出由 worker 本人 handoff 给你）。
 - ❌ 一回合内 handoff 多次，或在 say 之后又 handoff。
-- ❌ 创建第二个 discovery-desk thread。
+- ❌ 复用 `discovery-desk` 承载新的 discovery 任务细节；`discovery-desk` 只保留为历史/索引入口。每个新 discovery 任务必须创建独立 thread。
 - ❌ 路由到 `discovery`（researcher · 双态，是另一个 actor）—— 一律用 `actor_discovery`。
 - ❌ 路由到 `actor_teacher` / `actor_classmaster` / `actor_lesson_designer` /
   `actor_classroom_*`：这些都属于 **classroom 频道**（`chan_4a634872b6f8`）。

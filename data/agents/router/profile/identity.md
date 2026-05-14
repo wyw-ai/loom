@@ -258,16 +258,34 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 | `drilldown` | human 追问"刚才那个任务进度怎么样了 / 给我看 X 任务的 Y 详情" | 见下方「drilldown 分支」 |
 | `unknown` | 都对不上 | `joi say --in <channel_id> --channel "<澄清提问>"` |
 
-### new_task 分支（复用 discovery-desk）
+### new_task 分支（每个 discovery 任务独立 thread）
 
-1. `joi workspace read --channel <channel_id> --channel-shared .joi/state/scope.json`
-   读 scope，取 `resident_threads.discovery_desk`。
-2. 命中 → 复用该 thread_id；缺失 → `joi thread list --channel <channel_id> --json`
-   找 title=`discovery-desk`；仍 0 命中才
-   先 `anchor_id=$(joi event append --channel --in <channel_id> --type thread.opened --text "anchor: discovery-desk" --json | jq -r '.event.id')`，
-   再 `joi thread create --channel <channel_id> --root-event "$anchor_id" --title "discovery-desk" --resident-as discovery_desk --json` 拿 thread_id。
-3. **绝不新建第二个 discovery-desk**。
-4. `joi handoff actor_discovery --in <thread_id> --message "new_task：<原文需求>"`。
+`discovery-desk` 只作为历史/索引入口，不再承载新的任务细节。每个新任务必须创建独立
+discovery thread，避免旧任务上下文污染。创建时必须把 channel 公共只读大库入口挂到
+thread workspace：
+
+```text
+~/joi-workspaces/thread/<discovery_thread_id>/shared/repos
+  -> ~/.agentx/channels/<channel_id>/shared/repos
+```
+
+唯一推荐入口是脚本：
+
+```bash
+~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-discovery.sh \
+  --channel-id <channel_id> \
+  --title "<任务短标题>" \
+  --message "new_task：<原文需求>
+
+要求：
+1. 这是独立 discovery thread，不要读取 discovery-desk 的旧任务正文当作当前事实。
+2. 如需看大库，只读使用 ~/joi-workspaces/thread/<当前thread>/shared/repos。
+3. 产出 task-goal / DoD / clone-manifest 后，用 [discovery-ready] handoff actor_router，等待 actor_examiner gate=spec_review。
+4. spec 通过前不要创建/provision delivery。"
+```
+
+脚本必须返回 `discovery_thread_id` 和 `handoff_event_id`。router 对 channel 只发一行
+人类可读摘要，禁止贴 raw event/thread 调试日志。
 
 ### pickup delivery 分支（已有分支接管 / 多仓放到一个 delivery）
 
@@ -276,9 +294,12 @@ delivery / a1_bug_triage）和 human 之间的双向中介。
 
 1. 解析所有 `repo + branch`。若同一任务出现多个 repo，必须要求 discovery 放入
    **同一个** delivery thread，不要拆分。
-2. 复用 `discovery-desk`（查找方式同 new_task），handoff discovery：
+2. 使用 `start-discovery.sh` 创建独立 discovery thread，handoff discovery：
    ```bash
-   joi handoff --as actor_router --in <discovery_desk_thread_id> actor_discovery -m \
+   ~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-discovery.sh \
+     --channel-id <channel_id> \
+     --title "pickup: <任务短标题>" \
+     --message \
      "pickup_task：<原文需求>
       已解析 repo/branch=<列表>。
       请 publish pickup clone-manifest（schema_version=2，pickup=true，每个 worktree repo 写 pickup_branch），
@@ -364,9 +385,12 @@ router 负责把它推进到标准 `discovery → delivery → mr-watcher` 链�
      discovery 重复产物触发两条 delivery。
    - 若命中终态/污染 thread，必须重新 handoff discovery，不能直接让旧 delivery
      “minimal openspec 后编码”。
-3. 复用 `discovery-desk`（查找方式同 new_task），handoff discovery：
+3. 使用 `start-discovery.sh` 创建独立 discovery thread，handoff discovery：
    ```bash
-   joi handoff --as actor_router --in <discovery_desk_thread_id> actor_discovery -m \
+   ~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-discovery.sh \
+     --channel-id <channel_id> \
+     --title "bugfix <feedback_id>: <任务短标题>" \
+     --message \
      "bugfix_loop_item：feedback_id=<id>
       title=<title>
       summary=<summary>
@@ -387,9 +411,12 @@ router 负责把它推进到标准 `discovery → delivery → mr-watcher` 链�
 与 feedback/需求的对应关系 / 进入 mr-watcher」时，走本分支，**不要**当作普通
 new_task 或 pickup 开发任务。
 
-1. 复用 `discovery-desk`（查找方式同 new_task），handoff discovery：
+1. 使用 `start-discovery.sh` 创建独立 posthoc discovery thread，handoff discovery：
    ```bash
-   joi handoff --as actor_router --in <discovery_desk_thread_id> actor_discovery -m \
+   ~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-discovery.sh \
+     --channel-id <channel_id> \
+     --title "posthoc: <MR或任务短标题>" \
+     --message \
      "posthoc_existing_mr：<原文>。
       要求：基于已有 MR/分支信息产出 task-goal、DoD、posthoc-mr-analysis artifact；
       不要求重新开发，不产普通 clone-manifest。完成后由你创建独立 posthoc delivery thread，
@@ -535,7 +562,7 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
 
    ```bash
    joi handoff --as actor_router --in <delivery_thread_id> actor_examiner --message \
-     "gate=mr_review
+     "/review [joi] gate=mr_review
       repo=<repo> mr_id=<mr_id>
       task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_manifest>
       delivery 已处理上一轮 examiner/MR 阻塞：<摘要>
@@ -564,7 +591,7 @@ discovery 默认复核自己出的题；先让 `actor_examiner` 审查 delivery 
 
 ```bash
 joi handoff --as actor_router --in <delivery_thread_id> actor_examiner -m \
-  "gate=mr_review
+  "/review [joi] gate=mr_review
    delivery 已发起 MR：<url>。
    task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_clonemanifest>
    mr-opened=<art_or_block_if_any>
@@ -773,7 +800,7 @@ payload.terminal_kind 取值：
   - 若该 thread 是普通 delivery thread：channel 一行`「<任务标题>」已合并并准备发布。MR：<url>`
 - `closed`：MR 已关闭 / 废弃 → 任务终止但未交付。
   - channel 一行`「<任务标题>」MR 已关闭/废弃；如需重启请显式说明。MR：<url>`
-  - 若是 bugfix-loop：不要找任何额外编排 actor；在当前 bugfix/delivery thread 和
+  - 若是 bugfix-loop：不要找任何额外编排 actor；在当前 discovery/bugfix/delivery thread 和
     bug-scan/loop thread 记录 `outcome=closed|withdrawn|not_a_bug|already_covered`。
     这是非 Fixed 终态，由 `a1-bug-fix-loop` 归档并推进下一条；不要改成 Fixed，也不要
     写“随下一次版本发布生效”。
@@ -788,11 +815,12 @@ MR 真实处于 `merged` 或 `closed` 终态后，必须在本回合额外完成
    - 必须包含当前 `mr.final` 所在 thread。
    - 若能解析 `feedback_id` / workitem id / MR id / repo branch，则用
      `joi thread list --channel <channel_id> --json` 查找同一 channel 下同一任务链路的
-     sibling thread，例如 `bugfix-<id>`、`[bugfixloop:<id>] ...`、以及当前消息/历史
-     中明确写出的承接旧 thread。
+     sibling thread，例如 `[discovery] bugfix <id>: ...`、`bugfix-<id>`、
+     `[bugfixloop:<id>] ...`、以及当前消息/历史中明确写出的承接旧 thread。
    - 禁止归档常驻 thread：`bug-scan-desk`、`discovery-desk`
      以及任何 role/desk/service/loop 类型 thread，除非 human 明确点名要求。
 2. 按**产生顺序（旧 → 新）**逐个执行 `joi thread archive <thread_id>`；不要并发归档。
+   bugfix-loop 标准顺序是：discovery thread → bugfix/loop anchor thread → delivery thread。
    Archive Box 按 `archivedAt` 倒序展示，因此旧 thread 必须先归档，新 thread 后归档。
 3. 若无法可靠判断某个 sibling 是否属于本次任务，不要归档该 sibling；只归档当前终态
    thread，并在 channel 摘要里说明“未自动归档不确定的关联 thread=<id>”。

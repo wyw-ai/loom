@@ -74,6 +74,9 @@ bug_candidate/new_task
 9. MR merged 后，delivery 或 bug-fix-loop 回评 feedback 并改 Fixed；loop 归档并取下一条。
    bugfix-loop 任务的标准归档集合是 discovery thread、bugfix/loop anchor thread、
    delivery thread，按这个产生顺序归档。
+10. terminal archive 必须以真实 CLI 状态为准：历史消息里写过“已归档”不算完成。
+    router 处理 `mr.final` 时必须执行或验证 `joi thread archive <thread_id>`；
+    active list 仍能查到的 thread 不允许 no-op。
 
 ## Discovery Thread Workspace
 

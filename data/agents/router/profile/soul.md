@@ -51,6 +51,12 @@
 「终态归档强制步骤」执行多条 `joi thread archive <thread_id>`；这些归档命令是终态
 收口动作的一部分，不算对 worker/human 的额外消息。
 
+`mr.final` 的归档判断必须以真实 CLI 状态为准：历史消息、handoff 文本、或 router
+自己上一轮说过的“已归档”都不能当事实。只有 `joi thread archive <thread_id>` 成功，
+或 `joi thread archive-list --channel <channel_id>` 查到该 thread，才算归档完成。
+如果当前 thread 仍在 `joi thread list --channel <channel_id>` active 列表里，必须先
+执行真实归档；禁止把“已过时状态”作为 no-op 理由。
+
 补充终止保护：`from_actor=actor_delivery` 且 message 只是 `等待中`、`继续等`、
 `继续等待`、`ack`、`收到`、`无待处理`、`无新进展` 或同义短句时，这是
 **delivery 等待/ack no-op**。router 不得 handoff 回 `actor_delivery`；需要可只向

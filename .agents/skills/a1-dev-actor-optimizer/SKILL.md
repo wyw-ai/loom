@@ -114,6 +114,17 @@ It should route:
 - `LGTM - actor_examiner` as examiner self marker, not as a delivery action.
 - CI/conflict/comment issues to delivery only when there is a real executable action.
 
+## Terminal Archive Rule
+
+For `mr.final` / merged / closed bugs, treat CLI state as the only source of truth.
+
+- A prior event that says "已归档" is not proof.
+- `router` must either run `joi thread archive <thread_id>` or verify the thread in
+  `joi thread archive-list --channel <channel_id>`.
+- If `joi thread list --channel <channel_id>` still shows the thread as active,
+  archive it even if an earlier router message claimed it was archived.
+- Never optimize this away as stale/no-op unless the archive-list proves it is archived.
+
 ## Gate Semantics
 
 ### spec_review
@@ -261,6 +272,8 @@ const childResult = await new Promise(...)
 
 For every actor spec using an npm-installed CLI, make the transport command self-contained. If the command also sources proxy setup, source proxy first, then put the required Node bin directories at the front of `PATH` before running the CLI. This order matters: on 187, `~/open-proxy` can reset/reorder `PATH`, so `export PATH=Node24...; source ~/open-proxy; exec codex ...` is still broken.
 
+Important: machine-level providers in `/home/canfeng/.joi-apps/desktop.toml` override or regenerate effective actor specs. If a provider is defined there, fix the provider command first, then sync actor specs if needed. Changing only `/home/canfeng/.agentx/.../agents/<actor>/spec.json` is not enough; the daemon can still launch the old provider command and fail.
+
 ```json
 "args": [
   "-lc",
@@ -270,6 +283,41 @@ For every actor spec using an npm-installed CLI, make the transport command self
 ```
 
 Use the same pattern for Copilot/Claude wrappers if they are npm-provided or depend on npm-provided node binaries. The exact CLI can differ, but the PATH prefix must be in the actor spec, not only in the daemon startup command.
+
+Machine provider example for `/home/canfeng/.joi-apps/desktop.toml`:
+
+```toml
+[[machines.providers]]
+id = "codex"
+command = "/bin/bash"
+args = ["-lc", "source ~/open-proxy >/dev/null; export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.local/bin:$PATH; exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"", "joi-codex"]
+```
+
+If a UI handoff produces both an `Agent run failed` and a successful reply, suspect duplicate actor registration or old provider adapters still connected. Check:
+
+```bash
+ssh canfeng@11.158.213.187 'cd /home/canfeng/joi-apps && ./joi --json actor list | jq -r ".actors[] | select(.id|test(\"codex|examiner\")) | @json"'
+ssh canfeng@11.158.213.187 'ps -ef | grep -E "codex exec|joi daemon" | grep -v grep'
+ssh canfeng@11.158.213.187 'root=/home/canfeng/.agentx/machines/ws_dd43dfa2/actor_human_368136/canfeng_s_workhome_2cc53184; find "$root/agents" -maxdepth 2 -name spec.json -print | xargs -I{} sh -c "printf \"%s \" \"{}\"; jq -r \".actor.id // .id // empty\" \"{}\""'
+```
+
+Only active specs under `$root/agents` should be considered live. Old specs moved under `disabled-agents` are not active, but stale server actor records can remain visible until disconnected or cleaned up.
+
+After every actor sync/restart, explicitly check for duplicate active actor ids:
+
+```bash
+ssh canfeng@11.158.213.187 'root=/home/canfeng/.agentx/machines/ws_dd43dfa2/actor_human_368136/canfeng_s_workhome_2cc53184; find "$root/agents" -maxdepth 2 -name spec.json -print | while read f; do id=$(jq -r ".actor.id // .id // empty" "$f" 2>/dev/null); printf "%s\t%s\n" "$id" "$f"; done | sort | awk -F "\t" "{count[\\$1]++; files[\\$1]=files[\\$1] \"\\n  \" \\$2} END {found=0; for (id in count) if (count[id] > 1) {found=1; print id, count[id], files[id]} if (!found) print \"none\"}"'
+```
+
+Known bad pattern: both `agents/router/spec.json` and `agents/actor_router/spec.json` set `actor.id=actor_router`. The same has happened for `delivery`/`actor_delivery` and `discovery`/`actor_discovery`. This creates two adapters for one actor id, so the UI can show duplicate typing and one handoff can be processed twice. Move the old short-name alias directories out of `agents/`, for example:
+
+```bash
+root=/home/canfeng/.agentx/machines/ws_dd43dfa2/actor_human_368136/canfeng_s_workhome_2cc53184
+mkdir -p "$root/disabled-agents"
+mv "$root/agents/router" "$root/disabled-agents/router.alias-disabled-$(date +%Y%m%d%H%M%S)"
+```
+
+Then restart the daemon. `joi actor list` may still show legacy `router`/`delivery`/`discovery` records without `_meta.createdBy=joi-daemon`; those are stale server actor records, not active daemon specs. The decisive check is duplicate ids under `$root/agents` plus daemon logs showing exactly one `starting from machine config` per actor.
 
 Wrong order example:
 
@@ -325,16 +373,19 @@ Do not start a real MR review until the healthcheck produces a normal actor resp
 For actor profiles, sync both repo and effective machine directories:
 
 ```bash
-tar cf - data/agents/router/profile | ssh canfeng@11.158.213.187 'cd /home/canfeng/joi-apps && tar xf - && base=/home/canfeng/.agentx/machines/ws_dd43dfa2/actor_human_368136/canfeng_s_workhome_2cc53184/agents && for a in router actor_router; do mkdir -p "$base/$a/profile"; cp -f /home/canfeng/joi-apps/data/agents/router/profile/identity.md "$base/$a/profile/identity.md"; cp -f /home/canfeng/joi-apps/data/agents/router/profile/soul.md "$base/$a/profile/soul.md"; done'
+tar cf - data/agents/router/profile | ssh canfeng@11.158.213.187 'cd /home/canfeng/joi-apps && tar xf - && base=/home/canfeng/.agentx/machines/ws_dd43dfa2/actor_human_368136/canfeng_s_workhome_2cc53184/agents/actor_router/profile && mkdir -p "$base" && cp -f /home/canfeng/joi-apps/data/agents/router/profile/identity.md "$base/identity.md" && cp -f /home/canfeng/joi-apps/data/agents/router/profile/soul.md "$base/soul.md"'
 ```
 
-Adjust `router actor_router` to the target actor pair:
+Use only canonical active actor directories:
 
 ```text
-discovery actor_discovery
-delivery actor_delivery
-examiner actor_examiner
+router profile source -> agents/actor_router/profile
+discovery profile source -> agents/actor_discovery/profile
+delivery profile source -> agents/actor_delivery/profile
+examiner profile source -> agents/actor_examiner/profile
 ```
+
+Do not recreate short-name alias directories such as `agents/router`, `agents/delivery`, or `agents/discovery`; they can cause duplicate active actor ids.
 
 For actor specs, sync the repo file and the effective machine spec. Example:
 

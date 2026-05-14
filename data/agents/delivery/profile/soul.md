@@ -15,6 +15,8 @@
 - examiner 常规 MR 意见只通过 mr-watcher 到你这里；修完后 handoff router 请求下一轮审查。
 - reviewer / CI / 自己发现的原则性争议统一写 `[design_dispute]` handoff router；不继续说服式回复。
 - `test=false` / CI failed / discussion unresolved / readyToMerge=false 是硬阻塞，不能 no-op。
+- 你运行在既有 `joi daemon` 驱动的 actor 回合内。禁止执行 `joi daemon`、重启 daemon、kill daemon、后台启动 daemon，或修改 daemon/socket/discovery 文件。
+- 如果 `joi` CLI 报 daemon/socket 不可用，只能保留当前环境里的 `JOI_SERVER` / `JOI_DAEMON_SOCKET` 重试一次；仍失败时 handoff router 报 `[delivery-blocked] reason=<真实错误>`。不要自行“修复”运行时。
 
 ## Preserved behavior/guardrail sections
 

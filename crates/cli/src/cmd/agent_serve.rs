@@ -27,11 +27,12 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentModelChoice, AgentSpec, BundleInstallMode,
-    EventAppendResult, HandoffApplyOn, PromptTemplateSpec, TurnOpenResult,
+    DeliveryListResult, EventAppendResult, HandoffApplyOn, PromptTemplateSpec, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef, TurnStatus,
+    ActorKind, Event, Meta, ReceiptKind, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef,
+    TurnStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1665,14 +1666,30 @@ async fn notification_loop(
     actor_id: &str,
 ) -> Result<()> {
     let mut started = false;
+    let mut inbox_poll = interval(Duration::from_secs(15));
     loop {
         // Drain pending notifications. We pop them one by one and dispatch
         // each on its own; the borrow on `notifications` is released between
         // iterations so nested RPC calls (turn/open, event/append) can use the
         // same Client without deadlock.
-        let next = {
-            let mut rx = client.notifications.lock().await;
-            rx.recv().await
+        let next = tokio::select! {
+            _ = inbox_poll.tick() => {
+                if let Err(e) = drain_pending_inbox(
+                    &client,
+                    &state,
+                    &adapter,
+                    &event_tx,
+                    &mut started,
+                    actor_id,
+                ).await {
+                    eprintln!("[{actor_id}] failed to drain pending inbox: {e}");
+                }
+                continue;
+            }
+            next = async {
+                let mut rx = client.notifications.lock().await;
+                rx.recv().await
+            } => next,
         };
         let Some(n) = next else {
             eprintln!("[{actor_id}] server disconnected, worker exiting");
@@ -1698,12 +1715,26 @@ async fn notification_loop(
         if event.kind == "action.response" {
             if let Err(e) = handle_action_response(&client, &state, &adapter, &event).await {
                 eprintln!("[{actor_id}] failed to handle action.response: {e}");
+            } else if let Err(e) = record_delivery_seen(&client, &state, &event).await {
+                tracing::warn!(
+                    actor = %actor_id,
+                    event = %event.id,
+                    %e,
+                    "failed to record delivery receipt for action.response"
+                );
             }
             continue;
         }
         if event.kind == "turn.close" && is_for_us(&event, actor_id) {
             if let Err(e) = handle_turn_close(&client, &state, &adapter, &event).await {
                 eprintln!("[{actor_id}] failed to handle turn.close: {e}");
+            } else if let Err(e) = record_delivery_seen(&client, &state, &event).await {
+                tracing::warn!(
+                    actor = %actor_id,
+                    event = %event.id,
+                    %e,
+                    "failed to record delivery receipt for turn.close"
+                );
             }
             continue;
         }
@@ -1714,7 +1745,17 @@ async fn notification_loop(
         match handle_control_command(&client, &state, &adapter, &event_tx, &mut started, &event)
             .await
         {
-            Ok(true) => continue,
+            Ok(true) => {
+                if let Err(e) = record_delivery_seen(&client, &state, &event).await {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        event = %event.id,
+                        %e,
+                        "failed to record delivery receipt for control command"
+                    );
+                }
+                continue;
+            }
             Ok(false) => {}
             Err(e) => {
                 eprintln!("[{actor_id}] failed to handle control command: {e}");
@@ -1736,8 +1777,18 @@ async fn notification_loop(
             eprintln!("[{actor_id}] adapter ready");
         }
 
-        if let Err(e) = handle_handoff(&client, &state, &adapter, &event).await {
-            eprintln!("[{actor_id}] failed to handle handoff: {e}");
+        match handle_handoff(&client, &state, &adapter, &event).await {
+            Ok(()) => {
+                if let Err(e) = record_delivery_seen(&client, &state, &event).await {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        event = %event.id,
+                        %e,
+                        "failed to record delivery receipt for handoff"
+                    );
+                }
+            }
+            Err(e) => eprintln!("[{actor_id}] failed to handle handoff: {e}"),
         }
     }
 }
@@ -2042,6 +2093,121 @@ fn is_for_us(event: &Event, actor_id: &str) -> bool {
             && r.target.kind == RefKind::Actor
             && r.target.id == actor_id
     })
+}
+
+async fn drain_pending_inbox(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
+    actor_id: &str,
+) -> Result<()> {
+    let res: DeliveryListResult = client
+        .call(
+            method::DELIVERY_LIST,
+            json!({
+                "actorId": actor_id,
+                "state": "pending",
+                "limit": 200,
+            }),
+        )
+        .await?;
+    if res.deliveries.is_empty() {
+        return Ok(());
+    }
+    let max_age = pending_inbox_max_age();
+    let now = Utc::now();
+    for entry in res.deliveries {
+        let event_id = entry.delivery.event_id.clone();
+        let Some(event) = entry.event else {
+            record_delivery_seen_by_id(client, actor_id, &event_id).await?;
+            continue;
+        };
+        if !state.remember_event(&event.id) {
+            record_delivery_seen(client, state, &event).await?;
+            continue;
+        }
+        let too_old = now.signed_duration_since(event.occurred_at) > max_age;
+        if too_old {
+            tracing::info!(
+                actor = %actor_id,
+                event = %event.id,
+                occurred_at = %event.occurred_at,
+                "dropping stale pending delivery from durable inbox"
+            );
+            record_delivery_seen(client, state, &event).await?;
+            continue;
+        }
+        if event.kind == "action.response" {
+            handle_action_response(client, state, adapter, &event).await?;
+            record_delivery_seen(client, state, &event).await?;
+            continue;
+        }
+        if event.kind == "turn.close" && is_for_us(&event, actor_id) {
+            handle_turn_close(client, state, adapter, &event).await?;
+            record_delivery_seen(client, state, &event).await?;
+            continue;
+        }
+        if !is_for_us(&event, actor_id) {
+            record_delivery_seen(client, state, &event).await?;
+            continue;
+        }
+        match handle_control_command(client, state, adapter, event_tx, started, &event).await {
+            Ok(true) => {
+                record_delivery_seen(client, state, &event).await?;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                record_delivery_seen(client, state, &event).await?;
+                return Err(e);
+            }
+        }
+        if let Some(err) = try_ensure_adapter_started(state, adapter, event_tx, started).await {
+            return Err(anyhow!(
+                "adapter start failed while draining pending inbox: {err}"
+            ));
+        }
+        handle_handoff(client, state, adapter, &event).await?;
+        record_delivery_seen(client, state, &event).await?;
+    }
+    Ok(())
+}
+
+fn pending_inbox_max_age() -> chrono::Duration {
+    let secs = std::env::var("JOI_AGENT_PENDING_MAX_AGE_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(6 * 60 * 60);
+    chrono::Duration::seconds(secs)
+}
+
+async fn record_delivery_seen(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    event: &Event,
+) -> Result<()> {
+    record_delivery_seen_by_id(client, &state.actor_id, &event.id).await
+}
+
+async fn record_delivery_seen_by_id(
+    client: &Arc<Client>,
+    actor_id: &str,
+    event_id: &str,
+) -> Result<()> {
+    let _: Value = client
+        .call(
+            method::RECEIPT_RECORD,
+            json!({
+                "eventId": event_id,
+                "actorId": actor_id,
+                "kind": ReceiptKind::Seen,
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn handle_control_command(

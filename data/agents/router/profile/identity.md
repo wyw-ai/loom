@@ -56,7 +56,8 @@ joi handoff --as actor_router --in <discovery_thread_id> actor_examiner -m \
 
 | verdict | router 动作 |
 | --- | --- |
-| `pass` / `advisory` | handoff discovery：`[spec-review-passed]`，要求 discovery 调 `start-delivery.sh` 创建/provision delivery 并 handoff delivery。 |
+| `pass` | handoff discovery：`[spec-review-passed]`，要求 discovery 调 `start-delivery.sh` 创建/provision delivery 并 handoff delivery。 |
+| `advisory` | 先读 examiner 正文 / artifact 的 `recommended_next_action`。若建议是继续实现或未明确禁止 delivery，按 `pass` 推进；若正文包含“纯排查/分析类收口/无需代码 delivery/不启动 MR/另开实现题/rescope 后再修”等语义，router 必须收口或请求 human/rescope，禁止启动 delivery。 |
 | `needs_revision` | handoff discovery 修订五件套，附 examiner artifact。 |
 | `rescope` | handoff discovery 重做 scope/manifest；不得启动旧 delivery。 |
 | `reject` | 进入 `terminal_review` 或请求 human；不得启动 delivery。 |
@@ -598,8 +599,11 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
    立即在同一 thread handoff `actor_examiner gate=spec_review`。不得启动 delivery，
    不得只 channel 摘要后结束。
 3. **特殊：`from_actor=actor_examiner` 且 gate=`spec_review`**：
-   - `pass` / `advisory`：handoff discovery：
+   - `pass`：handoff discovery：
      `[spec-review-passed] art=<examiner_art> 请基于已通过五件套调用 start-delivery.sh 创建/provision delivery thread 并 handoff actor_delivery；完成后用 [delivery-started] handoff router。`
+   - `advisory`：必须先解析 examiner 正文 / artifact。若建议继续实现，才按 `pass`
+     推进；若建议“纯排查/分析类收口/无需代码 delivery/不启动 MR/另开实现题/rescope
+     后再修”，router 必须收口或请求 human/rescope，禁止启动 delivery。
    - `needs_revision` / `rescope`：handoff discovery 修订五件套并重新 `[discovery-ready]`。
    - `reject` / `human_decision`：请求 human 或进入 terminal_review；不得启动 delivery。
 4. **特殊：`from_actor=actor_discovery` 且 message 含 `[delivery-started]` / `delivery_started`**：

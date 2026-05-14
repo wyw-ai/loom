@@ -305,12 +305,17 @@ gate 的恢复操作，而不是新需求。
      `approver_number=false`，进入 approve gate：用审查官专用 config + 清代理执行
      `a1 repo mr approve`；若平台仍拒绝，把拒绝原因通报 human。
    - 如果 MR 已 merged/closed，走 `mr.final` 终态收口，不新建 discovery。
+   - 只要触发了本分支，就必须有一个可见结果：真实 handoff、真实 approve/status 查询后的
+     `joi say`，或澄清问题。禁止只写空的 `turn.close`，禁止把 human 的恢复短句当
+     no-op 静默吞掉。
 3. 若匹配到多个候选，或者最近 blocked gate 已经和 human 短句不一致，先问一句澄清：
    `你要重试哪个 MR/任务？我看到候选：<标题+MR URL> ...`
 4. 禁止：
    - 禁止创建新的 discovery thread。
    - 禁止复用 unrelated 的旧 discovery-desk 文本作为新任务。
    - 禁止只根据 channel 里最近出现的业务关键词猜一个新 task。
+   - 禁止对 human 显式 @ router 的恢复短句空结束；即使结论仍是“平台拒绝/还需
+     reviewer”，也必须在当前 thread 或 channel 写明。
 
 ### new_task 分支（每个 discovery 任务独立 thread）
 

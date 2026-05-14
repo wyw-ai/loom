@@ -64,6 +64,7 @@ pub struct AppendArgs {
     pub stdin: bool,
     pub reply_to: Option<String>,
     pub handoff_to: Option<String>,
+    pub handoff_prefix: Option<String>,
     pub artifact_links: Vec<String>,
 }
 
@@ -116,15 +117,20 @@ pub async fn append(client: Arc<Client>, args: AppendArgs) -> Result<()> {
         json!({ "contentType": args.content_type, "text": body })
     };
 
-    let payload = json!({
-        "event": {
-            "type": args.event_type,
-            "actorId": args.actor_id,
-            "scope": scope,
-            "payload": payload_value,
-            "relations": relations,
-        }
+    let mut event = json!({
+        "type": args.event_type,
+        "actorId": args.actor_id,
+        "scope": scope,
+        "payload": payload_value,
+        "relations": relations,
     });
+    if args.handoff_to.is_some() {
+        if let Some(prefix) = args.handoff_prefix.filter(|prefix| !prefix.is_empty()) {
+            event["_meta"] = json!({ "handoffPromptPrefix": prefix });
+        }
+    }
+
+    let payload = json!({ "event": event });
     let res: EventAppendResult = client.call(method::EVENT_APPEND, payload).await?;
     if render::is_json() {
         render::print_json(&res);

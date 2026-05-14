@@ -66,9 +66,9 @@ bug_candidate/new_task
 3. router 启动 `actor_examiner gate=spec_review`。
 4. spec 通过后，router 要求 discovery 调 `start-delivery.sh` 启动 delivery。
 5. delivery 实现、验证、发 MR，handoff router 并附 `[mr-opened v1]`。
-6. router 启动 `actor_examiner gate=mr_review`。MR 审查 handoff 的正文必须以
-   `/review [joi] gate=mr_review` 开头，让支持 review mode 的 agent 产品优先进入
-   代码审查模式；spec/design/terminal gate 不加 `/review`。
+6. router 启动 `actor_examiner gate=mr_review`。MR 审查 handoff 必须带
+   `--handoff-prefix $'/review [joi]\n'`，让支持 review mode 的 agent 产品优先进入
+   代码审查模式；正文仍从 `gate=mr_review` 开始，spec/design/terminal gate 不加该 prefix。
 7. examiner publish artifact，并在 MR 发 `[examiner-result]` 评论；常规结论不 handoff。
 8. mr-watcher 扫 MR 评论/CI/reviewer/终态，统一推进 delivery 或等待 human merge。
 9. MR merged 后，delivery 或 bug-fix-loop 回评 feedback 并改 Fixed；loop 归档并取下一条。

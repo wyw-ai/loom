@@ -561,8 +561,10 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
    `等待 reviewer/CI` no-op。handoff 模板：
 
    ```bash
-   joi handoff --as actor_router --in <delivery_thread_id> actor_examiner --message \
-     "/review [joi] gate=mr_review
+   joi handoff --as actor_router --in <delivery_thread_id> actor_examiner \
+     --handoff-prefix $'/review [joi]\n' \
+     --message \
+     "gate=mr_review
       repo=<repo> mr_id=<mr_id>
       task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_manifest>
       delivery 已处理上一轮 examiner/MR 阻塞：<摘要>
@@ -590,8 +592,10 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
 discovery 默认复核自己出的题；先让 `actor_examiner` 审查 delivery 的产出是否真的解了需求：
 
 ```bash
-joi handoff --as actor_router --in <delivery_thread_id> actor_examiner -m \
-  "/review [joi] gate=mr_review
+joi handoff --as actor_router --in <delivery_thread_id> actor_examiner \
+  --handoff-prefix $'/review [joi]\n' \
+  -m \
+  "gate=mr_review
    delivery 已发起 MR：<url>。
    task-goal=<art_taskgoal> DoD=<art_dod> clone-manifest=<art_clonemanifest>
    mr-opened=<art_or_block_if_any>

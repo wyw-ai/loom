@@ -190,6 +190,12 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u al
   a1 repo mr approve <mr_id> --repo <repo>
 ```
 
+`A1_CONFIG_DIR` selects the a1 auth store (`auth.yaml`). The global `--config`
+flag is not an auth-store selector. Before approve, router must use the same
+prefix to run `a1 -f json auth whoami`; if the returned platform identity is
+the MR author or Code rejects author/self-review, router must request a valid
+non-author reviewer/human instead of retrying approve.
+
 ## Channel 公共区卫生
 
 channel 只放 human 需要知道或处理的摘要，不放 actor 日志。默认静默；只有 human 决策、

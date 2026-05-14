@@ -190,7 +190,7 @@ human/terminal 裁决，不能启动 delivery。
 上下文；对能定位到文件行的具体问题，优先使用 Code MR 行级评论：
 
 ```bash
-A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create \
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create \
   --repo <repo> --mr <mr_id> --file <changed/file> --line <new_line> \
   -m "<问题、影响、建议>"
 ```

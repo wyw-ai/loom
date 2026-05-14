@@ -98,6 +98,29 @@ discussion unresolved 和 `readyToMerge=false` 必须拆因：只有代码、DoD
 改动要求、超出当前题范围的问题，由 examiner 记录为 platform note，router 不应因此把
 delivery 重新拉回修代码。
 
+### Examiner Pass 硬门禁
+
+router 永远不能自己推导“代码质量已通过”。MR 进入 approve/merge gate 必须同时满足：
+
+1. 当前 MR 最新一轮 `actor_examiner gate=mr_review` 已成功结束，不是 `Agent run failed`
+   / `turn.close failed` / 超时 / 配置错误。
+2. 当前 MR 下存在审查员身份发布的 `[examiner-result]` 结构化评论，且
+   `verdict=quality_pass`、`action_target=none`，artifact 指向当前 MR / 当前分支 /
+   最新 delivery 修复轮次。
+3. 当前 MR 下存在普通评论正文精确为 `LGTM - actor_examiner`。
+4. MR status 中 `test=true`，且没有阻塞型 discussion / conflict。
+
+以下信号都不能替代 examiner pass：
+
+- delivery 自述“已修完”“代码已就绪”“等待 approve”。
+- human reviewer 的 LGTM、已 resolve discussion、已 approve。
+- MR `readyToMerge=true` / `accepted` / `approver_number=true`。
+- 旧一轮 examiner `needs_changes` 后 delivery 又 push 了新 commit，但复审失败或尚未复审。
+
+如果 examiner 最新复审失败，router 的唯一动作是重新 handoff `actor_examiner
+gate=mr_review`，或在连续失败时请求 human/平台排障；禁止 approve，禁止通报
+“审查已通过”，禁止进入 merge gate。
+
 ### Channel Hygiene Contract
 
 channel 公共区是给 human 看的项目摘要，不是 actor 日志。router 对 channel 的默认动作是
@@ -756,13 +779,21 @@ human 需要知道的异常升级。**不要再 handoff**。
 如果 mr-watcher 推回 `mr.merge_gate`、`[mr-watcher-correction]`，或正文明确包含
 `quality_pass` + `action_target=none` + `merge/platform gate`：
 
-- 这不是 no-op。router 必须进入 approve/merge gate。
-- router 可以执行 MR approve（“通过 MR”），但必须使用审查官专用 a1 config；router 没有 merge 权限，也不得执行 merge。
+- 先执行 **Examiner Pass 硬门禁**。只要缺少当前 MR 的 `[examiner-result]
+  verdict=quality_pass` 或 `LGTM - actor_examiner`，或者最近一轮 examiner 失败，
+  router 必须重新 handoff `actor_examiner gate=mr_review` / 请求 human 排障，不得进入
+  approve/merge gate。
+- 硬门禁通过后，这不是 no-op。router 必须进入 approve/merge gate。
+- router 可以执行 MR approve（“通过 MR”），但必须使用审查官专用 a1 config 并清掉代理；
+  router 没有 merge 权限，也不得执行 merge。
 - approve 命令格式：
   ```bash
-  A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve <mr_id> --repo <repo>
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+    A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner \
+    a1 repo mr approve <mr_id> --repo <repo>
   ```
-  禁止裸跑 `a1 repo mr approve ...`。如果审查官专用身份被 Code 平台拒绝（例如无 reviewer 权限、分支规则限制），
+  禁止裸跑 `a1 repo mr approve ...`，禁止只设置 `A1_CONFIG_DIR` 而不清代理。
+  如果审查官专用身份被 Code 平台拒绝（例如无 reviewer 权限、分支规则限制），
   router 必须把拒绝原因写回 thread/channel，并请求有效 reviewer/human 处理；不要把问题交给
   delivery 修代码。
 - 若 MR status 是 `test=true`、`approver_number=true`，且 examiner 已将剩余

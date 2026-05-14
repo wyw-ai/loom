@@ -5,33 +5,28 @@
     "displayName": "审查员",
     "_meta": {
       "createdBy": "joi-daemon",
-      "providerId": "copilot",
-      "providerName": "GitHub Copilot CLI",
+      "providerId": "codex",
+      "providerName": "Codex CLI",
       "transportKind": "command"
     }
   },
   "transport": {
     "kind": "command",
-    "command": "/usr/local/bin/copilot",
+    "command": "/bin/bash",
     "args": [
-      "--add-dir",
-      "/home/canfeng/.joi-apps",
-      "--yolo",
-      "--output-format",
-      "json",
-      "--stream",
-      "off",
-      "-p"
+      "-lc",
+      "source ~/open-proxy >/dev/null; export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.local/bin:$PATH; exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"",
+      "joi-codex"
     ],
     "env": {
-      "PATH": "/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.cargo/bin:/home/canfeng/.local/bin:/home/canfeng/bin:/home/canfeng/joi-apps:/home/canfeng/canfeng-projects/a1/a1:/usr/local/bin:/usr/bin:/bin"
+      "JOI_NO_DAEMON": "1"
     },
     "model": "gpt-5.5",
     "modelArgs": [
       "--model",
       "{model}"
     ],
-    "outputFormat": "copilot_json",
+    "outputFormat": "codex_stream_json",
     "promptVia": "args"
   },
   "autostart": true,

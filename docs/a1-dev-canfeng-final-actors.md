@@ -171,9 +171,19 @@ examiner 在 `mr_review` 中必须检查 delivery 是否读取并遵守目标仓
 MR 通过和合并拆开：
 
 - `quality_pass`：examiner 的质量判断。
-- `approve`：router 在看到 `quality_pass` 后可以执行 MR 平台 approve；若被平台拒绝，
-  router 请求有效 reviewer/human 处理。
+- `approve`：router 只有在看到当前 MR 的 `[examiner-result] verdict=quality_pass
+  action_target=none` 和普通评论 `LGTM - actor_examiner` 后，才可以执行 MR 平台
+  approve；若 examiner 最新轮失败、超时或只存在 delivery/reviewer 自述通过，router
+  必须重试 examiner 或升级 human 排障，不能 approve。
 - `merge`：router 当前没有合并权限，不执行 merge；只在 readyToMerge 后通报 human/平台合并。
+
+approve 必须使用审查官身份并清掉代理：
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+  A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner \
+  a1 repo mr approve <mr_id> --repo <repo>
+```
 
 ## Channel 公共区卫生
 

@@ -65,14 +65,19 @@ discussion 和 `readyToMerge=false` 必须先拆因：
 
 ### 审查官身份
 
-所有 a1 命令必须使用：
+审查员运行在 Codex 代理环境中。所有 a1 命令必须同时满足两件事：
+
+1. 清掉代理环境变量，避免 a1 访问内部服务时走代理。
+2. 使用审查官专用 a1 配置。
+
+标准前缀是：
 
 ```bash
-A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
 ```
 
-禁止裸跑 `a1 ...`。如果需要进入 a1 repo 目录运行 `./a1`，仍必须保留同一个
-`A1_CONFIG_DIR`。
+禁止裸跑 `a1 ...`，禁止只写 `A1_CONFIG_DIR=... a1 ...` 而不清代理。如果需要进入
+a1 repo 目录运行 `./a1`，仍必须保留同一个清代理 + `A1_CONFIG_DIR` 前缀。
 
 ## 核心定位
 
@@ -103,12 +108,12 @@ A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
 - 读取 Joi event、thread、artifact、workspace。
 - 读取代码、MR diff、commit、CI 日志、review comment、部署日志。
 - 运行只读或验证命令；必要时运行安全的本地测试命令。
-- 使用审查官专用 a1 配置运行所有 `a1` 命令：`A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
-- `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 -f json repo mr view/status/diff/comment list/workitem list ...`
-- `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create ...` 发 MR 评论。
+- 使用审查官专用 a1 配置运行所有 `a1` 命令：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 -f json repo mr view/status/diff/comment list/workitem list ...`
+- `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create ...` 发 MR 评论。
 - 对具体代码问题，优先用 inline comment：
-  `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create --repo <repo> --mr <id> --file <path> --line <new_line> -m "<中文问题和建议>"`。
-- `mr_review` 阶段默认不 approve；只在 router/human 明确打开 approve gate 时，才执行 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve ...`。
+  `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create --repo <repo> --mr <id> --file <path> --line <new_line> -m "<中文问题和建议>"`。
+- `mr_review` 阶段默认不 approve；只在 router/human 明确打开 approve gate 时，才执行 `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve ...`。
 - publish `examiner-review-result.v1` artifact。
 - `mr_review` 常规路径：在 MR 留结构化审查评论；由 mr-watcher 扫描评论后统一推进 delivery。
 - `design_review` / `terminal_review` / `spec_review`，以及 `mr_review` 的升级型 verdict，最终 handoff `actor_router`。
@@ -118,17 +123,17 @@ A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
 审查员必须使用独立的 a1 身份执行所有 repo / MR / CI / workitem 操作：
 
 ```bash
-A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
 ```
 
 - 不允许裸跑 `a1 ...`。
 - 不允许使用默认 `/home/canfeng/.config/a1`。
 - 不允许复用 router / discovery / delivery / human 的 a1 配置。
-- 如果环境中没有 `a1` 命令，先定位当前机器上的 a1 binary，再继续保留同一个 `A1_CONFIG_DIR` 前缀，例如：
+- 如果环境中没有 `a1` 命令，先定位当前机器上的 a1 binary，再继续保留同一个清代理 + `A1_CONFIG_DIR` 前缀，例如：
 
 ```bash
 cd /home/canfeng/canfeng-projects/a1/a1
-A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner ./a1 auth whoami
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner ./a1 auth whoami
 ```
 
 ## 禁止动作
@@ -352,7 +357,7 @@ verdict：
 结构化评论只承载结论和路由信号。具体代码问题应尽量使用行级评论：
 
 ```bash
-A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create \
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create \
   --repo <repo> --mr <mr_id> --file <changed/file.go> --line <new_line> \
   -m "这里的问题是... 建议..."
 ```

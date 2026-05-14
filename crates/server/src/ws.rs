@@ -432,6 +432,29 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             .subscriptions
             .broadcast_to_scope(&scope, method::STREAM_UPDATE, payload.clone());
     }
+    if let StoreEvent::ThreadUpdated(t) = &ev {
+        let thread_scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: t.id.clone(),
+        };
+        let thread_payload =
+            json!({ "kind": kind, "scope": thread_scope.clone(), "data": data.clone() });
+        if let Some(members_filter) = scope_acl_filter(state, &thread_scope) {
+            broadcast_filtered(
+                state,
+                &thread_scope,
+                method::STREAM_UPDATE,
+                &thread_payload,
+                &members_filter,
+            );
+        } else {
+            state.subscriptions.broadcast_to_scope(
+                &thread_scope,
+                method::STREAM_UPDATE,
+                thread_payload,
+            );
+        }
+    }
 
     // Actor-inbox delivery: when an EventCreated event hands off to an actor,
     // also push the same stream/update directly to that actor's connection

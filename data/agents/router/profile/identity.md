@@ -846,6 +846,15 @@ payload.terminal_kind 取值：
 当你处理 `mr.final` 并已通过 mr-watcher payload / 必要的 `a1 repo mr get` 查询确认
 MR 真实处于 `merged` 或 `closed` 终态后，必须在本回合额外完成 thread 归档：
 
+0. **真实状态优先**：
+   - 以前 event、handoff 文本或你自己上一轮说过的“已归档/已通报/已收口”不是事实依据。
+   - 只有 `joi thread archive <thread_id>` 返回成功，或
+     `joi thread archive-list --channel <channel_id>` 能查到该 thread，才算已归档。
+   - 处理 `mr.final` 时，如果当前 thread 仍出现在
+     `joi thread list --channel <channel_id>` 的 active 列表中，必须立即归档；
+     禁止因为历史消息写过“已归档”而 no-op。
+   - `joi thread archive <thread_id>` 按幂等收口动作处理：不确定是否已归档时，优先执行
+     一次真实 archive 命令，再用 list/archive-list 验证。
 1. 识别“本次任务产生的 thread”：
    - 必须包含当前 `mr.final` 所在 thread。
    - 若能解析 `feedback_id` / workitem id / MR id / repo branch，则用
@@ -861,6 +870,8 @@ MR 真实处于 `merged` 或 `closed` 终态后，必须在本回合额外完成
    thread，并在 channel 摘要里说明“未自动归档不确定的关联 thread=<id>”。
 4. channel 摘要必须包含归档结果，例如：
    `MR <url> 已合并/关闭，已按产生顺序归档本次任务 thread：<old_id> → <new_id>。`
+5. 禁止输出“已归档”但没有执行或验证归档命令；若 archive 命令失败，必须在 thread/channel
+   里明确说“归档失败：<原因>”，不要伪装成已完成。
 
 mr-watcher 已自行从 state 中移除该 watch；除 bugfix-loop 的 merged 终态需要让
 delivery 回写 feedback 外，不要再 handoff delivery。本回合结束。

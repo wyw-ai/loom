@@ -619,11 +619,11 @@ summary=${summary}
     done < <(jq -c '.[]' <<<"$bugs")
 fi
 
-# 4. persist + emit status
-state=$(jq -c --argjson t "$tracking" '.tracking = $t' <<<"$state")
-tmp=$(mktemp); printf '%s' "$state" >"$tmp"; mv "$tmp" "$STATE_FILE"
-
-jq -nc \
+# 4. persist + emit status only when the logical queue state changes.
+# Scheduler cursorBy=body_hash hashes the full stdout body, so including
+# tick_at/tick_id in every no-op heartbeat makes every tick look new and
+# buries real desk messages behind status.update events.
+status_payload=$(jq -nc \
   --arg sv "1" \
   --arg producer "service_a1_bug_fix_loop" \
   --arg tick_id "$TICK_ID" \
@@ -640,4 +640,12 @@ jq -nc \
     fixed_total: ([$tracking[] | select(.fix_status=="fixed")] | length),
     closed_total: ([$tracking[] | select(.fix_status=="closed")] | length),
     tracking: $tracking
-  }'
+  }')
+status_signature=$(jq -c 'del(.tick_id, .tick_at)' <<<"$status_payload" | sha256sum | awk '{print $1}')
+last_status_signature=$(jq -r '.last_status_signature // ""' <<<"$state")
+state=$(jq -c --argjson t "$tracking" --arg sig "$status_signature" '.tracking = $t | .last_status_signature = $sig' <<<"$state")
+tmp=$(mktemp); printf '%s' "$state" >"$tmp"; mv "$tmp" "$STATE_FILE"
+
+if [[ "$status_signature" != "$last_status_signature" ]]; then
+  printf '%s\n' "$status_payload"
+fi

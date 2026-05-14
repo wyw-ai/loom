@@ -79,7 +79,8 @@ or "刚才失败的重试" should trigger a search of the current channel/thread
 the latest blocked MR/gate. If exactly one blocked MR is found, resume that
 thread and retry examiner or approve as appropriate. If multiple candidates
 exist, ask for clarification. Never create a new discovery thread from such a
-short recovery message.
+short recovery message. Never silently close these turns: the router must write
+a visible result with the attempted action, current gate, and next owner.
 
 Router must not:
 
@@ -326,6 +327,31 @@ mv "$root/agents/router" "$root/disabled-agents/router.alias-disabled-$(date +%Y
 ```
 
 Then restart the daemon. `joi actor list` may still show legacy `router`/`delivery`/`discovery` records without `_meta.createdBy=joi-daemon`; those are stale server actor records, not active daemon specs. The decisive check is duplicate ids under `$root/agents` plus daemon logs showing exactly one `starting from machine config` per actor.
+
+On 187, daemon provider discovery depends on the daemon process `PATH`; machine
+provider blocks in `/home/canfeng/.joi-apps/desktop.toml` do not replace this
+availability check. Do not restart with a bare `./joi daemon ...`, or
+`actor_router` / `actor_discovery` / `actor_delivery` can be skipped with
+`provider claude is not available on PATH`, and `actor_examiner` can be skipped
+with `provider codex is not available on PATH`.
+
+Use this restart form:
+
+```bash
+cd /home/canfeng/joi-apps
+PATH=/home/canfeng/canfeng-projects/system/.local/bin:/home/canfeng/.local/bin:/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:$PATH \
+  nohup ./joi daemon --server ws://11.158.213.187:7878/rpc > /tmp/joi-daemon.log 2>&1 &
+```
+
+After restart, `tail /tmp/joi-daemon.log` must show `actor_router`,
+`actor_discovery`, `actor_delivery`, and `actor_examiner` all `connected`.
+
+Claude Code 2.1.x can block actor startup by trying to sync
+`https://github.com/anthropics/claude-plugins-official.git`. For all Claude
+actors, keep `--bare` as the first CLI argument in both `transport.args` and
+`transport.session.resumeArgs`; this skips plugin sync and other startup
+prefetches. If a thread shows handoff events but no actor response, check
+`ps -ef | grep git-remote-https` and `/tmp/joi-daemon.log` for this symptom.
 
 Wrong order example:
 

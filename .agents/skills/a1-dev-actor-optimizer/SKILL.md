@@ -73,6 +73,14 @@ Router may:
 - Escalate human/platform gates.
 - Archive terminal task threads.
 
+Router must treat short human recovery messages as state-machine resumes, not
+new tasks. Phrases like "有权限了", "权限加好了", "再试下", "重新来",
+or "刚才失败的重试" should trigger a search of the current channel/thread for
+the latest blocked MR/gate. If exactly one blocked MR is found, resume that
+thread and retry examiner or approve as appropriate. If multiple candidates
+exist, ask for clarification. Never create a new discovery thread from such a
+short recovery message.
+
 Router must not:
 
 - Directly fix code.

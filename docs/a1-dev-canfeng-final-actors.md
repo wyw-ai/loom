@@ -77,6 +77,8 @@ bug_candidate/new_task
 10. terminal archive 必须以真实 CLI 状态为准：历史消息里写过“已归档”不算完成。
     router 处理 `mr.final` 时必须执行或验证 `joi thread archive <thread_id>`；
     active list 仍能查到的 thread 不允许 no-op。
+11. human 短句恢复（“有权限了 / 再试下 / 权限加好了 / 重新来”）必须回到最近
+    blocked MR/thread 做 gate retry；禁止按关键词另起 new_task。若无法唯一定位，先问澄清。
 
 ## Discovery Thread Workspace
 

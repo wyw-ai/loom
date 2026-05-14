@@ -679,7 +679,7 @@ mr-watcher 唯一 handoff delivery。这样避免 `examiner -> router -> deliver
 
 | verdict | 动作 |
 | --- | --- |
-| `quality_pass` | 进入 approve/merge gate：若 MR 仍缺平台 approve 且审查官专用身份有权限，执行 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve`；若已 approve 或 approve 不需要，进入 merge gate。router 不执行 merge。 |
+| `quality_pass` | 进入 approve/merge gate：若 MR 仍缺平台 approve，先用 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 -f json auth whoami` 校验真实身份；确认不是 MR 作者且有权限时，执行 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr approve`；若已 approve 或 approve 不需要，进入 merge gate。router 不执行 merge。 |
 | `needs_changes` | 兼容旧协议：若 MR 评论已存在，只 channel 摘要并等待 mr-watcher；若 MR 评论缺失，handoff examiner 补 `[examiner-result]` 评论，不直接 handoff delivery。 |
 | `blocked` | 若只是 CI / reviewer / discussion / approve 事实阻塞，channel 摘要并等待 mr-watcher；若 recommended_next_action 指向 human，则请求 human；若是状态机问题再按建议处理。 |
 | `design_review_needed` | 在同一 thread 再 handoff `actor_examiner`，`gate=design_review`，附本次审查 artifact 和争议摘要。 |
@@ -820,8 +820,12 @@ human 需要知道的异常升级。**不要再 handoff**。
   router 必须重新 handoff `actor_examiner gate=mr_review` / 请求 human 排障，不得进入
   approve/merge gate。
 - 硬门禁通过后，这不是 no-op。router 必须进入 approve/merge gate。
-- router 可以执行 MR approve（“通过 MR”），但必须使用审查官专用 a1 config 并清掉代理；
+- router 可以执行 MR approve（“通过 MR”），但必须使用审查官专用 a1 auth store 并清掉代理；
   router 没有 merge 权限，也不得执行 merge。
+- `a1` 身份选择以 `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner` 切换 auth store；`--config`
+  只是普通配置文件参数，不会替代 `auth.yaml` 身份。approve 前必须用同一前缀执行
+  `a1 -f json auth whoami`，并把返回的真实平台身份与 MR 作者比较；不要相信
+  `/home/canfeng/.config/a1-examiner` 目录名或 auth 文件里的 `user` 标注。
 - approve 命令格式：
   ```bash
   env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
@@ -829,15 +833,16 @@ human 需要知道的异常升级。**不要再 handoff**。
     a1 repo mr approve <mr_id> --repo <repo>
   ```
   禁止裸跑 `a1 repo mr approve ...`，禁止只设置 `A1_CONFIG_DIR` 而不清代理。
-  如果审查官专用身份被 Code 平台拒绝（例如无 reviewer 权限、分支规则限制），
+  如果 `auth whoami` 显示真实身份就是 MR 作者，或审查官专用身份被 Code 平台拒绝
+  （例如作者自审限制、无 reviewer 权限、分支规则限制），
   router 必须把拒绝原因写回 thread/channel，并请求有效 reviewer/human 处理；不要把问题交给
   delivery 修代码。
 - 若 MR status 是 `test=true`、`approver_number=true`，且 examiner 已将剩余
   discussion 判为非代码/开放性/范围外 discussion，则 delivery 无需继续改代码。
 - 若 MR status 是 `test=true` 且 examiner 已给出 `quality_pass`，但
   `approver_number=false` / “需等待 reviewer approve”，router 不得等待 human reviewer
-  作为默认动作；必须先用审查官专用 config 执行一次 approve。只有 approve 被平台拒绝
-  或审查官身份没有权限时，才请求 human/有效 reviewer 处理。
+  作为默认动作；必须先校验审查官 auth store 的真实身份，确认不是 MR 作者后再执行一次
+  approve。若真实身份就是作者，或 approve 被平台拒绝，才请求 human/有效非作者 reviewer 处理。
 - 若 `readyToMerge=false` 仅因 `discussion=false`，router 必须在 channel 或 thread
   明确请求 human/评论方/平台侧处理 discussion gate；不要再说“无新信息”，也不要
   handoff delivery。

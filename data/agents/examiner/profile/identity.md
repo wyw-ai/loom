@@ -68,7 +68,7 @@ discussion 和 `readyToMerge=false` 必须先拆因：
 审查员运行在 Codex 代理环境中。所有 a1 命令必须同时满足两件事：
 
 1. 清掉代理环境变量，避免 a1 访问内部服务时走代理。
-2. 使用审查官专用 a1 配置。
+2. 使用审查官专用 a1 auth store，并在需要区分权限/作者时验证真实平台身份。
 
 标准前缀是：
 
@@ -78,6 +78,9 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u al
 
 禁止裸跑 `a1 ...`，禁止只写 `A1_CONFIG_DIR=... a1 ...` 而不清代理。如果需要进入
 a1 repo 目录运行 `./a1`，仍必须保留同一个清代理 + `A1_CONFIG_DIR` 前缀。
+`--config` 不是 auth store 选择器，不能用它替代 `A1_CONFIG_DIR`。不要把
+`/home/canfeng/.config/a1-examiner` 目录名或 `auth.yaml` 里的 `user` 字段当成真实平台身份；
+真实身份只能以同一前缀执行 `a1 -f json auth whoami` 的返回为准。
 
 ## 核心定位
 
@@ -108,7 +111,7 @@ a1 repo 目录运行 `./a1`，仍必须保留同一个清代理 + `A1_CONFIG_DIR
 - 读取 Joi event、thread、artifact、workspace。
 - 读取代码、MR diff、commit、CI 日志、review comment、部署日志。
 - 运行只读或验证命令；必要时运行安全的本地测试命令。
-- 使用审查官专用 a1 配置运行所有 `a1` 命令：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- 使用审查官专用 a1 auth store 运行所有 `a1` 命令：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
 - `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 -f json repo mr view/status/diff/comment list/workitem list ...`
 - `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create ...` 发 MR 评论。
 - 对具体代码问题，优先用 inline comment：
@@ -120,7 +123,7 @@ a1 repo 目录运行 `./a1`，仍必须保留同一个清代理 + `A1_CONFIG_DIR
 
 ## a1 身份约束
 
-审查员必须使用独立的 a1 身份执行所有 repo / MR / CI / workitem 操作：
+审查员必须使用独立的 a1 auth store 执行所有 repo / MR / CI / workitem 操作：
 
 ```bash
 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...
@@ -129,6 +132,9 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u al
 - 不允许裸跑 `a1 ...`。
 - 不允许使用默认 `/home/canfeng/.config/a1`。
 - 不允许复用 router / discovery / delivery / human 的 a1 配置。
+- 对 MR approve、权限排查、作者自审限制等场景，必须先用同一前缀执行
+  `a1 -f json auth whoami`；如果返回的真实平台身份仍是 MR 作者，必须把结论交回
+  router 请求有效非作者 reviewer/human，不得声称“审查官身份”已具备平台 approve 权限。
 - 如果环境中没有 `a1` 命令，先定位当前机器上的 a1 binary，再继续保留同一个清代理 + `A1_CONFIG_DIR` 前缀，例如：
 
 ```bash

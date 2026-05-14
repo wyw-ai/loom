@@ -3013,7 +3013,9 @@ fn command_transport_without_resume(spec: &AgentSpec) -> bool {
 
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
 /// channel. Thread scopes need a one-time `thread/list` sweep; the result is
-/// cached on `WorkerState` so we don't hit the server per turn. A lookup
+/// cached on `WorkerState` so we don't hit the server per turn. Archived
+/// threads are queried as a fallback because explicit handoffs can arrive from
+/// historical threads that are no longer in the active list. A lookup
 /// failure (network error, thread not visible, etc.) returns `None`, which
 /// the memory selector interprets as "no channel scope available" and falls
 /// open — slightly leakier but never-wedging.
@@ -3033,17 +3035,22 @@ async fn resolve_channel_for_scope(
             {
                 return Some(cached);
             }
-            let res: proto::methods::ThreadListResult =
-                client.call(method::THREAD_LIST, json!({})).await.ok()?;
-            let mut cache = state.scope_channel_cache.lock().ok()?;
-            let mut found: Option<String> = None;
-            for t in res.threads {
-                if t.id == scope.id {
-                    found = Some(t.channel_id.clone());
+            for params in [json!({}), json!({ "archived": true })] {
+                let res: proto::methods::ThreadListResult =
+                    client.call(method::THREAD_LIST, params).await.ok()?;
+                let mut cache = state.scope_channel_cache.lock().ok()?;
+                let mut found: Option<String> = None;
+                for t in res.threads {
+                    if t.id == scope.id {
+                        found = Some(t.channel_id.clone());
+                    }
+                    cache.insert(t.id, t.channel_id);
                 }
-                cache.insert(t.id, t.channel_id);
+                if found.is_some() {
+                    return found;
+                }
             }
-            found
+            None
         }
     }
 }

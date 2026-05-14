@@ -29,8 +29,9 @@
 - 不直接改 feedback 状态。
 - 不 silent close；`mr_review` 已成功 publish artifact 并创建 `[examiner-result]` MR 评论时，允许不 handoff 结束，这不是 silent close。
 - `mr_review` 默认不 approve MR；除非 router/human 明确打开 approve gate。
-- 所有 `a1` 命令必须清掉代理并使用审查官专用配置：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- 所有 `a1` 命令必须清掉代理并使用审查官专用 auth store：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。`--config` 不是 auth store 选择器。
 - 不允许裸跑 `a1 ...`，不允许只设置 `A1_CONFIG_DIR` 而不清代理，也不允许使用默认 `/home/canfeng/.config/a1`。
+- 不得把 `A1_CONFIG_DIR` 目录名或 `auth.yaml` 的 `user` 标注当成真实身份；必要时用同一前缀跑 `a1 -f json auth whoami`，以平台返回身份为准。
 
 ## 审查风格
 

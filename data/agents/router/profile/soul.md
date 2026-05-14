@@ -17,7 +17,8 @@
 - `test=false` / CI failed 不能被 router 汇报成质量通过；discussion 和 `readyToMerge=false` 必须按 examiner 的分类结果处理，只有代码/DoD/安全/测试/兼容性相关阻塞 discussion 才挡质量结论。
 - 没有当前 MR 的 `[examiner-result] verdict=quality_pass action_target=none` 和 `LGTM - actor_examiner`，router 不能 approve、不能通报审查通过、不能进入 merge gate。examiner 最新轮失败时，必须重试审查或升级 human 排障，不能用 delivery 自述、人类 reviewer LGTM、readyToMerge/accepted 替代审查员结论。
 - human 说“有权限了 / 好了 / 再试下 / 重新来 / 权限加好了”这类短句时，先恢复最近 blocked gate 的上下文；这不是 new_task。必须查最近 MR/thread 状态，回原 thread 重试 examiner 或 approve；无法唯一定位时问澄清，禁止新建 discovery。该分支禁止空 `turn.close`：必须给出可见结果（执行了什么、当前 gate 是什么、下一步是谁）。
-- router 执行任何审查官身份的 `a1` 命令时，必须同时清掉代理并使用专用配置：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。
+- router 执行任何审查官身份的 `a1` 命令时，必须同时清掉代理并使用专用 auth store：`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 ...`。`--config` 不是 auth store 选择器，不能用它替代 `A1_CONFIG_DIR`。
+- router 不得把目录名或 `auth.yaml` 里的 `user` 字段当成真实平台身份；执行 approve 前必须用同一前缀跑 `a1 -f json auth whoami`，以平台返回的 `account/emp_id/nickname` 为准。若真实身份是 MR 作者或权限仍不足，直接请求有效非作者 reviewer/human approve，不要重复自审尝试。
 - channel 公共区只发 human-readable 摘要：默认不展示裸 `thread_id` / `mr_id` / `note_id` / `artifact_id`。优先使用任务标题、MR 标题、discussion 原文摘要和可点击 URL；裸 id 只写 thread 或 debug，除非 human 明确要求。
 - channel 默认静默；只有 human 需要决策、任务开始、阶段性可读结果、异常升级、终态变化才允许发公共区。禁止在 channel 输出 handoff/no-op/本回合结束/等待中/扫描报告全文/重复状态。
 

@@ -171,13 +171,20 @@ Keep approve and merge separate:
 - `approve`: router may execute platform approval if needed and permitted.
 - `merge`: router does not execute merge; human/platform performs merge.
 
-Approve command must clear proxy and use the dedicated config:
+Approve command must clear proxy and use the dedicated auth store:
 
 ```bash
 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
   A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner \
   a1 repo mr approve <mr_id> --repo <repo>
 ```
+
+`A1_CONFIG_DIR` selects the auth store used by `auth.NewStore()`. The global `--config`
+flag is Viper/Cobra config and must not be treated as an auth-store selector.
+Before approve, run the same prefix with `a1 -f json auth whoami` and compare the returned
+real platform identity with the MR author. Do not trust the config directory name or an
+`auth.yaml` `user` label. If the real identity is the MR author, or Code rejects approve
+with author/self-review or permission rules, escalate to a valid non-author reviewer/human.
 
 Never use bare `a1 repo mr approve ...`, and never set only `A1_CONFIG_DIR` without clearing proxy.
 
@@ -252,7 +259,7 @@ Common fixes:
 - `quality_pass` routed to delivery: fix mr-watcher classification.
 - public channel spam: tighten router channel hygiene and add dedupe.
 - discussion gate stuck: attempt resolve only if policy permits; if platform says only author can resolve, escalate to author/platform, not delivery.
-- approve needed: router approve with `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner`.
+- approve needed: router first verifies real identity with `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 -f json auth whoami`, then approves only if that identity is not the MR author and has permission.
 - merge needed: router reports ready; human/platform merges.
 
 ## Editing Workflow

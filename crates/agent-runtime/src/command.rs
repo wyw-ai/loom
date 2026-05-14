@@ -290,7 +290,7 @@ fn run_prompt(
     };
 
     let result = spawn_and_collect(&cfg, &prompt, &argv, &sender, &slot);
-    let outcome = match result {
+    let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
             let _ = sender.send(AdapterEvent::Error {
@@ -307,8 +307,33 @@ fn run_prompt(
         }
     };
 
+    let mut retried_as_first_run = false;
+    if !is_first_run && looks_like_session_lost(&outcome.stderr, &outcome.stdout) {
+        let _ = delete_session(&cfg, &scope);
+        tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
+            "command transport: dropped stale session and retrying first-run prompt");
+        let first_run_argv = expand_first_run_argv(&cfg, &prompt, &content);
+        outcome = match spawn_and_collect(&cfg, &prompt, &first_run_argv, &sender, &slot) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = sender.send(AdapterEvent::Error {
+                    scope: Some(scope.clone()),
+                    message: format!("command adapter retry spawn error: {e}"),
+                });
+                let _ = sender.send(AdapterEvent::Finished {
+                    scope: Some(scope.clone()),
+                    success: false,
+                    summary: e.clone(),
+                    usage: None,
+                });
+                return Err(e);
+            }
+        };
+        retried_as_first_run = true;
+    }
+
     // First-run capture: try once, save to disk on success.
-    if is_first_run && outcome.exit_code == 0 {
+    if (is_first_run || retried_as_first_run) && outcome.exit_code == 0 {
         if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
@@ -317,7 +342,10 @@ fn run_prompt(
                     }
                 }
                 Ok(None) => {
+                    let stdout = truncate_for_summary(&outcome.stdout);
+                    let stderr = truncate_for_summary(&outcome.stderr);
                     tracing::warn!(actor = %cfg.actor_id, rule = %rule,
+                        stdout = %stdout, stderr = %stderr,
                         "command transport: first_run_capture matched no session id");
                 }
                 Err(e) => {
@@ -326,7 +354,7 @@ fn run_prompt(
                 }
             }
         }
-    } else if outcome.exit_code != 0 && looks_like_session_lost(&outcome.stderr) {
+    } else if outcome.exit_code != 0 && looks_like_session_lost(&outcome.stderr, &outcome.stdout) {
         // Resume failed in a way that suggests the underlying session is gone.
         // Drop the bookkeeping so the next call retries as a first run. We do
         // NOT auto-retry inside this call — the user's prompt has already been
@@ -335,7 +363,7 @@ fn run_prompt(
         let _ = delete_session(&cfg, &scope);
         tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
             "command transport: dropped stale session after resume failure");
-    } else if !is_first_run && outcome.exit_code == 0 {
+    } else if !is_first_run && !retried_as_first_run && outcome.exit_code == 0 {
         if let Some(sid) = resume_session_id.as_deref() {
             if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to update command session");
@@ -951,11 +979,12 @@ fn delete_session(cfg: &CommandConfig, scope: &ScopeRef) -> std::io::Result<()> 
     Ok(())
 }
 
-fn looks_like_session_lost(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
+fn looks_like_session_lost(stderr: &str, stdout: &str) -> bool {
+    let s = format!("{stderr}\n{stdout}").to_ascii_lowercase();
     s.contains("session not found")
         || s.contains("unknown session")
         || s.contains("no such session")
+        || s.contains("no conversation found with session id")
 }
 
 // ---------------- first_run_capture ----------------
@@ -1500,9 +1529,13 @@ mod tests {
 
     #[test]
     fn looks_like_session_lost_matches_common_phrases() {
-        assert!(looks_like_session_lost("error: Session not found"));
-        assert!(looks_like_session_lost("UNKNOWN session abc"));
-        assert!(!looks_like_session_lost("everything is fine"));
+        assert!(looks_like_session_lost("error: Session not found", ""));
+        assert!(looks_like_session_lost("UNKNOWN session abc", ""));
+        assert!(looks_like_session_lost(
+            "",
+            r#"{"errors":["No conversation found with session ID: abc"]}"#
+        ));
+        assert!(!looks_like_session_lost("everything is fine", ""));
     }
 
     #[test]

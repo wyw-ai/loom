@@ -6,6 +6,7 @@
 .idea
 .DS_Store
 /.claude/
+/.agents/
 /.am/
 __pycache__/
 

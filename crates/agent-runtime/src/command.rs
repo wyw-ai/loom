@@ -77,6 +77,8 @@ pub struct CommandConfig {
     pub sessions_dir: PathBuf,
     /// Optional per-turn wall-clock timeout in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// Optional per-turn stdout idle timeout in milliseconds.
+    pub idle_timeout_ms: Option<u64>,
     /// Hash of `command` + `args` template (pre-expansion) — when the spec
     /// changes the saved sessions are invalidated.
     pub command_signature: String,
@@ -115,6 +117,7 @@ impl CommandConfig {
             prompt_via: spec.prompt_via,
             sessions_dir,
             timeout_ms: spec.timeout_ms,
+            idle_timeout_ms: spec.idle_timeout_ms,
             command_signature,
         }
     }
@@ -508,11 +511,18 @@ fn spawn_and_collect(
         .timeout_ms
         .filter(|ms| *ms > 0)
         .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let idle_timeout = cfg
+        .idle_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis);
+    let mut last_stdout_at = Instant::now();
     let mut exit: Option<ExitStatus> = None;
     let mut timed_out = false;
+    let mut idle_timed_out = false;
 
     loop {
         while let Ok(line) = stdout_rx.try_recv() {
+            last_stdout_at = Instant::now();
             collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
         }
 
@@ -538,15 +548,35 @@ fn spawn_and_collect(
             }
         }
 
+        if let Some(idle_timeout) = idle_timeout {
+            if last_stdout_at.elapsed() >= idle_timeout {
+                idle_timed_out = true;
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
+            }
+        }
+
         let wait_for = deadline
             .map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(50))
             })
+            .into_iter()
+            .chain(idle_timeout.map(|idle_timeout| {
+                idle_timeout
+                    .saturating_sub(last_stdout_at.elapsed())
+                    .min(Duration::from_millis(50))
+            }))
+            .min()
             .unwrap_or_else(|| Duration::from_millis(50));
         match stdout_rx.recv_timeout(wait_for) {
-            Ok(line) => collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout),
+            Ok(line) => {
+                last_stdout_at = Instant::now();
+                collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout)
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 std::thread::sleep(Duration::from_millis(50));
@@ -580,13 +610,18 @@ fn spawn_and_collect(
     // already pushed partial Text frames inline; we only need the final flush
     // + Finished here. The Text format never pushed anything, so we emit the
     // whole stdout as a single Text and then Finished.
-    let success = exit_code == 0 && !was_cancelled && !timed_out;
+    let success = exit_code == 0 && !was_cancelled && !timed_out && !idle_timed_out;
     let summary = if was_cancelled {
         "cancelled".into()
     } else if timed_out {
         match cfg.timeout_ms {
             Some(ms) => format!("timed out after {ms}ms"),
             None => "timed out".into(),
+        }
+    } else if idle_timed_out {
+        match cfg.idle_timeout_ms {
+            Some(ms) => format!("idle timed out after {ms}ms"),
+            None => "idle timed out".into(),
         }
     } else if success {
         String::new()
@@ -1352,6 +1387,7 @@ mod tests {
             prompt_via: PromptVia::Args,
             sessions_dir: PathBuf::from("/tmp/joi-test-sessions"),
             timeout_ms: None,
+            idle_timeout_ms: None,
             command_signature: "sha256:test".into(),
         }
     }
@@ -1670,6 +1706,43 @@ mod tests {
             }
         }
         assert!(got_timeout, "missing timeout Finished event");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_timeout_kills_quiet_child_and_reports_failed_turn() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "echo started; sleep 30".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.idle_timeout_ms = Some(100);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let started = std::time::Instant::now();
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "idle timeout did not reap the child promptly"
+        );
+        assert_ne!(outcome.exit_code, 0);
+        assert!(outcome.stdout.contains("started"));
+
+        let mut got_idle_timeout = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(!success);
+                assert_eq!(summary, "idle timed out after 100ms");
+                got_idle_timeout = true;
+                break;
+            }
+        }
+        assert!(got_idle_timeout, "missing idle timeout Finished event");
     }
 
     #[test]

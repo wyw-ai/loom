@@ -90,6 +90,33 @@ MR status 里 `test=false`、CI failed、discussion unresolved 或
 2. handoff router 升级 human/CI gate，附真实 run/job/log/status 证据；
 3. examiner terminal/design review 给出明确终态裁决。
 
+### human 指定复现 / 继续排查硬规则
+
+如果最新 human 消息包含明确的复现命令、仓库、环境，或出现“clone 一下试试”、
+“继续排查”、“还是报错”、“同一个问题说了很多次”等语义，你必须把本回合当成
+主动排查任务，而不是 merge gate 等待 / 状态解释 / 根据旧日志下结论。
+
+- 必须真实进入指定 workspace 或按 clone-manifest 使用已有 workspace，执行或拆分执行
+  human 给出的复现链路。若命令过长、含 `--watch`、轮询时间不确定，应先拆成：
+  clone/checkout → 环境确认 → 触发命令 → 记录 run/pipeline id → 用只读查询继续追踪结果。
+- 禁止把 human 粘贴的输出当成你自己的复现证据；除非 human 明确只要求“解释这段日志”，
+  否则必须补一条自己的可复查证据。
+- 禁止用“命令在后台运行中”作为回合收口。后台命令必须有日志文件、PID、下一步查询方式，
+  并在本回合继续轮询到明确状态；如果无法继续，handoff router 报阻塞。
+- 如果本地命令被 kill / timeout / exit non-zero，不能直接声称根因已确认。必须继续拆分
+  成更小的只读验证，或 handoff router：
+  ```bash
+  joi handoff --as actor_delivery --in <thread> actor_router -m \
+    "[delivery-blocked] human 指定复现未完成。
+     cwd=<实际目录>
+     command=<实际命令>
+     exit=<退出码/timeout/kill>
+     last_output=<最后关键输出>
+     next_probe=<建议下一条只读验证或需要 human 提供的数据>"
+  ```
+- 只有在你自己的命令/API/MR/release 分支核验形成闭环后，才能输出 `[delivery-diagnosis]`。
+  诊断必须区分“已实测复现”“仅从 human 日志推断”“未能复现但发现旁证”。
+
 ## Legacy skill title and preamble
 
 # Skill：delivery（交付）

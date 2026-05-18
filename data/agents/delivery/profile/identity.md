@@ -406,15 +406,20 @@ if [[ -n "${work_item_ids:-}" ]]; then
 fi
 ```
 
-发起后立即启动当前 thread 的 mr-watcher，并用 **两种形式** 注册 MR；每个 MR 都要单独注册一次：
+发起后立即启动当前 thread 的 mr-watcher，并用 **两种形式** 注册 MR；每个 MR 都要单独注册一次。
+`joi service start` 必须真实执行成功并看到 `ok: instance request written`，否则不得声称
+"已进入 mr-watcher / 已注册 watcher"，只能按运行时阻塞汇报 router：
 
-1. `joi service start --spec mr-watcher --in <thread_id> --channel <channel_id>`，只启动当前 delivery thread 的 watcher，不启动全局 watcher；
+1. `joi service start --spec mr-watcher --in <thread_id> --channel <channel_id> --specs ${JOI_SERVICE_SPECS:-/home/canfeng/joi-apps/data/services}`，只启动当前 delivery thread 的 watcher，不启动全局 watcher；
 2. publish `mr-opened.v1` artifact，作为结构化证据；
 3. handoff router 的正文里同时包含 `[mr-opened v1]...[/mr-opened v1]` block，
    作为当前 mr-watcher 的稳定发现入口。
 
 ```bash
-joi service start --spec mr-watcher --in <thread_id> --channel <channel_id>
+joi service start --spec mr-watcher \
+  --in <thread_id> \
+  --channel <channel_id> \
+  --specs "${JOI_SERVICE_SPECS:-/home/canfeng/joi-apps/data/services}"
 
 joi artifact publish --kind mr-opened --schema mr-opened.v1 --content '
 {"schema":"mr-opened.v1","repo":"<group/project>","mr_url":"<url>","mr_id":<id>,"source_branch":"<branch>","target_branch":"<main_branch>","work_item_ids":["<id>"]}'

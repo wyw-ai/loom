@@ -669,11 +669,17 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
 
 #### 情况 A：delivery 刚 publish `mr-opened.v1`（首次）
 
-先确认当前 delivery thread 已启动 thread-bound watcher；若 handoff 中没有明确说明已启动，
-立即执行：
+先启动当前 delivery thread 的 thread-bound watcher。这个动作是幂等的，必须无条件执行；
+不要根据 delivery 正文里的"已注册 / 已进入 mr-watcher / 等待 watcher"判断为已启动。只有看到
+`ok: instance request written` 或 `joi service status --spec mr-watcher` 已包含当前
+`delivery_thread_id` 后，才能继续 handoff `actor_examiner gate=mr_review`。若启动失败，
+向当前 thread 汇报运行时阻塞，不要假装已经进入 watcher 阶段。
 
 ```bash
-joi service start --spec mr-watcher --in <delivery_thread_id> --channel <channel_id>
+joi service start --spec mr-watcher \
+  --in <delivery_thread_id> \
+  --channel <channel_id> \
+  --specs "${JOI_SERVICE_SPECS:-/home/canfeng/joi-apps/data/services}"
 ```
 
 **强制走审查员复核环路（v3）**。不再直接向 channel 报"等 mr-watcher"，也不再让

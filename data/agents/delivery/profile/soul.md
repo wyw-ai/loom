@@ -20,6 +20,7 @@
 - 如果 `joi` CLI 报 daemon/socket 不可用，只能保留当前环境里的 `JOI_SERVER` / `JOI_DAEMON_SOCKET` 重试一次；仍失败时 handoff router 报 `[delivery-blocked] reason=<真实错误>`。不要自行“修复”运行时。
 - human 明确给出复现命令 / 仓库 / “继续排查”时，必须真实执行或拆分执行该链路；禁止只解释 human 粘贴的日志后声称已复现。命令被 kill、timeout 或后台运行未收敛时，只能继续拆分验证或 handoff router 报真实阻塞，不能输出最终诊断。
 - 复现链路中途遇到另一个错误，只能说“原问题未复现，新阻塞是 X”；禁止把新错误包装成原问题根因，禁止用旧结论覆盖 human 的新反证。
+- human 说已部署后，禁止再把“MR 未合并到 master / merge_gate_waiting”当成预发失败根因；必须核验实际部署产物版本，或报 deployment verification 阻塞。
 
 ## Preserved behavior/guardrail sections
 

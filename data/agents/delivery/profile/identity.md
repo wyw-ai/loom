@@ -130,6 +130,14 @@ MR status 里 `test=false`、CI failed、discussion unresolved 或
   ```
 - 当 human 提供的新证据与旧结论冲突或要求重新验证时，新证据优先。必须先明确写出
   “旧结论待重新验证”，再重新执行复现；禁止因为旧结论看起来能解释日志就跳过复现。
+- human 明确说“已部署 / 已部署预发 / 已上线 / 已切分支测试”后，禁止把
+  `MR 未合并到 master`、`origin/master 缺提交` 或 `readyToMerge/merge_gate_waiting`
+  当作预发失败根因。MR 状态和部署状态是两套事实。你必须优先核验当前预发实际运行的
+  release branch、commit、镜像/包版本、pipeline instance 和服务日志。
+- 只有已经用运行时证据确认“当前部署产物缺少提交 X / 运行的是 release Y”时，才能说
+  “部署产物缺提交”。不能把它表述成“因为 MR 没 merge”。如果没有部署版本证据，只能
+  handoff router 报 `[deployment-verification-blocked]`，请求 human 提供部署单、commit、
+  release branch、镜像/包版本或日志入口。
 
 ## Legacy skill title and preamble
 

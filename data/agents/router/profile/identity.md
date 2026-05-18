@@ -99,6 +99,21 @@ discussion unresolved 和 `readyToMerge=false` 必须拆因：只有代码、DoD
 改动要求、超出当前题范围的问题，由 examiner 记录为 platform note，router 不应因此把
 delivery 重新拉回修代码。
 
+### 部署事实硬边界
+
+MR 合并状态不是部署状态。human 明确说“已部署 / 已部署预发 / 已上线 / 已切分支测试”
+之后，router 必须把这当成新的运行时事实处理，不能再用 `MR 未合并到 master`、
+`origin/master 没有提交` 或 `merge_gate_waiting` 解释当前环境的失败。
+
+- `not merged` 只能说明代码平台状态；它不能证明预发没有部署该变更，因为 human 可能
+  手动部署 release 分支、临时分支、构建产物或指定 pipeline。
+- 对“已部署后仍失败”的消息，router 的下一步是启动运行时验证/排查：确认当前预发运行的
+  release branch、commit、镜像/包版本、pipeline instance、服务日志和实际请求/响应。
+- 如果无法确认部署版本，router 必须要求 delivery/discovery 报 `[deployment-verification-blocked]`
+  或向 human 要部署单/commit/日志；禁止继续通报“等待 human 合并后部署”。
+- 只有在已经核验“当前预发运行的产物确实缺少某个 commit”后，才能说“部署的是旧产物 /
+  缺少提交 X”。即便如此，也应表述为“部署产物缺提交”，不是“MR 没 merge”。
+
 ### Examiner Pass 硬门禁
 
 router 永远不能自己推导“代码质量已通过”。MR 进入 approve/merge gate 必须同时满足：

@@ -154,7 +154,7 @@ fi
 
 LOCK_ROOT="${TMPDIR:-/tmp}/joi-start-delivery-locks"
 mkdir -p "$LOCK_ROOT"
-LOCK_DIR="${LOCK_ROOT}/$(lock_key "${CHANNEL_ID}_${THREAD_TITLE}").lock"
+LOCK_DIR="${LOCK_ROOT}/$(lock_key "${CHANNEL_ID}_${SOURCE_THREAD_ID}_${TASK_GOAL}_${DOD}_${CLONE_MANIFEST}_${FEEDBACK_ID}_${THREAD_TITLE}").lock"
 LOCK_ACQUIRED=0
 for _ in $(seq 1 60); do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -187,6 +187,46 @@ thread_has_delivery_activity() {
             (.events // .items // .)[]?
             | select((.actorId // .actor_id // "") == "actor_delivery")
           ' >/dev/null 2>&1
+}
+
+thread_matches_task_identity() {
+    local tid="$1"
+    joi event list --in "$tid" --limit 80 --json 2>/dev/null \
+        | "$JQ_BIN" -e \
+            --arg task "$TASK_GOAL" \
+            --arg dod "$DOD" \
+            --arg manifest "$CLONE_MANIFEST" \
+            --arg source "$SOURCE_THREAD_ID" '
+            def contains_nonempty($needle): ($needle != "" and contains($needle));
+            (.events // .items // .)[]?
+            | (.payload.text // "") as $text
+            | select(
+                (
+                    ($text | contains_nonempty("task-goal=" + $task))
+                    and ($text | contains_nonempty("DoD=" + $dod))
+                    and ($text | contains_nonempty("clone-manifest=" + $manifest))
+                )
+                or (
+                    $source != ""
+                    and ($text | contains_nonempty("source_thread=" + $source))
+                )
+              )
+          ' >/dev/null 2>&1
+}
+
+find_task_identity_threads() {
+    local tid
+    joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null \
+        | "$JQ_BIN" -r '
+            (.threads // .items // .)[]?
+            | (.id // .thread_id // .thread.id // empty)
+          ' \
+        | while IFS= read -r tid; do
+            [[ -n "$tid" ]] || continue
+            if thread_matches_task_identity "$tid"; then
+                printf '%s\n' "$tid"
+            fi
+          done
 }
 
 pick_existing_thread() {
@@ -226,6 +266,9 @@ else
             | (.id // .thread_id // .thread.id // empty)
         ' | pick_existing_thread)
 fi
+if [[ -z "$existing_thread" ]]; then
+    existing_thread=$(find_task_identity_threads | pick_existing_thread)
+fi
 
 REUSED_THREAD=0
 SKIP_HANDOFF=0
@@ -236,7 +279,9 @@ if [[ -n "$existing_thread" ]]; then
         SKIP_HANDOFF=1
     fi
 else
-    root_text="delivery-start: ${THREAD_TITLE}"
+    root_text="delivery-start: ${THREAD_TITLE}
+task-goal=${TASK_GOAL} DoD=${DOD} clone-manifest=${CLONE_MANIFEST}
+source_thread=${SOURCE_THREAD_ID:-}"
     root_out=$(joi event append --channel --in "$CHANNEL_ID" --type thread.opened --text "$root_text" --json)
     root_event_id=$(event_id_from_send <<<"$root_out")
     [[ -n "$root_event_id" ]] || { echo "start-delivery: failed to create root channel event" >&2; exit 4; }

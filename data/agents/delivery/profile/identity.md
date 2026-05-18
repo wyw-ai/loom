@@ -44,6 +44,28 @@ examiner `gate=mr_review`。
 - `quality_pass`：不改代码，不 handoff router 刷进度；继续等 mr-watcher 的 CI/reviewer/merge gate。
 - `design_review_needed` / `reject`：暂停开发，等待 router/examiner 的上层裁决。
 
+### MR 评论修复闭环硬规则
+
+任何 reviewer / examiner / mr-watcher 推来的可执行 MR 评论，只要你已经采纳并完成修复，
+必须按这个顺序闭环：
+
+1. 修代码、补测试、push。
+2. 回复对应 discussion 的**根 note**，说明修复 commit / 处理结论。
+3. 对可 resolve 的根级 inline note 执行：
+   ```bash
+   a1 -f json repo mr comment resolve <root_note_id> --repo <repo> --mr <mr_id>
+   ```
+4. 再查一次未解决评论确认该根 note 不再出现：
+   ```bash
+   a1 -f json repo mr comment list --repo <repo> --mr <mr_id> --unresolved
+   ```
+
+只回复不 resolve，等同于该评论未处理完，禁止 handoff router 声称“本轮评论已处理完”。
+如果 resolve 命令失败，必须 handoff router 报 `[delivery-blocked]`，带上 repo、MR、
+root_note_id 和真实错误；不能把失败吞掉。只有两类情况允许不 resolve：该 note 不是
+根级 inline 评论（平台不支持 resolved state），或它是原则性质疑并已按
+`design_dispute` 暂停推进。
+
 ### design_dispute
 
 如果你发现当前实现无法在当前五件套内正确完成，或 reviewer 原则性质疑“不是 bug /
@@ -384,13 +406,16 @@ if [[ -n "${work_item_ids:-}" ]]; then
 fi
 ```
 
-发起后立即用 **两种形式** 注册给 mr-watcher，且每个 MR 都要单独注册一次：
+发起后立即启动当前 thread 的 mr-watcher，并用 **两种形式** 注册 MR；每个 MR 都要单独注册一次：
 
-1. publish `mr-opened.v1` artifact，作为结构化证据；
-2. handoff router 的正文里同时包含 `[mr-opened v1]...[/mr-opened v1]` block，
+1. `joi service start --spec mr-watcher --in <thread_id> --channel <channel_id>`，只启动当前 delivery thread 的 watcher，不启动全局 watcher；
+2. publish `mr-opened.v1` artifact，作为结构化证据；
+3. handoff router 的正文里同时包含 `[mr-opened v1]...[/mr-opened v1]` block，
    作为当前 mr-watcher 的稳定发现入口。
 
 ```bash
+joi service start --spec mr-watcher --in <thread_id> --channel <channel_id>
+
 joi artifact publish --kind mr-opened --schema mr-opened.v1 --content '
 {"schema":"mr-opened.v1","repo":"<group/project>","mr_url":"<url>","mr_id":<id>,"source_branch":"<branch>","target_branch":"<main_branch>","work_item_ids":["<id>"]}'
 ```
@@ -429,7 +454,7 @@ MR 常规审查结论会以 MR 下 `[examiner-result]` 评论形式出现，并�
 | verdict | 你的动作 |
 | --- | --- |
 | `quality_pass` | 不动作，仅在被唤醒时回一条轻量进度："收到审查员 quality_pass，继续等 CI / reviewer / merge gate。"（openspec archive 必须已在 MR 前完成；此处不是归档时机。） |
-| `needs_changes` | 读 `findings[]`：每条按 `required_action` 修；**不需要重发 mr-opened**，git push 即可（force-push 仅当 rebase 之后）。修完 handoff router："已按 examiner-review-result <art-id> 处理完 N 条 issue，请发起审查员复核第 K 轮。" |
+| `needs_changes` | 读 `findings[]`：每条按 `required_action` 修；若 finding 对应 MR inline note，必须回复根 note 并 resolve 根 note；**不需要重发 mr-opened**，git push 即可（force-push 仅当 rebase 之后）。修完 handoff router："已按 examiner-review-result <art-id> 处理完 N 条 issue，请发起审查员复核第 K 轮。" |
 | `blocked` | 按 router 指示补证据、补日志或等待 human；不要绕过审查继续推进。 |
 | `design_review_needed` / `reject` | 暂停开发，等待 router 发起 `design_review` / `terminal_review`；不要继续说服 reviewer。 |
 | `rescope` / `revise_dod` | 这是 discovery 重做五件套的信号；等待 router/discovery 重新 provision 或给新指令，不要在旧 manifest 上继续改。 |
@@ -457,14 +482,20 @@ MR 常规审查结论会以 MR 下 `[examiner-result]` 评论形式出现，并�
     ```bash
     a1 -f json repo mr comment list --repo <r> --mr <id>
     # 处理后，必须回复对应 discussion 的根 note：
-    a1 repo mr comment create --repo <r> --mr <id> --reply-to <note_id> -m "<中文回复>"
-    # 处理完 resolve：
-    a1 repo mr comment resolve --repo <r> --mr <id> --note <note_id>
+    a1 repo mr comment create --repo <r> --mr <id> --reply-to <root_note_id> -m "<中文回复>"
+    # 修复完成后必须 resolve 根级 inline note。注意 resolve 的 comment-id 是位置参数，不是 --note：
+    a1 -f json repo mr comment resolve <root_note_id> --repo <r> --mr <id>
+    # resolve 后必须复查未解决评论：
+    a1 -f json repo mr comment list --repo <r> --mr <id> --unresolved
     ```
     - **回复姿势**：如果 `a1 -f json repo mr comment list` 中该评论
       `parentNoteId != 0` / `parent_note_id != 0`，它是子评论。Code 平台不支持对子评论
       再回复；必须沿父链找到第一条根评论，用 `--reply-to <root_note_id>` 回复。不要
       `--reply-to <child_note_id>`。
+    - **resolve 姿势**：只 resolve 根级 inline note（`parentNoteId == 0` 且 `path`
+      非空）。对子评论或全局评论执行 resolve 会失败；这类评论处理后必须在 handoff
+      中说明“平台不支持 resolve，此 note 已回复但无 resolved state”。可 resolve
+      的评论若没有成功 resolve，不得计入“已处理完”。
     - 合理评论：修代码 + 回复"done in <sha>"；不采纳的评论：在根 note 下中文说明
       理由，不要默默忽略。
     - **原则性质疑必须暂停推进**：如果 reviewer 明确质疑任务/方案本身，例如

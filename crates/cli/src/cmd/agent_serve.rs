@@ -998,13 +998,14 @@ struct WorkerState {
     profile_dir: PathBuf,
     paths: AgentPaths,
     agent_server_url: String,
-    /// In-flight turn per scope. A worker owns one adapter instance, so handoff
-    /// prompts are serialized per actor even when they target different scopes.
+    /// In-flight turn per scope. A worker may own one adapter instance, but
+    /// scope/session state is isolated below the adapter boundary, so only
+    /// prompts in the same scope block each other.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
-    /// Actor-wide queue of triggers received while this worker is busy. Human
-    /// triggers are kept ahead of service callbacks so stale automation cannot
-    /// starve an explicit user handoff.
-    pending_triggers: Mutex<VecDeque<Event>>,
+    /// Per-scope queues of triggers received while that scope is busy. Human
+    /// triggers are kept ahead of service callbacks within the same scope so
+    /// stale automation cannot starve an explicit user handoff.
+    pending_triggers: Mutex<HashMap<String, VecDeque<Event>>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
     /// `Finished`, once final usage metadata is available.
     text_buffer: Mutex<HashMap<String, String>>,
@@ -1128,7 +1129,7 @@ impl WorkerState {
             paths,
             agent_server_url,
             active_turns: Mutex::new(HashMap::new()),
-            pending_triggers: Mutex::new(VecDeque::new()),
+            pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
@@ -1149,15 +1150,6 @@ impl WorkerState {
             .cloned()
     }
 
-    fn any_current_turn(&self) -> Option<ActiveTurn> {
-        self.active_turns
-            .lock()
-            .expect("active_turns poisoned")
-            .values()
-            .next()
-            .cloned()
-    }
-
     fn set_turn(&self, turn: ActiveTurn) {
         self.active_turns
             .lock()
@@ -1175,32 +1167,45 @@ impl WorkerState {
         Some(turn.clone())
     }
 
-    /// Drop the active turn for `scope_id` and pop the next actor-wide queued
-    /// trigger (if any).
+    /// Drop the active turn for `scope_id` and pop the next queued trigger for
+    /// that same scope (if any).
     fn clear_turn(&self, scope_id: &str) -> Option<Event> {
         let mut active = self.active_turns.lock().expect("active_turns poisoned");
         active.remove(scope_id);
         drop(active);
-        self.pending_triggers
-            .lock()
-            .expect("pending poisoned")
-            .pop_front()
+        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let next = match pending.get_mut(scope_id) {
+            Some(queue) => queue.pop_front(),
+            None => None,
+        };
+        if pending
+            .get(scope_id)
+            .map(|queue| queue.is_empty())
+            .unwrap_or(false)
+        {
+            pending.remove(scope_id);
+        }
+        next
     }
 
-    fn enqueue(&self, _scope_id: &str, event: Event) {
+    fn enqueue(&self, scope_id: &str, event: Event) {
         let mut pending = self.pending_triggers.lock().expect("pending poisoned");
-        if pending.iter().any(|queued| queued.id == event.id) {
+        if pending
+            .values()
+            .any(|queue| queue.iter().any(|queued| queued.id == event.id))
+        {
             return;
         }
+        let queue = pending.entry(scope_id.to_string()).or_default();
         if is_priority_trigger(&event) {
-            let insert_at = pending
+            let insert_at = queue
                 .iter()
                 .rposition(is_priority_trigger)
                 .map(|idx| idx + 1)
                 .unwrap_or(0);
-            pending.insert(insert_at, event);
+            queue.insert(insert_at, event);
         } else {
-            pending.push_back(event);
+            queue.push_back(event);
         }
     }
 
@@ -1208,8 +1213,8 @@ impl WorkerState {
         self.pending_triggers
             .lock()
             .expect("pending poisoned")
-            .iter()
-            .any(|event| event.id == event_id)
+            .values()
+            .any(|queue| queue.iter().any(|event| event.id == event_id))
     }
 
     fn push_text(&self, turn_id: &str, chunk: &str) {
@@ -2456,10 +2461,9 @@ async fn handle_handoff(
     trigger: &Event,
 ) -> Result<HandoffOutcome> {
     let trigger = trigger.clone();
-    // Actor-wide FIFO: one worker owns one adapter instance, so a model-driven
-    // self-handoff from a channel triage turn into a task thread must wait
-    // until the current turn has closed.
-    if state.any_current_turn().is_some() {
+    // Scope FIFO: the same actor can handle independent scopes concurrently,
+    // but prompts in one thread/channel remain ordered.
+    if state.current_turn(&trigger.scope.id).is_some() {
         let scope_id = trigger.scope.id.clone();
         state.enqueue(&scope_id, trigger);
         return Ok(HandoffOutcome::Queued);
@@ -3763,6 +3767,7 @@ mod tests {
                 session: None,
                 output_format: None,
                 prompt_via: proto::methods::PromptVia::default(),
+                timeout_ms: None,
                 interactive: None,
                 provider: None,
             },
@@ -4531,8 +4536,8 @@ mod tests {
     }
 
     #[test]
-    fn worker_state_queues_triggers_actor_wide_across_scopes() {
-        let root = temp_path("actor-wide-queue");
+    fn worker_state_queues_triggers_per_scope_only() {
+        let root = temp_path("scope-queue");
         let paths = AgentPaths::new(&root, "actor_demo");
         let state = WorkerState::new(
             "actor_demo".into(),
@@ -4554,7 +4559,19 @@ mod tests {
             trigger_actor: "actor_human".into(),
             cancel_requested: false,
         });
-        let queued = Event {
+        let queued_channel = Event {
+            id: "evt_channel_handoff".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_demo".into(),
+            scope: active_scope.clone(),
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({ "text": "continue triage" }),
+            relations: Vec::new(),
+            _meta: None,
+        };
+        let queued_thread = Event {
             id: "evt_thread_handoff".into(),
             kind: "content.add".into(),
             actor_id: "actor_demo".into(),
@@ -4570,20 +4587,30 @@ mod tests {
             _meta: None,
         };
 
-        assert!(state.any_current_turn().is_some());
-        state.enqueue(&queued.scope.id, queued.clone());
-        assert!(state.has_pending_event(&queued.id));
+        assert!(state.current_turn(&active_scope.id).is_some());
+        assert!(state.current_turn(&queued_thread.scope.id).is_none());
+        state.enqueue(&queued_channel.scope.id, queued_channel.clone());
+        state.enqueue(&queued_thread.scope.id, queued_thread.clone());
+        assert!(state.has_pending_event(&queued_channel.id));
+        assert!(state.has_pending_event(&queued_thread.id));
         assert_eq!(
             state.clear_turn(&active_scope.id).map(|event| event.id),
-            Some(queued.id)
+            Some(queued_channel.id)
         );
-        assert!(state.any_current_turn().is_none());
+        assert!(state.current_turn(&active_scope.id).is_none());
+        assert!(state.clear_turn(&active_scope.id).is_none());
+        assert_eq!(
+            state
+                .clear_turn(&queued_thread.scope.id)
+                .map(|event| event.id),
+            Some(queued_thread.id)
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn worker_state_prioritizes_human_triggers_without_reversing_human_fifo() {
-        let root = temp_path("actor-wide-priority-queue");
+        let root = temp_path("scope-priority-queue");
         let paths = AgentPaths::new(&root, "actor_demo");
         let state = WorkerState::new(
             "actor_demo".into(),
@@ -4610,10 +4637,7 @@ mod tests {
             id: "evt_service".into(),
             kind: "content.add".into(),
             actor_id: "mr-watcher".into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Thread,
-                id: "thread_service".into(),
-            },
+            scope: active_scope.clone(),
             turn_id: None,
             seq: 1,
             occurred_at: Utc::now(),
@@ -4625,10 +4649,7 @@ mod tests {
             id: "evt_human_one".into(),
             kind: "content.add".into(),
             actor_id: "actor_human_123".into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Channel,
-                id: "chan_main".into(),
-            },
+            scope: active_scope.clone(),
             turn_id: None,
             seq: 1,
             occurred_at: Utc::now(),
@@ -4640,10 +4661,7 @@ mod tests {
             id: "evt_human_two".into(),
             kind: "content.add".into(),
             actor_id: "actor_human_123".into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Thread,
-                id: "thread_human".into(),
-            },
+            scope: active_scope.clone(),
             turn_id: None,
             seq: 1,
             occurred_at: Utc::now(),
@@ -4662,14 +4680,14 @@ mod tests {
             Some(human_one.id)
         );
         assert_eq!(
-            state.clear_turn("chan_main").map(|event| event.id),
+            state.clear_turn(&active_scope.id).map(|event| event.id),
             Some(human_two.id)
         );
         assert_eq!(
-            state.clear_turn("thread_human").map(|event| event.id),
+            state.clear_turn(&active_scope.id).map(|event| event.id),
             Some(service.id)
         );
-        assert!(state.clear_turn("thread_service").is_none());
+        assert!(state.clear_turn(&active_scope.id).is_none());
         std::fs::remove_dir_all(root).ok();
     }
 }

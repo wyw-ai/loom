@@ -43,6 +43,7 @@ BRANCH_RE = re.compile(r"(?:branch|分支)[：:]\s*`?(?P<branch>[^`\s]+)")
 COMMENTS_RE = re.compile(r"(?:comments|评论数)[：:]\s*(?P<count>\d+)")
 MR_OPENED_BLOCK_RE = re.compile(r"\[mr-opened v1\](?P<body>.*?)\[/mr-opened v1\]", re.S)
 EXAMINER_RESULT_RE = re.compile(r"\[examiner-result\](?P<body>.*?)\[/examiner-result\]", re.S)
+EXAMINER_RESULT_FIELD_RE = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_-]*)=([^\s]+)")
 
 
 
@@ -531,10 +532,16 @@ def parse_examiner_result(text: str) -> dict[str, str] | None:
     result: dict[str, str] = {}
     for raw in match.group("body").splitlines():
         line = raw.strip()
-        if not line or "=" not in line:
+        if not line:
             continue
-        key, value = line.split("=", 1)
-        result[key.strip()] = value.strip()
+        inline_pairs = list(EXAMINER_RESULT_FIELD_RE.finditer(line))
+        if inline_pairs:
+            for pair in inline_pairs:
+                result[pair.group(1).strip()] = pair.group(2).strip().rstrip(",;")
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            result[key.strip()] = value.strip()
     if result.get("gate") != "mr_review":
         return None
     return result

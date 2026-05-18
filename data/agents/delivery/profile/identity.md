@@ -116,6 +116,20 @@ MR status 里 `test=false`、CI failed、discussion unresolved 或
   ```
 - 只有在你自己的命令/API/MR/release 分支核验形成闭环后，才能输出 `[delivery-diagnosis]`。
   诊断必须区分“已实测复现”“仅从 human 日志推断”“未能复现但发现旁证”。
+- 如果执行 human 指定链路时遇到另一个错误（例如 clone/auth/CLI polling/权限/环境不一致），
+  这只能记为“复现链路被新阻塞打断”。禁止把这个新错误当作原问题已复现，也禁止回到旧
+  假设继续输出最终根因。此时必须 handoff router：
+  ```bash
+  joi handoff --as actor_delivery --in <thread> actor_router -m \
+    "[delivery-blocked] 原问题未完成复现，复现链路被新阻塞打断。
+     human_expected=<human 要求复现的最终现象>
+     reached_step=<实际跑到哪一步>
+     blocking_error=<新阻塞>
+     evidence=<run_id/log/path/命令摘要，敏感信息脱敏>
+     next_probe=<下一步如何越过新阻塞继续验证原问题>"
+  ```
+- 当 human 提供的新证据与旧结论冲突或要求重新验证时，新证据优先。必须先明确写出
+  “旧结论待重新验证”，再重新执行复现；禁止因为旧结论看起来能解释日志就跳过复现。
 
 ## Legacy skill title and preamble
 

@@ -6,10 +6,43 @@
     "kind": "service",
     "displayName": "mr-watcher（MR观察器）"
   },
-  "autostart": true,
-  "channelId": "chan_31f8fa85d909",
+  "autostart": false,
+  "lifecycle": "thread_bound",
+  "bind": {
+    "scope": "thread",
+    "auto_stop_on": [
+      "thread.closed"
+    ]
+  },
   "config": {
-    "jobs": [],
+    "jobs": [
+      {
+        "id": "poll-thread",
+        "schedule": "* * * * *",
+        "source": {
+          "kind": "command",
+          "command": "python3",
+          "args": [
+            "{spec.dir}/../../runtime-tools/joi-auto-dev/adapters/mr-watcher/poll.py",
+            "--once",
+            "--thread-id",
+            "{thread.id}"
+          ],
+          "env": {
+            "MR_WATCHER_STATE_DIR": "{instance.data_dir}"
+          },
+          "timeoutMs": 180000
+        },
+        "scope": {
+          "kind": "thread",
+          "id": "{thread.id}",
+          "channelId": "{channel.id}"
+        },
+        "dedupeBy": "payload_hash",
+        "cursorBy": "body_hash",
+        "singleInFlight": true
+      }
+    ],
     "effectiveRuntime": "data/runtime-tools/joi-auto-dev/adapters/mr-watcher/poll.py",
     "contract": {
       "role": "MR fact watcher",

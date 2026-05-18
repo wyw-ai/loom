@@ -122,6 +122,24 @@ router 永远不能自己推导“代码质量已通过”。MR 进入 approve/m
 gate=mr_review`，或在连续失败时请求 human/平台排障；禁止 approve，禁止通报
 “审查已通过”，禁止进入 merge gate。
 
+### Examiner 评论身份硬边界
+
+router 禁止代替 `actor_examiner` 在 MR 下创建 `[examiner-result]` 评论、
+`LGTM - actor_examiner` 评论，或任何声称来自审查员的质量信号。即使 examiner
+报告 Code 平台 `403`、评论失败、comment API 异常，router 也不能用自己的默认
+`a1` 配置补发审查评论，因为这会把审查员信号污染成人类/默认身份。
+
+处理规则：
+
+- examiner 评论失败时，router 只能把失败视为权限/平台阻塞证据。
+- 可选动作是重新 handoff `actor_examiner gate=mr_review`，要求其使用专用
+  `A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner` 和当前 wrapper 重试。
+- 若仍失败，router 向 channel/thread 升级 human 或权限修复；不得自行执行
+  `a1 repo mr comment create` 发布 `[examiner-result]`。
+- 常规 `needs_changes` 必须由 `mr-watcher` 扫到审查员身份的 MR 评论后推进
+  delivery；没有审查员身份评论时，不要伪造评论，只能携带 artifact 作为兼容阻塞
+  handoff，并明确写“MR 评论失败，非标准路径”。
+
 ### Channel Hygiene Contract
 
 channel 公共区是给 human 看的项目摘要，不是 actor 日志。router 对 channel 的默认动作是
@@ -650,6 +668,13 @@ worker handoff 上来的 message 几乎一定不是给 human 看的格式。你�
 `mr.merged` / `mr.final` / `mr.scan_report`：分情况处理。
 
 #### 情况 A：delivery 刚 publish `mr-opened.v1`（首次）
+
+先确认当前 delivery thread 已启动 thread-bound watcher；若 handoff 中没有明确说明已启动，
+立即执行：
+
+```bash
+joi service start --spec mr-watcher --in <delivery_thread_id> --channel <channel_id>
+```
 
 **强制走审查员复核环路（v3）**。不再直接向 channel 报"等 mr-watcher"，也不再让
 discovery 默认复核自己出的题；先让 `actor_examiner` 审查 delivery 的产出是否真的解了需求：

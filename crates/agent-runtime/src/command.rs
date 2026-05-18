@@ -200,9 +200,15 @@ impl Adapter for CommandAdapter {
         // Reset cancel flag for this scope's new prompt; old PID is already
         // gone (cleared after the previous wait).
         slot.lock().cancel_requested = false;
-        tokio::task::spawn_blocking(move || run_prompt(cfg, prompt, sender, slot))
-            .await
-            .map_err(|e| e.to_string())?
+        // Detach the command turn so the actor worker can keep processing
+        // other scopes while a long-running provider command is active. The
+        // blocking worker reports completion through AdapterEvent::Finished.
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = run_prompt(cfg, prompt, sender, slot) {
+                tracing::debug!(error = %e, "command run_prompt returned err (already reported via AdapterEvent)");
+            }
+        });
+        Ok(())
     }
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
@@ -1764,6 +1770,62 @@ mod tests {
     /// Spawning a long-lived child and cancelling it should reap quickly with
     /// the cancelled label set, instead of waiting for the natural exit.
     /// Unix-only because `signal_child` is gated on cfg(unix).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_returns_before_command_finishes() {
+        let mut cfg = cfg();
+        cfg.command = "sleep".into();
+        cfg.args = vec!["30".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            adapter.send_prompt(prompt("ignored")),
+        )
+        .await
+        .expect("send_prompt should return promptly")
+        .expect("send_prompt ok");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "send_prompt blocked on the child command"
+        );
+
+        let scope = scope();
+        let slot = adapter.slot_for(&scope.id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if slot.lock().pid.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never registered a PID"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        adapter.cancel(scope).await.expect("cancel");
+
+        let mut got_cancelled = false;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(!success);
+                assert_eq!(summary, "cancelled");
+                got_cancelled = true;
+                break;
+            }
+        }
+        assert!(got_cancelled, "did not receive cancelled Finished event");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_kills_running_child_and_labels_summary() {

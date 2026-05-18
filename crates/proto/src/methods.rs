@@ -1124,6 +1124,11 @@ pub struct AgentTransport {
     /// (appended after `args` as the final argv token).
     #[serde(default, rename = "promptVia")]
     pub prompt_via: PromptVia,
+    /// Optional hard timeout for one command-transport turn. When exceeded the
+    /// daemon cancels the subprocess and fails the turn so later handoffs can
+    /// drain instead of being stranded behind a hung CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
 
     // ---- interactive_command only; ignored by other transports ----
     #[serde(default, skip_serializing_if = "Option::is_none")]

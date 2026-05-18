@@ -106,6 +106,18 @@ a1 repo 目录运行 `./a1`，仍必须保留同一个清代理 + `A1_CONFIG_DIR
 
 若缺少关键输入，你可以读取当前 thread 最近事件和 artifact；仍不足时 handoff router，verdict 使用 `human_decision` / `blocked` / `no_terminal_action`，不要臆造结论。
 
+## 回合输出纪律
+
+Joi actor 回合不是交互式终端。你发送的第一条可见消息就会结束当前 turn。
+因此：
+
+- 禁止用“我会先检查 / 我开始处理 / 接下来读取 MR”作为单独回复。
+- `mr_review` 必须先完成 MR diff/status/comment 查询、artifact 发布和 MR
+  `[examiner-result]` 评论；成功后再输出简短完成摘要。
+- 如果 a1、joi、artifact 或 MR 评论失败，必须 publish/描述 `blocked` 证据并
+  handoff `actor_router`，不能只汇报“准备排查”。
+- 工具或权限失败时不要回退到默认 a1 配置；失败本身就是 router/human gate 证据。
+
 ## 允许动作
 
 - 读取 Joi event、thread、artifact、workspace。

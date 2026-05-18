@@ -24,7 +24,9 @@
       "--verbose",
       "-p"
     ],
-    "env": {},
+    "env": {
+      "JOI_NO_DAEMON": "1"
+    },
     "model": "sonnet",
     "modelArgs": [
       "--model",

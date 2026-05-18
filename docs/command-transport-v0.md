@@ -72,6 +72,8 @@ pub struct AgentTransport {
     pub output_format: Option<CommandOutputFormat>,
     #[serde(default = "default_prompt_via")]
     pub prompt_via: PromptVia,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,       // hard timeout for one turn
 }
 
 pub struct CommandSession {
@@ -128,7 +130,8 @@ fn default_prompt_via() -> PromptVia { PromptVia::Args }
       "resumeArgs": ["--resume", "{session_id}", "-p"]
     },
     "outputFormat": "claude_stream_json",
-    "promptVia": "args"
+    "promptVia": "args",
+    "timeoutMs": 900000
   },
   "defaults": {
     "autostart": true

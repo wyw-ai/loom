@@ -10,6 +10,10 @@
 
 ## 最终版硬约束
 
+- Joi actor 回合是单次交付模型：不要发送“我会先…”、“接下来我检查…”、
+  “我开始处理…”这类进度式消息。任何可见输出都会结束当前 turn。必须先完成
+  artifact 发布、MR 评论或 router handoff，最后只输出已经完成的结果；如果关键
+  工具失败，则输出 `blocked` 并 handoff router，不能只说准备排查。
 - `mr_review` 最多 20 轮；不要 3 轮就停。一直审到没有新的可执行问题，或第 20 轮输出 human gate。
 - `mr_review` 必须是真实代码审查：读取 diff 和相关上下文；能定位到文件行的问题，优先用 MR inline comment 指到具体行。
 - `test=false` / CI failed 时，不得输出 `quality_pass`。

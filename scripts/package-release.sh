@@ -31,7 +31,7 @@ Options:
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
   --out-dir DIR      Package output directory. Defaults to $PACKAGE_OUT_DIR or dist/packages.
   --oss-base-url URL OSS manager origin. Defaults to $OSS_BASE_URL or pre-ai.
-  --oss-group GROUP  OSS group. Defaults to joi-apps/releases/<version>/<git-sha>.
+  --oss-group GROUP  OSS group. Defaults to joi-apps-releases-<version>-<git-sha>.
   -h, --help         Show this help.
 
 Environment:
@@ -99,8 +99,12 @@ GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GENERATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/joi-package.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
+sanitize_oss_group_part() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-'
+}
+
 if [[ -z "$OSS_GROUP" ]]; then
-  OSS_GROUP="joi-apps/releases/$VERSION/$GIT_SHA"
+  OSS_GROUP="joi-apps-releases-$(sanitize_oss_group_part "$VERSION")-$(sanitize_oss_group_part "$GIT_SHA")"
 fi
 
 RUNTIME_TARGETS=(

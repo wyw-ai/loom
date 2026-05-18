@@ -5,7 +5,7 @@
 //! `AgentSpec`s in memory, and then runs the shared agent worker implementation.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{
@@ -45,8 +45,13 @@ pub async fn run(
         return Ok(());
     }
 
-    let cfg = load_desktop_config().unwrap_or_default();
-    let machine = select_machine(&cfg, machine_id.as_deref())?;
+    let mut cfg = load_desktop_config().unwrap_or_default();
+    let machine = select_machine_or_bootstrap(
+        &mut cfg,
+        machine_id.as_deref(),
+        data_root.as_deref(),
+        &server_url,
+    )?;
     let providers = apply_provider_overrides(detected_providers, &machine.providers);
     let mut selected_machine_snapshot = machine.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
@@ -1055,6 +1060,100 @@ fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<Machin
         .ok_or_else(|| anyhow!("no machine configured"))
 }
 
+fn select_machine_or_bootstrap(
+    cfg: &mut DesktopConfig,
+    requested: Option<&str>,
+    data_root: Option<&Path>,
+    server_url: &str,
+) -> Result<MachineConfig> {
+    let Some(id) = requested.and_then(trimmed_non_empty) else {
+        return select_machine(cfg, None);
+    };
+
+    match select_machine(cfg, Some(id)) {
+        Ok(machine) => Ok(machine),
+        Err(err) if cfg.machines.iter().any(|machine| machine.id == id) => Err(err),
+        Err(err) => {
+            let Some(data_root) = data_root else {
+                return Err(err);
+            };
+            let Some(machine) = bootstrap_requested_machine(cfg, id, data_root) else {
+                return Err(err);
+            };
+            restore_selected_machine_context(cfg, &machine, server_url, true);
+            save_desktop_config(cfg)
+                .with_context(|| format!("persist bootstrapped machine {id}"))?;
+            eprintln!(
+                "joi daemon: bootstrapped machine={} from data root {}",
+                id,
+                data_root.display()
+            );
+            Ok(machine)
+        }
+    }
+}
+
+fn bootstrap_requested_machine(
+    cfg: &DesktopConfig,
+    machine_id: &str,
+    data_root: &Path,
+) -> Option<MachineConfig> {
+    let context = parse_machine_data_root_context(data_root);
+    if context.workspace_id.is_none() || context.owner_actor_id.is_none() {
+        return None;
+    }
+
+    Some(MachineConfig {
+        workspace_id: context
+            .workspace_id
+            .or_else(|| active_workspace_id(cfg).map(ToString::to_string)),
+        owner_actor_id: context
+            .owner_actor_id
+            .or_else(|| active_account_actor_id(cfg).map(ToString::to_string)),
+        id: machine_id.to_string(),
+        name: context
+            .machine_name
+            .unwrap_or_else(|| machine_id.to_string()),
+        kind: default_machine_kind(),
+        data_root: data_root.display().to_string(),
+        providers: Vec::new(),
+        agents: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct MachineDataRootContext {
+    workspace_id: Option<String>,
+    owner_actor_id: Option<String>,
+    machine_name: Option<String>,
+}
+
+fn parse_machine_data_root_context(data_root: &Path) -> MachineDataRootContext {
+    let parts: Vec<String> = data_root
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str().map(ToString::to_string),
+            _ => None,
+        })
+        .collect();
+    let mut context = MachineDataRootContext {
+        machine_name: parts.last().and_then(|part| non_empty(part.trim())),
+        ..MachineDataRootContext::default()
+    };
+
+    for idx in (0..parts.len()).rev() {
+        if parts[idx] != "machines" || idx + 3 >= parts.len() {
+            continue;
+        }
+        context.workspace_id = non_empty(parts[idx + 1].trim());
+        context.owner_actor_id = non_empty(parts[idx + 2].trim());
+        context.machine_name = non_empty(parts[idx + 3].trim()).or(context.machine_name);
+        break;
+    }
+
+    context
+}
+
 fn active_workspace_id(cfg: &DesktopConfig) -> Option<&str> {
     cfg.active
         .as_deref()
@@ -1342,6 +1441,56 @@ mod tests {
         let err = select_machine(&cfg, Some("machine_other")).expect_err("owner mismatch");
 
         assert!(err.to_string().contains("active account"));
+    }
+
+    #[test]
+    fn bootstrap_requested_machine_uses_agentx_data_root_context() {
+        let cfg = DesktopConfig::default();
+        let data_root = PathBuf::from(
+            "/home/user/.agentx/machines/ws_3ab26c27/actor_human_339795/my_computer_ae33127d",
+        );
+
+        let selected = bootstrap_requested_machine(&cfg, "machine_ae33127d", &data_root)
+            .expect("agentx machine data root should bootstrap");
+
+        assert_eq!(selected.id, "machine_ae33127d");
+        assert_eq!(selected.workspace_id.as_deref(), Some("ws_3ab26c27"));
+        assert_eq!(
+            selected.owner_actor_id.as_deref(),
+            Some("actor_human_339795")
+        );
+        assert_eq!(selected.name, "my_computer_ae33127d");
+        assert_eq!(
+            selected.data_root,
+            "/home/user/.agentx/machines/ws_3ab26c27/actor_human_339795/my_computer_ae33127d"
+        );
+        assert!(selected.agents.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_requested_machine_rejects_unscoped_data_root() {
+        let cfg = DesktopConfig::default();
+        let data_root = PathBuf::from("/tmp/joi-daemon");
+
+        let selected = bootstrap_requested_machine(&cfg, "machine_ae33127d", &data_root);
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_machine_does_not_bootstrap_without_data_root() {
+        let mut cfg = DesktopConfig::default();
+
+        let err = select_machine_or_bootstrap(
+            &mut cfg,
+            Some("machine_ae33127d"),
+            None,
+            "ws://127.0.0.1:19999/rpc",
+        )
+        .expect_err("missing data root should preserve unknown machine error");
+
+        assert!(err.to_string().contains("unknown machine id"));
+        assert!(cfg.machines.is_empty());
     }
 
     #[test]

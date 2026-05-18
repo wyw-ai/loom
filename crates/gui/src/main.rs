@@ -13,6 +13,7 @@ mod ws;
 
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
 use tauri::Manager;
 use tokio::sync::Mutex;
 

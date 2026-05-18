@@ -1217,6 +1217,14 @@ impl WorkerState {
             .any(|queue| queue.iter().any(|event| event.id == event_id))
     }
 
+    fn has_active_trigger(&self, event_id: &str) -> bool {
+        self.active_turns
+            .lock()
+            .expect("active_turns poisoned")
+            .values()
+            .any(|turn| turn.trigger_event_id == event_id)
+    }
+
     fn push_text(&self, turn_id: &str, chunk: &str) {
         if chunk.is_empty() {
             return;
@@ -2158,8 +2166,15 @@ async fn drain_pending_inbox(
             if state.has_pending_event(&event.id) {
                 continue;
             }
-            record_delivery_seen(client, state, &event).await?;
-            continue;
+            if state.has_active_trigger(&event.id) {
+                record_delivery_seen(client, state, &event).await?;
+                continue;
+            }
+            tracing::warn!(
+                actor = %actor_id,
+                event = %event.id,
+                "retrying pending delivery that was seen but is no longer active or queued"
+            );
         }
         let too_old = now.signed_duration_since(event.occurred_at) > max_age;
         if too_old {

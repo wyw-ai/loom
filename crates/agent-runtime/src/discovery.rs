@@ -177,6 +177,7 @@ impl DetectedAgentProvider {
             output_format: Some(command_output_format_for_provider(&self.id)),
             prompt_via: PromptVia::Args,
             timeout_ms: None,
+            idle_timeout_ms: None,
             interactive: None,
             provider: None,
         }

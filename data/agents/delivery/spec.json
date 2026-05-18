@@ -49,7 +49,9 @@
       ]
     },
     "outputFormat": "claude_stream_json",
-    "promptVia": "args"
+    "promptVia": "args",
+    "timeoutMs": 7200000,
+    "idleTimeoutMs": 1200000
   },
   "autostart": true,
   "models": {

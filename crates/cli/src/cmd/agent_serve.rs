@@ -3783,6 +3783,7 @@ mod tests {
                 output_format: None,
                 prompt_via: proto::methods::PromptVia::default(),
                 timeout_ms: None,
+                idle_timeout_ms: None,
                 interactive: None,
                 provider: None,
             },

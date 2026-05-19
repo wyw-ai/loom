@@ -977,7 +977,7 @@ pre {
 
 .download-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -1015,6 +1015,11 @@ pre {
 
 .download-card .btn {
   margin-top: auto;
+}
+
+.download-card pre {
+  width: 100%;
+  font-size: 11px;
 }
 
 pre {

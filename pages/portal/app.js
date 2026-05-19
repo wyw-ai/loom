@@ -491,8 +491,14 @@ function handleAction(action) {
 function renderDownloads() {
   const release = window.JOI_RELEASE_DOWNLOADS || {};
   const artifacts = Array.isArray(release.artifacts) ? release.artifacts : [];
+  const publicArtifacts = artifacts
+    .filter((item) => item.kind === "gui" || item.kind === "installer")
+    .sort((a, b) => {
+      const order = { gui: 0, installer: 1 };
+      return (order[a.kind] ?? 9) - (order[b.kind] ?? 9);
+    });
   if (!downloadGrid || !downloadMeta) return;
-  if (artifacts.length === 0) {
+  if (publicArtifacts.length === 0) {
     downloadGrid.innerHTML = `
       <article class="download-card">
         <b>No release uploaded yet</b>
@@ -502,15 +508,19 @@ function renderDownloads() {
     return;
   }
   downloadMeta.textContent = `Version ${release.version} / ${release.gitSha} / ${release.group}`;
-  downloadGrid.innerHTML = artifacts
-    .map((item) => `
+  downloadGrid.innerHTML = publicArtifacts
+    .map((item) => {
+      const isInstaller = item.kind === "installer";
+      return `
       <article class="download-card download-card--${item.kind}">
-        <small>${item.kind}</small>
-        <b>${item.label}</b>
+        <small>${isInstaller ? "install.sh" : "dmg"}</small>
+        <b>${isInstaller ? "Install script" : "Joi Desktop for macOS"}</b>
         <p>${formatBytes(item.size)} · sha256 ${String(item.sha256).slice(0, 12)}...</p>
-        <a class="btn btn--primary" href="${item.downloadUrl}" target="_blank" rel="noreferrer">Download</a>
+        ${isInstaller ? `<pre>curl -fsSL ${item.downloadUrl} | sh -s -- --module all -y</pre>` : ""}
+        <a class="btn btn--primary" href="${item.downloadUrl}" target="_blank" rel="noreferrer">${isInstaller ? "Download install.sh" : "Download DMG"}</a>
       </article>
-    `)
+    `;
+    })
     .join("");
 }
 

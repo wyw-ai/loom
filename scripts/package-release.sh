@@ -232,10 +232,259 @@ write_manifest() {
     printf 'generated_at=%s\n' "$GENERATED_AT"
     printf 'profile=%s\n' "$PROFILE"
     printf '\nartifacts:\n'
-    find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' \) \
+    find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' \) \
       -exec basename {} \; | sort | sed 's/^/- /'
   } >"$manifest"
   log "wrote $manifest"
+}
+
+artifact_download_url() {
+  local file_name="$1"
+  printf '%s/api/v1/%s/%s' "${OSS_BASE_URL%/}" "$OSS_GROUP" "$file_name"
+}
+
+write_installer() {
+  local installer="$PACKAGE_OUT_DIR/install.sh"
+  local runtime_mac="joi-runtime-$VERSION-universal-apple-darwin.tar.gz"
+  local runtime_linux_x86="joi-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
+  local runtime_linux_arm="joi-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
+  local sha_mac sha_linux_x86 sha_linux_arm
+
+  ensure_file "$PACKAGE_OUT_DIR/$runtime_mac"
+  ensure_file "$PACKAGE_OUT_DIR/$runtime_linux_x86"
+  ensure_file "$PACKAGE_OUT_DIR/$runtime_linux_arm"
+
+  sha_mac="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_mac" | awk '{print $1}')"
+  sha_linux_x86="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_linux_x86" | awk '{print $1}')"
+  sha_linux_arm="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_linux_arm" | awk '{print $1}')"
+
+  cat >"$installer" <<EOF
+#!/usr/bin/env sh
+set -eu
+
+VERSION='$VERSION'
+GIT_SHA='$GIT_SHA'
+DEFAULT_BIN_DIR="\${HOME}/.local/bin"
+
+URL_UNIVERSAL_APPLE_DARWIN='$(artifact_download_url "$runtime_mac")'
+SHA_UNIVERSAL_APPLE_DARWIN='$sha_mac'
+URL_X86_64_UNKNOWN_LINUX_MUSL='$(artifact_download_url "$runtime_linux_x86")'
+SHA_X86_64_UNKNOWN_LINUX_MUSL='$sha_linux_x86'
+URL_AARCH64_UNKNOWN_LINUX_MUSL='$(artifact_download_url "$runtime_linux_arm")'
+SHA_AARCH64_UNKNOWN_LINUX_MUSL='$sha_linux_arm'
+
+usage() {
+  cat <<'USAGE'
+Usage: install.sh [options]
+
+Install Joi runtime binaries from the current release.
+
+Options:
+  -m, --module MODULE   Module to install: all, joi, joi-server, server.
+                        Can be repeated or comma-separated. Default: all.
+  -t, --target TARGET   Override target package:
+                        universal-apple-darwin,
+                        x86_64-unknown-linux-musl,
+                        aarch64-unknown-linux-musl.
+      --bin-dir DIR     Install binaries into DIR. Default: \$HOME/.local/bin.
+      --dry-run         Print the selected package and modules without installing.
+      --print-url       Print the selected runtime package URL and exit.
+  -y, --yes             Accepted for non-interactive automation.
+  -h, --help            Show this help.
+
+Examples:
+  sh install.sh
+  sh install.sh --module joi
+  sh install.sh --module joi-server --bin-dir /usr/local/bin
+  sh install.sh --target x86_64-unknown-linux-musl --module joi,joi-server -y
+USAGE
+}
+
+die() {
+  printf 'install.sh: %s\n' "\$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "\$1" >/dev/null 2>&1 || die "missing required command: \$1"
+}
+
+detect_target() {
+  os="\$(uname -s 2>/dev/null || true)"
+  arch="\$(uname -m 2>/dev/null || true)"
+  case "\$os:\$arch" in
+    Darwin:*) printf '%s\n' universal-apple-darwin ;;
+    Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-musl ;;
+    Linux:aarch64|Linux:arm64) printf '%s\n' aarch64-unknown-linux-musl ;;
+    *) die "unsupported platform: \$os \$arch; pass --target explicitly" ;;
+  esac
+}
+
+runtime_url() {
+  case "\$1" in
+    universal-apple-darwin) printf '%s\n' "\$URL_UNIVERSAL_APPLE_DARWIN" ;;
+    x86_64-unknown-linux-musl) printf '%s\n' "\$URL_X86_64_UNKNOWN_LINUX_MUSL" ;;
+    aarch64-unknown-linux-musl) printf '%s\n' "\$URL_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    *) die "unknown target: \$1" ;;
+  esac
+}
+
+runtime_sha256() {
+  case "\$1" in
+    universal-apple-darwin) printf '%s\n' "\$SHA_UNIVERSAL_APPLE_DARWIN" ;;
+    x86_64-unknown-linux-musl) printf '%s\n' "\$SHA_X86_64_UNKNOWN_LINUX_MUSL" ;;
+    aarch64-unknown-linux-musl) printf '%s\n' "\$SHA_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    *) die "unknown target: \$1" ;;
+  esac
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "\$1" | awk '{print \$1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "\$1" | awk '{print \$1}'
+  else
+    die "missing checksum command: install shasum or sha256sum"
+  fi
+}
+
+download_file() {
+  url="\$1"
+  out="\$2"
+  need_cmd curl
+  if [ "\${JOI_INSTALL_KEEP_PROXY:-}" = "1" ]; then
+    curl -fL --retry 3 --connect-timeout 20 -o "\$out" "\$url"
+  else
+    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \\
+      -u http_proxy -u https_proxy -u all_proxy \\
+      curl -fL --retry 3 --connect-timeout 20 -o "\$out" "\$url"
+  fi
+}
+
+normalize_modules() {
+  modules=""
+  for module in \$(printf '%s' "\$1" | tr ',' ' '); do
+    case "\$module" in
+      all) modules="joi joi-server" ;;
+      joi|cli) modules="\$modules joi" ;;
+      server|joi-server) modules="\$modules joi-server" ;;
+      "") ;;
+      *) die "unknown module: \$module" ;;
+    esac
+  done
+  printf '%s\n' "\$modules"
+}
+
+install_one() {
+  name="\$1"
+  src="\$2"
+  dst="\$3"
+  [ -f "\$src" ] || die "archive does not contain \$name"
+  mkdir -p "\$dst"
+  cp "\$src" "\$dst/\$name"
+  chmod 0755 "\$dst/\$name"
+  printf 'installed %s -> %s/%s\n' "\$name" "\$dst" "\$name"
+}
+
+target=""
+module_spec="all"
+bin_dir="\$DEFAULT_BIN_DIR"
+dry_run=0
+print_url=0
+
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in
+    -m|--module)
+      [ "\$#" -ge 2 ] || die "missing value for \$1"
+      if [ "\$module_spec" = "all" ]; then module_spec="\$2"; else module_spec="\$module_spec,\$2"; fi
+      shift 2
+      ;;
+    --module=*)
+      value="\${1#*=}"
+      if [ "\$module_spec" = "all" ]; then module_spec="\$value"; else module_spec="\$module_spec,\$value"; fi
+      shift
+      ;;
+    -t|--target)
+      [ "\$#" -ge 2 ] || die "missing value for \$1"
+      target="\$2"
+      shift 2
+      ;;
+    --target=*)
+      target="\${1#*=}"
+      shift
+      ;;
+    --bin-dir)
+      [ "\$#" -ge 2 ] || die "missing value for \$1"
+      bin_dir="\$2"
+      shift 2
+      ;;
+    --bin-dir=*)
+      bin_dir="\${1#*=}"
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --print-url)
+      print_url=1
+      shift
+      ;;
+    -y|--yes)
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: \$1"
+      ;;
+  esac
+done
+
+[ -n "\$target" ] || target="\$(detect_target)"
+url="\$(runtime_url "\$target")"
+expected_sha="\$(runtime_sha256 "\$target")"
+modules="\$(normalize_modules "\$module_spec")"
+
+if [ "\$print_url" -eq 1 ]; then
+  printf '%s\n' "\$url"
+  exit 0
+fi
+
+printf 'Joi %s (%s)\n' "\$VERSION" "\$GIT_SHA"
+printf 'target: %s\n' "\$target"
+printf 'modules:%s\n' "\$modules"
+printf 'bin dir: %s\n' "\$bin_dir"
+printf 'package: %s\n' "\$url"
+
+if [ "\$dry_run" -eq 1 ]; then
+  exit 0
+fi
+
+need_cmd tar
+tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/joi-install.XXXXXX")"
+trap 'rm -rf "\$tmp_dir"' EXIT INT TERM
+archive="\$tmp_dir/joi-runtime.tar.gz"
+
+download_file "\$url" "\$archive"
+actual_sha="\$(sha256_file "\$archive")"
+[ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$url"
+
+tar -xzf "\$archive" -C "\$tmp_dir"
+package_dir="\$(find "\$tmp_dir" -maxdepth 1 -type d -name "joi-runtime-*" | head -1)"
+[ -n "\$package_dir" ] || die "runtime package did not extract correctly"
+
+for module in \$modules; do
+  install_one "\$module" "\$package_dir/bin/\$module" "\$bin_dir"
+done
+
+printf 'done. Add %s to PATH if needed.\n' "\$bin_dir"
+EOF
+
+  chmod 0755 "$installer"
+  log "wrote $installer"
 }
 
 write_checksums() {
@@ -245,7 +494,7 @@ write_checksums() {
     artifacts=()
     while IFS= read -r artifact; do
       artifacts+=("$artifact")
-    done < <(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' \) \
+    done < <(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' \) \
       -exec basename {} \; | sort)
 
     if [[ "${#artifacts[@]}" -eq 0 ]]; then
@@ -299,6 +548,7 @@ artifact_kind() {
   case "$1" in
     joi-runtime-*.tar.gz) printf 'runtime' ;;
     joi-gui-*.dmg) printf 'gui' ;;
+    install.sh) printf 'installer' ;;
     SHA256SUMS) printf 'checksums' ;;
     manifest.txt) printf 'manifest' ;;
     *) printf 'file' ;;
@@ -313,6 +563,7 @@ artifact_label() {
   label="${label%.tar.gz}"
   label="${label%.dmg}"
   case "$file_name" in
+    install.sh) label="Install script" ;;
     SHA256SUMS) label="SHA256 checksums" ;;
     manifest.txt) label="Release manifest" ;;
   esac
@@ -359,7 +610,7 @@ upload_artifacts() {
   while IFS= read -r artifact; do
     artifacts+=("$artifact")
   done < <(find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \
-    \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'SHA256SUMS' -o -name 'manifest.txt' \) \
+    \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' -o -name 'SHA256SUMS' -o -name 'manifest.txt' \) \
     | sort)
 
   if [[ "${#artifacts[@]}" -eq 0 ]]; then
@@ -406,6 +657,7 @@ PY
 mkdir -p "$PACKAGE_OUT_DIR"
 rm -f "$PACKAGE_OUT_DIR"/joi-runtime-*.tar.gz \
   "$PACKAGE_OUT_DIR"/joi-gui-*.dmg \
+  "$PACKAGE_OUT_DIR"/install.sh \
   "$PACKAGE_OUT_DIR"/SHA256SUMS \
   "$PACKAGE_OUT_DIR"/manifest.txt
 
@@ -426,6 +678,7 @@ else
   log "skipping GUI dmg"
 fi
 
+write_installer
 write_manifest
 write_checksums
 

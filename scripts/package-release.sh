@@ -12,11 +12,14 @@ DIST_DIR="${DIST_DIR:-dist}"
 PACKAGE_OUT_DIR="${PACKAGE_OUT_DIR:-$DIST_DIR/packages}"
 OSS_BASE_URL="${OSS_BASE_URL:-https://pre-ai.aone.alibaba-inc.com}"
 OSS_GROUP="${OSS_GROUP:-}"
+DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
+PORTAL_DOWNLOAD_BASE_URL="${PORTAL_DOWNLOAD_BASE_URL:-}"
 PORTAL_RELEASE_DATA="${PORTAL_RELEASE_DATA:-pages/portal/release-downloads.js}"
 PROFILE="release"
 SKIP_BUILD=0
 SKIP_GUI=0
 SKIP_UPLOAD=1
+WRITE_RELEASE_DATA=0
 
 usage() {
   cat <<'EOF'
@@ -29,6 +32,8 @@ Options:
   --skip-gui         Do not build/copy the macOS arm64 GUI dmg.
   --upload, --publish Upload release artifacts to OSS and refresh portal release data.
   --skip-upload      Do not upload release artifacts to OSS. This is the default.
+  --write-release-data
+                      Write portal release data using DOWNLOAD_BASE_URL-derived URLs.
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
   --out-dir DIR      Package output directory. Defaults to $PACKAGE_OUT_DIR or dist/packages.
   --oss-base-url URL OSS manager origin. Defaults to $OSS_BASE_URL or pre-ai.
@@ -44,6 +49,9 @@ Environment:
   PACKAGE_OUT_DIR    Package output directory. Defaults to dist/packages.
   OSS_BASE_URL       OSS manager origin.
   OSS_GROUP          OSS grouped upload path.
+  DOWNLOAD_BASE_URL  Public artifact URL prefix used by --write-release-data and install.sh.
+  PORTAL_DOWNLOAD_BASE_URL
+                      Public artifact URL prefix used only by --write-release-data.
   PORTAL_RELEASE_DATA Portal release data JS path.
 EOF
 }
@@ -64,6 +72,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --upload | --publish)
       SKIP_UPLOAD=0
+      shift
+      ;;
+    --write-release-data)
+      WRITE_RELEASE_DATA=1
       shift
       ;;
     --dist-dir)
@@ -268,7 +280,20 @@ write_manifest() {
 
 artifact_download_url() {
   local file_name="$1"
+  if [[ -n "$DOWNLOAD_BASE_URL" ]]; then
+    printf '%s/%s' "${DOWNLOAD_BASE_URL%/}" "$file_name"
+    return
+  fi
   printf '%s/api/v1/%s/%s' "${OSS_BASE_URL%/}" "$OSS_GROUP" "$file_name"
+}
+
+portal_artifact_download_url() {
+  local file_name="$1"
+  if [[ -n "$PORTAL_DOWNLOAD_BASE_URL" ]]; then
+    printf '%s/%s' "${PORTAL_DOWNLOAD_BASE_URL%/}" "$file_name"
+    return
+  fi
+  artifact_download_url "$file_name"
 }
 
 write_installer() {
@@ -629,6 +654,59 @@ PY
   fi
 }
 
+write_release_data_from_local_artifacts() {
+  local uploads_json="$TMP_DIR/local-uploads.json"
+  local first=1
+  printf '[\n' >"$uploads_json"
+
+  local artifacts=()
+  while IFS= read -r artifact; do
+    artifacts+=("$artifact")
+  done < <(find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \
+    \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' -o -name 'SHA256SUMS' -o -name 'manifest.txt' \) \
+    | sort)
+
+  if [[ "${#artifacts[@]}" -eq 0 ]]; then
+    echo "no package artifacts found for release data" >&2
+    exit 1
+  fi
+
+  for artifact in "${artifacts[@]}"; do
+    local file_name url size sha kind label
+    file_name="$(basename "$artifact")"
+    url="$(portal_artifact_download_url "$file_name")"
+    size="$(wc -c <"$artifact" | tr -d ' ')"
+    sha="$(checksum_cmd "$artifact" | awk '{print $1}')"
+    kind="$(artifact_kind "$file_name")"
+    label="$(artifact_label "$file_name")"
+
+    if [[ "$first" -eq 0 ]]; then
+      printf ',\n' >>"$uploads_json"
+    fi
+    first=0
+    python3 - "$uploads_json" "$file_name" "$label" "$kind" "$size" "$sha" "$url" <<'PY'
+import json
+import sys
+
+_, uploads_json, file_name, label, kind, size, sha, url = sys.argv
+item = {
+    "fileName": file_name,
+    "label": label,
+    "kind": kind,
+    "size": int(size),
+    "sha256": sha,
+    "downloadUrl": url,
+}
+with open(uploads_json, "a", encoding="utf-8") as f:
+    f.write("  ")
+    json.dump(item, f, ensure_ascii=False)
+PY
+  done
+
+  printf '\n]\n' >>"$uploads_json"
+  write_portal_release_data "$uploads_json"
+}
+
 upload_artifacts() {
   local uploads_json="$TMP_DIR/uploads.json"
   local first=1
@@ -712,6 +790,8 @@ write_checksums
 
 if [[ "$SKIP_UPLOAD" -eq 0 ]]; then
   upload_artifacts
+elif [[ "$WRITE_RELEASE_DATA" -eq 1 ]]; then
+  write_release_data_from_local_artifacts
 else
   log "skipping OSS upload"
 fi

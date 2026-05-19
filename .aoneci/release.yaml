@@ -1,0 +1,86 @@
+name: Release
+
+triggers:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    # Joi Desktop dmg packaging uses hdiutil/codesign, so the release job must
+    # run on a macOS runner. The runtime archives are built in the same job so
+    # install.sh and release-downloads.js can be generated from one package set.
+    image: macos-14
+    timeout: 120m
+    steps:
+      - uses: checkout
+      - uses: setup-env
+        inputs:
+          node-version: 20
+          tnpm-version: 10
+      - id: setup-toolchain
+        run: |
+          set -euo pipefail
+          export RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
+          export RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}"
+          if ! command -v rustup >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          [ ! -f "$HOME/.cargo/env" ] || . "$HOME/.cargo/env"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          if command -v brew >/dev/null 2>&1; then
+            brew list musl-cross >/dev/null 2>&1 || brew install filosottile/musl-cross/musl-cross
+          fi
+          command -v x86_64-linux-musl-gcc >/dev/null 2>&1
+          command -v aarch64-linux-musl-gcc >/dev/null 2>&1
+          if ! cargo tauri --version >/dev/null 2>&1; then
+            cargo install tauri-cli --version '^2' --locked
+          fi
+          if command -v corepack >/dev/null 2>&1; then
+            corepack enable
+            corepack prepare pnpm@9 --activate
+          else
+            npm install -g pnpm@9 --registry=https://registry.anpm.alibaba-inc.com
+          fi
+          pnpm --dir apps/gui-web install --frozen-lockfile --registry=https://registry.anpm.alibaba-inc.com
+      - id: package
+        run: |
+          set -euo pipefail
+          TAG="${{git.tag}}"
+          VERSION="${TAG#v}"
+          CARGO_VERSION="$(awk -F\" '/^version/ { print $2; exit }' Cargo.toml)"
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "tag ${TAG} does not match Cargo.toml version ${CARGO_VERSION}" >&2
+            exit 1
+          fi
+          DOWNLOAD_BASE_URL="https://git.cn-hangzhou.oss-cdn.aliyun-inc.com/joi-apps/${TAG}" \
+          PORTAL_DOWNLOAD_BASE_URL="https://git.cn-hangzhou.oss-cdn.aliyun-inc.com/joi-apps/latest" \
+          PORTAL_RELEASE_DATA="dist/packages/release-downloads.js" \
+            scripts/package-release.sh --write-release-data --out-dir dist/packages
+      - id: verify
+        run: |
+          set -euo pipefail
+          TAG="${{git.tag}}"
+          VERSION="${TAG#v}"
+          sh -n dist/packages/install.sh
+          dist/packages/install.sh --dry-run --target x86_64-unknown-linux-musl --module joi-server -y
+          hdiutil verify "dist/packages/joi-gui-${VERSION}-aarch64-apple-darwin.dmg"
+          codesign --verify --deep --strict --verbose=2 "target/aarch64-apple-darwin/release/bundle/macos/Joi Desktop.app"
+      - uses: upload-oss
+        inputs:
+          path: dist/packages/*
+          region: cn-hangzhou
+          oss-bucket: ${{secrets.OSS_BUCKET}}
+          oss-endpoint: ${{secrets.OSS_ENDPOINT}}
+          access-key-id: ${{secrets.OSS_ACCESS_KEY_ID}}
+          access-key-secret: ${{secrets.OSS_ACCESS_KEY_SECRET}}
+          storage-path: joi-apps/${{git.tag}}/
+      - uses: upload-oss
+        inputs:
+          path: dist/packages/*
+          region: cn-hangzhou
+          oss-bucket: ${{secrets.OSS_BUCKET}}
+          oss-endpoint: ${{secrets.OSS_ENDPOINT}}
+          access-key-id: ${{secrets.OSS_ACCESS_KEY_ID}}
+          access-key-secret: ${{secrets.OSS_ACCESS_KEY_SECRET}}
+          storage-path: joi-apps/latest/

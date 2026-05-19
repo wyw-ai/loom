@@ -27,12 +27,13 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentModelChoice, AgentSpec, BundleInstallMode,
-    DeliveryListResult, EventAppendResult, HandoffApplyOn, PromptTemplateSpec, TurnOpenResult,
+    DeliveryListResult, EventAppendResult, HandoffApplyOn, PromptTemplateSpec,
+    TaskAssignmentUpdateResult, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
     ActorKind, Event, Meta, ReceiptKind, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef,
-    TurnStatus,
+    TaskAssignmentStatus, TurnStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2523,6 +2524,8 @@ async fn dispatch_handoff(
             cancel_requested: false,
         };
         state.set_turn(active.clone());
+        mark_assignment_running_if_needed(client, state, &trigger).await;
+        append_turn_started_ack(client, state, &active, &trigger).await;
 
         let adapter_prompt = build_adapter_prompt(
             client,
@@ -3667,6 +3670,97 @@ async fn append_trace(
     Ok(())
 }
 
+async fn mark_assignment_running_if_needed(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    trigger: &Event,
+) {
+    let Some(assignment_id) = assignment_id_for_start(trigger) else {
+        return;
+    };
+    let result: Result<TaskAssignmentUpdateResult> = client
+        .call(
+            method::TASK_ASSIGNMENT_UPDATE,
+            json!({
+                "assignmentId": assignment_id,
+                "status": TaskAssignmentStatus::Running,
+            }),
+        )
+        .await
+        .with_context(|| format!("task/assignment.update assignment={assignment_id}"));
+    if let Err(e) = result {
+        tracing::warn!(
+            actor = %state.actor_id,
+            assignment = %assignment_id,
+            %e,
+            "failed to mark assignment running"
+        );
+    }
+}
+
+async fn append_turn_started_ack(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    active: &ActiveTurn,
+    trigger: &Event,
+) {
+    let result = append_event(
+        client,
+        "content.add",
+        &state.actor_id,
+        &active.scope,
+        Some(&active.id),
+        json!({
+            "contentType": "text/markdown",
+            "text": "Received. Working on it.",
+            "_meta": {
+                "kind": "turn.started_ack",
+                "triggerEventId": trigger.id,
+            }
+        }),
+        responds_to_event_relation(&trigger.id),
+        None,
+    )
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            actor = %state.actor_id,
+            turn = %active.id,
+            scope = %active.scope.id,
+            %e,
+            "failed to append turn started acknowledgement"
+        );
+    }
+}
+
+fn assignment_id_for_start(trigger: &Event) -> Option<&str> {
+    let meta = trigger
+        .payload
+        .get("_meta")
+        .and_then(|value| value.as_object())?;
+    if meta.contains_key("assignmentStatus") {
+        return None;
+    }
+    meta.get("assignmentId")
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn responds_to_event_relation(event_id: &str) -> Vec<Relation> {
+    if event_id.is_empty() {
+        return vec![];
+    }
+    vec![Relation {
+        kind: RelationKind::RespondsTo,
+        target: Ref {
+            kind: RefKind::Event,
+            id: event_id.to_string(),
+            _meta: None,
+        },
+        _meta: None,
+    }]
+}
+
 async fn append_event(
     client: &Arc<Client>,
     kind: &str,
@@ -3706,19 +3800,6 @@ async fn flush_text(
     text: String,
     meta: Option<Meta>,
 ) -> Result<()> {
-    let relations = if trigger_event_id.is_empty() {
-        vec![]
-    } else {
-        vec![Relation {
-            kind: RelationKind::RespondsTo,
-            target: Ref {
-                kind: RefKind::Event,
-                id: trigger_event_id.to_string(),
-                _meta: None,
-            },
-            _meta: None,
-        }]
-    };
     append_event(
         client,
         "content.add",
@@ -3726,7 +3807,7 @@ async fn flush_text(
         scope,
         Some(turn_id),
         json!({ "contentType": "text/markdown", "text": text }),
-        relations,
+        responds_to_event_relation(trigger_event_id),
         meta,
     )
     .await
@@ -4112,6 +4193,48 @@ mod tests {
 
         assert!(!is_for_us(&own_plain_message, "actor_agent_emma"));
         assert!(!is_for_us(&handoff_to_other, "actor_agent_emma"));
+    }
+
+    #[test]
+    fn assignment_start_detection_skips_return_handoff() {
+        let mut trigger = Event {
+            id: "evt_assignment".into(),
+            kind: "content.add".into(),
+            actor_id: "actor_agent_owner".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_task".into(),
+            },
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({
+                "text": "assignment",
+                "_meta": {
+                    "taskId": "task_1",
+                    "assignmentId": "asgn_1",
+                    "assignmentType": "review"
+                }
+            }),
+            relations: vec![],
+            _meta: None,
+        };
+
+        assert_eq!(assignment_id_for_start(&trigger), Some("asgn_1"));
+
+        trigger.payload["_meta"]["assignmentStatus"] = json!("completed");
+        assert_eq!(assignment_id_for_start(&trigger), None);
+    }
+
+    #[test]
+    fn responds_to_event_relation_targets_trigger_event() {
+        let relations = responds_to_event_relation("evt_trigger");
+
+        assert_eq!(relations.len(), 1);
+        assert!(matches!(relations[0].kind, RelationKind::RespondsTo));
+        assert_eq!(relations[0].target.kind, RefKind::Event);
+        assert_eq!(relations[0].target.id, "evt_trigger");
+        assert!(responds_to_event_relation("").is_empty());
     }
 
     #[test]

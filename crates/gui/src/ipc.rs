@@ -656,7 +656,7 @@ pub async fn agent_remove(
 ) -> Result<AgentListResult, String> {
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
     let mut removed = false;
     for machine in cfg.machines.iter_mut().filter(|machine| {
         config::machine_belongs_to_workspace_and_owner(
@@ -982,7 +982,7 @@ pub async fn machine_create(
     }
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let owner_actor_id = config::active_owner_actor_id(&cfg);
     let workspace_dir = workspace_id
         .as_deref()
         .map(slugify)
@@ -1051,7 +1051,7 @@ pub async fn machine_remove(
     }
     let before = cfg.machines.len();
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
     let server_url = active_server_url(&cfg).to_string();
     let actor_ids = cfg
         .machines
@@ -1101,7 +1101,7 @@ pub async fn machine_agent_create(
     }
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
     let actor_id = actor_id_from_input(&args.actor_id, name, &machine_id).map_err(stringify)?;
     if server_machine_by_id(&cfg, state.try_client().await, &machine_id)
         .await
@@ -1196,7 +1196,7 @@ pub async fn machine_agent_remove(
 ) -> Result<MachineListResult, String> {
     let mut cfg = config::load_or_init().map_err(stringify)?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
     if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
         .await
         .is_some()
@@ -1574,8 +1574,13 @@ fn server_machine_info_from_actor(
 }
 
 fn remote_machine_belongs_to_active_context(meta: &RemoteMachineMeta, cfg: &DesktopConfig) -> bool {
+    if let Some(workspace_id) = meta.workspace_id.as_deref() {
+        if Some(workspace_id) != config::active_workspace_id(cfg) {
+            return false;
+        }
+    }
     if let Some(owner_actor_id) = meta.owner_actor_id.as_deref() {
-        if Some(owner_actor_id) != config::active_account_actor_id(cfg) {
+        if Some(owner_actor_id) != config::active_owner_actor_id(cfg).as_deref() {
             return false;
         }
     }
@@ -1691,24 +1696,24 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
         .flat_map(|machine| machine.agents.iter().map(|agent| agent.actor_id.clone()))
         .collect::<HashSet<_>>();
 
+    if let Some(actors) = value.get("actors").and_then(Value::as_array) {
+        for actor in actors {
+            if let Some(machine) =
+                server_machine_info_from_actor(actor, cfg, active_server_url(cfg))
+            {
+                allowed_agents.extend(
+                    machine
+                        .agents
+                        .iter()
+                        .map(|agent| agent.info.spec.actor.id.clone()),
+                );
+            }
+        }
+    }
+
     let Some(actors) = value.get_mut("actors").and_then(Value::as_array_mut) else {
         return value;
     };
-
-    for actor in actors.iter() {
-        let Some(meta_value) = actor.get("_meta") else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_value::<RemoteMachineMeta>(meta_value.clone()) else {
-            continue;
-        };
-        if !is_complete_remote_machine_inventory(&meta)
-            || !remote_machine_belongs_to_active_context(&meta, cfg)
-        {
-            continue;
-        }
-        allowed_agents.extend(meta.agents.into_iter().map(|agent| agent.actor_id));
-    }
 
     actors.retain(|actor| {
         let kind = actor
@@ -2073,7 +2078,7 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
 
     let mut cfg = config::load_or_init()?;
     let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_account_actor_id(&cfg).map(ToString::to_string);
+    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
     let Some(machine_index) = cfg.machines.iter().position(|machine| {
         machine.id == machine_id
             && config::machine_belongs_to_workspace_and_owner(
@@ -2287,23 +2292,24 @@ mod tests {
     }
 
     #[test]
-    fn actor_list_filter_includes_agents_from_same_owner_server_inventory() {
-        let account = test_account();
+    fn actor_list_filter_allows_agents_from_server_machine_inventory() {
         let cfg = DesktopConfig {
             active: Some("default".into()),
-            account: Some(account.clone()),
+            account: None,
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
                 server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: account.actor_id.clone(),
-                display_name: account_display_name(&account),
+                actor_id: String::new(),
+                display_name: String::new(),
             }],
-            machines: vec![],
+            machines: vec![MachineConfig {
+                agents: Vec::new(),
+                ..test_machine("machine_remote", Some("actor_human_88084"), "unused")
+            }],
         };
         let value = json!({
             "actors": [
-                { "id": account.actor_id, "kind": "human", "displayName": "星楚" },
                 {
                     "id": "actor_service_machine_remote",
                     "kind": "service",
@@ -2313,25 +2319,35 @@ mod tests {
                         "source": "daemon",
                         "machineId": "machine_remote",
                         "inventoryVersion": 2,
-                        "revision": 2,
+                        "revision": 7,
                         "observedAt": "2026-05-13T10:50:00Z",
-                        "workspaceId": "ws_from_daemon",
-                        "ownerActorId": account.actor_id,
+                        "workspaceId": "default",
+                        "ownerActorId": "actor_human_88084",
                         "name": "Remote Box",
-                        "kind": "local",
-                        "dataRoot": "/tmp/remote",
-                        "configDir": "/tmp/config",
-                        "capabilities": ["inventory.read", "machine.command"],
-                        "providers": [],
+                        "kind": "remote",
+                        "dataRoot": "/home/canfeng/.agentx/machine_remote",
+                        "configDir": "/home/canfeng/.joi-apps",
+                        "capabilities": ["inventory.read", "connection.status", "machine.command"],
+                        "providers": [{
+                            "id": "codex",
+                            "displayName": "Codex CLI",
+                            "command": "/usr/bin/codex",
+                            "transportKind": "command",
+                            "args": ["exec"],
+                            "defaultModel": "gpt-5.5",
+                            "modelChoices": []
+                        }],
                         "agents": [{
-                            "providerId": "claude",
+                            "providerId": "codex",
                             "actorId": "actor_remote_agent",
-                            "name": "Remote Agent"
+                            "name": "Remote Agent",
+                            "model": "gpt-5.5",
+                            "autostart": true
                         }]
                     }
                 },
                 { "id": "actor_remote_agent", "kind": "agent", "displayName": "Remote Agent" },
-                { "id": "actor_unrelated_agent", "kind": "agent", "displayName": "Unrelated" }
+                { "id": "actor_other_agent", "kind": "agent", "displayName": "Other Agent" }
             ]
         });
 
@@ -2344,7 +2360,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(actor_ids.contains(&"actor_remote_agent"));
-        assert!(!actor_ids.contains(&"actor_unrelated_agent"));
+        assert!(!actor_ids.contains(&"actor_other_agent"));
     }
 
     #[test]
@@ -2403,11 +2419,6 @@ mod tests {
             .expect("server machine");
 
         assert_eq!(machine.id, "machine_remote");
-        assert_eq!(machine.workspace_id.as_deref(), Some("default"));
-        assert_eq!(
-            machine.owner_actor_id.as_deref(),
-            Some(account.actor_id.as_str())
-        );
         assert_eq!(machine.source, "server_inventory");
         assert!(!machine.read_only);
         assert_eq!(
@@ -2432,94 +2443,6 @@ mod tests {
             machine.agents[0].profile_path,
             "/home/canfeng/.agentx/machine_remote/agents/actor_remote_agent/profile"
         );
-    }
-
-    #[test]
-    fn server_machine_inventory_allows_same_owner_different_local_workspace_id() {
-        let account = test_account();
-        let cfg = DesktopConfig {
-            active: Some("default".into()),
-            account: Some(account.clone()),
-            workspaces: vec![Workspace {
-                id: "default".into(),
-                name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: account.actor_id.clone(),
-                display_name: account_display_name(&account),
-            }],
-            machines: vec![],
-        };
-        let actor = json!({
-            "id": "actor_service_machine_remote",
-            "kind": "service",
-            "displayName": "Remote Box",
-            "_meta": {
-                "role": "machine",
-                "source": "daemon",
-                "machineId": "machine_remote",
-                "inventoryVersion": 2,
-                "revision": 7,
-                "observedAt": "2026-05-13T10:50:00Z",
-                "workspaceId": "ws_created_by_another_gui_profile",
-                "ownerActorId": account.actor_id,
-                "name": "Remote Box",
-                "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.joi-apps",
-                "capabilities": ["inventory.read", "connection.status", "machine.command"],
-                "providers": [],
-                "agents": []
-            }
-        });
-
-        let machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
-            .expect("same owner machine should be visible on the connected server");
-
-        assert_eq!(
-            machine.workspace_id.as_deref(),
-            Some("ws_created_by_another_gui_profile")
-        );
-    }
-
-    #[test]
-    fn server_machine_inventory_hides_other_owner() {
-        let account = test_account();
-        let cfg = DesktopConfig {
-            active: Some("default".into()),
-            account: Some(account.clone()),
-            workspaces: vec![Workspace {
-                id: "default".into(),
-                name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: account.actor_id.clone(),
-                display_name: account_display_name(&account),
-            }],
-            machines: vec![],
-        };
-        let actor = json!({
-            "id": "actor_service_machine_remote",
-            "kind": "service",
-            "displayName": "Remote Box",
-            "_meta": {
-                "role": "machine",
-                "source": "daemon",
-                "machineId": "machine_remote",
-                "inventoryVersion": 2,
-                "revision": 7,
-                "observedAt": "2026-05-13T10:50:00Z",
-                "workspaceId": "default",
-                "ownerActorId": "actor_human_other",
-                "name": "Remote Box",
-                "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.joi-apps",
-                "capabilities": ["inventory.read", "connection.status", "machine.command"],
-                "providers": [],
-                "agents": []
-            }
-        });
-
-        assert!(server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc").is_none());
     }
 
     #[test]

@@ -1,16 +1,24 @@
 window.JOI_RELEASE_DOWNLOADS = {
   "version": "0.1.0",
-  "gitSha": "56d539a",
-  "generatedAt": "2026-05-19T03:42:39Z",
-  "group": "joi-apps-releases-0-1-0-56d539a",
+  "gitSha": "96aec93",
+  "generatedAt": "2026-05-19T04:54:08Z",
+  "group": "joi-apps-releases-0-1-0-96aec93",
   "artifacts": [
     {
       "fileName": "SHA256SUMS",
       "label": "SHA256 checksums",
       "kind": "checksums",
-      "size": 677,
-      "sha256": "159be0e801cf55b1f9e676253a1cf9fccbd30524b492f37a8a5af8c27187c894",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/SHA256SUMS"
+      "size": 754,
+      "sha256": "dddd80241022ce2478a374df3c714464219d7db4554a90e56581ed97de99f292",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/SHA256SUMS"
+    },
+    {
+      "fileName": "install.sh",
+      "label": "Install script",
+      "kind": "installer",
+      "size": 6413,
+      "sha256": "f0c9be6eed4a065a5d61e0ef50de8715fff42795dfd2ce09f1ea115a638fca0b",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/install.sh"
     },
     {
       "fileName": "joi-gui-0.1.0-aarch64-apple-darwin.dmg",
@@ -18,55 +26,55 @@ window.JOI_RELEASE_DOWNLOADS = {
       "kind": "gui",
       "size": 25451139,
       "sha256": "291e6c44badd51811aec47a93578061c6c3c4b793cd7ff65230404bdbf55115c",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/joi-gui-0.1.0-aarch64-apple-darwin.dmg"
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/joi-gui-0.1.0-aarch64-apple-darwin.dmg"
     },
     {
       "fileName": "joi-runtime-0.1.0-aarch64-apple-darwin.tar.gz",
       "label": "aarch64-apple-darwin",
       "kind": "runtime",
-      "size": 7540280,
-      "sha256": "929e3e2ac42a7277169b821017edebd4e0eb2453482d592c896b315e0ebc4c7c",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/joi-runtime-0.1.0-aarch64-apple-darwin.tar.gz"
+      "size": 7540277,
+      "sha256": "4ae89cbc7c3a640c60dbbf7bdcc2c65b81504fe9cab43586d21c5bfdcfd6d1eb",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/joi-runtime-0.1.0-aarch64-apple-darwin.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-aarch64-unknown-linux-musl.tar.gz",
       "label": "aarch64-unknown-linux-musl",
       "kind": "runtime",
-      "size": 7851870,
-      "sha256": "5ef73adfc001067830f9af03a122f80332fa46e73535bc0ddc93aa57c40ea62d",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/joi-runtime-0.1.0-aarch64-unknown-linux-musl.tar.gz"
+      "size": 7851869,
+      "sha256": "b8f53acb33e8eafb6e7dac20c4f8e81b403c332e3b36a34f58e6e285ae04dd1d",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/joi-runtime-0.1.0-aarch64-unknown-linux-musl.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-universal-apple-darwin.tar.gz",
       "label": "universal-apple-darwin",
       "kind": "runtime",
-      "size": 15584037,
-      "sha256": "5cee5ff02f78efb38dc3edc463e17aba527657f4a07fde4640ad62534eb39533",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/joi-runtime-0.1.0-universal-apple-darwin.tar.gz"
+      "size": 15584022,
+      "sha256": "aa3231e79e7b5e317670021aff720570d5b8610425c790b364cc596e8c3a8206",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/joi-runtime-0.1.0-universal-apple-darwin.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-x86_64-apple-darwin.tar.gz",
       "label": "x86_64-apple-darwin",
       "kind": "runtime",
-      "size": 8045231,
-      "sha256": "68717e6f669bd867095dc5d1b5d16a0537ef8fc3a2fd5f6aa70f27508b5b844d",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/joi-runtime-0.1.0-x86_64-apple-darwin.tar.gz"
+      "size": 8045235,
+      "sha256": "365a7f88a9d46c874308a859c6cb05d3ae827f06c84b5f823903077939e57815",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/joi-runtime-0.1.0-x86_64-apple-darwin.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-x86_64-unknown-linux-musl.tar.gz",
       "label": "x86_64-unknown-linux-musl",
       "kind": "runtime",
-      "size": 8230721,
-      "sha256": "41fa72ae58ee11ec525e9c9b85365a308f8a82d6cc4692d3e6d195260d371c9c",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/joi-runtime-0.1.0-x86_64-unknown-linux-musl.tar.gz"
+      "size": 8230723,
+      "sha256": "facc71ce5402ad8910ec6d4679a54114cc1d2d17cae9b4d172b2461665024600",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/joi-runtime-0.1.0-x86_64-unknown-linux-musl.tar.gz"
     },
     {
       "fileName": "manifest.txt",
       "label": "Release manifest",
       "kind": "manifest",
-      "size": 385,
-      "sha256": "c1e29143d1e4d42a5f2353f38782bca69ec18fd1a7b632eeb808dbd9ec1e8b40",
-      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-56d539a/manifest.txt"
+      "size": 398,
+      "sha256": "9ef33484578de0981aa2180b52b844e5b4f04bdb9ff8c66cc0c8a5d4b7452d43",
+      "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-releases-0-1-0-96aec93/manifest.txt"
     }
   ]
 };

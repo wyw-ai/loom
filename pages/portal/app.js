@@ -502,7 +502,7 @@ function renderDownloads() {
     downloadGrid.innerHTML = `
       <article class="download-card">
         <b>No release uploaded yet</b>
-        <p>Run <code>scripts/package-release.sh</code> to build packages, upload them, and refresh this list.</p>
+        <p>Run <code>scripts/package-release.sh --upload</code> to build packages, upload them, and refresh this list.</p>
       </article>
     `;
     return;

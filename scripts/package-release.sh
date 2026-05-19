@@ -384,7 +384,7 @@ upload_artifacts() {
 import json
 import sys
 
-_, file_name, label, kind, size, sha, url = sys.argv
+_, uploads_json, file_name, label, kind, size, sha, url = sys.argv
 item = {
     "fileName": file_name,
     "label": label,
@@ -393,7 +393,7 @@ item = {
     "sha256": sha,
     "downloadUrl": url,
 }
-with open(sys.argv[1], "a", encoding="utf-8") as f:
+with open(uploads_json, "a", encoding="utf-8") as f:
     f.write("  ")
     json.dump(item, f, ensure_ascii=False)
 PY

@@ -15,7 +15,7 @@
     "command": "/bin/bash",
     "args": [
       "-lc",
-      "source ~/open-proxy >/dev/null && exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"",
+      "source ~/open-proxy >/dev/null; export PATH=/home/canfeng/canfeng-projects/.data/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.nvm/versions/node/v24.14.1/bin:/home/canfeng/.local/bin:$PATH; exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"",
       "joi-codex"
     ],
     "env": {

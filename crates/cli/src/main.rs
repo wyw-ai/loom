@@ -71,7 +71,11 @@ enum Cmd {
         /// Canonical destination target: #<channel_id> or #<channel_id>:<root_event_id>.
         #[arg(long)]
         target: Option<String>,
-        #[arg(long, default_value = "")]
+        /// Prompt prefix to place at the very beginning of the receiver's
+        /// final provider prompt for this handoff only.
+        #[arg(long = "handoff-prefix")]
+        handoff_prefix: Option<String>,
+        #[arg(long, short = 'm', default_value = "")]
         message: String,
     },
     /// Message commands using the canonical #channel/#channel:root-event/dm:actor grammar.
@@ -667,6 +671,10 @@ enum EventCmd {
         /// Add a `hands_off_to` relation pointing at this actor id.
         #[arg(long = "handoff")]
         handoff: Option<String>,
+        /// Prompt prefix to place at the very beginning of the handoff
+        /// receiver's final provider prompt for this event only.
+        #[arg(long = "handoff-prefix")]
+        handoff_prefix: Option<String>,
         /// Add one or more `attaches_artifact` relations targeting an artifact
         /// (`art_…` or `artifact://…`). May be repeated.
         #[arg(long = "artifact-link")]
@@ -1321,8 +1329,21 @@ async fn main() -> Result<()> {
             r#in,
             channel,
             target,
+            handoff_prefix,
             message,
-        } => cmd::handoff::run(client, cfg.actor_id, agent, r#in, channel, target, message).await?,
+        } => {
+            cmd::handoff::run(
+                client,
+                cfg.actor_id,
+                agent,
+                r#in,
+                channel,
+                target,
+                handoff_prefix,
+                message,
+            )
+            .await?
+        }
         Cmd::Message { sub } => match sub {
             MessageCmd::Send {
                 target,
@@ -1507,6 +1528,7 @@ async fn main() -> Result<()> {
                 stdin,
                 reply,
                 handoff,
+                handoff_prefix,
                 artifact_link,
             } => {
                 cmd::event::append(
@@ -1522,6 +1544,7 @@ async fn main() -> Result<()> {
                         stdin,
                         reply_to: reply,
                         handoff_to: handoff,
+                        handoff_prefix,
                         artifact_links: artifact_link,
                     },
                 )

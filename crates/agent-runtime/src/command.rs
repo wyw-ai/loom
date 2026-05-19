@@ -27,8 +27,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -40,6 +41,9 @@ use tokio::sync::mpsc;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 use crate::usage::extract_token_usage_from_text;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Per-scope handle to an in-flight subprocess. The PID is set after spawn
 /// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
@@ -71,6 +75,10 @@ pub struct CommandConfig {
     /// Where to keep `<actor>/<scope_id>.json` session bookkeeping files. The
     /// adapter creates subdirs lazily on first write.
     pub sessions_dir: PathBuf,
+    /// Optional per-turn wall-clock timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Optional per-turn stdout idle timeout in milliseconds.
+    pub idle_timeout_ms: Option<u64>,
     /// Hash of `command` + `args` template (pre-expansion) — when the spec
     /// changes the saved sessions are invalidated.
     pub command_signature: String,
@@ -108,6 +116,8 @@ impl CommandConfig {
             output_format: spec.output_format.unwrap_or_default(),
             prompt_via: spec.prompt_via,
             sessions_dir,
+            timeout_ms: spec.timeout_ms,
+            idle_timeout_ms: spec.idle_timeout_ms,
             command_signature,
         }
     }
@@ -193,9 +203,15 @@ impl Adapter for CommandAdapter {
         // Reset cancel flag for this scope's new prompt; old PID is already
         // gone (cleared after the previous wait).
         slot.lock().cancel_requested = false;
-        tokio::task::spawn_blocking(move || run_prompt(cfg, prompt, sender, slot))
-            .await
-            .map_err(|e| e.to_string())?
+        // Detach the command turn so the actor worker can keep processing
+        // other scopes while a long-running provider command is active. The
+        // blocking worker reports completion through AdapterEvent::Finished.
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = run_prompt(cfg, prompt, sender, slot) {
+                tracing::debug!(error = %e, "command run_prompt returned err (already reported via AdapterEvent)");
+            }
+        });
+        Ok(())
     }
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
@@ -243,7 +259,19 @@ impl Adapter for CommandAdapter {
 /// callers know cancel isn't wired there yet (joi-server's audience is Unix).
 #[cfg(unix)]
 fn signal_child(pid: u32) -> Result<(), String> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    signal_child_with(pid, libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn signal_child_with(pid: u32, signal: libc::c_int) -> Result<(), String> {
+    let rc = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    let rc = if rc == 0 {
+        rc
+    } else {
+        // Older processes may not have been spawned into their own process
+        // group. Fall back to the direct PID for compatibility.
+        unsafe { libc::kill(pid as libc::pid_t, signal) }
+    };
     if rc == 0 {
         Ok(())
     } else {
@@ -261,6 +289,16 @@ fn signal_child(pid: u32) -> Result<(), String> {
 #[cfg(not(unix))]
 fn signal_child(_pid: u32) -> Result<(), String> {
     Err("command transport cancel is not implemented for this platform".into())
+}
+
+#[cfg(unix)]
+fn force_kill_child(pid: u32) -> Result<(), String> {
+    signal_child_with(pid, libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn force_kill_child(_pid: u32) -> Result<(), String> {
+    Err("command transport timeout kill is not implemented for this platform".into())
 }
 
 fn run_prompt(
@@ -290,7 +328,7 @@ fn run_prompt(
     };
 
     let result = spawn_and_collect(&cfg, &prompt, &argv, &sender, &slot);
-    let outcome = match result {
+    let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
             let _ = sender.send(AdapterEvent::Error {
@@ -307,8 +345,33 @@ fn run_prompt(
         }
     };
 
+    let mut retried_as_first_run = false;
+    if !is_first_run && looks_like_session_lost(&outcome.stderr, &outcome.stdout) {
+        let _ = delete_session(&cfg, &scope);
+        tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
+            "command transport: dropped stale session and retrying first-run prompt");
+        let first_run_argv = expand_first_run_argv(&cfg, &prompt, &content);
+        outcome = match spawn_and_collect(&cfg, &prompt, &first_run_argv, &sender, &slot) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = sender.send(AdapterEvent::Error {
+                    scope: Some(scope.clone()),
+                    message: format!("command adapter retry spawn error: {e}"),
+                });
+                let _ = sender.send(AdapterEvent::Finished {
+                    scope: Some(scope.clone()),
+                    success: false,
+                    summary: e.clone(),
+                    usage: None,
+                });
+                return Err(e);
+            }
+        };
+        retried_as_first_run = true;
+    }
+
     // First-run capture: try once, save to disk on success.
-    if is_first_run && outcome.exit_code == 0 {
+    if (is_first_run || retried_as_first_run) && outcome.exit_code == 0 {
         if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
@@ -317,7 +380,10 @@ fn run_prompt(
                     }
                 }
                 Ok(None) => {
+                    let stdout = truncate_for_summary(&outcome.stdout);
+                    let stderr = truncate_for_summary(&outcome.stderr);
                     tracing::warn!(actor = %cfg.actor_id, rule = %rule,
+                        stdout = %stdout, stderr = %stderr,
                         "command transport: first_run_capture matched no session id");
                 }
                 Err(e) => {
@@ -326,7 +392,7 @@ fn run_prompt(
                 }
             }
         }
-    } else if outcome.exit_code != 0 && looks_like_session_lost(&outcome.stderr) {
+    } else if outcome.exit_code != 0 && looks_like_session_lost(&outcome.stderr, &outcome.stdout) {
         // Resume failed in a way that suggests the underlying session is gone.
         // Drop the bookkeeping so the next call retries as a first run. We do
         // NOT auto-retry inside this call — the user's prompt has already been
@@ -335,7 +401,7 @@ fn run_prompt(
         let _ = delete_session(&cfg, &scope);
         tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
             "command transport: dropped stale session after resume failure");
-    } else if !is_first_run && outcome.exit_code == 0 {
+    } else if !is_first_run && !retried_as_first_run && outcome.exit_code == 0 {
         if let Some(sid) = resume_session_id.as_deref() {
             if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to update command session");
@@ -384,6 +450,7 @@ fn spawn_and_collect(
     if matches!(cfg.prompt_via, PromptVia::Env) {
         cmd.env("JOI_PROMPT", &prompt.content);
     }
+    configure_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))?;
@@ -413,8 +480,25 @@ fn spawn_and_collect(
     let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
     let stderr = child.stderr.take().ok_or("failed to open child stderr")?;
 
-    // Stream stdout in a foreground loop so we can translate it live; collect
-    // stderr on a thread purely so it doesn't fill its pipe and deadlock.
+    // Stream stdout on a helper thread so the foreground loop can enforce a
+    // hard timeout even if the child is silent or never closes stdout.
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<String>();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = stdout_tx.send(line.clone());
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    // Collect stderr on a thread purely so it doesn't fill its pipe and
+    // deadlock the child.
     let stderr_handle = std::thread::spawn(move || {
         let mut buf = String::new();
         let mut r = BufReader::new(stderr);
@@ -423,47 +507,93 @@ fn spawn_and_collect(
     });
 
     let mut collected_stdout = String::new();
-    match cfg.output_format {
-        CommandOutputFormat::Text => {
-            let mut r = BufReader::new(stdout);
-            let _ = r.read_to_string(&mut collected_stdout);
+    let deadline = cfg
+        .timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let idle_timeout = cfg
+        .idle_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis);
+    let mut last_stdout_at = Instant::now();
+    let mut exit: Option<ExitStatus> = None;
+    let mut timed_out = false;
+    let mut idle_timed_out = false;
+
+    loop {
+        while let Ok(line) = stdout_rx.try_recv() {
+            last_stdout_at = Instant::now();
+            collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
         }
-        CommandOutputFormat::NdjsonLines => {
-            let r = BufReader::new(stdout);
-            for line in r.lines().map_while(Result::ok) {
-                collected_stdout.push_str(&line);
-                collected_stdout.push('\n');
-                translate_ndjson_line(&line, &prompt.scope, sender);
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to poll child: {e}"))?
+        {
+            exit = Some(status);
+            break;
+        }
+
+        if slot.lock().cancel_requested {
+            let _ = signal_child(child.id());
+        }
+
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
             }
         }
-        CommandOutputFormat::ClaudeStreamJson => {
-            let r = BufReader::new(stdout);
-            for line in r.lines().map_while(Result::ok) {
-                collected_stdout.push_str(&line);
-                collected_stdout.push('\n');
-                translate_claude_stream_line(&line, &prompt.scope, sender);
+
+        if let Some(idle_timeout) = idle_timeout {
+            if last_stdout_at.elapsed() >= idle_timeout {
+                idle_timed_out = true;
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
             }
         }
-        CommandOutputFormat::CopilotJson => {
-            let r = BufReader::new(stdout);
-            for line in r.lines().map_while(Result::ok) {
-                collected_stdout.push_str(&line);
-                collected_stdout.push('\n');
+
+        let wait_for = deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50))
+            })
+            .into_iter()
+            .chain(idle_timeout.map(|idle_timeout| {
+                idle_timeout
+                    .saturating_sub(last_stdout_at.elapsed())
+                    .min(Duration::from_millis(50))
+            }))
+            .min()
+            .unwrap_or_else(|| Duration::from_millis(50));
+        match stdout_rx.recv_timeout(wait_for) {
+            Ok(line) => {
+                last_stdout_at = Instant::now();
+                collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout)
             }
-        }
-        CommandOutputFormat::CodexStreamJson => {
-            let r = BufReader::new(stdout);
-            for line in r.lines().map_while(Result::ok) {
-                collected_stdout.push_str(&line);
-                collected_stdout.push('\n');
-                translate_codex_event_line(&line, &prompt.scope, sender);
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
 
-    let exit = child
-        .wait()
-        .map_err(|e| format!("failed to wait on child: {e}"))?;
+    let exit = match exit {
+        Some(status) => status,
+        None => child
+            .wait()
+            .map_err(|e| format!("failed to wait on child: {e}"))?,
+    };
+    let _ = stdout_handle.join();
+    for line in stdout_rx.try_iter() {
+        collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+    }
     let collected_stderr = stderr_handle.join().unwrap_or_default();
     let exit_code = exit.code().unwrap_or(-1);
     // Snapshot + clear the cancel flag now that the child is reaped, before
@@ -480,9 +610,19 @@ fn spawn_and_collect(
     // already pushed partial Text frames inline; we only need the final flush
     // + Finished here. The Text format never pushed anything, so we emit the
     // whole stdout as a single Text and then Finished.
-    let success = exit_code == 0 && !was_cancelled;
+    let success = exit_code == 0 && !was_cancelled && !timed_out && !idle_timed_out;
     let summary = if was_cancelled {
         "cancelled".into()
+    } else if timed_out {
+        match cfg.timeout_ms {
+            Some(ms) => format!("timed out after {ms}ms"),
+            None => "timed out".into(),
+        }
+    } else if idle_timed_out {
+        match cfg.idle_timeout_ms {
+            Some(ms) => format!("idle timed out after {ms}ms"),
+            None => "idle timed out".into(),
+        }
     } else if success {
         String::new()
     } else if !collected_stderr.is_empty() {
@@ -544,6 +684,37 @@ fn spawn_and_collect(
         stdout: collected_stdout,
         stderr: collected_stderr,
     })
+}
+
+#[cfg(unix)]
+fn configure_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_cmd: &mut Command) {}
+
+fn collect_stdout_line(
+    cfg: &CommandConfig,
+    prompt: &AdapterPrompt,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+    line: &str,
+    collected_stdout: &mut String,
+) {
+    collected_stdout.push_str(line);
+    let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
+    match cfg.output_format {
+        CommandOutputFormat::NdjsonLines => {
+            translate_ndjson_line(parsed_line, &prompt.scope, sender);
+        }
+        CommandOutputFormat::ClaudeStreamJson => {
+            translate_claude_stream_line(parsed_line, &prompt.scope, sender);
+        }
+        CommandOutputFormat::CodexStreamJson => {
+            translate_codex_event_line(parsed_line, &prompt.scope, sender);
+        }
+        CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => {}
+    }
 }
 
 fn truncate_for_summary(s: &str) -> String {
@@ -951,11 +1122,12 @@ fn delete_session(cfg: &CommandConfig, scope: &ScopeRef) -> std::io::Result<()> 
     Ok(())
 }
 
-fn looks_like_session_lost(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
+fn looks_like_session_lost(stderr: &str, stdout: &str) -> bool {
+    let s = format!("{stderr}\n{stdout}").to_ascii_lowercase();
     s.contains("session not found")
         || s.contains("unknown session")
         || s.contains("no such session")
+        || s.contains("no conversation found with session id")
 }
 
 // ---------------- first_run_capture ----------------
@@ -1214,6 +1386,8 @@ mod tests {
             output_format: CommandOutputFormat::Text,
             prompt_via: PromptVia::Args,
             sessions_dir: PathBuf::from("/tmp/joi-test-sessions"),
+            timeout_ms: None,
+            idle_timeout_ms: None,
             command_signature: "sha256:test".into(),
         }
     }
@@ -1498,11 +1672,88 @@ mod tests {
         assert_eq!(outcome.stdout.trim(), "stdin-closed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_running_child_and_reports_failed_turn() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "sleep 30".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.timeout_ms = Some(100);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let started = std::time::Instant::now();
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timeout did not reap the child promptly"
+        );
+        assert_ne!(outcome.exit_code, 0);
+
+        let mut got_timeout = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(!success);
+                assert_eq!(summary, "timed out after 100ms");
+                got_timeout = true;
+                break;
+            }
+        }
+        assert!(got_timeout, "missing timeout Finished event");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_timeout_kills_quiet_child_and_reports_failed_turn() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "echo started; sleep 30".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.idle_timeout_ms = Some(100);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let started = std::time::Instant::now();
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "idle timeout did not reap the child promptly"
+        );
+        assert_ne!(outcome.exit_code, 0);
+        assert!(outcome.stdout.contains("started"));
+
+        let mut got_idle_timeout = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(!success);
+                assert_eq!(summary, "idle timed out after 100ms");
+                got_idle_timeout = true;
+                break;
+            }
+        }
+        assert!(got_idle_timeout, "missing idle timeout Finished event");
+    }
+
     #[test]
     fn looks_like_session_lost_matches_common_phrases() {
-        assert!(looks_like_session_lost("error: Session not found"));
-        assert!(looks_like_session_lost("UNKNOWN session abc"));
-        assert!(!looks_like_session_lost("everything is fine"));
+        assert!(looks_like_session_lost("error: Session not found", ""));
+        assert!(looks_like_session_lost("UNKNOWN session abc", ""));
+        assert!(looks_like_session_lost(
+            "",
+            r#"{"errors":["No conversation found with session ID: abc"]}"#
+        ));
+        assert!(!looks_like_session_lost("everything is fine", ""));
     }
 
     #[test]
@@ -1592,6 +1843,62 @@ mod tests {
     /// Spawning a long-lived child and cancelling it should reap quickly with
     /// the cancelled label set, instead of waiting for the natural exit.
     /// Unix-only because `signal_child` is gated on cfg(unix).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_prompt_returns_before_command_finishes() {
+        let mut cfg = cfg();
+        cfg.command = "sleep".into();
+        cfg.args = vec!["30".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            adapter.send_prompt(prompt("ignored")),
+        )
+        .await
+        .expect("send_prompt should return promptly")
+        .expect("send_prompt ok");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "send_prompt blocked on the child command"
+        );
+
+        let scope = scope();
+        let slot = adapter.slot_for(&scope.id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if slot.lock().pid.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never registered a PID"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        adapter.cancel(scope).await.expect("cancel");
+
+        let mut got_cancelled = false;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(!success);
+                assert_eq!(summary, "cancelled");
+                got_cancelled = true;
+                break;
+            }
+        }
+        assert!(got_cancelled, "did not receive cancelled Finished event");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_kills_running_child_and_labels_summary() {

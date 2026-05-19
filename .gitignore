@@ -2,9 +2,11 @@
 /data/journal.jsonl
 /data/artifacts/
 /dist/
+/pages/build/
 .idea
 .DS_Store
 /.claude/
+/.agents/
 /.am/
 __pycache__/
 

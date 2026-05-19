@@ -59,16 +59,26 @@ export const useChannels = create<ChannelsState>((set) => ({
     set((s) => ({
       threadsByChannel: {
         ...s.threadsByChannel,
-        [channelId]: sortByTitle(threads),
+        [channelId]: sortByTitle(threads.filter((t) => !t.archivedAt)),
       },
     })),
   replaceArchivedThreads: (channelId, threads) =>
-    set((s) => ({
-      archivedThreadsByChannel: {
-        ...s.archivedThreadsByChannel,
-        [channelId]: sortByArchivedTime(threads),
-      },
-    })),
+    set((s) => {
+      const archived = threads.filter((t) => t.archivedAt);
+      const archivedIds = new Set(archived.map((t) => t.id));
+      return {
+        threadsByChannel: {
+          ...s.threadsByChannel,
+          [channelId]: (s.threadsByChannel[channelId] ?? []).filter(
+            (t) => !archivedIds.has(t.id),
+          ),
+        },
+        archivedThreadsByChannel: {
+          ...s.archivedThreadsByChannel,
+          [channelId]: sortByArchivedTime(archived),
+        },
+      };
+    }),
   upsertThread: (t) =>
     set((s) => {
       const active = (s.threadsByChannel[t.channelId] ?? []).filter(

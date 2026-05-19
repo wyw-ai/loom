@@ -53,10 +53,9 @@ jobs:
             echo "tag ${TAG} does not match Cargo.toml version ${CARGO_VERSION}" >&2
             exit 1
           fi
-          DOWNLOAD_BASE_URL="https://git.cn-hangzhou.oss-cdn.aliyun-inc.com/joi-apps/${TAG}" \
-          PORTAL_DOWNLOAD_BASE_URL="https://git.cn-hangzhou.oss-cdn.aliyun-inc.com/joi-apps/latest" \
+          OSS_GROUP="joi-apps-latest" \
           PORTAL_RELEASE_DATA="dist/packages/release-downloads.js" \
-            scripts/package-release.sh --write-release-data --out-dir dist/packages
+            scripts/package-release.sh --upload --out-dir dist/packages
       - id: verify
         run: |
           set -euo pipefail
@@ -66,21 +65,3 @@ jobs:
           dist/packages/install.sh --dry-run --target x86_64-unknown-linux-musl --module joi-server -y
           hdiutil verify "dist/packages/joi-gui-${VERSION}-aarch64-apple-darwin.dmg"
           codesign --verify --deep --strict --verbose=2 "target/aarch64-apple-darwin/release/bundle/macos/Joi Desktop.app"
-      - uses: upload-oss
-        inputs:
-          path: dist/packages/*
-          region: cn-hangzhou
-          oss-bucket: ${{secrets.OSS_BUCKET}}
-          oss-endpoint: ${{secrets.OSS_ENDPOINT}}
-          access-key-id: ${{secrets.OSS_ACCESS_KEY_ID}}
-          access-key-secret: ${{secrets.OSS_ACCESS_KEY_SECRET}}
-          storage-path: joi-apps/${{git.tag}}/
-      - uses: upload-oss
-        inputs:
-          path: dist/packages/*
-          region: cn-hangzhou
-          oss-bucket: ${{secrets.OSS_BUCKET}}
-          oss-endpoint: ${{secrets.OSS_ENDPOINT}}
-          access-key-id: ${{secrets.OSS_ACCESS_KEY_ID}}
-          access-key-secret: ${{secrets.OSS_ACCESS_KEY_SECRET}}
-          storage-path: joi-apps/latest/

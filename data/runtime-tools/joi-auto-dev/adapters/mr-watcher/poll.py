@@ -95,6 +95,10 @@ def run_json(cmd: list[str], *, cwd: str | None = None) -> Any:
     return json.loads(proc.stdout)
 
 
+def joi_cmd(*args: str) -> list[str]:
+    return [JOI_BIN, "--server", JOI_SERVER, "--json", *args]
+
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -190,12 +194,12 @@ def save_state(state: dict[str, MrWatch]) -> None:
 
 
 def list_threads() -> list[dict[str, Any]]:
-    data = run_json(["joi", "--json", "thread", "list"])
+    data = run_json(joi_cmd("thread", "list"))
     return data.get("threads") or []
 
 
 def list_events(thread_id: str, limit: int = EVENT_SCAN_LIMIT) -> list[dict[str, Any]]:
-    data = run_json(["joi", "--json", "event", "list", "--in", thread_id, "--limit", str(limit)])
+    data = run_json(joi_cmd("event", "list", "--in", thread_id, "--limit", str(limit)))
     return data.get("events") or []
 
 
@@ -388,10 +392,7 @@ def append_event(
     event_type: str, thread_id: str, text: str, *, handoff: str | None, payload: dict[str, Any], mr_urls: list[str] | None = None
 ) -> None:
     cmd = [
-        JOI_BIN,
-        "--server",
-        JOI_SERVER,
-        "--json",
+        *joi_cmd(),
         "--as",
         ACTOR_ID,
         "event",

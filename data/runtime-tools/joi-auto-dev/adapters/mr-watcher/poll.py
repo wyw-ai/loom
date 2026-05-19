@@ -15,6 +15,7 @@ from typing import Any
 
 POLL_INTERVAL = int(os.environ.get("MR_WATCHER_INTERVAL", "60"))
 JOI_SERVER = os.environ.get("JOI_SERVER", "ws://127.0.0.1:7878/rpc")
+JOI_BIN = os.environ.get("JOI_BIN", "joi")
 ACTOR_ID = os.environ.get("MR_WATCHER_ACTOR_ID", "mr-watcher")
 STATE_DIR = Path(os.environ.get("MR_WATCHER_STATE_DIR", str(Path.home() / ".local/state/joi-agent/mr-watcher")))
 STATE_FILE = STATE_DIR / "state.json"
@@ -22,12 +23,6 @@ TERMINAL_FILE = STATE_DIR / "terminal.json"
 CURRENT_RUN_GROUP_MAX_ID_GAP = int(os.environ.get("MR_WATCHER_CURRENT_RUN_GROUP_MAX_ID_GAP", "1000"))
 COMPENSATION_SECONDS = int(os.environ.get("MR_WATCHER_COMPENSATION_SECONDS", "1800"))
 QUIET_SECONDS = int(os.environ.get("MR_WATCHER_QUIET_SECONDS", "300"))
-JOI_RPC_HELPER = Path(
-    os.environ.get(
-        "JOI_RPC_HELPER",
-        str(Path(__file__).resolve().parents[2] / "dev-helper-bridge" / "joi_rpc.py"),
-    )
-)
 EVENT_SCAN_LIMIT = int(os.environ.get("MR_WATCHER_EVENT_SCAN_LIMIT", "120"))
 
 DELIVERY_SELF_USERNAMES = {
@@ -89,8 +84,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def run(cmd: list[str], *, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, capture_output=True, cwd=cwd, check=False)
+def run(cmd: list[str], *, cwd: str | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, input=input_text, capture_output=True, cwd=cwd, check=False)
 
 
 def run_json(cmd: list[str], *, cwd: str | None = None) -> Any:
@@ -393,21 +388,25 @@ def append_event(
     event_type: str, thread_id: str, text: str, *, handoff: str | None, payload: dict[str, Any], mr_urls: list[str] | None = None
 ) -> None:
     cmd = [
-        "python3",
-        str(JOI_RPC_HELPER),
-        "append",
-        "--scope-kind",
-        "thread",
-        "--scope-id",
-        thread_id,
-        "--actor-id",
+        JOI_BIN,
+        "--server",
+        JOI_SERVER,
+        "--json",
+        "--as",
         ACTOR_ID,
-        "--text",
-        text,
+        "event",
+        "append",
+        "--in",
+        thread_id,
+        "--type",
+        event_type,
+        "--content-type",
+        "text/markdown",
+        "--stdin",
     ]
     if handoff:
         cmd += ["--handoff", handoff]
-    proc = run(cmd)
+    proc = run(cmd, input_text=text)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout).strip() or f"append failed for {thread_id}")
     # Follow the helper with a structured JSON line for debugging/log shipping.

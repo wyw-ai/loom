@@ -27,6 +27,7 @@ under:
 | `a1-bug-triage` | `actor_a1_bug_triage` | Claude | A1 feedback triage |
 | `router` | `actor_router` | Claude | Human-facing routing and orchestration |
 | `discovery` | `actor_discovery` | Claude | Task discovery, repo analysis, delivery handoff |
+| `examiner` | `actor_examiner` | Claude | Spec/MR/design/terminal quality review |
 | `delivery` | `actor_delivery` | Claude | Implementation, MR, review/CI handling |
 | `classmaster` | `actor_classmaster` | Codex | Classroom training control plane |
 | `teacher` | `actor_teacher` | Codex | Training homework/grading/profile patch authoring |

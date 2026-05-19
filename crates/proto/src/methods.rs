@@ -601,6 +601,21 @@ mod tests {
             ClaudeSettingsMode::ActorProfile
         );
     }
+
+    #[test]
+    fn command_transport_deserializes_turn_timeouts() {
+        let transport: AgentTransport = serde_json::from_str(
+            r#"{
+                "kind": "command",
+                "command": "claude",
+                "timeoutMs": 7200000,
+                "idleTimeoutMs": 1200000
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(transport.timeout_ms, Some(7_200_000));
+        assert_eq!(transport.idle_timeout_ms, Some(1_200_000));
+    }
 }
 
 // ---- turn/trace.append (external client → server) ----
@@ -1124,6 +1139,21 @@ pub struct AgentTransport {
     /// (appended after `args` as the final argv token).
     #[serde(default, rename = "promptVia")]
     pub prompt_via: PromptVia,
+    /// Optional hard timeout for one command-transport turn. When exceeded the
+    /// daemon cancels the subprocess and fails the turn so later handoffs can
+    /// drain instead of being stranded behind a hung CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
+    /// Optional idle timeout for one command-transport turn. The timer resets
+    /// whenever the subprocess emits stdout. This catches provider CLIs that
+    /// have already produced their last useful stream event but remain alive
+    /// because one of their tool subprocesses leaked.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "idleTimeoutMs"
+    )]
+    pub idle_timeout_ms: Option<u64>,
 
     // ---- interactive_command only; ignored by other transports ----
     #[serde(default, skip_serializing_if = "Option::is_none")]

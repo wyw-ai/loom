@@ -210,7 +210,7 @@ gui-dev:
 gui-release:
 	cd crates/gui && $(CARGO) tauri build
 
-gui-dmg-mac-arm:
+gui-dmg-mac-arm: mac-arm-release
 	cd crates/gui && $(CARGO) tauri build --target $(TRIPLE_MAC_ARM) --bundles dmg --ci
 
 gui-clean:

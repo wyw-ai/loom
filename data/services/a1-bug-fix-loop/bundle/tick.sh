@@ -11,8 +11,8 @@
 #      "fixed"; tracked bugs whose MR / feedback reached a non-fixed terminal
 #      state (closed, withdrawn, not-a-bug, already-covered) become "closed".
 #   3. If concurrency budget allows, pick the next "pending" bug,
-#      create a bugfix thread (joi thread create), bootstrap repos,
-#      handoff to actor_a1_bug_triage, persist tracking row.
+#      create a bugfix thread and handoff router. Router must drive
+#      discovery -> examiner spec_review -> delivery, not discovery -> delivery directly.
 #   4. If no pending bug exists and the scanner thread is stale (>=24h),
 #      handoff feedback-scanner inside the resident scanner thread.
 #   5. Emit one bug-fix-loop-status.v1 line (the running ledger).
@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/bin:$HOME/.nvm/versions/node/v24.14.1/bin:$HOME/joi-apps:$HOME/canfeng-projects/a1/a1:$PATH"
 
 DRY_RUN=0
 STATE_DIR=""
@@ -64,6 +64,11 @@ command -v jq >/dev/null 2>&1 || { echo "tick.sh: jq is required" >&2; exit 3; }
 mkdir -p "$STATE_DIR"
 STATE_FILE="$STATE_DIR/state.json"
 [[ -f "$STATE_FILE" ]] || echo '{"tracking":{}}' > "$STATE_FILE"
+
+LOCK_FILE="$STATE_DIR/loop.lock"
+exec 9>"$LOCK_FILE"
+flock 9
+
 QUEUE_DIR="${FEEDBACK_QUEUE_DIR:-$FEEDBACK_TRIAGE_STATE_DIR/feedback-queues/thread-$SCANNER_TID}"
 BUGS_FILE="$QUEUE_DIR/bugs.json"
 QUEUE_META_FILE="$QUEUE_DIR/scan-meta.json"
@@ -244,6 +249,70 @@ find_delivery_thread_for_feedback() {
 
     list=$(joi thread archive-list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
     find_in_thread_json <<<"$list"
+}
+
+find_bugfix_thread_for_feedback() {
+    local fid="$1" list found
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    joi_avail || return 0
+
+    find_in_thread_json() {
+      jq -r --arg fid "$fid" '
+      (.threads // .items // .)[]?
+      | (.title // .name // "") as $title
+      | select($title == ("bugfix-" + $fid) or ($title | startswith("[bugfix:" + $fid + "]")))
+      | (.id // .thread_id // .thread.id // empty)
+    ' 2>/dev/null | head -n 1
+    }
+
+    list=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    found=$(find_in_thread_json <<<"$list")
+    if [[ -n "$found" ]]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+
+    list=$(joi thread archive-list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    find_in_thread_json <<<"$list"
+}
+
+find_discovery_thread_for_feedback() {
+    local fid="$1" list found
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    joi_avail || return 0
+
+    find_in_thread_json() {
+      jq -r --arg fid "$fid" '
+      (.threads // .items // .)[]?
+      | (.title // .name // "") as $title
+      | select($title | startswith("[discovery] bugfix " + $fid + ":"))
+      | (.id // .thread_id // .thread.id // empty)
+    ' 2>/dev/null | head -n 1
+    }
+
+    list=$(joi thread list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    found=$(find_in_thread_json <<<"$list")
+    if [[ -n "$found" ]]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+
+    list=$(joi thread archive-list --channel "$CHANNEL_ID" --json 2>/dev/null) || list=""
+    find_in_thread_json <<<"$list"
+}
+
+archive_task_threads() {
+    local fid="$1" discovery_tid="${2:-}" bf_tid="${3:-}" delivery_tid="${4:-}"
+    [[ "$DRY_RUN" -eq 0 ]] || return 0
+    joi_avail || return 0
+    if [[ -z "$discovery_tid" || "$discovery_tid" == "null" ]]; then
+        discovery_tid=$(find_discovery_thread_for_feedback "$fid" || true)
+    fi
+    [[ -n "$discovery_tid" && "$discovery_tid" != "null" ]] && joi thread archive "$discovery_tid" >/dev/null 2>&1 || true
+    [[ -n "$bf_tid" && "$bf_tid" != "null" && "$bf_tid" != "$discovery_tid" ]] && joi thread archive "$bf_tid" >/dev/null 2>&1 || true
+    if [[ -n "$delivery_tid" && "$delivery_tid" != "null" && "$delivery_tid" != "$bf_tid" && "$delivery_tid" != "$discovery_tid" ]]; then
+        joi thread archive "$delivery_tid" >/dev/null 2>&1 || true
+    fi
 }
 
 mr_is_merged() {
@@ -479,6 +548,7 @@ bugs=$(fetch_bugs)
 for fid in $(jq -r 'keys[]' <<<"$tracking"); do
     cur_status=$(jq -r --arg k "$fid" '.[$k].fix_status' <<<"$tracking")
     [[ "$cur_status" != "in_progress" ]] && continue
+    discovery_tid=$(jq -r --arg k "$fid" '.[$k].discovery_thread_id // ""' <<<"$tracking")
     bf_tid=$(jq -r --arg k "$fid" '.[$k].bugfix_thread_id // ""' <<<"$tracking")
     delivery_tid=$(jq -r --arg k "$fid" '.[$k].delivery_thread_id // ""' <<<"$tracking")
     if [[ -z "$delivery_tid" || "$delivery_tid" == "null" ]]; then
@@ -496,10 +566,12 @@ for fid in $(jq -r 'keys[]' <<<"$tracking"); do
         tracking=$(jq -c --arg k "$fid" --arg ts "$TICK_AT" --arg close_result "${close_result:-skipped}" \
             '.[$k].fix_status = "fixed"
              | .[$k].fixed_at = $ts
+             | .[$k].archived_at = $ts
              | .[$k].feedback_closed_at = $ts
              | .[$k].feedback_close_result = $close_result' <<<"$tracking")
+        archive_task_threads "$fid" "${discovery_tid:-}" "$bf_tid" "${delivery_tid:-}"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按 MR 终态收口：已回评并更新为 Fixed（result=${close_result:-skipped}）。" >/dev/null 2>&1 || true
+            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按 MR 终态收口：已回评并更新为 Fixed（result=${close_result:-skipped}），并已按产生顺序归档 discovery/bugfix/delivery thread。" >/dev/null 2>&1 || true
         fi
     elif [[ "$(mr_is_final_closed "$bf_tid")" == "true" || "$(mr_is_final_closed "$terminal_tid")" == "true" || "$(feedback_is_nonfixed_terminal "$fid")" == "true" ]]; then
         outcome=$(extract_nonfixed_outcome "$terminal_tid" || true)
@@ -525,8 +597,9 @@ for fid in $(jq -r 'keys[]' <<<"$tracking"); do
              | .[$k].archived_at = $ts
              | .[$k].feedback_closed_at = $ts
              | .[$k].feedback_close_result = $close_result' <<<"$tracking")
+        archive_task_threads "$fid" "${discovery_tid:-}" "$bf_tid" "${delivery_tid:-}"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按非 Fixed 终态归档：outcome=${outcome}（result=${close_result:-skipped}），继续处理下一条队列。" >/dev/null 2>&1 || true
+            joi say --as svc_a1_bug_fix_loop --in "$SCANNER_TID" "[bug-fix-loop] feedback $fid 已按非 Fixed 终态归档：outcome=${outcome}（result=${close_result:-skipped}），并已按产生顺序归档 discovery/bugfix/delivery thread，继续处理下一条队列。" >/dev/null 2>&1 || true
         fi
     fi
 done
@@ -551,21 +624,26 @@ if [[ $budget -gt 0 ]]; then
 
         bf_tid="(dry-run-thread)"
         if [[ "$DRY_RUN" -eq 0 ]] && joi_avail; then
-            root_event=""
-            if anchor=$(joi event append --as svc_a1_bug_fix_loop --channel --in "$CHANNEL_ID" \
-                --type thread.opened --text "anchor: bugfix-$fid" --json 2>/dev/null); then
-                root_event=$(jq -r '.event.id // ""' <<<"$anchor")
-            fi
-            if [[ -n "$root_event" ]] && out=$(joi thread create --channel "$CHANNEL_ID" \
-                --root-event "$root_event" --title "bugfix-$fid" --json 2>/dev/null); then
-                bf_tid=$(jq -r '.thread.id // .thread_id // .id // ""' <<<"$out")
+            existing_tid=$(find_bugfix_thread_for_feedback "$fid" || true)
+            if [[ -n "$existing_tid" ]]; then
+                bf_tid="$existing_tid"
+            else
+                root_event=""
+                if anchor=$(joi event append --as svc_a1_bug_fix_loop --channel --in "$CHANNEL_ID" \
+                    --type thread.opened --text "anchor: bugfix-$fid" --json 2>/dev/null); then
+                    root_event=$(jq -r '.event.id // ""' <<<"$anchor")
+                fi
+                if [[ -n "$root_event" ]] && out=$(joi thread create --channel "$CHANNEL_ID" \
+                    --root-event "$root_event" --title "bugfix-$fid" --json 2>/dev/null); then
+                    bf_tid=$(jq -r '.thread.id // .thread_id // .id // ""' <<<"$out")
+                fi
             fi
             if [[ -n "$bf_tid" && "$bf_tid" != "(dry-run-thread)" ]]; then
                 joi handoff --as svc_a1_bug_fix_loop actor_router --in "$bf_tid" \
                     --message "bugfix-loop next：feedback_id=${fid}
 title=${title}
 summary=${summary}
-请按存量 bug 修复闭环推进：先让 discovery 产出 task-goal/DoD/clone-manifest，再新建/启动 delivery，后续 MR watcher 终态由 delivery 回评并更新 feedback 状态；loop 只负责监工和归档。" >/dev/null 2>&1 || true
+请按存量 bug 修复闭环推进：router 先 handoff discovery 产出 task-goal/DoD/clone-manifest；discovery 必须 [discovery-ready] 回 router；router 再启动 actor_examiner gate=spec_review；只有 spec_review 通过后，router 才要求 discovery 创建/provision delivery 并 handoff actor_delivery。后续 MR watcher 终态由 delivery 回评并更新 feedback 状态；loop 只负责监工和归档。" >/dev/null 2>&1 || true
             fi
             if a1_avail; then
                 a1 feedback claim "$fid" --note "已进入 bug-fix loop：$bf_tid" >/dev/null 2>&1 || true
@@ -584,11 +662,11 @@ summary=${summary}
     done < <(jq -c '.[]' <<<"$bugs")
 fi
 
-# 4. persist + emit status
-state=$(jq -c --argjson t "$tracking" '.tracking = $t' <<<"$state")
-tmp=$(mktemp); printf '%s' "$state" >"$tmp"; mv "$tmp" "$STATE_FILE"
-
-jq -nc \
+# 4. persist + emit status only when the logical queue state changes.
+# Scheduler cursorBy=body_hash hashes the full stdout body, so including
+# tick_at/tick_id in every no-op heartbeat makes every tick look new and
+# buries real desk messages behind status.update events.
+status_payload=$(jq -nc \
   --arg sv "1" \
   --arg producer "service_a1_bug_fix_loop" \
   --arg tick_id "$TICK_ID" \
@@ -605,4 +683,12 @@ jq -nc \
     fixed_total: ([$tracking[] | select(.fix_status=="fixed")] | length),
     closed_total: ([$tracking[] | select(.fix_status=="closed")] | length),
     tracking: $tracking
-  }'
+  }')
+status_signature=$(jq -c 'del(.tick_id, .tick_at)' <<<"$status_payload" | sha256sum | awk '{print $1}')
+last_status_signature=$(jq -r '.last_status_signature // ""' <<<"$state")
+state=$(jq -c --argjson t "$tracking" --arg sig "$status_signature" '.tracking = $t | .last_status_signature = $sig' <<<"$state")
+tmp=$(mktemp); printf '%s' "$state" >"$tmp"; mv "$tmp" "$STATE_FILE"
+
+if [[ "$status_signature" != "$last_status_signature" ]]; then
+  printf '%s\n' "$status_payload"
+fi

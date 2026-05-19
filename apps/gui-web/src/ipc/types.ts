@@ -300,6 +300,8 @@ export interface AgentProviderSummary {
 }
 
 export interface MachineInfo {
+  workspaceId?: string | null;
+  ownerActorId?: string | null;
   id: string;
   name: string;
   kind: string;

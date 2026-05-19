@@ -18,6 +18,7 @@ pub async fn run(
     scope_id: Option<String>,
     is_channel: bool,
     target_scope: Option<String>,
+    handoff_prefix: Option<String>,
     message: String,
 ) -> Result<()> {
     let target = match target_actor_id {
@@ -74,15 +75,17 @@ pub async fn run(
             _meta: None,
         });
     }
-    let payload = json!({
-        "event": {
-            "type": "content.add",
-            "actorId": actor_id,
-            "scope": scope,
-            "payload": { "contentType": "text/markdown", "text": message },
-            "relations": relations,
-        }
+    let mut event = json!({
+        "type": "content.add",
+        "actorId": actor_id,
+        "scope": scope,
+        "payload": { "contentType": "text/markdown", "text": message },
+        "relations": relations,
     });
+    if let Some(prefix) = handoff_prefix.filter(|prefix| !prefix.is_empty()) {
+        event["_meta"] = json!({ "handoffPromptPrefix": prefix });
+    }
+    let payload = json!({ "event": event });
     let res: EventAppendResult = client.call(method::EVENT_APPEND, payload).await?;
     if render::is_json() {
         render::print_json(&res);

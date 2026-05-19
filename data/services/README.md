@@ -19,7 +19,7 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
 | `mr-detector`     | scheduler   | thread-bound  | cron + 自我完成      | `mr-event-*.json`（artifact-contracts §6） |
 | `a1-bug-fix-loop` | scheduler   | thread-bound on `bug-scan-desk` | cron `*/5 * * * *`  | bugfix loop status artifact |
 | `feedback-scanner` | scheduler  | channel-level | remote-managed placeholder | feedback scanner service actor |
-| `mr-watcher`      | scheduler   | channel-level | remote-managed placeholder | MR watcher service actor |
+| `mr-watcher`      | scheduler   | thread-bound  | per delivery thread `poll.py --thread-id` | MR watcher service actor |
 
 > Thread bootstrap（按 clone-manifest 准备 thread workspace 仓库目录）由
 > `joi thread create --bootstrap-artifact` 通过 §4.2.1 mounts 投影完成；

@@ -432,6 +432,29 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             .subscriptions
             .broadcast_to_scope(&scope, method::STREAM_UPDATE, payload.clone());
     }
+    if let StoreEvent::ThreadUpdated(t) = &ev {
+        let thread_scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: t.id.clone(),
+        };
+        let thread_payload =
+            json!({ "kind": kind, "scope": thread_scope.clone(), "data": data.clone() });
+        if let Some(members_filter) = scope_acl_filter(state, &thread_scope) {
+            broadcast_filtered(
+                state,
+                &thread_scope,
+                method::STREAM_UPDATE,
+                &thread_payload,
+                &members_filter,
+            );
+        } else {
+            state.subscriptions.broadcast_to_scope(
+                &thread_scope,
+                method::STREAM_UPDATE,
+                thread_payload,
+            );
+        }
+    }
 
     // Actor-inbox delivery: when an EventCreated event hands off to an actor,
     // also push the same stream/update directly to that actor's connection
@@ -453,6 +476,10 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         // RespondsTo reverse-target (the actor whose event is being replied
         // to). Reverse-delivery makes service plugins reachable without
         // subscribing to every scope they touch — see store.rs append_event.
+        let has_explicit_actor_handoff = e
+            .relations
+            .iter()
+            .any(|r| matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor);
         let mut targets: Vec<(String, &'static str, bool)> = Vec::new();
         for r in &e.relations {
             match r.kind {
@@ -460,7 +487,10 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                     let force_self = r.target.id == e.actor_id;
                     targets.push((r.target.id.clone(), "hands_off_to", force_self));
                 }
-                RelationKind::RespondsTo if r.target.kind == RefKind::Event => {
+                RelationKind::RespondsTo
+                    if r.target.kind == RefKind::Event
+                        && (!has_explicit_actor_handoff || e.kind == "action.response") =>
+                {
                     if let Some(orig) = state.store.get_event(&r.target.id) {
                         // Usually self-responses are deliberately ignored by
                         // the actor-inbox path. Permission approvals are the
@@ -599,7 +629,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use proto::types::{Ref, RefKind, Relation, RelationKind};
+    use proto::types::{Actor, Ref, RefKind, Relation, RelationKind};
     use tokio::sync::oneshot;
 
     use crate::artifacts::ArtifactStore;
@@ -737,5 +767,116 @@ mod tests {
             proto::methods::stream_kind::EVENT_CREATED
         );
         assert_eq!(value["params"]["data"]["event"]["id"], handoff.id);
+    }
+
+    #[test]
+    fn fanout_does_not_reverse_deliver_explicit_handoff_reply() {
+        let state = fresh_state("explicit-handoff-reply");
+        let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel::<String>();
+        let (examiner_tx, mut examiner_rx) = mpsc::unbounded_channel::<String>();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_delivery".into(),
+            actor_id: Some("actor_delivery".into()),
+            tx: delivery_tx,
+        });
+        state.subscriptions.add_connection(Connection {
+            id: "conn_examiner".into(),
+            actor_id: Some("actor_examiner".into()),
+            tx: examiner_tx,
+        });
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_delivery".into(),
+                display_name: "delivery".into(),
+                kind: ActorKind::Agent,
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("delivery actor");
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_examiner".into(),
+                display_name: "examiner".into(),
+                kind: ActorKind::Agent,
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("examiner actor");
+
+        let channel = state
+            .store
+            .create_channel("c".into(), None)
+            .expect("channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_delivery")
+            .unwrap();
+        state
+            .store
+            .grant_channel(&channel.id, "actor_examiner")
+            .unwrap();
+        state
+            .store
+            .grant_channel(&channel.id, "actor_router")
+            .unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let original = state
+            .store
+            .append_event(
+                "content.add".into(),
+                "actor_delivery".into(),
+                scope.clone(),
+                None,
+                json!({ "text": "done" }),
+                Vec::new(),
+                None,
+            )
+            .expect("original");
+        let handoff = state
+            .store
+            .append_event(
+                "content.add".into(),
+                "actor_router".into(),
+                scope,
+                None,
+                json!({ "text": "please review" }),
+                vec![
+                    Relation {
+                        kind: RelationKind::RespondsTo,
+                        target: Ref {
+                            kind: RefKind::Event,
+                            id: original.id,
+                            _meta: None,
+                        },
+                        _meta: None,
+                    },
+                    Relation {
+                        kind: RelationKind::HandsOffTo,
+                        target: Ref {
+                            kind: RefKind::Actor,
+                            id: "actor_examiner".into(),
+                            _meta: None,
+                        },
+                        _meta: None,
+                    },
+                ],
+                None,
+            )
+            .expect("handoff");
+
+        fanout(&state, StoreEvent::EventCreated(handoff));
+
+        examiner_rx
+            .try_recv()
+            .expect("explicit handoff target should receive actor-inbox frame");
+        assert!(
+            delivery_rx.try_recv().is_err(),
+            "responds_to actor should not also receive actor-inbox frame",
+        );
     }
 }

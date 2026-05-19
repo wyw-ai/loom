@@ -1143,11 +1143,18 @@ impl Store {
         // agent's reply via actor-inbox without subscribing to every scope it
         // touches. Self-responses (replying to your own event) are skipped to
         // avoid pending rows the speaker would have to acknowledge themselves.
+        let has_explicit_actor_handoff = event
+            .relations
+            .iter()
+            .any(|r| matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor);
         let mut reverse_targets: Vec<String> = Vec::new();
         {
             let inner = self.inner.read();
             for r in &event.relations {
                 if !matches!(r.kind, RelationKind::RespondsTo) || r.target.kind != RefKind::Event {
+                    continue;
+                }
+                if has_explicit_actor_handoff && event.kind != "action.response" {
                     continue;
                 }
                 let Some(orig) = inner.events.get(&r.target.id) else {
@@ -2707,6 +2714,58 @@ mod tests {
         assert!(matches!(delivery.state, DeliveryState::Pending));
         assert_eq!(delivery.event_id, reply_id);
         assert_eq!(delivery.actor_id, "svc_am_bridge");
+    }
+
+    #[test]
+    fn explicit_handoff_reply_does_not_reverse_deliver_to_original_actor() {
+        // Reply-as-handoff events may carry both HandsOffTo and RespondsTo.
+        // The explicit handoff target is the only actor that should wake up;
+        // otherwise one user action can start two actor turns.
+        let store = fresh_store();
+        let ch = store.create_channel("c".into(), None).unwrap();
+        store.grant_channel(&ch.id, "actor_router").unwrap();
+        store.grant_channel(&ch.id, "actor_delivery").unwrap();
+        store.grant_channel(&ch.id, "actor_examiner").unwrap();
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: ch.id.clone(),
+        };
+
+        let original_id = append_with_relations(
+            &store,
+            "content.add",
+            "actor_delivery",
+            scope.clone(),
+            vec![],
+        );
+        let handoff_id = append_with_relations(
+            &store,
+            "content.add",
+            "actor_router",
+            scope,
+            vec![
+                responds_to(&original_id),
+                Relation {
+                    kind: RelationKind::HandsOffTo,
+                    target: Ref {
+                        kind: RefKind::Actor,
+                        id: "actor_examiner".into(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                },
+            ],
+        );
+
+        let deliveries = store.inner.read().deliveries.clone();
+        assert!(
+            deliveries.contains_key(&(handoff_id.clone(), "actor_examiner".to_string())),
+            "explicit target must receive the delivery",
+        );
+        assert!(
+            !deliveries.contains_key(&(handoff_id, "actor_delivery".to_string())),
+            "responds_to target must not also receive the delivery",
+        );
     }
 
     #[test]

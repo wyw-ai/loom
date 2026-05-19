@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Joi Apps - 多 Agent 协作工作台</title>
+  <meta name="description" content="Joi Apps 是本地优先的多 Agent 协作工作台，把人、Agent、服务、审批和产物放进同一个任务现场。">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="page">
+    <header class="site-header" aria-label="Joi Apps navigation">
+      <a class="brand" href="#">
+        <span class="brand-mark">J</span>
+        <span>Joi Apps</span>
+      </a>
+      <nav>
+        <a href="#demo">工作台</a>
+        <a href="#why">重点</a>
+        <a href="#downloads">下载</a>
+      </nav>
+    </header>
+
+    <section class="hero" id="demo">
+      <div class="hero-copy">
+        <div>
+          <p class="eyebrow">Local-first multi-agent workspace</p>
+          <h1>把 Agent 拉进<br>同一个任务现场。</h1>
+          <p class="lead">
+            Joi 不是新的 Agent。它是人、Claude/Codex、CI 服务和审批动作之间的协作层：
+            谁接手、看哪段上下文、执行到哪一步、产物在哪里，都留在同一个 workspace。
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn--primary" href="#downloads">下载 Desktop / install.sh</a>
+            <a class="btn" href="#start">启动本地工作台</a>
+          </div>
+        </div>
+        <div class="hero-aside">
+          <div class="command-line" id="start">
+            <code>joi-server --bind 127.0.0.1:8787</code>
+            <code>joi daemon --server http://127.0.0.1:8787</code>
+          </div>
+        </div>
+      </div>
+
+      <div class="demo-frame" aria-label="Joi Desktop demo">
+        <div class="desktop-window">
+          <div class="window-titlebar">
+            <span class="traffic traffic--red"></span>
+            <span class="traffic traffic--yellow"></span>
+            <span class="traffic traffic--green"></span>
+            <strong>Joi Desktop</strong>
+          </div>
+          <div class="shell">
+            <nav class="server-rail" aria-label="Workspace rail">
+              <button class="workspace-button is-active" title="Joi Lab">J<span></span></button>
+              <button class="rail-icon is-active" data-view="chat" title="Chat" aria-label="Chat">#</button>
+              <button class="rail-icon" data-view="tasks" title="Tasks" aria-label="Tasks">✓</button>
+              <button class="rail-icon" data-view="members" title="Members" aria-label="Members">◎</button>
+              <button class="rail-icon" data-view="machines" title="Computers" aria-label="Computers">▣</button>
+              <button class="rail-icon rail-icon--bottom" id="reset-button" title="Refresh context" aria-label="Refresh context">↻</button>
+            </nav>
+            <aside class="side-pane" id="workbench-side"></aside>
+            <section class="workbench-main" id="workbench-main"></section>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="focus-strip" id="why" aria-label="Joi core value">
+      <article>
+        <span>01</span>
+        <b>明确交接</b>
+        <p>handoff 让任务从人交给 router、discovery、delivery 或 service，不靠聊天记录猜责任人。</p>
+      </article>
+      <article>
+        <span>02</span>
+        <b>本机执行</b>
+        <p>server 只记录协作事实；Agent 仍在自己的机器、目录和权限边界里执行。</p>
+      </article>
+      <article>
+        <span>03</span>
+        <b>审批留痕</b>
+        <p>部署、删除、外部调用这类副作用进入 Inbox，批准或拒绝都会回到任务现场。</p>
+      </article>
+    </section>
+
+    <section class="downloads-section" id="downloads" aria-labelledby="downloads-title">
+      <div class="section-heading">
+        <p class="eyebrow">Downloads</p>
+        <h2 id="downloads-title">下载 Desktop，或用 install.sh 安装运行时。</h2>
+        <p>页面只保留图形界面和自动安装脚本；install.sh 会按系统选择 runtime 包，也支持非交互参数指定安装模块。</p>
+      </div>
+      <div class="download-panel">
+        <div class="download-meta" id="download-meta">Release artifacts will appear after packaging.</div>
+        <div class="download-grid" id="download-grid"></div>
+      </div>
+    </section>
+
+    <footer class="page-footer">
+      <div class="page-footer__brand">
+        <span class="page-footer__mark">JOI</span>
+        <span>Local-first multi-agent collaboration</span>
+      </div>
+      <nav class="page-footer__links">
+        <a href="#demo">工作台</a>
+        <a href="#why">重点</a>
+        <a href="#downloads">下载</a>
+      </nav>
+    </footer>
+  </main>
+
+  <script src="release-downloads.js"></script>
+  <script src="https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/release-downloads.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

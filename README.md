@@ -103,7 +103,8 @@ make install-targets      # 一次性装齐 4 个 triple 的 std：
 make package-release
 ```
 
-这个目标会先构建 macOS / Linux 的 release runtime，再生成统一发布包：
+这个目标会先构建 macOS / Linux 的 release runtime，再生成统一发布包；默认只写本地产物，
+不会上传 OSS，也不会更新 pages 的 release 数据：
 
 ```text
 dist/packages/
@@ -126,13 +127,30 @@ scripts/package-release.sh --skip-build
 scripts/package-release.sh --skip-gui
 ```
 
+正式发版走 AoneCI tag 链路，和 `a1` 仓库一致：推送 `v*` tag 会触发
+`.aoneci/release.yaml`，自动打包并通过 pre-ai grouped upload 上传到稳定 group
+`joi-apps-latest`，同时刷新
+`https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/release-downloads.js`。
+Pages 页面加载这个 latest 数据文件，所以页面上的 DMG 和 `install.sh` 链接会指向最近一次发布：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+如果需要手动发布到同一个 latest group，显式指定 `OSS_GROUP` 并传 `--upload`：
+
+```sh
+OSS_GROUP=joi-apps-latest scripts/package-release.sh --upload
+```
+
 linux 档默认用 host 的 `cargo` 原生交叉，需要装好 musl 工具链。macOS 上推荐：
 
 ```sh
 brew install filosottile/musl-cross/musl-cross   # 同时提供 x86_64 + aarch64 musl gcc
 ```
 
-`~/.cargo/config.toml` 里已经把 linker 指向 `x86_64-linux-musl-gcc` /
+仓库的 `.cargo/config.toml` 已经把 linker 指向 `x86_64-linux-musl-gcc` /
 `aarch64-linux-musl-gcc`，装完即用。如果你偏好容器化的 `cross` 流程，`cargo
 install cross` 后用 `make linux-x86-release LINUX_BUILDER=cross` 显式切回去；
 Apple Silicon 上 cross 会在 QEMU 里跑 x86 rustc，实测会 SIGSEGV，因此默认不走这条路。

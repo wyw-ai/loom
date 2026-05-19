@@ -128,20 +128,20 @@ scripts/package-release.sh --skip-gui
 ```
 
 正式发版走 AoneCI tag 链路，和 `a1` 仓库一致：推送 `v*` tag 会触发
-`.aoneci/release.yaml`，自动打包、上传 `dist/packages/*` 到
-`joi-apps/<tag>/` 和 `joi-apps/latest/`，并刷新
-`joi-apps/latest/release-downloads.js`。Pages 页面加载这个 latest 数据文件，所以页面上的
-DMG 和 `install.sh` 链接会指向最近一次发布：
+`.aoneci/release.yaml`，自动打包并通过 pre-ai grouped upload 上传到稳定 group
+`joi-apps-latest`，同时刷新
+`https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/release-downloads.js`。
+Pages 页面加载这个 latest 数据文件，所以页面上的 DMG 和 `install.sh` 链接会指向最近一次发布：
 
 ```sh
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-如果需要手动发布到旧的 grouped upload 接口，显式传 `--upload`：
+如果需要手动发布到同一个 latest group，显式指定 `OSS_GROUP` 并传 `--upload`：
 
 ```sh
-scripts/package-release.sh --upload
+OSS_GROUP=joi-apps-latest scripts/package-release.sh --upload
 ```
 
 linux 档默认用 host 的 `cargo` 原生交叉，需要装好 musl 工具链。macOS 上推荐：

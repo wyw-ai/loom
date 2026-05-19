@@ -30,8 +30,8 @@ Build and package Joi release artifacts in one command.
 Options:
   --skip-build       Package existing dist/release binaries without rebuilding.
   --skip-gui         Do not build/copy the macOS arm64 GUI dmg.
-  --upload, --publish Upload release artifacts to OSS and refresh portal release data.
-  --skip-upload      Do not upload release artifacts to OSS. This is the default.
+  --upload, --publish Upload release artifacts to pre-ai grouped storage and refresh portal release data.
+  --skip-upload      Do not upload release artifacts. This is the default.
   --write-release-data
                       Write portal release data using DOWNLOAD_BASE_URL-derived URLs.
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
@@ -47,7 +47,7 @@ Environment:
   LINUX_BUILDER      Builder for Linux Rust targets. Defaults to $CARGO.
   DIST_DIR           Dist directory. Defaults to dist.
   PACKAGE_OUT_DIR    Package output directory. Defaults to dist/packages.
-  OSS_BASE_URL       OSS manager origin.
+  OSS_BASE_URL       pre-ai grouped upload origin.
   OSS_GROUP          OSS grouped upload path.
   DOWNLOAD_BASE_URL  Public artifact URL prefix used by --write-release-data and install.sh.
   PORTAL_DOWNLOAD_BASE_URL
@@ -758,6 +758,9 @@ PY
 
   printf '\n]\n' >>"$uploads_json"
   write_portal_release_data "$uploads_json"
+  if [[ -f "$PORTAL_RELEASE_DATA" ]]; then
+    upload_one_artifact "$PORTAL_RELEASE_DATA" >/dev/null
+  fi
 }
 
 mkdir -p "$PACKAGE_OUT_DIR"

@@ -16,7 +16,7 @@ PORTAL_RELEASE_DATA="${PORTAL_RELEASE_DATA:-pages/portal/release-downloads.js}"
 PROFILE="release"
 SKIP_BUILD=0
 SKIP_GUI=0
-SKIP_UPLOAD=0
+SKIP_UPLOAD=1
 
 usage() {
   cat <<'EOF'
@@ -27,7 +27,8 @@ Build and package Joi release artifacts in one command.
 Options:
   --skip-build       Package existing dist/release binaries without rebuilding.
   --skip-gui         Do not build/copy the macOS arm64 GUI dmg.
-  --skip-upload      Do not upload release artifacts to OSS.
+  --upload, --publish Upload release artifacts to OSS and refresh portal release data.
+  --skip-upload      Do not upload release artifacts to OSS. This is the default.
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
   --out-dir DIR      Package output directory. Defaults to $PACKAGE_OUT_DIR or dist/packages.
   --oss-base-url URL OSS manager origin. Defaults to $OSS_BASE_URL or pre-ai.
@@ -59,6 +60,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-upload)
       SKIP_UPLOAD=1
+      shift
+      ;;
+    --upload | --publish)
+      SKIP_UPLOAD=0
       shift
       ;;
     --dist-dir)
@@ -178,49 +183,72 @@ EOF
   log "wrote $archive"
 }
 
-find_latest_dmg() {
-  local roots=(
-    "target/aarch64-apple-darwin/release/bundle/dmg"
-    "target/release/bundle/dmg"
-    "crates/gui/target/aarch64-apple-darwin/release/bundle/dmg"
-    "crates/gui/target/release/bundle/dmg"
-  )
-  local latest=""
-  local latest_mtime=0
-
-  for root in "${roots[@]}"; do
-    [[ -d "$root" ]] || continue
-    while IFS= read -r -d '' path; do
-      local mtime
-      mtime="$(stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path")"
-      if [[ "$mtime" -gt "$latest_mtime" ]]; then
-        latest="$path"
-        latest_mtime="$mtime"
-      fi
-    done < <(find "$root" -type f -name '*.dmg' -print0)
-  done
-
-  [[ -n "$latest" ]] || return 1
-  printf '%s\n' "$latest"
-}
-
 package_gui_dmg() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "GUI dmg packaging requires macOS; rerun on macOS or pass --skip-gui" >&2
     exit 1
   fi
 
-  log "building GUI dmg for aarch64-apple-darwin"
-  run_make gui-dmg-mac-arm
+  local target="aarch64-apple-darwin"
+  local src_joi="$DIST_DIR/$PROFILE/$target/joi"
+  ensure_file "$src_joi"
 
-  local dmg
-  if ! dmg="$(find_latest_dmg)"; then
-    echo "Tauri build finished but no dmg was found" >&2
+  log "building GUI app bundle for $target"
+  (
+    cd crates/gui
+    "$CARGO" tauri build --target "$target" --bundles app --ci
+  )
+
+  local app="target/$target/release/bundle/macos/Joi Desktop.app"
+  if [[ ! -d "$app" ]]; then
+    echo "Tauri build finished but no app bundle was found at $app" >&2
     exit 1
   fi
 
   local out="$PACKAGE_OUT_DIR/joi-gui-$VERSION-aarch64-apple-darwin.dmg"
-  cp "$dmg" "$out"
+  local resources_dir="$app/Contents/Resources/bin"
+  mkdir -p "$resources_dir"
+  cp "$src_joi" "$resources_dir/joi"
+  chmod 0755 "$resources_dir/joi"
+
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign - "$app"
+  fi
+
+  local stage_dir
+  stage_dir="$(mktemp -d "/private/tmp/joi-gui-dmg.XXXXXX")"
+  if command -v ditto >/dev/null 2>&1; then
+    ditto "$app" "$stage_dir/Joi Desktop.app"
+  else
+    cp -R "$app" "$stage_dir/Joi Desktop.app"
+  fi
+  ln -s /Applications "$stage_dir/Applications"
+  local dmg_dir="target/$target/release/bundle/dmg"
+  local dmg="$dmg_dir/Joi Desktop_${VERSION}_aarch64.dmg"
+  local tmp_dmg="/private/tmp/joi-gui-dmg-output-${VERSION}-$$.dmg"
+  mkdir -p "$dmg_dir"
+  rm -f "$dmg" "$out" "$tmp_dmg"
+  local attempt=1
+  local max_attempts=5
+  until hdiutil create \
+      -volname "Joi Desktop" \
+      -srcfolder "$stage_dir" \
+      -ov \
+      -format UDRO \
+      "$tmp_dmg"; do
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      rm -f "$tmp_dmg"
+      echo "hdiutil create failed after $max_attempts attempts" >&2
+      exit 1
+    fi
+    rm -f "$tmp_dmg"
+    sleep "$((attempt * 2))"
+    attempt=$((attempt + 1))
+  done
+  cp "$tmp_dmg" "$dmg"
+  cp "$tmp_dmg" "$out"
+  rm -rf "$stage_dir"
+  rm -f "$tmp_dmg"
   log "wrote $out"
 }
 

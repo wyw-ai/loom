@@ -20,4 +20,4 @@ jobs:
       - uses: deploy-pages
         inputs:
           deploy-dir: pages/build/
-          production-branch: master
+          production-branch: main

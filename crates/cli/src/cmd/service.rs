@@ -457,13 +457,13 @@ mod service_spec_loader_tests {
     fn load_real_data_services_preserves_top_level_params_schema() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/services");
         let specs = load_specs(&dir).expect("load data/services specs");
-        let mr_detector = specs
+        let bug_fix_loop = specs
             .iter()
-            .find(|spec| spec.id == "mr-detector")
-            .expect("mr-detector spec");
+            .find(|spec| spec.id == "a1-bug-fix-loop")
+            .expect("a1-bug-fix-loop spec");
 
         assert!(
-            mr_detector
+            bug_fix_loop
                 .params_schema
                 .as_ref()
                 .and_then(|schema| schema.get("required"))

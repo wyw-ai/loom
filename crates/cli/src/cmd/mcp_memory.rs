@@ -8,6 +8,7 @@
 //! * `memory.query`  — search (text / tags / types / channel scope)
 //! * `memory.append` — record a new memory
 //! * `memory.get`    — fetch by id
+//! * `memory.update` — mutate review status with the same source guards as CLI
 //!
 //! Protocol: minimal MCP 2024-11-05. Handshake via `initialize`, then
 //! `tools/list` and `tools/call`. Anything we don't recognize gets a
@@ -126,7 +127,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "memory.append",
-            "description": "Record a new memory entry for this actor. Status defaults to 'accepted'. The runtime auto-fills id / ts / actorId.",
+            "description": "Record a new memory entry for this actor. Status defaults to 'pending'. The runtime auto-fills id / ts / actorId.",
             "inputSchema": {
                 "type": "object",
                 "required": ["summary"],
@@ -135,7 +136,7 @@ fn tool_definitions() -> Value {
                     "detail":     { "type": "string" },
                     "type":       { "type": "string", "default": "note", "description": "fact / decision / task / note / preference — not enforced." },
                     "confidence": { "type": "string", "enum": ["high", "medium", "low"], "default": "medium" },
-                    "status":     { "type": "string", "default": "accepted", "description": "accepted / pending / rejected / archived." },
+                    "status":     { "type": "string", "default": "pending", "description": "accepted / pending / rejected / archived." },
                     "tags":       { "type": "array", "items": { "type": "string" } },
                     "channelId":  { "type": "string", "description": "Channel this memory was learned in. Drives channel-scoped retrieval." },
                     "threadId":   { "type": "string" },
@@ -150,6 +151,20 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "required": ["id"],
                 "properties": { "id": { "type": "string" } }
+            }
+        },
+        {
+            "name": "memory.update",
+            "description": "Update memory status. Moving to accepted requires source channel and message refs.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id", "status"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "accepted", "rejected", "archived"] },
+                    "reason": { "type": "string" },
+                    "messageIds": { "type": "array", "items": { "type": "string" } }
+                }
             }
         }
     ])
@@ -172,6 +187,7 @@ fn handle_tool_call(
         "memory.query" => memory_query(store, &args),
         "memory.append" => memory_append(actor_id, store, &args),
         "memory.get" => memory_get(store, &args),
+        "memory.update" => memory_update(store, &args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -229,6 +245,29 @@ fn memory_append(
     if summary.trim().is_empty() {
         return Err("`summary` must be non-empty".into());
     }
+    let status = args
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("pending")
+        .to_string();
+    validate_status(&status)?;
+    let channel_id = args
+        .get("channelId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let message_ids: Vec<String> = args
+        .get("messageIds")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if status == "accepted" && (channel_id.trim().is_empty() || message_ids.is_empty()) {
+        return Err("accepted memory requires channelId and messageIds".into());
+    }
     let record = MemoryRecord {
         schema_version: 1,
         id: format!("mem_{}", Uuid::new_v4().simple()),
@@ -239,11 +278,7 @@ fn memory_append(
             .and_then(Value::as_str)
             .unwrap_or("note")
             .to_string(),
-        status: args
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("accepted")
-            .to_string(),
+        status,
         summary,
         detail: args
             .get("detail")
@@ -256,25 +291,13 @@ fn memory_append(
             .unwrap_or("medium")
             .to_string(),
         source: MemorySource {
-            channel_id: args
-                .get("channelId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            channel_id,
             thread_id: args
                 .get("threadId")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            message_ids: args
-                .get("messageIds")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            message_ids,
         },
         tags: args
             .get("tags")
@@ -305,6 +328,56 @@ fn memory_get(store: &JsonlMemoryStore, args: &Value) -> Result<Vec<Value>, Stri
             Ok(vec![json!({ "type": "text", "text": text })])
         }
         None => Err(format!("no record with id {id}")),
+    }
+}
+
+fn memory_update(store: &JsonlMemoryStore, args: &Value) -> Result<Vec<Value>, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "`id` is required".to_string())?;
+    let status = args
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "`status` is required".to_string())?
+        .to_string();
+    validate_status(&status)?;
+    let mut record = store
+        .get(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no record with id {id}"))?;
+    if let Some(message_ids) = args.get("messageIds").and_then(Value::as_array) {
+        for message_id in message_ids.iter().filter_map(Value::as_str) {
+            if !record.source.message_ids.iter().any(|id| id == message_id) {
+                record.source.message_ids.push(message_id.to_string());
+            }
+        }
+    }
+    if status == "accepted"
+        && (record.source.channel_id.trim().is_empty() || record.source.message_ids.is_empty())
+    {
+        return Err("accepted memory requires source channel and message refs".into());
+    }
+    record.status = status;
+    record.ts = Utc::now().to_rfc3339();
+    if let Some(reason) = args.get("reason").and_then(Value::as_str) {
+        if !reason.trim().is_empty() {
+            if !record.detail.trim().is_empty() {
+                record.detail.push_str("\n\n");
+            }
+            record.detail.push_str("status update: ");
+            record.detail.push_str(reason);
+        }
+    }
+    store.append(&record).map_err(|e| e.to_string())?;
+    let text = format!("updated {} (status={})", record.id, record.status);
+    Ok(vec![json!({ "type": "text", "text": text })])
+}
+
+fn validate_status(status: &str) -> Result<(), String> {
+    match status {
+        "pending" | "accepted" | "rejected" | "archived" => Ok(()),
+        other => Err(format!("unknown memory status `{other}`")),
     }
 }
 
@@ -363,7 +436,15 @@ mod tests {
         );
         let tools = resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["memory.query", "memory.append", "memory.get"]);
+        assert_eq!(
+            names,
+            vec![
+                "memory.query",
+                "memory.append",
+                "memory.get",
+                "memory.update"
+            ]
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -394,7 +475,7 @@ mod tests {
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": {
                     "name": "memory.query",
-                    "arguments": { "text": "tabs", "channelId": "ch1" }
+                    "arguments": { "text": "tabs", "channelId": "ch1", "includeNonAccepted": true }
                 }
             }),
         );
@@ -433,6 +514,98 @@ mod tests {
             }),
         );
         assert_eq!(resp["error"]["code"].as_i64().unwrap(), -32000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn append_accepted_requires_source_refs() {
+        let dir = tmpdir();
+        let store = store_at(&dir);
+        let resp = handle_request(
+            "actor_x",
+            &store,
+            &json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {
+                    "name": "memory.append",
+                    "arguments": {
+                        "summary": "verified lesson",
+                        "status": "accepted",
+                        "channelId": "ch1"
+                    }
+                }
+            }),
+        );
+        assert_eq!(resp["error"]["code"].as_i64().unwrap(), -32000);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("accepted memory requires"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn update_to_accepted_requires_existing_source_refs() {
+        let dir = tmpdir();
+        let store = store_at(&dir);
+        let _append = handle_request(
+            "actor_x",
+            &store,
+            &json!({
+                "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                "params": {
+                    "name": "memory.append",
+                    "arguments": {
+                        "summary": "needs review",
+                        "channelId": "ch1"
+                    }
+                }
+            }),
+        );
+        let record = store
+            .query(&MemoryQuery {
+                include_non_accepted: true,
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap()
+            .pop()
+            .unwrap();
+        let rejected = handle_request(
+            "actor_x",
+            &store,
+            &json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {
+                    "name": "memory.update",
+                    "arguments": {
+                        "id": record.id,
+                        "status": "accepted"
+                    }
+                }
+            }),
+        );
+        assert_eq!(rejected["error"]["code"].as_i64().unwrap(), -32000);
+        let accepted = handle_request(
+            "actor_x",
+            &store,
+            &json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {
+                    "name": "memory.update",
+                    "arguments": {
+                        "id": record.id,
+                        "status": "accepted",
+                        "messageIds": ["evt_1"],
+                        "reason": "human verified"
+                    }
+                }
+            }),
+        );
+        assert!(accepted.get("error").is_none());
+        let updated = store.get(&record.id).unwrap().unwrap();
+        assert_eq!(updated.status, "accepted");
+        assert_eq!(updated.source.message_ids, vec!["evt_1"]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

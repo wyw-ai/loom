@@ -28,6 +28,16 @@ run() {
   "$@"
 }
 
+run "joi-core-terminal" env \
+  JOI_BIN="$REPO_ROOT/target/release/joi" \
+  JOI_SERVER_BIN="$REPO_ROOT/target/release/joi-server" \
+  bash scripts/e2e/run-joi-core-terminal.sh
+
+run "a1-dev-canfeng-native" env \
+  JOI_BIN="$REPO_ROOT/target/release/joi" \
+  JOI_SERVER_BIN="$REPO_ROOT/target/release/joi-server" \
+  bash scripts/e2e/run-a1-dev-canfeng-native.sh
+
 run "mr-detector (M3)"   bash scripts/e2e/run-mr-detector.sh
 run "spec-apply (M5/O6)" bash scripts/e2e/run-spec-apply.sh
 

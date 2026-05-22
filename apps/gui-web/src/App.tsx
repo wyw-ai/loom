@@ -167,8 +167,30 @@ export function App() {
         const r = await ipc.taskList();
         if (!stillCurrent()) return;
         useTasks.getState().replaceTasks(r.tasks);
+        await backfillTaskActionRequests(r.tasks, workspace.actorId, stillCurrent);
       } catch {
         if (stillCurrent()) useTasks.getState().clear();
+      }
+      try {
+        let cursor: string | undefined;
+        for (let page = 0; page < 10; page += 1) {
+          const r = await ipc.deliveryList({
+            actorId: workspace.actorId,
+            state: "pending",
+            limit: 200,
+            cursor,
+          });
+          if (!stillCurrent()) return;
+          for (const item of r.deliveries) {
+            if (item.event?.type === "action.request") {
+              addActionRequestToInbox(item.event);
+            }
+          }
+          cursor = r.nextCursor;
+          if (!cursor || r.deliveries.length === 0) break;
+        }
+      } catch {
+        /* best-effort — live actor-inbox pushes still populate the inbox */
       }
     })();
     return () => {
@@ -183,7 +205,6 @@ export function App() {
   }) {
     const channels = useChannels.getState();
     const messages = useMessages.getState();
-    const inbox = useInbox.getState();
     const me = useSession.getState().workspace?.actorId;
 
     switch (u.kind) {
@@ -223,36 +244,18 @@ export function App() {
           : null;
         const evScopeKey = scopeKey(ev.scope);
 
-        if (ev.type === "action.request" && forMe && evScopeKey !== currentKey) {
-          const p = summarizeActionRequest(
-            (ev.payload ?? {}) as Record<string, unknown>,
-          );
-          const payload = (ev.payload ?? {}) as Record<string, unknown>;
-          inbox.add({
-            requestEventId: ev.id,
-            scope: ev.scope,
-            title: p.title,
-            description: p.description,
-            requestType:
-              typeof payload.requestType === "string"
-                ? payload.requestType
-                : undefined,
-            reason: p.reason,
-            command: p.command,
-            rawInput: p.rawInput,
-            actionRequestId: p.requestId,
-            choices: p.choices,
-            arrivedAt: ev.occurredAt,
-            seen: false,
-          });
-          useUI
-            .getState()
-            .pushToast("warn", `action.request waiting in #${ev.scope.id}`);
-          void notifyDesktop(
-            "Action request waiting",
-            `${p.title} in #${ev.scope.id}`,
-          );
-          return;
+        if (ev.type === "action.request" && forMe) {
+          const p = addActionRequestToInbox(ev);
+          if (evScopeKey !== currentKey) {
+            useUI
+              .getState()
+              .pushToast("warn", `action.request waiting in #${ev.scope.id}`);
+            void notifyDesktop(
+              "Action request waiting",
+              `${p.title} in #${ev.scope.id}`,
+            );
+            return;
+          }
         }
 
         messages.ingestEvent(ev.scope, ev);
@@ -260,7 +263,7 @@ export function App() {
           const reqId = ev.relations.find(
             (r) => r.kind === "responds_to" && r.target.kind === "event",
           )?.target.id;
-          if (reqId) inbox.remove(reqId);
+          if (reqId) useInbox.getState().remove(reqId);
         }
         return;
       }
@@ -425,4 +428,75 @@ function mergeMemberIds(...memberLists: string[][]): string[] {
     }
   }
   return merged;
+}
+
+function addActionRequestToInbox(ev: JoiEvent) {
+  const payload = (ev.payload ?? {}) as Record<string, unknown>;
+  const summary = summarizeActionRequest(payload);
+  useInbox.getState().add({
+    requestEventId: ev.id,
+    scope: ev.scope,
+    title: summary.title,
+    description: summary.description,
+    requestType:
+      typeof payload.requestType === "string"
+        ? payload.requestType
+        : undefined,
+    reason: summary.reason,
+    command: summary.command,
+    rawInput: summary.rawInput,
+    actionRequestId: summary.requestId,
+    taskId: typeof payload.taskId === "string" ? payload.taskId : undefined,
+    targetKey:
+      typeof payload.targetKey === "string" ? payload.targetKey : undefined,
+    choices: summary.choices,
+    arrivedAt: ev.occurredAt,
+    seen: false,
+  });
+  return summary;
+}
+
+async function backfillTaskActionRequests(
+  tasks: Task[],
+  actorId: string,
+  stillCurrent: () => boolean,
+) {
+  const activeTasks = tasks
+    .filter((task) => !["done", "failed", "canceled"].includes(task.status))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 100);
+  for (const task of activeTasks) {
+    if (!stillCurrent()) return;
+    try {
+      const res = await ipc.scopeRead(
+        { kind: "thread", id: task.canonicalThreadId },
+        200,
+      );
+      if (!stillCurrent()) return;
+      addPendingActionRequestsFromEvents(res.events, actorId);
+    } catch {
+      /* task thread may be archived or temporarily inaccessible */
+    }
+  }
+}
+
+function addPendingActionRequestsFromEvents(events: JoiEvent[], actorId: string) {
+  const answered = new Set<string>();
+  for (const ev of events) {
+    if (ev.type !== "action.response") continue;
+    const requestId = ev.relations.find(
+      (r) => r.kind === "responds_to" && r.target.kind === "event",
+    )?.target.id;
+    if (requestId) answered.add(requestId);
+  }
+  for (const ev of events) {
+    if (ev.type !== "action.request" || answered.has(ev.id)) continue;
+    const forActor = ev.relations.some(
+      (r) =>
+        r.kind === "hands_off_to" &&
+        r.target.kind === "actor" &&
+        r.target.id === actorId,
+    );
+    if (forActor) addActionRequestToInbox(ev);
+  }
 }

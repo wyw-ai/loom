@@ -8,6 +8,8 @@ import type {
   ArtifactReadResult,
   Channel,
   DesktopConfig,
+  DeliveryListEntry,
+  ActorDeliveryState,
   HumanAccount,
   JoiEvent,
   MachineInfo,
@@ -16,12 +18,20 @@ import type {
   ScopeRef,
   StreamUpdate,
   Task,
+  TaskArtifactLink,
   TaskAssignment,
   TaskAssignmentStatus,
   TaskAssignmentType,
+  TaskChangeAckDisposition,
+  TaskChangeDelivery,
+  TaskFact,
+  TaskProjection,
+  TaskProjectionHealth,
+  TaskRef,
   TaskStatus,
   Thread,
   TurnStreamDelta,
+  WorkspaceLease,
   Workspace,
 } from "./types";
 
@@ -256,6 +266,10 @@ export async function taskList(params?: {
 export async function taskGet(taskId: string): Promise<{
   task: Task;
   assignments: TaskAssignment[];
+  refs?: TaskRef[];
+  artifactLinks?: TaskArtifactLink[];
+  facts?: TaskFact[];
+  projections?: TaskProjection[];
 }> {
   return invoke("task_get", { params: { taskId } });
 }
@@ -277,6 +291,8 @@ export async function taskAssignmentCreate(params: {
   toActorId: string;
   type: TaskAssignmentType;
   instruction: string;
+  contract?: unknown;
+  idempotencyKey?: string;
 }): Promise<{ assignment: TaskAssignment; task: Task; event: JoiEvent }> {
   return invoke("task_assignment_create", { params });
 }
@@ -286,8 +302,104 @@ export async function taskAssignmentUpdate(params: {
   status?: TaskAssignmentStatus;
   resultEventId?: string;
   resultSummary?: string;
+  resultEnvelope?: unknown;
+  resultArtifactIds?: string[];
+  resultFactIds?: string[];
+  evidenceRefs?: string[];
 }): Promise<{ assignment: TaskAssignment; task: Task }> {
   return invoke("task_assignment_update", { params });
+}
+
+export async function taskRefFind(params: {
+  channelId?: string;
+  kind: string;
+  subtype?: string;
+  normalized: string;
+  confidence?: string;
+  status?: string;
+}): Promise<{ refs: TaskRef[]; tasks: Task[] }> {
+  return invoke("task_ref_find", { params });
+}
+
+export async function taskArtifactList(params: {
+  taskId: string;
+  status?: string;
+}): Promise<{ links: TaskArtifactLink[] }> {
+  return invoke("task_artifact_list", { params });
+}
+
+export async function taskFactList(params: {
+  taskId: string;
+  kind?: string;
+  status?: string;
+  targetKey?: string;
+}): Promise<{ facts: TaskFact[] }> {
+  return invoke("task_fact_list", { params });
+}
+
+export async function taskProjectionGet(params: {
+  taskId: string;
+  projectionType?: string;
+}): Promise<{ projection?: TaskProjection | null; health: TaskProjectionHealth }> {
+  return invoke("task_projection_get", { params });
+}
+
+export async function taskAssignmentContext(
+  assignmentId: string,
+): Promise<{
+  task: Task;
+  assignment: TaskAssignment;
+  refs: TaskRef[];
+  artifactLinks: TaskArtifactLink[];
+  facts: TaskFact[];
+  projection?: TaskProjection | null;
+  guards: unknown;
+}> {
+  return invoke("task_assignment_context", { params: { assignmentId } });
+}
+
+export async function taskAssignmentPreflight(params: {
+  assignmentId: string;
+  targetKey?: string;
+  head?: string;
+  effect?: string;
+}): Promise<{ preflight: unknown }> {
+  return invoke("task_assignment_preflight", { params });
+}
+
+export async function taskChangeList(params?: {
+  taskId?: string;
+  includeHandled?: boolean;
+  afterCursor?: number;
+  limit?: number;
+}): Promise<{ deliveries: TaskChangeDelivery[] }> {
+  return invoke("task_change_list", { params: params ?? {} });
+}
+
+export async function taskChangeAck(params: {
+  changeId: string;
+  disposition: TaskChangeAckDisposition;
+  resultRefIds?: string[];
+  reason?: string;
+}): Promise<{ delivery: TaskChangeDelivery }> {
+  return invoke("task_change_ack", { params });
+}
+
+export async function deliveryList(params: {
+  actorId: string;
+  state?: ActorDeliveryState;
+  limit?: number;
+  cursor?: string;
+}): Promise<{ deliveries: DeliveryListEntry[]; nextCursor?: string }> {
+  return invoke("delivery_list", { params });
+}
+
+export async function taskWorkspaceLeaseList(params?: {
+  resourceKey?: string;
+  assignmentId?: string;
+  activeOnly?: boolean;
+}): Promise<{ leases: WorkspaceLease[] }> {
+  return invoke("task_workspace_lease_list", { params: params ?? {} });
 }
 
 export async function artifactPublish(params: {

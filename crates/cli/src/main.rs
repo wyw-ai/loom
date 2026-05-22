@@ -195,6 +195,11 @@ enum Cmd {
         #[arg(long, conflicts_with = "in")]
         channel: Option<String>,
     },
+    /// Manage per-actor memory records using the same store as MCP memory.
+    Memory {
+        #[command(subcommand)]
+        sub: MemoryCmd,
+    },
     /// Run joi as a stdio MCP server. Typically not invoked by humans —
     /// the runtime auto-injects this as a `session/new.mcpServers` entry
     /// when an agent's spec opts into `memory.delivery.mcp`.
@@ -521,6 +526,66 @@ enum McpCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum MemoryCmd {
+    Query {
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long = "include-non-accepted")]
+        include_non_accepted: bool,
+        #[arg(long = "profile-dir")]
+        profile_dir: Option<PathBuf>,
+    },
+    Append {
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long = "source-channel")]
+        source_channel: String,
+        #[arg(long = "source-event")]
+        source_event: Option<String>,
+        #[arg(long, default_value = "pending")]
+        status: String,
+        #[arg(long = "type", default_value = "note")]
+        record_type: String,
+        #[arg(long, default_value = "medium")]
+        confidence: String,
+        #[arg(long)]
+        detail: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long = "profile-dir")]
+        profile_dir: Option<PathBuf>,
+    },
+    Get {
+        #[arg(long)]
+        actor: String,
+        memory_id: String,
+        #[arg(long = "profile-dir")]
+        profile_dir: Option<PathBuf>,
+    },
+    Update {
+        #[arg(long)]
+        actor: String,
+        memory_id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long = "source-event")]
+        source_event: Option<String>,
+        #[arg(long = "profile-dir")]
+        profile_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ChannelCmd {
     /// Create a new channel. Channels created via this CLI are private by
     /// default — the caller is the sole initial member; invite others
@@ -612,6 +677,8 @@ enum ThreadCmd {
 
 #[derive(Subcommand, Debug)]
 enum EventCmd {
+    /// Read one event by id, with the same ACL as its containing scope.
+    Get { event_id: String },
     /// List events in a thread (default) or channel scope.
     List {
         /// Scope id (thread id by default; pass --channel to read a channel scope).
@@ -696,6 +763,12 @@ enum TaskCmd {
         owner: Option<String>,
         #[arg(long)]
         status: Option<String>,
+        #[arg(long = "parent-source-event")]
+        parent_source_event: Option<String>,
+        #[arg(long = "parent-task")]
+        parent_task: Option<String>,
+        #[arg(long = "practice-contract-epoch")]
+        practice_contract_epoch: Option<String>,
     },
     /// List visible tasks.
     List {
@@ -731,11 +804,47 @@ enum TaskCmd {
         assignment_type: String,
         #[arg(long)]
         instruction: String,
+        #[arg(long = "contract-json")]
+        contract_json: Option<String>,
+        #[arg(long = "contract-file")]
+        contract_file: Option<PathBuf>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Attach, find, and list task identity references.
+    Ref {
+        #[command(subcommand)]
+        sub: TaskRefCmd,
+    },
+    /// Attach, activate, and list typed task artifacts.
+    Artifact {
+        #[command(subcommand)]
+        sub: TaskArtifactCmd,
+    },
+    /// Append and list typed task facts.
+    Fact {
+        #[command(subcommand)]
+        sub: TaskFactCmd,
+    },
+    /// Put and read task projections.
+    Projection {
+        #[command(subcommand)]
+        sub: TaskProjectionCmd,
     },
     /// Update a task assignment result.
     Assignment {
         #[command(subcommand)]
         sub: TaskAssignmentCmd,
+    },
+    /// List and ack durable task change deliveries.
+    Change {
+        #[command(subcommand)]
+        sub: TaskChangeCmd,
+    },
+    /// Workspace/write-scope lease commands.
+    Workspace {
+        #[command(subcommand)]
+        sub: TaskWorkspaceCmd,
     },
 }
 
@@ -749,6 +858,237 @@ enum TaskAssignmentCmd {
         result_event: Option<String>,
         #[arg(long)]
         result: Option<String>,
+        #[arg(long = "result-envelope-json")]
+        result_envelope_json: Option<String>,
+        #[arg(long = "result-artifact-id")]
+        result_artifact_ids: Vec<String>,
+        #[arg(long = "result-fact-id")]
+        result_fact_ids: Vec<String>,
+        #[arg(long = "evidence-ref")]
+        evidence_refs: Vec<String>,
+    },
+    Context {
+        assignment_id: String,
+    },
+    Preflight {
+        assignment_id: String,
+        #[arg(long = "target-key", default_value = "")]
+        target_key: String,
+        #[arg(long, default_value = "")]
+        head: String,
+        #[arg(long, default_value = "")]
+        effect: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskRefCmd {
+    Attach {
+        task_id: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value = "")]
+        subtype: String,
+        #[arg(long)]
+        value: String,
+        #[arg(long, default_value = "")]
+        normalized: String,
+        #[arg(long, default_value = "inferred")]
+        confidence: String,
+        #[arg(long, default_value = "active")]
+        status: String,
+        #[arg(long = "source-event")]
+        source_event: Option<String>,
+        #[arg(long = "fields-json")]
+        fields_json: Option<String>,
+    },
+    Find {
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value = "")]
+        subtype: String,
+        #[arg(long)]
+        normalized: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        confidence: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+    },
+    List {
+        task_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskArtifactCmd {
+    Attach {
+        task_id: String,
+        #[arg(long = "artifact-id")]
+        artifact_id: String,
+        #[arg(long, default_value = "")]
+        schema: String,
+        #[arg(long, default_value = "evidence")]
+        role: String,
+        #[arg(long, default_value = "active")]
+        status: String,
+        #[arg(long = "lineage-json")]
+        lineage_json: Option<String>,
+        #[arg(long = "binding-json")]
+        binding_json: Option<String>,
+    },
+    Activate {
+        link_id: String,
+        #[arg(long = "supersede")]
+        supersede_link_ids: Vec<String>,
+    },
+    List {
+        task_id: String,
+        #[arg(long)]
+        status: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskFactCmd {
+    Append {
+        task_id: String,
+        #[arg(long = "target-key", default_value = "")]
+        target_key: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long = "type", default_value = "user_defined")]
+        fact_type: String,
+        #[arg(long)]
+        signature: Option<String>,
+        #[arg(long, default_value = "active")]
+        status: String,
+        #[arg(long = "replaces")]
+        replaces: Vec<String>,
+        #[arg(long = "authority", default_value = "")]
+        authority: String,
+        #[arg(long = "authority-binding-json")]
+        authority_binding_json: Option<String>,
+        #[arg(long = "source-cursor")]
+        source_cursor: Option<String>,
+        #[arg(long = "source-snapshot-id")]
+        source_snapshot_id: Option<String>,
+        #[arg(long = "external-updated-at")]
+        external_updated_at: Option<String>,
+        #[arg(long = "observed-field")]
+        observed_fields: Vec<String>,
+        #[arg(long = "unobserved-field")]
+        unobserved_fields: Vec<String>,
+        #[arg(long = "unavailable-reason")]
+        unavailable_reason: Option<String>,
+        #[arg(long = "snapshot-completeness")]
+        snapshot_completeness: Option<String>,
+        #[arg(long = "producer-id")]
+        producer_id: Option<String>,
+        #[arg(long, default_value = "")]
+        summary: String,
+        #[arg(long = "raw-ref")]
+        raw_refs: Vec<String>,
+        #[arg(long = "artifact-id")]
+        artifact_id: Option<String>,
+        #[arg(long = "payload-schema", default_value = "")]
+        payload_schema: String,
+        #[arg(long = "subject-json")]
+        subject_json: Option<String>,
+        #[arg(long = "payload-json")]
+        payload_json: Option<String>,
+    },
+    List {
+        task_id: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long = "target-key")]
+        target_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskProjectionCmd {
+    Put {
+        task_id: String,
+        #[arg(long = "type", default_value = "summary")]
+        projection_type: String,
+        #[arg(long, default_value = "fresh")]
+        health: String,
+        #[arg(long = "producer-id")]
+        producer_id: Option<String>,
+        #[arg(long = "watermark-json")]
+        watermark_json: Option<String>,
+        #[arg(long = "payload-schema", default_value = "")]
+        payload_schema: String,
+        #[arg(long = "payload-json")]
+        payload_json: Option<String>,
+    },
+    Get {
+        task_id: String,
+        #[arg(long = "type", default_value = "summary")]
+        projection_type: String,
+    },
+    List {
+        task_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskChangeCmd {
+    List {
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long = "include-handled")]
+        include_handled: bool,
+        #[arg(long = "after-cursor")]
+        after_cursor: Option<u64>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    Ack {
+        change_id: String,
+        #[arg(long)]
+        disposition: String,
+        #[arg(long = "result-ref")]
+        result_ref_ids: Vec<String>,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskWorkspaceCmd {
+    Lease {
+        #[command(subcommand)]
+        sub: TaskWorkspaceLeaseCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskWorkspaceLeaseCmd {
+    Acquire {
+        assignment_id: String,
+        #[arg(long = "resource-key")]
+        resource_key: String,
+        #[arg(long, default_value = "write")]
+        mode: String,
+        #[arg(long = "ttl-seconds")]
+        ttl_seconds: Option<i64>,
+    },
+    Release {
+        lease_id: String,
+    },
+    List {
+        #[arg(long = "resource-key")]
+        resource_key: Option<String>,
+        #[arg(long = "assignment-id")]
+        assignment_id: Option<String>,
+        #[arg(long = "active-only")]
+        active_only: bool,
     },
 }
 
@@ -803,6 +1143,9 @@ enum ActorCmd {
         /// Display name. Defaults to actor_id.
         #[arg(long)]
         display: Option<String>,
+        /// Actor/service capability metadata as JSON.
+        #[arg(long = "capabilities-json")]
+        capabilities_json: Option<String>,
     },
     /// Delete an actor row from the server registry.
     Delete { actor_id: String },
@@ -1004,6 +1347,76 @@ async fn main() -> Result<()> {
     } else {
         OutputMode::Pretty
     });
+    if let Cmd::Memory { sub } = &args.cmd {
+        return match sub {
+            MemoryCmd::Query {
+                actor,
+                channel,
+                text,
+                limit,
+                include_non_accepted,
+                profile_dir,
+            } => cmd::memory::query(
+                actor.clone(),
+                profile_dir.clone(),
+                channel.clone(),
+                text.clone(),
+                *limit,
+                *include_non_accepted,
+                args.json,
+            ),
+            MemoryCmd::Append {
+                actor,
+                summary,
+                source_channel,
+                source_event,
+                status,
+                record_type,
+                confidence,
+                detail,
+                tags,
+                profile_dir,
+            } => cmd::memory::append(
+                actor.clone(),
+                profile_dir.clone(),
+                summary.clone(),
+                source_channel.clone(),
+                source_event.clone(),
+                status.clone(),
+                record_type.clone(),
+                confidence.clone(),
+                detail.clone(),
+                tags.clone(),
+                args.json,
+            ),
+            MemoryCmd::Get {
+                actor,
+                memory_id,
+                profile_dir,
+            } => cmd::memory::get(
+                actor.clone(),
+                profile_dir.clone(),
+                memory_id.clone(),
+                args.json,
+            ),
+            MemoryCmd::Update {
+                actor,
+                memory_id,
+                status,
+                reason,
+                source_event,
+                profile_dir,
+            } => cmd::memory::update(
+                actor.clone(),
+                profile_dir.clone(),
+                memory_id.clone(),
+                status.clone(),
+                reason.clone(),
+                source_event.clone(),
+                args.json,
+            ),
+        };
+    }
     let cfg = config::resolve(
         args.server.clone(),
         args.actor.clone(),
@@ -1379,6 +1792,9 @@ async fn main() -> Result<()> {
                 description,
                 owner,
                 status,
+                parent_source_event,
+                parent_task,
+                practice_contract_epoch,
             } => {
                 cmd::task::create(
                     client,
@@ -1388,6 +1804,9 @@ async fn main() -> Result<()> {
                     description,
                     owner,
                     status,
+                    parent_source_event,
+                    parent_task,
+                    practice_contract_epoch,
                 )
                 .await?
             }
@@ -1410,6 +1829,9 @@ async fn main() -> Result<()> {
                 to,
                 assignment_type,
                 instruction,
+                contract_json,
+                contract_file,
+                idempotency_key,
             } => {
                 cmd::task::assign(
                     client,
@@ -1418,15 +1840,184 @@ async fn main() -> Result<()> {
                     to,
                     assignment_type,
                     instruction,
+                    contract_json,
+                    contract_file,
+                    idempotency_key,
                 )
                 .await?
             }
+            TaskCmd::Ref { sub } => match sub {
+                TaskRefCmd::Attach {
+                    task_id,
+                    kind,
+                    subtype,
+                    value,
+                    normalized,
+                    confidence,
+                    status,
+                    source_event,
+                    fields_json,
+                } => {
+                    cmd::task::ref_attach(
+                        client,
+                        task_id,
+                        kind,
+                        subtype,
+                        value,
+                        normalized,
+                        confidence,
+                        status,
+                        source_event,
+                        fields_json,
+                    )
+                    .await?
+                }
+                TaskRefCmd::Find {
+                    kind,
+                    subtype,
+                    normalized,
+                    channel,
+                    confidence,
+                    status,
+                } => {
+                    cmd::task::ref_find(
+                        client, kind, subtype, normalized, channel, confidence, status,
+                    )
+                    .await?
+                }
+                TaskRefCmd::List { task_id } => cmd::task::ref_list(client, task_id).await?,
+            },
+            TaskCmd::Artifact { sub } => match sub {
+                TaskArtifactCmd::Attach {
+                    task_id,
+                    artifact_id,
+                    schema,
+                    role,
+                    status,
+                    lineage_json,
+                    binding_json,
+                } => {
+                    cmd::task::artifact_attach(
+                        client,
+                        task_id,
+                        artifact_id,
+                        schema,
+                        role,
+                        status,
+                        lineage_json,
+                        binding_json,
+                    )
+                    .await?
+                }
+                TaskArtifactCmd::Activate {
+                    link_id,
+                    supersede_link_ids,
+                } => cmd::task::artifact_activate(client, link_id, supersede_link_ids).await?,
+                TaskArtifactCmd::List { task_id, status } => {
+                    cmd::task::artifact_list(client, task_id, status).await?
+                }
+            },
+            TaskCmd::Fact { sub } => match sub {
+                TaskFactCmd::Append {
+                    task_id,
+                    target_key,
+                    kind,
+                    fact_type,
+                    signature,
+                    status,
+                    replaces,
+                    authority,
+                    authority_binding_json,
+                    source_cursor,
+                    source_snapshot_id,
+                    external_updated_at,
+                    observed_fields,
+                    unobserved_fields,
+                    unavailable_reason,
+                    snapshot_completeness,
+                    producer_id,
+                    summary,
+                    raw_refs,
+                    artifact_id,
+                    payload_schema,
+                    subject_json,
+                    payload_json,
+                } => {
+                    cmd::task::fact_append(
+                        client,
+                        task_id,
+                        target_key,
+                        kind,
+                        fact_type,
+                        signature,
+                        status,
+                        replaces,
+                        authority,
+                        authority_binding_json,
+                        source_cursor,
+                        source_snapshot_id,
+                        external_updated_at,
+                        observed_fields,
+                        unobserved_fields,
+                        unavailable_reason,
+                        snapshot_completeness,
+                        producer_id,
+                        summary,
+                        raw_refs,
+                        artifact_id,
+                        payload_schema,
+                        subject_json,
+                        payload_json,
+                    )
+                    .await?
+                }
+                TaskFactCmd::List {
+                    task_id,
+                    kind,
+                    status,
+                    target_key,
+                } => cmd::task::fact_list(client, task_id, kind, status, target_key).await?,
+            },
+            TaskCmd::Projection { sub } => match sub {
+                TaskProjectionCmd::Put {
+                    task_id,
+                    projection_type,
+                    health,
+                    producer_id,
+                    watermark_json,
+                    payload_schema,
+                    payload_json,
+                } => {
+                    cmd::task::projection_put(
+                        client,
+                        task_id,
+                        projection_type,
+                        health,
+                        producer_id,
+                        watermark_json,
+                        payload_schema,
+                        payload_json,
+                    )
+                    .await?
+                }
+                TaskProjectionCmd::Get {
+                    task_id,
+                    projection_type,
+                } => cmd::task::projection_get(client, task_id, projection_type).await?,
+                TaskProjectionCmd::List { task_id } => {
+                    cmd::task::projection_list(client, task_id).await?
+                }
+            },
             TaskCmd::Assignment { sub } => match sub {
                 TaskAssignmentCmd::Update {
                     assignment_id,
                     status,
                     result_event,
                     result,
+                    result_envelope_json,
+                    result_artifact_ids,
+                    result_fact_ids,
+                    evidence_refs,
                 } => {
                     cmd::task::assignment_update(
                         client,
@@ -1434,9 +2025,75 @@ async fn main() -> Result<()> {
                         status,
                         result_event,
                         result,
+                        result_envelope_json,
+                        result_artifact_ids,
+                        result_fact_ids,
+                        evidence_refs,
                     )
                     .await?
                 }
+                TaskAssignmentCmd::Context { assignment_id } => {
+                    cmd::task::assignment_context(client, assignment_id).await?
+                }
+                TaskAssignmentCmd::Preflight {
+                    assignment_id,
+                    target_key,
+                    head,
+                    effect,
+                } => {
+                    cmd::task::assignment_preflight(client, assignment_id, target_key, head, effect)
+                        .await?
+                }
+            },
+            TaskCmd::Change { sub } => match sub {
+                TaskChangeCmd::List {
+                    task_id,
+                    include_handled,
+                    after_cursor,
+                    limit,
+                } => {
+                    cmd::task::change_list(client, task_id, include_handled, after_cursor, limit)
+                        .await?
+                }
+                TaskChangeCmd::Ack {
+                    change_id,
+                    disposition,
+                    result_ref_ids,
+                    reason,
+                } => {
+                    cmd::task::change_ack(client, change_id, disposition, result_ref_ids, reason)
+                        .await?
+                }
+            },
+            TaskCmd::Workspace { sub } => match sub {
+                TaskWorkspaceCmd::Lease { sub } => match sub {
+                    TaskWorkspaceLeaseCmd::Acquire {
+                        assignment_id,
+                        resource_key,
+                        mode,
+                        ttl_seconds,
+                    } => {
+                        cmd::task::lease_acquire(
+                            client,
+                            assignment_id,
+                            resource_key,
+                            mode,
+                            ttl_seconds,
+                        )
+                        .await?
+                    }
+                    TaskWorkspaceLeaseCmd::Release { lease_id } => {
+                        cmd::task::lease_release(client, lease_id).await?
+                    }
+                    TaskWorkspaceLeaseCmd::List {
+                        resource_key,
+                        assignment_id,
+                        active_only,
+                    } => {
+                        cmd::task::lease_list(client, resource_key, assignment_id, active_only)
+                            .await?
+                    }
+                },
             },
         },
         Cmd::Spec { sub } => match sub {
@@ -1505,7 +2162,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
+        Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Event { sub } => match sub {
+            EventCmd::Get { event_id } => cmd::event::get(client, event_id).await?,
             EventCmd::List {
                 r#in,
                 channel,
@@ -1557,7 +2216,8 @@ async fn main() -> Result<()> {
                 actor_id,
                 kind,
                 display,
-            } => cmd::actor::upsert(client, actor_id, kind, display).await?,
+                capabilities_json,
+            } => cmd::actor::upsert(client, actor_id, kind, display, capabilities_json).await?,
             ActorCmd::Delete { actor_id } => cmd::actor::delete(client, actor_id).await?,
         },
         Cmd::Artifact { sub } => match sub {

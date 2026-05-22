@@ -1,71 +1,71 @@
 window.JOI_RELEASE_DOWNLOADS = {
   "version": "0.1.0",
-  "gitSha": "latest",
-  "generatedAt": "2026-05-19T04:54:08Z",
-  "group": "latest",
+  "gitSha": "41f6ce3",
+  "generatedAt": "2026-05-22T03:41:24Z",
+  "group": "joi-apps-latest",
   "artifacts": [
     {
       "fileName": "SHA256SUMS",
       "label": "SHA256 checksums",
       "kind": "checksums",
       "size": 754,
-      "sha256": "dddd80241022ce2478a374df3c714464219d7db4554a90e56581ed97de99f292",
+      "sha256": "27c0dcd64afbcdfe6c1c2d2c5439b4c3b1b07a104ab2e0ef27975d535b969356",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/SHA256SUMS"
     },
     {
       "fileName": "install.sh",
       "label": "Install script",
       "kind": "installer",
-      "size": 6413,
-      "sha256": "f0c9be6eed4a065a5d61e0ef50de8715fff42795dfd2ce09f1ea115a638fca0b",
+      "size": 6365,
+      "sha256": "800618a7d5e77026122bac07ac21f0b358e57bad42d42fa77959f4d886a5ad41",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/install.sh"
     },
     {
       "fileName": "joi-gui-0.1.0-aarch64-apple-darwin.dmg",
       "label": "aarch64-apple-darwin",
       "kind": "gui",
-      "size": 25451139,
-      "sha256": "291e6c44badd51811aec47a93578061c6c3c4b793cd7ff65230404bdbf55115c",
+      "size": 26283137,
+      "sha256": "0e8ede6a6e638875b874579b76e1103c9a91b736fb7d4a3497d9b78bd682d6ae",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/joi-gui-0.1.0-aarch64-apple-darwin.dmg"
     },
     {
       "fileName": "joi-runtime-0.1.0-aarch64-apple-darwin.tar.gz",
       "label": "aarch64-apple-darwin",
       "kind": "runtime",
-      "size": 7540277,
-      "sha256": "4ae89cbc7c3a640c60dbbf7bdcc2c65b81504fe9cab43586d21c5bfdcfd6d1eb",
+      "size": 8111535,
+      "sha256": "db06c182f056bd671c49ae5911424a9828def337f4adcb9b7dc0b354a59045d7",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/joi-runtime-0.1.0-aarch64-apple-darwin.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-aarch64-unknown-linux-musl.tar.gz",
       "label": "aarch64-unknown-linux-musl",
       "kind": "runtime",
-      "size": 7851869,
-      "sha256": "b8f53acb33e8eafb6e7dac20c4f8e81b403c332e3b36a34f58e6e285ae04dd1d",
+      "size": 8572801,
+      "sha256": "a38c455910a00730bdad2adce58faf065b53a9056f8769b1e8344636edb2d8a5",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/joi-runtime-0.1.0-aarch64-unknown-linux-musl.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-universal-apple-darwin.tar.gz",
       "label": "universal-apple-darwin",
       "kind": "runtime",
-      "size": 15584022,
-      "sha256": "aa3231e79e7b5e317670021aff720570d5b8610425c790b364cc596e8c3a8206",
+      "size": 16777642,
+      "sha256": "1cbbbf60ab59801b414bf34dbc35cfb6943752c1bdb4dc029eb087e75112df23",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/joi-runtime-0.1.0-universal-apple-darwin.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-x86_64-apple-darwin.tar.gz",
       "label": "x86_64-apple-darwin",
       "kind": "runtime",
-      "size": 8045235,
-      "sha256": "365a7f88a9d46c874308a859c6cb05d3ae827f06c84b5f823903077939e57815",
+      "size": 8665089,
+      "sha256": "a48598297261c76c2bca720bd0251fa66c45eda175c330831c9115d60c34c8ac",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/joi-runtime-0.1.0-x86_64-apple-darwin.tar.gz"
     },
     {
       "fileName": "joi-runtime-0.1.0-x86_64-unknown-linux-musl.tar.gz",
       "label": "x86_64-unknown-linux-musl",
       "kind": "runtime",
-      "size": 8230723,
-      "sha256": "facc71ce5402ad8910ec6d4679a54114cc1d2d17cae9b4d172b2461665024600",
+      "size": 8952702,
+      "sha256": "d01349751e4a5298a038faa4f77aa073b303c9d2aa9d4e31023704714a84bb16",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/joi-runtime-0.1.0-x86_64-unknown-linux-musl.tar.gz"
     },
     {
@@ -73,7 +73,7 @@ window.JOI_RELEASE_DOWNLOADS = {
       "label": "Release manifest",
       "kind": "manifest",
       "size": 398,
-      "sha256": "9ef33484578de0981aa2180b52b844e5b4f04bdb9ff8c66cc0c8a5d4b7452d43",
+      "sha256": "167eb35fd351d3b03e9be4e6a9706673f4c3ee605610148ba1111fd0adcdf700",
       "downloadUrl": "https://pre-ai.aone.alibaba-inc.com/api/v1/joi-apps-latest/manifest.txt"
     }
   ]

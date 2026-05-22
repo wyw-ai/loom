@@ -214,6 +214,313 @@ pub enum TaskAssignmentStatus {
     Canceled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRefConfidence {
+    Confirmed,
+    Inferred,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRefStatus {
+    Active,
+    Superseded,
+    Retired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRef {
+    pub id: String,
+    pub task_id: String,
+    pub channel_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub subtype: String,
+    pub value: String,
+    pub normalized: String,
+    #[serde(default)]
+    pub fields: Value,
+    pub confidence: TaskRefConfidence,
+    pub status: TaskRefStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+    pub created_by_actor_id: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskArtifactLinkStatus {
+    Active,
+    Proposal,
+    Superseded,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifactLink {
+    pub id: String,
+    pub task_id: String,
+    pub artifact_id: String,
+    #[serde(default)]
+    pub schema: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub sequence: u64,
+    pub status: TaskArtifactLinkStatus,
+    #[serde(default)]
+    pub lineage: Value,
+    #[serde(default)]
+    pub binding: Value,
+    pub created_by_actor_id: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFactType {
+    Observation,
+    Status,
+    Decision,
+    Action,
+    UserDefined,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFactStatus {
+    Active,
+    Superseded,
+    Retracted,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSnapshotCompleteness {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFact {
+    pub id: String,
+    pub task_id: String,
+    #[serde(default)]
+    pub target_key: String,
+    pub kind: String,
+    #[serde(default = "default_task_fact_type")]
+    pub fact_type: TaskFactType,
+    #[serde(default)]
+    pub subject: Value,
+    pub signature: String,
+    pub status: TaskFactStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retracted_by: Option<String>,
+    #[serde(default)]
+    pub authority: String,
+    #[serde(default)]
+    pub authority_binding: Value,
+    pub observed_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_updated_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_completeness: Option<TaskSnapshotCompleteness>,
+    pub producer_id: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub payload_schema: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+fn default_task_fact_type() -> TaskFactType {
+    TaskFactType::UserDefined
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskProjectionHealth {
+    Fresh,
+    Stale,
+    Missing,
+    Invalid,
+    RepairRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjection {
+    pub id: String,
+    pub task_id: String,
+    #[serde(default)]
+    pub projection_type: String,
+    pub producer_actor_id: String,
+    pub health: TaskProjectionHealth,
+    #[serde(default)]
+    pub watermark: Value,
+    #[serde(default)]
+    pub payload_schema: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskChangeType {
+    Fact,
+    Projection,
+    Assignment,
+    ArtifactLink,
+    Lease,
+    Action,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskChange {
+    pub id: String,
+    pub cursor: u64,
+    pub task_id: String,
+    pub change_type: TaskChangeType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<String>,
+    pub signature: String,
+    #[serde(default)]
+    pub summary: String,
+    pub occurred_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub requires_ack: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskChangeDeliveryStatus {
+    Pending,
+    Processing,
+    Handled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskChangeAckDisposition {
+    AssignmentCreated,
+    AssignmentReused,
+    ActionRequested,
+    FactWritten,
+    ArtifactWritten,
+    ProjectionRepaired,
+    Blocked,
+    NoopRecorded,
+    Escalated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskChangeDelivery {
+    pub change: TaskChange,
+    pub recipient_actor_id: String,
+    pub status: TaskChangeDeliveryStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<TaskChangeAckDisposition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_ref_ids: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceLeaseMode {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceLeaseStatus {
+    Active,
+    Released,
+    Expired,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLease {
+    pub id: String,
+    pub resource_key: String,
+    pub holder_assignment_id: String,
+    pub holder_actor_id: String,
+    pub mode: WorkspaceLeaseMode,
+    pub status: WorkspaceLeaseStatus,
+    pub expires_at: Timestamp,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPreflightResult {
+    pub assignment_id: String,
+    pub allowed: bool,
+    pub checked_at: Timestamp,
+    #[serde(default)]
+    pub target_key: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub effect: String,
+    pub guards: Value,
+    #[serde(default)]
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -226,6 +533,10 @@ pub struct Task {
     /// Thread attached to `source_event_id`; all progress and handoff
     /// discussion should return here.
     pub canonical_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_source_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     pub title: String,
     #[serde(default)]
     pub description: String,
@@ -239,6 +550,8 @@ pub struct Task {
     pub artifact_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignment_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub practice_contract_epoch: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
@@ -261,6 +574,20 @@ pub struct TaskAssignment {
     pub result_event_id: Option<String>,
     #[serde(default)]
     pub result_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_fact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_envelope: Option<Value>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
@@ -474,7 +801,7 @@ pub struct PageInfo {
 // ---- common payload helpers ----
 
 pub mod payload {
-    use super::Meta;
+    use super::{Meta, Timestamp};
     use serde::{Deserialize, Serialize};
 
     /// Payload for `content.add`.
@@ -509,6 +836,18 @@ pub mod payload {
         pub description: String,
         #[serde(default)]
         pub choices: Vec<ActionChoice>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub decision_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub blocks_assignment_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub conversion_owner_actor_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expires_at: Option<Timestamp>,
     }
 
     /// Payload for `action.response`.

@@ -12,6 +12,8 @@ export interface InboxItem {
   command?: string;
   rawInput?: string;
   actionRequestId?: string;
+  taskId?: string;
+  targetKey?: string;
   choices: ActionChoice[];
   arrivedAt: string;
   seen: boolean;

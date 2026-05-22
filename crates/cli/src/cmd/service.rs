@@ -457,13 +457,18 @@ mod service_spec_loader_tests {
     fn load_real_data_services_preserves_top_level_params_schema() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/services");
         let specs = load_specs(&dir).expect("load data/services specs");
-        let bug_fix_loop = specs
+        let spec_with_schema = specs
             .iter()
-            .find(|spec| spec.id == "a1-bug-fix-loop")
-            .expect("a1-bug-fix-loop spec");
+            .find(|spec| {
+                spec.params_schema
+                    .as_ref()
+                    .and_then(|schema| schema.get("required"))
+                    .is_some()
+            })
+            .expect("at least one service spec with required params_schema");
 
         assert!(
-            bug_fix_loop
+            spec_with_schema
                 .params_schema
                 .as_ref()
                 .and_then(|schema| schema.get("required"))

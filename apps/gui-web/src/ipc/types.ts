@@ -107,6 +107,8 @@ export interface Task {
   channelId: string;
   sourceEventId: string;
   canonicalThreadId: string;
+  parentSourceEventId?: string | null;
+  parentTaskId?: string | null;
   title: string;
   description: string;
   requesterActorId: string;
@@ -115,6 +117,7 @@ export interface Task {
   resultSummary: string;
   artifactIds?: string[];
   assignmentIds?: string[];
+  practiceContractEpoch?: string | null;
   createdAt: string;
   updatedAt: string;
   _meta?: Record<string, unknown>;
@@ -130,9 +133,158 @@ export interface TaskAssignment {
   status: TaskAssignmentStatus;
   resultEventId?: string | null;
   resultSummary: string;
+  contract?: unknown;
+  idempotencyKey?: string | null;
+  leaseId?: string | null;
+  resultArtifactIds?: string[];
+  resultFactIds?: string[];
+  evidenceRefs?: string[];
+  resultEnvelope?: unknown;
   createdAt: string;
   updatedAt: string;
   _meta?: Record<string, unknown>;
+}
+
+export type TaskRefConfidence = "confirmed" | "inferred";
+export type TaskRefStatus = "active" | "superseded" | "retired";
+
+export interface TaskRef {
+  id: string;
+  taskId: string;
+  channelId: string;
+  kind: string;
+  subtype: string;
+  value: string;
+  normalized: string;
+  fields?: unknown;
+  confidence: TaskRefConfidence;
+  status: TaskRefStatus;
+  supersededBy?: string | null;
+  sourceEventId?: string | null;
+  createdByActorId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TaskArtifactLinkStatus = "active" | "proposal" | "superseded" | "rejected";
+
+export interface TaskArtifactLink {
+  id: string;
+  taskId: string;
+  artifactId: string;
+  schema: string;
+  role: string;
+  sequence: number;
+  status: TaskArtifactLinkStatus;
+  lineage?: unknown;
+  binding?: unknown;
+  createdByActorId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TaskFactStatus = "active" | "superseded" | "retracted" | "conflict";
+export type TaskFactType = "observation" | "status" | "decision" | "action" | "user_defined";
+
+export interface TaskFact {
+  id: string;
+  taskId: string;
+  targetKey: string;
+  kind: string;
+  factType: TaskFactType;
+  signature: string;
+  status: TaskFactStatus;
+  authority?: string;
+  authorityBinding?: unknown;
+  observedFields?: string[];
+  unobservedFields?: string[];
+  unavailableReason?: string | null;
+  snapshotCompleteness?: "complete" | "partial" | "unknown" | null;
+  producerId: string;
+  summary: string;
+  payloadSchema?: string;
+  payload?: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TaskProjectionHealth =
+  | "fresh"
+  | "stale"
+  | "missing"
+  | "invalid"
+  | "repair_required";
+
+export interface TaskProjection {
+  id: string;
+  taskId: string;
+  projectionType: string;
+  producerActorId: string;
+  health: TaskProjectionHealth;
+  watermark?: unknown;
+  payloadSchema?: string;
+  payload?: unknown;
+  updatedAt: string;
+}
+
+export type TaskChangeDeliveryStatus = "pending" | "processing" | "handled" | "failed";
+export type TaskChangeAckDisposition =
+  | "assignment_created"
+  | "assignment_reused"
+  | "action_requested"
+  | "fact_written"
+  | "artifact_written"
+  | "projection_repaired"
+  | "blocked"
+  | "noop_recorded"
+  | "escalated";
+
+export interface TaskChangeDelivery {
+  change: {
+    id: string;
+    cursor: number;
+    taskId: string;
+    changeType: string;
+    sourceIds?: string[];
+    signature: string;
+    summary: string;
+    occurredAt: string;
+    recipients?: string[];
+    requiresAck: boolean;
+  };
+  recipientActorId: string;
+  status: TaskChangeDeliveryStatus;
+  disposition?: TaskChangeAckDisposition | null;
+  resultRefIds?: string[];
+  reason?: string;
+  ackedAt?: string | null;
+}
+
+export type ActorDeliveryState = "pending" | "delivered" | "failed";
+
+export interface Delivery {
+  eventId: string;
+  actorId: string;
+  state: ActorDeliveryState;
+  updatedAt: string;
+  _meta?: Record<string, unknown>;
+}
+
+export interface DeliveryListEntry {
+  delivery: Delivery;
+  event?: JoiEvent | null;
+}
+
+export interface WorkspaceLease {
+  id: string;
+  resourceKey: string;
+  holderAssignmentId: string;
+  holderActorId: string;
+  mode: "read" | "write";
+  status: "active" | "released" | "expired" | "canceled";
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type ArtifactKind = "file" | "directory";

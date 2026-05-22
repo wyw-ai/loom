@@ -12,6 +12,7 @@ pub mod event;
 pub mod handoff;
 pub mod mcp_announcement;
 pub mod mcp_memory;
+pub mod memory;
 pub mod message;
 pub mod reload;
 pub mod reminder;

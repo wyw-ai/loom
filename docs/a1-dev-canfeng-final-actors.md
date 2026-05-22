@@ -1,6 +1,10 @@
 # a1-dev-canfeng 最终 Actor 分工
 
-> 状态：当前生效方案。本文定义 a1-dev-canfeng 自动化开发闭环的角色边界、状态机和升级规则。
+> 状态：Legacy / Superseded。本文是上一阶段 thread + `runtime-tools` 编排方案的历史材料，不再作为新版终态实现依据。新版终态以 `docs/a1-dev-actor-memory-operating-architecture.md` 为准。
+>
+> 本文中的 `start-discovery.sh`、`start-delivery.sh`、独立 discovery/delivery thread 状态机、mr-watcher 直接推进 handoff 等规则，只能作为迁移输入或 bad/normal case 校准材料；新实现必须使用 Joi-native Task、canonical thread、TaskRef、TaskArtifactLink、TaskFact、TaskProjection、TaskAssignmentContract 和 action.request/action.response。
+
+> 原状态：当前生效方案。现在仅保留为历史参考，帮助识别旧方案迁移遗留。
 
 ## 目标
 

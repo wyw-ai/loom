@@ -4,72 +4,48 @@
   "actor": {
     "id": "svc_a1_bug_fix_loop",
     "kind": "service",
-    "displayName": "A1 Bug Fix Loop"
-  },
-  "autostart": false,
-  "lifecycle": "thread_bound",
-  "bind": {
-    "scope": "thread",
-    "auto_stop_on": [
-      "thread.closed",
-      "service.self_complete"
-    ]
-  },
-  "params_schema": {
-    "required": [
-      "channel_id",
-      "scanner_thread_id"
-    ],
-    "properties": {
-      "channel_id": {
-        "type": "string"
-      },
-      "scanner_thread_id": {
-        "type": "string"
-      },
-      "concurrency": {
-        "type": "integer",
-        "default": 1
-      }
+    "displayName": "A1 Bug Fix Loop",
+    "capabilities": {
+      "capabilities": [
+        "feedback.read",
+        "task.candidate.emit",
+        "task.ref.find"
+      ],
+      "revision": "a1-bug-fix-loop@2026-05-19"
     }
   },
+  "autostart": false,
+  "channelId": "chan_31f8fa85d909",
   "config": {
     "jobs": [
       {
-        "id": "tick",
+        "id": "tick-candidates",
         "schedule": "*/5 * * * *",
         "source": {
           "kind": "command",
-          "command": "bash",
+          "command": "python3",
           "args": [
-            "{spec.dir}/bundle/tick.sh",
-            "--state-dir",
-            "{instance.data_dir}",
-            "--channel-id",
-            "{params.channel_id}",
-            "--scanner-thread-id",
-            "{params.scanner_thread_id}",
-            "--loop-thread-id",
-            "{thread.id}",
-            "--concurrency",
-            "{params.concurrency}"
+            "{spec.dir}/bundle/tick-native.py"
           ],
           "timeoutMs": 180000
         },
         "scope": {
-          "kind": "thread",
-          "id": "{thread.id}",
-          "channelId": "{channel.id}"
+          "kind": "channel",
+          "id": "chan_31f8fa85d909"
         },
-        "dedupeBy": "source_event_id",
+        "dedupeBy": "payload_hash",
         "cursorBy": "body_hash",
-        "singleInFlight": true,
-        "emit": {
-          "mode": "artifact_per_json_line",
-          "artifactNameTemplate": "bug-fix-loop-status-{tick_id}.json",
-          "statusEventType": "status.update"
-        }
+        "singleInFlight": true
       }
-    ]
+    ],
+    "contract": {
+      "role": "feedback/workitem queue candidate adapter",
+      "doesNotMaintain": [
+        "separate task state",
+        "root cause",
+        "delivery assignment"
+      ],
+      "candidateMode": "router owns TaskRef binding and task creation"
+    }
   }
 }

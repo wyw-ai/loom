@@ -16,10 +16,11 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
 | --- | --- | --- | --- | --- |
 | `repo-cache`      | scheduler   | channel-level | cron `*/15 * * * *` | 仓库镜像（本地缓存） |
 | `repo-notes`      | command     | channel-level | 手动子命令           | a1 kbase 仓库笔记 |
-| `mr-detector`     | scheduler   | thread-bound  | cron + 自我完成      | `mr-event-*.json`（artifact-contracts §6） |
-| `a1-bug-fix-loop` | scheduler   | thread-bound on `bug-scan-desk` | cron `*/5 * * * *`  | bugfix loop status artifact |
-| `feedback-scanner` | scheduler  | channel-level | remote-managed placeholder | feedback scanner service actor |
-| `mr-watcher`      | scheduler   | thread-bound  | per delivery thread `poll.py --thread-id` | MR watcher service actor |
+| `a1-bug-fix-loop` | scheduler   | channel-level | cron `*/5 * * * *`  | feedback/workitem candidate event |
+| `feedback-scanner` | scheduler  | channel-level | cron `*/5 * * * *` | feedback candidate event |
+| `mr-watcher`      | scheduler   | task-aware thread-bound | confirmed task MR poll | `TaskFact target.observed`；无 task id 时只发 candidate event |
+| `task-projection` | scheduler   | task-aware thread-bound | task facts/artifacts changed | `task-summary.v1` projection |
+| `a1-side-effect-gateway` | scheduler | task-aware thread-bound | 高风险外部写前 | assignment preflight gate |
 
 > Thread bootstrap（按 clone-manifest 准备 thread workspace 仓库目录）由
 > `joi thread create --bootstrap-artifact` 通过 §4.2.1 mounts 投影完成；
@@ -46,13 +47,17 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
   `{"service.self_complete":true,"reason":"..."}`，host（p4a 落地）会把它转成
   `service.self_complete` 事件并停掉对应实例。
 - 产出 artifact 的形状统一对齐 `docs/artifact-contracts.md`。
+- a1-dev-canfeng 的新版生产路径禁止依赖旧版自动开发 runtime。旧目录可以作为迁移材料保留，但 ServiceSpec 不再指向它。
 
 ## 离线冒烟
 
 ```sh
 # scheduler 类
 data/services/repo-cache/bundle/sync.sh --dry-run
-data/services/mr-detector/bundle/poll.sh --dry-run
+data/services/mr-watcher/bundle/poll.py --dry-run
+data/services/feedback-scanner/bundle/scan.py --dry-run
+data/services/a1-bug-fix-loop/bundle/tick-native.py --dry-run
+data/services/a1-side-effect-gateway/bundle/preflight-exec.sh --assignment-id asgn_test --target-key repo:test --head head --effect repo.push --dry-run
 
 # command 类
 data/services/repo-notes/bundle/pull.sh --dry-run

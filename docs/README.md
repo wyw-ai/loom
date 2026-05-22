@@ -17,6 +17,9 @@
 
 - [channel-topology-design.md](./channel-topology-design.md) —— a1-dev-canfeng / classroom 两个生产 channel 的职责切分、thread 拓扑、actor 配置、工作流
 - [a1-dev-canfeng-final-actors.md](./a1-dev-canfeng-final-actors.md) —— a1-dev-canfeng 当前生效的最终 actor 分工、状态机、审查 gate 和 MR 推进规则
+- [a1-dev-canfeng-badcases.md](./a1-dev-canfeng-badcases.md) —— a1-dev-canfeng 真实任务 bad case 样本，用于后续推演
+- [a1-dev-canfeng-normalcases.md](./a1-dev-canfeng-normalcases.md) —— a1-dev-canfeng 真实任务 normal case 样本，用于后续推演
+- [a1-dev-actor-memory-operating-architecture.md](./a1-dev-actor-memory-operating-architecture.md) —— a1-dev-canfeng 下一版 actor / 研发规范 / Joi memory 终态运行架构
 - [a1-dev-engineering-standards-agent-scope.md](./a1-dev-engineering-standards-agent-scope.md) —— 研发规范员 actor、debug playbook、validation-plan / validation-evidence 的改动范围
 - [examiner-actor-design.md](./examiner-actor-design.md) —— a1-dev-canfeng 审查员 actor 设计：五件套审查、MR 审查、终态策略和 handoff 边界
 - [artifact-contracts.md](./artifact-contracts.md) —— 跨 actor 的 artifact JSON schema 与契约

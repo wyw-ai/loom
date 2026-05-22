@@ -29,13 +29,32 @@ pub mod method {
     pub const TASK_GET: &str = "task/get";
     pub const TASK_LIST: &str = "task/list";
     pub const TASK_UPDATE: &str = "task/update";
+    pub const TASK_REF_ATTACH: &str = "task/ref.attach";
+    pub const TASK_REF_FIND: &str = "task/ref.find";
+    pub const TASK_REF_LIST: &str = "task/ref.list";
+    pub const TASK_ARTIFACT_ATTACH: &str = "task/artifact.attach";
+    pub const TASK_ARTIFACT_ACTIVATE: &str = "task/artifact.activate";
+    pub const TASK_ARTIFACT_LIST: &str = "task/artifact.list";
+    pub const TASK_FACT_APPEND: &str = "task/fact.append";
+    pub const TASK_FACT_LIST: &str = "task/fact.list";
+    pub const TASK_PROJECTION_PUT: &str = "task/projection.put";
+    pub const TASK_PROJECTION_GET: &str = "task/projection.get";
+    pub const TASK_PROJECTION_LIST: &str = "task/projection.list";
     pub const TASK_ASSIGNMENT_CREATE: &str = "task/assignment.create";
     pub const TASK_ASSIGNMENT_UPDATE: &str = "task/assignment.update";
+    pub const TASK_ASSIGNMENT_CONTEXT: &str = "task/assignment.context";
+    pub const TASK_ASSIGNMENT_PREFLIGHT: &str = "task/assignment.preflight";
+    pub const TASK_CHANGE_LIST: &str = "task/change.list";
+    pub const TASK_CHANGE_ACK: &str = "task/change.ack";
+    pub const TASK_WORKSPACE_LEASE_ACQUIRE: &str = "task/workspace.lease.acquire";
+    pub const TASK_WORKSPACE_LEASE_RELEASE: &str = "task/workspace.lease.release";
+    pub const TASK_WORKSPACE_LEASE_LIST: &str = "task/workspace.lease.list";
     pub const TURN_OPEN: &str = "turn/open";
     pub const TURN_CLOSE: &str = "turn/close";
     pub const TURN_TRACE_READ: &str = "turn/trace.read";
     pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
     pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
+    pub const EVENT_GET: &str = "event/get";
     pub const EVENT_APPEND: &str = "event/append";
     pub const MESSAGE_SEARCH: &str = "message/search";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
@@ -205,6 +224,19 @@ fn default_limit() -> u32 {
 pub struct ScopeReadResult {
     pub events: Vec<Event>,
     pub page_info: PageInfo,
+}
+
+// ---- event/get ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventGetParams {
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventGetResult {
+    pub event: Event,
 }
 
 // ---- channel/create ----
@@ -392,6 +424,12 @@ pub struct TaskCreateParams {
     pub owner_actor_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_source_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub practice_contract_epoch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +448,14 @@ pub struct TaskGetResult {
     pub task: Task,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignments: Vec<TaskAssignment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<TaskRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_links: Vec<TaskArtifactLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<TaskFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projections: Vec<TaskProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -451,6 +497,244 @@ pub struct TaskUpdateResult {
     pub task: Task,
 }
 
+// ---- task refs / artifacts / facts / projections ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRefAttachParams {
+    pub task_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub subtype: String,
+    pub value: String,
+    #[serde(default)]
+    pub normalized: String,
+    #[serde(default)]
+    pub fields: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<TaskRefConfidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskRefStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRefAttachResult {
+    pub task_ref: TaskRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRefFindParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub subtype: String,
+    pub normalized: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<TaskRefConfidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskRefStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRefFindResult {
+    pub refs: Vec<TaskRef>,
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRefListParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRefListResult {
+    pub refs: Vec<TaskRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifactAttachParams {
+    pub task_id: String,
+    pub artifact_id: String,
+    #[serde(default)]
+    pub schema: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskArtifactLinkStatus>,
+    #[serde(default)]
+    pub lineage: Value,
+    #[serde(default)]
+    pub binding: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskArtifactAttachResult {
+    pub link: TaskArtifactLink,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifactActivateParams {
+    pub link_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersede_link_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskArtifactActivateResult {
+    pub link: TaskArtifactLink,
+    pub superseded: Vec<TaskArtifactLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifactListParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskArtifactLinkStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskArtifactListResult {
+    pub links: Vec<TaskArtifactLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFactAppendParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub target_key: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_type: Option<TaskFactType>,
+    #[serde(default)]
+    pub subject: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskFactStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retracted_by: Option<String>,
+    #[serde(default)]
+    pub authority: String,
+    #[serde(default)]
+    pub authority_binding: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_updated_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_completeness: Option<TaskSnapshotCompleteness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<String>,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub payload_schema: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskFactAppendResult {
+    pub fact: TaskFact,
+    #[serde(default)]
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFactListParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskFactStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskFactListResult {
+    pub facts: Vec<TaskFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionPutParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub projection_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<TaskProjectionHealth>,
+    #[serde(default)]
+    pub watermark: Value,
+    #[serde(default)]
+    pub payload_schema: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProjectionPutResult {
+    pub projection: TaskProjection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionGetParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub projection_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProjectionGetResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<TaskProjection>,
+    pub health: TaskProjectionHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectionListParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProjectionListResult {
+    pub projections: Vec<TaskProjection>,
+}
+
 // ---- task assignment ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +747,10 @@ pub struct TaskAssignmentCreateParams {
     #[serde(rename = "type")]
     pub assignment_type: TaskAssignmentType,
     pub instruction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,12 +771,140 @@ pub struct TaskAssignmentUpdateParams {
     pub result_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_envelope: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_artifact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_fact_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAssignmentUpdateResult {
     pub assignment: TaskAssignment,
     pub task: Task,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignmentContextParams {
+    pub assignment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAssignmentContextResult {
+    pub task: Task,
+    pub assignment: TaskAssignment,
+    pub refs: Vec<TaskRef>,
+    pub artifact_links: Vec<TaskArtifactLink>,
+    pub facts: Vec<TaskFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<TaskProjection>,
+    pub guards: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignmentPreflightParams {
+    pub assignment_id: String,
+    #[serde(default)]
+    pub target_key: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub effect: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAssignmentPreflightResult {
+    pub preflight: TaskPreflightResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskChangeListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub include_handled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_cursor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskChangeListResult {
+    pub deliveries: Vec<TaskChangeDelivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskChangeAckParams {
+    pub change_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_actor_id: Option<String>,
+    pub disposition: TaskChangeAckDisposition,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_ref_ids: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskChangeAckResult {
+    pub delivery: TaskChangeDelivery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLeaseAcquireParams {
+    pub assignment_id: String,
+    pub resource_key: String,
+    pub mode: WorkspaceLeaseMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLeaseAcquireResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<WorkspaceLease>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<WorkspaceLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLeaseReleaseParams {
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLeaseReleaseResult {
+    pub lease: WorkspaceLease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLeaseListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<String>,
+    #[serde(default)]
+    pub active_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLeaseListResult {
+    pub leases: Vec<WorkspaceLease>,
 }
 
 // ---- turn/open / close ----

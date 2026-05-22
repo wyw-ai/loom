@@ -82,14 +82,39 @@ pub async fn dispatch(
         method::TASK_GET => task_get(state, connection_id, params),
         method::TASK_LIST => task_list(state, connection_id, params),
         method::TASK_UPDATE => task_update(state, connection_id, params),
+        method::TASK_REF_ATTACH => task_ref_attach(state, connection_id, params),
+        method::TASK_REF_FIND => task_ref_find(state, connection_id, params),
+        method::TASK_REF_LIST => task_ref_list(state, connection_id, params),
+        method::TASK_ARTIFACT_ATTACH => task_artifact_attach(state, connection_id, params),
+        method::TASK_ARTIFACT_ACTIVATE => task_artifact_activate(state, connection_id, params),
+        method::TASK_ARTIFACT_LIST => task_artifact_list(state, connection_id, params),
+        method::TASK_FACT_APPEND => task_fact_append(state, connection_id, params),
+        method::TASK_FACT_LIST => task_fact_list(state, connection_id, params),
+        method::TASK_PROJECTION_PUT => task_projection_put(state, connection_id, params),
+        method::TASK_PROJECTION_GET => task_projection_get(state, connection_id, params),
+        method::TASK_PROJECTION_LIST => task_projection_list(state, connection_id, params),
         method::TASK_ASSIGNMENT_CREATE => {
             task_assignment_create(state, connection_id, params).await
         }
         method::TASK_ASSIGNMENT_UPDATE => task_assignment_update(state, connection_id, params),
+        method::TASK_ASSIGNMENT_CONTEXT => task_assignment_context(state, connection_id, params),
+        method::TASK_ASSIGNMENT_PREFLIGHT => {
+            task_assignment_preflight(state, connection_id, params)
+        }
+        method::TASK_CHANGE_LIST => task_change_list(state, connection_id, params),
+        method::TASK_CHANGE_ACK => task_change_ack(state, connection_id, params),
+        method::TASK_WORKSPACE_LEASE_ACQUIRE => {
+            workspace_lease_acquire(state, connection_id, params)
+        }
+        method::TASK_WORKSPACE_LEASE_RELEASE => {
+            workspace_lease_release(state, connection_id, params)
+        }
+        method::TASK_WORKSPACE_LEASE_LIST => workspace_lease_list(state, connection_id, params),
         method::TURN_OPEN => turn_open(state, params),
         method::TURN_CLOSE => turn_close(state, connection_id, params).await,
         method::TURN_TRACE_READ => turn_trace_read(state, connection_id, params),
         method::TURN_TRACE_APPEND => turn_trace_append(state, connection_id, params),
+        method::EVENT_GET => event_get(state, connection_id, params),
         method::EVENT_APPEND => event_append(state, params).await,
         method::MESSAGE_SEARCH => message_search(state, connection_id, params),
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
@@ -278,6 +303,20 @@ fn scope_read(state: &AppState, connection_id: &str, params: Option<Value>) -> H
             _meta: None,
         },
     })
+}
+
+fn event_get(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: EventGetParams = parse_params(params)?;
+    let actor_id = caller_actor(state, connection_id)?;
+    let event = state
+        .store
+        .get_event(&p.event_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "event"))?;
+    state
+        .store
+        .check_scope_access(&event.scope, &actor_id)
+        .map_err(map_store_err)?;
+    ok(EventGetResult { event })
 }
 
 /// Look up the actor id bound to this connection. All ACL gates rely on
@@ -646,6 +685,9 @@ fn task_create(state: &AppState, connection_id: &str, params: Option<Value>) -> 
             requester,
             p.owner_actor_id,
             p.status,
+            p.parent_source_event_id,
+            p.parent_task_id,
+            p.practice_contract_epoch,
         )
         .map_err(map_store_err)?;
     ok(TaskCreateResult { task })
@@ -660,7 +702,18 @@ fn task_get(state: &AppState, connection_id: &str, params: Option<Value>) -> Han
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
     ensure_task_access(state, &task, &caller)?;
     let assignments = state.store.list_task_assignments(&task.id);
-    ok(TaskGetResult { task, assignments })
+    let refs = state.store.list_task_refs(&task.id);
+    let artifact_links = state.store.list_task_artifact_links(&task.id, None);
+    let facts = state.store.list_task_facts(&task.id, None, None, None);
+    let projections = state.store.list_task_projections(&task.id);
+    ok(TaskGetResult {
+        task,
+        assignments,
+        refs,
+        artifact_links,
+        facts,
+        projections,
+    })
 }
 
 fn task_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -710,6 +763,277 @@ fn task_update(state: &AppState, connection_id: &str, params: Option<Value>) -> 
     ok(TaskUpdateResult { task })
 }
 
+fn task_ref_attach(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskRefAttachParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let task_ref = state
+        .store
+        .attach_task_ref(
+            &p.task_id,
+            p.kind,
+            p.subtype,
+            p.value,
+            p.normalized,
+            p.fields,
+            p.confidence.unwrap_or(TaskRefConfidence::Inferred),
+            p.status.unwrap_or(TaskRefStatus::Active),
+            p.superseded_by,
+            p.source_event_id,
+            caller,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskRefAttachResult { task_ref })
+}
+
+fn task_ref_find(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskRefFindParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if let Some(channel_id) = p.channel_id.as_ref() {
+        if !state.store.is_channel_member(channel_id, &caller) {
+            return Err(ErrorObject::new(
+                ErrorCode::APP_INVALID_STATE,
+                format!("actor {caller} cannot find refs in channel {channel_id}"),
+            ));
+        }
+    }
+    let (refs, tasks) = state.store.find_task_refs(
+        p.channel_id.as_deref(),
+        &p.kind,
+        &p.subtype,
+        &p.normalized,
+        p.confidence,
+        p.status,
+    );
+    let refs: Vec<TaskRef> = refs
+        .into_iter()
+        .filter(|r| state.store.is_channel_member(&r.channel_id, &caller))
+        .collect();
+    let tasks: Vec<Task> = tasks
+        .into_iter()
+        .filter(|task| state.store.is_channel_member(&task.channel_id, &caller))
+        .collect();
+    ok(TaskRefFindResult { refs, tasks })
+}
+
+fn task_ref_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskRefListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    ok(TaskRefListResult {
+        refs: state.store.list_task_refs(&p.task_id),
+    })
+}
+
+fn task_artifact_attach(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskArtifactAttachParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let link = state
+        .store
+        .attach_task_artifact_link(
+            &p.task_id,
+            p.artifact_id,
+            p.schema,
+            p.role,
+            p.sequence,
+            p.status.unwrap_or(TaskArtifactLinkStatus::Active),
+            p.lineage,
+            p.binding,
+            caller,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskArtifactAttachResult { link })
+}
+
+fn task_artifact_activate(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskArtifactActivateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let link = state
+        .store
+        .get_task_artifact_link(&p.link_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "artifact link"))?;
+    let task = state
+        .store
+        .get_task(&link.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let (link, superseded) = state
+        .store
+        .activate_task_artifact_link(&p.link_id, p.supersede_link_ids)
+        .map_err(map_store_err)?;
+    ok(TaskArtifactActivateResult { link, superseded })
+}
+
+fn task_artifact_list(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskArtifactListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    ok(TaskArtifactListResult {
+        links: state.store.list_task_artifact_links(&p.task_id, p.status),
+    })
+}
+
+fn task_fact_append(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskFactAppendParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let (fact, created) = state
+        .store
+        .append_task_fact(
+            &p.task_id,
+            p.target_key,
+            p.kind,
+            p.fact_type.unwrap_or(TaskFactType::UserDefined),
+            p.subject,
+            p.signature,
+            p.status.unwrap_or(TaskFactStatus::Active),
+            p.replaces,
+            p.retracted_by,
+            p.authority,
+            p.authority_binding,
+            p.observed_at,
+            p.source_cursor,
+            p.source_snapshot_id,
+            p.external_updated_at,
+            p.observed_fields,
+            p.unobserved_fields,
+            p.unavailable_reason,
+            p.snapshot_completeness,
+            p.producer_id.unwrap_or(caller),
+            p.summary,
+            p.raw_refs,
+            p.artifact_id,
+            p.payload_schema,
+            p.payload,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskFactAppendResult { fact, created })
+}
+
+fn task_fact_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskFactListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    ok(TaskFactListResult {
+        facts: state.store.list_task_facts(
+            &p.task_id,
+            p.kind.as_deref(),
+            p.status,
+            p.target_key.as_deref(),
+        ),
+    })
+}
+
+fn task_projection_put(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskProjectionPutParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let projection = state
+        .store
+        .put_task_projection(
+            &p.task_id,
+            if p.projection_type.trim().is_empty() {
+                "summary".to_string()
+            } else {
+                p.projection_type
+            },
+            p.producer_actor_id.unwrap_or(caller),
+            p.health.unwrap_or(TaskProjectionHealth::Fresh),
+            p.watermark,
+            p.payload_schema,
+            p.payload,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskProjectionPutResult { projection })
+}
+
+fn task_projection_get(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskProjectionGetParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let projection_type = if p.projection_type.trim().is_empty() {
+        "summary"
+    } else {
+        p.projection_type.as_str()
+    };
+    let projection = state.store.get_task_projection(&p.task_id, projection_type);
+    let health = projection
+        .as_ref()
+        .map(|p| p.health)
+        .unwrap_or(TaskProjectionHealth::Missing);
+    ok(TaskProjectionGetResult { projection, health })
+}
+
+fn task_projection_list(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskProjectionListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let task = state
+        .store
+        .get_task(&p.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    ok(TaskProjectionListResult {
+        projections: state.store.list_task_projections(&p.task_id),
+    })
+}
+
 async fn task_assignment_create(
     state: &AppState,
     connection_id: &str,
@@ -723,7 +1047,7 @@ async fn task_assignment_create(
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
     ensure_task_access(state, &task, &caller)?;
     let from = p.from_actor_id.unwrap_or(caller);
-    let (assignment, task) = state
+    let (assignment, task, _created) = state
         .store
         .create_task_assignment(
             &p.task_id,
@@ -731,19 +1055,21 @@ async fn task_assignment_create(
             p.to_actor_id.clone(),
             p.assignment_type,
             p.instruction.clone(),
+            p.contract.clone(),
+            p.idempotency_key,
         )
         .map_err(map_store_err)?;
 
     let event = state
         .store
-        .append_event(
+        .ensure_assignment_handoff_event(
+            &assignment.id,
             "content.add".into(),
-            from,
+            assignment.from_actor_id.clone(),
             ScopeRef {
                 kind: ScopeKind::Thread,
                 id: task.canonical_thread_id.clone(),
             },
-            None,
             json!({
                 "contentType": "text/markdown",
                 "text": task_assignment_message(&task, &assignment),
@@ -752,7 +1078,8 @@ async fn task_assignment_create(
                     "taskNumber": task.number,
                     "assignmentId": assignment.id,
                     "assignmentType": assignment.assignment_type,
-                    "expectedOutput": "Update the assignment result and reply in this task thread."
+                    "assignmentContract": assignment.contract.clone(),
+                    "expectedOutput": "Read assignment-context, publish typed outputs/facts, then complete this assignment with task/assignment.update."
                 }
             }),
             vec![
@@ -811,6 +1138,16 @@ fn task_assignment_update(
         .get_task(&assignment.task_id)
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
     ensure_task_access(state, &task, &caller)?;
+    let is_owner = task.owner_actor_id.as_deref() == Some(caller.as_str());
+    if caller != assignment.to_actor_id && caller != assignment.from_actor_id && !is_owner {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot update assignment {} owned by {}",
+                assignment.id, assignment.to_actor_id
+            ),
+        ));
+    }
     let (assignment, task) = state
         .store
         .update_task_assignment(
@@ -818,12 +1155,201 @@ fn task_assignment_update(
             requested_status,
             p.result_event_id,
             p.result_summary,
+            p.result_envelope,
+            p.result_artifact_ids,
+            p.result_fact_ids,
+            p.evidence_refs,
         )
         .map_err(map_store_err)?;
     if requested_status.is_some_and(is_terminal_assignment_status) {
         emit_assignment_return_handoff(state, &caller, &task, &assignment);
     }
     ok(TaskAssignmentUpdateResult { assignment, task })
+}
+
+fn task_assignment_context(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskAssignmentContextParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let (task, assignment, refs, artifact_links, facts, projection, guards) = state
+        .store
+        .assignment_context(&p.assignment_id)
+        .map_err(map_store_err)?;
+    ensure_task_access(state, &task, &caller)?;
+    ok(TaskAssignmentContextResult {
+        task,
+        assignment,
+        refs,
+        artifact_links,
+        facts,
+        projection,
+        guards,
+    })
+}
+
+fn task_assignment_preflight(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: TaskAssignmentPreflightParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let assignment = state
+        .store
+        .get_assignment(&p.assignment_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "assignment"))?;
+    let task = state
+        .store
+        .get_task(&assignment.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    if caller != assignment.to_actor_id && caller != assignment.from_actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot preflight assignment {} owned by {}",
+                assignment.id, assignment.to_actor_id
+            ),
+        ));
+    }
+    let preflight = state
+        .store
+        .assignment_preflight(&p.assignment_id, p.target_key, p.head, p.effect)
+        .map_err(map_store_err)?;
+    ok(TaskAssignmentPreflightResult { preflight })
+}
+
+fn task_change_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskChangeListParams = parse_params(params).unwrap_or_default();
+    let caller = caller_actor(state, connection_id)?;
+    let recipient = p.recipient_actor_id.unwrap_or(caller.clone());
+    if recipient != caller {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot list task changes for {recipient}"),
+        ));
+    }
+    let deliveries = state.store.list_task_changes(
+        &recipient,
+        p.task_id.as_deref(),
+        p.include_handled,
+        p.after_cursor,
+        p.limit,
+    );
+    ok(TaskChangeListResult { deliveries })
+}
+
+fn task_change_ack(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: TaskChangeAckParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let recipient = p.recipient_actor_id.unwrap_or(caller.clone());
+    if recipient != caller {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot ack task changes for {recipient}"),
+        ));
+    }
+    let delivery = state
+        .store
+        .ack_task_change(
+            &p.change_id,
+            &recipient,
+            p.disposition,
+            p.result_ref_ids,
+            p.reason,
+        )
+        .map_err(map_store_err)?;
+    ok(TaskChangeAckResult { delivery })
+}
+
+fn workspace_lease_acquire(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: WorkspaceLeaseAcquireParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let assignment = state
+        .store
+        .get_assignment(&p.assignment_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "assignment"))?;
+    let task = state
+        .store
+        .get_task(&assignment.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    if caller != assignment.to_actor_id && caller != assignment.from_actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot acquire lease for assignment {}",
+                assignment.id
+            ),
+        ));
+    }
+    let expires_at = p
+        .expires_at
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(p.ttl_seconds.unwrap_or(3600)));
+    let (lease, conflicts) = state
+        .store
+        .acquire_workspace_lease(&p.assignment_id, p.resource_key, p.mode, expires_at)
+        .map_err(map_store_err)?;
+    ok(WorkspaceLeaseAcquireResult { lease, conflicts })
+}
+
+fn workspace_lease_release(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: WorkspaceLeaseReleaseParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let existing = state
+        .store
+        .get_workspace_lease(&p.lease_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "lease"))?;
+    let assignment = state
+        .store
+        .get_assignment(&existing.holder_assignment_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "assignment"))?;
+    let task = state
+        .store
+        .get_task(&assignment.task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &task, &caller)?;
+    let lease = state
+        .store
+        .release_workspace_lease(&p.lease_id)
+        .map_err(map_store_err)?;
+    ok(WorkspaceLeaseReleaseResult { lease })
+}
+
+fn workspace_lease_list(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: WorkspaceLeaseListParams = parse_params(params).unwrap_or_default();
+    let caller = caller_actor(state, connection_id)?;
+    let leases = state.store.list_workspace_leases(
+        p.resource_key.as_deref(),
+        p.assignment_id.as_deref(),
+        p.active_only,
+    );
+    let leases: Vec<WorkspaceLease> = leases
+        .into_iter()
+        .filter(|lease| {
+            state
+                .store
+                .get_assignment(&lease.holder_assignment_id)
+                .and_then(|assignment| state.store.get_task(&assignment.task_id))
+                .is_some_and(|task| state.store.is_channel_member(&task.channel_id, &caller))
+        })
+        .collect();
+    ok(WorkspaceLeaseListResult { leases })
 }
 
 fn is_terminal_assignment_status(status: TaskAssignmentStatus) -> bool {
@@ -910,7 +1436,7 @@ fn emit_assignment_return_handoff(
 
 fn task_assignment_message(task: &Task, assignment: &TaskAssignment) -> String {
     format!(
-        "Task #{number}: {title}\n\nAssignment `{assignment_id}` ({assignment_type:?}) for @{to_actor}.\n\n{instruction}\n\nReturn your result in this thread and update the assignment when complete. Completion hands the task back to the actor who assigned it for the next step.",
+        "Task #{number}: {title}\n\nAssignment `{assignment_id}` ({assignment_type:?}) for @{to_actor}.\n\n{instruction}\n\nRead assignment-context before acting. Publish typed outputs with `joi task artifact attach` / `joi task fact append`. When complete, run `joi task assignment update {assignment_id} --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`. Do not direct-handoff another actor to finish this assignment; the assignment update returns the task to the assigner.",
         number = task.number,
         title = task.title,
         assignment_id = assignment.id,
@@ -2083,6 +2609,70 @@ mod tests {
             .expect("create thread")
     }
 
+    #[tokio::test]
+    async fn event_get_reads_by_id_and_respects_scope_acl() {
+        let state = fresh_state("event-get");
+        open_conn(&state, "conn_human", "actor_human").await;
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        let channel = dispatch(
+            &state,
+            "conn_human",
+            method::CHANNEL_CREATE,
+            Some(json!({
+                "title": "private event lookup",
+                "actorId": "actor_human"
+            })),
+        )
+        .await
+        .expect("channel/create");
+        let channel: ChannelCreateResult = serde_json::from_value(channel).expect("channel");
+
+        let appended = dispatch(
+            &state,
+            "conn_human",
+            method::EVENT_APPEND,
+            Some(json!({
+                "event": {
+                    "type": "content.add",
+                    "actorId": "actor_human",
+                    "scope": { "kind": "channel", "id": channel.channel.id },
+                    "payload": {
+                        "contentType": "text/markdown",
+                        "text": "lookup target"
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("event/append");
+        let appended: EventAppendResult = serde_json::from_value(appended).expect("append result");
+
+        let fetched = dispatch(
+            &state,
+            "conn_human",
+            method::EVENT_GET,
+            Some(json!({ "eventId": appended.event.id })),
+        )
+        .await
+        .expect("event/get");
+        let fetched: EventGetResult = serde_json::from_value(fetched).expect("event result");
+        assert_eq!(fetched.event.id, appended.event.id);
+        assert_eq!(
+            fetched.event.payload.get("text").and_then(Value::as_str),
+            Some("lookup target")
+        );
+
+        let denied = dispatch(
+            &state,
+            "conn_intruder",
+            method::EVENT_GET,
+            Some(json!({ "eventId": appended.event.id })),
+        )
+        .await;
+        assert!(denied.is_err());
+    }
+
     #[test]
     fn artifact_publish_rejects_inaccessible_scope() {
         let state = fresh_state("artifact-publish-acl");
@@ -2168,7 +2758,8 @@ mod tests {
                 "taskId": created.task.id,
                 "toActorId": "actor_reviewer",
                 "type": "review",
-                "instruction": "review the story"
+                "instruction": "review the story",
+                "contract": {}
             })),
         )
         .await
@@ -2197,6 +2788,89 @@ mod tests {
             meta.get("assignmentId").and_then(|value| value.as_str()),
             Some(assigned.assignment.id.as_str())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn task_assignment_create_idempotent_race_returns_existing_handoff() {
+        let state = fresh_state("task-assignment-create-idempotent-race");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        let channel = state
+            .store
+            .create_channel("tasks".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_reviewer")
+            .expect("grant reviewer");
+        let source_event_id =
+            append_channel_root(&state, &channel.id, "actor_owner", "write story");
+        let created = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_CREATE,
+            Some(json!({
+                "sourceEventId": source_event_id,
+                "title": "write story",
+                "ownerActorId": "actor_owner"
+            })),
+        )
+        .await
+        .expect("task/create");
+        let created: TaskCreateResult = serde_json::from_value(created).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let state = state.clone();
+            let task_id = created.task.id.clone();
+            handles.push(tokio::spawn(async move {
+                dispatch(
+                    &state,
+                    "conn_owner",
+                    method::TASK_ASSIGNMENT_CREATE,
+                    Some(json!({
+                        "taskId": task_id,
+                        "toActorId": "actor_reviewer",
+                        "type": "review",
+                        "instruction": "review the story",
+                        "contract": {"idempotency_key": "story-review"},
+                        "idempotencyKey": "story-review"
+                    })),
+                )
+                .await
+            }));
+        }
+
+        let mut assignments = std::collections::HashSet::new();
+        let mut events = std::collections::HashSet::new();
+        for handle in handles {
+            let value = handle.await.expect("join").expect("task/assignment.create");
+            let assigned: TaskAssignmentCreateResult = serde_json::from_value(value).unwrap();
+            assignments.insert(assigned.assignment.id);
+            events.insert(assigned.event.id);
+        }
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(events.len(), 1);
+
+        let (thread_events, _) = state.store.read_scope(
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: created.task.canonical_thread_id,
+            },
+            50,
+            None,
+        );
+        let handoff_count = thread_events
+            .iter()
+            .filter(|event| {
+                event
+                    .payload
+                    .get("_meta")
+                    .and_then(|meta| meta.get("assignmentId"))
+                    .and_then(serde_json::Value::as_str)
+                    == assignments.iter().next().map(String::as_str)
+            })
+            .count();
+        assert_eq!(handoff_count, 1);
     }
 
     #[tokio::test]
@@ -2242,7 +2916,8 @@ mod tests {
                 "taskId": created.task.id,
                 "toActorId": "actor_reviewer",
                 "type": "review",
-                "instruction": "review the story"
+                "instruction": "review the story",
+                "contract": {}
             })),
         )
         .await
@@ -2270,9 +2945,29 @@ mod tests {
             method::TASK_ASSIGNMENT_UPDATE,
             Some(json!({
                 "assignmentId": assigned.assignment.id,
+                "status": "running"
+            })),
+        )
+        .await
+        .expect("task/assignment.update running");
+        let updated: TaskAssignmentUpdateResult = serde_json::from_value(updated).unwrap();
+        assert_eq!(updated.assignment.status, TaskAssignmentStatus::Running);
+
+        let updated = dispatch(
+            &state,
+            "conn_reviewer",
+            method::TASK_ASSIGNMENT_UPDATE,
+            Some(json!({
+                "assignmentId": assigned.assignment.id,
                 "status": "completed",
-                "resultEventId": result_event.id,
-                "resultSummary": "looks good"
+                "resultEventId": result_event.id.clone(),
+                "resultSummary": "looks good",
+                "resultEnvelope": {
+                    "assignment_id": assigned.assignment.id,
+                    "status": "completed",
+                    "verdict": "pass",
+                    "evidence_refs": [result_event.id.clone()]
+                }
             })),
         )
         .await

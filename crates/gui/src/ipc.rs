@@ -483,6 +483,134 @@ pub async fn task_update(state: State<'_, AppState>, params: Value) -> Result<Va
 }
 
 #[tauri::command]
+pub async fn task_ref_attach(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_REF_ATTACH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_ref_find(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_REF_FIND, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_ref_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_REF_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_artifact_attach(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_ARTIFACT_ATTACH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_artifact_activate(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_ARTIFACT_ACTIVATE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_artifact_list(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_ARTIFACT_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_fact_append(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_FACT_APPEND, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_fact_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_FACT_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_projection_put(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_PROJECTION_PUT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_projection_get(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_PROJECTION_GET, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_projection_list(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_PROJECTION_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn task_assignment_create(
     state: State<'_, AppState>,
     params: Value,
@@ -504,6 +632,101 @@ pub async fn task_assignment_update(
         .client()
         .await?
         .call_raw(method::TASK_ASSIGNMENT_UPDATE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_assignment_context(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_ASSIGNMENT_CONTEXT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_assignment_preflight(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_ASSIGNMENT_PREFLIGHT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_change_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_CHANGE_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_change_ack(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_CHANGE_ACK, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn delivery_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::DELIVERY_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_workspace_lease_acquire(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_WORKSPACE_LEASE_ACQUIRE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_workspace_lease_release(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_WORKSPACE_LEASE_RELEASE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn task_workspace_lease_list(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::TASK_WORKSPACE_LEASE_LIST, Some(params))
         .await
         .map_err(stringify)
 }
@@ -1409,7 +1632,7 @@ async fn run_remote_machine_command(
         .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
     if !machine.can_command {
         return Err(format!(
-            "machine `{}` does not advertise machine.command capability",
+            "machine `{}` is read-only for the current account",
             machine.id
         ));
     }
@@ -1483,11 +1706,8 @@ fn server_machine_info_from_actor(
     cfg: &DesktopConfig,
     server_url: &str,
 ) -> Option<MachineInfo> {
-    let meta_value = actor.get("_meta")?.clone();
-    let meta: RemoteMachineMeta = serde_json::from_value(meta_value).ok()?;
-    if !is_complete_remote_machine_inventory(&meta)
-        || !remote_machine_belongs_to_active_context(&meta, cfg)
-    {
+    let meta = remote_machine_meta_from_actor(actor)?;
+    if !is_complete_remote_machine_inventory(&meta) {
         return None;
     }
     let connection_actor_id = actor.get("id")?.as_str()?.to_string();
@@ -1540,10 +1760,11 @@ fn server_machine_info_from_actor(
     };
     let (serve_command, setup_script) = daemon_start_commands(&data_root, server_url, &machine_id);
 
-    let can_command = meta
-        .capabilities
-        .iter()
-        .any(|capability| capability == "machine.command");
+    let can_command = remote_machine_belongs_to_active_owner(&meta, cfg)
+        && meta
+            .capabilities
+            .iter()
+            .any(|capability| capability == "machine.command");
     let read_only = !can_command;
     Some(MachineInfo {
         workspace_id: meta.workspace_id,
@@ -1573,12 +1794,12 @@ fn server_machine_info_from_actor(
     })
 }
 
-fn remote_machine_belongs_to_active_context(meta: &RemoteMachineMeta, cfg: &DesktopConfig) -> bool {
-    if let Some(workspace_id) = meta.workspace_id.as_deref() {
-        if Some(workspace_id) != config::active_workspace_id(cfg) {
-            return false;
-        }
-    }
+fn remote_machine_meta_from_actor(actor: &Value) -> Option<RemoteMachineMeta> {
+    let meta_value = actor.get("_meta")?.clone();
+    serde_json::from_value(meta_value).ok()
+}
+
+fn remote_machine_belongs_to_active_owner(meta: &RemoteMachineMeta, cfg: &DesktopConfig) -> bool {
     if let Some(owner_actor_id) = meta.owner_actor_id.as_deref() {
         if Some(owner_actor_id) != config::active_owner_actor_id(cfg).as_deref() {
             return false;
@@ -1698,16 +1919,15 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
 
     if let Some(actors) = value.get("actors").and_then(Value::as_array) {
         for actor in actors {
-            if let Some(machine) =
-                server_machine_info_from_actor(actor, cfg, active_server_url(cfg))
+            let Some(meta) = remote_machine_meta_from_actor(actor) else {
+                continue;
+            };
+            if !is_complete_remote_machine_inventory(&meta)
+                || !remote_machine_belongs_to_active_owner(&meta, cfg)
             {
-                allowed_agents.extend(
-                    machine
-                        .agents
-                        .iter()
-                        .map(|agent| agent.info.spec.actor.id.clone()),
-                );
+                continue;
             }
+            allowed_agents.extend(meta.agents.iter().map(|agent| agent.actor_id.clone()));
         }
     }
 
@@ -2292,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_list_filter_allows_agents_from_server_machine_inventory() {
+    fn actor_list_filter_allows_owned_agents_from_server_machine_inventory_across_workspace_ids() {
         let cfg = DesktopConfig {
             active: Some("default".into()),
             account: None,
@@ -2321,7 +2541,7 @@ mod tests {
                         "inventoryVersion": 2,
                         "revision": 7,
                         "observedAt": "2026-05-13T10:50:00Z",
-                        "workspaceId": "default",
+                        "workspaceId": "server_workspace",
                         "ownerActorId": "actor_human_88084",
                         "name": "Remote Box",
                         "kind": "remote",
@@ -2443,6 +2663,98 @@ mod tests {
             machine.agents[0].profile_path,
             "/home/canfeng/.agentx/machine_remote/agents/actor_remote_agent/profile"
         );
+    }
+
+    #[test]
+    fn server_machine_inventory_is_visible_across_local_workspace_profile_ids() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("local_profile".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "local_profile".into(),
+                name: "Remote Server".into(),
+                server_url: "ws://example/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+            machines: vec![],
+        };
+        let actor = json!({
+            "id": "actor_service_machine_remote",
+            "kind": "service",
+            "displayName": "Remote Box",
+            "_meta": {
+                "role": "machine",
+                "source": "daemon",
+                "machineId": "machine_remote",
+                "inventoryVersion": 2,
+                "revision": 7,
+                "observedAt": "2026-05-13T10:50:00Z",
+                "workspaceId": "server_workspace",
+                "ownerActorId": account.actor_id,
+                "name": "Remote Box",
+                "kind": "remote",
+                "dataRoot": "/home/canfeng/.agentx/machine_remote",
+                "configDir": "/home/canfeng/.joi-apps",
+                "capabilities": ["inventory.read", "connection.status", "machine.command"],
+                "providers": [],
+                "agents": []
+            }
+        });
+
+        let machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
+            .expect("server machine must not be hidden by local GUI workspace id");
+
+        assert_eq!(machine.workspace_id.as_deref(), Some("server_workspace"));
+        assert!(!machine.read_only);
+        assert!(machine.can_command);
+    }
+
+    #[test]
+    fn server_machine_inventory_from_other_owner_is_visible_but_read_only() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Remote Server".into(),
+                server_url: "ws://example/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+            machines: vec![],
+        };
+        let actor = json!({
+            "id": "actor_service_machine_other",
+            "kind": "service",
+            "displayName": "Other Box",
+            "_meta": {
+                "role": "machine",
+                "source": "daemon",
+                "machineId": "machine_other",
+                "inventoryVersion": 2,
+                "revision": 4,
+                "observedAt": "2026-05-13T10:50:00Z",
+                "workspaceId": "server_workspace",
+                "ownerActorId": "actor_human_other",
+                "name": "Other Box",
+                "kind": "remote",
+                "dataRoot": "/home/other/.agentx/machine_other",
+                "configDir": "/home/other/.joi-apps",
+                "capabilities": ["inventory.read", "connection.status", "machine.command"],
+                "providers": [],
+                "agents": []
+            }
+        });
+
+        let machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
+            .expect("other-owner daemon should still be discoverable");
+
+        assert_eq!(machine.id, "machine_other");
+        assert!(machine.read_only);
+        assert!(!machine.can_command);
     }
 
     #[test]

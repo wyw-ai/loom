@@ -128,7 +128,7 @@ export function MachinesPage() {
 
   const createAgent = async (machine: MachineInfo, input: AgentCreateInput) => {
     if (machine.readOnly) {
-      pushToast("warn", "remote computers are read-only until server-mediated commands land");
+      pushToast("warn", "This computer is read-only for the current connection");
       return;
     }
     const result = await ipc.machineAgentCreate({
@@ -148,7 +148,7 @@ export function MachinesPage() {
 
   const removeMachine = (machine: MachineInfo) => {
     if (machine.readOnly) {
-      pushToast("warn", "remote computers are read-only until server-mediated commands land");
+      pushToast("warn", "This computer is read-only for the current connection");
       return;
     }
     if (machines.length <= 1) {
@@ -176,7 +176,7 @@ export function MachinesPage() {
 
   const removeAgent = (machine: MachineInfo, agent: MachineAgentInfo) => {
     if (machine.readOnly) {
-      pushToast("warn", "remote computers are read-only until server-mediated commands land");
+      pushToast("warn", "This computer is read-only for the current connection");
       return;
     }
     openModal({

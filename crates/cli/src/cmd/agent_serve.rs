@@ -28,7 +28,7 @@ use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentModelChoice, AgentSpec, BundleInstallMode,
     DeliveryListResult, EventAppendResult, HandoffApplyOn, PromptTemplateSpec,
-    TaskAssignmentUpdateResult, TurnOpenResult,
+    TaskAssignmentContextResult, TaskAssignmentUpdateResult, TurnOpenResult,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -1816,16 +1816,7 @@ async fn notification_loop(
         }
 
         match handle_handoff(&client, &state, &adapter, &event).await {
-            Ok(HandoffOutcome::Dispatched(dispatched)) => {
-                if let Err(e) = record_delivery_seen(&client, &state, &dispatched).await {
-                    tracing::warn!(
-                        actor = %actor_id,
-                        event = %dispatched.id,
-                        %e,
-                        "failed to record delivery receipt for handoff"
-                    );
-                }
-            }
+            Ok(HandoffOutcome::Dispatched) => {}
             Ok(HandoffOutcome::Queued) => {}
             Err(e) => eprintln!("[{actor_id}] failed to handle handoff: {e}"),
         }
@@ -2168,7 +2159,6 @@ async fn drain_pending_inbox(
                 continue;
             }
             if state.has_active_trigger(&event.id) {
-                record_delivery_seen(client, state, &event).await?;
                 continue;
             }
             tracing::warn!(
@@ -2218,11 +2208,7 @@ async fn drain_pending_inbox(
                 "adapter start failed while draining pending inbox: {err}"
             ));
         }
-        if let HandoffOutcome::Dispatched(dispatched) =
-            handle_handoff(client, state, adapter, &event).await?
-        {
-            record_delivery_seen(client, state, &dispatched).await?;
-        }
+        let _ = handle_handoff(client, state, adapter, &event).await?;
     }
     Ok(())
 }
@@ -2466,7 +2452,7 @@ fn responds_to(event_id: &str) -> Relation {
 }
 
 enum HandoffOutcome {
-    Dispatched(Event),
+    Dispatched,
     Queued,
 }
 
@@ -2486,7 +2472,7 @@ async fn handle_handoff(
     }
     dispatch_handoff(client, state, adapter, trigger)
         .await
-        .map(HandoffOutcome::Dispatched)
+        .map(|_| HandoffOutcome::Dispatched)
 }
 
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
@@ -2525,7 +2511,9 @@ async fn dispatch_handoff(
         };
         state.set_turn(active.clone());
         mark_assignment_running_if_needed(client, state, &trigger).await;
-        append_turn_started_ack(client, state, &active, &trigger).await;
+        if turn_started_ack_enabled() {
+            append_turn_started_ack(client, state, &active, &trigger).await;
+        }
 
         let adapter_prompt = build_adapter_prompt(
             client,
@@ -2634,12 +2622,17 @@ async fn render_trigger_prompt(
     trigger: &Event,
 ) -> String {
     let actor_names = actor_display_map_for_prompt(client, state).await;
-    render_trigger_prompt_with_names(
+    let mut prompt = render_trigger_prompt_with_names(
         &state.actor_id,
         &state.spec.actor.display_name,
         trigger,
         &actor_names,
-    )
+    );
+    if let Some(context) = assignment_context_for_prompt(client, trigger).await {
+        prompt.push_str("\n\n");
+        prompt.push_str(&context);
+    }
+    prompt
 }
 
 async fn actor_display_map_for_prompt(
@@ -2739,6 +2732,41 @@ fn trigger_task_context(trigger: &Event) -> Option<String> {
         out.push('\n');
     }
     Some(out)
+}
+
+async fn assignment_context_for_prompt(client: &Arc<Client>, trigger: &Event) -> Option<String> {
+    let assignment_id = trigger
+        .payload
+        .get("_meta")
+        .and_then(|value| value.as_object())
+        .and_then(|meta| meta.get("assignmentId"))
+        .and_then(|value| value.as_str())?;
+    match client
+        .call::<_, TaskAssignmentContextResult>(
+            method::TASK_ASSIGNMENT_CONTEXT,
+            json!({ "assignmentId": assignment_id }),
+        )
+        .await
+    {
+        Ok(context) => {
+            let body = serde_json::to_string_pretty(&context)
+                .unwrap_or_else(|_| "{\"error\":\"failed to render assignment context\"}".into());
+            Some(format!(
+                "=== Joi assignment context ===\n\
+                 This JSON is the authoritative task input. Read it before acting; use preflight before external side effects.\n\
+                 Assignment lifecycle rules:\n\
+                 - Publish durable outputs with `joi artifact publish`, then make them typed task outputs with `joi task artifact attach <task_id> --artifact-id <art_id> --schema <schema> --role <role> --status active`.\n\
+                 - Record durable evidence with `joi task fact append`; do not use plain messages as gate evidence.\n\
+                 - Finish this assignment with `joi task assignment update <assignment_id> --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`.\n\
+                 - Do not hand off to another actor directly to finish an assignment; the assignment update returns the task to the assigning actor.\n\
+                 ```json\n{body}\n```"
+            ))
+        }
+        Err(err) => Some(format!(
+            "=== Joi assignment context ===\n\
+             Failed to load assignment-context for {assignment_id}: {err}. Return a blocked/stale result instead of continuing from natural-language instruction only."
+        )),
+    }
 }
 
 fn handoff_target_ids(trigger: &Event) -> Vec<String> {
@@ -3313,9 +3341,14 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          JOI_DAEMON_SOCKET, JOI_ACTOR, JOI_SCOPE_ID, JOI_SCOPE_KIND, JOI_TURN_ID, JOI_TRIGGER_EVENT_ID, and JOI_TRIGGER_ACTOR are already injected into your env,\n\
          so commands like:\n\
            joi --json event list --in {scope_id}{scope_flag}\n\
+           joi --json event get \"$JOI_TRIGGER_EVENT_ID\"\n\
            joi --json artifact get <art_id|artifact://...>\n\
+           joi --json task assign <task_id> --to <actor_id> --type <type> --instruction <text> --contract-file <path>\n\
            joi --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
            joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
+        `joi task assign` requires a machine-readable contract. Do not fall back\n\
+        to direct actor handoff when assignment creation fails; report the\n\
+        blocker or fix the contract and retry the assignment.\n\
          `joi ask-user-question` is for choices or missing input; its JSON\n\
          output is the human's answer to your question, not an approval.\n\
          `joi request-approval` is for approve/reject gates before risky work.\n\
@@ -3326,6 +3359,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          target creates or reuses the thread automatically. Use\n\
          `joi --json thread list` only when you need to map a thread scope id\n\
          back to that target.\n\
+         If your trigger event replies to another event, use `joi --json event get`\n\
+         on the `replies_to` target before treating the visible handoff text as\n\
+         the user's original request.\n\
          Use `--json` for machine-readable output and `joi <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\
@@ -3570,6 +3606,16 @@ async fn translate_one(
                     );
                 }
             }
+            if let Err(e) =
+                record_delivery_seen_by_id(client, actor_id, &active.trigger_event_id).await
+            {
+                tracing::warn!(
+                    actor = %actor_id,
+                    event = %active.trigger_event_id,
+                    %e,
+                    "failed to record delivery receipt after adapter finished"
+                );
+            }
             // Drop the active slot for this scope and pick up the next queued
             // trigger (if any). Clear unconditionally — if close_turn failed
             // server-side we still need to free the slot, otherwise the queue
@@ -3580,16 +3626,7 @@ async fn translate_one(
             let next_trigger = state.clear_turn(&scope_id);
             if let Some(next) = next_trigger {
                 match dispatch_handoff(client, state, adapter, next).await {
-                    Ok(dispatched) => {
-                        if let Err(e) = record_delivery_seen(client, state, &dispatched).await {
-                            tracing::warn!(
-                                actor = %actor_id,
-                                event = %dispatched.id,
-                                %e,
-                                "failed to record delivery receipt for queued handoff"
-                            );
-                        }
-                    }
+                    Ok(_) => {}
                     Err(e) => eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}"),
                 }
             }
@@ -3712,7 +3749,7 @@ async fn append_turn_started_ack(
         Some(&active.id),
         json!({
             "contentType": "text/markdown",
-            "text": "Received. Working on it.",
+            "text": "已收到，正在处理。",
             "_meta": {
                 "kind": "turn.started_ack",
                 "triggerEventId": trigger.id,
@@ -3731,6 +3768,18 @@ async fn append_turn_started_ack(
             "failed to append turn started acknowledgement"
         );
     }
+}
+
+fn turn_started_ack_enabled() -> bool {
+    std::env::var("JOI_AGENT_TURN_STARTED_ACK")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn assignment_id_for_start(trigger: &Event) -> Option<&str> {

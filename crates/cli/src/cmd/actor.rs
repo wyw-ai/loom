@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use proto::methods::*;
 use proto::types::{Actor, ActorKind};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::render;
@@ -28,13 +28,17 @@ pub async fn upsert(
     actor_id: String,
     kind: String,
     display: Option<String>,
+    capabilities_json: Option<String>,
 ) -> Result<()> {
     let kind = parse_actor_kind(&kind)?;
+    let capabilities: Option<Value> = capabilities_json
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()?;
     let actor = Actor {
         id: actor_id.clone(),
         kind,
         display_name: display.unwrap_or_else(|| actor_id.clone()),
-        capabilities: None,
+        capabilities,
         _meta: None,
     };
     let res: ActorUpsertResult = client

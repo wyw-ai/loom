@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
+import { useActors } from "@/store/actors";
 import { useChannels } from "@/store/channels";
 import { useMessages } from "@/store/messages";
 import { useSession } from "@/store/session";
@@ -24,6 +25,11 @@ import { Prompt } from "@/features/prompt/Prompt";
 import { AnnouncementBanner } from "./AnnouncementBanner";
 import { StreamingStatusBar } from "./StreamingStatusBar";
 import { openRenameChannel } from "@/features/sidebar/channelActions";
+import {
+  loadTaskDetailSnapshot,
+  TaskDetailPanel,
+  type TaskDetailSnapshot,
+} from "@/features/tasks/TasksPage";
 
 type MainTab = "chat" | "tasks";
 
@@ -260,8 +266,13 @@ function TabButton({
 
 function ChannelTasksPanel() {
   const [filter, setFilter] = useState<TaskStatus | "all">("all");
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<TaskDetailSnapshot | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const scope = useChannels((s) => s.currentScope);
   const threadsByChannel = useChannels((s) => s.threadsByChannel);
+  const actors = useActors((s) => s.byId);
   const selfId = useSession((s) => s.workspace?.actorId);
   const taskRows = useTasks((s) => s.tasks);
   const upsertTask = useTasks((s) => s.upsertTask);
@@ -281,6 +292,49 @@ function ChannelTasksPanel() {
       }))
       .filter((task) => filter === "all" || task.status === filter);
   }, [filter, scope, taskRows]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    if (!tasks.some((task) => task.id === selectedTaskId)) {
+      setSelectedTaskId(null);
+    }
+  }, [selectedTaskId, tasks]);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      setDetail(null);
+      setDetailError(null);
+      return;
+    }
+    let alive = true;
+    setDetailLoading(true);
+    setDetailError(null);
+    loadTaskDetailSnapshot(selectedTaskId)
+      .then((snapshot) => {
+        if (alive) setDetail(snapshot);
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setDetail(null);
+        setDetailError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (alive) setDetailLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [selectedTaskId, taskRows]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelectedTaskId(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedTaskId]);
+
   const filters: Array<[TaskStatus | "all", string]> = [
     ["all", "All"],
     ["todo", "Todo"],
@@ -291,7 +345,7 @@ function ChannelTasksPanel() {
   ];
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
+    <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
       <div className="flex items-center gap-2 border-b-2 border-black bg-white px-3 py-3">
         <div className="min-w-0 flex-1">
           <div
@@ -375,7 +429,11 @@ function ChannelTasksPanel() {
             {tasks.map((task) => (
               <article
                 key={task.id}
-                className="border-2 border-black bg-brutal-cream p-3 shadow-brutal-sm"
+                className={clsx(
+                  "cursor-pointer border-2 border-black bg-brutal-cream p-3 shadow-brutal-sm transition-colors hover:bg-brutal-yellow",
+                  selectedTaskId === task.id && "bg-brutal-yellow",
+                )}
+                onClick={() => setSelectedTaskId(task.id)}
               >
                 <div className="mb-2 flex items-center gap-2 font-mono text-[11px] text-black/45">
                   <span>{task.id}</span>
@@ -387,6 +445,20 @@ function ChannelTasksPanel() {
           </div>
         )}
       </div>
+      {selectedTaskId && (
+        <div
+          className="absolute inset-0 z-30 flex justify-end bg-black/25"
+          onClick={() => setSelectedTaskId(null)}
+        >
+          <TaskDetailPanel
+            detail={detail}
+            loading={detailLoading}
+            error={detailError}
+            actors={actors}
+            onClose={() => setSelectedTaskId(null)}
+          />
+        </div>
+      )}
     </div>
   );
 }

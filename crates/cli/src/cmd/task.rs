@@ -1,9 +1,14 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use proto::methods::*;
-use proto::types::{TaskAssignmentStatus, TaskAssignmentType, TaskStatus};
-use serde_json::json;
+use proto::types::{
+    TaskArtifactLinkStatus, TaskAssignmentStatus, TaskAssignmentType, TaskChangeAckDisposition,
+    TaskFactStatus, TaskFactType, TaskProjectionHealth, TaskRefConfidence, TaskRefStatus,
+    TaskSnapshotCompleteness, TaskStatus, WorkspaceLeaseMode,
+};
+use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::render;
@@ -16,6 +21,9 @@ pub async fn create(
     description: String,
     owner: Option<String>,
     status: Option<String>,
+    parent_source_event: Option<String>,
+    parent_task: Option<String>,
+    practice_contract_epoch: Option<String>,
 ) -> Result<()> {
     let status = parse_task_status_opt(status)?;
     let res: TaskCreateResult = client
@@ -28,6 +36,9 @@ pub async fn create(
                 "requesterActorId": actor_id,
                 "ownerActorId": owner,
                 "status": status,
+                "parentSourceEventId": parent_source_event,
+                "parentTaskId": parent_task,
+                "practiceContractEpoch": practice_contract_epoch,
             }),
         )
         .await?;
@@ -136,6 +147,7 @@ pub async fn update(
     artifact_ids: Vec<String>,
 ) -> Result<()> {
     let status = parse_task_status_opt(status)?;
+    let artifact_ids = expand_cli_values(artifact_ids);
     let res: TaskUpdateResult = client
         .call(
             method::TASK_UPDATE,
@@ -166,8 +178,12 @@ pub async fn assign(
     to: String,
     assignment_type: String,
     instruction: String,
+    contract_json: Option<String>,
+    contract_file: Option<PathBuf>,
+    idempotency_key: Option<String>,
 ) -> Result<()> {
     let assignment_type = parse_assignment_type(&assignment_type)?;
+    let contract = json_from_inline_or_file(contract_json, contract_file)?;
     let res: TaskAssignmentCreateResult = client
         .call(
             method::TASK_ASSIGNMENT_CREATE,
@@ -177,6 +193,8 @@ pub async fn assign(
                 "toActorId": to,
                 "type": assignment_type,
                 "instruction": instruction,
+                "contract": contract,
+                "idempotencyKey": idempotency_key,
             }),
         )
         .await?;
@@ -197,8 +215,31 @@ pub async fn assignment_update(
     status: Option<String>,
     result_event: Option<String>,
     result: Option<String>,
+    result_envelope_json: Option<String>,
+    result_artifact_ids: Vec<String>,
+    result_fact_ids: Vec<String>,
+    evidence_refs: Vec<String>,
 ) -> Result<()> {
     let status = parse_assignment_status_opt(status)?;
+    let result_artifact_ids = expand_cli_values(result_artifact_ids);
+    let result_fact_ids = expand_cli_values(result_fact_ids);
+    let evidence_refs = expand_cli_values(evidence_refs);
+    let mut result_envelope = json_value_opt(result_envelope_json)?;
+    if result_envelope.is_none()
+        && status == Some(TaskAssignmentStatus::Completed)
+        && (!result_artifact_ids.is_empty()
+            || !result_fact_ids.is_empty()
+            || !evidence_refs.is_empty())
+    {
+        result_envelope = Some(json!({
+            "assignmentId": assignment_id,
+            "status": "completed",
+            "summary": result.clone().unwrap_or_default(),
+            "resultArtifacts": result_artifact_ids.clone(),
+            "resultFacts": result_fact_ids.clone(),
+            "evidenceRefs": evidence_refs.clone(),
+        }));
+    }
     let res: TaskAssignmentUpdateResult = client
         .call(
             method::TASK_ASSIGNMENT_UPDATE,
@@ -207,6 +248,10 @@ pub async fn assignment_update(
                 "status": status,
                 "resultEventId": result_event,
                 "resultSummary": result,
+                "resultEnvelope": result_envelope,
+                "resultArtifactIds": result_artifact_ids,
+                "resultFactIds": result_fact_ids,
+                "evidenceRefs": evidence_refs,
             }),
         )
         .await?;
@@ -217,6 +262,550 @@ pub async fn assignment_update(
             "assignment {} ({:?})",
             res.assignment.id, res.assignment.status
         );
+    }
+    Ok(())
+}
+
+fn expand_cli_values(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        for part in value.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub async fn ref_attach(
+    client: Arc<Client>,
+    task_id: String,
+    kind: String,
+    subtype: String,
+    value: String,
+    normalized: String,
+    confidence: String,
+    status: String,
+    source_event: Option<String>,
+    fields_json: Option<String>,
+) -> Result<()> {
+    let fields = json_value_opt(fields_json)?.unwrap_or_else(|| json!({}));
+    let confidence = parse_ref_confidence(&confidence)?;
+    let status = parse_ref_status(&status)?;
+    let res: TaskRefAttachResult = client
+        .call(
+            method::TASK_REF_ATTACH,
+            json!({
+                "taskId": task_id,
+                "kind": kind,
+                "subtype": subtype,
+                "value": value,
+                "normalized": normalized,
+                "confidence": confidence,
+                "status": status,
+                "sourceEventId": source_event,
+                "fields": fields,
+            }),
+        )
+        .await?;
+    print_or_line(&res, || format!("ref {} attached", res.task_ref.id));
+    Ok(())
+}
+
+pub async fn ref_find(
+    client: Arc<Client>,
+    kind: String,
+    subtype: String,
+    normalized: String,
+    channel: Option<String>,
+    confidence: Option<String>,
+    status: Option<String>,
+) -> Result<()> {
+    let confidence = confidence.map(|v| parse_ref_confidence(&v)).transpose()?;
+    let status = status.map(|v| parse_ref_status(&v)).transpose()?;
+    let res: TaskRefFindResult = client
+        .call(
+            method::TASK_REF_FIND,
+            json!({
+                "channelId": channel,
+                "kind": kind,
+                "subtype": subtype,
+                "normalized": normalized,
+                "confidence": confidence,
+                "status": status,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for task_ref in res.refs {
+            println!(
+                "{} {} {} {} -> {} ({:?}/{:?})",
+                task_ref.id,
+                task_ref.kind,
+                task_ref.subtype,
+                task_ref.normalized,
+                task_ref.task_id,
+                task_ref.confidence,
+                task_ref.status
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn ref_list(client: Arc<Client>, task_id: String) -> Result<()> {
+    let res: TaskRefListResult = client
+        .call(method::TASK_REF_LIST, json!({ "taskId": task_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for task_ref in res.refs {
+            println!(
+                "{} {} {} {} ({:?}/{:?})",
+                task_ref.id,
+                task_ref.kind,
+                task_ref.subtype,
+                task_ref.normalized,
+                task_ref.confidence,
+                task_ref.status
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn artifact_attach(
+    client: Arc<Client>,
+    task_id: String,
+    artifact_id: String,
+    schema: String,
+    role: String,
+    status: String,
+    lineage_json: Option<String>,
+    binding_json: Option<String>,
+) -> Result<()> {
+    let status = parse_artifact_link_status(&status)?;
+    let lineage = json_value_opt(lineage_json)?.unwrap_or_else(|| json!({}));
+    let binding = json_value_opt(binding_json)?.unwrap_or_else(|| json!({}));
+    let res: TaskArtifactAttachResult = client
+        .call(
+            method::TASK_ARTIFACT_ATTACH,
+            json!({
+                "taskId": task_id,
+                "artifactId": artifact_id,
+                "schema": schema,
+                "role": role,
+                "status": status,
+                "lineage": lineage,
+                "binding": binding,
+            }),
+        )
+        .await?;
+    print_or_line(&res, || format!("artifact link {} attached", res.link.id));
+    Ok(())
+}
+
+pub async fn artifact_activate(
+    client: Arc<Client>,
+    link_id: String,
+    supersede_link_ids: Vec<String>,
+) -> Result<()> {
+    let res: TaskArtifactActivateResult = client
+        .call(
+            method::TASK_ARTIFACT_ACTIVATE,
+            json!({ "linkId": link_id, "supersedeLinkIds": supersede_link_ids }),
+        )
+        .await?;
+    print_or_line(&res, || format!("artifact link {} active", res.link.id));
+    Ok(())
+}
+
+pub async fn artifact_list(
+    client: Arc<Client>,
+    task_id: String,
+    status: Option<String>,
+) -> Result<()> {
+    let status = status.map(|v| parse_artifact_link_status(&v)).transpose()?;
+    let res: TaskArtifactListResult = client
+        .call(
+            method::TASK_ARTIFACT_LIST,
+            json!({ "taskId": task_id, "status": status }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for link in res.links {
+            println!(
+                "{} {} {} {} ({:?})",
+                link.id, link.artifact_id, link.schema, link.role, link.status
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn fact_append(
+    client: Arc<Client>,
+    task_id: String,
+    target_key: String,
+    kind: String,
+    fact_type: String,
+    signature: Option<String>,
+    status: String,
+    replaces: Vec<String>,
+    authority: String,
+    authority_binding_json: Option<String>,
+    source_cursor: Option<String>,
+    source_snapshot_id: Option<String>,
+    external_updated_at: Option<String>,
+    observed_fields: Vec<String>,
+    unobserved_fields: Vec<String>,
+    unavailable_reason: Option<String>,
+    snapshot_completeness: Option<String>,
+    producer_id: Option<String>,
+    summary: String,
+    raw_refs: Vec<String>,
+    artifact_id: Option<String>,
+    payload_schema: String,
+    subject_json: Option<String>,
+    payload_json: Option<String>,
+) -> Result<()> {
+    let fact_type = parse_fact_type(&fact_type)?;
+    let status = parse_fact_status(&status)?;
+    let authority_binding = json_value_opt(authority_binding_json)?.unwrap_or_else(|| json!({}));
+    let subject = json_value_opt(subject_json)?.unwrap_or_else(|| json!({}));
+    let payload = json_value_opt(payload_json)?.unwrap_or_else(|| json!({}));
+    let snapshot_completeness = snapshot_completeness
+        .map(|v| parse_snapshot_completeness(&v))
+        .transpose()?;
+    let res: TaskFactAppendResult = client
+        .call(
+            method::TASK_FACT_APPEND,
+            json!({
+                "taskId": task_id,
+                "targetKey": target_key,
+                "kind": kind,
+                "factType": fact_type,
+                "signature": signature,
+                "status": status,
+                "replaces": replaces,
+                "authority": authority,
+                "authorityBinding": authority_binding,
+                "sourceCursor": source_cursor,
+                "sourceSnapshotId": source_snapshot_id,
+                "externalUpdatedAt": external_updated_at,
+                "observedFields": observed_fields,
+                "unobservedFields": unobserved_fields,
+                "unavailableReason": unavailable_reason,
+                "snapshotCompleteness": snapshot_completeness,
+                "producerId": producer_id,
+                "summary": summary,
+                "rawRefs": raw_refs,
+                "artifactId": artifact_id,
+                "payloadSchema": payload_schema,
+                "subject": subject,
+                "payload": payload,
+            }),
+        )
+        .await?;
+    print_or_line(&res, || {
+        if res.created {
+            format!("fact {} appended", res.fact.id)
+        } else {
+            format!("fact {} already existed", res.fact.id)
+        }
+    });
+    Ok(())
+}
+
+pub async fn fact_list(
+    client: Arc<Client>,
+    task_id: String,
+    kind: Option<String>,
+    status: Option<String>,
+    target_key: Option<String>,
+) -> Result<()> {
+    let status = status.map(|v| parse_fact_status(&v)).transpose()?;
+    let res: TaskFactListResult = client
+        .call(
+            method::TASK_FACT_LIST,
+            json!({
+                "taskId": task_id,
+                "kind": kind,
+                "status": status,
+                "targetKey": target_key,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for fact in res.facts {
+            println!(
+                "{} {} {} ({:?}) {}",
+                fact.id, fact.target_key, fact.kind, fact.status, fact.summary
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn projection_put(
+    client: Arc<Client>,
+    task_id: String,
+    projection_type: String,
+    health: String,
+    producer_id: Option<String>,
+    watermark_json: Option<String>,
+    payload_schema: String,
+    payload_json: Option<String>,
+) -> Result<()> {
+    let health = parse_projection_health(&health)?;
+    let watermark = json_value_opt(watermark_json)?.unwrap_or_else(|| json!({}));
+    let payload = json_value_opt(payload_json)?.unwrap_or_else(|| json!({}));
+    let res: TaskProjectionPutResult = client
+        .call(
+            method::TASK_PROJECTION_PUT,
+            json!({
+                "taskId": task_id,
+                "projectionType": projection_type,
+                "producerActorId": producer_id,
+                "health": health,
+                "watermark": watermark,
+                "payloadSchema": payload_schema,
+                "payload": payload,
+            }),
+        )
+        .await?;
+    print_or_line(&res, || {
+        format!(
+            "projection {} ({:?})",
+            res.projection.id, res.projection.health
+        )
+    });
+    Ok(())
+}
+
+pub async fn projection_get(
+    client: Arc<Client>,
+    task_id: String,
+    projection_type: String,
+) -> Result<()> {
+    let res: TaskProjectionGetResult = client
+        .call(
+            method::TASK_PROJECTION_GET,
+            json!({ "taskId": task_id, "projectionType": projection_type }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if let Some(projection) = res.projection {
+        println!("projection {} ({:?})", projection.id, projection.health);
+    } else {
+        println!("projection missing ({:?})", res.health);
+    }
+    Ok(())
+}
+
+pub async fn projection_list(client: Arc<Client>, task_id: String) -> Result<()> {
+    let res: TaskProjectionListResult = client
+        .call(method::TASK_PROJECTION_LIST, json!({ "taskId": task_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for projection in res.projections {
+            println!(
+                "{} {} ({:?})",
+                projection.id, projection.projection_type, projection.health
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn assignment_context(client: Arc<Client>, assignment_id: String) -> Result<()> {
+    let res: TaskAssignmentContextResult = client
+        .call(
+            method::TASK_ASSIGNMENT_CONTEXT,
+            json!({ "assignmentId": assignment_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "assignment {} task {} guards {}",
+            res.assignment.id, res.task.id, res.guards
+        );
+    }
+    Ok(())
+}
+
+pub async fn assignment_preflight(
+    client: Arc<Client>,
+    assignment_id: String,
+    target_key: String,
+    head: String,
+    effect: String,
+) -> Result<()> {
+    let res: TaskAssignmentPreflightResult = client
+        .call(
+            method::TASK_ASSIGNMENT_PREFLIGHT,
+            json!({
+                "assignmentId": assignment_id,
+                "targetKey": target_key,
+                "head": head,
+                "effect": effect,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "preflight {} allowed={} {}",
+            res.preflight.assignment_id, res.preflight.allowed, res.preflight.reason
+        );
+    }
+    Ok(())
+}
+
+pub async fn change_list(
+    client: Arc<Client>,
+    task_id: Option<String>,
+    include_handled: bool,
+    after_cursor: Option<u64>,
+    limit: Option<usize>,
+) -> Result<()> {
+    let res: TaskChangeListResult = client
+        .call(
+            method::TASK_CHANGE_LIST,
+            json!({
+                "taskId": task_id,
+                "includeHandled": include_handled,
+                "afterCursor": after_cursor,
+                "limit": limit,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for delivery in res.deliveries {
+            println!(
+                "{} #{} {} {:?}",
+                delivery.change.id,
+                delivery.change.cursor,
+                delivery.change.summary,
+                delivery.status
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn change_ack(
+    client: Arc<Client>,
+    change_id: String,
+    disposition: String,
+    result_ref_ids: Vec<String>,
+    reason: String,
+) -> Result<()> {
+    let disposition = parse_change_disposition(&disposition)?;
+    let res: TaskChangeAckResult = client
+        .call(
+            method::TASK_CHANGE_ACK,
+            json!({
+                "changeId": change_id,
+                "disposition": disposition,
+                "resultRefIds": result_ref_ids,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    print_or_line(&res, || format!("acked {}", res.delivery.change.id));
+    Ok(())
+}
+
+pub async fn lease_acquire(
+    client: Arc<Client>,
+    assignment_id: String,
+    resource_key: String,
+    mode: String,
+    ttl_seconds: Option<i64>,
+) -> Result<()> {
+    let mode = parse_lease_mode(&mode)?;
+    let res: WorkspaceLeaseAcquireResult = client
+        .call(
+            method::TASK_WORKSPACE_LEASE_ACQUIRE,
+            json!({
+                "assignmentId": assignment_id,
+                "resourceKey": resource_key,
+                "mode": mode,
+                "ttlSeconds": ttl_seconds,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if let Some(lease) = res.lease {
+        println!("lease {} active", lease.id);
+    } else {
+        println!("lease conflict");
+        for conflict in res.conflicts {
+            println!(
+                "  {} {} holder={}",
+                conflict.id, conflict.resource_key, conflict.holder_assignment_id
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn lease_release(client: Arc<Client>, lease_id: String) -> Result<()> {
+    let res: WorkspaceLeaseReleaseResult = client
+        .call(
+            method::TASK_WORKSPACE_LEASE_RELEASE,
+            json!({ "leaseId": lease_id }),
+        )
+        .await?;
+    print_or_line(&res, || format!("lease {} released", res.lease.id));
+    Ok(())
+}
+
+pub async fn lease_list(
+    client: Arc<Client>,
+    resource_key: Option<String>,
+    assignment_id: Option<String>,
+    active_only: bool,
+) -> Result<()> {
+    let res: WorkspaceLeaseListResult = client
+        .call(
+            method::TASK_WORKSPACE_LEASE_LIST,
+            json!({
+                "resourceKey": resource_key,
+                "assignmentId": assignment_id,
+                "activeOnly": active_only,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        for lease in res.leases {
+            println!(
+                "{} {} {:?} {:?} holder={}",
+                lease.id, lease.resource_key, lease.mode, lease.status, lease.holder_assignment_id
+            );
+        }
     }
     Ok(())
 }
@@ -265,6 +854,140 @@ fn parse_assignment_status(value: &str) -> Result<TaskAssignmentStatus> {
     }
 }
 
+fn parse_ref_confidence(value: &str) -> Result<TaskRefConfidence> {
+    match normalize(value).as_str() {
+        "confirmed" => Ok(TaskRefConfidence::Confirmed),
+        "inferred" => Ok(TaskRefConfidence::Inferred),
+        other => bail!("unknown task ref confidence `{other}`"),
+    }
+}
+
+fn parse_ref_status(value: &str) -> Result<TaskRefStatus> {
+    match normalize(value).as_str() {
+        "active" => Ok(TaskRefStatus::Active),
+        "superseded" => Ok(TaskRefStatus::Superseded),
+        "retired" => Ok(TaskRefStatus::Retired),
+        other => bail!("unknown task ref status `{other}`"),
+    }
+}
+
+fn parse_artifact_link_status(value: &str) -> Result<TaskArtifactLinkStatus> {
+    match normalize(value).as_str() {
+        "active" => Ok(TaskArtifactLinkStatus::Active),
+        "proposal" => Ok(TaskArtifactLinkStatus::Proposal),
+        "superseded" => Ok(TaskArtifactLinkStatus::Superseded),
+        "rejected" => Ok(TaskArtifactLinkStatus::Rejected),
+        other => bail!("unknown artifact link status `{other}`"),
+    }
+}
+
+fn parse_fact_type(value: &str) -> Result<TaskFactType> {
+    match normalize(value).as_str() {
+        "observation" => Ok(TaskFactType::Observation),
+        "status" => Ok(TaskFactType::Status),
+        "decision" => Ok(TaskFactType::Decision),
+        "action" => Ok(TaskFactType::Action),
+        "userdefined" => Ok(TaskFactType::UserDefined),
+        other => bail!("unknown fact type `{other}`"),
+    }
+}
+
+fn parse_fact_status(value: &str) -> Result<TaskFactStatus> {
+    match normalize(value).as_str() {
+        "active" => Ok(TaskFactStatus::Active),
+        "superseded" => Ok(TaskFactStatus::Superseded),
+        "retracted" => Ok(TaskFactStatus::Retracted),
+        "conflict" => Ok(TaskFactStatus::Conflict),
+        other => bail!("unknown fact status `{other}`"),
+    }
+}
+
+fn parse_snapshot_completeness(value: &str) -> Result<TaskSnapshotCompleteness> {
+    match normalize(value).as_str() {
+        "complete" => Ok(TaskSnapshotCompleteness::Complete),
+        "partial" => Ok(TaskSnapshotCompleteness::Partial),
+        "unknown" => Ok(TaskSnapshotCompleteness::Unknown),
+        other => bail!("unknown snapshot completeness `{other}`"),
+    }
+}
+
+fn parse_projection_health(value: &str) -> Result<TaskProjectionHealth> {
+    match normalize(value).as_str() {
+        "fresh" => Ok(TaskProjectionHealth::Fresh),
+        "stale" => Ok(TaskProjectionHealth::Stale),
+        "missing" => Ok(TaskProjectionHealth::Missing),
+        "invalid" => Ok(TaskProjectionHealth::Invalid),
+        "repairrequired" => Ok(TaskProjectionHealth::RepairRequired),
+        other => bail!("unknown projection health `{other}`"),
+    }
+}
+
+fn parse_change_disposition(value: &str) -> Result<TaskChangeAckDisposition> {
+    match normalize(value).as_str() {
+        "assignmentcreated" => Ok(TaskChangeAckDisposition::AssignmentCreated),
+        "assignmentreused" => Ok(TaskChangeAckDisposition::AssignmentReused),
+        "actionrequested" => Ok(TaskChangeAckDisposition::ActionRequested),
+        "factwritten" => Ok(TaskChangeAckDisposition::FactWritten),
+        "artifactwritten" => Ok(TaskChangeAckDisposition::ArtifactWritten),
+        "projectionrepaired" => Ok(TaskChangeAckDisposition::ProjectionRepaired),
+        "blocked" => Ok(TaskChangeAckDisposition::Blocked),
+        "nooprecorded" => Ok(TaskChangeAckDisposition::NoopRecorded),
+        "escalated" => Ok(TaskChangeAckDisposition::Escalated),
+        other => bail!("unknown task change disposition `{other}`"),
+    }
+}
+
+fn parse_lease_mode(value: &str) -> Result<WorkspaceLeaseMode> {
+    match normalize(value).as_str() {
+        "read" => Ok(WorkspaceLeaseMode::Read),
+        "write" => Ok(WorkspaceLeaseMode::Write),
+        other => bail!("unknown lease mode `{other}`"),
+    }
+}
+
+fn json_value_opt(raw: Option<String>) -> Result<Option<Value>> {
+    raw.map(|s| serde_json::from_str(&s).map_err(Into::into))
+        .transpose()
+}
+
+fn json_from_inline_or_file(
+    inline: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<Option<Value>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => bail!("use either --contract-json or --contract-file, not both"),
+        (Some(raw), None) => Ok(Some(serde_json::from_str(&raw)?)),
+        (None, Some(path)) => Ok(Some(serde_json::from_str(&std::fs::read_to_string(path)?)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn print_or_line<T: serde::Serialize>(value: &T, line: impl FnOnce() -> String) {
+    if render::is_json() {
+        render::print_json(value);
+    } else {
+        println!("{}", line());
+    }
+}
+
 fn normalize(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace(['_', '-'], "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_cli_values;
+
+    #[test]
+    fn expand_cli_values_splits_commas_trims_and_dedupes() {
+        assert_eq!(
+            expand_cli_values(vec![
+                "art_1, art_2".into(),
+                "art_2".into(),
+                "  ".into(),
+                "art_3,,art_1".into(),
+            ]),
+            vec!["art_1", "art_2", "art_3"]
+        );
+    }
 }

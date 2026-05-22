@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration as ChronoDuration, Utc, Weekday};
@@ -107,6 +108,14 @@ struct Inner {
     threads: HashMap<String, Thread>,
     tasks: HashMap<String, Task>,
     assignments: HashMap<String, TaskAssignment>,
+    task_refs: HashMap<String, TaskRef>,
+    task_artifact_links: HashMap<String, TaskArtifactLink>,
+    task_facts: HashMap<String, TaskFact>,
+    task_projections: HashMap<String, TaskProjection>,
+    workspace_leases: HashMap<String, WorkspaceLease>,
+    task_changes: HashMap<String, TaskChange>,
+    task_change_deliveries: HashMap<(String, String), TaskChangeDelivery>,
+    task_change_seq: u64,
     turns: HashMap<String, Turn>,
     /// scope ref -> ordered events
     events_by_scope: HashMap<ScopeRef, Vec<String>>,
@@ -580,6 +589,9 @@ impl Store {
         requester_actor_id: String,
         owner_actor_id: Option<String>,
         status: Option<TaskStatus>,
+        parent_source_event_id: Option<String>,
+        parent_task_id: Option<String>,
+        practice_contract_epoch: Option<String>,
     ) -> StoreResult<Task> {
         let _guard = self.structure_lock.lock();
         let source = self
@@ -641,6 +653,8 @@ impl Store {
             channel_id,
             source_event_id,
             canonical_thread_id,
+            parent_source_event_id,
+            parent_task_id,
             title: task_title,
             description,
             requester_actor_id,
@@ -653,6 +667,7 @@ impl Store {
             result_summary: String::new(),
             artifact_ids: Vec::new(),
             assignment_ids: Vec::new(),
+            practice_contract_epoch,
             created_at: now,
             updated_at: now,
             _meta: None,
@@ -783,6 +798,640 @@ impl Store {
         Ok(task)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_task_ref(
+        &self,
+        task_id: &str,
+        kind: String,
+        subtype: String,
+        value: String,
+        normalized: String,
+        fields: serde_json::Value,
+        confidence: TaskRefConfidence,
+        status: TaskRefStatus,
+        superseded_by: Option<String>,
+        source_event_id: Option<String>,
+        created_by_actor_id: String,
+    ) -> StoreResult<TaskRef> {
+        let _guard = self.structure_lock.lock();
+        let task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        let normalized = if normalized.trim().is_empty() {
+            normalize_task_ref(&value)
+        } else {
+            normalized.trim().to_string()
+        };
+        let now = Utc::now();
+        let mut to_upsert = Vec::new();
+        {
+            let inner = self.inner.read();
+            if let Some(existing) = inner.task_refs.values().find(|r| {
+                r.task_id == task_id
+                    && r.kind == kind
+                    && r.subtype == subtype
+                    && r.normalized == normalized
+                    && r.status == status
+            }) {
+                return Ok(existing.clone());
+            }
+            if status == TaskRefStatus::Active {
+                for existing in inner.task_refs.values().filter(|r| {
+                    r.channel_id == task.channel_id
+                        && r.kind == kind
+                        && r.subtype == subtype
+                        && r.normalized == normalized
+                        && r.status == TaskRefStatus::Active
+                        && r.task_id != task_id
+                }) {
+                    let Some(existing_task) = inner.tasks.get(&existing.task_id) else {
+                        continue;
+                    };
+                    if is_terminal_task_status(existing_task.status) {
+                        continue;
+                    }
+                    if confidence == TaskRefConfidence::Confirmed
+                        && existing.confidence == TaskRefConfidence::Inferred
+                    {
+                        let mut superseded = existing.clone();
+                        superseded.status = TaskRefStatus::Superseded;
+                        superseded.superseded_by = Some(format!("tref_pending_{}", short_id()));
+                        superseded.updated_at = now;
+                        to_upsert.push(superseded);
+                    } else {
+                        return Err(StoreError::Conflict(format!(
+                            "active task ref {} / {} / {} already belongs to non-terminal task {}",
+                            kind, subtype, normalized, existing.task_id
+                        )));
+                    }
+                }
+            }
+        }
+
+        let id = format!("tref_{}", short_id());
+        for superseded in &mut to_upsert {
+            if superseded
+                .superseded_by
+                .as_deref()
+                .is_some_and(|id| id.starts_with("tref_pending_"))
+            {
+                superseded.superseded_by = Some(id.clone());
+            }
+            self.journal
+                .append(&Mutation::TaskRefUpsert(superseded.clone()))?;
+        }
+        let task_ref = TaskRef {
+            id,
+            task_id: task.id.clone(),
+            channel_id: task.channel_id.clone(),
+            kind,
+            subtype,
+            value,
+            normalized,
+            fields,
+            confidence,
+            status,
+            superseded_by,
+            source_event_id,
+            created_by_actor_id,
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::TaskRefUpsert(task_ref.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            for superseded in to_upsert {
+                inner.task_refs.insert(superseded.id.clone(), superseded);
+            }
+            inner
+                .task_refs
+                .insert(task_ref.id.clone(), task_ref.clone());
+        }
+        self.record_task_change(
+            &task,
+            TaskChangeType::Action,
+            vec![task_ref.id.clone()],
+            format!(
+                "task_ref:{}:{}:{}",
+                task_ref.kind, task_ref.subtype, task_ref.normalized
+            ),
+            format!("task ref {} attached", task_ref.kind),
+            default_task_change_recipients(&task, &[]),
+            true,
+        )?;
+        Ok(task_ref)
+    }
+
+    pub fn find_task_refs(
+        &self,
+        channel_id: Option<&str>,
+        kind: &str,
+        subtype: &str,
+        normalized: &str,
+        confidence: Option<TaskRefConfidence>,
+        status: Option<TaskRefStatus>,
+    ) -> (Vec<TaskRef>, Vec<Task>) {
+        let inner = self.inner.read();
+        let mut refs: Vec<TaskRef> = inner
+            .task_refs
+            .values()
+            .filter(|r| channel_id.is_none_or(|id| r.channel_id == id))
+            .filter(|r| r.kind == kind)
+            .filter(|r| r.subtype == subtype)
+            .filter(|r| r.normalized == normalized)
+            .filter(|r| confidence.is_none_or(|c| r.confidence == c))
+            .filter(|r| status.is_none_or(|s| r.status == s))
+            .cloned()
+            .collect();
+        refs.sort_by(|a, b| {
+            a.channel_id
+                .cmp(&b.channel_id)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.subtype.cmp(&b.subtype))
+                .then_with(|| a.normalized.cmp(&b.normalized))
+        });
+        let tasks = refs
+            .iter()
+            .filter_map(|r| inner.tasks.get(&r.task_id).cloned())
+            .collect();
+        (refs, tasks)
+    }
+
+    pub fn list_task_refs(&self, task_id: &str) -> Vec<TaskRef> {
+        let inner = self.inner.read();
+        let mut refs: Vec<TaskRef> = inner
+            .task_refs
+            .values()
+            .filter(|r| r.task_id == task_id)
+            .cloned()
+            .collect();
+        refs.sort_by(|a, b| {
+            a.kind
+                .cmp(&b.kind)
+                .then_with(|| a.subtype.cmp(&b.subtype))
+                .then_with(|| a.normalized.cmp(&b.normalized))
+        });
+        refs
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_task_artifact_link(
+        &self,
+        task_id: &str,
+        artifact_id: String,
+        schema: String,
+        role: String,
+        sequence: Option<u64>,
+        status: TaskArtifactLinkStatus,
+        lineage: serde_json::Value,
+        binding: serde_json::Value,
+        created_by_actor_id: String,
+    ) -> StoreResult<TaskArtifactLink> {
+        let _guard = self.structure_lock.lock();
+        let task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        {
+            let inner = self.inner.read();
+            if !inner.artifacts.contains_key(&artifact_id) {
+                return Err(StoreError::NotFound(format!("artifact {artifact_id}")));
+            }
+            if status == TaskArtifactLinkStatus::Active {
+                let target_key = binding_string(&binding, "target_key");
+                let purpose = binding_string(&binding, "purpose");
+                if let Some(existing) = inner.task_artifact_links.values().find(|l| {
+                    l.task_id == task_id
+                        && l.status == TaskArtifactLinkStatus::Active
+                        && l.schema == schema
+                        && l.role == role
+                        && binding_string(&l.binding, "target_key") == target_key
+                        && binding_string(&l.binding, "purpose") == purpose
+                }) {
+                    return Err(StoreError::Conflict(format!(
+                        "active artifact link {} already covers schema={} role={} target={} purpose={}",
+                        existing.id, schema, role, target_key, purpose
+                    )));
+                }
+            }
+        }
+        let seq = sequence.unwrap_or_else(|| {
+            self.inner
+                .read()
+                .task_artifact_links
+                .values()
+                .filter(|l| l.task_id == task_id)
+                .map(|l| l.sequence)
+                .max()
+                .unwrap_or(0)
+                + 1
+        });
+        let now = Utc::now();
+        let link = TaskArtifactLink {
+            id: format!("tal_{}", short_id()),
+            task_id: task.id.clone(),
+            artifact_id,
+            schema,
+            role,
+            sequence: seq,
+            status,
+            lineage,
+            binding,
+            created_by_actor_id,
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::TaskArtifactLinkUpsert(link.clone()))?;
+        self.inner
+            .write()
+            .task_artifact_links
+            .insert(link.id.clone(), link.clone());
+        self.record_task_change(
+            &task,
+            TaskChangeType::ArtifactLink,
+            vec![link.id.clone()],
+            format!(
+                "artifact_link:{}:{}:{}",
+                link.schema, link.role, link.sequence
+            ),
+            format!("artifact link {} attached", link.role),
+            default_task_change_recipients(&task, &[]),
+            true,
+        )?;
+        Ok(link)
+    }
+
+    pub fn activate_task_artifact_link(
+        &self,
+        link_id: &str,
+        supersede_link_ids: Vec<String>,
+    ) -> StoreResult<(TaskArtifactLink, Vec<TaskArtifactLink>)> {
+        let _guard = self.structure_lock.lock();
+        let mut link = self
+            .inner
+            .read()
+            .task_artifact_links
+            .get(link_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("artifact link {link_id}")))?;
+        let task = self
+            .get_task(&link.task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {}", link.task_id)))?;
+        let mut superseded = Vec::new();
+        {
+            let inner = self.inner.read();
+            let target_key = binding_string(&link.binding, "target_key");
+            let purpose = binding_string(&link.binding, "purpose");
+            for existing in inner.task_artifact_links.values().filter(|l| {
+                l.id != link.id
+                    && l.task_id == link.task_id
+                    && l.status == TaskArtifactLinkStatus::Active
+                    && l.schema == link.schema
+                    && l.role == link.role
+                    && binding_string(&l.binding, "target_key") == target_key
+                    && binding_string(&l.binding, "purpose") == purpose
+            }) {
+                if supersede_link_ids.iter().any(|id| id == &existing.id) {
+                    let mut s = existing.clone();
+                    s.status = TaskArtifactLinkStatus::Superseded;
+                    s.updated_at = Utc::now();
+                    superseded.push(s);
+                } else {
+                    return Err(StoreError::Conflict(format!(
+                        "active artifact link {} must be superseded before {} can activate",
+                        existing.id, link.id
+                    )));
+                }
+            }
+        }
+        link.status = TaskArtifactLinkStatus::Active;
+        link.updated_at = Utc::now();
+        for item in &superseded {
+            self.journal
+                .append(&Mutation::TaskArtifactLinkUpsert(item.clone()))?;
+        }
+        self.journal
+            .append(&Mutation::TaskArtifactLinkUpsert(link.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            for item in &superseded {
+                inner
+                    .task_artifact_links
+                    .insert(item.id.clone(), item.clone());
+            }
+            inner
+                .task_artifact_links
+                .insert(link.id.clone(), link.clone());
+        }
+        self.record_task_change(
+            &task,
+            TaskChangeType::ArtifactLink,
+            std::iter::once(link.id.clone())
+                .chain(superseded.iter().map(|l| l.id.clone()))
+                .collect(),
+            format!("artifact_link_activate:{}", link.id),
+            format!("artifact link {} activated", link.role),
+            default_task_change_recipients(&task, &[]),
+            true,
+        )?;
+        Ok((link, superseded))
+    }
+
+    pub fn list_task_artifact_links(
+        &self,
+        task_id: &str,
+        status: Option<TaskArtifactLinkStatus>,
+    ) -> Vec<TaskArtifactLink> {
+        let mut links: Vec<TaskArtifactLink> = self
+            .inner
+            .read()
+            .task_artifact_links
+            .values()
+            .filter(|l| l.task_id == task_id)
+            .filter(|l| status.is_none_or(|s| l.status == s))
+            .cloned()
+            .collect();
+        links.sort_by(|a, b| a.sequence.cmp(&b.sequence).then_with(|| a.id.cmp(&b.id)));
+        links
+    }
+
+    pub fn get_task_artifact_link(&self, link_id: &str) -> Option<TaskArtifactLink> {
+        self.inner.read().task_artifact_links.get(link_id).cloned()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_task_fact(
+        &self,
+        task_id: &str,
+        target_key: String,
+        kind: String,
+        fact_type: TaskFactType,
+        subject: serde_json::Value,
+        signature: Option<String>,
+        status: TaskFactStatus,
+        replaces: Vec<String>,
+        retracted_by: Option<String>,
+        authority: String,
+        authority_binding: serde_json::Value,
+        observed_at: Option<Timestamp>,
+        source_cursor: Option<String>,
+        source_snapshot_id: Option<String>,
+        external_updated_at: Option<Timestamp>,
+        observed_fields: Vec<String>,
+        unobserved_fields: Vec<String>,
+        unavailable_reason: Option<String>,
+        snapshot_completeness: Option<TaskSnapshotCompleteness>,
+        producer_id: String,
+        summary: String,
+        raw_refs: Vec<String>,
+        artifact_id: Option<String>,
+        payload_schema: String,
+        payload: serde_json::Value,
+    ) -> StoreResult<(TaskFact, bool)> {
+        let _guard = self.structure_lock.lock();
+        let task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        let signature = signature.unwrap_or_else(|| {
+            task_fact_signature(
+                &target_key,
+                &kind,
+                &subject,
+                &authority,
+                &authority_binding,
+                &payload_schema,
+                &payload,
+                &observed_fields,
+                &unobserved_fields,
+                snapshot_completeness,
+            )
+        });
+        {
+            let inner = self.inner.read();
+            if let Some(existing) = inner.task_facts.values().find(|f| {
+                f.task_id == task_id
+                    && f.signature == signature
+                    && f.status == status
+                    && f.target_key == target_key
+                    && f.kind == kind
+            }) {
+                return Ok((existing.clone(), false));
+            }
+        }
+        let now = Utc::now();
+        let mut lifecycle_updates = Vec::new();
+        {
+            let inner = self.inner.read();
+            for old_id in &replaces {
+                if let Some(old) = inner.task_facts.get(old_id) {
+                    if old.task_id != task.id {
+                        return Err(StoreError::InvalidState(format!(
+                            "replacement fact {old_id} does not belong to task {}",
+                            task.id
+                        )));
+                    }
+                    let mut updated = old.clone();
+                    updated.status = match status {
+                        TaskFactStatus::Retracted => TaskFactStatus::Retracted,
+                        TaskFactStatus::Conflict => TaskFactStatus::Conflict,
+                        _ => TaskFactStatus::Superseded,
+                    };
+                    updated.retracted_by = if status == TaskFactStatus::Retracted {
+                        Some(format!("fact_pending_{}", short_id()))
+                    } else {
+                        updated.retracted_by
+                    };
+                    updated.updated_at = now;
+                    lifecycle_updates.push(updated);
+                }
+            }
+        }
+        let id = format!("fact_{}", short_id());
+        for update in &mut lifecycle_updates {
+            if update
+                .retracted_by
+                .as_deref()
+                .is_some_and(|id| id.starts_with("fact_pending_"))
+            {
+                update.retracted_by = Some(id.clone());
+            }
+            self.journal
+                .append(&Mutation::TaskFactUpsert(update.clone()))?;
+        }
+        let fact = TaskFact {
+            id,
+            task_id: task.id.clone(),
+            target_key,
+            kind,
+            fact_type,
+            subject,
+            signature,
+            status,
+            replaces,
+            retracted_by,
+            authority,
+            authority_binding,
+            observed_at: observed_at.unwrap_or(now),
+            source_cursor,
+            source_snapshot_id,
+            external_updated_at,
+            observed_fields,
+            unobserved_fields,
+            unavailable_reason,
+            snapshot_completeness,
+            producer_id,
+            summary,
+            raw_refs,
+            artifact_id,
+            payload_schema,
+            payload,
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::TaskFactUpsert(fact.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            for update in lifecycle_updates {
+                inner.task_facts.insert(update.id.clone(), update);
+            }
+            inner.task_facts.insert(fact.id.clone(), fact.clone());
+        }
+        self.record_task_change(
+            &task,
+            TaskChangeType::Fact,
+            vec![fact.id.clone()],
+            format!("fact:{}:{}:{}", fact.target_key, fact.kind, fact.signature),
+            if fact.summary.trim().is_empty() {
+                format!("task fact {} appended", fact.kind)
+            } else {
+                fact.summary.clone()
+            },
+            default_task_change_recipients(&task, &[]),
+            true,
+        )?;
+        Ok((fact, true))
+    }
+
+    pub fn list_task_facts(
+        &self,
+        task_id: &str,
+        kind: Option<&str>,
+        status: Option<TaskFactStatus>,
+        target_key: Option<&str>,
+    ) -> Vec<TaskFact> {
+        let mut facts: Vec<TaskFact> = self
+            .inner
+            .read()
+            .task_facts
+            .values()
+            .filter(|f| f.task_id == task_id)
+            .filter(|f| kind.is_none_or(|kind| f.kind == kind))
+            .filter(|f| status.is_none_or(|status| f.status == status))
+            .filter(|f| target_key.is_none_or(|target| f.target_key == target))
+            .cloned()
+            .collect();
+        facts.sort_by(|a, b| {
+            a.observed_at
+                .cmp(&b.observed_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        facts
+    }
+
+    pub fn put_task_projection(
+        &self,
+        task_id: &str,
+        projection_type: String,
+        producer_actor_id: String,
+        health: TaskProjectionHealth,
+        watermark: serde_json::Value,
+        payload_schema: String,
+        payload: serde_json::Value,
+    ) -> StoreResult<TaskProjection> {
+        let _guard = self.structure_lock.lock();
+        let task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        let now = Utc::now();
+        let id = self
+            .inner
+            .read()
+            .task_projections
+            .values()
+            .find(|p| p.task_id == task_id && p.projection_type == projection_type)
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| format!("tproj_{}", short_id()));
+        let projection = TaskProjection {
+            id,
+            task_id: task.id.clone(),
+            projection_type,
+            producer_actor_id,
+            health,
+            watermark,
+            payload_schema,
+            payload,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::TaskProjectionUpsert(projection.clone()))?;
+        self.inner
+            .write()
+            .task_projections
+            .insert(projection.id.clone(), projection.clone());
+        self.record_task_change(
+            &task,
+            TaskChangeType::Projection,
+            vec![projection.id.clone()],
+            format!(
+                "projection:{}:{:?}:{}",
+                projection.projection_type,
+                projection.health,
+                json_pair_hash(&projection.watermark, &projection.payload)
+            ),
+            format!("task projection {} updated", projection.projection_type),
+            default_task_change_recipients(&task, &[]),
+            true,
+        )?;
+        Ok(projection)
+    }
+
+    pub fn get_task_projection(
+        &self,
+        task_id: &str,
+        projection_type: &str,
+    ) -> Option<TaskProjection> {
+        self.inner
+            .read()
+            .task_projections
+            .values()
+            .find(|p| p.task_id == task_id && p.projection_type == projection_type)
+            .cloned()
+    }
+
+    pub fn list_task_projections(&self, task_id: &str) -> Vec<TaskProjection> {
+        let mut projections: Vec<TaskProjection> = self
+            .inner
+            .read()
+            .task_projections
+            .values()
+            .filter(|p| p.task_id == task_id)
+            .cloned()
+            .collect();
+        projections.sort_by(|a, b| {
+            a.projection_type
+                .cmp(&b.projection_type)
+                .then_with(|| a.updated_at.cmp(&b.updated_at))
+        });
+        projections
+    }
+
     pub fn create_task_assignment(
         &self,
         task_id: &str,
@@ -790,7 +1439,10 @@ impl Store {
         to_actor_id: String,
         assignment_type: TaskAssignmentType,
         instruction: String,
-    ) -> StoreResult<(TaskAssignment, Task)> {
+        contract: Option<serde_json::Value>,
+        idempotency_key: Option<String>,
+    ) -> StoreResult<(TaskAssignment, Task, bool)> {
+        let _guard = self.structure_lock.lock();
         let mut task = self
             .get_task(task_id)
             .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
@@ -806,6 +1458,57 @@ impl Store {
                 task.channel_id
             )));
         }
+        if is_terminal_task_status(task.status)
+            && matches!(
+                assignment_type,
+                TaskAssignmentType::Fix | TaskAssignmentType::Review
+            )
+        {
+            return Err(StoreError::InvalidState(format!(
+                "terminal task {} rejects {:?} assignment",
+                task.id, assignment_type
+            )));
+        }
+        let Some(contract_value) = contract.as_ref() else {
+            return Err(StoreError::InvalidState(format!(
+                "assignment for task {} requires machine-readable contract",
+                task.id
+            )));
+        };
+        if !contract_value.is_object() {
+            return Err(StoreError::InvalidState(format!(
+                "assignment for task {} requires object contract",
+                task.id
+            )));
+        }
+        let effective_idempotency = idempotency_key.clone().or_else(|| {
+            contract
+                .as_ref()
+                .and_then(|c| json_path_string(c, &["idempotency_key"]))
+        });
+        if let Some(key) = effective_idempotency.as_ref() {
+            let inner = self.inner.read();
+            if let Some(existing) = inner.assignments.values().find(|a| {
+                a.task_id == task_id
+                    && a.idempotency_key.as_deref() == Some(key)
+                    && matches!(
+                        a.status,
+                        TaskAssignmentStatus::Pending | TaskAssignmentStatus::Running
+                    )
+            }) {
+                return Ok((existing.clone(), task, false));
+            }
+            if inner.assignments.values().any(|a| {
+                a.task_id == task_id
+                    && a.idempotency_key.as_deref() == Some(key)
+                    && a.status == TaskAssignmentStatus::Completed
+            }) {
+                return Err(StoreError::Conflict(format!(
+                    "completed assignment already exists for idempotency key {key}"
+                )));
+            }
+        }
+        self.validate_assignment_contract(&task, &to_actor_id, contract_value)?;
         let now = Utc::now();
         let assignment = TaskAssignment {
             id: format!("asgn_{}", short_id()),
@@ -817,6 +1520,13 @@ impl Store {
             status: TaskAssignmentStatus::Pending,
             result_event_id: None,
             result_summary: String::new(),
+            contract,
+            idempotency_key: effective_idempotency,
+            lease_id: None,
+            result_artifact_ids: Vec::new(),
+            result_fact_ids: Vec::new(),
+            evidence_refs: Vec::new(),
+            result_envelope: None,
             created_at: now,
             updated_at: now,
             _meta: None,
@@ -848,7 +1558,16 @@ impl Store {
             task: task.clone(),
         });
         self.emit(StoreEvent::TaskChanged(task.clone()));
-        Ok((assignment, task))
+        self.record_task_change(
+            &task,
+            TaskChangeType::Assignment,
+            vec![assignment.id.clone()],
+            format!("assignment:create:{}", assignment.id),
+            format!("assignment {} created", assignment.id),
+            default_task_change_recipients(&task, &[assignment.from_actor_id.clone()]),
+            true,
+        )?;
+        Ok((assignment, task, true))
     }
 
     pub fn update_task_assignment(
@@ -857,7 +1576,12 @@ impl Store {
         status: Option<TaskAssignmentStatus>,
         result_event_id: Option<String>,
         result_summary: Option<String>,
+        result_envelope: Option<serde_json::Value>,
+        result_artifact_ids: Vec<String>,
+        result_fact_ids: Vec<String>,
+        evidence_refs: Vec<String>,
     ) -> StoreResult<(TaskAssignment, Task)> {
+        let _guard = self.structure_lock.lock();
         let mut assignment = self
             .get_assignment(assignment_id)
             .ok_or_else(|| StoreError::NotFound(format!("assignment {assignment_id}")))?;
@@ -866,14 +1590,51 @@ impl Store {
                 return Err(StoreError::NotFound(format!("event {event_id}")));
             }
         }
-        if let Some(status) = status {
-            assignment.status = status;
+        if let Some(next_status) = status {
+            if next_status == TaskAssignmentStatus::Completed {
+                if assignment.status != TaskAssignmentStatus::Running {
+                    return Err(StoreError::InvalidState(format!(
+                        "assignment {} must be running before it can complete",
+                        assignment.id
+                    )));
+                }
+                let completion_envelope = result_envelope
+                    .as_ref()
+                    .or(assignment.result_envelope.as_ref())
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "completed assignment {} requires result envelope",
+                            assignment.id
+                        ))
+                    })?;
+                validate_completion_result_envelope(&assignment, completion_envelope)?;
+                let guards = self.assignment_guards(&assignment);
+                if !assignment_guards_allow_completion(&guards) {
+                    return Err(StoreError::InvalidState(format!(
+                        "assignment {} cannot complete because guards are not clean: {}",
+                        assignment.id, guards
+                    )));
+                }
+            }
+            assignment.status = next_status;
         }
         if let Some(event_id) = result_event_id {
             assignment.result_event_id = Some(event_id);
         }
         if let Some(summary) = result_summary {
             assignment.result_summary = summary;
+        }
+        if let Some(envelope) = result_envelope {
+            assignment.result_envelope = Some(envelope);
+        }
+        if !result_artifact_ids.is_empty() {
+            assignment.result_artifact_ids = unique_nonempty(result_artifact_ids);
+        }
+        if !result_fact_ids.is_empty() {
+            assignment.result_fact_ids = unique_nonempty(result_fact_ids);
+        }
+        if !evidence_refs.is_empty() {
+            assignment.evidence_refs = unique_nonempty(evidence_refs);
         }
         assignment.updated_at = Utc::now();
         let mut task = self
@@ -895,7 +1656,658 @@ impl Store {
             task: task.clone(),
         });
         self.emit(StoreEvent::TaskChanged(task.clone()));
+        self.record_task_change(
+            &task,
+            TaskChangeType::Assignment,
+            vec![assignment.id.clone()],
+            format!(
+                "assignment:update:{}:{:?}",
+                assignment.id, assignment.status
+            ),
+            format!("assignment {} updated", assignment.id),
+            default_task_change_recipients(
+                &task,
+                &[
+                    assignment.from_actor_id.clone(),
+                    assignment.to_actor_id.clone(),
+                ],
+            ),
+            is_terminal_assignment_status_for_store(assignment.status),
+        )?;
         Ok((assignment, task))
+    }
+
+    pub fn assignment_context(
+        &self,
+        assignment_id: &str,
+    ) -> StoreResult<(
+        Task,
+        TaskAssignment,
+        Vec<TaskRef>,
+        Vec<TaskArtifactLink>,
+        Vec<TaskFact>,
+        Option<TaskProjection>,
+        serde_json::Value,
+    )> {
+        let assignment = self
+            .get_assignment(assignment_id)
+            .ok_or_else(|| StoreError::NotFound(format!("assignment {assignment_id}")))?;
+        let task = self
+            .get_task(&assignment.task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {}", assignment.task_id)))?;
+        let refs = self.list_task_refs(&task.id);
+        let artifact_links = self.list_task_artifact_links(&task.id, None);
+        let facts = self.list_task_facts(&task.id, None, None, None);
+        let projection = self
+            .get_task_projection(&task.id, "summary")
+            .or_else(|| self.list_task_projections(&task.id).into_iter().next());
+        let guards = self.assignment_guards(&assignment);
+        Ok((
+            task,
+            assignment,
+            refs,
+            artifact_links,
+            facts,
+            projection,
+            guards,
+        ))
+    }
+
+    pub fn assignment_preflight(
+        &self,
+        assignment_id: &str,
+        target_key: String,
+        head: String,
+        effect: String,
+    ) -> StoreResult<TaskPreflightResult> {
+        self.expire_workspace_leases()?;
+        let assignment = self
+            .get_assignment(assignment_id)
+            .ok_or_else(|| StoreError::NotFound(format!("assignment {assignment_id}")))?;
+        let checked_at = Utc::now();
+        let guards = self.assignment_guards_with_request(&assignment, &target_key, &head, &effect);
+        let allowed = guards
+            .get("freshness")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| v == "matched")
+            && guards
+                .get("lease")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|v| v == "valid" || v == "unclaimed")
+            && guards
+                .get("runtime_revision")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|v| v == "matched" || v == "unknown")
+            && guards
+                .get("assignment_status")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|v| v == "running");
+        let reason = if allowed {
+            String::new()
+        } else {
+            "preflight guard failed".to_string()
+        };
+        Ok(TaskPreflightResult {
+            assignment_id: assignment.id,
+            allowed,
+            checked_at,
+            target_key,
+            head,
+            effect,
+            guards,
+            reason,
+        })
+    }
+
+    pub fn acquire_workspace_lease(
+        &self,
+        assignment_id: &str,
+        resource_key: String,
+        mode: WorkspaceLeaseMode,
+        expires_at: Timestamp,
+    ) -> StoreResult<(Option<WorkspaceLease>, Vec<WorkspaceLease>)> {
+        let _guard = self.structure_lock.lock();
+        let mut assignment = self
+            .get_assignment(assignment_id)
+            .ok_or_else(|| StoreError::NotFound(format!("assignment {assignment_id}")))?;
+        let task = self
+            .get_task(&assignment.task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {}", assignment.task_id)))?;
+        let now = Utc::now();
+        let active: Vec<WorkspaceLease> = self
+            .inner
+            .read()
+            .workspace_leases
+            .values()
+            .filter(|lease| {
+                lease.resource_key == resource_key
+                    && lease.status == WorkspaceLeaseStatus::Active
+                    && lease.expires_at > now
+            })
+            .cloned()
+            .collect();
+        let conflicts: Vec<WorkspaceLease> = active
+            .into_iter()
+            .filter(|lease| {
+                lease.holder_assignment_id != assignment_id
+                    && (mode == WorkspaceLeaseMode::Write
+                        || lease.mode == WorkspaceLeaseMode::Write)
+            })
+            .collect();
+        if !conflicts.is_empty() {
+            self.record_task_change(
+                &task,
+                TaskChangeType::Lease,
+                conflicts.iter().map(|l| l.id.clone()).collect(),
+                format!("lease_conflict:{resource_key}"),
+                format!("workspace lease conflict on {resource_key}"),
+                default_task_change_recipients(&task, &[assignment.from_actor_id.clone()]),
+                true,
+            )?;
+            return Ok((None, conflicts));
+        }
+        let lease = WorkspaceLease {
+            id: format!("lease_{}", short_id()),
+            resource_key,
+            holder_assignment_id: assignment.id.clone(),
+            holder_actor_id: assignment.to_actor_id.clone(),
+            mode,
+            status: WorkspaceLeaseStatus::Active,
+            expires_at,
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        assignment.lease_id = Some(lease.id.clone());
+        assignment.updated_at = now;
+        self.journal
+            .append(&Mutation::WorkspaceLeaseUpsert(lease.clone()))?;
+        self.journal
+            .append(&Mutation::TaskAssignmentUpsert(assignment.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            inner
+                .workspace_leases
+                .insert(lease.id.clone(), lease.clone());
+            inner
+                .assignments
+                .insert(assignment.id.clone(), assignment.clone());
+        }
+        self.record_task_change(
+            &task,
+            TaskChangeType::Lease,
+            vec![lease.id.clone()],
+            format!("lease_acquired:{}", lease.resource_key),
+            format!("workspace lease acquired on {}", lease.resource_key),
+            default_task_change_recipients(&task, &[assignment.from_actor_id.clone()]),
+            true,
+        )?;
+        Ok((Some(lease), Vec::new()))
+    }
+
+    pub fn release_workspace_lease(&self, lease_id: &str) -> StoreResult<WorkspaceLease> {
+        let _guard = self.structure_lock.lock();
+        let mut lease = self
+            .inner
+            .read()
+            .workspace_leases
+            .get(lease_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("lease {lease_id}")))?;
+        lease.status = WorkspaceLeaseStatus::Released;
+        lease.updated_at = Utc::now();
+        self.journal
+            .append(&Mutation::WorkspaceLeaseUpsert(lease.clone()))?;
+        self.inner
+            .write()
+            .workspace_leases
+            .insert(lease.id.clone(), lease.clone());
+        if let Some(assignment) = self.get_assignment(&lease.holder_assignment_id) {
+            if let Some(task) = self.get_task(&assignment.task_id) {
+                self.record_task_change(
+                    &task,
+                    TaskChangeType::Lease,
+                    vec![lease.id.clone()],
+                    format!("lease_released:{}", lease.resource_key),
+                    format!("workspace lease released on {}", lease.resource_key),
+                    default_task_change_recipients(&task, &[assignment.from_actor_id]),
+                    true,
+                )?;
+            }
+        }
+        Ok(lease)
+    }
+
+    pub fn get_workspace_lease(&self, lease_id: &str) -> Option<WorkspaceLease> {
+        self.inner.read().workspace_leases.get(lease_id).cloned()
+    }
+
+    pub fn list_workspace_leases(
+        &self,
+        resource_key: Option<&str>,
+        assignment_id: Option<&str>,
+        active_only: bool,
+    ) -> Vec<WorkspaceLease> {
+        let _ = self.expire_workspace_leases();
+        let now = Utc::now();
+        let mut leases: Vec<WorkspaceLease> = self
+            .inner
+            .read()
+            .workspace_leases
+            .values()
+            .filter(|lease| resource_key.is_none_or(|key| lease.resource_key == key))
+            .filter(|lease| assignment_id.is_none_or(|id| lease.holder_assignment_id == id))
+            .filter(|lease| {
+                !active_only
+                    || (lease.status == WorkspaceLeaseStatus::Active && lease.expires_at > now)
+            })
+            .cloned()
+            .collect();
+        leases.sort_by(|a, b| {
+            a.resource_key
+                .cmp(&b.resource_key)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        leases
+    }
+
+    fn expire_workspace_leases(&self) -> StoreResult<()> {
+        let _guard = self.structure_lock.lock();
+        let now = Utc::now();
+        let expired: Vec<WorkspaceLease> = self
+            .inner
+            .read()
+            .workspace_leases
+            .values()
+            .filter(|lease| lease.status == WorkspaceLeaseStatus::Active && lease.expires_at <= now)
+            .cloned()
+            .collect();
+        for mut lease in expired {
+            lease.status = WorkspaceLeaseStatus::Expired;
+            lease.updated_at = now;
+            self.journal
+                .append(&Mutation::WorkspaceLeaseUpsert(lease.clone()))?;
+            self.inner
+                .write()
+                .workspace_leases
+                .insert(lease.id.clone(), lease.clone());
+            if let Some(assignment) = self.get_assignment(&lease.holder_assignment_id) {
+                if let Some(task) = self.get_task(&assignment.task_id) {
+                    self.record_task_change(
+                        &task,
+                        TaskChangeType::Lease,
+                        vec![lease.id.clone()],
+                        format!("lease_expired:{}", lease.id),
+                        format!("workspace lease expired on {}", lease.resource_key),
+                        default_task_change_recipients(&task, &[assignment.from_actor_id]),
+                        true,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_task_changes(
+        &self,
+        recipient_actor_id: &str,
+        task_id: Option<&str>,
+        include_handled: bool,
+        after_cursor: Option<u64>,
+        limit: Option<usize>,
+    ) -> Vec<TaskChangeDelivery> {
+        let mut rows: Vec<TaskChangeDelivery> = self
+            .inner
+            .read()
+            .task_change_deliveries
+            .values()
+            .filter(|delivery| delivery.recipient_actor_id == recipient_actor_id)
+            .filter(|delivery| task_id.is_none_or(|id| delivery.change.task_id == id))
+            .filter(|delivery| {
+                include_handled || delivery.status != TaskChangeDeliveryStatus::Handled
+            })
+            .filter(|delivery| after_cursor.is_none_or(|cursor| delivery.change.cursor > cursor))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.change.cursor.cmp(&b.change.cursor));
+        rows.truncate(limit.unwrap_or(100).clamp(1, 500));
+        rows
+    }
+
+    pub fn ack_task_change(
+        &self,
+        change_id: &str,
+        recipient_actor_id: &str,
+        disposition: TaskChangeAckDisposition,
+        result_ref_ids: Vec<String>,
+        reason: String,
+    ) -> StoreResult<TaskChangeDelivery> {
+        let key = (change_id.to_string(), recipient_actor_id.to_string());
+        let mut delivery = self
+            .inner
+            .read()
+            .task_change_deliveries
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "task change {change_id} for recipient {recipient_actor_id}"
+                ))
+            })?;
+        if delivery.status == TaskChangeDeliveryStatus::Handled {
+            return Err(StoreError::InvalidState(format!(
+                "task change {change_id} for recipient {recipient_actor_id} is already handled"
+            )));
+        }
+        if result_ref_ids.iter().all(|id| id.trim().is_empty()) && reason.trim().is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "task change {change_id} ack requires result refs or reason"
+            )));
+        }
+        delivery.status = TaskChangeDeliveryStatus::Handled;
+        delivery.disposition = Some(disposition);
+        delivery.result_ref_ids = unique_nonempty(result_ref_ids);
+        delivery.reason = reason;
+        delivery.acked_at = Some(Utc::now());
+        self.journal
+            .append(&Mutation::TaskChangeDeliveryUpsert(delivery.clone()))?;
+        self.inner
+            .write()
+            .task_change_deliveries
+            .insert(key, delivery.clone());
+        Ok(delivery)
+    }
+
+    fn validate_assignment_contract(
+        &self,
+        task: &Task,
+        to_actor_id: &str,
+        contract: &serde_json::Value,
+    ) -> StoreResult<()> {
+        let required_artifacts =
+            json_path_array_strings(contract, &["context", "required_artifacts"]);
+        let required_facts = json_path_array_strings(contract, &["context", "required_facts"]);
+        let required_validation_facts =
+            json_path_array_strings(contract, &["context", "required_validation_facts"]);
+        let required_capabilities = json_path_array_strings(contract, &["required_capabilities"]);
+        let inner = self.inner.read();
+        for artifact_id in required_artifacts {
+            let exists = task.artifact_ids.iter().any(|id| id == &artifact_id)
+                || inner.task_artifact_links.values().any(|link| {
+                    link.task_id == task.id
+                        && link.artifact_id == artifact_id
+                        && link.status == TaskArtifactLinkStatus::Active
+                });
+            if !exists {
+                return Err(StoreError::InvalidState(format!(
+                    "required artifact {artifact_id} is not active for task {}",
+                    task.id
+                )));
+            }
+        }
+        for fact_id in required_facts {
+            let Some(fact) = inner.task_facts.get(&fact_id) else {
+                return Err(StoreError::InvalidState(format!(
+                    "required fact {fact_id} is missing"
+                )));
+            };
+            if fact.task_id != task.id || fact.status != TaskFactStatus::Active {
+                return Err(StoreError::InvalidState(format!(
+                    "required fact {fact_id} is not active for task {}",
+                    task.id
+                )));
+            }
+        }
+        for fact_id in required_validation_facts {
+            let Some(fact) = inner.task_facts.get(&fact_id) else {
+                return Err(StoreError::InvalidState(format!(
+                    "required validation fact {fact_id} is missing"
+                )));
+            };
+            if fact.task_id != task.id || fact.status != TaskFactStatus::Active {
+                return Err(StoreError::InvalidState(format!(
+                    "required validation fact {fact_id} is not active for task {}",
+                    task.id
+                )));
+            }
+        }
+        if !required_capabilities.is_empty() {
+            let actor = inner
+                .actors
+                .get(to_actor_id)
+                .ok_or_else(|| StoreError::NotFound(format!("actor {to_actor_id}")))?;
+            let available = actor_capabilities(actor);
+            for capability in required_capabilities {
+                if !available.iter().any(|c| c == &capability) {
+                    return Err(StoreError::InvalidState(format!(
+                        "actor {to_actor_id} lacks capability {capability}"
+                    )));
+                }
+            }
+        }
+        if let Some(expected) =
+            json_path_string(contract, &["versions", "target_actor_spec_revision"])
+        {
+            let actor = inner
+                .actors
+                .get(to_actor_id)
+                .ok_or_else(|| StoreError::NotFound(format!("actor {to_actor_id}")))?;
+            let current = actor_revision(actor).ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "actor {to_actor_id} does not expose runtime revision"
+                ))
+            })?;
+            if current != expected {
+                return Err(StoreError::InvalidState(format!(
+                    "actor {to_actor_id} revision mismatch: expected {expected}, current {current}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn assignment_guards(&self, assignment: &TaskAssignment) -> serde_json::Value {
+        self.assignment_guards_with_request(assignment, "", "", "")
+    }
+
+    fn assignment_guards_with_request(
+        &self,
+        assignment: &TaskAssignment,
+        target_key: &str,
+        head: &str,
+        effect: &str,
+    ) -> serde_json::Value {
+        let contract = assignment.contract.as_ref();
+        let freshness = match contract {
+            Some(contract) => {
+                let expected_target =
+                    json_path_string(contract, &["target", "target_key"]).unwrap_or_default();
+                let expected_head =
+                    json_path_string(contract, &["target", "head"]).unwrap_or_default();
+                let effect_allowed = effect.is_empty()
+                    || json_path_array_strings(contract, &["effects", "authorized"]).is_empty()
+                    || json_path_array_strings(contract, &["effects", "authorized"])
+                        .iter()
+                        .any(|item| item == effect);
+                if (!target_key.is_empty()
+                    && !expected_target.is_empty()
+                    && expected_target != target_key)
+                    || (!head.is_empty() && !expected_head.is_empty() && expected_head != head)
+                    || !effect_allowed
+                {
+                    "stale"
+                } else {
+                    "matched"
+                }
+            }
+            None => "matched",
+        };
+        let lease = match assignment.lease_id.as_deref() {
+            Some(lease_id) => {
+                let now = Utc::now();
+                match self.inner.read().workspace_leases.get(lease_id).cloned() {
+                    Some(lease)
+                        if lease.status == WorkspaceLeaseStatus::Active
+                            && lease.expires_at > now =>
+                    {
+                        "valid"
+                    }
+                    Some(_) => "expired",
+                    None => "missing",
+                }
+            }
+            None => {
+                let write_mode = contract
+                    .and_then(|c| json_path_string(c, &["workspace", "write_mode"]))
+                    .unwrap_or_default();
+                if write_mode == "write" {
+                    "missing"
+                } else {
+                    "unclaimed"
+                }
+            }
+        };
+        let runtime_revision = contract
+            .and_then(|c| json_path_string(c, &["versions", "target_actor_spec_revision"]))
+            .map(|expected| {
+                let current = self
+                    .inner
+                    .read()
+                    .actors
+                    .get(&assignment.to_actor_id)
+                    .and_then(actor_revision);
+                match current {
+                    Some(current) if current == expected => "matched",
+                    Some(_) => "mismatch",
+                    None => "unknown",
+                }
+            })
+            .unwrap_or("unknown");
+        let assignment_status = match assignment.status {
+            TaskAssignmentStatus::Pending => "pending",
+            TaskAssignmentStatus::Running => "running",
+            TaskAssignmentStatus::Canceled => "canceled",
+            TaskAssignmentStatus::Completed | TaskAssignmentStatus::Failed => "terminal",
+        };
+        serde_json::json!({
+            "missing": guard_missing_inputs(self, assignment),
+            "stale": [],
+            "freshness": freshness,
+            "lease": lease,
+            "runtime_revision": runtime_revision,
+            "assignment_status": assignment_status
+        })
+    }
+
+    fn record_task_change(
+        &self,
+        task: &Task,
+        change_type: TaskChangeType,
+        source_ids: Vec<String>,
+        signature: String,
+        summary: String,
+        recipients: Vec<String>,
+        requires_ack: bool,
+    ) -> StoreResult<TaskChange> {
+        let recipients = unique_nonempty(recipients);
+        let mut inner = self.inner.write();
+        if let Some(existing) = inner
+            .task_changes
+            .values()
+            .find(|change| change.task_id == task.id && change.signature == signature)
+        {
+            return Ok(existing.clone());
+        }
+        inner.task_change_seq += 1;
+        let change = TaskChange {
+            id: format!("tchg_{}", short_id()),
+            cursor: inner.task_change_seq,
+            task_id: task.id.clone(),
+            change_type,
+            source_ids: unique_nonempty(source_ids),
+            signature,
+            summary,
+            occurred_at: Utc::now(),
+            recipients,
+            requires_ack,
+        };
+        let deliveries: Vec<TaskChangeDelivery> = change
+            .recipients
+            .iter()
+            .map(|recipient| TaskChangeDelivery {
+                change: change.clone(),
+                recipient_actor_id: recipient.clone(),
+                status: TaskChangeDeliveryStatus::Pending,
+                disposition: None,
+                result_ref_ids: Vec::new(),
+                reason: String::new(),
+                acked_at: None,
+            })
+            .collect();
+        self.journal
+            .append(&Mutation::TaskChangeUpsert(change.clone()))?;
+        for delivery in &deliveries {
+            self.journal
+                .append(&Mutation::TaskChangeDeliveryUpsert(delivery.clone()))?;
+        }
+        inner.task_changes.insert(change.id.clone(), change.clone());
+        for delivery in deliveries {
+            inner.task_change_deliveries.insert(
+                (
+                    delivery.change.id.clone(),
+                    delivery.recipient_actor_id.clone(),
+                ),
+                delivery,
+            );
+        }
+        drop(inner);
+        self.emit(StoreEvent::TaskChanged(task.clone()));
+        Ok(change)
+    }
+
+    fn record_action_response_task_change(
+        &self,
+        response: &Event,
+    ) -> StoreResult<Option<TaskChange>> {
+        let request = {
+            let inner = self.inner.read();
+            response
+                .relations
+                .iter()
+                .find(|r| {
+                    matches!(r.kind, RelationKind::RespondsTo) && r.target.kind == RefKind::Event
+                })
+                .and_then(|r| inner.events.get(&r.target.id))
+                .filter(|event| event.kind == "action.request")
+                .cloned()
+        };
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        let task_id = json_field_string(&request.payload, "taskId")
+            .or_else(|| json_field_string(&request.payload, "task_id"));
+        let Some(task_id) = task_id else {
+            return Ok(None);
+        };
+        let Some(task) = self.get_task(&task_id) else {
+            return Ok(None);
+        };
+        let conversion_owner = json_field_string(&request.payload, "conversionOwnerActorId")
+            .or_else(|| json_field_string(&request.payload, "conversion_owner_actor_id"));
+        let recipients = default_task_change_recipients(
+            &task,
+            &conversion_owner.into_iter().collect::<Vec<_>>(),
+        );
+        let change = self.record_task_change(
+            &task,
+            TaskChangeType::Action,
+            vec![request.id.clone(), response.id.clone()],
+            format!("action_response:{}:{}", request.id, response.id),
+            "action response requires conversion".into(),
+            recipients,
+            true,
+        )?;
+        Ok(Some(change))
     }
 
     // -------- Turns --------
@@ -1192,6 +2604,10 @@ impl Store {
             self.emit(StoreEvent::DeliveryUpdated(delivery));
         }
 
+        if event.kind == "action.response" {
+            let _ = self.record_action_response_task_change(&event);
+        }
+
         self.emit(StoreEvent::EventCreated(event.clone()));
 
         if implicit_turn {
@@ -1203,6 +2619,40 @@ impl Store {
 
     pub fn get_event(&self, id: &str) -> Option<Event> {
         self.inner.read().events.get(id).cloned()
+    }
+
+    pub fn find_assignment_handoff_event(&self, assignment_id: &str) -> Option<Event> {
+        self.inner
+            .read()
+            .events
+            .values()
+            .find(|event| {
+                event
+                    .payload
+                    .get("_meta")
+                    .and_then(|meta| meta.get("assignmentId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(assignment_id)
+            })
+            .cloned()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_assignment_handoff_event(
+        &self,
+        assignment_id: &str,
+        kind: String,
+        actor_id: String,
+        scope: ScopeRef,
+        payload: serde_json::Value,
+        relations: Vec<Relation>,
+        meta: Option<Meta>,
+    ) -> StoreResult<Event> {
+        let _guard = self.structure_lock.lock();
+        if let Some(event) = self.find_assignment_handoff_event(assignment_id) {
+            return Ok(event);
+        }
+        self.append_event(kind, actor_id, scope, None, payload, relations, meta)
     }
 
     pub fn read_scope(
@@ -1714,6 +3164,30 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::TaskAssignmentUpsert(a) => {
             inner.assignments.insert(a.id.clone(), a);
         }
+        Mutation::TaskRefUpsert(r) => {
+            inner.task_refs.insert(r.id.clone(), r);
+        }
+        Mutation::TaskArtifactLinkUpsert(l) => {
+            inner.task_artifact_links.insert(l.id.clone(), l);
+        }
+        Mutation::TaskFactUpsert(f) => {
+            inner.task_facts.insert(f.id.clone(), f);
+        }
+        Mutation::TaskProjectionUpsert(p) => {
+            inner.task_projections.insert(p.id.clone(), p);
+        }
+        Mutation::WorkspaceLeaseUpsert(l) => {
+            inner.workspace_leases.insert(l.id.clone(), l);
+        }
+        Mutation::TaskChangeUpsert(c) => {
+            inner.task_change_seq = inner.task_change_seq.max(c.cursor);
+            inner.task_changes.insert(c.id.clone(), c);
+        }
+        Mutation::TaskChangeDeliveryUpsert(d) => {
+            inner
+                .task_change_deliveries
+                .insert((d.change.id.clone(), d.recipient_actor_id.clone()), d);
+        }
         Mutation::TurnOpen(t) => {
             inner.turns.insert(t.id.clone(), t);
         }
@@ -1909,6 +3383,263 @@ fn unique_nonempty(ids: Vec<String>) -> Vec<String> {
     out
 }
 
+fn is_terminal_task_status(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
+    )
+}
+
+fn is_terminal_assignment_status_for_store(status: TaskAssignmentStatus) -> bool {
+    matches!(
+        status,
+        TaskAssignmentStatus::Completed
+            | TaskAssignmentStatus::Failed
+            | TaskAssignmentStatus::Canceled
+    )
+}
+
+fn normalize_task_ref(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn binding_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn task_fact_signature(
+    target_key: &str,
+    kind: &str,
+    subject: &serde_json::Value,
+    authority: &str,
+    authority_binding: &serde_json::Value,
+    payload_schema: &str,
+    payload: &serde_json::Value,
+    observed_fields: &[String],
+    unobserved_fields: &[String],
+    snapshot_completeness: Option<TaskSnapshotCompleteness>,
+) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    target_key.hash(&mut hasher);
+    kind.hash(&mut hasher);
+    subject.to_string().hash(&mut hasher);
+    authority.hash(&mut hasher);
+    authority_binding.to_string().hash(&mut hasher);
+    payload_schema.hash(&mut hasher);
+    payload.to_string().hash(&mut hasher);
+    observed_fields.hash(&mut hasher);
+    unobserved_fields.hash(&mut hasher);
+    snapshot_completeness.hash(&mut hasher);
+    format!("hash:{:016x}", hasher.finish())
+}
+
+fn json_pair_hash(a: &serde_json::Value, b: &serde_json::Value) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    a.to_string().hash(&mut hasher);
+    b.to_string().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn json_path_string(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str().map(str::to_string)
+}
+
+fn json_field_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn json_path_array_strings(value: &serde_json::Value, path: &[&str]) -> Vec<String> {
+    let mut current = value;
+    for key in path {
+        let Some(next) = current.get(*key) else {
+            return Vec::new();
+        };
+        current = next;
+    }
+    current
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn actor_capabilities(actor: &Actor) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(value) = actor.capabilities.as_ref() {
+        if let Some(arr) = value.as_array() {
+            out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+        }
+        if let Some(arr) = value
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+        {
+            out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+        }
+        if let Some(arr) = value.get("tools").and_then(serde_json::Value::as_array) {
+            out.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+        }
+    }
+    unique_nonempty(out)
+}
+
+fn actor_revision(actor: &Actor) -> Option<String> {
+    actor
+        .capabilities
+        .as_ref()
+        .and_then(|v| {
+            v.get("revision")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| v.get("specRevision").and_then(serde_json::Value::as_str))
+                .or_else(|| v.get("profileRevision").and_then(serde_json::Value::as_str))
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            actor
+                ._meta
+                .as_ref()
+                .and_then(|m| m.get("revision"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn default_task_change_recipients(task: &Task, extra: &[String]) -> Vec<String> {
+    let mut recipients = Vec::new();
+    if let Some(owner) = task.owner_actor_id.as_ref() {
+        recipients.push(owner.clone());
+    }
+    recipients.push(task.requester_actor_id.clone());
+    recipients.extend(extra.iter().cloned());
+    unique_nonempty(recipients)
+}
+
+fn guard_missing_inputs(store: &Store, assignment: &TaskAssignment) -> Vec<String> {
+    let mut missing = Vec::new();
+    let Some(contract) = assignment.contract.as_ref() else {
+        return missing;
+    };
+    let inner = store.inner.read();
+    for artifact_id in json_path_array_strings(contract, &["context", "required_artifacts"]) {
+        let Some(task) = inner.tasks.get(&assignment.task_id) else {
+            missing.push(format!("task:{}", assignment.task_id));
+            return missing;
+        };
+        let exists = task.artifact_ids.iter().any(|id| id == &artifact_id)
+            || inner.task_artifact_links.values().any(|link| {
+                link.task_id == assignment.task_id
+                    && link.artifact_id == artifact_id
+                    && link.status == TaskArtifactLinkStatus::Active
+            });
+        if !exists {
+            missing.push(format!("artifact:{artifact_id}"));
+        }
+    }
+    for fact_id in json_path_array_strings(contract, &["context", "required_facts"]) {
+        let exists = inner.task_facts.get(&fact_id).is_some_and(|fact| {
+            fact.task_id == assignment.task_id && fact.status == TaskFactStatus::Active
+        });
+        if !exists {
+            missing.push(format!("fact:{fact_id}"));
+        }
+    }
+    for fact_id in json_path_array_strings(contract, &["context", "required_validation_facts"]) {
+        let exists = inner.task_facts.get(&fact_id).is_some_and(|fact| {
+            fact.task_id == assignment.task_id && fact.status == TaskFactStatus::Active
+        });
+        if !exists {
+            missing.push(format!("validation_fact:{fact_id}"));
+        }
+    }
+    missing
+}
+
+fn assignment_guards_allow_completion(guards: &serde_json::Value) -> bool {
+    let missing_clean = guards
+        .get("missing")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|items| items.is_empty());
+    let stale_clean = guards
+        .get("stale")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|items| items.is_empty());
+    let lease_clean = guards
+        .get("lease")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|v| v == "valid" || v == "unclaimed");
+    let runtime_clean = guards
+        .get("runtime_revision")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|v| v == "matched" || v == "unknown");
+    let assignment_running = guards
+        .get("assignment_status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|v| v == "running");
+    missing_clean && stale_clean && lease_clean && runtime_clean && assignment_running
+}
+
+fn validate_completion_result_envelope(
+    assignment: &TaskAssignment,
+    envelope: &serde_json::Value,
+) -> StoreResult<()> {
+    if !envelope.is_object() {
+        return Err(StoreError::InvalidState(format!(
+            "completed assignment {} result envelope must be an object",
+            assignment.id
+        )));
+    }
+    let envelope_assignment_id = json_field_string(envelope, "assignmentId")
+        .or_else(|| json_field_string(envelope, "assignment_id"));
+    if envelope_assignment_id.as_deref() != Some(assignment.id.as_str()) {
+        return Err(StoreError::InvalidState(format!(
+            "completed assignment {} result envelope must reference assignment_id",
+            assignment.id
+        )));
+    }
+    let status = json_field_string(envelope, "status").unwrap_or_default();
+    if status.trim().is_empty() {
+        return Err(StoreError::InvalidState(format!(
+            "completed assignment {} result envelope requires status",
+            assignment.id
+        )));
+    }
+    if envelope
+        .get("resultArtifacts")
+        .or_else(|| envelope.get("result_artifacts"))
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|items| items.is_empty())
+        && envelope
+            .get("resultFacts")
+            .or_else(|| envelope.get("result_facts"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|items| items.is_empty())
+        && envelope
+            .get("evidenceRefs")
+            .or_else(|| envelope.get("evidence_refs"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|items| items.is_empty())
+    {
+        return Err(StoreError::InvalidState(format!(
+            "completed assignment {} result envelope requires result artifact, fact, or evidence refs",
+            assignment.id
+        )));
+    }
+    Ok(())
+}
+
 fn next_repeat_after(from: chrono::DateTime<Utc>, rule: &str) -> Option<chrono::DateTime<Utc>> {
     if let Some(raw) = rule.strip_prefix("every:") {
         return parse_duration_seconds(raw)
@@ -2068,6 +3799,39 @@ mod tests {
             .expect("create thread")
     }
 
+    fn create_owned_task(store: &Arc<Store>, channel_id: &str, title: &str) -> Task {
+        let root_event_id = append_channel_root(store, channel_id, "actor_owner", title);
+        store
+            .create_task(
+                root_event_id,
+                Some(title.into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                Some("test@epoch".into()),
+            )
+            .expect("create task")
+    }
+
+    fn put_test_artifact(store: &Arc<Store>, id: &str) -> Artifact {
+        let artifact = Artifact {
+            id: id.into(),
+            uri: format!("artifact://{id}"),
+            kind: ArtifactKind::File,
+            name: id.into(),
+            media_type: "application/json".into(),
+            size: 2,
+            checksum: format!("sha256:{id}"),
+            created_by: "actor_owner".into(),
+            created_at: Utc::now(),
+            _meta: None,
+        };
+        store.put_artifact(artifact).expect("put artifact")
+    }
+
     #[test]
     fn update_channel_changes_title_and_persists_via_replay() {
         let store = fresh_store();
@@ -2220,6 +3984,9 @@ mod tests {
                 "actor_owner".into(),
                 Some("actor_owner".into()),
                 None,
+                None,
+                None,
+                None,
             )
             .expect("create task");
 
@@ -2236,6 +4003,34 @@ mod tests {
             .expect("replay");
         let replayed_task = replayed.get_task(&task.id).expect("replayed task");
         assert_eq!(replayed_task.canonical_thread_id, task.canonical_thread_id);
+    }
+
+    #[test]
+    fn task_parent_fields_support_compound_request_split() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("split".into(), Some("actor_owner".into()))
+            .unwrap();
+        let parent_event =
+            append_channel_root(&store, &ch.id, "actor_owner", "fix A and inspect B");
+        let child_event = append_channel_root(&store, &ch.id, "actor_owner", "fix A");
+        let child = store
+            .create_task(
+                child_event,
+                Some("fix A".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::Claimed),
+                Some(parent_event.clone()),
+                None,
+                Some("test@epoch".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            child.parent_source_event_id.as_deref(),
+            Some(parent_event.as_str())
+        );
     }
 
     #[test]
@@ -2265,6 +4060,9 @@ mod tests {
                 "actor_owner".into(),
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .expect_err("thread event cannot anchor task");
         assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
@@ -2278,6 +4076,9 @@ mod tests {
                 "actor_owner".into(),
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
         let err = store
@@ -2286,6 +4087,9 @@ mod tests {
                 None,
                 String::new(),
                 "actor_owner".into(),
+                None,
+                None,
+                None,
                 None,
                 None,
             )
@@ -2314,6 +4118,9 @@ mod tests {
                         String::new(),
                         "actor_owner".into(),
                         Some("actor_owner".into()),
+                        None,
+                        None,
+                        None,
                         None,
                     )
                 })
@@ -2351,15 +4158,20 @@ mod tests {
                 "actor_owner".into(),
                 Some("actor_owner".into()),
                 Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
             )
             .unwrap();
-        let (assignment, task) = store
+        let (assignment, task, _) = store
             .create_task_assignment(
                 &task.id,
                 "actor_owner".into(),
                 "actor_reviewer".into(),
                 TaskAssignmentType::Review,
                 "review story".into(),
+                Some(serde_json::json!({})),
+                None,
             )
             .unwrap();
         assert_eq!(task.status, TaskStatus::WaitingReview);
@@ -2380,9 +4192,32 @@ mod tests {
         let (updated, _) = store
             .update_task_assignment(
                 &assignment.id,
+                Some(TaskAssignmentStatus::Running),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(updated.status, TaskAssignmentStatus::Running);
+        let envelope = serde_json::json!({
+            "assignment_id": assignment.id,
+            "status": "completed",
+            "verdict": "pass",
+            "evidence_refs": [result_event.id.clone()]
+        });
+        let (updated, _) = store
+            .update_task_assignment(
+                &assignment.id,
                 Some(TaskAssignmentStatus::Completed),
                 Some(result_event.id.clone()),
                 Some("looks good".into()),
+                Some(envelope),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             )
             .unwrap();
         assert_eq!(updated.status, TaskAssignmentStatus::Completed);
@@ -2398,6 +4233,1105 @@ mod tests {
             .expect("replayed assignment");
         assert_eq!(replayed_assignment.result_summary, "looks good");
         assert_eq!(replayed_assignment.status, TaskAssignmentStatus::Completed);
+    }
+
+    #[test]
+    fn task_ref_conflict_and_lookup_are_durable() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("refs".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task_a = create_owned_task(&store, &ch.id, "task a");
+        let task_b = create_owned_task(&store, &ch.id, "task b");
+
+        let tref = store
+            .attach_task_ref(
+                &task_a.id,
+                "branch".into(),
+                "git_branch".into(),
+                "feature/x".into(),
+                "repo#feature/x".into(),
+                serde_json::json!({}),
+                TaskRefConfidence::Confirmed,
+                TaskRefStatus::Active,
+                None,
+                Some(task_a.source_event_id.clone()),
+                "actor_owner".into(),
+            )
+            .unwrap();
+        let conflict = store
+            .attach_task_ref(
+                &task_b.id,
+                "branch".into(),
+                "git_branch".into(),
+                "feature/x".into(),
+                "repo#feature/x".into(),
+                serde_json::json!({}),
+                TaskRefConfidence::Confirmed,
+                TaskRefStatus::Active,
+                None,
+                None,
+                "actor_owner".into(),
+            )
+            .expect_err("same active confirmed ref cannot bind two non-terminal tasks");
+        assert!(matches!(conflict, StoreError::Conflict(_)));
+
+        let (refs, tasks) = store.find_task_refs(
+            Some(&ch.id),
+            "branch",
+            "git_branch",
+            "repo#feature/x",
+            Some(TaskRefConfidence::Confirmed),
+            Some(TaskRefStatus::Active),
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, tref.id);
+        assert_eq!(tasks[0].id, task_a.id);
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert_eq!(replayed.list_task_refs(&task_a.id).len(), 1);
+        for (kind, subtype, normalized) in [
+            ("external_url", "code_mr", "code:example/repo!1"),
+            ("external_url", "feedback", "feedback:42"),
+            ("thread_alias", "legacy_thread", "thread_old"),
+            ("title_alias", "human_title", "fix-login"),
+        ] {
+            store
+                .attach_task_ref(
+                    &task_a.id,
+                    kind.into(),
+                    subtype.into(),
+                    normalized.into(),
+                    normalized.into(),
+                    serde_json::json!({}),
+                    TaskRefConfidence::Inferred,
+                    TaskRefStatus::Active,
+                    None,
+                    None,
+                    "actor_owner".into(),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.list_task_refs(&task_a.id).len(), 5);
+    }
+
+    #[test]
+    fn concurrent_confirmed_task_ref_attach_keeps_single_active_owner() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("ref-race".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task_a = create_owned_task(&store, &ch.id, "task a");
+        let task_b = create_owned_task(&store, &ch.id, "task b");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [task_a.id.clone(), task_b.id.clone()]
+            .into_iter()
+            .map(|task_id| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.attach_task_ref(
+                        &task_id,
+                        "branch".into(),
+                        "git_branch".into(),
+                        "repo#race".into(),
+                        "repo#race".into(),
+                        serde_json::json!({}),
+                        TaskRefConfidence::Confirmed,
+                        TaskRefStatus::Active,
+                        None,
+                        None,
+                        "actor_owner".into(),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(StoreError::Conflict(_))))
+                .count(),
+            1
+        );
+        let (refs, tasks) = store.find_task_refs(
+            Some(&ch.id),
+            "branch",
+            "git_branch",
+            "repo#race",
+            Some(TaskRefConfidence::Confirmed),
+            Some(TaskRefStatus::Active),
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn task_artifact_link_activate_supersedes_current_link() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("artifacts".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "artifact task");
+        put_test_artifact(&store, "art_a");
+        put_test_artifact(&store, "art_b");
+
+        let first = store
+            .attach_task_artifact_link(
+                &task.id,
+                "art_a".into(),
+                "effective-context.v1".into(),
+                "current".into(),
+                None,
+                TaskArtifactLinkStatus::Active,
+                serde_json::json!({}),
+                serde_json::json!({"target_key":"repo#branch","purpose":"context"}),
+                "actor_owner".into(),
+            )
+            .unwrap();
+        let second = store
+            .attach_task_artifact_link(
+                &task.id,
+                "art_b".into(),
+                "effective-context.v1".into(),
+                "current".into(),
+                None,
+                TaskArtifactLinkStatus::Proposal,
+                serde_json::json!({"supersedes":[first.artifact_id]}),
+                serde_json::json!({"target_key":"repo#branch","purpose":"context"}),
+                "actor_owner".into(),
+            )
+            .unwrap();
+        let (active, superseded) = store
+            .activate_task_artifact_link(&second.id, vec![first.id.clone()])
+            .unwrap();
+        assert_eq!(active.status, TaskArtifactLinkStatus::Active);
+        assert_eq!(superseded[0].status, TaskArtifactLinkStatus::Superseded);
+        let links = store.list_task_artifact_links(&task.id, Some(TaskArtifactLinkStatus::Active));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, second.id);
+    }
+
+    #[test]
+    fn task_fact_idempotency_lifecycle_and_partial_snapshot_fields_round_trip() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("facts".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "fact task");
+        let (first, created) = store
+            .append_task_fact(
+                &task.id,
+                "mr:1".into(),
+                "ci.status".into(),
+                TaskFactType::Status,
+                serde_json::json!({"pipeline":"p1"}),
+                Some("ci:p1".into()),
+                TaskFactStatus::Active,
+                Vec::new(),
+                None,
+                "code".into(),
+                serde_json::json!({"reviewer":"bot"}),
+                None,
+                Some("100".into()),
+                Some("snap-100".into()),
+                Some(Utc::now()),
+                vec!["state".into()],
+                vec!["duration".into()],
+                Some("partial_response".into()),
+                Some(TaskSnapshotCompleteness::Partial),
+                "actor_ci".into(),
+                "ci failed".into(),
+                vec!["evt_1".into()],
+                None,
+                "ci-status.v1".into(),
+                serde_json::json!({"state":"failed"}),
+            )
+            .unwrap();
+        assert!(created);
+        let (_, duplicated) = store
+            .append_task_fact(
+                &task.id,
+                "mr:1".into(),
+                "ci.status".into(),
+                TaskFactType::Status,
+                serde_json::json!({"pipeline":"p1"}),
+                Some("ci:p1".into()),
+                TaskFactStatus::Active,
+                Vec::new(),
+                None,
+                "code".into(),
+                serde_json::json!({"reviewer":"bot"}),
+                None,
+                Some("100".into()),
+                Some("snap-100".into()),
+                None,
+                vec!["state".into()],
+                vec!["duration".into()],
+                Some("partial_response".into()),
+                Some(TaskSnapshotCompleteness::Partial),
+                "actor_ci".into(),
+                "ci failed".into(),
+                vec![],
+                None,
+                "ci-status.v1".into(),
+                serde_json::json!({"state":"failed"}),
+            )
+            .unwrap();
+        assert!(!duplicated);
+
+        let (second, _) = store
+            .append_task_fact(
+                &task.id,
+                "mr:1".into(),
+                "ci.status".into(),
+                TaskFactType::Status,
+                serde_json::json!({"pipeline":"p1"}),
+                Some("ci:p1:pass".into()),
+                TaskFactStatus::Active,
+                vec![first.id.clone()],
+                None,
+                "code".into(),
+                serde_json::json!({"reviewer":"bot"}),
+                None,
+                Some("101".into()),
+                Some("snap-101".into()),
+                Some(Utc::now()),
+                vec!["state".into()],
+                vec!["duration".into()],
+                None,
+                Some(TaskSnapshotCompleteness::Partial),
+                "actor_ci".into(),
+                "ci passed".into(),
+                vec![],
+                None,
+                "ci-status.v1".into(),
+                serde_json::json!({"state":"passed"}),
+            )
+            .unwrap();
+        let first_after = store
+            .list_task_facts(&task.id, None, None, None)
+            .into_iter()
+            .find(|fact| fact.id == first.id)
+            .unwrap();
+        assert_eq!(first_after.status, TaskFactStatus::Superseded);
+        assert_eq!(second.observed_fields, vec!["state"]);
+        assert_eq!(
+            second.snapshot_completeness,
+            Some(TaskSnapshotCompleteness::Partial)
+        );
+        let (retracted, _) = store
+            .append_task_fact(
+                &task.id,
+                "mr:1".into(),
+                "human.decision".into(),
+                TaskFactType::Decision,
+                serde_json::json!({}),
+                Some("decision:1".into()),
+                TaskFactStatus::Retracted,
+                Vec::new(),
+                Some(second.id.clone()),
+                "human".into(),
+                serde_json::json!({}),
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(TaskSnapshotCompleteness::Unknown),
+                "actor_owner".into(),
+                "decision retracted".into(),
+                vec![],
+                None,
+                "decision.v1".into(),
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let (conflict, _) = store
+            .append_task_fact(
+                &task.id,
+                "mr:1".into(),
+                "ci.status".into(),
+                TaskFactType::Status,
+                serde_json::json!({}),
+                Some("ci:conflict".into()),
+                TaskFactStatus::Conflict,
+                Vec::new(),
+                None,
+                "code".into(),
+                serde_json::json!({}),
+                None,
+                Some("102".into()),
+                Some("snap-102".into()),
+                None,
+                vec!["state".into()],
+                Vec::new(),
+                None,
+                Some(TaskSnapshotCompleteness::Complete),
+                "actor_ci".into(),
+                "ci conflict".into(),
+                vec![],
+                None,
+                "ci-status.v1".into(),
+                serde_json::json!({"state":"unknown"}),
+            )
+            .unwrap();
+        assert_eq!(retracted.status, TaskFactStatus::Retracted);
+        assert_eq!(conflict.status, TaskFactStatus::Conflict);
+    }
+
+    #[test]
+    fn concurrent_duplicate_fact_append_creates_one_record() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("fact-race".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "fact race");
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let store = store.clone();
+                let task_id = task.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.append_task_fact(
+                        &task_id,
+                        "mr:race".into(),
+                        "ci.status".into(),
+                        TaskFactType::Status,
+                        serde_json::json!({"pipeline":"p1"}),
+                        Some("ci:p1".into()),
+                        TaskFactStatus::Active,
+                        Vec::new(),
+                        None,
+                        "code".into(),
+                        serde_json::json!({"source":"test"}),
+                        None,
+                        Some("100".into()),
+                        Some("snap-100".into()),
+                        None,
+                        vec!["state".into()],
+                        Vec::new(),
+                        None,
+                        Some(TaskSnapshotCompleteness::Complete),
+                        "actor_ci".into(),
+                        "ci passed".into(),
+                        Vec::new(),
+                        None,
+                        "ci-status.v1".into(),
+                        serde_json::json!({"state":"passed"}),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
+        assert_eq!(
+            store
+                .list_task_facts(
+                    &task.id,
+                    Some("ci.status"),
+                    Some(TaskFactStatus::Active),
+                    None
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn replacing_fact_from_another_task_is_rejected() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("fact-cross-task".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task_a = create_owned_task(&store, &ch.id, "task a");
+        let task_b = create_owned_task(&store, &ch.id, "task b");
+        let (fact, _) = store
+            .append_task_fact(
+                &task_a.id,
+                "mr:1".into(),
+                "ci.status".into(),
+                TaskFactType::Status,
+                serde_json::json!({}),
+                Some("ci:a".into()),
+                TaskFactStatus::Active,
+                Vec::new(),
+                None,
+                String::new(),
+                serde_json::json!({}),
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                "actor_owner".into(),
+                String::new(),
+                Vec::new(),
+                None,
+                String::new(),
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let err = store
+            .append_task_fact(
+                &task_b.id,
+                "mr:1".into(),
+                "ci.status".into(),
+                TaskFactType::Status,
+                serde_json::json!({}),
+                Some("ci:b".into()),
+                TaskFactStatus::Active,
+                vec![fact.id],
+                None,
+                String::new(),
+                serde_json::json!({}),
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                "actor_owner".into(),
+                String::new(),
+                Vec::new(),
+                None,
+                String::new(),
+                serde_json::json!({}),
+            )
+            .expect_err("cross-task fact replacement rejected");
+        assert!(matches!(err, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn task_projection_change_delivery_and_ack_round_trip() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("projection".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "projection task");
+        let mut rx = store.subscribe();
+        let projection = store
+            .put_task_projection(
+                &task.id,
+                "summary".into(),
+                "actor_projection".into(),
+                TaskProjectionHealth::Fresh,
+                serde_json::json!({"fact_ids":[]}),
+                "task-summary.v1".into(),
+                serde_json::json!({"summary":"ready"}),
+            )
+            .unwrap();
+        assert_eq!(projection.health, TaskProjectionHealth::Fresh);
+        match rx.try_recv().expect("projection emits task.changed") {
+            StoreEvent::TaskChanged(changed) => assert_eq!(changed.id, task.id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(store.get_task_projection(&task.id, "detail").is_none());
+        let stale = store
+            .put_task_projection(
+                &task.id,
+                "detail".into(),
+                "actor_projection".into(),
+                TaskProjectionHealth::RepairRequired,
+                serde_json::json!({}),
+                "task-detail.v1".into(),
+                serde_json::json!({"reason":"conflict"}),
+            )
+            .unwrap();
+        assert_eq!(stale.health, TaskProjectionHealth::RepairRequired);
+        let deliveries = store.list_task_changes("actor_owner", Some(&task.id), false, None, None);
+        assert!(deliveries
+            .iter()
+            .any(|delivery| delivery.change.change_type == TaskChangeType::Projection));
+        let change_id = deliveries
+            .iter()
+            .find(|delivery| delivery.change.change_type == TaskChangeType::Projection)
+            .unwrap()
+            .change
+            .id
+            .clone();
+        let ack = store
+            .ack_task_change(
+                &change_id,
+                "actor_owner",
+                TaskChangeAckDisposition::NoopRecorded,
+                Vec::new(),
+                "projection observed".into(),
+            )
+            .unwrap();
+        assert_eq!(ack.status, TaskChangeDeliveryStatus::Handled);
+        let duplicate = store
+            .ack_task_change(
+                &change_id,
+                "actor_owner",
+                TaskChangeAckDisposition::NoopRecorded,
+                Vec::new(),
+                "again".into(),
+            )
+            .expect_err("duplicate ack rejected");
+        assert!(matches!(duplicate, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn task_change_ack_requires_reason_or_result_refs() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("ack".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "ack task");
+        store
+            .put_task_projection(
+                &task.id,
+                "summary".into(),
+                "actor_projection".into(),
+                TaskProjectionHealth::Fresh,
+                serde_json::json!({"fact_ids":[]}),
+                "task-summary.v1".into(),
+                serde_json::json!({"summary":"ready"}),
+            )
+            .unwrap();
+        let change_id = store
+            .list_task_changes("actor_owner", Some(&task.id), false, None, None)
+            .into_iter()
+            .find(|delivery| delivery.change.change_type == TaskChangeType::Projection)
+            .unwrap()
+            .change
+            .id;
+        let err = store
+            .ack_task_change(
+                &change_id,
+                "actor_owner",
+                TaskChangeAckDisposition::NoopRecorded,
+                Vec::new(),
+                String::new(),
+            )
+            .expect_err("empty ack rejected");
+        assert!(matches!(err, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn action_response_with_task_scope_notifies_conversion_owner() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("action".into(), Some("actor_owner".into()))
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "action task");
+        let request = store
+            .append_event(
+                "action.request".into(),
+                "actor_owner".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: task.canonical_thread_id.clone(),
+                },
+                None,
+                serde_json::json!({
+                    "requestType": "choose",
+                    "title": "Continue?",
+                    "taskId": task.id,
+                    "targetKey": "repo#main",
+                    "decisionKind": "scope-decision",
+                    "conversionOwnerActorId": "actor_owner"
+                }),
+                vec![],
+                None,
+            )
+            .unwrap();
+        let response = store
+            .append_event(
+                "action.response".into(),
+                "actor_owner".into(),
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: task.canonical_thread_id.clone(),
+                },
+                None,
+                serde_json::json!({"optionId":"yes"}),
+                vec![Relation {
+                    kind: RelationKind::RespondsTo,
+                    target: Ref {
+                        kind: RefKind::Event,
+                        id: request.id.clone(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                }],
+                None,
+            )
+            .unwrap();
+        let deliveries = store.list_task_changes("actor_owner", Some(&task.id), false, None, None);
+        assert!(deliveries.iter().any(|delivery| {
+            delivery.change.change_type == TaskChangeType::Action
+                && delivery.change.source_ids.contains(&request.id)
+                && delivery.change.source_ids.contains(&response.id)
+        }));
+    }
+
+    #[test]
+    fn assignment_contract_preflight_and_write_lease_conflict_are_enforced() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("lease".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_delivery").unwrap();
+        store
+            .upsert_actor(Actor {
+                id: "actor_delivery".into(),
+                kind: ActorKind::Agent,
+                display_name: "delivery".into(),
+                capabilities: Some(serde_json::json!({
+                    "capabilities": ["workspace.write", "artifact.publish"],
+                    "revision": "rev-a"
+                })),
+                _meta: None,
+            })
+            .unwrap();
+        let task = create_owned_task(&store, &ch.id, "lease task");
+        let contract = serde_json::json!({
+            "target": {"target_key": "repo#main", "head": "h1"},
+            "effects": {"authorized": ["repo.push"]},
+            "workspace": {"resource_key": "worktree:repo", "write_mode": "write"},
+            "required_capabilities": ["workspace.write"],
+            "versions": {"target_actor_spec_revision": "rev-a"},
+            "idempotency_key": "lease-test"
+        });
+        let missing_required = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Fix,
+                "missing inputs".into(),
+                Some(serde_json::json!({
+                    "context": {"required_facts": ["fact_missing"]},
+                    "idempotency_key": "missing-inputs"
+                })),
+                None,
+            )
+            .expect_err("required fact guard rejects missing inputs");
+        assert!(matches!(missing_required, StoreError::InvalidState(_)));
+        let (assignment, _, created) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Fix,
+                "fix".into(),
+                Some(contract),
+                None,
+            )
+            .unwrap();
+        assert!(created);
+        let (same, _, created) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Fix,
+                "fix duplicate".into(),
+                Some(serde_json::json!({
+                    "target": {"target_key": "repo#main", "head": "h1"},
+                    "workspace": {"resource_key": "worktree:repo", "write_mode": "write"},
+                    "idempotency_key": "lease-test"
+                })),
+                None,
+            )
+            .unwrap();
+        assert_eq!(same.id, assignment.id);
+        assert!(!created);
+        let blocked = store
+            .assignment_preflight(
+                &assignment.id,
+                "repo#main".into(),
+                "h1".into(),
+                "repo.push".into(),
+            )
+            .unwrap();
+        assert!(!blocked.allowed);
+        assert_eq!(blocked.guards["lease"], "missing");
+
+        let (lease, conflicts) = store
+            .acquire_workspace_lease(
+                &assignment.id,
+                "worktree:repo".into(),
+                WorkspaceLeaseMode::Write,
+                Utc::now() + ChronoDuration::minutes(30),
+            )
+            .unwrap();
+        assert!(conflicts.is_empty());
+        assert!(lease.is_some());
+        let still_pending = store
+            .assignment_preflight(
+                &assignment.id,
+                "repo#main".into(),
+                "h1".into(),
+                "repo.push".into(),
+            )
+            .unwrap();
+        assert!(!still_pending.allowed);
+        assert_eq!(still_pending.guards["assignment_status"], "pending");
+        store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Running),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let allowed = store
+            .assignment_preflight(
+                &assignment.id,
+                "repo#main".into(),
+                "h1".into(),
+                "repo.push".into(),
+            )
+            .unwrap();
+        assert!(allowed.allowed);
+
+        let (other, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Fix,
+                "fix again".into(),
+                Some(serde_json::json!({
+                    "target": {"target_key": "repo#main", "head": "h2"},
+                    "workspace": {"resource_key": "worktree:repo", "write_mode": "write"},
+                    "required_capabilities": ["workspace.write"],
+                    "versions": {"target_actor_spec_revision": "rev-a"},
+                    "idempotency_key": "lease-test-2"
+                })),
+                None,
+            )
+            .unwrap();
+        let (lease, conflicts) = store
+            .acquire_workspace_lease(
+                &other.id,
+                "worktree:repo".into(),
+                WorkspaceLeaseMode::Write,
+                Utc::now() + ChronoDuration::minutes(30),
+            )
+            .unwrap();
+        assert!(lease.is_none());
+        assert_eq!(conflicts.len(), 1);
+
+        let mismatch_create = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Investigate,
+                "revision mismatch".into(),
+                Some(serde_json::json!({
+                    "target": {"target_key": "repo#main", "head": "h1"},
+                    "versions": {"target_actor_spec_revision": "rev-b"},
+                    "idempotency_key": "revision-mismatch"
+                })),
+                None,
+            )
+            .expect_err("revision mismatch rejected at create time");
+        assert!(matches!(mismatch_create, StoreError::InvalidState(_)));
+
+        let (mismatch, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Investigate,
+                "revision drift".into(),
+                Some(serde_json::json!({
+                    "target": {"target_key": "repo#main", "head": "h1"},
+                    "versions": {"target_actor_spec_revision": "rev-a"},
+                    "idempotency_key": "revision-drift"
+                })),
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_actor(Actor {
+                id: "actor_delivery".into(),
+                kind: ActorKind::Agent,
+                display_name: "delivery".into(),
+                capabilities: Some(serde_json::json!({
+                    "capabilities": ["workspace.write", "artifact.publish"],
+                    "revision": "rev-c"
+                })),
+                _meta: None,
+            })
+            .unwrap();
+        let preflight = store
+            .assignment_preflight(
+                &mismatch.id,
+                "repo#main".into(),
+                "h1".into(),
+                "repo.push".into(),
+            )
+            .unwrap();
+        assert!(!preflight.allowed);
+        assert_eq!(preflight.guards["runtime_revision"], "mismatch");
+
+        store
+            .update_task(
+                &task.id,
+                Some(TaskStatus::Done),
+                None,
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        let terminal = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Review,
+                "review done task".into(),
+                None,
+                None,
+            )
+            .expect_err("terminal task rejects review assignment");
+        assert!(matches!(terminal, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn concurrent_assignment_idempotency_returns_one_assignment() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("assignment-race".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_delivery").unwrap();
+        let task = create_owned_task(&store, &ch.id, "assignment race");
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let task_id = task.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.create_task_assignment(
+                        &task_id,
+                        "actor_owner".into(),
+                        "actor_delivery".into(),
+                        TaskAssignmentType::Fix,
+                        "fix".into(),
+                        Some(serde_json::json!({
+                            "idempotency_key": "same-target-head-context"
+                        })),
+                        Some("same-target-head-context".into()),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|(_, _, created)| *created).count(), 1);
+        let ids: std::collections::HashSet<_> = results
+            .iter()
+            .map(|(assignment, _, _)| assignment.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(store.list_task_assignments(&task.id).len(), 1);
+    }
+
+    #[test]
+    fn required_artifact_must_be_task_active_and_validation_fact_active() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("validation".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_delivery").unwrap();
+        let task = create_owned_task(&store, &ch.id, "validation task");
+        put_test_artifact(&store, "art_required");
+        let contract_without_validation = serde_json::json!({
+            "context": {
+                "required_artifacts": ["art_required"],
+                "required_validation_facts": ["fact_missing"]
+            },
+            "idempotency_key": "validation-missing"
+        });
+        let err = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Review,
+                "review".into(),
+                Some(contract_without_validation.clone()),
+                None,
+            )
+            .expect_err("unlinked artifact rejected");
+        assert!(matches!(err, StoreError::InvalidState(_)));
+        store
+            .attach_task_artifact_link(
+                &task.id,
+                "art_required".into(),
+                "effective-context.v1".into(),
+                "current".into(),
+                None,
+                TaskArtifactLinkStatus::Active,
+                serde_json::json!({}),
+                serde_json::json!({"target_key":"repo#main","purpose":"context"}),
+                "actor_owner".into(),
+            )
+            .unwrap();
+        let err = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Review,
+                "review".into(),
+                Some(contract_without_validation),
+                None,
+            )
+            .expect_err("missing validation fact rejected");
+        assert!(matches!(err, StoreError::InvalidState(_)));
+        let (fact, _) = store
+            .append_task_fact(
+                &task.id,
+                "art_required".into(),
+                "artifact.contract_validated".into(),
+                TaskFactType::Status,
+                serde_json::json!({}),
+                Some("validate:art_required".into()),
+                TaskFactStatus::Active,
+                Vec::new(),
+                None,
+                "validator".into(),
+                serde_json::json!({}),
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                "validator".into(),
+                "artifact valid".into(),
+                Vec::new(),
+                Some("art_required".into()),
+                "contract-validation-result.v1".into(),
+                serde_json::json!({"valid": true}),
+            )
+            .unwrap();
+        let (assignment, _, created) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_delivery".into(),
+                TaskAssignmentType::Review,
+                "review".into(),
+                Some(serde_json::json!({
+                    "context": {
+                        "required_artifacts": ["art_required"],
+                        "required_validation_facts": [fact.id]
+                    },
+                    "idempotency_key": "validation-ok"
+                })),
+                None,
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(assignment.to_actor_id, "actor_delivery");
+    }
+
+    #[test]
+    fn concurrent_write_lease_acquire_allows_single_holder_and_expires_visibly() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("lease-race".into(), Some("actor_owner".into()))
+            .unwrap();
+        for actor in ["actor_delivery_a", "actor_delivery_b"] {
+            store.grant_channel(&ch.id, actor).unwrap();
+        }
+        let task = create_owned_task(&store, &ch.id, "lease race");
+        let mut assignments = Vec::new();
+        for actor in ["actor_delivery_a", "actor_delivery_b"] {
+            let (assignment, _, _) = store
+                .create_task_assignment(
+                    &task.id,
+                    "actor_owner".into(),
+                    actor.into(),
+                    TaskAssignmentType::Fix,
+                    "fix".into(),
+                    Some(serde_json::json!({
+                        "workspace": {"resource_key": "worktree:race", "write_mode": "write"},
+                        "idempotency_key": actor
+                    })),
+                    None,
+                )
+                .unwrap();
+            assignments.push(assignment);
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = assignments
+            .iter()
+            .map(|assignment| {
+                let store = store.clone();
+                let assignment_id = assignment.id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.acquire_workspace_lease(
+                        &assignment_id,
+                        "worktree:race".into(),
+                        WorkspaceLeaseMode::Write,
+                        Utc::now() + ChronoDuration::milliseconds(50),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|(lease, _)| lease.is_some()).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, conflicts)| !conflicts.is_empty())
+                .count(),
+            1
+        );
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let _leases = store.list_workspace_leases(Some("worktree:race"), None, false);
+        assert!(store
+            .list_workspace_leases(Some("worktree:race"), None, false)
+            .iter()
+            .any(|lease| lease.status == WorkspaceLeaseStatus::Expired));
+        assert!(store
+            .list_task_changes("actor_owner", Some(&task.id), false, None, None)
+            .iter()
+            .any(|delivery| delivery.change.summary.contains("expired")));
     }
 
     #[test]

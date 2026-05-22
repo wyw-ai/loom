@@ -9,6 +9,18 @@ use serde_json::json;
 use crate::client::Client;
 use crate::render;
 
+pub async fn get(client: Arc<Client>, event_id: String) -> Result<()> {
+    let res: EventGetResult = client
+        .call(method::EVENT_GET, json!({ "eventId": event_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        render::render_event(&res.event);
+    }
+    Ok(())
+}
+
 pub async fn list(
     client: Arc<Client>,
     scope_id: String,

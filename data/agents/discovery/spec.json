@@ -6,8 +6,17 @@
     "_meta": {
       "createdBy": "joi-daemon",
       "providerId": "claude",
-      "providerName": "Claude Code",
-      "transportKind": "command"
+      "providerName": "Claude Code (GLM-5.1 endpoint)",
+      "transportKind": "command",
+      "revision": "actor_discovery@2026-05-19"
+    },
+    "capabilities": {
+      "capabilities": [
+        "artifact.publish",
+        "workspace.read",
+        "fact.append"
+      ],
+      "revision": "actor_discovery@2026-05-19"
     }
   },
   "transport": {
@@ -53,27 +62,11 @@
   },
   "autostart": true,
   "models": {
-    "default": "claude-sonnet-4.6",
+    "default": "sonnet",
     "choices": [
       {
         "id": "sonnet",
-        "label": "Sonnet"
-      },
-      {
-        "id": "opus",
-        "label": "Opus"
-      },
-      {
-        "id": "claude-sonnet-4.6",
-        "label": "Claude Sonnet 4.6"
-      },
-      {
-        "id": "claude-opus-4.7",
-        "label": "Claude Opus 4.7"
-      },
-      {
-        "id": "claude-haiku-4.5",
-        "label": "Claude Haiku 4.5"
+        "label": "GLM-5.1"
       }
     ]
   },
@@ -81,6 +74,12 @@
     "files": {
       "identity": "identity.md",
       "soul": "soul.md"
+    }
+  },
+  "memory": {
+    "delivery": {
+      "mcp": true,
+      "prompt": false
     }
   }
 }

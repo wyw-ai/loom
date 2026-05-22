@@ -4,7 +4,15 @@
   "actor": {
     "id": "mr-watcher",
     "kind": "service",
-    "displayName": "mr-watcher（MR观察器）"
+    "displayName": "mr-watcher（MR事实观察器）",
+    "capabilities": {
+      "capabilities": [
+        "platform.mr.read",
+        "fact.append",
+        "task.ref.find"
+      ],
+      "revision": "mr-watcher@2026-05-19"
+    }
   },
   "autostart": false,
   "lifecycle": "thread_bound",
@@ -14,22 +22,53 @@
       "thread.closed"
     ]
   },
+  "params_schema": {
+    "properties": {
+      "task_id": {
+        "type": "string"
+      },
+      "repo": {
+        "type": "string"
+      },
+      "mr": {
+        "type": "string"
+      },
+      "target_key": {
+        "type": "string"
+      }
+    }
+  },
   "config": {
     "jobs": [
       {
-        "id": "poll-thread",
+        "id": "poll-task",
         "schedule": "* * * * *",
         "source": {
           "kind": "command",
           "command": "python3",
           "args": [
-            "{spec.dir}/../../runtime-tools/joi-auto-dev/adapters/mr-watcher/poll.py",
+            "{spec.dir}/bundle/poll.py",
             "--once",
-            "--thread-id",
-            "{thread.id}"
+            "--task-id",
+            "{params.task_id}",
+            "--repo",
+            "{params.repo}",
+            "--mr",
+            "{params.mr}",
+            "--target-key",
+            "{params.target_key}"
           ],
           "env": {
-            "MR_WATCHER_STATE_DIR": "{instance.data_dir}"
+            "MR_WATCHER_STATE_DIR": "{instance.data_dir}",
+            "JOI_BIN": "/home/canfeng/joi-apps/joi",
+            "JOI_SERVER": "ws://127.0.0.1:7878/rpc",
+            "A1_BIN": "/home/canfeng/.local/bin/a1",
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "http_proxy": "",
+            "https_proxy": "",
+            "ALL_PROXY": "",
+            "all_proxy": ""
           },
           "timeoutMs": 180000
         },
@@ -43,28 +82,21 @@
         "singleInFlight": true
       }
     ],
-    "effectiveRuntime": "data/runtime-tools/joi-auto-dev/adapters/mr-watcher/poll.py",
     "contract": {
       "role": "MR fact watcher",
-      "handles": [
-        "mr comments",
-        "examiner [examiner-result] comments",
-        "examiner LGTM pass marker",
-        "examiner quality_pass + LGTM - actor_examiner -> router merge/platform gate",
-        "ci failures",
-        "conflicts",
-        "readyToMerge",
-        "merged/closed terminal state"
+      "writes": [
+        "TaskFact target.observed",
+        "TaskFact target.status_changed",
+        "TaskFact target.authority_validated/invalid"
       ],
       "doesNotHandle": [
         "quality judgement",
-        "design dispute judgement",
-        "direct delivery implementation decisions",
-        "handoff delivery for examiner action_target=none",
-        "handoff delivery for LGTM - actor_examiner marker",
-        "merge/platform gate when latest examiner run failed or no current quality_pass exists"
+        "design judgement",
+        "direct handoff",
+        "delivery/examiner assignment creation",
+        "merge/platform decisions"
       ],
-      "ciCompensationSeconds": 1800
+      "candidateMode": "without task_id the watcher emits a candidate event for actor_router"
     }
   }
 }

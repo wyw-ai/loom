@@ -4,11 +4,47 @@
   "actor": {
     "id": "feedback-scanner",
     "kind": "service",
-    "displayName": "feedback-scanner（缺陷扫描器）"
+    "displayName": "feedback-scanner（缺陷候选扫描器）",
+    "capabilities": {
+      "capabilities": [
+        "feedback.read",
+        "task.candidate.emit",
+        "fact.append"
+      ],
+      "revision": "feedback-scanner@2026-05-19"
+    }
   },
-  "autostart": true,
+  "autostart": false,
   "channelId": "chan_31f8fa85d909",
   "config": {
-    "jobs": []
+    "jobs": [
+      {
+        "id": "scan-candidates",
+        "schedule": "*/5 * * * *",
+        "source": {
+          "kind": "command",
+          "command": "python3",
+          "args": [
+            "{spec.dir}/bundle/scan.py"
+          ],
+          "timeoutMs": 180000
+        },
+        "scope": {
+          "kind": "channel",
+          "id": "chan_31f8fa85d909"
+        },
+        "dedupeBy": "payload_hash",
+        "cursorBy": "body_hash",
+        "singleInFlight": true
+      }
+    ],
+    "contract": {
+      "candidateOnlyWithoutTask": true,
+      "doesNotHandle": [
+        "root cause analysis",
+        "task creation",
+        "delivery assignment"
+      ]
+    }
   }
 }

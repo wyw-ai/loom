@@ -9,7 +9,8 @@
 /.agents/
 /.am/
 __pycache__/
-
+docs
+data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/
 /apps/gui-web/dist/

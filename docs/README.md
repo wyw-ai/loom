@@ -4,6 +4,7 @@
 
 - [current-app-implementation.md](./current-app-implementation.md) —— 当前 app 实现技术总览，适合作为入口
 - [architecture.md](./architecture.md) —— 当前架构（进程边界 / 数据归属 / 协议 / 调度循环 / 取消 / actor 管理 / 代码边界）
+- [loom-refactor-plan.md](./loom-refactor-plan.md) —— 从 Joi 到 Loom 的破坏性重构技术设计
 - [architecture-v1-agent-client.md](./architecture-v1-agent-client.md) —— agent client 拆分、adapter 模型与 v1 部署方式
 - [service-plugin-system-design.md](./service-plugin-system-design.md) —— service / plugin host 设计（runtime 引用此文档为权威规范）
 - [scheduler-plugin.md](./scheduler-plugin.md) —— `joi service serve` 内的 cron 任务插件

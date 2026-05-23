@@ -15,8 +15,8 @@
 - 不直接改生产 actor profile/spec；所有生产变更走 `lesson-plan.md` + `approval.spec_apply`。
 - 不把公共频道当日志；给人类看的进度回 classroom 公共频道，详细记录写 greeting / training thread。
 - 不吞失败：缺 artifact、teacher 未响应、spec_apply 失败，都要公开汇报并保留档案。
-- handoff 目标一律使用完整 id：`actor_teacher`、`actor_router`、`actor_delivery`。
+- wake message 目标一律使用完整 id：`actor_teacher`、`actor_router`、`actor_delivery`。
 
 ## 终止
 
-每回合最后输出 `__JOI_DONE__`。
+每回合最后输出 `__LOOM_DONE__`。

@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Local, Utc};
+use proto::types::Message;
+#[cfg(test)]
 use proto::types::{Event, RelationKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -15,27 +17,21 @@ pub struct Bubble {
     pub kind: BubbleKind,
     pub text: String,
     pub ts: DateTime<Utc>,
-    pub reply_to_event_id: Option<String>,
-    pub trailing_event_id: Option<String>,
+    pub reply_to_source_id: Option<String>,
+    pub trailing_source_id: Option<String>,
     pub delivery: DeliveryState,
-    /// Target actor id when this bubble represents an explicit handoff
-    /// (`/handoff @x` or `@x msg`). The body line is rendered as
-    /// `|-> handoff -> {display(target)} ({short_id}): {text}` instead of
-    /// the raw text — keeping the target id out of the stored string lets
-    /// us look the display name up at render time.
-    pub handoff_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BubbleKind {
-    /// content.add; subsequent same-actor/turn chunks append in place
+    /// Chat message; subsequent same-actor messages can append in place.
     Stream,
-    /// Non-content events (handoff, action.response, etc.)
+    /// Non-chat control messages (action.response, etc.)
     Static,
-    /// `action.request` events targeting the human. Rendered with extra
+    /// `action.request` messages targeting the human. Rendered with extra
     /// prominence so the operator notices that the agent is parked waiting
     /// for a decision; counted by `pending_action_requests` until an
-    /// `action.response` matches the trailing event id.
+    /// `action.response` matches the trailing source id.
     ActionRequest,
     /// system / informational lines (server hints, errors)
     System,
@@ -43,7 +39,7 @@ pub enum BubbleKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
-    /// Not relevant (incoming events, system lines).
+    /// Not relevant (incoming messages, system lines).
     NotApplicable,
     /// Outgoing message; waiting for the server to echo it back through the stream.
     Pending,
@@ -51,17 +47,15 @@ pub enum DeliveryState {
     Delivered,
 }
 
-/// Latest pinned announcement for the current scope. Derived purely by
-/// reducing `announcement.set` / `announcement.clear` events as they pass
-/// through `push_event` — the canonical state lives in the journal, this
-/// is just the cached "current value" the UI panel reads.
+/// Latest pinned announcement for the current scope. Derived from
+/// `announcement.set` / `announcement.clear` messages as they arrive.
 #[derive(Debug, Clone)]
 pub struct Announcement {
     /// Body text (markdown). Rendered by the announcement panel.
     pub text: String,
     /// Actor that posted/edited the announcement.
     pub actor_id: String,
-    /// Server timestamp of the `announcement.set` event.
+    /// Server timestamp of the `announcement.set` message.
     pub ts: DateTime<Utc>,
 }
 
@@ -69,15 +63,11 @@ pub struct Announcement {
 pub struct History {
     pub bubbles: Vec<Bubble>,
     /// Latest announcement, or `None` if none has been set or the most
-    /// recent event was an `announcement.clear`. Replaced wholesale by each
-    /// new `announcement.set`; cold-start `scope/read` replays naturally
-    /// converge on the latest.
+    /// recent message was an `announcement.clear`.
     pub current_announcement: Option<Announcement>,
-    /// Event ids of `action.request` events that have already been answered
-    /// in this scope. Populated from the `RespondsTo` relation on incoming
-    /// `action.response` events. Stored as a side set because the response
-    /// and request live in different bubbles and their own event ids differ
-    /// — comparing `trailing_event_id` directly never matches.
+    /// Source ids of `action.request` messages that have already been
+    /// answered in this scope. Stored as a side set because the response and
+    /// request live in different bubbles and their own source ids differ.
     acked_request_ids: HashSet<String>,
 }
 
@@ -88,24 +78,12 @@ pub struct RenderedHistory {
 }
 
 impl History {
+    #[cfg(test)]
     pub fn push_event(&mut self, ev: &Event) {
         match ev.kind.as_str() {
-            // Explicit handoff (e.g. `/handoff @x msg` or `@x msg`) — no
-            // parent message — renders as its own static "↪ handoff → x: …"
-            // line so it stands apart from regular chat.
-            //
-            // Reply-as-handoff (the common case: user picks `r` on someone's
-            // message, types a response) gets BOTH `hands_off_to` and
-            // `replies_to`; it should look like a normal reply with the dim
-            // `↩ @target` quote line above it. Falling through to
-            // `append_stream` keeps a single bubble AND lets the sender's
-            // pending outgoing bubble flip to Delivered when the echo lands.
-            "content.add" if hands_off_target(ev).is_some() && reply_target(ev).is_none() => {
-                let target = hands_off_target(ev).unwrap_or_default();
-                let msg = handoff_message(ev);
-                self.push_handoff(ev, target, msg);
-            }
-            "content.add" => self.append_stream(ev),
+            // Chat content is carried by Message records. Ignore legacy
+            // content events so the TUI does not mix old and new streams.
+            "content.add" => {}
             "action.request" => self.push_action_request(ev, format_action_request(ev)),
             "action.response" => {
                 if let Some(target) = responds_to_target(ev) {
@@ -115,30 +93,10 @@ impl History {
             }
             // Pinned announcement updates: render in the right-side panel
             // rather than as a chat bubble. We still want them to flow
-            // through `push_event` so cold-start `scope/read` replays
+            // through `push_event` so legacy journal replays
             // converge naturally on the latest value.
             "announcement.set" => self.apply_announcement_set(ev),
             "announcement.clear" => self.current_announcement = None,
-            // turn.close is normally suppressed; the closing content arrives
-            // as a normal content.add event. Cancelled turns are the exception
-            // because other channel members should see who pulled the plug.
-            "turn.close" => {
-                let is_cancelled = ev
-                    .payload
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.eq_ignore_ascii_case("cancelled"))
-                    .unwrap_or(false);
-                if is_cancelled {
-                    let by = ev
-                        .payload
-                        .get("_meta")
-                        .and_then(|m| m.get("cancelledBy"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    self.push_system(format!("— turn cancelled by @{} —", by));
-                }
-            }
             other => self.push_static(ev, format!("{}: {}", other, ev.payload)),
         }
     }
@@ -150,23 +108,69 @@ impl History {
             kind: BubbleKind::System,
             text: text.into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: None,
+            reply_to_source_id: None,
+            trailing_source_id: None,
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
     }
 
-    /// Push our own outgoing content.add bubble immediately on send, with
-    /// the server-assigned event id so we can flip to Delivered when it
-    /// echoes back through stream/update.
+    pub fn push_message(&mut self, message: &Message) {
+        for b in self.bubbles.iter_mut().rev() {
+            if b.delivery == DeliveryState::Pending
+                && b.trailing_source_id.as_deref() == Some(message.id.as_str())
+            {
+                b.delivery = DeliveryState::Delivered;
+                return;
+            }
+        }
+        match message
+            .metadata
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("action.request") => {
+                self.push_action_request_message(message, format_action_request_message(message));
+                return;
+            }
+            Some("action.response") => {
+                if let Some(target) = message.parent_message_id.as_ref() {
+                    self.acked_request_ids.insert(target.clone());
+                }
+                self.push_static_message(message, format_action_response_message(message));
+                return;
+            }
+            Some("announcement.set") => {
+                self.apply_announcement_message(message);
+                return;
+            }
+            Some("announcement.clear") => {
+                self.current_announcement = None;
+                return;
+            }
+            _ => {}
+        }
+        self.bubbles.push(Bubble {
+            actor_id: message.author_actor_id.clone(),
+            turn_id: None,
+            kind: BubbleKind::Stream,
+            text: message.body.clone(),
+            ts: message.created_at,
+            reply_to_source_id: message.parent_message_id.clone(),
+            trailing_source_id: Some(message.id.clone()),
+            delivery: DeliveryState::NotApplicable,
+        });
+    }
+
+    /// Push our own outgoing message immediately on send, with the
+    /// server-assigned message id so we can flip to Delivered when it echoes
+    /// back through stream/update.
     pub fn push_outgoing(
         &mut self,
         actor_id: &str,
-        event_id: &str,
+        message_id: &str,
         ts: DateTime<Utc>,
         text: String,
-        reply_to_event_id: Option<String>,
+        parent_message_id: Option<String>,
     ) {
         self.bubbles.push(Bubble {
             actor_id: actor_id.to_string(),
@@ -174,59 +178,16 @@ impl History {
             kind: BubbleKind::Stream,
             text,
             ts,
-            reply_to_event_id,
-            trailing_event_id: Some(event_id.to_string()),
+            reply_to_source_id: parent_message_id,
+            trailing_source_id: Some(message_id.to_string()),
             delivery: DeliveryState::Pending,
-            handoff_target: None,
-        });
-    }
-
-    fn append_stream(&mut self, ev: &Event) {
-        let text = ev
-            .payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // If this is our own outgoing bubble we already pushed locally, just
-        // flip to Delivered and skip — we'd otherwise duplicate the text.
-        // Scan back across all bubbles so a stray notification arriving
-        // between push_outgoing and the echo can't strand us in Pending.
-        for b in self.bubbles.iter_mut().rev() {
-            if b.delivery == DeliveryState::Pending
-                && b.trailing_event_id.as_deref() == Some(ev.id.as_str())
-            {
-                b.delivery = DeliveryState::Delivered;
-                return;
-            }
-        }
-        if let Some(b) = self.bubbles.last_mut() {
-            if b.kind == BubbleKind::Stream
-                && b.actor_id == ev.actor_id
-                && b.turn_id == ev.turn_id
-                && b.delivery == DeliveryState::NotApplicable
-            {
-                b.text.push_str(&text);
-                b.trailing_event_id = Some(ev.id.clone());
-                return;
-            }
-        }
-        self.bubbles.push(Bubble {
-            actor_id: ev.actor_id.clone(),
-            turn_id: ev.turn_id.clone(),
-            kind: BubbleKind::Stream,
-            text,
-            ts: ev.occurred_at,
-            reply_to_event_id: reply_target(ev),
-            trailing_event_id: Some(ev.id.clone()),
-            delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
     }
 
     /// Reduce an `announcement.set` event into `current_announcement`.
     /// Empty `payload.text` is treated as a clear so callers can either
     /// emit `announcement.clear` or post `set` with `text: ""`.
+    #[cfg(test)]
     fn apply_announcement_set(&mut self, ev: &Event) {
         let text = ev
             .payload
@@ -245,6 +206,7 @@ impl History {
         });
     }
 
+    #[cfg(test)]
     fn push_static(&mut self, ev: &Event, text: String) {
         self.bubbles.push(Bubble {
             actor_id: ev.actor_id.clone(),
@@ -252,13 +214,13 @@ impl History {
             kind: BubbleKind::Static,
             text,
             ts: ev.occurred_at,
-            reply_to_event_id: reply_target(ev),
-            trailing_event_id: Some(ev.id.clone()),
+            reply_to_source_id: reply_target(ev),
+            trailing_source_id: Some(ev.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
     }
 
+    #[cfg(test)]
     fn push_action_request(&mut self, ev: &Event, text: String) {
         self.bubbles.push(Bubble {
             actor_id: ev.actor_id.clone(),
@@ -266,28 +228,57 @@ impl History {
             kind: BubbleKind::ActionRequest,
             text,
             ts: ev.occurred_at,
-            reply_to_event_id: reply_target(ev),
-            trailing_event_id: Some(ev.id.clone()),
+            reply_to_source_id: reply_target(ev),
+            trailing_source_id: Some(ev.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
     }
 
-    /// Static bubble for an explicit handoff. Stores only the message body
-    /// in `text` and stashes the target id on the bubble; the renderer
-    /// formats `|-> handoff -> {display(target)} ({short_id}): {text}` so
-    /// the target's display name updates if the actor directory changes.
-    fn push_handoff(&mut self, ev: &Event, target: String, message: String) {
+    fn apply_announcement_message(&mut self, message: &Message) {
+        let text = message
+            .metadata
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or(message.body.as_str())
+            .to_string();
+        if text.trim().is_empty() {
+            self.current_announcement = None;
+            return;
+        }
+        self.current_announcement = Some(Announcement {
+            text,
+            actor_id: message.author_actor_id.clone(),
+            ts: message.created_at,
+        });
+    }
+
+    fn push_static_message(&mut self, message: &Message, text: String) {
         self.bubbles.push(Bubble {
-            actor_id: ev.actor_id.clone(),
-            turn_id: ev.turn_id.clone(),
+            actor_id: message.author_actor_id.clone(),
+            turn_id: None,
             kind: BubbleKind::Static,
-            text: message,
-            ts: ev.occurred_at,
-            reply_to_event_id: reply_target(ev),
-            trailing_event_id: Some(ev.id.clone()),
+            text,
+            ts: message.created_at,
+            reply_to_source_id: message.parent_message_id.clone(),
+            trailing_source_id: Some(message.id.clone()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: Some(target),
+        });
+    }
+
+    fn push_action_request_message(&mut self, message: &Message, text: String) {
+        self.bubbles.push(Bubble {
+            actor_id: message.author_actor_id.clone(),
+            turn_id: message
+                .metadata
+                .get("runId")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string),
+            kind: BubbleKind::ActionRequest,
+            text,
+            ts: message.created_at,
+            reply_to_source_id: message.parent_message_id.clone(),
+            trailing_source_id: Some(message.id.clone()),
+            delivery: DeliveryState::NotApplicable,
         });
     }
 
@@ -295,7 +286,7 @@ impl History {
         let mut out = Vec::new();
         for b in &self.bubbles {
             if b.kind == BubbleKind::ActionRequest {
-                if let Some(eid) = b.trailing_event_id.as_ref() {
+                if let Some(eid) = b.trailing_source_id.as_ref() {
                     if !self.acked_request_ids.contains(eid) {
                         out.push((eid.clone(), b.text.clone()));
                     }
@@ -337,10 +328,10 @@ impl History {
         reply_target_label(bubble, display_for)
     }
 
-    pub fn actor_for_event(&self, event_id: &str) -> Option<&str> {
+    pub fn actor_for_source(&self, source_id: &str) -> Option<&str> {
         self.bubbles
             .iter()
-            .find(|b| b.trailing_event_id.as_deref() == Some(event_id))
+            .find(|b| b.trailing_source_id.as_deref() == Some(source_id))
             .map(|b| b.actor_id.as_str())
     }
 
@@ -400,7 +391,7 @@ impl History {
             // Reply quote line above the bubble (parent preview). Always on
             // its own row — wrapping is handled by `Paragraph::wrap`.
             if let Some(p) = b
-                .reply_to_event_id
+                .reply_to_source_id
                 .as_deref()
                 .map(|pid| lookup_parent(pid, &self.bubbles, display_for))
             {
@@ -453,29 +444,9 @@ impl History {
             total_rows = total_rows.saturating_add(wrapped_rows(&header_line, width));
             out.push(header_line);
 
-            // Body. Handoff bubbles get a dedicated `handoff -> ...`
-            // line; stream bubbles go through the markdown renderer; other
-            // static bubbles render their pre-formatted text verbatim.
-            let body_rows: Vec<Vec<Span<'static>>> =
-                if let (BubbleKind::Static, Some(target)) = (&b.kind, b.handoff_target.as_ref()) {
-                    let label = format!(
-                        "handoff -> {} ({}): {}",
-                        display_for(target),
-                        short_actor_ref(target),
-                        display_text(&b.text)
-                    );
-                    label
-                        .split('\n')
-                        .map(|line| {
-                            vec![Span::styled(
-                                line.to_string(),
-                                Style::default().fg(Color::DarkGray),
-                            )]
-                        })
-                        .collect()
-                } else {
-                    bubble_body_rows(b)
-                };
+            // Body. Stream bubbles go through the markdown renderer; control
+            // bubbles render their pre-formatted text verbatim.
+            let body_rows: Vec<Vec<Span<'static>>> = bubble_body_rows(b);
             let body_row_count = body_rows.len();
             let collapsed =
                 body_row_count > COLLAPSED_BODY_LINES && !expanded_bubble_indices.contains(&idx);
@@ -536,7 +507,7 @@ fn lookup_parent(
 ) -> ParentPreview {
     bubbles
         .iter()
-        .find(|b| b.trailing_event_id.as_deref() == Some(parent_id))
+        .find(|b| b.trailing_source_id.as_deref() == Some(parent_id))
         .map(|b| ParentPreview {
             actor: display_for(&b.actor_id),
             text: preview_text(&b.text),
@@ -606,7 +577,7 @@ fn preview_text(text: &str) -> String {
 }
 
 fn is_replyable_bubble(bubble: &Bubble) -> bool {
-    bubble.kind != BubbleKind::System && bubble.trailing_event_id.is_some()
+    bubble.kind != BubbleKind::System && bubble.trailing_source_id.is_some()
 }
 
 fn reply_target_label(
@@ -616,12 +587,13 @@ fn reply_target_label(
     if !is_replyable_bubble(bubble) {
         return None;
     }
-    let event_id = bubble.trailing_event_id.as_ref()?.clone();
+    let source_id = bubble.trailing_source_id.as_ref()?.clone();
     let actor = display_for(&bubble.actor_id);
     let preview = preview_text(&bubble.text);
-    Some((event_id, format!("@{}: {}", actor, preview)))
+    Some((source_id, format!("@{}: {}", actor, preview)))
 }
 
+#[cfg(test)]
 fn reply_target(ev: &Event) -> Option<String> {
     ev.relations
         .iter()
@@ -629,9 +601,10 @@ fn reply_target(ev: &Event) -> Option<String> {
         .map(|r| r.target.id.clone())
 }
 
-/// Event id this event responds to, e.g. an `action.response` pointing back
-/// at the `action.request` it answers. Used to retire the request from the
-/// pending set in `pending_action_requests`.
+/// Source id this legacy test event responds to, e.g. an `action.response`
+/// pointing back at the `action.request` it answers. Used to retire the
+/// request from the pending set in `pending_action_requests`.
+#[cfg(test)]
 fn responds_to_target(ev: &Event) -> Option<String> {
     ev.relations
         .iter()
@@ -689,6 +662,7 @@ fn wrapped_rows(line: &Line<'_>, width: u16) -> usize {
         .max(1)
 }
 
+#[cfg(test)]
 fn format_action_request(ev: &Event) -> String {
     let title = ev
         .payload
@@ -706,6 +680,24 @@ fn format_action_request(ev: &Event) -> String {
     s
 }
 
+fn format_action_request_message(message: &Message) -> String {
+    let title = message
+        .metadata
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(action)");
+    let mut s = format!("⚠ action.request {} — {}", short_id(&message.id), title);
+    if let Some(arr) = message.metadata.get("choices").and_then(|v| v.as_array()) {
+        for choice in arr {
+            let cid = choice.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = choice.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            s.push_str(&format!("\n  - {}: {}", cid, label));
+        }
+    }
+    s
+}
+
+#[cfg(test)]
 fn format_action_response(ev: &Event) -> String {
     let opt = ev
         .payload
@@ -715,35 +707,13 @@ fn format_action_response(ev: &Event) -> String {
     format!("✓ action.response → {}", opt)
 }
 
-fn hands_off_target(ev: &Event) -> Option<String> {
-    ev.relations
-        .iter()
-        .find(|r| matches!(r.kind, RelationKind::HandsOffTo))
-        .map(|r| r.target.id.clone())
-}
-
-fn handoff_message(ev: &Event) -> String {
-    // Body lives in `text` for content.add+HandsOffTo; legacy `handoff.offer`
-    // events used `message` — keep the fallback so old journals render.
-    ev.payload
-        .get("text")
+fn format_action_response_message(message: &Message) -> String {
+    let opt = message
+        .metadata
+        .get("optionId")
         .and_then(|v| v.as_str())
-        .or_else(|| ev.payload.get("message").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Compact actor id used in handoff render (e.g. `actor_agent_opencode_v1`
-/// → `agent_opencode_v1`, then truncated to 16 chars). Identical strategy
-/// to `app::short_actor_ref` — duplicated here to avoid pulling the App
-/// module into history's dependency graph.
-fn short_actor_ref(id: &str) -> String {
-    let compact = id.strip_prefix("actor_").unwrap_or(id);
-    if compact.chars().count() > 16 {
-        format!("{}…", compact.chars().take(16).collect::<String>())
-    } else {
-        compact.to_string()
-    }
+        .unwrap_or("");
+    format!("✓ action.response → {}", opt)
 }
 
 fn short_id(id: &str) -> String {
@@ -763,7 +733,10 @@ mod tests {
         DeliveryState, History,
     };
     use chrono::Utc;
-    use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef};
+    use proto::types::{
+        DeliveryPolicy as MessageDeliveryPolicy, Event, Message, MessageIntent, MessageKind, Ref,
+        RefKind, Relation, RelationKind, ScopeKind, ScopeRef,
+    };
     use ratatui::widgets::{Paragraph, Wrap};
     use serde_json::json;
 
@@ -830,7 +803,7 @@ mod tests {
                 ],
             }),
             relations: vec![Relation {
-                kind: RelationKind::HandsOffTo,
+                kind: RelationKind::DirectedTo,
                 target: Ref {
                     kind: RefKind::Actor,
                     id: "actor_human_current".into(),
@@ -850,7 +823,7 @@ mod tests {
             Some(BubbleKind::ActionRequest)
         );
 
-        // An action.response carrying the same trailing event id (pushed via
+        // An action.response carrying the same trailing source id (pushed via
         // push_static through the normal `action.response` path) clears it.
         let resp = Event {
             id: "evt_action_1".into(),
@@ -877,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_for_event_finds_bubble_owner() {
+    fn actor_for_source_finds_bubble_owner() {
         let mut history = History::default();
         history.bubbles.push(Bubble {
             actor_id: "actor_agent_opencode".into(),
@@ -885,17 +858,16 @@ mod tests {
             kind: BubbleKind::Static,
             text: "hello".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_1".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         assert_eq!(
-            history.actor_for_event("evt_1"),
+            history.actor_for_source("evt_1"),
             Some("actor_agent_opencode")
         );
-        assert_eq!(history.actor_for_event("evt_missing"), None);
+        assert_eq!(history.actor_for_source("evt_missing"), None);
     }
 
     #[test]
@@ -908,10 +880,9 @@ mod tests {
             kind: BubbleKind::Static,
             text: "first".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_1".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         history.push_system("system");
         history.bubbles.push(Bubble {
@@ -920,10 +891,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "second".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_2".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_2".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         assert_eq!(history.newest_replyable_index(), Some(3));
@@ -942,10 +912,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "hello\nworld".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_1".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         let rendered =
@@ -967,10 +936,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "this is a line that should wrap in a narrow history pane".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_1".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         let rendered =
@@ -996,10 +964,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "the original message that someone is going to reply to".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_parent".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_parent".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         history.bubbles.push(Bubble {
             actor_id: "Coder".into(),
@@ -1007,26 +974,24 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "这个任务已经完成了".into(),
             ts: Utc::now(),
-            reply_to_event_id: Some("evt_parent".into()),
-            trailing_event_id: Some("evt_reply".into()),
+            reply_to_source_id: Some("evt_parent".into()),
+            trailing_source_id: Some("evt_reply".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         history
     }
 
     #[test]
-    fn reply_target_label_omits_event_id() {
+    fn reply_target_label_omits_source_id() {
         let bubble = Bubble {
             actor_id: "bojun.cbj".into(),
             turn_id: None,
             kind: BubbleKind::Stream,
             text: "hello world".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_abc123def456".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_abc123def456".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         };
         let (id, label) = reply_target_label(&bubble, &|id| id.to_string()).unwrap();
         assert_eq!(id, "evt_abc123def456");
@@ -1044,7 +1009,7 @@ mod tests {
         let quote = line_text(&rendered.lines[3]);
         assert!(quote.contains("↩ @bojun.cbj:"), "got: {quote:?}");
         assert!(quote.contains("the original"), "got: {quote:?}");
-        assert!(!quote.contains("evt_"), "quote leaked event id: {quote:?}");
+        assert!(!quote.contains("evt_"), "quote leaked source id: {quote:?}");
         let reply_header = line_text(&rendered.lines[4]);
         assert!(reply_header.contains("[Coder]"), "got: {reply_header:?}");
         let reply_body = line_text(&rendered.lines[5]);
@@ -1069,10 +1034,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "responding to someone".into(),
             ts: Utc::now(),
-            reply_to_event_id: Some("evt_long_gone".into()),
-            trailing_event_id: Some("evt_reply".into()),
+            reply_to_source_id: Some("evt_long_gone".into()),
+            trailing_source_id: Some("evt_reply".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         let rendered =
             history.render_lines(80, None, &HashSet::new(), &|id| id.to_string(), &|_| None);
@@ -1105,10 +1069,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "hello".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_x".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_x".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         let rendered = history.render_lines(
             80,
@@ -1138,46 +1101,20 @@ mod tests {
     }
 
     #[test]
-    fn render_lines_handoff_uses_new_format() {
+    fn push_message_renders_chat_message() {
         let mut history = History::default();
-        let ev = Event {
-            id: "evt_h".into(),
-            kind: "content.add".into(),
-            actor_id: "actor_human_self".into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Thread,
-                id: "thread_x".into(),
-            },
-            turn_id: None,
-            seq: 1,
-            occurred_at: Utc::now(),
-            payload: json!({ "text": "please look" }),
-            relations: vec![Relation {
-                kind: RelationKind::HandsOffTo,
-                target: Ref {
-                    kind: RefKind::Actor,
-                    id: "actor_agent_opencode".into(),
-                    _meta: None,
-                },
-                _meta: None,
-            }],
-            _meta: None,
-        };
-        history.push_event(&ev);
+        let message = make_message("msg_1", "actor_human_self", "please look", None);
+        history.push_message(&message);
 
         let display_for = |id: &str| match id {
             "actor_human_self" => "bojun.cbj".to_string(),
-            "actor_agent_opencode" => "Coder".to_string(),
             other => other.to_string(),
         };
         let rendered = history.render_lines(120, None, &HashSet::new(), &display_for, &|_| None);
         // header + body
         assert_eq!(rendered.lines.len(), 2);
         let body = line_text(&rendered.lines[1]);
-        assert!(
-            body.contains("handoff -> Coder (agent_opencode): please look"),
-            "got: {body:?}"
-        );
+        assert!(body.contains("please look"), "got: {body:?}");
     }
 
     #[test]
@@ -1189,10 +1126,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "1\n2\n3\n4\n5\n6\n7".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_long".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_long".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         let rendered =
@@ -1216,10 +1152,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "1\n2\n3\n4\n5\n6\n7".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_long".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_long".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         let mut expanded = HashSet::new();
@@ -1233,69 +1168,42 @@ mod tests {
         assert!(last.contains('7'));
     }
 
-    #[test]
-    fn cancelled_turn_close_renders_system_divider() {
-        let mut history = History::default();
-        let close = Event {
-            id: "evt_close".into(),
-            kind: "turn.close".into(),
-            actor_id: "Coder".into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Thread,
-                id: "thread_x".into(),
-            },
-            turn_id: Some("turn_1".into()),
-            seq: 2,
-            occurred_at: Utc::now(),
-            payload: json!({
-                "status": "cancelled",
-                "stopReason": "user_cancelled",
-                "_meta": { "cancelledBy": "bojun.cbj" }
-            }),
-            relations: vec![],
-            _meta: None,
-        };
-        history.push_event(&close);
-        assert_eq!(history.bubbles.len(), 1);
-        let divider = &history.bubbles[0];
-        assert_eq!(divider.kind, BubbleKind::System);
-        assert!(divider.text.contains("cancelled by @bojun.cbj"));
-    }
-
-    #[test]
-    fn non_cancelled_turn_close_is_still_suppressed() {
-        // Sanity: regular turn.close still produces no bubble (the closing
-        // chunk arrives separately as content.add).
-        let mut history = History::default();
-        let close = Event {
-            id: "evt_close".into(),
-            kind: "turn.close".into(),
-            actor_id: "Coder".into(),
-            scope: ScopeRef {
-                kind: ScopeKind::Thread,
-                id: "thread_x".into(),
-            },
-            turn_id: Some("turn_1".into()),
-            seq: 2,
-            occurred_at: Utc::now(),
-            payload: json!({ "status": "closed" }),
-            relations: vec![],
-            _meta: None,
-        };
-        history.push_event(&close);
-        assert!(history.bubbles.is_empty());
-    }
-
-    fn make_event_with_relations(
+    fn make_message(
         id: &str,
         actor: &str,
-        text: &str,
-        relations: Vec<Relation>,
-    ) -> Event {
-        Event {
+        body: &str,
+        parent_message_id: Option<String>,
+    ) -> Message {
+        Message {
             id: id.into(),
+            target: "#chan_demo:msg_root".into(),
+            author_actor_id: actor.into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_x".into(),
+            },
+            created_at: Utc::now(),
+            kind: MessageKind::Human,
+            body: body.into(),
+            mentions: Vec::new(),
+            audience: Vec::new(),
+            intent: MessageIntent::Chat,
+            delivery_policy: MessageDeliveryPolicy::NotifyOnly,
+            parent_message_id,
+            thread_root_message_id: Some("msg_root".into()),
+            task_id: None,
+            attachments: Vec::new(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn content_events_are_ignored_by_chat_history() {
+        let mut history = History::default();
+        let ev = Event {
+            id: "evt_old_content".into(),
             kind: "content.add".into(),
-            actor_id: actor.into(),
+            actor_id: "actor_human".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thread_x".into(),
@@ -1303,92 +1211,38 @@ mod tests {
             turn_id: None,
             seq: 1,
             occurred_at: Utc::now(),
-            payload: json!({ "text": text }),
-            relations,
+            payload: json!({ "text": "old event body" }),
+            relations: Vec::new(),
             _meta: None,
-        }
-    }
-
-    #[test]
-    fn explicit_handoff_without_reply_renders_static_bubble() {
-        // `@target msg` / `/handoff @target msg` — no replies_to, just
-        // hands_off_to. The bubble stores the message body (not the
-        // formatted line) and stashes the target id for the renderer.
-        let mut history = History::default();
-        let ev = make_event_with_relations(
-            "evt_h",
-            "actor_human",
-            "do this",
-            vec![Relation {
-                kind: RelationKind::HandsOffTo,
-                target: Ref {
-                    kind: RefKind::Actor,
-                    id: "actor_agent_coder".into(),
-                    _meta: None,
-                },
-                _meta: None,
-            }],
-        );
+        };
         history.push_event(&ev);
-        assert_eq!(history.bubbles.len(), 1);
-        assert_eq!(history.bubbles[0].kind, BubbleKind::Static);
-        assert_eq!(history.bubbles[0].text, "do this");
-        assert_eq!(
-            history.bubbles[0].handoff_target.as_deref(),
-            Some("actor_agent_coder")
-        );
+        assert!(history.bubbles.is_empty());
     }
 
     #[test]
-    fn reply_with_handoff_finalizes_pending_outgoing_bubble() {
-        // The user replies to an agent: the echoed event has BOTH replies_to
-        // and hands_off_to. The pending outgoing bubble (pushed locally) must
-        // flip to Delivered, and no extra static "↪ handoff" bubble appears.
+    fn echoed_message_finalizes_pending_outgoing_bubble() {
         let mut history = History::default();
         history.push_outgoing(
             "actor_human",
-            "evt_reply",
+            "msg_reply",
             Utc::now(),
             "got it".into(),
-            Some("evt_parent".into()),
+            Some("msg_parent".into()),
         );
         assert_eq!(history.bubbles[0].delivery, DeliveryState::Pending);
 
-        let ev = make_event_with_relations(
-            "evt_reply",
+        let message = make_message(
+            "msg_reply",
             "actor_human",
             "got it",
-            vec![
-                Relation {
-                    kind: RelationKind::RepliesTo,
-                    target: Ref {
-                        kind: RefKind::Event,
-                        id: "evt_parent".into(),
-                        _meta: None,
-                    },
-                    _meta: None,
-                },
-                Relation {
-                    kind: RelationKind::HandsOffTo,
-                    target: Ref {
-                        kind: RefKind::Actor,
-                        id: "actor_agent_coder".into(),
-                        _meta: None,
-                    },
-                    _meta: None,
-                },
-            ],
+            Some("msg_parent".into()),
         );
-        history.push_event(&ev);
+        history.push_message(&message);
 
-        // Still a single bubble — flipped to Delivered, no duplicate handoff line.
+        // Still a single bubble; the echoed message flips the optimistic row.
         assert_eq!(history.bubbles.len(), 1);
         assert_eq!(history.bubbles[0].delivery, DeliveryState::Delivered);
         assert_eq!(history.bubbles[0].text, "got it");
-        assert!(!history
-            .bubbles
-            .iter()
-            .any(|b| b.text.starts_with("↪ handoff")));
     }
 
     fn announcement_event(id: &str, actor: &str, text: &str, kind: &str) -> Event {

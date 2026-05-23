@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # repo-cache/sync.sh — refresh git mirrors declared in a channel
-# `.joi/repos/manifest.json` into the service host data dir.
+# `.loom/repos/manifest.json` into the service host data dir.
 #
 # Reads:    <manifest> 
 # Writes:   <cache_root>/<urlencoded(repo_id)>/  (bare or --shared clone)

@@ -9,7 +9,7 @@ echo "==> Cleaning build directory..."
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-echo "==> Copying Joi portal..."
+echo "==> Copying Loom portal..."
 cp "$PORTAL_DIR/index.html" "$BUILD_DIR/index.html"
 cp "$PORTAL_DIR/style.css" "$BUILD_DIR/style.css"
 cp "$PORTAL_DIR/app.js" "$BUILD_DIR/app.js"

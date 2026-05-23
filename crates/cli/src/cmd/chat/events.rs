@@ -8,7 +8,10 @@ use crossterm::event::{
     MouseEvent, MouseEventKind,
 };
 use proto::methods::{method, stream_kind};
-use proto::types::{Channel, Event, ScopeKind, ScopeRef, Turn};
+use proto::types::{
+    AudienceKind, Channel, DeliveryPolicy, Message, MessageIntent, Run, RunStatus, ScopeKind,
+    ScopeRef,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::json;
@@ -50,7 +53,7 @@ pub async fn run(
         }
         if let Err(e) = backfill(&client, &mut app, &scope).await {
             app.history
-                .push_system(format!("scope/read backfill failed: {}", e));
+                .push_system(format!("message.list backfill failed: {}", e));
         }
     }
     refresh_actor_directory(&client, &mut app).await;
@@ -61,10 +64,10 @@ pub async fn run(
         };
         app.set_status(format!("connected as {} · {}", display_name, label));
     } else {
-        // `joi chat` without `--in`: auto-open the sidebar + populate the
+        // `loom chat` without `--in`: auto-open the sidebar + populate the
         // channel list so the operator can immediately pick/create a
         // thread instead of staring at an empty chat pane.
-        app.history.push_system("Welcome to Joi chat.");
+        app.history.push_system("Welcome to Loom chat.");
         app.history
             .push_system("No scope bound. Use the sidebar (Ctrl+B) to pick a channel,");
         app.history.push_system(
@@ -225,7 +228,7 @@ async fn switch_scope(
     *scope = target_scope.clone();
     if let Err(e) = backfill(client, app, &target_scope).await {
         app.history
-            .push_system(format!("scope/read backfill failed: {}", e));
+            .push_system(format!("message.list backfill failed: {}", e));
     }
     let label = match target_scope.kind {
         ScopeKind::Thread => format!("thread {}", target_scope.id),
@@ -245,14 +248,36 @@ async fn subscribe(client: &Client, actor_id: &str, scope: &ScopeRef) -> Result<
 }
 
 async fn backfill(client: &Client, app: &mut App, scope: &ScopeRef) -> Result<()> {
-    use proto::methods::ScopeReadResult;
-    let res: ScopeReadResult = client
-        .call(method::SCOPE_READ, json!({ "scope": scope, "limit": 100 }))
+    use proto::methods::MessageListResult;
+    let target = message_target_for_scope(client, scope).await?;
+    let res: MessageListResult = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({ "target": target, "limit": 100 }),
+        )
         .await?;
-    for ev in res.events {
-        app.ingest_event(&ev);
+    for message in res.messages {
+        app.ingest_message(&message);
     }
     Ok(())
+}
+
+async fn message_target_for_scope(client: &Client, scope: &ScopeRef) -> Result<String> {
+    use proto::methods::ThreadListResult;
+    match scope.kind {
+        ScopeKind::Channel => Ok(format!("#{}", scope.id)),
+        ScopeKind::Thread => {
+            let res: ThreadListResult = client
+                .call(method::THREAD_LIST, json!({ "archived": false }))
+                .await?;
+            let thread = res
+                .threads
+                .into_iter()
+                .find(|thread| thread.id == scope.id)
+                .ok_or_else(|| anyhow::anyhow!("thread {} not found", scope.id))?;
+            Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
+        }
+    }
 }
 
 async fn bootstrap_display_name(client: &Client, actor_id: &str) -> String {
@@ -299,12 +324,6 @@ async fn refresh_actor_directory(client: &Client, app: &mut App) {
 }
 
 fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) {
-    if n.method == method::TURN_TRACE_UPDATE {
-        if let Some(params) = n.params {
-            handle_trace_update(app, &params);
-        }
-        return;
-    }
     if n.method != method::STREAM_UPDATE {
         return;
     }
@@ -332,34 +351,39 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         }
         _ => {}
     }
-    // Parse the embedded scope and (for EVENT_CREATED) the embedded event up
-    // front so we can recognize an `action.request` aimed at us BEFORE the
-    // scope filter — the server pushes that frame to our connection directly
-    // (ws.rs actor-inbox fanout for HandsOffTo targets) even when we're bound
-    // to a different scope, and dropping it on the floor is the bug that
-    // leaves humans unable to intervene.
+    // Parse the embedded scope and message up front so we can recognize an
+    // `action.request` aimed at us BEFORE the scope filter. The server pushes
+    // that frame to our connection directly through actor-inbox fanout even
+    // when we're bound to a different scope.
     let parsed_scope: Option<ScopeRef> = params
         .get("scope")
         .cloned()
         .and_then(|s| serde_json::from_value::<ScopeRef>(s).ok());
-    let parsed_event: Option<Event> = if kind == stream_kind::EVENT_CREATED {
-        data.get("event")
+    let parsed_message: Option<Message> = if kind == stream_kind::MESSAGE_CREATED {
+        data.get("message")
             .cloned()
-            .and_then(|v| serde_json::from_value::<Event>(v).ok())
+            .and_then(|v| serde_json::from_value::<Message>(v).ok())
     } else {
         None
     };
     let in_scope = parsed_scope.as_ref().map_or(true, |p| p == scope);
-    let action_for_me = parsed_event
+    let action_message_for_me = parsed_message
         .as_ref()
-        .map(|ev| ev.kind == "action.request" && local_is_handoff_target(ev, &app.actor_id))
+        .map(|message| {
+            message
+                .metadata
+                .get("kind")
+                .and_then(|value| value.as_str())
+                == Some("action.request")
+                && message_is_directed_target(message, &app.actor_id)
+        })
         .unwrap_or(false);
 
     // Cross-scope action.request inbox push: surface a banner + bell + desktop
     // notification, but don't ingest into the current scope's history.
-    if action_for_me && !in_scope {
-        if let (Some(ev), Some(parsed)) = (parsed_event.as_ref(), parsed_scope.as_ref()) {
-            apply_cross_scope_action_request(app, parsed, ev);
+    if action_message_for_me && !in_scope {
+        if let (Some(message), Some(parsed)) = (parsed_message.as_ref(), parsed_scope.as_ref()) {
+            apply_cross_scope_action_request_message(app, parsed, message);
         }
         return;
     }
@@ -368,25 +392,18 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
         return;
     }
     match kind.as_str() {
-        stream_kind::EVENT_CREATED => {
-            if let Some(ev) = parsed_event.as_ref() {
-                app.ingest_event(ev);
-                if action_for_me {
-                    apply_in_scope_action_request(app, ev);
+        stream_kind::MESSAGE_CREATED => {
+            if let Some(message) = parsed_message.as_ref() {
+                app.ingest_message(message);
+                if action_message_for_me {
+                    apply_in_scope_action_request_message(app, message);
                 }
             }
         }
-        stream_kind::TURN_OPENED => {
-            if let Some(turn_value) = data.get("turn").cloned() {
-                if let Ok(t) = serde_json::from_value::<Turn>(turn_value) {
-                    apply_turn_opened(app, t);
-                }
-            }
-        }
-        stream_kind::TURN_CLOSED => {
-            if let Some(turn_value) = data.get("turn").cloned() {
-                if let Ok(t) = serde_json::from_value::<Turn>(turn_value) {
-                    app.open_turns.remove(&t.id);
+        stream_kind::RUN_UPDATED => {
+            if let Some(run_value) = data.get("run").cloned() {
+                if let Ok(run) = serde_json::from_value::<Run>(run_value) {
+                    apply_run_updated(app, run);
                 }
             }
         }
@@ -394,16 +411,11 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
     }
 }
 
-/// True when `ev` carries a `HandsOffTo` Relation pointing at the local actor.
-/// Used to decide whether a fresh `action.request` is one we owe a response to
-/// (server-side wakeup.rs sets this relation to the turn's trigger actor).
-fn local_is_handoff_target(ev: &Event, local: &str) -> bool {
-    use proto::types::{RefKind, RelationKind};
-    ev.relations.iter().any(|r| {
-        matches!(r.kind, RelationKind::HandsOffTo)
-            && r.target.kind == RefKind::Actor
-            && r.target.id == local
-    })
+fn message_is_directed_target(message: &Message, local: &str) -> bool {
+    message
+        .audience
+        .iter()
+        .any(|audience| matches!(audience.kind, AudienceKind::Actor) && audience.id == local)
 }
 
 /// Same-scope action.request for the local actor: fire the bell + desktop
@@ -412,26 +424,23 @@ fn local_is_handoff_target(ev: &Event, local: &str) -> bool {
 /// choice immediately. Suppress auto-pop while another modal is up so we
 /// don't clobber draft state — the highlighted bubble + status-bar counter
 /// will still draw the operator in.
-fn apply_in_scope_action_request(app: &mut App, ev: &Event) {
-    let title = ev
-        .payload
+fn apply_in_scope_action_request_message(app: &mut App, message: &Message) {
+    let title = message
+        .metadata
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("(action)");
     super::notify::ring_terminal_bell();
-    super::notify::desktop_notify("Joi · action requested", title);
+    super::notify::desktop_notify("Loom · action requested", title);
     let idle = matches!(app.mode, Mode::Normal) && app.prompt.is_none() && app.picker.is_none();
     if idle {
         app.open_action_picker();
     }
 }
 
-/// Cross-scope action.request landed via the actor-inbox push: don't pollute
-/// the current scope's history with a foreign event, but tell the operator
-/// (banner + bell + desktop notification) so they can switch and respond.
-fn apply_cross_scope_action_request(app: &mut App, scope: &ScopeRef, ev: &Event) {
-    let title = ev
-        .payload
+fn apply_cross_scope_action_request_message(app: &mut App, scope: &ScopeRef, message: &Message) {
+    let title = message
+        .metadata
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("(action)");
@@ -446,26 +455,31 @@ fn apply_cross_scope_action_request(app: &mut App, scope: &ScopeRef, ev: &Event)
     app.set_status(format!("⚠ action.request waiting in {}", scope_label));
     super::notify::ring_terminal_bell();
     super::notify::desktop_notify(
-        "Joi · action requested",
+        "Loom · action requested",
         &format!("{} — in {}", title, scope_label),
     );
 }
 
-/// Register a freshly opened turn so cancel and the in-flight bar know about
-/// it. Skip turns we ourselves own — humans don't run agent-style turns
-/// through this chat, and even if they did, cancel would be a no-op against
-/// the same connection.
-fn apply_turn_opened(app: &mut App, t: Turn) {
-    if t.actor_id == app.actor_id {
+/// Register a run so cancel and the in-flight bar know about it. Skip runs we
+/// ourselves own; the human chat only cancels remote agent runs.
+fn apply_run_updated(app: &mut App, run: Run) {
+    if run.actor_id == app.actor_id {
+        return;
+    }
+    if matches!(
+        run.status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
+    ) {
+        app.open_turns.remove(&run.id);
         return;
     }
     app.open_turns.insert(
-        t.id.clone(),
+        run.id.clone(),
         OpenTurn {
-            turn_id: t.id,
-            actor_id: t.actor_id,
-            scope: t.scope,
-            opened_at: t.opened_at,
+            turn_id: run.id,
+            actor_id: run.actor_id,
+            scope: run.scope,
+            opened_at: run.opened_at,
         },
     );
 }
@@ -571,7 +585,7 @@ fn apply_channel_revoked(app: &mut App, data: &serde_json::Value) {
 
     if actor_id == app.actor_id {
         // If the active chat thread lives in this channel, surface a strong
-        // warning in history; further `event/append` calls will be rejected.
+        // warning in history; further message sends will be rejected.
         let in_revoked_channel = current_chat_channel(app).as_deref() == Some(channel_id.as_str());
         if in_revoked_channel {
             app.history.push_system(format!(
@@ -587,48 +601,6 @@ fn apply_channel_revoked(app: &mut App, data: &serde_json::Value) {
             .cloned()
             .unwrap_or_else(|| actor_id.clone());
         app.set_status(format!("{} left #{}", display, title));
-    }
-}
-
-fn handle_trace_update(app: &mut App, params: &serde_json::Value) {
-    let frame = match params.get("frame") {
-        Some(f) => f,
-        None => return,
-    };
-    let kind = frame.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let body = frame
-        .get("payload")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let summary = match kind {
-        "text.delta" => body
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .chars()
-            .take(40)
-            .collect::<String>(),
-        "tool.start" | "tool.update" | "tool.end" => body
-            .get("toolName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("tool")
-            .to_string(),
-        "status" => body
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "error" => body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    };
-    if summary.is_empty() {
-        app.set_status(format!("trace · {}", kind));
-    } else {
-        app.set_status(format!("trace · {}: {}", kind, summary));
     }
 }
 
@@ -696,7 +668,7 @@ async fn handle_key(client: &Arc<Client>, app: &mut App, key: KeyEvent, scope: &
                 PickerOutcome::Selected(id) => {
                     let kind = match &app.mode {
                         Mode::Picker(k) => match k {
-                            PickerKind::HandoffTarget => PickerKind::HandoffTarget,
+                            PickerKind::DirectTarget => PickerKind::DirectTarget,
                             PickerKind::Action => PickerKind::Action,
                             PickerKind::Reply => PickerKind::Reply,
                             PickerKind::InviteActor { channel_id } => PickerKind::InviteActor {
@@ -1433,7 +1405,7 @@ async fn handle_prompt_submit(
     value: String,
 ) {
     use proto::methods::{
-        ChannelCreateResult, ChannelUpdateResult, EventAppendResult, ThreadCreateResult,
+        ChannelCreateResult, ChannelUpdateResult, MessageSendResult, ThreadCreateResult,
         ThreadUpdateResult,
     };
     match kind {
@@ -1470,30 +1442,25 @@ async fn handle_prompt_submit(
         }
         PromptKind::CreateThread { channel_id } => {
             let root = client
-                .call::<_, EventAppendResult>(
-                    method::EVENT_APPEND,
+                .call::<_, MessageSendResult>(
+                    method::MESSAGE_SEND,
                     json!({
-                        "event": {
-                            "type": "content.add",
-                            "actorId": app.actor_id.clone(),
-                            "scope": { "kind": "channel", "id": channel_id.clone() },
-                            "payload": { "contentType": "text/markdown", "text": value.clone() },
-                            "relations": []
-                        }
+                        "target": format!("#{channel_id}"),
+                        "body": value.clone(),
                     }),
                 )
                 .await;
-            let root_event_id = match root {
-                Ok(r) => r.event.id,
+            let root_message_id = match root {
+                Ok(r) => r.message.id,
                 Err(e) => {
-                    app.set_status(format!("thread root event append failed: {}", e));
+                    app.set_status(format!("thread root message send failed: {}", e));
                     return;
                 }
             };
             let res = client
                 .call::<_, ThreadCreateResult>(
                     method::THREAD_CREATE,
-                    json!({ "channelId": channel_id, "rootEventId": root_event_id, "title": value }),
+                    json!({ "channelId": channel_id, "rootMessageId": root_message_id, "title": value }),
                 )
                 .await;
             match res {
@@ -1599,7 +1566,7 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
             }
 
             if thread_count > 0 {
-                // Hand off to the typed-name danger-zone prompt. The actual
+                // Continue to the typed-name danger-zone prompt. The actual
                 // RPC fires from `handle_text_submit::CascadeDeleteChannel`
                 // once the operator types the channel name verbatim.
                 app.prompt = Some(PromptModal::text(
@@ -1637,7 +1604,7 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
             do_channel_revoke(client, app, channel_id, actor_id).await;
             return;
         }
-        ConfirmKind::InviteThenHandoff {
+        ConfirmKind::InviteThenSend {
             channel_id,
             actor_id,
             message,
@@ -1650,10 +1617,10 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
                 id: app.thread_id.clone(),
             });
             do_channel_invite(client, app, channel_id, actor_id.clone()).await;
-            // Even if invite failed, attempting the handoff surfaces the
+            // Even if invite failed, attempting the send surfaces the
             // server's PERMISSION_DENIED verbatim — useful signal for the
             // operator. So we don't gate on invite success.
-            do_handoff_with_message(client, app, actor_id, message, &scope).await;
+            send_directed_message(client, app, actor_id, message, &scope).await;
             return;
         }
         ConfirmKind::DeleteThread { thread_id } => {
@@ -1701,9 +1668,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// Parse `@target message body` into a handoff. If no message body is
-/// provided we just status-bar a hint instead of sending an empty handoff —
-/// the user can keep typing.
+/// Parse `@target message body` into a directed message. If no message body is
+/// provided we just status-bar a hint instead of sending an empty message.
 async fn handle_at_input(client: &Arc<Client>, app: &mut App, rest: &str, scope: &ScopeRef) {
     let mut split = rest.splitn(2, char::is_whitespace);
     let target = split.next().unwrap_or("").trim().to_string();
@@ -1716,12 +1682,17 @@ async fn handle_at_input(client: &Arc<Client>, app: &mut App, rest: &str, scope:
         app.set_status(format!("unknown agent `{}`", target));
         return;
     }
+    if message.trim().is_empty() {
+        app.set_status("usage: @<actor_id> <message>");
+        app.input = format!("@{} ", target).into();
+        return;
+    }
     // Best-effort membership pre-check: if the target isn't in the current
     // channel's member cache and the channel is private, route through a
-    // confirm modal that does `channel/invite` then the handoff. This
+    // confirm modal that does `channel/invite` then sends the message. This
     // pre-check is racy (membership cache can be stale) but the server is
-    // authoritative — `event/append` will surface PERMISSION_DENIED if the
-    // local cache lied to us, which we surface verbatim from `do_handoff`.
+    // authoritative; `message.send` will surface PERMISSION_DENIED if the
+    // local cache lied to us.
     if let Some(channel_id) = current_chat_channel(app) {
         if needs_invite_for(app, &channel_id, &target) {
             let display = app
@@ -1736,27 +1707,27 @@ async fn handle_at_input(client: &Arc<Client>, app: &mut App, rest: &str, scope:
                 .map(|c| c.title.clone())
                 .unwrap_or_else(|| channel_id.clone());
             app.prompt = Some(PromptModal::confirm(
-                ConfirmKind::InviteThenHandoff {
+                ConfirmKind::InviteThenSend {
                     channel_id,
                     actor_id: target.clone(),
                     message,
                 },
                 "Invite first?",
                 format!(
-                    "@{} isn't in #{}. Invite them first, then send the handoff?",
+                    "@{} isn't in #{}. Invite them first, then send the message?",
                     display, title
                 ),
             ));
             return;
         }
     }
-    do_handoff_with_message(client, app, target, message, scope).await;
+    send_directed_message(client, app, target, message, scope).await;
 }
 
 /// `true` iff we have enough cache to know that `actor_id` is NOT yet a
 /// member of `channel_id` AND the channel is private (so the missing
 /// membership actually matters). Returns `false` in the absence of a
-/// definitive answer — better to attempt the handoff and let the server
+/// definitive answer — better to attempt the send and let the server
 /// reject than to spam the operator with bogus invite confirms.
 fn needs_invite_for(app: &App, channel_id: &str, actor_id: &str) -> bool {
     let Some(s) = app.sidebar.as_ref() else {
@@ -1782,11 +1753,12 @@ async fn on_picker_selected(
     app: &mut App,
     kind: PickerKind,
     id: String,
-    scope: &ScopeRef,
+    _scope: &ScopeRef,
 ) {
     match kind {
-        PickerKind::HandoffTarget => {
-            do_handoff(client, app, id, scope).await;
+        PickerKind::DirectTarget => {
+            app.input = format!("@{} ", id).into();
+            app.set_status(format!("message → @{} (type body and press Enter)", id));
         }
         PickerKind::Action => {
             // Default to "allow" / accept; richer choice menu is a follow-up.
@@ -1892,16 +1864,16 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
     let cmd = split.next().unwrap_or("").to_string();
     let arg = split.next().unwrap_or("").trim().to_string();
     match cmd.as_str() {
-        "handoff" => {
+        "ask" => {
             if arg.is_empty() {
-                open_handoff_picker(client, app).await;
+                open_direct_picker(client, app).await;
             } else {
-                // `/handoff <target> [message...]` — first token is the target,
+                // `/ask <target> [message...]` — first token is the target,
                 // anything after the next whitespace is the message body.
                 let mut a = arg.splitn(2, char::is_whitespace);
                 let target = a.next().unwrap_or("").trim().to_string();
                 let message = a.next().unwrap_or("").trim().to_string();
-                do_handoff_with_message(client, app, target, message, scope).await;
+                send_directed_message(client, app, target, message, scope).await;
             }
         }
         "reply" => {
@@ -1953,13 +1925,6 @@ async fn handle_slash_input(client: &Arc<Client>, app: &mut App, rest: &str, sco
             refresh_members(client, app, &channel_id).await;
             print_members_into_history(app, &channel_id);
         }
-        "announce" => {
-            // `/announce <text>`        → set/replace the pinned announcement
-            // `/announce` (empty) or
-            // `/announce clear`         → drop the current announcement
-            let clear = arg.is_empty() || arg.eq_ignore_ascii_case("clear");
-            do_announce(client, app, scope, if clear { None } else { Some(arg) }).await;
-        }
         "quit" | "q" | "exit" => app.should_quit = true,
         other => app.set_status(format!("unknown /{}", other)),
     }
@@ -2009,7 +1974,7 @@ fn print_members_into_history(app: &mut App, channel_id: &str) {
     }
 }
 
-async fn open_handoff_picker(client: &Arc<Client>, app: &mut App) {
+async fn open_direct_picker(client: &Arc<Client>, app: &mut App) {
     use proto::methods::ActorListResult;
     let mut items: Vec<PickerItem> = Vec::new();
     if let Ok(list) = client
@@ -2040,108 +2005,126 @@ async fn open_handoff_picker(client: &Arc<Client>, app: &mut App) {
         app.set_status("no other actors known to the server");
         return;
     }
-    app.open_handoff_picker(items);
+    app.open_direct_picker(items);
 }
 
-async fn do_handoff(client: &Arc<Client>, app: &mut App, target: String, scope: &ScopeRef) {
-    // Modal-picker path: no message body was supplied, send the offer alone.
-    do_handoff_with_message(client, app, target, String::new(), scope).await;
-}
-
-async fn do_handoff_with_message(
+async fn send_directed_message(
     client: &Arc<Client>,
     app: &mut App,
     target: String,
     message: String,
     scope: &ScopeRef,
 ) {
-    use proto::methods::EventAppendResult;
+    use proto::methods::MessageSendResult;
     if !app.has_scope() {
         app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
         return;
     }
-    let payload = json!({
-        "event": {
-            "type": "content.add",
-            "actorId": app.actor_id,
-            "scope": scope,
-            "payload": { "contentType": "text/markdown", "text": message },
-            "relations": [
-                { "kind": "hands_off_to", "target": { "kind": "actor", "id": target.clone() } }
-            ],
+    if message.trim().is_empty() {
+        app.set_status("usage: /ask <actor_id> <message>");
+        app.input = format!("@{} ", target).into();
+        return;
+    }
+    let target_ref = match message_target_for_scope(client, scope).await {
+        Ok(target_ref) => target_ref,
+        Err(e) => {
+            app.set_status(format!("resolve message target failed: {}", e));
+            return;
         }
-    });
-    let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
-    match res {
-        Ok(_) => app.set_status(format!("handoff -> {}", target)),
-        Err(e) => app.set_status(format!("handoff failed: {}", e)),
-    }
-}
-
-async fn do_announce(client: &Arc<Client>, app: &mut App, scope: &ScopeRef, text: Option<String>) {
-    use proto::methods::EventAppendResult;
-    if !app.has_scope() {
-        app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
-        return;
-    }
-    let (kind, payload_text) = match text.as_deref() {
-        Some(t) => ("announcement.set", t.to_string()),
-        None => ("announcement.clear", String::new()),
     };
-    let payload = json!({
-        "event": {
-            "type": kind,
-            "actorId": app.actor_id,
-            "scope": scope,
-            "payload": { "text": payload_text },
-        }
-    });
-    let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
+    let parent_message_id = app
+        .reply_target
+        .as_ref()
+        .map(|target| target.message_id.clone());
+    let res: Result<MessageSendResult, _> = client
+        .call(
+            method::MESSAGE_SEND,
+            json!({
+                "target": target_ref,
+                "body": message,
+                "audience": [{ "kind": "actor", "id": target.clone() }],
+                "intent": MessageIntent::RequestAction,
+                "deliveryPolicy": DeliveryPolicy::WakeAgent,
+                "parentMessageId": parent_message_id,
+            }),
+        )
+        .await;
     match res {
-        Ok(_) => app.set_status(if text.is_some() {
-            "announcement updated".to_string()
-        } else {
-            "announcement cleared".to_string()
-        }),
-        Err(e) => app.set_status(format!("announce failed: {}", e)),
+        Ok(r) => {
+            let actor = app.actor_id.clone();
+            app.history.push_outgoing(
+                &actor,
+                &r.message.id,
+                r.message.created_at,
+                r.message.body,
+                r.message.parent_message_id.clone(),
+            );
+            app.selected_history_idx = app.history.newest_replyable_index();
+            app.reply_target = None;
+            app.jump_to_bottom();
+            app.set_status(format!("message -> {}", target));
+        }
+        Err(e) => app.set_status(format!("message send failed: {}", e)),
     }
 }
 
 async fn do_action_response(
     client: &Arc<Client>,
     app: &mut App,
-    event_id: String,
+    message_id: String,
     option_id: String,
     accepted: bool,
 ) {
-    use proto::methods::EventAppendResult;
+    use proto::methods::MessageSendResult;
     let kind = if accepted { "accepted" } else { "declined" };
     let Some(scope) = app.current_scope() else {
         app.set_status("no scope bound — cannot respond to action");
         return;
     };
-    let payload = json!({
-        "event": {
-            "type": "action.response",
-            "actorId": app.actor_id,
-            "scope": scope,
-            "payload": { "optionId": option_id, "kind": kind },
-            "relations": [
-                { "kind": "responds_to", "target": { "kind": "event", "id": event_id.clone() } }
-            ],
+    let target = match message_target_for_scope(client, &scope).await {
+        Ok(target) => target,
+        Err(e) => {
+            app.set_status(format!("resolve message target failed: {}", e));
+            return;
         }
+    };
+    let Some(request_actor) = app
+        .history
+        .actor_for_source(&message_id)
+        .map(str::to_string)
+    else {
+        app.set_status("action request is no longer in local history");
+        return;
+    };
+    let metadata = json!({
+        "kind": "action.response",
+        "optionId": option_id.clone(),
+        "responseKind": kind,
+        "requestMessageId": message_id.clone(),
     });
-    let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
+    let res: Result<MessageSendResult, _> = client
+        .call(
+            method::MESSAGE_SEND,
+            json!({
+                "target": target,
+                "body": format!("{kind}: {}", metadata["optionId"].as_str().unwrap_or("")),
+                "audience": [{ "kind": AudienceKind::Actor, "id": request_actor }],
+                "intent": MessageIntent::Notify,
+                "deliveryPolicy": DeliveryPolicy::WakeAgent,
+                "parentMessageId": message_id.clone(),
+                "metadata": metadata,
+            }),
+        )
+        .await;
     match res {
         Ok(_) => {
             let _ = client
-                .call_raw(
-                    method::RECEIPT_RECORD,
-                    Some(json!({
-                        "eventId": event_id,
+                .call::<_, proto::methods::DeliveryAckResult>(
+                    method::DELIVERY_ACK,
+                    json!({
                         "actorId": app.actor_id,
-                        "kind": kind,
-                    })),
+                        "sourceId": message_id,
+                    }),
                 )
                 .await;
             app.set_status(format!("action {} ({})", kind, option_id));
@@ -2184,12 +2167,12 @@ async fn list_agents(client: &Arc<Client>, app: &mut App) {
     }
 }
 
-fn arm_reply_target(app: &mut App, event_id: String) {
+fn arm_reply_target(app: &mut App, message_id: String) {
     let preview = app
         .history
         .reply_targets(&|id| app.display_name_for(id))
         .into_iter()
-        .find(|(id, _)| id == &event_id)
+        .find(|(id, _)| id == &message_id)
         .map(|(_, label)| label)
         .unwrap_or_else(|| "(unknown message)".to_string());
     if app.input.display_text().trim_start().starts_with("/reply") {
@@ -2197,47 +2180,49 @@ fn arm_reply_target(app: &mut App, event_id: String) {
         app.slash_menu = None;
         app.at_menu = None;
     }
-    app.set_reply_target(event_id, preview);
+    app.set_reply_target(message_id, preview);
 }
 
 fn reply_selected_history(app: &mut App) {
-    let Some((event_id, _)) = app.selected_history_target() else {
+    let Some((message_id, _)) = app.selected_history_target() else {
         app.set_status("select a message with ↑/↓ first");
         return;
     };
-    arm_reply_target(app, event_id);
+    arm_reply_target(app, message_id);
 }
 
-fn message_relations(
-    app: &App,
-    attached_artifact_ids: &[String],
-) -> (Vec<serde_json::Value>, Option<String>) {
-    let mut relations = Vec::new();
-    let reply_target = app
+fn message_send_context(app: &App) -> (Option<String>, Vec<serde_json::Value>, DeliveryPolicy) {
+    let parent_message_id = app
         .reply_target
         .as_ref()
-        .map(|target| target.event_id.clone());
-    if let Some(reply_to) = reply_target.as_ref() {
-        relations.push(json!({
-            "kind": "replies_to",
-            "target": { "kind": "event", "id": reply_to }
-        }));
-        if let Some(target_actor_id) = app.history.actor_for_event(reply_to) {
-            if target_actor_id != app.actor_id && target_actor_id != "system" {
-                relations.push(json!({
-                    "kind": "hands_off_to",
-                    "target": { "kind": "actor", "id": target_actor_id }
-                }));
-            }
+        .map(|target| target.message_id.clone());
+    let Some(parent_id) = parent_message_id.as_ref() else {
+        return (None, Vec::new(), DeliveryPolicy::NotifyOnly);
+    };
+    let Some(target_actor_id) = app.history.actor_for_source(parent_id) else {
+        return (parent_message_id, Vec::new(), DeliveryPolicy::NotifyOnly);
+    };
+    if target_actor_id == app.actor_id || target_actor_id == "system" {
+        return (parent_message_id, Vec::new(), DeliveryPolicy::NotifyOnly);
+    }
+    let delivery_policy = match app.actor_kinds.get(target_actor_id).map(String::as_str) {
+        Some("agent") => DeliveryPolicy::WakeAgent,
+        _ => DeliveryPolicy::NotifyOnly,
+    };
+    (
+        parent_message_id,
+        vec![json!({ "kind": "actor", "id": target_actor_id })],
+        delivery_policy,
+    )
+}
+
+fn message_intent_for_delivery(policy: DeliveryPolicy) -> MessageIntent {
+    match policy {
+        DeliveryPolicy::WakeAgent => MessageIntent::RequestAction,
+        DeliveryPolicy::NotifyOnly | DeliveryPolicy::RouteByIntent | DeliveryPolicy::Silent => {
+            MessageIntent::Chat
         }
     }
-    for artifact_id in attached_artifact_ids {
-        relations.push(json!({
-            "kind": "attaches_artifact",
-            "target": { "kind": "artifact", "id": artifact_id }
-        }));
-    }
-    (relations, reply_target)
 }
 
 async fn handle_paste(client: &Arc<Client>, app: &mut App, text: String, scope: &ScopeRef) {
@@ -2377,33 +2362,45 @@ async fn send_message(
     submission: &DraftSubmission,
     scope: &ScopeRef,
 ) {
-    use proto::methods::EventAppendResult;
+    use proto::methods::MessageSendResult;
     if !app.has_scope() {
         app.set_status("open a channel or thread first (Ctrl+B, then Enter/c)");
         return;
     }
-    let (relations, reply_target) = message_relations(app, &submission.attached_artifact_ids);
-    let payload = json!({
-        "event": {
-            "type": "content.add",
-            "actorId": app.actor_id,
-            "scope": scope,
-            "payload": { "contentType": "text/markdown", "text": submission.text },
-            "relations": relations,
+    let target = match message_target_for_scope(client, scope).await {
+        Ok(target) => target,
+        Err(e) => {
+            app.set_status(format!("resolve message target failed: {}", e));
+            return;
         }
-    });
-    let res: Result<EventAppendResult, _> = client.call(method::EVENT_APPEND, payload).await;
+    };
+    let (parent_message_id, audience, delivery_policy) = message_send_context(app);
+    let intent = message_intent_for_delivery(delivery_policy);
+    let res: Result<MessageSendResult, _> = client
+        .call(
+            method::MESSAGE_SEND,
+            json!({
+                "target": target,
+                "body": submission.text,
+                "attachments": submission.attached_artifact_ids.clone(),
+                "parentMessageId": parent_message_id,
+                "audience": audience,
+                "intent": intent,
+                "deliveryPolicy": delivery_policy,
+            }),
+        )
+        .await;
     match res {
         Ok(r) => {
             let actor = app.actor_id.clone();
-            // Render the bubble immediately as Pending. When stream/update
-            // echoes the same event id back, History flips it to Delivered.
+            // Render the bubble immediately as Pending. When stream/update echoes
+            // the same message id back, History flips it to Delivered.
             app.history.push_outgoing(
                 &actor,
-                &r.event.id,
-                r.event.occurred_at,
+                &r.message.id,
+                r.message.created_at,
                 submission.text.clone(),
-                reply_target,
+                r.message.parent_message_id.clone(),
             );
             app.selected_history_idx = app.history.newest_replyable_index();
             app.reply_target = None;
@@ -2413,19 +2410,18 @@ async fn send_message(
     }
 }
 
-/// True when the current scope has at least one open turn that's cancellable.
-/// Source of truth is the `open_turns` registry (driven by `turn.opened` /
-/// `turn.closed` notifications).
+/// True when the current scope has at least one open run that's cancellable.
+/// Source of truth is the `open_turns` registry, driven by `run.updated`.
 fn has_open_turn(app: &App, scope: &ScopeRef) -> bool {
     !app.open_turns_in_scope(scope).is_empty()
 }
 
-/// Pick which in-flight turn to cancel.
+/// Pick which in-flight run to cancel.
 ///
-/// - `target_actor: Some(actor)` → most recent open turn for that actor;
+/// - `target_actor: Some(actor)` → most recent open run for that actor;
 ///   status hint if none found.
 /// - `target_actor: None`        → the bubble at `selected_history_idx` if
-///   it's tied to an open turn; otherwise the unique open turn in scope;
+///   it's tied to an open run; otherwise the unique open run in scope;
 ///   if multiple, status hint asking the user to disambiguate.
 fn pick_cancel_target(
     app: &App,
@@ -2476,20 +2472,19 @@ async fn cancel_in_scope(
     let display = app.display_name_for(&actor);
     let res = client
         .call_raw(
-            method::TURN_CLOSE,
+            method::RUN_CANCEL,
             Some(json!({
-                "turnId": turn_id,
-                "status": "cancelled",
+                "runId": turn_id,
             })),
         )
         .await;
     match res {
         Ok(_) => {
             // Optimistic cleanup: drop our local entry so a quick second Esc
-            // doesn't try to cancel the same already-cancelled turn before
-            // the `turn.closed` notification round-trips back.
+            // doesn't try to cancel the same already-canceled run before
+            // the `run.updated` notification round-trips back.
             app.open_turns.remove(&turn_id);
-            app.set_status(format!("cancelled @{display}'s turn"))
+            app.set_status(format!("cancelled @{display}'s run"))
         }
         Err(e) => app.set_status(format!("cancel failed: {}", e)),
     }
@@ -2498,7 +2493,7 @@ async fn cancel_in_scope(
 #[cfg(test)]
 mod tests {
     use super::{
-        arm_reply_target, message_relations, pick_cancel_target, reply_selected_history,
+        arm_reply_target, message_send_context, pick_cancel_target, reply_selected_history,
         route_paste_to_focused_ui,
     };
     use crate::cmd::chat::app::{App, Mode, PickerKind};
@@ -2506,6 +2501,7 @@ mod tests {
     use crate::cmd::chat::picker::Picker;
     use crate::cmd::chat::prompt::{PromptKind, PromptModal};
     use chrono::Utc;
+    use proto::types::DeliveryPolicy;
 
     #[test]
     fn arm_reply_target_clears_reply_command_residue() {
@@ -2521,46 +2517,44 @@ mod tests {
 
         assert!(app.input.is_empty());
         assert_eq!(
-            app.reply_target.as_ref().map(|t| t.event_id.as_str()),
+            app.reply_target.as_ref().map(|t| t.message_id.as_str()),
             Some("evt_123")
         );
     }
 
     #[test]
-    fn reply_to_other_actor_adds_hands_off_to_relation() {
+    fn reply_to_agent_adds_message_audience() {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
             "bojun.cbj".into(),
         );
+        app.actor_kinds
+            .insert("actor_agent_opencode".into(), "agent".into());
         app.history.bubbles.push(Bubble {
             actor_id: "actor_agent_opencode".into(),
             turn_id: None,
             kind: BubbleKind::Stream,
             text: "hello".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_123".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
-        let (relations, reply_target) = message_relations(&app, &[]);
+        let (parent_message_id, audience, delivery_policy) = message_send_context(&app);
 
-        assert_eq!(reply_target.as_deref(), Some("evt_123"));
-        assert_eq!(relations.len(), 2);
-        assert_eq!(relations[0]["kind"], "replies_to");
-        assert_eq!(relations[0]["target"]["kind"], "event");
-        assert_eq!(relations[0]["target"]["id"], "evt_123");
-        assert_eq!(relations[1]["kind"], "hands_off_to");
-        assert_eq!(relations[1]["target"]["kind"], "actor");
-        assert_eq!(relations[1]["target"]["id"], "actor_agent_opencode");
+        assert_eq!(parent_message_id.as_deref(), Some("evt_123"));
+        assert_eq!(audience.len(), 1);
+        assert_eq!(audience[0]["kind"], "actor");
+        assert_eq!(audience[0]["id"], "actor_agent_opencode");
+        assert_eq!(delivery_policy, DeliveryPolicy::WakeAgent);
     }
 
     #[test]
-    fn reply_to_self_does_not_add_hands_off_to_relation() {
+    fn reply_to_self_does_not_add_message_audience() {
         let mut app = App::new(
             "actor_human_current".into(),
             "thread_demo".into(),
@@ -2573,35 +2567,17 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "hello".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_123".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         app.set_reply_target("evt_123".into(), "evt_123".into());
 
-        let (relations, _) = message_relations(&app, &[]);
+        let (parent_message_id, audience, delivery_policy) = message_send_context(&app);
 
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0]["kind"], "replies_to");
-    }
-
-    #[test]
-    fn attached_artifacts_are_emitted_as_relations() {
-        let app = App::new(
-            "actor_human_current".into(),
-            "thread_demo".into(),
-            proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
-        );
-
-        let (relations, _) = message_relations(&app, &["art_123".into(), "art_456".into()]);
-
-        assert_eq!(relations.len(), 2);
-        assert_eq!(relations[0]["kind"], "attaches_artifact");
-        assert_eq!(relations[0]["target"]["kind"], "artifact");
-        assert_eq!(relations[0]["target"]["id"], "art_123");
-        assert_eq!(relations[1]["target"]["id"], "art_456");
+        assert_eq!(parent_message_id.as_deref(), Some("evt_123"));
+        assert!(audience.is_empty());
+        assert_eq!(delivery_policy, DeliveryPolicy::NotifyOnly);
     }
 
     #[test]
@@ -2618,10 +2594,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "hello".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_123".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_123".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         app.selected_history_idx = Some(0);
 
@@ -2630,7 +2605,7 @@ mod tests {
         assert_eq!(
             app.reply_target
                 .as_ref()
-                .map(|target| target.event_id.as_str()),
+                .map(|target| target.message_id.as_str()),
             Some("evt_123")
         );
     }
@@ -2681,10 +2656,9 @@ mod tests {
                 kind: BubbleKind::Stream,
                 text: "working".into(),
                 ts: chrono::Utc::now(),
-                reply_to_event_id: None,
-                trailing_event_id: None,
+                reply_to_source_id: None,
+                trailing_source_id: None,
                 delivery: DeliveryState::NotApplicable,
-                handoff_target: None,
             });
         }
         app

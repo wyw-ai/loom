@@ -17,7 +17,7 @@
           "--repo",
           "{params.repo_id}",
           "--mirror",
-          "{channel.workspace}/.joi/repos/notes/{params.repo_id}.json"
+          "{channel.workspace}/.loom/repos/notes/{params.repo_id}.json"
         ]
       },
       "push": {

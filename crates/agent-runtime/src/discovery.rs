@@ -1,7 +1,7 @@
 //! Local agent CLI discovery and provider-spec synthesis.
 //!
 //! This module is intentionally small and side-effect free except for reading
-//! `PATH`. The GUI uses it to present supported local CLIs, while `joi daemon`
+//! `PATH`. The GUI uses it to present supported local CLIs, while `loom-daemon`
 //! uses the same provider profiles to build runtime `AgentSpec`s from machine
 //! config without requiring on-disk provider JSON specs.
 
@@ -99,7 +99,7 @@ const PROVIDER_DEFS: &[ProviderDef] = &[
 pub fn detect_agent_cli_providers() -> Vec<DetectedAgentProvider> {
     detect_agent_cli_providers_in_path_with_config_dir(
         std::env::var_os("PATH").unwrap_or_default(),
-        &joi_config_dir(),
+        &loom_config_dir(),
     )
 }
 
@@ -159,10 +159,10 @@ impl DetectedAgentProvider {
         let mut env = self.transport_env.clone();
         if self.id == "codex" {
             // Codex runs model-generated shell commands inside its own
-            // sandbox. The Joi daemon socket is outside the actor workspace
-            // and macOS Seatbelt denies AF_UNIX access there, so have `joi`
-            // CLI calls use JOI_SERVER directly.
-            env.entry("JOI_NO_DAEMON".into())
+            // sandbox. The Loom daemon socket is outside the actor workspace
+            // and macOS Seatbelt denies AF_UNIX access there, so have `loom`
+            // CLI calls use LOOM_SERVER directly.
+            env.entry("LOOM_NO_DAEMON".into())
                 .or_insert_with(|| "1".into());
         }
         AgentTransport {
@@ -214,7 +214,7 @@ fn actor_spec_from_definition(
         "transportKind".into(),
         json!(provider.transport_kind.clone()),
     );
-    meta.insert("createdBy".into(), json!("joi-daemon"));
+    meta.insert("createdBy".into(), json!("loom-daemon"));
     if let Some(reasoning_effort) = definition
         .reasoning_effort
         .as_deref()
@@ -465,11 +465,11 @@ fn home_relative_path(path: &str) -> Option<PathBuf> {
 }
 
 fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
-    let joi_config_dir = absolute_path(config_dir);
+    let loom_config_dir = absolute_path(config_dir);
     let mut args = Vec::new();
     match def.id {
         "claude" => {
-            append_add_dir_arg(&mut args, &joi_config_dir);
+            append_add_dir_arg(&mut args, &loom_config_dir);
             args.push("--permission-mode".into());
             args.push("bypassPermissions".into());
             args.push("--output-format".into());
@@ -478,14 +478,14 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "qoder" => {
-            append_add_dir_arg(&mut args, &joi_config_dir);
+            append_add_dir_arg(&mut args, &loom_config_dir);
             args.push("--yolo".into());
             args.push("--output-format".into());
             args.push("stream-json".into());
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "copilot" => {
-            append_add_dir_arg(&mut args, &joi_config_dir);
+            append_add_dir_arg(&mut args, &loom_config_dir);
             args.push("--yolo".into());
             args.push("--output-format".into());
             args.push("json".into());
@@ -500,7 +500,7 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
             args.push("danger-full-access".into());
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
-            append_add_dir_arg(&mut args, &joi_config_dir);
+            append_add_dir_arg(&mut args, &loom_config_dir);
         }
         "opencode" => {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
@@ -550,14 +550,14 @@ fn append_add_dir_arg(args: &mut Vec<String>, dir: &Path) {
     args.push(dir.display().to_string());
 }
 
-fn joi_config_dir() -> PathBuf {
-    if let Some(value) = std::env::var_os("JOI_CONFIG_DIR").filter(|value| !value.is_empty()) {
+fn loom_config_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("LOOM_CONFIG_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(value);
     }
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home).join(".joi-apps");
+        return PathBuf::from(home).join(".loom");
     }
-    PathBuf::from(".joi-apps")
+    PathBuf::from(".loom")
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -611,7 +611,7 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "joi-discovery-{name}-{}",
+            "loom-discovery-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock drift")
@@ -752,7 +752,7 @@ mod tests {
             codex
                 .transport()
                 .env
-                .get("JOI_NO_DAEMON")
+                .get("LOOM_NO_DAEMON")
                 .map(String::as_str),
             Some("1")
         );
@@ -780,7 +780,7 @@ mod tests {
                 "-c".into(),
                 "sandbox_workspace_write.network_access=true".into(),
                 "--add-dir".into(),
-                "/tmp/joi-config".into(),
+                "/tmp/loom-config".into(),
             ],
             transport_env: BTreeMap::new(),
             default_model: None,
@@ -812,14 +812,14 @@ mod tests {
                 "-c",
                 "sandbox_workspace_write.network_access=true",
                 "--add-dir",
-                "/tmp/joi-config"
+                "/tmp/loom-config"
             ]
         );
         assert_eq!(
             specs[0]
                 .transport
                 .env
-                .get("JOI_NO_DAEMON")
+                .get("LOOM_NO_DAEMON")
                 .map(String::as_str),
             Some("1")
         );
@@ -845,7 +845,7 @@ mod tests {
                 args: Some(vec![
                     "-lc".into(),
                     "vpn && exec codex \"$@\"".into(),
-                    "joi-codex".into(),
+                    "loom-codex".into(),
                 ]),
                 env: BTreeMap::from([("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into())]),
             }],
@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(provider.command, "/bin/bash");
         assert_eq!(
             provider.args,
-            vec!["-lc", "vpn && exec codex \"$@\"", "joi-codex"]
+            vec!["-lc", "vpn && exec codex \"$@\"", "loom-codex"]
         );
         let transport = provider.transport();
         assert_eq!(
@@ -862,7 +862,7 @@ mod tests {
             Some("http://127.0.0.1:7890")
         );
         assert_eq!(
-            transport.env.get("JOI_NO_DAEMON").map(String::as_str),
+            transport.env.get("LOOM_NO_DAEMON").map(String::as_str),
             Some("1")
         );
     }

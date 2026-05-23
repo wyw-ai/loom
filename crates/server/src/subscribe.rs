@@ -54,15 +54,15 @@ impl Subscriptions {
     ///   runtime delivery.
     ///
     /// * `Agent` / `Service` — always takes over. Long-lived host processes
-    ///   (`joi daemon`, `joi service serve`) claiming an actor means
+    ///   (`loom-daemon`, `loom service serve`) claiming an actor means
     ///   "I am the runtime for this actor"; a restart after a crash needs
     ///   to win even if the previous WS hasn't been reaped yet (the old
     ///   conn's TCP close detection on the server side may lag the new
     ///   process's `connection/open` by tens of ms). See
     ///   `docs/service-plugin-system-design.md` §9.4.
     /// * `Human` — only take if no other live connection holds the slot.
-    ///   Stops short-lived `joi` subcommands shelled from inside an agent
-    ///   or service tool call (which inherit `JOI_ACTOR` pointing at the
+    ///   Stops short-lived `loom` subcommands shelled from inside an agent
+    ///   or service tool call (which inherit `LOOM_ACTOR` pointing at the
     ///   long-lived actor and dial `connection/open` on every invocation,
     ///   defaulting to `kind = Human`) from yanking the runtime out of
     ///   the routing table when their connection later closes.
@@ -382,9 +382,9 @@ mod tests {
 
     #[test]
     fn service_kind_preempts_existing_live_binding() {
-        // §9.4: a long-lived `joi service serve` restart must take over the
+        // §9.4: a long-lived `loom service serve` restart must take over the
         // actor-inbox even if the previous WS hasn't been reaped yet — same
-        // contract as `joi daemon`. Without preempt, the new host can't
+        // contract as `loom-daemon`. Without preempt, the new host can't
         // receive any actor-inbox push until the old conn TCP-times out.
         let subs = Subscriptions::new();
         subs.add_connection(make_conn("conn_old"));
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn human_kind_does_not_preempt_live_binding() {
-        // A short-lived `joi --as svc_xxx say` defaults to actor_kind=Human
+        // A short-lived `loom --as svc_xxx message send` defaults to actor_kind=Human
         // (see client::open_connection). It must NOT yank the long-lived
         // service host out of the routing table, otherwise its eventual
         // disconnect would leave the actor with no inbox owner at all.

@@ -14,6 +14,7 @@ pub enum RefKind {
     Thread,
     Turn,
     Event,
+    Message,
     Artifact,
     Task,
 }
@@ -95,13 +96,52 @@ pub struct Channel {
     pub _meta: Option<Meta>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorGroup {
+    pub id: String,
+    pub channel_id: String,
+    /// Stable mention handle without the leading `@`.
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub member_actor_ids: Vec<String>,
+    /// Default false: group mentions notify humans but do not wake agents.
+    #[serde(default)]
+    pub wake_agents: bool,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorPresence {
+    pub actor_id: String,
+    pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub following: bool,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub attention_policy: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
     pub channel_id: String,
     pub title: String,
-    pub root_event_id: String,
+    pub root_message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
@@ -124,7 +164,7 @@ pub struct Turn {
     pub actor_id: String,
     pub scope: ScopeRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_event_id: Option<String>,
+    pub trigger_source_id: Option<String>,
     pub status: TurnStatus,
     pub opened_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,12 +175,202 @@ pub struct Turn {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Queued,
+    PreparingContext,
+    Running,
+    WaitingTool,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Run {
+    pub id: String,
+    pub actor_id: String,
+    pub scope: ScopeRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_reason: Option<String>,
+    pub agent_config_version_id: String,
+    pub status: RunStatus,
+    pub opened_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<Timestamp>,
+    #[serde(default, rename = "metadata")]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFrame {
+    pub run_id: String,
+    pub seq: u64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigVersion {
+    pub id: String,
+    pub actor_id: String,
+    pub version: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
+    pub tools: serde_json::Value,
+    #[serde(default)]
+    pub capability_tags: Vec<String>,
+    #[serde(default)]
+    pub attention_policy: serde_json::Value,
+    #[serde(default)]
+    pub context_policy: serde_json::Value,
+    #[serde(default)]
+    pub reply_policy: serde_json::Value,
+    pub created_by: String,
+    pub created_at: Timestamp,
+    #[serde(default, rename = "metadata")]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigActivation {
+    pub actor_id: String,
+    pub version_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+    pub activated_by: String,
+    pub activated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationMode {
+    Sequential,
+    ParallelReduce,
+    Broadcast,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationDecisionRule {
+    OwnerDecides,
+    HumanApproval,
+    AllAck,
+    Majority,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationStatus {
+    Planning,
+    CollectingResponses,
+    Committed,
+    Executing,
+    Done,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationResponseKind {
+    Ack,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationResponse {
+    pub actor_id: String,
+    pub kind: CoordinationResponseKind,
+    #[serde(default)]
+    pub reason: String,
+    pub responded_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationSession {
+    pub id: String,
+    pub target: String,
+    pub scope: ScopeRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_message_id: Option<String>,
+    pub owner_actor_id: String,
+    pub mode: CoordinationMode,
+    pub decision_rule: CoordinationDecisionRule,
+    pub status: CoordinationStatus,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baton_holder_actor_id: Option<String>,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub responses: Vec<CoordinationResponse>,
+    #[serde(default)]
+    pub plan: serde_json::Value,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default, rename = "metadata")]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationStepType {
+    Work,
+    Handoff,
+    Skip,
+    Reassign,
+    Reduce,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationStepStatus {
+    Submitted,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationStep {
+    pub id: String,
+    pub session_id: String,
+    pub actor_id: String,
+    pub step_type: CoordinationStepType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_key: Option<String>,
+    pub base_revision: u64,
+    pub status: CoordinationStepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_message_id: Option<String>,
+    #[serde(default)]
+    pub output: serde_json::Value,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum RelationKind {
     RepliesTo,
     /// "X is meant for actor Y." Machine-routing semantics only exist when a
     /// binding explicitly writes this relation; raw `@handle` text has no
     /// protocol meaning by itself.
-    HandsOffTo,
+    DirectedTo,
     RespondsTo,
     AttachesArtifact,
     RelatesToTask,
@@ -158,13 +388,11 @@ pub struct Relation {
 #[serde(rename_all = "camelCase")]
 pub struct Event {
     pub id: String,
-    /// Event type, e.g. "content.add", "action.request", "action.response",
-    /// "artifact.publish", "turn.close". Handoff is expressed as a
-    /// `content.add` carrying a `HandsOffTo` relation rather than a
-    /// dedicated event kind. Vendor extensions
-    /// allowed. Agent tool calls and internal status changes are NOT events;
-    /// they are turn-private trace frames carried by `turn/trace.update`
-    /// (see `proto::types::trace`).
+    /// Event type, e.g. "action.request", "action.response", or
+    /// "artifact.publish". User-visible directed messages are represented by
+    /// `Message`; `DirectedTo` remains only for internal control records.
+    /// Agent tool calls and runtime status changes are NOT events; they are
+    /// private run frames carried by `run.append`.
     #[serde(rename = "type")]
     pub kind: String,
     pub actor_id: String,
@@ -179,6 +407,122 @@ pub struct Event {
     pub relations: Vec<Relation>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    Human,
+    Agent,
+    System,
+    Attention,
+    TaskUpdate,
+    Artifact,
+}
+
+fn default_message_kind() -> MessageKind {
+    MessageKind::Human
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageIntent {
+    Chat,
+    Ask,
+    RequestAction,
+    AssignTask,
+    StatusUpdate,
+    Review,
+    Notify,
+}
+
+fn default_message_intent() -> MessageIntent {
+    MessageIntent::Chat
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryPolicy {
+    NotifyOnly,
+    WakeAgent,
+    RouteByIntent,
+    Silent,
+}
+
+fn default_delivery_policy() -> DeliveryPolicy {
+    DeliveryPolicy::NotifyOnly
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AudienceKind {
+    Actor,
+    Group,
+    All,
+    Agents,
+    Humans,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudienceRef {
+    pub kind: AudienceKind,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageMentionKind {
+    Actor,
+    Group,
+    All,
+    Agents,
+    Humans,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageMention {
+    pub actor_or_group_id: String,
+    pub kind: MessageMentionKind,
+    pub source: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub display: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub id: String,
+    pub scope: ScopeRef,
+    pub target: String,
+    pub author_actor_id: String,
+    pub created_at: Timestamp,
+    #[serde(default = "default_message_kind")]
+    pub kind: MessageKind,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub mentions: Vec<MessageMention>,
+    #[serde(default)]
+    pub audience: Vec<AudienceRef>,
+    #[serde(default = "default_message_intent")]
+    pub intent: MessageIntent,
+    #[serde(default = "default_delivery_policy")]
+    pub delivery_policy: DeliveryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
+    #[serde(default, rename = "metadata")]
+    pub metadata: Meta,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -247,7 +591,7 @@ pub struct TaskRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_event_id: Option<String>,
+    pub source_message_id: Option<String>,
     pub created_by_actor_id: String,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -528,13 +872,13 @@ pub struct Task {
     /// Monotonic, human-facing number scoped to `channel_id`.
     pub number: u64,
     pub channel_id: String,
-    /// Top-level channel event that anchors this work item.
-    pub source_event_id: String,
-    /// Thread attached to `source_event_id`; all progress and handoff
+    /// Top-level channel message that anchors this work item.
+    pub source_message_id: String,
+    /// Thread attached to `source_message_id`; all progress and directed
     /// discussion should return here.
     pub canonical_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_source_event_id: Option<String>,
+    pub parent_source_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
     pub title: String,
@@ -571,7 +915,7 @@ pub struct TaskAssignment {
     pub instruction: String,
     pub status: TaskAssignmentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_event_id: Option<String>,
+    pub result_message_id: Option<String>,
     #[serde(default)]
     pub result_summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,7 +969,7 @@ pub struct Membership {
     pub joined_at: Timestamp,
     pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_read_event_id: Option<String>,
+    pub last_read_source_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
@@ -641,7 +985,7 @@ pub enum DeliveryState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Delivery {
-    pub event_id: String,
+    pub source_id: String,
     pub actor_id: String,
     pub state: DeliveryState,
     pub updated_at: Timestamp,
@@ -710,27 +1054,6 @@ pub struct MachineCommand {
     pub error: Option<MachineCommandError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Timestamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
-    pub _meta: Option<Meta>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ReceiptKind {
-    Seen,
-    Read,
-    Accepted,
-    Declined,
-    Completed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Receipt {
-    pub event_id: String,
-    pub actor_id: String,
-    pub kind: ReceiptKind,
-    pub recorded_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
@@ -862,25 +1185,13 @@ pub mod payload {
     fn default_kind() -> String {
         "accepted".into()
     }
-
-    /// Payload for `turn.close`.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct TurnCloseEvent {
-        pub status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub stop_reason: Option<String>,
-    }
 }
 
-// ---- turn-private trace ----
+// ---- run trace frame payloads ----
 //
-// Trace frames live on a `Turn` and are visible only to the turn's owner
-// actor (the agent that runs the turn). They are NOT events: they have no
-// global event id, are not stored in `events_by_scope`, are never returned by
-// `scope/read`, and cannot be addressed by `replies_to` / `responds_to` /
-// `references`. They are delivered through the dedicated `turn/trace.update`
-// notification and can be re-read by the owner via `turn/trace.read`.
+// Trace payloads live on `RunFrame` records. They are NOT events: they have no
+// global event id, are not stored in `events_by_scope`, and cannot be addressed
+// by message reply or event response relations.
 
 pub mod trace {
     use super::{Meta, Timestamp};

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cache-ctl.sh — channel-level shared/repos cache controller.
 #
-# Maintains `~/.agentx/channels/<chan>/shared/repos/<basename>.git` as bare
+# Maintains `~/.local/share/loom/agents/channels/<chan>/shared/repos/<basename>.git` as bare
 # mirrors with HEAD pinned to the upstream default branch (master / main / ...).
 #
 # Subcommands:
@@ -11,19 +11,19 @@
 #   prune   <repo> [--yes]      remove a mirror
 #   heal    [--all]             repair: convert non-bare → bare, repin HEAD
 #
-# Requires: --chan <chan_id> (or env JOI_CHAN_ID).
+# Requires: --chan <chan_id> (or env LOOM_CHAN_ID).
 
 set -euo pipefail
 
-CHAN_ID="${JOI_CHAN_ID:-}"
+CHAN_ID="${LOOM_CHAN_ID:-}"
 SHARED_ROOT=""
 
 log()  { printf '[cache-ctl] %s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
 
 resolve_root() {
-    [[ -n "$CHAN_ID" ]] || die "--chan <chan_id> (or env JOI_CHAN_ID) required"
-    SHARED_ROOT="${HOME}/.agentx/channels/${CHAN_ID}/shared/repos"
+    [[ -n "$CHAN_ID" ]] || die "--chan <chan_id> (or env LOOM_CHAN_ID) required"
+    SHARED_ROOT="${LOOM_AGENT_DATA_ROOT:-${HOME}/.local/share/loom/agents}/channels/${CHAN_ID}/shared/repos"
     mkdir -p "$SHARED_ROOT"
 }
 

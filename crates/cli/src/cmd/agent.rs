@@ -65,7 +65,7 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-/// Bump the per-actor reload marker so a running legacy `joi agent serve`
+/// Bump the per-actor reload marker so a running `loom-daemon`
 /// host re-reads the AgentSpec + bundle and respawns the worker.
 pub fn reload(actor_id: String) -> Result<()> {
     let data_root = super::agent_serve::default_data_root_pub();
@@ -188,14 +188,14 @@ fn non_empty(value: &str) -> Option<String> {
 }
 
 pub(crate) fn default_specs_dir() -> PathBuf {
-    if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
+    if let Ok(s) = std::env::var("LOOM_AGENT_SPECS") {
         if !s.is_empty() {
             return PathBuf::from(s);
         }
     }
     dirs::config_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+        .map(|d| d.join("loom").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents"))
 }
 
 pub(crate) fn load_specs_at(dir: &Path) -> Result<Vec<AgentSpec>> {

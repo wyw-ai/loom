@@ -1,15 +1,11 @@
-// First user is `joi service am-handler` (S2-5).
+// First user is `loom service am-handler` (S2-5).
 #![allow(dead_code)]
 
-//! Thread-map persistence + scope-mode resolution + legacy migration.
+//! Thread-map persistence + scope-mode resolution.
 //!
 //! Per-channel mapping `{ channelId: { thread_key: ThreadEntry } }`, mirrors
-//! the JSON shape the Python reference wrote so existing operators can
-//! migrate without re-mapping. New canonical path is
-//! `<state_dir>/thread-map.json` (§10); the one-shot
-//! [`migrate_legacy`] copies from the old
-//! `~/.config/aone-message-cli/joi-thread-map.json` location on first
-//! run, leaves the original in place (per §10 migration note).
+//! the JSON shape the Python reference wrote. Canonical path is
+//! `<state_dir>/thread-map.json` (§10).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -154,44 +150,6 @@ pub fn thread_map_path(state_dir: &Path) -> PathBuf {
     state_dir.join("thread-map.json")
 }
 
-pub fn legacy_thread_map_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config")
-        .join("aone-message-cli")
-        .join("joi-thread-map.json")
-}
-
-/// One-shot legacy import. Copies the old Python path into the new
-/// service-host path **iff**:
-///
-/// * the new path does not yet exist (don't clobber a running map),
-/// * AND the legacy path exists (no-op for fresh installs).
-///
-/// Returns `true` when a copy actually happened so the caller can log.
-/// Per §10 migration note the original is **not** deleted — leaves a
-/// rollback option if the operator needs to fall back to the Python
-/// reference during the cutover.
-pub fn migrate_legacy(new_path: &Path, legacy_path: &Path) -> Result<bool> {
-    if new_path.exists() {
-        return Ok(false);
-    }
-    if !legacy_path.exists() {
-        return Ok(false);
-    }
-    let raw = fs::read_to_string(legacy_path)
-        .with_context(|| format!("read legacy thread map {}", legacy_path.display()))?;
-    let parent = new_path.parent().expect("new path has parent");
-    fs::create_dir_all(parent)?;
-    fs::write(new_path, raw)
-        .with_context(|| format!("write new thread map {}", new_path.display()))?;
-    tracing::info!(
-        legacy = %legacy_path.display(),
-        new = %new_path.display(),
-        "migrated AM thread-map from legacy path; original retained",
-    );
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,7 +157,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let p =
-            std::env::temp_dir().join(format!("joi-am-scope-{}", uuid::Uuid::new_v4().simple()));
+            std::env::temp_dir().join(format!("loom-am-scope-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -293,54 +251,5 @@ mod tests {
         save(&path, &ThreadMap::default()).expect("save");
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists());
-    }
-
-    #[test]
-    fn migrate_copies_legacy_and_keeps_original() {
-        let dir = temp_dir();
-        let legacy = dir.join("legacy.json");
-        let new = dir.join("svc").join("thread-map.json");
-        fs::write(
-            &legacy,
-            r#"{"ch1":{"conversation:c1":{"threadId":"t1","title":"x","createdAt":1}}}"#,
-        )
-        .unwrap();
-
-        assert!(migrate_legacy(&new, &legacy).expect("migrate"));
-        assert!(new.exists(), "new path created");
-        assert!(legacy.exists(), "legacy retained");
-
-        let loaded = load(&new).expect("load new");
-        let entry = loaded
-            .channels
-            .get("ch1")
-            .and_then(|c| c.get("conversation:c1"))
-            .expect("entry");
-        assert_eq!(entry.thread_id, "t1");
-    }
-
-    #[test]
-    fn migrate_is_noop_when_new_already_exists() {
-        // Operator may have manually populated the new path; never
-        // clobber it with the legacy file.
-        let dir = temp_dir();
-        let legacy = dir.join("legacy.json");
-        let new = dir.join("thread-map.json");
-        fs::write(&legacy, r#"{"old":{}}"#).unwrap();
-        fs::write(&new, r#"{"new":{}}"#).unwrap();
-
-        assert!(!migrate_legacy(&new, &legacy).expect("noop"));
-        let loaded = load(&new).expect("load");
-        assert!(loaded.channels.contains_key("new"));
-        assert!(!loaded.channels.contains_key("old"));
-    }
-
-    #[test]
-    fn migrate_is_noop_when_legacy_missing() {
-        let dir = temp_dir();
-        let legacy = dir.join("nope.json");
-        let new = dir.join("thread-map.json");
-        assert!(!migrate_legacy(&new, &legacy).expect("noop"));
-        assert!(!new.exists(), "no file created from nothing");
     }
 }

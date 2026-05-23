@@ -1,23 +1,20 @@
 //! Daemon agent worker internals.
 //!
-//! `joi daemon` synthesizes `AgentSpec`s from the desktop machine config and
+//! `loom-daemon` synthesizes `AgentSpec`s from the desktop machine config and
 //! uses this module to open a dedicated WebSocket per agent, then supervise
 //! that one agent through the shared `agent-runtime` adapter trait.
 //!
-//! Architecture (per docs/architecture-v1-agent-client.md §6):
+//! Architecture:
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
 //!   * `connection/open` with `actorKind = "agent"` binds the connection to the
-//!     agent's actor id; the server's actor-inbox delivery (see
-//!     `crates/server/src/ws.rs::fanout`) then pushes every `HandsOffTo`-targeted
-//!     `event.created` straight to this connection
-//!   * active scopes are also subscribed while prompts run, so older servers
-//!     that only scope-broadcast `action.response` events still unblock ACP
-//!     permission prompts
-//!   * a notification loop turns those events into `Adapter::send_prompt` calls,
-//!     opening / tracking a turn through `turn/open` + `turn/close`
-//!   * a translator task drains `AdapterEvent`s and re-emits them as
-//!     `event/append` (public content) + `turn/trace.append` (owner-only trace)
-//!     RPCs.
+//!     agent's actor id; the server's actor-inbox delivery pushes directed
+//!     messages and control records straight to this connection
+//!   * active scopes are subscribed while prompts run so run updates and action
+//!     responses unblock the adapter without polling delay
+//!   * a notification loop turns directed messages into `Adapter::send_prompt`
+//!     calls and opens/closes a `run.*` lifecycle record
+//!   * a translator task drains `AdapterEvent`s and writes final messages plus
+//!     private `run.append` trace frames back to the server.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -26,17 +23,22 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
-    method, stream_kind, ActorListResult, AgentModelChoice, AgentSpec, BundleInstallMode,
-    DeliveryListResult, EventAppendResult, HandoffApplyOn, PromptTemplateSpec,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, TurnOpenResult,
+    method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
+    AgentModelChoice, AgentSpec, BundleInstallMode, InboxListResult, MessageSendResult,
+    PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
+    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, Event, Meta, ReceiptKind, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef,
-    TaskAssignmentStatus, TurnStatus,
+    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, RunStatus, ScopeKind,
+    ScopeRef, TaskAssignmentStatus,
 };
+#[cfg(test)]
+use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, sleep, Duration};
@@ -84,7 +86,7 @@ pub async fn run(
     }
 
     eprintln!(
-        "joi agent serve: loaded {} agent(s) from {}",
+        "loom agent serve: loaded {} agent(s) from {}",
         specs.len(),
         specs_dir.display()
     );
@@ -231,25 +233,25 @@ pub(crate) fn default_data_root_pub() -> PathBuf {
 }
 
 fn default_data_root() -> PathBuf {
-    if let Ok(s) = std::env::var("JOI_AGENT_DATA_ROOT") {
+    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
         if !s.is_empty() {
             return PathBuf::from(s);
         }
     }
     dirs::data_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents-data"))
+        .map(|d| d.join("loom").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
 }
 
 fn default_specs_dir() -> PathBuf {
-    if let Ok(s) = std::env::var("JOI_AGENT_SPECS") {
+    if let Ok(s) = std::env::var("LOOM_AGENT_SPECS") {
         if !s.is_empty() {
             return PathBuf::from(s);
         }
     }
     dirs::config_dir()
-        .map(|d| d.join("joi").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".joi").join("agents"))
+        .map(|d| d.join("loom").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents"))
 }
 
 fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
@@ -302,13 +304,13 @@ fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
     Ok(Some(spec))
 }
 
-/// The path to *this* joi binary. Used as the `command` for the
-/// auto-injected `joi-memory` MCP server entry; falls back to the bare
-/// name `"joi"` (hoping it's on PATH) if we can't resolve our own exe.
-fn current_joi_binary() -> Option<PathBuf> {
+/// The path to *this* loom binary. Used as the `command` for the
+/// auto-injected Loom MCP server entries; falls back to the bare
+/// name `"loom"` (hoping it's on PATH) if we can't resolve our own exe.
+fn current_loom_binary() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .or_else(|| Some(PathBuf::from("joi")))
+        .or_else(|| Some(PathBuf::from("loom")))
 }
 
 pub struct MachineCommandTask {
@@ -587,7 +589,7 @@ struct BundlePaths {
 impl AgentPaths {
     fn new(data_root: &Path, actor_id: &str) -> Self {
         let agent_root = data_root.join("agents").join(actor_id);
-        let scope_workspaces_root = std::env::var_os("JOI_SCOPE_WORKSPACES_ROOT")
+        let scope_workspaces_root = std::env::var_os("LOOM_SCOPE_WORKSPACES_ROOT")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("workspaces"));
@@ -789,64 +791,91 @@ impl AgentPaths {
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut env = BTreeMap::new();
-        env.insert("JOI_SERVER".into(), server_url.to_string());
+        env.insert("LOOM_SERVER".into(), server_url.to_string());
         if let Some(socket) = daemon_ipc::env_socket_path() {
+            env.insert("LOOM_DAEMON_SOCKET".into(), socket.display().to_string());
             env.insert(
                 daemon_ipc::ENV_DAEMON_SOCKET.into(),
                 socket.display().to_string(),
             );
         }
-        env.insert("JOI_ACTOR".into(), actor_id.to_string());
-        env.insert("JOI_SCOPE_ID".into(), scope_ref.id.clone());
+        env.insert("LOOM_ACTOR".into(), actor_id.to_string());
+        env.insert("LOOM_SCOPE_ID".into(), scope_ref.id.clone());
         env.insert(
-            "JOI_SCOPE_KIND".into(),
+            "LOOM_SCOPE_KIND".into(),
             scope_kind_name(scope_ref.kind).to_string(),
         );
         insert_current_time_env(&mut env);
         if let Some(active) = active {
-            env.insert("JOI_TURN_ID".into(), active.id.clone());
+            env.insert("LOOM_RUN_ID".into(), active.run_id.clone());
             env.insert(
-                "JOI_TRIGGER_EVENT_ID".into(),
-                active.trigger_event_id.clone(),
+                "LOOM_TRIGGER_MESSAGE_ID".into(),
+                active.trigger_source_id.clone(),
             );
-            env.insert("JOI_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+            env.insert("LOOM_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
         }
         env.insert(
-            "JOI_AGENT_PROFILE".into(),
+            "LOOM_AGENT_PROFILE".into(),
             self.profile.display().to_string(),
         );
         env.insert(
-            "JOI_AGENT_BUNDLE_DIR".into(),
+            "LOOM_AGENT_BUNDLE_DIR".into(),
             self.bundle_current.display().to_string(),
         );
+        env.insert("LOOM_CHANNEL_ID".into(), channel_id.to_string());
         env.insert("AGENTX_CHANNEL_ID".into(), channel_id.to_string());
+        env.insert(
+            "LOOM_CHANNEL_ROOT".into(),
+            scope.channel_root.display().to_string(),
+        );
         env.insert(
             "AGENTX_CHANNEL_ROOT".into(),
             scope.channel_root.display().to_string(),
+        );
+        env.insert(
+            "LOOM_CHANNEL_SHARED".into(),
+            scope.channel_shared.display().to_string(),
         );
         env.insert(
             "AGENTX_CHANNEL_SHARED".into(),
             scope.channel_shared.display().to_string(),
         );
         env.insert(
+            "LOOM_CHANNEL_SHARED_ARTIFACTS".into(),
+            scope.channel_artifacts.display().to_string(),
+        );
+        env.insert(
             "AGENTX_CHANNEL_SHARED_ARTIFACTS".into(),
             scope.channel_artifacts.display().to_string(),
+        );
+        env.insert(
+            "LOOM_AGENT_ROOT".into(),
+            scope.agent_root.display().to_string(),
         );
         env.insert(
             "AGENTX_AGENT_ROOT".into(),
             scope.agent_root.display().to_string(),
         );
         env.insert(
+            "LOOM_AGENT_WORKSPACE".into(),
+            scope.workspace.display().to_string(),
+        );
+        env.insert(
             "AGENTX_AGENT_WORKSPACE".into(),
             scope.workspace.display().to_string(),
         );
+        env.insert("LOOM_AGENT_LOGS".into(), scope.logs.display().to_string());
         env.insert("AGENTX_AGENT_LOGS".into(), scope.logs.display().to_string());
+        env.insert(
+            "LOOM_SCOPE_SKILLS".into(),
+            scope.skills.display().to_string(),
+        );
         env.insert(
             "AGENTX_SCOPE_SKILLS".into(),
             scope.skills.display().to_string(),
         );
         env.insert(
-            "JOI_SCOPE_SKILLS_DIR".into(),
+            "LOOM_SCOPE_SKILLS_DIR".into(),
             scope.skills.display().to_string(),
         );
         env
@@ -989,6 +1018,64 @@ fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
     }
 }
 
+#[derive(Clone)]
+enum AgentTrigger {
+    Message(Message),
+    #[cfg(test)]
+    Event(Event),
+}
+
+impl AgentTrigger {
+    fn id(&self) -> &str {
+        match self {
+            AgentTrigger::Message(message) => &message.id,
+            #[cfg(test)]
+            AgentTrigger::Event(event) => &event.id,
+        }
+    }
+
+    fn scope(&self) -> &ScopeRef {
+        match self {
+            AgentTrigger::Message(message) => &message.scope,
+            #[cfg(test)]
+            AgentTrigger::Event(event) => &event.scope,
+        }
+    }
+
+    fn actor_id(&self) -> &str {
+        match self {
+            AgentTrigger::Message(message) => &message.author_actor_id,
+            #[cfg(test)]
+            AgentTrigger::Event(event) => &event.actor_id,
+        }
+    }
+
+    fn meta_value(&self, key: &str) -> Option<&Value> {
+        match self {
+            AgentTrigger::Message(message) => message.metadata.get(key),
+            #[cfg(test)]
+            AgentTrigger::Event(event) => event
+                .payload
+                .get("_meta")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get(key))
+                .or_else(|| event._meta.as_ref().and_then(|meta| meta.get(key))),
+        }
+    }
+
+    fn reply_target(&self) -> Option<String> {
+        match self {
+            AgentTrigger::Message(message) => Some(message.target.clone()),
+            #[cfg(test)]
+            AgentTrigger::Event(_) => None,
+        }
+    }
+
+    fn is_message(&self) -> bool {
+        matches!(self, AgentTrigger::Message(_))
+    }
+}
+
 struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
@@ -999,14 +1086,15 @@ struct WorkerState {
     profile_dir: PathBuf,
     paths: AgentPaths,
     agent_server_url: String,
+    agent_config_version_id: String,
     /// In-flight turn per scope. A worker may own one adapter instance, but
     /// scope/session state is isolated below the adapter boundary, so only
     /// prompts in the same scope block each other.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
     /// Per-scope queues of triggers received while that scope is busy. Human
     /// triggers are kept ahead of service callbacks within the same scope so
-    /// stale automation cannot starve an explicit user handoff.
-    pending_triggers: Mutex<HashMap<String, VecDeque<Event>>>,
+    /// stale automation cannot starve an explicit user request.
+    pending_triggers: Mutex<HashMap<String, VecDeque<AgentTrigger>>>,
     /// Per-turn streaming text buffer; flushed as a single `content.add` on
     /// `Finished`, once final usage metadata is available.
     text_buffer: Mutex<HashMap<String, String>>,
@@ -1020,19 +1108,19 @@ struct WorkerState {
     /// `thread/list` RPC and reused from then on. Channel scopes don't need
     /// resolution (scope.id IS the channel id) so those don't populate it.
     scope_channel_cache: Mutex<HashMap<String, String>>,
-    /// Event ids already received from the server notification stream. The
-    /// same event can arrive through both scope broadcast and actor-inbox
+    /// Trigger source ids already received from the server notification stream.
+    /// The same source can arrive through both scope broadcast and actor-inbox
     /// routing when we subscribe to an active scope for legacy server
     /// compatibility.
-    seen_events: Mutex<HashSet<String>>,
-    /// action.request event id → underlying ACP request id.
+    seen_sources: Mutex<HashSet<String>>,
+    /// action.request message id -> underlying ACP request id.
     action_map: Mutex<HashMap<String, String>>,
-    /// action.request event id → metadata for Joi-owned model selection prompts.
+    /// action.request message id -> metadata for Loom-owned model selection prompts.
     model_action_map: Mutex<HashMap<String, ModelActionRequest>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
-    /// Actor id → display name cache used when rendering handoff prompts.
+    /// Actor id → display name cache used when rendering trigger prompts.
     /// The server keeps actor rows authoritative; this cache is a fallback
     /// when actor/list is temporarily unavailable.
     actor_display_cache: Mutex<HashMap<String, String>>,
@@ -1040,9 +1128,15 @@ struct WorkerState {
 
 #[derive(Clone)]
 struct ActiveTurn {
+    /// Temporary legacy turn id kept only for existing cancellation UI and
+    /// compatibility with old action.response events while execution state
+    /// moves to Run.
     id: String,
+    run_id: String,
     scope: ScopeRef,
-    trigger_event_id: String,
+    trigger_source_id: String,
+    trigger_is_message: bool,
+    reply_target: Option<String>,
     prompt_stats: PromptStats,
     prompt_breakdown: PromptBreakdown,
     /// Actor that triggered the current turn — needed when emitting a
@@ -1109,12 +1203,31 @@ struct ModelStateFile {
 }
 
 impl WorkerState {
+    #[cfg(test)]
     fn new(
         actor_id: String,
         spec: AgentSpec,
         profile_dir: PathBuf,
         paths: AgentPaths,
         agent_server_url: String,
+    ) -> Self {
+        Self::new_with_agent_config_version(
+            actor_id,
+            spec,
+            profile_dir,
+            paths,
+            agent_server_url,
+            "agent_config_test".into(),
+        )
+    }
+
+    fn new_with_agent_config_version(
+        actor_id: String,
+        spec: AgentSpec,
+        profile_dir: PathBuf,
+        paths: AgentPaths,
+        agent_server_url: String,
+        agent_config_version_id: String,
     ) -> Self {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, model))
@@ -1129,13 +1242,14 @@ impl WorkerState {
             profile_dir,
             paths,
             agent_server_url,
+            agent_config_version_id,
             active_turns: Mutex::new(HashMap::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
-            seen_events: Mutex::new(HashSet::new()),
+            seen_sources: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
@@ -1170,7 +1284,7 @@ impl WorkerState {
 
     /// Drop the active turn for `scope_id` and pop the next queued trigger for
     /// that same scope (if any).
-    fn clear_turn(&self, scope_id: &str) -> Option<Event> {
+    fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
         let mut active = self.active_turns.lock().expect("active_turns poisoned");
         active.remove(scope_id);
         drop(active);
@@ -1189,41 +1303,41 @@ impl WorkerState {
         next
     }
 
-    fn enqueue(&self, scope_id: &str, event: Event) {
+    fn enqueue(&self, scope_id: &str, trigger: AgentTrigger) {
         let mut pending = self.pending_triggers.lock().expect("pending poisoned");
         if pending
             .values()
-            .any(|queue| queue.iter().any(|queued| queued.id == event.id))
+            .any(|queue| queue.iter().any(|queued| queued.id() == trigger.id()))
         {
             return;
         }
         let queue = pending.entry(scope_id.to_string()).or_default();
-        if is_priority_trigger(&event) {
+        if is_priority_trigger(&trigger) {
             let insert_at = queue
                 .iter()
                 .rposition(is_priority_trigger)
                 .map(|idx| idx + 1)
                 .unwrap_or(0);
-            queue.insert(insert_at, event);
+            queue.insert(insert_at, trigger);
         } else {
-            queue.push_back(event);
+            queue.push_back(trigger);
         }
     }
 
-    fn has_pending_event(&self, event_id: &str) -> bool {
+    fn has_pending_source(&self, source_id: &str) -> bool {
         self.pending_triggers
             .lock()
             .expect("pending poisoned")
             .values()
-            .any(|queue| queue.iter().any(|event| event.id == event_id))
+            .any(|queue| queue.iter().any(|trigger| trigger.id() == source_id))
     }
 
-    fn has_active_trigger(&self, event_id: &str) -> bool {
+    fn has_active_trigger(&self, source_id: &str) -> bool {
         self.active_turns
             .lock()
             .expect("active_turns poisoned")
             .values()
-            .any(|turn| turn.trigger_event_id == event_id)
+            .any(|turn| turn.trigger_source_id == source_id)
     }
 
     fn push_text(&self, turn_id: &str, chunk: &str) {
@@ -1257,27 +1371,27 @@ impl WorkerState {
             .insert(scope_id.to_string())
     }
 
-    fn record_action_request(&self, event_id: String, request_id: String) {
+    fn record_action_request(&self, message_id: String, request_id: String) {
         self.action_map
             .lock()
             .expect("action_map poisoned")
-            .insert(event_id, request_id);
+            .insert(message_id, request_id);
     }
 
-    fn lookup_action_request(&self, event_id: &str) -> Option<String> {
+    fn lookup_action_request(&self, message_id: &str) -> Option<String> {
         self.action_map
             .lock()
             .expect("action_map poisoned")
-            .get(event_id)
+            .get(message_id)
             .cloned()
     }
 
-    fn forget_action_request(&self, event_id: &str) {
+    fn forget_action_request(&self, message_id: &str) {
         let _ = self
             .action_map
             .lock()
             .expect("action_map poisoned")
-            .remove(event_id);
+            .remove(message_id);
     }
 
     fn current_model(&self) -> Option<String> {
@@ -1336,46 +1450,47 @@ impl WorkerState {
         Ok(())
     }
 
-    fn record_model_action_request(&self, event_id: String, request: ModelActionRequest) {
+    fn record_model_action_request(&self, message_id: String, request: ModelActionRequest) {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .insert(event_id, request);
+            .insert(message_id, request);
     }
 
-    fn lookup_model_action_request(&self, event_id: &str) -> Option<ModelActionRequest> {
+    fn lookup_model_action_request(&self, message_id: &str) -> Option<ModelActionRequest> {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .get(event_id)
+            .get(message_id)
             .cloned()
     }
 
-    fn is_model_action_request(&self, event_id: &str) -> bool {
+    fn is_model_action_request(&self, message_id: &str) -> bool {
         self.model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .contains_key(event_id)
+            .contains_key(message_id)
     }
 
-    fn forget_model_action_request(&self, event_id: &str) {
+    fn forget_model_action_request(&self, message_id: &str) {
         let _ = self
             .model_action_map
             .lock()
             .expect("model_action_map poisoned")
-            .remove(event_id);
+            .remove(message_id);
     }
 
-    fn remember_event(&self, event_id: &str) -> bool {
-        self.seen_events
+    fn remember_source(&self, source_id: &str) -> bool {
+        self.seen_sources
             .lock()
-            .expect("seen_events poisoned")
-            .insert(event_id.to_string())
+            .expect("seen_sources poisoned")
+            .insert(source_id.to_string())
     }
 }
 
-fn is_priority_trigger(event: &Event) -> bool {
-    event.actor_id.starts_with("actor_human_") || matches!(event.scope.kind, ScopeKind::Channel)
+fn is_priority_trigger(trigger: &AgentTrigger) -> bool {
+    trigger.actor_id().starts_with("actor_human_")
+        || matches!(trigger.scope().kind, ScopeKind::Channel)
 }
 
 fn model_state_path(profile_dir: &Path) -> PathBuf {
@@ -1524,6 +1639,7 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     client
         .open_connection_as(&actor_id, actor_kind, Some(&display_name))
         .await?;
+    let agent_config_version_id = publish_runtime_agent_config(&client, &actor_id, &spec).await?;
     eprintln!(
         "[{actor_id}] connected to {server_url} as {:?}",
         spec.actor.kind
@@ -1532,16 +1648,17 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     let agent_server_url = agent_child_server_url(&server_url);
     if agent_server_url != server_url {
         eprintln!(
-            "[{actor_id}] injecting JOI_SERVER={} for child agents (agent-client connected via {})",
+            "[{actor_id}] injecting LOOM_SERVER={} for child agents (agent-client connected via {})",
             agent_server_url, server_url
         );
     }
-    let state = Arc::new(WorkerState::new(
+    let state = Arc::new(WorkerState::new_with_agent_config_version(
         actor_id.clone(),
         spec.clone(),
         paths.profile.clone(),
         paths.clone(),
         agent_server_url.clone(),
+        agent_config_version_id,
     ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
     let adapter = build_adapter(&spec, &paths, &bundle_paths, &agent_server_url)?;
@@ -1567,6 +1684,73 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     result
 }
 
+async fn publish_runtime_agent_config(
+    client: &Client,
+    actor_id: &str,
+    spec: &AgentSpec,
+) -> Result<String> {
+    let spec_json = serde_json::to_value(spec).context("serialize agent spec")?;
+    let spec_bytes = serde_json::to_vec(spec).context("serialize agent spec for hash")?;
+    let mut hasher = Sha256::new();
+    hasher.update(&spec_bytes);
+    let spec_hash = format!("{:x}", hasher.finalize());
+    let version = format!("runtime-{}", &spec_hash[..12]);
+    let prompt = spec
+        .prompt_template
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize prompt template")?
+        .unwrap_or_default();
+    let model = default_model_for_spec(spec)
+        .or_else(|| spec.transport.model.clone())
+        .unwrap_or_default();
+    let capabilities = spec
+        .actor
+        .capabilities
+        .as_ref()
+        .and_then(|value| value.get("capabilities"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let published: AgentConfigPublishResult = client
+        .call(
+            method::AGENT_CONFIG_PUBLISH,
+            json!({
+                "actorId": actor_id,
+                "version": version,
+                "prompt": prompt,
+                "model": model,
+                "adapter": spec.transport.kind,
+                "tools": spec_json,
+                "capabilityTags": capabilities,
+                "metadata": {
+                    "source": "loom-daemon",
+                    "specHash": format!("sha256:{spec_hash}"),
+                }
+            }),
+        )
+        .await
+        .with_context(|| format!("agent_config.publish for {actor_id}"))?;
+    let activated: AgentConfigActivateResult = client
+        .call(
+            method::AGENT_CONFIG_ACTIVATE,
+            json!({
+                "actorId": actor_id,
+                "versionId": published.version.id,
+            }),
+        )
+        .await
+        .with_context(|| format!("agent_config.activate for {actor_id}"))?;
+    Ok(activated.version.id)
+}
+
 fn build_adapter(
     spec: &AgentSpec,
     paths: &AgentPaths,
@@ -1581,13 +1765,19 @@ fn build_adapter(
         .collect();
     let mut command_env = spec.transport.env.clone();
     process_env
-        .entry("JOI_SERVER".into())
+        .entry("LOOM_SERVER".into())
         .or_insert_with(|| server_url.to_string());
     command_env
-        .entry("JOI_SERVER".into())
+        .entry("LOOM_SERVER".into())
         .or_insert_with(|| server_url.to_string());
     if let Some(socket) = daemon_ipc::env_socket_path() {
         let socket = socket.display().to_string();
+        process_env
+            .entry("LOOM_DAEMON_SOCKET".into())
+            .or_insert_with(|| socket.clone());
+        command_env
+            .entry("LOOM_DAEMON_SOCKET".into())
+            .or_insert_with(|| socket.clone());
         process_env
             .entry(daemon_ipc::ENV_DAEMON_SOCKET.into())
             .or_insert_with(|| socket.clone());
@@ -1596,35 +1786,35 @@ fn build_adapter(
             .or_insert(socket);
     }
     process_env
-        .entry("JOI_ACTOR".into())
+        .entry("LOOM_ACTOR".into())
         .or_insert_with(|| spec.actor.id.clone());
     command_env
-        .entry("JOI_ACTOR".into())
+        .entry("LOOM_ACTOR".into())
         .or_insert_with(|| spec.actor.id.clone());
     process_env
-        .entry("JOI_AGENT_PROFILE".into())
+        .entry("LOOM_AGENT_PROFILE".into())
         .or_insert_with(|| paths.profile.display().to_string());
     command_env
-        .entry("JOI_AGENT_PROFILE".into())
+        .entry("LOOM_AGENT_PROFILE".into())
         .or_insert_with(|| paths.profile.display().to_string());
     process_env
-        .entry("JOI_AGENT_BUNDLE_ROOT".into())
+        .entry("LOOM_AGENT_BUNDLE_ROOT".into())
         .or_insert_with(|| bundle_paths.root.display().to_string());
     command_env
-        .entry("JOI_AGENT_BUNDLE_ROOT".into())
+        .entry("LOOM_AGENT_BUNDLE_ROOT".into())
         .or_insert_with(|| bundle_paths.root.display().to_string());
     process_env
-        .entry("JOI_AGENT_BUNDLE_DIR".into())
+        .entry("LOOM_AGENT_BUNDLE_DIR".into())
         .or_insert_with(|| bundle_paths.current.display().to_string());
     command_env
-        .entry("JOI_AGENT_BUNDLE_DIR".into())
+        .entry("LOOM_AGENT_BUNDLE_DIR".into())
         .or_insert_with(|| bundle_paths.current.display().to_string());
     if !bundle_paths.version.is_empty() {
         process_env
-            .entry("JOI_AGENT_BUNDLE_VERSION".into())
+            .entry("LOOM_AGENT_BUNDLE_VERSION".into())
             .or_insert_with(|| bundle_paths.version.clone());
         command_env
-            .entry("JOI_AGENT_BUNDLE_VERSION".into())
+            .entry("LOOM_AGENT_BUNDLE_VERSION".into())
             .or_insert_with(|| bundle_paths.version.clone());
     }
     insert_static_local_time_env(&mut process_env);
@@ -1638,9 +1828,9 @@ fn build_adapter(
 
     match spec.transport.kind.as_str() {
         "acp_stdio" => {
-            let joi_binary = current_joi_binary();
+            let loom_binary = current_loom_binary();
             let mcp_servers = agent_runtime::build_mcp_servers(
-                joi_binary.as_deref(),
+                loom_binary.as_deref(),
                 &spec.actor.id,
                 &paths.profile,
                 spec.memory.as_ref(),
@@ -1708,7 +1898,7 @@ async fn notification_loop(
     loop {
         // Drain pending notifications. We pop them one by one and dispatch
         // each on its own; the borrow on `notifications` is released between
-        // iterations so nested RPC calls (turn/open, event/append) can use the
+        // iterations so nested RPC calls (run.open, message.send) can use the
         // same Client without deadlock.
         let next = tokio::select! {
             _ = inbox_poll.tick() => {
@@ -1738,201 +1928,83 @@ async fn notification_loop(
             continue;
         }
         let Some(params) = n.params else { continue };
-        if params.get("kind").and_then(|v| v.as_str()) != Some(stream_kind::EVENT_CREATED) {
-            continue;
-        }
-        let Some(event_value) = params.get("data").and_then(|d| d.get("event")).cloned() else {
+        let Some(kind) = params.get("kind").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Ok(event) = serde_json::from_value::<Event>(event_value) else {
-            continue;
-        };
-        if !state.remember_event(&event.id) {
-            continue;
-        }
-        if event.kind == "action.response" {
-            if let Err(e) = handle_action_response(&client, &state, &adapter, &event).await {
-                eprintln!("[{actor_id}] failed to handle action.response: {e}");
-            } else if let Err(e) = record_delivery_seen(&client, &state, &event).await {
-                tracing::warn!(
-                    actor = %actor_id,
-                    event = %event.id,
-                    %e,
-                    "failed to record delivery receipt for action.response"
-                );
+        if kind == stream_kind::MESSAGE_CREATED {
+            let Some(message_value) = params.get("data").and_then(|d| d.get("message")).cloned()
+            else {
+                continue;
+            };
+            let Ok(message) = serde_json::from_value::<Message>(message_value) else {
+                continue;
+            };
+            if !state.remember_source(&message.id) {
+                continue;
             }
-            continue;
-        }
-        if event.kind == "turn.close" && is_for_us(&event, actor_id) {
-            if let Err(e) = handle_turn_close(&client, &state, &adapter, &event).await {
-                eprintln!("[{actor_id}] failed to handle turn.close: {e}");
-            } else if let Err(e) = record_delivery_seen(&client, &state, &event).await {
-                tracing::warn!(
-                    actor = %actor_id,
-                    event = %event.id,
-                    %e,
-                    "failed to record delivery receipt for turn.close"
-                );
+            if !is_message_for_us(&message, actor_id) {
+                continue;
             }
-            continue;
-        }
-        if !is_for_us(&event, actor_id) {
-            continue;
-        }
-
-        match handle_control_command(&client, &state, &adapter, &event_tx, &mut started, &event)
-            .await
-        {
-            Ok(true) => {
-                if let Err(e) = record_delivery_seen(&client, &state, &event).await {
+            if message.metadata.get("kind").and_then(Value::as_str) == Some("action.response") {
+                if let Err(e) =
+                    handle_action_response_message(&client, &state, &adapter, &message).await
+                {
+                    eprintln!("[{actor_id}] failed to handle action.response message: {e}");
+                } else if let Err(e) =
+                    record_delivery_seen_by_id(&client, actor_id, &message.id).await
+                {
                     tracing::warn!(
                         actor = %actor_id,
-                        event = %event.id,
+                        message = %message.id,
                         %e,
-                        "failed to record delivery receipt for control command"
+                        "failed to record delivery ack for action.response message"
                     );
                 }
                 continue;
             }
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("[{actor_id}] failed to handle control command: {e}");
-                continue;
+            match handle_message_trigger(
+                &client,
+                &state,
+                &adapter,
+                &event_tx,
+                &mut started,
+                actor_id,
+                message,
+            )
+            .await
+            {
+                Ok(TriggerOutcome::Dispatched) => {}
+                Ok(TriggerOutcome::Queued) => {}
+                Err(e) => eprintln!("[{actor_id}] failed to handle message trigger: {e}"),
             }
-        }
-
-        // Lazy start the adapter on first hands_off_to event.
-        if !started {
-            eprintln!(
-                "[{actor_id}] starting adapter (first hand-off; ACP cold-start \
-                 can take 30-60s while the agent refreshes its model registry)…"
-            );
-            if let Err(e) = adapter.start(event_tx.clone()).await {
-                eprintln!("[{actor_id}] adapter start failed: {e}");
-                continue;
-            }
-            started = true;
-            eprintln!("[{actor_id}] adapter ready");
-        }
-
-        match handle_handoff(&client, &state, &adapter, &event).await {
-            Ok(HandoffOutcome::Dispatched) => {}
-            Ok(HandoffOutcome::Queued) => {}
-            Err(e) => eprintln!("[{actor_id}] failed to handle handoff: {e}"),
-        }
-    }
-}
-
-async fn handle_action_response(
-    client: &Arc<Client>,
-    state: &Arc<WorkerState>,
-    adapter: &Arc<dyn Adapter>,
-    event: &Event,
-) -> Result<()> {
-    let mut saw_response_relation = false;
-    for relation in &event.relations {
-        if !matches!(relation.kind, RelationKind::RespondsTo)
-            || relation.target.kind != RefKind::Event
-        {
             continue;
         }
-        saw_response_relation = true;
-        let request_event_id = relation.target.id.as_str();
-        let echoed_request_id = action_request_id_from_response(event);
-        if echoed_request_id
-            .as_deref()
-            .is_some_and(is_joi_tool_request_id)
-        {
-            eprintln!(
-                "[{}] action.response {} is for a joi human-interaction tool {}; leaving it for the waiting tool process",
-                state.actor_id, event.id, request_event_id
-            );
-            return Ok(());
-        }
-        if state.is_model_action_request(request_event_id)
-            || echoed_request_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("joi:model:"))
-        {
-            handle_model_action_response(client, state, adapter, event, request_event_id).await?;
-            return Ok(());
-        }
-        let request_id = match state.lookup_action_request(request_event_id) {
-            Some(id) => id,
-            None => match echoed_request_id {
-                Some(id) => {
-                    eprintln!(
-                        "[{}] action.response {} used echoed ACP request id for {}",
-                        state.actor_id, event.id, request_event_id
-                    );
-                    id
-                }
-                None => {
-                    eprintln!(
-                        "[{}] action.response {} ignored: no pending ACP request for {} \
-                         (joi daemon may have restarted after the action.request)",
-                        state.actor_id, event.id, request_event_id
-                    );
-                    continue;
-                }
-            },
-        };
-        let option_id = event
-            .payload
-            .get("optionId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if option_id.is_empty() {
-            eprintln!(
-                "[{}] action.response {} ignored: missing payload.optionId",
-                state.actor_id, event.id
-            );
-            return Ok(());
-        }
-        eprintln!(
-            "[{}] action.response {} -> ACP request {} option {}",
-            state.actor_id, event.id, request_id, option_id
-        );
-        adapter
-            .respond_action(request_id.clone(), option_id)
-            .await
-            .map_err(|e| anyhow!("adapter respond_action failed: {e}"))?;
-        state.forget_action_request(request_event_id);
-        return Ok(());
     }
-    if !saw_response_relation {
-        eprintln!(
-            "[{}] action.response {} ignored: missing responds_to relation",
-            state.actor_id, event.id
-        );
-    }
-    Ok(())
 }
 
-fn action_request_id_from_response(event: &Event) -> Option<String> {
-    event
-        .payload
+fn action_request_id_from_message(message: &Message) -> Option<String> {
+    message
+        .metadata
         .get("requestId")
-        .or_else(|| event.payload.get("actionId"))
+        .or_else(|| message.metadata.get("actionId"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
 }
 
-fn is_joi_tool_request_id(id: &str) -> bool {
-    id.starts_with("joi:question:") || id.starts_with("joi:approval:")
+fn is_loom_tool_request_id(id: &str) -> bool {
+    id.starts_with("loom:question:") || id.starts_with("loom:approval:")
 }
 
-async fn handle_model_action_response(
+async fn handle_model_action_response_message(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
-    event: &Event,
-    request_event_id: &str,
+    message: &Message,
+    request_message_id: &str,
 ) -> Result<()> {
-    let option_id = event
-        .payload
+    let option_id = message
+        .metadata
         .get("optionId")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -1940,14 +2012,14 @@ async fn handle_model_action_response(
         .to_string();
     if option_id.is_empty() {
         eprintln!(
-            "[{}] model action.response {} ignored: missing payload.optionId",
-            state.actor_id, event.id
+            "[{}] model action.response message {} ignored: missing metadata.optionId",
+            state.actor_id, message.id
         );
         return Ok(());
     }
 
     let request = state
-        .lookup_model_action_request(request_event_id)
+        .lookup_model_action_request(request_message_id)
         .unwrap_or_else(|| ModelActionRequest {
             source: ModelActionSource::Spec,
             choices: state.model_choices(),
@@ -1962,45 +2034,44 @@ async fn handle_model_action_response(
 
     let Some(choice) = choice else {
         eprintln!(
-            "[{}] model action.response {} ignored: unknown model `{}`",
-            state.actor_id, event.id, option_id
+            "[{}] model action.response message {} ignored: unknown model `{}`",
+            state.actor_id, message.id, option_id
         );
-        state.forget_model_action_request(request_event_id);
+        state.forget_model_action_request(request_message_id);
         return Ok(());
     };
 
     if let Err(err) =
-        apply_model_selection(state, adapter, event, &request.source, &option_id).await
+        apply_model_selection_for_scope(state, adapter, &message.scope, &request.source, &option_id)
+            .await
     {
-        state.forget_model_action_request(request_event_id);
-        append_model_selection_failure(client, state, event, &choice, &option_id, &err).await?;
+        state.forget_model_action_request(request_message_id);
+        append_model_selection_failure_message(client, state, message, &choice, &option_id, &err)
+            .await?;
         eprintln!(
             "[{}] failed to select model `{}` via {}: {}",
-            state.actor_id, option_id, event.id, err
+            state.actor_id, option_id, message.id, err
         );
         return Ok(());
     }
-    state.forget_model_action_request(request_event_id);
+    state.forget_model_action_request(request_message_id);
 
     let label = model_choice_label(&choice);
     let text = model_selection_success_text(&request.source, label, &option_id);
-    append_event(
+    send_scope_message(
         client,
-        "content.add",
-        &state.actor_id,
-        &event.scope,
-        None,
-        json!({
-            "contentType": "text/markdown",
-            "text": text
-        }),
-        vec![responds_to(&event.id)],
-        None,
+        &message.scope,
+        text,
+        Some(message.id.clone()),
+        Some(message.author_actor_id.clone()),
+        MessageIntent::StatusUpdate,
+        DeliveryPolicy::NotifyOnly,
+        Meta::default(),
     )
     .await?;
     eprintln!(
         "[{}] selected model `{}` via {}",
-        state.actor_id, option_id, event.id
+        state.actor_id, option_id, message.id
     );
     Ok(())
 }
@@ -2015,15 +2086,15 @@ fn model_selection_success_text(
             "Model set to `{label}` (`{option_id}`). It has been applied to the current ACP session and saved for future sessions."
         ),
         ModelActionSource::Spec => format!(
-            "Model set to `{label}` (`{option_id}`). It is saved for this agent and will be used when Joi creates a new ACP session."
+            "Model set to `{label}` (`{option_id}`). It is saved for this agent and will be used when Loom creates a new ACP session."
         ),
     }
 }
 
-async fn apply_model_selection(
+async fn apply_model_selection_for_scope(
     state: &WorkerState,
     adapter: &Arc<dyn Adapter>,
-    event: &Event,
+    scope: &ScopeRef,
     source: &ModelActionSource,
     option_id: &str,
 ) -> Result<()> {
@@ -2033,11 +2104,7 @@ async fn apply_model_selection(
         }
         ModelActionSource::Adapter { config_id } => {
             adapter
-                .set_model_option(
-                    event.scope.clone(),
-                    config_id.clone(),
-                    option_id.to_string(),
-                )
+                .set_model_option(scope.clone(), config_id.clone(), option_id.to_string())
                 .await
                 .map_err(|err| anyhow!("ACP session/set_config_option failed: {err}"))?;
             state.set_current_model_unchecked(option_id.to_string())?;
@@ -2046,83 +2113,170 @@ async fn apply_model_selection(
     Ok(())
 }
 
-async fn append_model_selection_failure(
+async fn append_model_selection_failure_message(
     client: &Arc<Client>,
-    state: &WorkerState,
-    event: &Event,
+    _state: &WorkerState,
+    message: &Message,
     choice: &AgentModelChoice,
     option_id: &str,
     err: &anyhow::Error,
 ) -> Result<()> {
     let label = model_choice_label(choice);
-    append_event(
+    send_scope_message(
         client,
-        "content.add",
-        &state.actor_id,
-        &event.scope,
-        None,
-        json!({
-            "contentType": "text/markdown",
-            "text": format!("Failed to set model `{label}` (`{option_id}`): `{err}`.")
-        }),
-        vec![responds_to(&event.id)],
-        None,
+        &message.scope,
+        format!("Failed to set model `{label}` (`{option_id}`): `{err}`."),
+        Some(message.id.clone()),
+        Some(message.author_actor_id.clone()),
+        MessageIntent::StatusUpdate,
+        DeliveryPolicy::NotifyOnly,
+        Meta::default(),
     )
-    .await?;
-    Ok(())
+    .await
+    .map(|_| ())
 }
 
-async fn handle_turn_close(
-    _client: &Arc<Client>,
-    state: &Arc<WorkerState>,
-    adapter: &Arc<dyn Adapter>,
-    event: &Event,
-) -> Result<()> {
-    if event.payload.get("status").and_then(|v| v.as_str()) != Some("cancelled") {
-        return Ok(());
-    }
-    let Some(turn_id) = event.turn_id.as_deref() else {
-        return Ok(());
-    };
-    let Some(active) = state.current_turn(&event.scope.id) else {
-        return Ok(());
-    };
-    if active.id != turn_id {
-        return Ok(());
-    }
-    let active = state
-        .mark_cancel_requested(&event.scope.id, turn_id)
-        .unwrap_or(active);
-
-    if let Err(e) = adapter.cancel(active.scope.clone()).await {
-        tracing::warn!(
-            actor = %state.actor_id,
-            turn = %active.id,
-            scope = %active.scope.id,
-            %e,
-            "adapter cancel failed",
-        );
-    }
-    if state.take_text(&active.id).is_some() {
-        tracing::debug!(
-            actor = %state.actor_id,
-            turn = %active.id,
-            scope = %active.scope.id,
-            "discarding buffered text from cancelled turn"
-        );
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn is_for_us(event: &Event, actor_id: &str) -> bool {
-    // Self-authored handoffs are still explicit routing signals. They are not
+    // Self-authored directed events are still explicit routing signals. They are not
     // the normal way to enter a thread, but generated callbacks or deliberate
     // follow-up turns must not be filtered out just because author == target.
     event.relations.iter().any(|r| {
-        matches!(r.kind, RelationKind::HandsOffTo)
+        matches!(r.kind, RelationKind::DirectedTo)
             && r.target.kind == RefKind::Actor
             && r.target.id == actor_id
     })
+}
+
+fn is_message_for_us(message: &Message, actor_id: &str) -> bool {
+    if message.author_actor_id == actor_id {
+        return false;
+    }
+    if message.target == format!("dm:@{actor_id}") {
+        return true;
+    }
+    message.audience.iter().any(|audience| match audience.kind {
+        AudienceKind::Actor => audience.id == actor_id,
+        AudienceKind::Agents => message.delivery_policy == DeliveryPolicy::WakeAgent,
+        AudienceKind::All | AudienceKind::Humans | AudienceKind::Group => false,
+    })
+}
+
+async fn handle_message_trigger(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
+    actor_id: &str,
+    message: Message,
+) -> Result<TriggerOutcome> {
+    let trigger = AgentTrigger::Message(message);
+    match handle_control_command(client, state, adapter, event_tx, started, &trigger).await {
+        Ok(true) => {
+            record_delivery_seen_by_id(client, actor_id, trigger.id()).await?;
+            return Ok(TriggerOutcome::Dispatched);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            record_delivery_seen_by_id(client, actor_id, trigger.id()).await?;
+            return Err(e);
+        }
+    }
+    if let Some(err) = try_ensure_adapter_started(state, adapter, event_tx, started).await {
+        return Err(anyhow!(
+            "adapter start failed while handling message trigger: {err}"
+        ));
+    }
+    handle_trigger(client, state, adapter, trigger).await
+}
+
+async fn handle_action_response_message(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    message: &Message,
+) -> Result<()> {
+    let request_message_id = message
+        .parent_message_id
+        .as_deref()
+        .or_else(|| {
+            message
+                .metadata
+                .get("requestMessageId")
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty());
+    let Some(request_message_id) = request_message_id else {
+        eprintln!(
+            "[{}] action.response message {} ignored: missing parentMessageId",
+            state.actor_id, message.id
+        );
+        return Ok(());
+    };
+    let echoed_request_id = action_request_id_from_message(message);
+    if echoed_request_id
+        .as_deref()
+        .is_some_and(is_loom_tool_request_id)
+    {
+        eprintln!(
+            "[{}] action.response message {} is for a loom human-interaction tool {}; leaving it for the waiting tool process",
+            state.actor_id, message.id, request_message_id
+        );
+        return Ok(());
+    }
+    if state.is_model_action_request(request_message_id)
+        || echoed_request_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("loom:model:"))
+    {
+        handle_model_action_response_message(client, state, adapter, message, request_message_id)
+            .await?;
+        return Ok(());
+    }
+    let request_id = match state.lookup_action_request(request_message_id) {
+        Some(id) => id,
+        None => match echoed_request_id {
+            Some(id) => {
+                eprintln!(
+                    "[{}] action.response message {} used echoed ACP request id for {}",
+                    state.actor_id, message.id, request_message_id
+                );
+                id
+            }
+            None => {
+                eprintln!(
+                    "[{}] action.response message {} ignored: no pending ACP request for {} \
+                     (loom-daemon may have restarted after the action.request)",
+                    state.actor_id, message.id, request_message_id
+                );
+                return Ok(());
+            }
+        },
+    };
+    let option_id = message
+        .metadata
+        .get("optionId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if option_id.is_empty() {
+        eprintln!(
+            "[{}] action.response message {} ignored: missing metadata.optionId",
+            state.actor_id, message.id
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "[{}] action.response message {} -> ACP request {} option {}",
+        state.actor_id, message.id, request_id, option_id
+    );
+    adapter
+        .respond_action(request_id.clone(), option_id)
+        .await
+        .map_err(|e| anyhow!("adapter respond_action failed: {e}"))?;
+    state.forget_action_request(request_message_id);
+    Ok(())
 }
 
 async fn drain_pending_inbox(
@@ -2133,9 +2287,9 @@ async fn drain_pending_inbox(
     started: &mut bool,
     actor_id: &str,
 ) -> Result<()> {
-    let res: DeliveryListResult = client
+    let res: InboxListResult = client
         .call(
-            method::DELIVERY_LIST,
+            method::INBOX_LIST,
             json!({
                 "actorId": actor_id,
                 "state": "pending",
@@ -2149,72 +2303,56 @@ async fn drain_pending_inbox(
     let max_age = pending_inbox_max_age();
     let now = Utc::now();
     for entry in res.deliveries {
-        let event_id = entry.delivery.event_id.clone();
-        let Some(event) = entry.event else {
-            record_delivery_seen_by_id(client, actor_id, &event_id).await?;
-            continue;
-        };
-        if !state.remember_event(&event.id) {
-            if state.has_pending_event(&event.id) {
+        let source_id = entry.delivery.source_id.clone();
+        if let Some(message) = entry.message {
+            if !state.remember_source(&message.id) {
+                if state.has_pending_source(&message.id) || state.has_active_trigger(&message.id) {
+                    continue;
+                }
+                tracing::warn!(
+                    actor = %actor_id,
+                    message = %message.id,
+                    "retrying pending message delivery that was seen but is no longer active or queued"
+                );
+            }
+            let too_old = now.signed_duration_since(message.created_at) > max_age;
+            if too_old {
+                tracing::info!(
+                    actor = %actor_id,
+                    message = %message.id,
+                    created_at = %message.created_at,
+                    "dropping stale pending message delivery from durable inbox"
+                );
+                record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            if state.has_active_trigger(&event.id) {
+            if entry.delivery.actor_id != actor_id && !is_message_for_us(&message, actor_id) {
+                record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            tracing::warn!(
-                actor = %actor_id,
-                event = %event.id,
-                "retrying pending delivery that was seen but is no longer active or queued"
-            );
-        }
-        let too_old = now.signed_duration_since(event.occurred_at) > max_age;
-        if too_old {
-            tracing::info!(
-                actor = %actor_id,
-                event = %event.id,
-                occurred_at = %event.occurred_at,
-                "dropping stale pending delivery from durable inbox"
-            );
-            record_delivery_seen(client, state, &event).await?;
-            continue;
-        }
-        if event.kind == "action.response" {
-            handle_action_response(client, state, adapter, &event).await?;
-            record_delivery_seen(client, state, &event).await?;
-            continue;
-        }
-        if event.kind == "turn.close" && is_for_us(&event, actor_id) {
-            handle_turn_close(client, state, adapter, &event).await?;
-            record_delivery_seen(client, state, &event).await?;
-            continue;
-        }
-        if !is_for_us(&event, actor_id) {
-            record_delivery_seen(client, state, &event).await?;
-            continue;
-        }
-        match handle_control_command(client, state, adapter, event_tx, started, &event).await {
-            Ok(true) => {
-                record_delivery_seen(client, state, &event).await?;
+            if message.metadata.get("kind").and_then(Value::as_str) == Some("action.response") {
+                handle_action_response_message(client, state, adapter, &message).await?;
+                record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            Ok(false) => {}
-            Err(e) => {
-                record_delivery_seen(client, state, &event).await?;
-                return Err(e);
-            }
+            let _ = handle_message_trigger(
+                client, state, adapter, event_tx, started, actor_id, message,
+            )
+            .await?;
+            continue;
         }
-        if let Some(err) = try_ensure_adapter_started(state, adapter, event_tx, started).await {
-            return Err(anyhow!(
-                "adapter start failed while draining pending inbox: {err}"
-            ));
-        }
-        let _ = handle_handoff(client, state, adapter, &event).await?;
+        tracing::warn!(
+            actor = %actor_id,
+            source = %source_id,
+            "acknowledging inbox delivery whose source is no longer a message"
+        );
+        record_delivery_seen_by_id(client, actor_id, &source_id).await?;
     }
     Ok(())
 }
 
 fn pending_inbox_max_age() -> chrono::Duration {
-    let secs = std::env::var("JOI_AGENT_PENDING_MAX_AGE_SECS")
+    let secs = std::env::var("LOOM_AGENT_PENDING_MAX_AGE_SECS")
         .ok()
         .and_then(|raw| raw.trim().parse::<i64>().ok())
         .filter(|secs| *secs > 0)
@@ -2225,23 +2363,22 @@ fn pending_inbox_max_age() -> chrono::Duration {
 async fn record_delivery_seen(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    event: &Event,
+    trigger: &AgentTrigger,
 ) -> Result<()> {
-    record_delivery_seen_by_id(client, &state.actor_id, &event.id).await
+    record_delivery_seen_by_id(client, &state.actor_id, trigger.id()).await
 }
 
 async fn record_delivery_seen_by_id(
     client: &Arc<Client>,
     actor_id: &str,
-    event_id: &str,
+    source_id: &str,
 ) -> Result<()> {
     let _: Value = client
         .call(
-            method::RECEIPT_RECORD,
+            method::DELIVERY_ACK,
             json!({
-                "eventId": event_id,
                 "actorId": actor_id,
-                "kind": ReceiptKind::Seen,
+                "sourceId": source_id,
             }),
         )
         .await?;
@@ -2254,8 +2391,17 @@ async fn handle_control_command(
     adapter: &Arc<dyn Adapter>,
     event_tx: &mpsc::UnboundedSender<AdapterEvent>,
     started: &mut bool,
-    trigger: &Event,
+    trigger: &AgentTrigger,
 ) -> Result<bool> {
+    match trigger {
+        AgentTrigger::Message(message) => {
+            if handle_run_cancel_message(state, adapter, message).await? {
+                return Ok(true);
+            }
+        }
+        #[cfg(test)]
+        AgentTrigger::Event(_) => {}
+    }
     match render_prompt(trigger).trim() {
         "/model" | "/models" => {
             let adapter_start_error =
@@ -2265,6 +2411,52 @@ async fn handle_control_command(
         }
         _ => Ok(false),
     }
+}
+
+async fn handle_run_cancel_message(
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    message: &Message,
+) -> Result<bool> {
+    if message.metadata.get("kind").and_then(Value::as_str) != Some("run.cancel") {
+        return Ok(false);
+    }
+    let Some(run_id) = message.metadata.get("runId").and_then(Value::as_str) else {
+        tracing::warn!(
+            actor = %state.actor_id,
+            message = %message.id,
+            "run.cancel message missing runId"
+        );
+        return Ok(true);
+    };
+    let Some(active) = state.current_turn(&message.scope.id) else {
+        return Ok(true);
+    };
+    if active.run_id != run_id {
+        return Ok(true);
+    }
+    let active = state
+        .mark_cancel_requested(&message.scope.id, run_id)
+        .unwrap_or(active);
+
+    if let Err(e) = adapter.cancel(active.scope.clone()).await {
+        tracing::warn!(
+            actor = %state.actor_id,
+            run = %active.run_id,
+            scope = %active.scope.id,
+            %e,
+            "adapter cancel failed",
+        );
+    }
+    if state.take_text(&active.id).is_some() {
+        tracing::debug!(
+            actor = %state.actor_id,
+            run = %active.run_id,
+            scope = %active.scope.id,
+            "discarding buffered text from canceled run"
+        );
+    }
+    Ok(true)
 }
 
 async fn try_ensure_adapter_started(
@@ -2300,12 +2492,13 @@ async fn open_model_picker(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
-    trigger: &Event,
+    trigger: &AgentTrigger,
     adapter_start_error: Option<String>,
 ) -> Result<()> {
     let mut adapter_error = adapter_start_error;
     let adapter_options = if adapter_error.is_none() {
-        match build_adapter_prompt(client, state, &trigger.scope, String::new(), None, None).await {
+        match build_adapter_prompt(client, state, trigger.scope(), String::new(), None, None).await
+        {
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
                 Err(err) => {
@@ -2332,18 +2525,15 @@ async fn open_model_picker(
         if let Some(err) = adapter_error {
             text.push_str(&format!("\n\nACP model lookup failed: `{err}`"));
         }
-        append_event(
+        send_scope_message(
             client,
-            "content.add",
-            &state.actor_id,
-            &trigger.scope,
-            None,
-            json!({
-                "contentType": "text/markdown",
-                "text": text
-            }),
-            vec![responds_to(&trigger.id)],
-            None,
+            trigger.scope(),
+            text,
+            trigger.is_message().then(|| trigger.id().to_string()),
+            Some(trigger.actor_id().to_string()),
+            MessageIntent::StatusUpdate,
+            DeliveryPolicy::NotifyOnly,
+            Meta::default(),
         )
         .await?;
         return Ok(());
@@ -2361,43 +2551,32 @@ async fn open_model_picker(
         .collect::<Vec<_>>();
     let current_label = current.as_deref().unwrap_or("(none)");
     let payload = json!({
-        "requestId": format!("joi:model:{}", trigger.id),
-        "requestType": "joi.model.select",
+        "requestId": format!("loom:model:{}", trigger.id()),
+        "requestType": "loom.model.select",
         "title": format!("Choose model for @{}", state.actor_id),
         "description": format!(
             "Current model: {current_label}\n\n{source_description}"
         ),
         "choices": payload_choices,
     });
-    let appended = append_event(
+    let sent = send_action_request_message(
         client,
-        "action.request",
-        &state.actor_id,
-        &trigger.scope,
-        None,
+        trigger.scope(),
+        trigger.actor_id().to_string(),
         payload,
-        vec![
-            responds_to(&trigger.id),
-            Relation {
-                kind: RelationKind::HandsOffTo,
-                target: Ref {
-                    kind: RefKind::Actor,
-                    id: trigger.actor_id.clone(),
-                    _meta: None,
-                },
-                _meta: None,
-            },
-        ],
+        trigger.is_message().then(|| trigger.id().to_string()),
         None,
     )
     .await?;
     state.record_model_action_request(
-        appended.event.id.clone(),
+        sent.message.id.clone(),
         ModelActionRequest { source, choices },
     );
     eprintln!(
         "[{}] opened model picker {} for {}",
-        state.actor_id, appended.event.id, trigger.actor_id
+        state.actor_id,
+        sent.message.id,
+        trigger.actor_id()
     );
     Ok(())
 }
@@ -2435,90 +2614,86 @@ fn model_picker_choices(
         state.model_choices(),
         state.current_model(),
         ModelActionSource::Spec,
-        "These choices came from the runtime definition. The selected model is saved for this actor and used when Joi creates ACP sessions.",
+        "These choices came from the runtime definition. The selected model is saved for this actor and used when Loom creates ACP sessions.",
     )
 }
 
-fn responds_to(event_id: &str) -> Relation {
-    Relation {
-        kind: RelationKind::RespondsTo,
-        target: Ref {
-            kind: RefKind::Event,
-            id: event_id.to_string(),
-            _meta: None,
-        },
-        _meta: None,
-    }
-}
-
-enum HandoffOutcome {
+enum TriggerOutcome {
     Dispatched,
     Queued,
 }
 
-async fn handle_handoff(
+async fn handle_trigger(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
-    trigger: &Event,
-) -> Result<HandoffOutcome> {
+    trigger: AgentTrigger,
+) -> Result<TriggerOutcome> {
     let trigger = trigger.clone();
     // Scope FIFO: the same actor can handle independent scopes concurrently,
     // but prompts in one thread/channel remain ordered.
-    if state.current_turn(&trigger.scope.id).is_some() {
-        let scope_id = trigger.scope.id.clone();
+    if state.current_turn(&trigger.scope().id).is_some() {
+        let scope_id = trigger.scope().id.clone();
         state.enqueue(&scope_id, trigger);
-        return Ok(HandoffOutcome::Queued);
+        return Ok(TriggerOutcome::Queued);
     }
-    dispatch_handoff(client, state, adapter, trigger)
+    dispatch_trigger(client, state, adapter, trigger)
         .await
-        .map(|_| HandoffOutcome::Dispatched)
+        .map(|_| TriggerOutcome::Dispatched)
 }
 
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
-/// both the initial hand-off and the Finished handler when it pops the next
+/// both the initial trigger and the Finished handler when it pops the next
 /// queued trigger. On `send_prompt` failure we iteratively drain the queue
 /// (rather than spawn-recursing) so a single bad prompt can't strand the rest
 /// and the future stays Send for `tokio::spawn`.
-async fn dispatch_handoff(
+async fn dispatch_trigger(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
-    mut trigger: Event,
-) -> Result<Event> {
+    mut trigger: AgentTrigger,
+) -> Result<AgentTrigger> {
     loop {
-        subscribe_scope(client, state, &trigger.scope).await;
-        let turn_res: TurnOpenResult = client
+        subscribe_scope(client, state, trigger.scope()).await;
+        let run_res: RunOpenResult = client
             .call(
-                method::TURN_OPEN,
+                method::RUN_OPEN,
                 json!({
                     "actorId": state.actor_id,
-                    "scope": trigger.scope,
-                    "triggerEventId": trigger.id,
+                    "scope": trigger.scope(),
+                    "startReason": trigger.id(),
+                    "agentConfigVersionId": state.agent_config_version_id.clone(),
+                    "metadata": {
+                        "triggerSourceId": trigger.id(),
+                        "triggerIsMessage": trigger.is_message(),
+                    },
                 }),
             )
             .await?;
         let user_text = render_trigger_prompt(client, state, &trigger).await;
         let prompt = compose_envelope_prompt(client, state, &trigger, &user_text).await;
         let active = ActiveTurn {
-            id: turn_res.turn.id.clone(),
-            scope: trigger.scope.clone(),
-            trigger_event_id: trigger.id.clone(),
+            id: run_res.run.id.clone(),
+            run_id: run_res.run.id.clone(),
+            scope: trigger.scope().clone(),
+            trigger_source_id: trigger.id().to_string(),
+            trigger_is_message: trigger.is_message(),
+            reply_target: trigger.reply_target(),
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
-            trigger_actor: trigger.actor_id.clone(),
+            trigger_actor: trigger.actor_id().to_string(),
             cancel_requested: false,
         };
         state.set_turn(active.clone());
         mark_assignment_running_if_needed(client, state, &trigger).await;
-        if turn_started_ack_enabled() {
-            append_turn_started_ack(client, state, &active, &trigger).await;
+        if run_started_ack_enabled() {
+            append_run_started_ack(client, state, &active, &trigger).await;
         }
 
         let adapter_prompt = build_adapter_prompt(
             client,
             state,
-            &trigger.scope,
+            trigger.scope(),
             prompt.content,
             Some(&active),
             Some(&trigger),
@@ -2528,16 +2703,16 @@ async fn dispatch_handoff(
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(trigger),
             Err(e) => {
-                let _ = close_turn(client, &active.id, TurnStatus::Failed).await;
-                if let Err(receipt_err) = record_delivery_seen(client, state, &trigger).await {
+                let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
+                if let Err(ack_err) = record_delivery_seen(client, state, &trigger).await {
                     tracing::warn!(
                         actor = %state.actor_id,
-                        event = %trigger.id,
-                        %receipt_err,
-                        "failed to record delivery receipt for failed handoff dispatch"
+                        event = %trigger.id(),
+                        %ack_err,
+                        "failed to record delivery ack for failed trigger dispatch"
                     );
                 }
-                let scope_id = trigger.scope.id.clone();
+                let scope_id = trigger.scope().id.clone();
                 match state.clear_turn(&scope_id) {
                     Some(next) => {
                         tracing::warn!(
@@ -2561,7 +2736,7 @@ async fn build_adapter_prompt(
     scope: &ScopeRef,
     content: String,
     active: Option<&ActiveTurn>,
-    trigger: Option<&Event>,
+    trigger: Option<&AgentTrigger>,
 ) -> Result<AdapterPrompt> {
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
@@ -2606,20 +2781,31 @@ async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &Scop
     }
 }
 
-fn render_prompt(trigger: &Event) -> String {
-    if let Some(text) = trigger.payload.get("text").and_then(|v| v.as_str()) {
-        return text.to_string();
+fn render_prompt(trigger: &AgentTrigger) -> String {
+    match trigger {
+        AgentTrigger::Message(message) => {
+            if !message.body.is_empty() {
+                return message.body.clone();
+            }
+            serde_json::to_string(&message.metadata).unwrap_or_default()
+        }
+        #[cfg(test)]
+        AgentTrigger::Event(event) => {
+            if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+            if let Some(text) = event.payload.get("message").and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+            serde_json::to_string(&event.payload).unwrap_or_default()
+        }
     }
-    if let Some(text) = trigger.payload.get("message").and_then(|v| v.as_str()) {
-        return text.to_string();
-    }
-    serde_json::to_string(&trigger.payload).unwrap_or_default()
 }
 
 async fn render_trigger_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    trigger: &Event,
+    trigger: &AgentTrigger,
 ) -> String {
     let actor_names = actor_display_map_for_prompt(client, state).await;
     let mut prompt = render_trigger_prompt_with_names(
@@ -2665,43 +2851,49 @@ async fn actor_display_map_for_prompt(
 fn render_trigger_prompt_with_names(
     local_actor_id: &str,
     local_display_name: &str,
-    trigger: &Event,
+    trigger: &AgentTrigger,
     actor_names: &HashMap<String, String>,
 ) -> String {
     let text = annotate_actor_mentions(&render_prompt(trigger), actor_names);
-    let from = actor_label(&trigger.actor_id, actor_names);
+    let from = actor_label(trigger.actor_id(), actor_names);
     let me = actor_label_with_fallback(local_actor_id, local_display_name, actor_names);
-    let handoff_targets = handoff_target_ids(trigger);
-    let target_labels = handoff_targets
+    let delivery_targets = trigger_target_ids(trigger);
+    let target_labels = delivery_targets
         .iter()
         .map(|id| actor_label(id, actor_names))
         .collect::<Vec<_>>();
-    let delivery = if handoff_targets.iter().any(|id| id == local_actor_id) {
-        "explicit handoff to you"
-    } else if handoff_targets.is_empty() {
+    let delivery = if delivery_targets.iter().any(|id| id == local_actor_id) {
+        "explicit route to you"
+    } else if delivery_targets.is_empty() {
         "scope message"
     } else {
-        "explicit handoff to another actor"
+        "explicit route to another actor"
     };
     let visible = if target_labels.is_empty() {
         format!("{from}: {text}")
     } else {
-        format!("handoff -> {}: {text}", target_labels.join(", "))
+        format!("route -> {}: {text}", target_labels.join(", "))
     };
-    let scope_kind = scope_kind_name(trigger.scope.kind);
+    let scope = trigger.scope();
+    let scope_kind = scope_kind_name(scope.kind);
+    let source_label = if trigger.is_message() {
+        "Message id"
+    } else {
+        "Source id"
+    };
 
     let mut out = format!(
-        "=== Latest Joi message ===\n\
+        "=== Latest Loom message ===\n\
          Your actor: {me}\n\
          From: {from}\n\
          Scope: {scope_kind}:{scope_id}\n\
-         Event id: {event_id}\n\
+         {source_label}: {source_id}\n\
          Delivery: {delivery}\n",
-        scope_id = trigger.scope.id,
-        event_id = trigger.id,
+        scope_id = scope.id,
+        source_id = trigger.id(),
     );
     if !target_labels.is_empty() {
-        out.push_str("Handoff target(s): ");
+        out.push_str("Route target(s): ");
         out.push_str(&target_labels.join(", "));
         out.push('\n');
     }
@@ -2713,20 +2905,27 @@ fn render_trigger_prompt_with_names(
     out
 }
 
-fn trigger_task_context(trigger: &Event) -> Option<String> {
-    let meta = trigger
-        .payload
-        .get("_meta")
-        .and_then(|value| value.as_object())?;
-    let task_id = meta.get("taskId").and_then(|value| value.as_str())?;
+fn trigger_task_context(trigger: &AgentTrigger) -> Option<String> {
+    let task_id = trigger
+        .meta_value("taskId")
+        .and_then(|value| value.as_str())?;
     let mut out = format!("Task id: {task_id}\n");
-    if let Some(number) = meta.get("taskNumber").and_then(|value| value.as_u64()) {
+    if let Some(number) = trigger
+        .meta_value("taskNumber")
+        .and_then(|value| value.as_u64())
+    {
         out.push_str(&format!("Task number: #{number}\n"));
     }
-    if let Some(assignment_id) = meta.get("assignmentId").and_then(|value| value.as_str()) {
+    if let Some(assignment_id) = trigger
+        .meta_value("assignmentId")
+        .and_then(|value| value.as_str())
+    {
         out.push_str(&format!("Assignment id: {assignment_id}\n"));
     }
-    if let Some(expected) = meta.get("expectedOutput").and_then(|value| value.as_str()) {
+    if let Some(expected) = trigger
+        .meta_value("expectedOutput")
+        .and_then(|value| value.as_str())
+    {
         out.push_str("Expected output: ");
         out.push_str(expected);
         out.push('\n');
@@ -2734,12 +2933,12 @@ fn trigger_task_context(trigger: &Event) -> Option<String> {
     Some(out)
 }
 
-async fn assignment_context_for_prompt(client: &Arc<Client>, trigger: &Event) -> Option<String> {
+async fn assignment_context_for_prompt(
+    client: &Arc<Client>,
+    trigger: &AgentTrigger,
+) -> Option<String> {
     let assignment_id = trigger
-        .payload
-        .get("_meta")
-        .and_then(|value| value.as_object())
-        .and_then(|meta| meta.get("assignmentId"))
+        .meta_value("assignmentId")
         .and_then(|value| value.as_str())?;
     match client
         .call::<_, TaskAssignmentContextResult>(
@@ -2752,32 +2951,44 @@ async fn assignment_context_for_prompt(client: &Arc<Client>, trigger: &Event) ->
             let body = serde_json::to_string_pretty(&context)
                 .unwrap_or_else(|_| "{\"error\":\"failed to render assignment context\"}".into());
             Some(format!(
-                "=== Joi assignment context ===\n\
+                "=== Loom assignment context ===\n\
                  This JSON is the authoritative task input. Read it before acting; use preflight before external side effects.\n\
                  Assignment lifecycle rules:\n\
-                 - Publish durable outputs with `joi artifact publish`, then make them typed task outputs with `joi task artifact attach <task_id> --artifact-id <art_id> --schema <schema> --role <role> --status active`.\n\
-                 - Record durable evidence with `joi task fact append`; do not use plain messages as gate evidence.\n\
-                 - Finish this assignment with `joi task assignment update <assignment_id> --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`.\n\
-                 - Do not hand off to another actor directly to finish an assignment; the assignment update returns the task to the assigning actor.\n\
+                 - Publish durable outputs with `loom artifact publish`, then make them typed task outputs with `loom task artifact attach <task_id> --artifact-id <art_id> --schema <schema> --role <role> --status active`.\n\
+                 - Record durable evidence with `loom task fact append`; do not use plain messages as gate evidence.\n\
+                 - Finish this assignment with `loom task assignment update <assignment_id> --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`.\n\
+                 - Do not route to another actor directly to finish an assignment; the assignment update returns the task to the assigning actor.\n\
                  ```json\n{body}\n```"
             ))
         }
         Err(err) => Some(format!(
-            "=== Joi assignment context ===\n\
+            "=== Loom assignment context ===\n\
              Failed to load assignment-context for {assignment_id}: {err}. Return a blocked/stale result instead of continuing from natural-language instruction only."
         )),
     }
 }
 
-fn handoff_target_ids(trigger: &Event) -> Vec<String> {
+fn trigger_target_ids(trigger: &AgentTrigger) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
-    for relation in &trigger.relations {
-        if matches!(relation.kind, RelationKind::HandsOffTo)
-            && relation.target.kind == RefKind::Actor
-            && seen.insert(relation.target.id.clone())
-        {
-            targets.push(relation.target.id.clone());
+    match trigger {
+        AgentTrigger::Message(message) => {
+            for audience in &message.audience {
+                if audience.kind == AudienceKind::Actor && seen.insert(audience.id.clone()) {
+                    targets.push(audience.id.clone());
+                }
+            }
+        }
+        #[cfg(test)]
+        AgentTrigger::Event(event) => {
+            for relation in &event.relations {
+                if matches!(relation.kind, RelationKind::DirectedTo)
+                    && relation.target.kind == RefKind::Actor
+                    && seen.insert(relation.target.id.clone())
+                {
+                    targets.push(relation.target.id.clone());
+                }
+            }
         }
     }
     targets
@@ -2845,7 +3056,7 @@ fn actor_identity_manifest(actor_id: &str, display_name: &str) -> String {
     }
     let label = actor_label_with_fallback(actor_id, display_name, &actor_names);
     format!(
-        "=== System: Joi actor identity ===\n\
+        "=== System: Loom actor identity ===\n\
          You are {label}.\n\
          Treat this as your stable runtime identity. Other @actors in the\n\
          latest message are routing targets or people being discussed; they\n\
@@ -2883,7 +3094,7 @@ fn local_time_manifest() -> String {
          Current UTC time: {utc}\n\
          Local timezone: {timezone}\n\
          UTC offset: {offset}\n\
-         Joi protocol timestamps are RFC3339 UTC, often ending in `Z`.\n\
+         Loom protocol timestamps are RFC3339 UTC, often ending in `Z`.\n\
          Convert those timestamps to the local timezone above before comparing\n\
          them with GUI/chat timestamps or describing times to the user.",
         local = info.local_rfc3339,
@@ -2895,14 +3106,14 @@ fn local_time_manifest() -> String {
 
 fn insert_static_local_time_env(env: &mut BTreeMap<String, String>) {
     let info = local_time_info();
-    env.entry("JOI_LOCAL_TIMEZONE".into())
+    env.entry("LOOM_LOCAL_TIMEZONE".into())
         .or_insert_with(|| timezone_env_value(&info));
-    env.entry("JOI_LOCAL_TIMEZONE_LABEL".into())
+    env.entry("LOOM_LOCAL_TIMEZONE_LABEL".into())
         .or_insert_with(|| timezone_label(&info));
-    env.entry("JOI_LOCAL_UTC_OFFSET".into())
+    env.entry("LOOM_LOCAL_UTC_OFFSET".into())
         .or_insert_with(|| info.utc_offset.clone());
     if !info.zone_abbrev.is_empty() {
-        env.entry("JOI_LOCAL_TIMEZONE_ABBR".into())
+        env.entry("LOOM_LOCAL_TIMEZONE_ABBR".into())
             .or_insert_with(|| info.zone_abbrev.clone());
     }
     if let Some(name) = info.timezone_name {
@@ -2912,13 +3123,13 @@ fn insert_static_local_time_env(env: &mut BTreeMap<String, String>) {
 
 fn insert_current_time_env(env: &mut BTreeMap<String, String>) {
     let info = local_time_info();
-    env.insert("JOI_CURRENT_TIME".into(), info.local_rfc3339.clone());
-    env.insert("JOI_CURRENT_TIME_UTC".into(), info.utc_rfc3339.clone());
-    env.insert("JOI_LOCAL_TIMEZONE".into(), timezone_env_value(&info));
-    env.insert("JOI_LOCAL_TIMEZONE_LABEL".into(), timezone_label(&info));
-    env.insert("JOI_LOCAL_UTC_OFFSET".into(), info.utc_offset.clone());
+    env.insert("LOOM_CURRENT_TIME".into(), info.local_rfc3339.clone());
+    env.insert("LOOM_CURRENT_TIME_UTC".into(), info.utc_rfc3339.clone());
+    env.insert("LOOM_LOCAL_TIMEZONE".into(), timezone_env_value(&info));
+    env.insert("LOOM_LOCAL_TIMEZONE_LABEL".into(), timezone_label(&info));
+    env.insert("LOOM_LOCAL_UTC_OFFSET".into(), info.utc_offset.clone());
     if !info.zone_abbrev.is_empty() {
-        env.insert("JOI_LOCAL_TIMEZONE_ABBR".into(), info.zone_abbrev.clone());
+        env.insert("LOOM_LOCAL_TIMEZONE_ABBR".into(), info.zone_abbrev.clone());
     }
     if let Some(name) = info.timezone_name {
         env.insert("TZ".into(), name);
@@ -2981,10 +3192,10 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    trigger: &Event,
+    trigger: &AgentTrigger,
     user_text: &str,
 ) -> PromptTelemetry {
-    let scope = &trigger.scope;
+    let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
     let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
     let runtime_context = local_time_manifest();
@@ -3032,11 +3243,11 @@ async fn compose_envelope_prompt(
             .map(|section| section.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        return apply_handoff_prefix_to_prompt(
+        return apply_trigger_prefix_to_prompt(
             &state.spec,
             prompt_telemetry(content, &sections),
             first_turn,
-            handoff_prompt_prefix_from_trigger(trigger),
+            trigger_prompt_prefix_from_trigger(trigger),
         );
     }
 
@@ -3052,21 +3263,21 @@ async fn compose_envelope_prompt(
             user_message: &user_text,
             scope_bootstrap: &scope_bootstrap,
         });
-    apply_handoff_prefix_to_prompt(
+    apply_trigger_prefix_to_prompt(
         &state.spec,
         prompt_telemetry(prompt, &sections),
         first_turn,
-        handoff_prompt_prefix_from_trigger(trigger),
+        trigger_prompt_prefix_from_trigger(trigger),
     )
 }
 
-fn apply_handoff_prefix_to_prompt(
+fn apply_trigger_prefix_to_prompt(
     spec: &AgentSpec,
     mut prompt: PromptTelemetry,
     first_turn: bool,
     trigger_prefix: Option<&str>,
 ) -> PromptTelemetry {
-    let Some(prefix) = trigger_prefix.or_else(|| handoff_prefix_for_turn(spec, first_turn)) else {
+    let Some(prefix) = trigger_prefix.or_else(|| trigger_prefix_for_turn(spec, first_turn)) else {
         return prompt;
     };
     if prompt.content.starts_with(prefix) {
@@ -3080,8 +3291,8 @@ fn apply_handoff_prefix_to_prompt(
     prompt.breakdown.sections.insert(
         0,
         PromptBreakdownSection {
-            key: "handoff_prefix".to_string(),
-            label: "Handoff Prefix".to_string(),
+            key: "trigger_prefix".to_string(),
+            label: "Trigger Prefix".to_string(),
             char_count: stats.char_count,
             byte_count: stats.byte_count,
             approx_token_count: stats.approx_token_count,
@@ -3092,24 +3303,22 @@ fn apply_handoff_prefix_to_prompt(
     prompt
 }
 
-fn handoff_prompt_prefix_from_trigger(trigger: &Event) -> Option<&str> {
+fn trigger_prompt_prefix_from_trigger(trigger: &AgentTrigger) -> Option<&str> {
     trigger
-        ._meta
-        .as_ref()
-        .and_then(|meta| meta.get("handoffPromptPrefix"))
+        .meta_value("triggerPromptPrefix")
         .and_then(|value| value.as_str())
         .filter(|prefix| !prefix.is_empty())
 }
 
-fn handoff_prefix_for_turn(spec: &AgentSpec, first_turn: bool) -> Option<&str> {
-    let handoff = spec.handoff.as_ref()?;
-    let prefix = handoff.trigger_prompt_prefix.as_str();
+fn trigger_prefix_for_turn(spec: &AgentSpec, first_turn: bool) -> Option<&str> {
+    let trigger = spec.trigger.as_ref()?;
+    let prefix = trigger.trigger_prompt_prefix.as_str();
     if prefix.is_empty() {
         return None;
     }
-    let applies = match handoff.apply_on {
-        HandoffApplyOn::EveryTurn => true,
-        HandoffApplyOn::FirstTurn => first_turn,
+    let applies = match trigger.apply_on {
+        TriggerPrefixApplyOn::EveryTurn => true,
+        TriggerPrefixApplyOn::FirstTurn => first_turn,
     };
     applies.then_some(prefix)
 }
@@ -3154,23 +3363,26 @@ fn apply_prompt_template(
 
 fn prompt_template_vars(
     state: &WorkerState,
-    trigger: &Event,
+    trigger: &AgentTrigger,
     channel_id: &str,
 ) -> BTreeMap<String, String> {
     let mut vars = state
         .paths
-        .template_vars(&state.actor_id, channel_id, &trigger.scope);
+        .template_vars(&state.actor_id, channel_id, trigger.scope());
     extend_prompt_template_vars(&mut vars, state, Some(trigger));
     vars
 }
 
-fn minimal_prompt_template_vars(state: &WorkerState, trigger: &Event) -> BTreeMap<String, String> {
+fn minimal_prompt_template_vars(
+    state: &WorkerState,
+    trigger: &AgentTrigger,
+) -> BTreeMap<String, String> {
     let mut vars = BTreeMap::new();
     vars.insert("actor.id".into(), state.actor_id.clone());
-    vars.insert("scope.id".into(), trigger.scope.id.clone());
+    vars.insert("scope.id".into(), trigger.scope().id.clone());
     vars.insert(
         "scope.kind".into(),
-        scope_kind_name(trigger.scope.kind).to_string(),
+        scope_kind_name(trigger.scope().kind).to_string(),
     );
     extend_prompt_template_vars(&mut vars, state, Some(trigger));
     vars
@@ -3179,11 +3391,11 @@ fn minimal_prompt_template_vars(state: &WorkerState, trigger: &Event) -> BTreeMa
 fn extend_prompt_template_vars(
     vars: &mut BTreeMap<String, String>,
     state: &WorkerState,
-    trigger: Option<&Event>,
+    trigger: Option<&AgentTrigger>,
 ) {
     if let Some(trigger) = trigger {
-        vars.insert("trigger.id".into(), trigger.id.clone());
-        vars.insert("trigger.actor_id".into(), trigger.actor_id.clone());
+        vars.insert("trigger.id".into(), trigger.id().to_string());
+        vars.insert("trigger.actor_id".into(), trigger.actor_id().to_string());
     }
     if let Some(template) = state.spec.prompt_template.as_ref() {
         if let Some(active_skill) = template.active_skill.as_deref() {
@@ -3276,7 +3488,7 @@ fn command_transport_without_resume(spec: &AgentSpec) -> bool {
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
 /// channel. Thread scopes need a one-time `thread/list` sweep; the result is
 /// cached on `WorkerState` so we don't hit the server per turn. Archived
-/// threads are queried as a fallback because explicit handoffs can arrive from
+/// threads are queried as a fallback because explicit routed messages can arrive from
 /// historical threads that are no longer in the active list. A lookup
 /// failure (network error, thread not visible, etc.) returns `None`, which
 /// the memory selector interprets as "no channel scope available" and falls
@@ -3325,51 +3537,42 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         ScopeKind::Thread => "thread",
         ScopeKind::Channel => "channel",
     };
-    let scope_flag = if matches!(scope.kind, ScopeKind::Channel) {
-        " --channel"
-    } else {
-        ""
-    };
     format!(
-        "=== System: Joi multi-actor context (auto-injected on session start) ===\n\
-         You are an agent driven by `joi daemon`.\n\
+        "=== System: Loom multi-actor context (auto-injected on session start) ===\n\
+         You are an agent driven by `loom-daemon`.\n\
          Identity:\n\
            actor id      = {actor_id}\n\
            current scope = {scope_kind}:{scope_id}\n\
          \n\
-         You can shell out to the `joi` CLI for server access. JOI_SERVER,\n\
-         JOI_DAEMON_SOCKET, JOI_ACTOR, JOI_SCOPE_ID, JOI_SCOPE_KIND, JOI_TURN_ID, JOI_TRIGGER_EVENT_ID, and JOI_TRIGGER_ACTOR are already injected into your env,\n\
+         You can shell out to the `loom` CLI for server access. LOOM_SERVER,\n\
+         LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, and LOOM_TRIGGER_ACTOR are already injected into your env,\n\
          so commands like:\n\
-           joi --json event list --in {scope_id}{scope_flag}\n\
-           joi --json event get \"$JOI_TRIGGER_EVENT_ID\"\n\
-           joi --json artifact get <art_id|artifact://...>\n\
-           joi --json task assign <task_id> --to <actor_id> --type <type> --instruction <text> --contract-file <path>\n\
-           joi --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
-           joi --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
-        `joi task assign` requires a machine-readable contract. Do not fall back\n\
-        to direct actor handoff when assignment creation fails; report the\n\
+           loom --json inbox list --no-ack\n\
+           loom --json message read --target '#<channel_id>:<root_message_id>'\n\
+           loom --json artifact get <art_id|artifact://...>\n\
+           loom --json task assign <task_id> --to <actor_id> --type <type> --instruction <text> --contract-file <path>\n\
+           loom --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
+           loom --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
+        `loom task assign` requires a machine-readable contract. Do not fall back\n\
+        to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
-         `joi ask-user-question` is for choices or missing input; its JSON\n\
+         `loom ask-user-question` is for choices or missing input; its JSON\n\
          output is the human's answer to your question, not an approval.\n\
-         `joi request-approval` is for approve/reject gates before risky work.\n\
+         `loom request-approval` is for approve/reject gates before risky work.\n\
          continue the current task using `answer.optionId`, `answer.label`, or\n\
          `answer.text`, and phrase follow-up messages as the user's answer.\n\
-         Message and handoff targets use `#<channel_id>` for channels and\n\
-         `#<channel_id>:<root_event_id>` for threads; sending to a thread\n\
+         Message targets use `#<channel_id>` for channels and\n\
+         `#<channel_id>:<root_message_id>` for threads; sending to a thread\n\
          target creates or reuses the thread automatically. Use\n\
-         `joi --json thread list` only when you need to map a thread scope id\n\
+         `loom --json thread list` only when you need to map a thread scope id\n\
          back to that target.\n\
-         If your trigger event replies to another event, use `joi --json event get`\n\
-         on the `replies_to` target before treating the visible handoff text as\n\
-         the user's original request.\n\
-         Use `--json` for machine-readable output and `joi <subcommand> --help`\n\
+         Use `--json` for machine-readable output and `loom <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\
          ",
         actor_id = actor_id,
         scope_kind = scope_kind,
         scope_id = scope.id,
-        scope_flag = scope_flag,
     )
 }
 
@@ -3434,7 +3637,7 @@ async fn translate_one(
             state.push_text(&active.id, &content);
             append_trace(
                 client,
-                &active.id,
+                &active.run_id,
                 TraceKind::TextDelta,
                 json!({ "text": content }),
             )
@@ -3454,7 +3657,7 @@ async fn translate_one(
             }
             append_trace(
                 client,
-                &active.id,
+                &active.run_id,
                 TraceKind::ToolStart,
                 json!({ "toolName": tool_name, "input": input }),
             )
@@ -3476,9 +3679,9 @@ async fn translate_one(
                 return Ok(());
             }
             // Surface the request to the trigger actor (so they can
-            // `joi action accept/decline`) and remember the ACP request id.
-            // The server reverse-delivers the eventual action.response back
-            // to this agent connection through actor-inbox fanout.
+            // `loom action accept/decline`) and remember the ACP request id.
+            // The response message is parented to this request and delivered
+            // back to the agent through the durable actor inbox.
             let payload = json!({
                 "requestId": id,
                 "requestType": request_type,
@@ -3489,30 +3692,21 @@ async fn translate_one(
                     "label": c.label,
                 })).collect::<Vec<_>>(),
             });
-            let relations = vec![Relation {
-                kind: RelationKind::HandsOffTo,
-                target: Ref {
-                    kind: RefKind::Actor,
-                    id: active.trigger_actor.clone(),
-                    _meta: None,
-                },
-                _meta: None,
-            }];
-            let appended = append_event(
+            let sent = send_action_request_message(
                 client,
-                "action.request",
-                actor_id,
                 &active.scope,
-                Some(&active.id),
+                active.trigger_actor.clone(),
                 payload,
-                relations,
-                None,
+                active
+                    .trigger_is_message
+                    .then(|| active.trigger_source_id.clone()),
+                Some(active.run_id.clone()),
             )
             .await?;
-            state.record_action_request(appended.event.id.clone(), id.clone());
+            state.record_action_request(sent.message.id.clone(), id.clone());
             eprintln!(
                 "[{actor_id}] action.request {} -> trigger {} (ACP request {})",
-                appended.event.id, active.trigger_actor, id
+                sent.message.id, active.trigger_actor, id
             );
         }
         AdapterEvent::StatusChange { scope: _, status } => {
@@ -3524,7 +3718,7 @@ async fn translate_one(
                 }
                 append_trace(
                     client,
-                    &active.id,
+                    &active.run_id,
                     TraceKind::Status,
                     json!({ "status": status }),
                 )
@@ -3551,69 +3745,37 @@ async fn translate_one(
                 let _ = state.take_text(&active.id);
             } else if let Some(text) = state.take_text(&active.id) {
                 let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                flush_text(
-                    client,
-                    actor_id,
-                    &active.scope,
-                    &active.id,
-                    &active.trigger_event_id,
-                    text,
-                    Some(meta),
-                )
-                .await?;
+                flush_text(client, actor_id, &active, text, Some(meta)).await?;
             } else if !success {
                 if let Some(text) = failed_turn_text(&summary) {
                     let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                    flush_text(
-                        client,
-                        actor_id,
-                        &active.scope,
-                        &active.id,
-                        &active.trigger_event_id,
-                        text,
-                        Some(meta),
-                    )
-                    .await?;
+                    flush_text(client, actor_id, &active, text, Some(meta)).await?;
                 }
             }
-            if !active.cancel_requested {
-                let status = if success {
-                    TurnStatus::Closed
-                } else {
-                    TurnStatus::Failed
-                };
-                let _ = append_event(
-                    client,
-                    "turn.close",
-                    actor_id,
-                    &active.scope,
-                    Some(&active.id),
-                    json!({
-                        "status": format!("{:?}", status).to_lowercase(),
-                        "stopReason": summary,
-                    }),
-                    vec![],
-                    None,
-                )
-                .await;
-                if let Err(e) = close_turn(client, &active.id, status).await {
-                    tracing::warn!(
-                        actor = %actor_id,
-                        turn = %active.id,
-                        scope = %active.scope.id,
-                        %e,
-                        "close_turn RPC failed; clearing slot anyway so the queue can drain"
-                    );
-                }
+            let run_status = if active.cancel_requested {
+                RunStatus::Canceled
+            } else if success {
+                RunStatus::Completed
+            } else {
+                RunStatus::Failed
+            };
+            if let Err(e) = close_run(client, &active.run_id, run_status).await {
+                tracing::warn!(
+                    actor = %actor_id,
+                    run = %active.run_id,
+                    scope = %active.scope.id,
+                    %e,
+                    "run.close RPC failed; clearing slot anyway so the queue can drain"
+                );
             }
             if let Err(e) =
-                record_delivery_seen_by_id(client, actor_id, &active.trigger_event_id).await
+                record_delivery_seen_by_id(client, actor_id, &active.trigger_source_id).await
             {
                 tracing::warn!(
                     actor = %actor_id,
-                    event = %active.trigger_event_id,
+                    event = %active.trigger_source_id,
                     %e,
-                    "failed to record delivery receipt after adapter finished"
+                    "failed to record delivery ack after adapter finished"
                 );
             }
             // Drop the active slot for this scope and pick up the next queued
@@ -3625,7 +3787,7 @@ async fn translate_one(
                 .unwrap_or_else(|| active.scope.id.clone());
             let next_trigger = state.clear_turn(&scope_id);
             if let Some(next) = next_trigger {
-                match dispatch_handoff(client, state, adapter, next).await {
+                match dispatch_trigger(client, state, adapter, next).await {
                     Ok(_) => {}
                     Err(e) => eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}"),
                 }
@@ -3635,7 +3797,7 @@ async fn translate_one(
             if let Some(active) = active {
                 append_trace(
                     client,
-                    &active.id,
+                    &active.run_id,
                     TraceKind::Error,
                     json!({ "message": message }),
                 )
@@ -3677,6 +3839,11 @@ fn build_turn_meta(
 
     let mut meta = Meta::new();
     meta.insert(
+        "trigger_source_id".into(),
+        json!(active.trigger_source_id.clone()),
+    );
+    meta.insert("run_id".into(), json!(active.run_id.clone()));
+    meta.insert(
         "prompt_stats".into(),
         serde_json::to_value(&active.prompt_stats).unwrap_or(Value::Null),
     );
@@ -3693,24 +3860,40 @@ fn build_turn_meta(
 
 async fn append_trace(
     client: &Arc<Client>,
-    turn_id: &str,
+    run_id: &str,
     kind: TraceKind,
     payload: Value,
 ) -> Result<()> {
-    let _: Value = client
+    let _: RunAppendResult = client
         .call(
-            method::TURN_TRACE_APPEND,
-            json!({ "turnId": turn_id, "kind": kind, "payload": payload }),
+            method::RUN_APPEND,
+            json!({
+                "runId": run_id,
+                "status": "running",
+                "frameKind": trace_frame_kind(kind),
+                "payload": payload,
+            }),
         )
         .await
-        .with_context(|| format!("turn/trace.append turn={turn_id}"))?;
+        .with_context(|| format!("run.append run={run_id}"))?;
     Ok(())
+}
+
+fn trace_frame_kind(kind: TraceKind) -> &'static str {
+    match kind {
+        TraceKind::ToolStart => "trace.tool.start",
+        TraceKind::ToolUpdate => "trace.tool.update",
+        TraceKind::ToolEnd => "trace.tool.end",
+        TraceKind::TextDelta => "trace.text.delta",
+        TraceKind::Status => "trace.status",
+        TraceKind::Error => "trace.error",
+    }
 }
 
 async fn mark_assignment_running_if_needed(
     client: &Arc<Client>,
     state: &WorkerState,
-    trigger: &Event,
+    trigger: &AgentTrigger,
 ) {
     let Some(assignment_id) = assignment_id_for_start(trigger) else {
         return;
@@ -3735,43 +3918,58 @@ async fn mark_assignment_running_if_needed(
     }
 }
 
-async fn append_turn_started_ack(
+async fn append_run_started_ack(
     client: &Arc<Client>,
     state: &WorkerState,
     active: &ActiveTurn,
-    trigger: &Event,
+    trigger: &AgentTrigger,
 ) {
-    let result = append_event(
-        client,
-        "content.add",
-        &state.actor_id,
-        &active.scope,
-        Some(&active.id),
-        json!({
-            "contentType": "text/markdown",
-            "text": "已收到，正在处理。",
-            "_meta": {
-                "kind": "turn.started_ack",
-                "triggerEventId": trigger.id,
-            }
-        }),
-        responds_to_event_relation(&trigger.id),
-        None,
-    )
-    .await;
+    let metadata = {
+        let mut metadata = Meta::default();
+        metadata.insert("kind".into(), json!("run.started_ack"));
+        metadata.insert("triggerSourceId".into(), json!(trigger.id()));
+        metadata
+    };
+    let result = if let Some(target) = active.reply_target.as_deref() {
+        send_agent_message(
+            client,
+            target,
+            "已收到，正在处理。".into(),
+            Some(trigger.id().to_string()),
+            Some(trigger.actor_id().to_string()),
+            MessageIntent::StatusUpdate,
+            DeliveryPolicy::NotifyOnly,
+            metadata,
+        )
+        .await
+        .map(|_| ())
+    } else {
+        send_scope_message(
+            client,
+            &active.scope,
+            "已收到，正在处理。".into(),
+            trigger.is_message().then(|| trigger.id().to_string()),
+            Some(trigger.actor_id().to_string()),
+            MessageIntent::StatusUpdate,
+            DeliveryPolicy::NotifyOnly,
+            metadata,
+        )
+        .await
+        .map(|_| ())
+    };
     if let Err(e) = result {
         tracing::warn!(
             actor = %state.actor_id,
-            turn = %active.id,
+            run = %active.run_id,
             scope = %active.scope.id,
             %e,
-            "failed to append turn started acknowledgement"
+            "failed to append run started acknowledgement"
         );
     }
 }
 
-fn turn_started_ack_enabled() -> bool {
-    std::env::var("JOI_AGENT_TURN_STARTED_ACK")
+fn run_started_ack_enabled() -> bool {
+    std::env::var("LOOM_AGENT_RUN_STARTED_ACK")
         .ok()
         .map(|value| {
             matches!(
@@ -3782,90 +3980,216 @@ fn turn_started_ack_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn assignment_id_for_start(trigger: &Event) -> Option<&str> {
-    let meta = trigger
-        .payload
-        .get("_meta")
-        .and_then(|value| value.as_object())?;
-    if meta.contains_key("assignmentStatus") {
+fn assignment_id_for_start(trigger: &AgentTrigger) -> Option<&str> {
+    if trigger.meta_value("assignmentStatus").is_some() {
         return None;
     }
-    meta.get("assignmentId")
+    trigger
+        .meta_value("assignmentId")
         .and_then(|value| value.as_str())
         .filter(|id| !id.trim().is_empty())
 }
 
-fn responds_to_event_relation(event_id: &str) -> Vec<Relation> {
-    if event_id.is_empty() {
-        return vec![];
+async fn send_agent_message(
+    client: &Arc<Client>,
+    target: &str,
+    body: String,
+    parent_message_id: Option<String>,
+    audience_actor_id: Option<String>,
+    intent: MessageIntent,
+    delivery_policy: DeliveryPolicy,
+    metadata: Meta,
+) -> Result<MessageSendResult> {
+    let audience = audience_actor_id
+        .map(|actor_id| {
+            vec![json!({
+                "kind": "actor",
+                "id": actor_id,
+            })]
+        })
+        .unwrap_or_default();
+    let mut input = json!({
+        "target": target,
+        "body": body,
+        "audience": audience,
+        "intent": intent,
+        "deliveryPolicy": delivery_policy,
+        "metadata": metadata,
+    });
+    if let Some(parent_message_id) = parent_message_id {
+        input["parentMessageId"] = json!(parent_message_id);
     }
-    vec![Relation {
-        kind: RelationKind::RespondsTo,
-        target: Ref {
-            kind: RefKind::Event,
-            id: event_id.to_string(),
-            _meta: None,
-        },
-        _meta: None,
-    }]
+    client
+        .call(method::MESSAGE_SEND, input)
+        .await
+        .with_context(|| format!("message.send target={target}"))
 }
 
-async fn append_event(
+async fn send_scope_message(
     client: &Arc<Client>,
-    kind: &str,
-    actor_id: &str,
     scope: &ScopeRef,
-    turn_id: Option<&str>,
+    body: String,
+    parent_message_id: Option<String>,
+    audience_actor_id: Option<String>,
+    intent: MessageIntent,
+    delivery_policy: DeliveryPolicy,
+    metadata: Meta,
+) -> Result<MessageSendResult> {
+    let target = message_target_for_scope(client, scope).await?;
+    send_agent_message(
+        client,
+        &target,
+        body,
+        parent_message_id,
+        audience_actor_id,
+        intent,
+        delivery_policy,
+        metadata,
+    )
+    .await
+    .with_context(|| format!("message.send scope={}", scope.id))
+}
+
+async fn message_target_for_scope(client: &Arc<Client>, scope: &ScopeRef) -> Result<String> {
+    match scope.kind {
+        ScopeKind::Channel => Ok(format!("#{}", scope.id)),
+        ScopeKind::Thread => {
+            let res: ThreadListResult = client
+                .call(method::THREAD_LIST, json!({ "archived": false }))
+                .await
+                .context("thread/list")?;
+            let thread = res
+                .threads
+                .into_iter()
+                .find(|thread| thread.id == scope.id)
+                .ok_or_else(|| anyhow!("thread {} not found", scope.id))?;
+            Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
+        }
+    }
+}
+
+async fn send_action_request_message(
+    client: &Arc<Client>,
+    scope: &ScopeRef,
+    target_actor: String,
     payload: Value,
-    relations: Vec<Relation>,
-    meta: Option<Meta>,
-) -> Result<EventAppendResult> {
-    let mut input = json!({
-        "type": kind,
-        "actorId": actor_id,
-        "scope": scope,
-        "payload": payload,
-        "relations": relations,
-    });
-    if let Some(t) = turn_id {
-        input["turnId"] = json!(t);
+    parent_message_id: Option<String>,
+    run_id: Option<String>,
+) -> Result<MessageSendResult> {
+    let mut metadata = action_request_metadata(payload)?;
+    if let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) {
+        metadata.insert("runId".into(), json!(run_id));
     }
-    if let Some(meta) = meta {
-        input["_meta"] = serde_json::to_value(meta)?;
+    let body = format_action_request_body(&metadata);
+    send_scope_message(
+        client,
+        scope,
+        body,
+        parent_message_id,
+        Some(target_actor),
+        MessageIntent::RequestAction,
+        DeliveryPolicy::WakeAgent,
+        metadata,
+    )
+    .await
+}
+
+fn action_request_metadata(payload: Value) -> Result<Meta> {
+    let mut metadata = Meta::default();
+    metadata.insert("kind".into(), json!("action.request"));
+    match payload {
+        Value::Object(map) => {
+            for (key, value) in map {
+                metadata.insert(key, value);
+            }
+        }
+        other => {
+            metadata.insert("payload".into(), other);
+        }
     }
-    let res: EventAppendResult = client
-        .call(method::EVENT_APPEND, json!({ "event": input }))
-        .await
-        .with_context(|| format!("event/append kind={kind}"))?;
-    Ok(res)
+    Ok(metadata)
+}
+
+fn format_action_request_body(metadata: &Meta) -> String {
+    let title = metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Action requested");
+    let description = metadata
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut body = format!("Action requested: {title}");
+    if !description.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(description);
+    }
+    if let Some(choices) = metadata.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            let id = choice.get("id").and_then(Value::as_str).unwrap_or("");
+            let label = choice.get("label").and_then(Value::as_str).unwrap_or("");
+            if !id.is_empty() || !label.is_empty() {
+                body.push_str(&format!("\n- {id}: {label}"));
+            }
+        }
+    }
+    body
 }
 
 async fn flush_text(
     client: &Arc<Client>,
     actor_id: &str,
-    scope: &ScopeRef,
-    turn_id: &str,
-    trigger_event_id: &str,
+    active: &ActiveTurn,
     text: String,
     meta: Option<Meta>,
 ) -> Result<()> {
-    append_event(
+    if active.trigger_is_message {
+        if let Some(target) = active.reply_target.as_deref() {
+            return send_agent_message(
+                client,
+                target,
+                text,
+                Some(active.trigger_source_id.clone()),
+                Some(active.trigger_actor.clone()),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                meta.unwrap_or_default(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                tracing::warn!(
+                    actor = %actor_id,
+                    turn = %active.id,
+                    scope = %active.scope.id,
+                    %e,
+                    "message.send failed"
+                );
+                e
+            });
+        }
+    }
+    send_scope_message(
         client,
-        "content.add",
-        actor_id,
-        scope,
-        Some(turn_id),
-        json!({ "contentType": "text/markdown", "text": text }),
-        responds_to_event_relation(trigger_event_id),
-        meta,
+        &active.scope,
+        text,
+        active
+            .trigger_is_message
+            .then(|| active.trigger_source_id.clone()),
+        Some(active.trigger_actor.clone()),
+        MessageIntent::Chat,
+        DeliveryPolicy::NotifyOnly,
+        meta.unwrap_or_default(),
     )
     .await
     .map(|_| ())
     .map_err(|e| {
         tracing::warn!(
             actor = %actor_id,
-            turn = %turn_id,
-            scope = %scope.id,
+            turn = %active.id,
+            scope = %active.scope.id,
             %e,
             "content.add failed"
         );
@@ -3873,14 +4197,14 @@ async fn flush_text(
     })
 }
 
-async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> Result<()> {
-    let _: Value = client
+async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Result<()> {
+    let _: RunCloseResult = client
         .call(
-            method::TURN_CLOSE,
-            json!({ "turnId": turn_id, "status": status }),
+            method::RUN_CLOSE,
+            json!({ "runId": run_id, "status": status }),
         )
         .await
-        .with_context(|| format!("turn/close turn={turn_id}"))?;
+        .with_context(|| format!("run.close run={run_id}"))?;
     Ok(())
 }
 
@@ -3888,9 +4212,9 @@ async fn close_turn(client: &Arc<Client>, turn_id: &str, status: TurnStatus) -> 
 mod tests {
     use super::*;
     use proto::methods::{
-        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, HandoffSpec,
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, TriggerSpec,
     };
-    use proto::types::{Actor, ActorKind};
+    use proto::types::{Actor, ActorKind, Ref, Relation};
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
         AgentSpec {
@@ -3923,7 +4247,7 @@ mod tests {
             identity: None,
             memory: None,
             announcement: None,
-            handoff: None,
+            trigger: None,
             prompt_template: None,
         }
     }
@@ -3931,7 +4255,7 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "joi-agent-serve-tests-{name}-{}",
+            "loom-agent-serve-tests-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock drift")
@@ -4073,8 +4397,11 @@ mod tests {
 
         let active = ActiveTurn {
             id: "turn_demo".into(),
+            run_id: "run_demo".into(),
             scope: scope.clone(),
-            trigger_event_id: "evt_trigger".into(),
+            trigger_source_id: "msg_trigger".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_demo".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "human_alice".into(),
@@ -4089,11 +4416,15 @@ mod tests {
         );
 
         assert_eq!(
-            env.get("JOI_SCOPE_ID").map(String::as_str),
+            env.get("LOOM_SCOPE_ID").map(String::as_str),
             Some("chan_demo")
         );
         assert_eq!(
-            env.get("JOI_SCOPE_KIND").map(String::as_str),
+            env.get("LOOM_SCOPE_ID").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(
+            env.get("LOOM_SCOPE_KIND").map(String::as_str),
             Some("channel")
         );
         assert_eq!(
@@ -4101,21 +4432,26 @@ mod tests {
             Some("chan_demo")
         );
         assert_eq!(
-            env.get("JOI_TURN_ID").map(String::as_str),
-            Some("turn_demo")
+            env.get("LOOM_CHANNEL_ID").map(String::as_str),
+            Some("chan_demo")
+        );
+        assert_eq!(env.get("LOOM_RUN_ID").map(String::as_str), Some("run_demo"));
+        assert_eq!(
+            env.get("LOOM_TRIGGER_MESSAGE_ID").map(String::as_str),
+            Some("msg_trigger")
         );
         assert_eq!(
-            env.get("JOI_TRIGGER_EVENT_ID").map(String::as_str),
-            Some("evt_trigger")
+            env.get("LOOM_TRIGGER_MESSAGE_ID").map(String::as_str),
+            Some("msg_trigger")
         );
         assert_eq!(
-            env.get("JOI_TRIGGER_ACTOR").map(String::as_str),
+            env.get("LOOM_TRIGGER_ACTOR").map(String::as_str),
             Some("human_alice")
         );
-        assert!(env.get("JOI_CURRENT_TIME").is_some());
-        assert!(env.get("JOI_CURRENT_TIME_UTC").is_some());
-        assert!(env.get("JOI_LOCAL_UTC_OFFSET").is_some());
-        assert!(env.get("JOI_LOCAL_TIMEZONE").is_some());
+        assert!(env.get("LOOM_CURRENT_TIME").is_some());
+        assert!(env.get("LOOM_CURRENT_TIME_UTC").is_some());
+        assert!(env.get("LOOM_LOCAL_UTC_OFFSET").is_some());
+        assert!(env.get("LOOM_LOCAL_TIMEZONE").is_some());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4137,7 +4473,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_prompt_restores_handoff_semantics_and_display_names() {
+    fn trigger_prompt_restores_routing_semantics_and_display_names() {
         let mut actor_names = HashMap::new();
         actor_names.insert("actor_human_xingchu".into(), "星楚".into());
         actor_names.insert("actor_agent_g_1234".into(), "G仔".into());
@@ -4158,7 +4494,7 @@ mod tests {
                 "text": "生成一个童话小说，然后发给@actor_agent_emma_142b6f2d读下"
             }),
             relations: vec![Relation {
-                kind: RelationKind::HandsOffTo,
+                kind: RelationKind::DirectedTo,
                 target: Ref {
                     kind: RefKind::Actor,
                     id: "actor_agent_g_1234".into(),
@@ -4169,20 +4505,24 @@ mod tests {
             _meta: None,
         };
 
-        let prompt =
-            render_trigger_prompt_with_names("actor_agent_g_1234", "G仔", &trigger, &actor_names);
+        let prompt = render_trigger_prompt_with_names(
+            "actor_agent_g_1234",
+            "G仔",
+            &AgentTrigger::Event(trigger),
+            &actor_names,
+        );
 
         assert!(prompt.contains("Your actor: G仔 (@actor_agent_g_1234)"));
         assert!(prompt.contains("From: 星楚 (@actor_human_xingchu)"));
-        assert!(prompt.contains("Delivery: explicit handoff to you"));
-        assert!(prompt.contains("handoff -> G仔 (@actor_agent_g_1234):"));
+        assert!(prompt.contains("Delivery: explicit route to you"));
+        assert!(prompt.contains("route -> G仔 (@actor_agent_g_1234):"));
         assert!(prompt.contains("Emma (@actor_agent_emma_142b6f2d)"));
     }
 
     #[test]
-    fn self_authored_handoff_to_local_actor_is_deliverable() {
+    fn self_authored_directed_event_to_local_actor_is_deliverable() {
         let event = Event {
-            id: "evt_self_handoff".into(),
+            id: "evt_self_route".into(),
             kind: "content.add".into(),
             actor_id: "actor_agent_emma".into(),
             scope: ScopeRef {
@@ -4194,7 +4534,7 @@ mod tests {
             occurred_at: Utc::now(),
             payload: json!({ "text": "continue in the task thread" }),
             relations: vec![Relation {
-                kind: RelationKind::HandsOffTo,
+                kind: RelationKind::DirectedTo,
                 target: Ref {
                     kind: RefKind::Actor,
                     id: "actor_agent_emma".into(),
@@ -4210,7 +4550,7 @@ mod tests {
     }
 
     #[test]
-    fn self_authored_content_without_local_handoff_is_not_deliverable() {
+    fn self_authored_content_without_local_route_is_not_deliverable() {
         let own_plain_message = Event {
             id: "evt_self_plain".into(),
             kind: "content.add".into(),
@@ -4226,10 +4566,10 @@ mod tests {
             relations: Vec::new(),
             _meta: None,
         };
-        let handoff_to_other = Event {
-            id: "evt_handoff_other".into(),
+        let route_to_other = Event {
+            id: "evt_route_other".into(),
             relations: vec![Relation {
-                kind: RelationKind::HandsOffTo,
+                kind: RelationKind::DirectedTo,
                 target: Ref {
                     kind: RefKind::Actor,
                     id: "actor_agent_q".into(),
@@ -4241,11 +4581,11 @@ mod tests {
         };
 
         assert!(!is_for_us(&own_plain_message, "actor_agent_emma"));
-        assert!(!is_for_us(&handoff_to_other, "actor_agent_emma"));
+        assert!(!is_for_us(&route_to_other, "actor_agent_emma"));
     }
 
     #[test]
-    fn assignment_start_detection_skips_return_handoff() {
+    fn assignment_start_detection_skips_return_message() {
         let mut trigger = Event {
             id: "evt_assignment".into(),
             kind: "content.add".into(),
@@ -4269,21 +4609,13 @@ mod tests {
             _meta: None,
         };
 
-        assert_eq!(assignment_id_for_start(&trigger), Some("asgn_1"));
+        assert_eq!(
+            assignment_id_for_start(&AgentTrigger::Event(trigger.clone())),
+            Some("asgn_1")
+        );
 
         trigger.payload["_meta"]["assignmentStatus"] = json!("completed");
-        assert_eq!(assignment_id_for_start(&trigger), None);
-    }
-
-    #[test]
-    fn responds_to_event_relation_targets_trigger_event() {
-        let relations = responds_to_event_relation("evt_trigger");
-
-        assert_eq!(relations.len(), 1);
-        assert!(matches!(relations[0].kind, RelationKind::RespondsTo));
-        assert_eq!(relations[0].target.kind, RefKind::Event);
-        assert_eq!(relations[0].target.id, "evt_trigger");
-        assert!(responds_to_event_relation("").is_empty());
+        assert_eq!(assignment_id_for_start(&AgentTrigger::Event(trigger)), None);
     }
 
     #[test]
@@ -4304,11 +4636,11 @@ mod tests {
     }
 
     #[test]
-    fn handoff_prefix_applies_to_every_turn() {
+    fn trigger_prefix_applies_to_every_turn() {
         let mut spec = sample_spec(None);
-        spec.handoff = Some(HandoffSpec {
+        spec.trigger = Some(TriggerSpec {
             trigger_prompt_prefix: "/router\n".into(),
-            apply_on: HandoffApplyOn::EveryTurn,
+            apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
         let sections = vec![agent_runtime::PromptSection {
             name: "user_message",
@@ -4316,7 +4648,7 @@ mod tests {
         }];
 
         assert_eq!(
-            apply_handoff_prefix_to_prompt(
+            apply_trigger_prefix_to_prompt(
                 &spec,
                 prompt_telemetry("hello".into(), &sections),
                 false,
@@ -4326,7 +4658,7 @@ mod tests {
             "/router\nhello"
         );
         assert_eq!(
-            apply_handoff_prefix_to_prompt(
+            apply_trigger_prefix_to_prompt(
                 &spec,
                 prompt_telemetry("/router\nhello".into(), &sections),
                 false,
@@ -4350,7 +4682,7 @@ mod tests {
         let template = PromptTemplateSpec {
             active_skill: Some("router".into()),
             every_turn_prefix: vec![
-                "[joi] {actor.id} {scope.kind}:{scope.id}".into(),
+                "[loom] {actor.id} {scope.kind}:{scope.id}".into(),
                 "workspace_dir: {workspace.dir}".into(),
                 "mode: {vars.mode}".into(),
             ],
@@ -4363,7 +4695,7 @@ mod tests {
         };
 
         let first = apply_prompt_template(Some(&template), &vars, true, "/router\nhi");
-        assert!(first.contains("[joi] actor_router channel:chan_1"));
+        assert!(first.contains("[loom] actor_router channel:chan_1"));
         assert!(first.contains("workspace_dir: /tmp/work"));
         assert!(first.contains("skill: router"));
         assert!(first.contains("# Router skill"));
@@ -4376,44 +4708,44 @@ mod tests {
     }
 
     #[test]
-    fn handoff_prefix_is_first_in_final_prompt() {
+    fn trigger_prefix_is_first_in_final_prompt() {
         let mut spec = sample_spec(None);
-        spec.handoff = Some(HandoffSpec {
+        spec.trigger = Some(TriggerSpec {
             trigger_prompt_prefix: "/router\n".into(),
-            apply_on: HandoffApplyOn::EveryTurn,
+            apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
         let sections = vec![agent_runtime::PromptSection {
             name: "user_message",
-            content: "=== User message ===\n[joi envelope]\nhello".into(),
+            content: "=== User message ===\n[loom envelope]\nhello".into(),
         }];
         let prompt = prompt_telemetry(sections[0].content.clone(), &sections);
 
-        let prompt = apply_handoff_prefix_to_prompt(&spec, prompt, false, None);
+        let prompt = apply_trigger_prefix_to_prompt(&spec, prompt, false, None);
 
         assert!(prompt.content.starts_with("/router\n=== User message ==="));
-        assert_eq!(prompt.breakdown.sections[0].key, "handoff_prefix");
+        assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
     }
 
     #[test]
-    fn per_handoff_prefix_overrides_actor_default_and_is_first() {
+    fn per_trigger_prefix_overrides_actor_default_and_is_first() {
         let mut spec = sample_spec(None);
-        spec.handoff = Some(HandoffSpec {
+        spec.trigger = Some(TriggerSpec {
             trigger_prompt_prefix: "/router\n".into(),
-            apply_on: HandoffApplyOn::EveryTurn,
+            apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
         let sections = vec![agent_runtime::PromptSection {
             name: "user_message",
-            content: "=== User message ===\n[joi envelope]\nhello".into(),
+            content: "=== User message ===\n[loom envelope]\nhello".into(),
         }];
         let prompt = prompt_telemetry(sections[0].content.clone(), &sections);
 
-        let prompt = apply_handoff_prefix_to_prompt(&spec, prompt, false, Some("/review [joi]\n"));
+        let prompt = apply_trigger_prefix_to_prompt(&spec, prompt, false, Some("/review [loom]\n"));
 
         assert!(prompt
             .content
-            .starts_with("/review [joi]\n=== User message ==="));
+            .starts_with("/review [loom]\n=== User message ==="));
         assert!(!prompt.content.starts_with("/router\n"));
-        assert_eq!(prompt.breakdown.sections[0].key, "handoff_prefix");
+        assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
     }
 
     #[test]
@@ -4449,7 +4781,7 @@ mod tests {
             _meta: None,
         };
 
-        let vars = prompt_template_vars(&state, &trigger, "chan_demo");
+        let vars = prompt_template_vars(&state, &AgentTrigger::Event(trigger), "chan_demo");
 
         assert_eq!(vars.get("actor.id").map(String::as_str), Some("actor_demo"));
         assert_eq!(
@@ -4476,11 +4808,11 @@ mod tests {
     }
 
     #[test]
-    fn joi_human_interaction_request_ids_are_tool_local() {
-        assert!(is_joi_tool_request_id("joi:question:abc"));
-        assert!(is_joi_tool_request_id("joi:approval:abc"));
-        assert!(!is_joi_tool_request_id("joi:model:abc"));
-        assert!(!is_joi_tool_request_id("acp:permission:abc"));
+    fn loom_human_interaction_request_ids_are_tool_local() {
+        assert!(is_loom_tool_request_id("loom:question:abc"));
+        assert!(is_loom_tool_request_id("loom:approval:abc"));
+        assert!(!is_loom_tool_request_id("loom:model:abc"));
+        assert!(!is_loom_tool_request_id("acp:permission:abc"));
     }
 
     #[test]
@@ -4511,8 +4843,11 @@ mod tests {
         };
         state.set_turn(ActiveTurn {
             id: "turn_1".into(),
+            run_id: "run_1".into(),
             scope: scope.clone(),
-            trigger_event_id: "evt_1".into(),
+            trigger_source_id: "msg_1".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_demo".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
@@ -4740,15 +5075,18 @@ mod tests {
         };
         state.set_turn(ActiveTurn {
             id: "turn_channel".into(),
+            run_id: "run_channel".into(),
             scope: active_scope.clone(),
-            trigger_event_id: "evt_root".into(),
+            trigger_source_id: "msg_root".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_triage".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
             cancel_requested: false,
         });
         let queued_channel = Event {
-            id: "evt_channel_handoff".into(),
+            id: "evt_channel_route".into(),
             kind: "content.add".into(),
             actor_id: "actor_demo".into(),
             scope: active_scope.clone(),
@@ -4760,7 +5098,7 @@ mod tests {
             _meta: None,
         };
         let queued_thread = Event {
-            id: "evt_thread_handoff".into(),
+            id: "evt_thread_route".into(),
             kind: "content.add".into(),
             actor_id: "actor_demo".into(),
             scope: ScopeRef {
@@ -4777,12 +5115,20 @@ mod tests {
 
         assert!(state.current_turn(&active_scope.id).is_some());
         assert!(state.current_turn(&queued_thread.scope.id).is_none());
-        state.enqueue(&queued_channel.scope.id, queued_channel.clone());
-        state.enqueue(&queued_thread.scope.id, queued_thread.clone());
-        assert!(state.has_pending_event(&queued_channel.id));
-        assert!(state.has_pending_event(&queued_thread.id));
+        state.enqueue(
+            &queued_channel.scope.id,
+            AgentTrigger::Event(queued_channel.clone()),
+        );
+        state.enqueue(
+            &queued_thread.scope.id,
+            AgentTrigger::Event(queued_thread.clone()),
+        );
+        assert!(state.has_pending_source(&queued_channel.id));
+        assert!(state.has_pending_source(&queued_thread.id));
         assert_eq!(
-            state.clear_turn(&active_scope.id).map(|event| event.id),
+            state
+                .clear_turn(&active_scope.id)
+                .map(|trigger| trigger.id().to_string()),
             Some(queued_channel.id)
         );
         assert!(state.current_turn(&active_scope.id).is_none());
@@ -4790,7 +5136,7 @@ mod tests {
         assert_eq!(
             state
                 .clear_turn(&queued_thread.scope.id)
-                .map(|event| event.id),
+                .map(|trigger| trigger.id().to_string()),
             Some(queued_thread.id)
         );
         std::fs::remove_dir_all(root).ok();
@@ -4813,8 +5159,11 @@ mod tests {
         };
         state.set_turn(ActiveTurn {
             id: "turn_busy".into(),
+            run_id: "run_busy".into(),
             scope: active_scope.clone(),
-            trigger_event_id: "evt_busy".into(),
+            trigger_source_id: "msg_busy".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_demo:msg_busy".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "mr-watcher".into(),
@@ -4841,7 +5190,7 @@ mod tests {
             turn_id: None,
             seq: 1,
             occurred_at: Utc::now(),
-            payload: json!({ "text": "first human handoff" }),
+            payload: json!({ "text": "first human request" }),
             relations: Vec::new(),
             _meta: None,
         };
@@ -4853,26 +5202,32 @@ mod tests {
             turn_id: None,
             seq: 1,
             occurred_at: Utc::now(),
-            payload: json!({ "text": "second human handoff" }),
+            payload: json!({ "text": "second human request" }),
             relations: Vec::new(),
             _meta: None,
         };
 
-        state.enqueue(&service.scope.id, service.clone());
-        state.enqueue(&human_one.scope.id, human_one.clone());
-        state.enqueue(&human_two.scope.id, human_two.clone());
-        state.enqueue(&human_one.scope.id, human_one.clone());
+        state.enqueue(&service.scope.id, AgentTrigger::Event(service.clone()));
+        state.enqueue(&human_one.scope.id, AgentTrigger::Event(human_one.clone()));
+        state.enqueue(&human_two.scope.id, AgentTrigger::Event(human_two.clone()));
+        state.enqueue(&human_one.scope.id, AgentTrigger::Event(human_one.clone()));
 
         assert_eq!(
-            state.clear_turn(&active_scope.id).map(|event| event.id),
+            state
+                .clear_turn(&active_scope.id)
+                .map(|trigger| trigger.id().to_string()),
             Some(human_one.id)
         );
         assert_eq!(
-            state.clear_turn(&active_scope.id).map(|event| event.id),
+            state
+                .clear_turn(&active_scope.id)
+                .map(|trigger| trigger.id().to_string()),
             Some(human_two.id)
         );
         assert_eq!(
-            state.clear_turn(&active_scope.id).map(|event| event.id),
+            state
+                .clear_turn(&active_scope.id)
+                .map(|trigger| trigger.id().to_string()),
             Some(service.id)
         );
         assert!(state.clear_turn(&active_scope.id).is_none());

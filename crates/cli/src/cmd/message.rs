@@ -3,22 +3,23 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
-use proto::types::{Ref, RefKind, Relation, RelationKind, ScopeRef};
+use proto::types::{DeliveryPolicy, MessageIntent};
 use serde_json::json;
 
 use crate::client::Client;
 use crate::render;
 
-use super::target::{resolve_target, TargetMode};
-
 pub async fn send(
     client: Arc<Client>,
-    actor_id: String,
-    target: String,
+    _actor_id: String,
+    target: Option<String>,
+    to: Option<String>,
     text: Option<String>,
+    intent: Option<String>,
+    delivery_policy: Option<String>,
     attachment_ids: Vec<String>,
 ) -> Result<()> {
-    let resolved = resolve_target(&client, &actor_id, &target, TargetMode::Write).await?;
+    let target = resolve_send_target(target, to)?;
     let body = match text {
         Some(t) => t,
         None => {
@@ -32,65 +33,101 @@ pub async fn send(
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
-    let mut relations = attachment_relations(attachment_ids);
-    if let Some(root_event_id) = resolved.thread_root_event_id.as_ref() {
-        relations.push(Relation {
-            kind: RelationKind::RepliesTo,
-            target: Ref {
-                kind: RefKind::Event,
-                id: root_event_id.clone(),
-                _meta: None,
-            },
-            _meta: None,
-        });
+    let intent = parse_message_intent(intent)?;
+    let delivery_policy = parse_delivery_policy(delivery_policy)?;
+    let mut params = json!({
+        "target": target,
+        "body": body,
+        "attachments": attachment_ids,
+    });
+    if let Some(intent) = intent {
+        params["intent"] = serde_json::to_value(intent)?;
     }
-    if let Some(actor) = resolved.direct_actor {
-        relations.push(Relation {
-            kind: RelationKind::HandsOffTo,
-            target: Ref {
-                kind: RefKind::Actor,
-                id: actor,
-                _meta: None,
-            },
-            _meta: None,
-        });
+    if let Some(delivery_policy) = delivery_policy {
+        params["deliveryPolicy"] = serde_json::to_value(delivery_policy)?;
     }
-    append_content(client, &actor_id, resolved.scope, body, relations).await
+    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("message {}", res.message.id);
+    }
+    Ok(())
+}
+
+fn resolve_send_target(target: Option<String>, to: Option<String>) -> Result<String> {
+    match (target, to) {
+        (Some(target), None) if !target.trim().is_empty() => Ok(target),
+        (None, Some(to)) if !to.trim().is_empty() => {
+            let to = to.trim();
+            if to.starts_with("dm:") {
+                Ok(to.to_string())
+            } else if to.starts_with('@') {
+                Ok(format!("dm:{to}"))
+            } else {
+                Ok(format!("dm:@{to}"))
+            }
+        }
+        (Some(_), Some(_)) => bail!("use either --target or --to, not both"),
+        _ => bail!("missing destination: pass --target or --to"),
+    }
+}
+
+fn parse_message_intent(raw: Option<String>) -> Result<Option<MessageIntent>> {
+    raw.map(|value| {
+        serde_json::from_value::<MessageIntent>(json!(value.trim())).with_context(|| {
+            "invalid --intent; expected chat, ask, request_action, assign_task, status_update, review, or notify"
+        })
+    })
+    .transpose()
+}
+
+fn parse_delivery_policy(raw: Option<String>) -> Result<Option<DeliveryPolicy>> {
+    raw.map(|value| {
+        serde_json::from_value::<DeliveryPolicy>(json!(value.trim())).with_context(|| {
+            "invalid --delivery-policy; expected notify_only, wake_agent, route_by_intent, or silent"
+        })
+    })
+    .transpose()
 }
 
 pub async fn read(
     client: Arc<Client>,
-    actor_id: String,
+    _actor_id: String,
     target: String,
     limit: u32,
     before: Option<String>,
 ) -> Result<()> {
-    let resolved = resolve_target(&client, &actor_id, &target, TargetMode::Read).await?;
     let mut params = json!({
-        "scope": resolved.scope,
+        "target": target,
         "limit": limit,
     });
     if let Some(before) = before {
-        params["beforeEventId"] = json!(before);
+        params["beforeMessageId"] = json!(before);
     }
-    let res: ScopeReadResult = client.call(method::SCOPE_READ, params).await?;
+    let res: MessageListResult = client.call(method::MESSAGE_LIST, params).await?;
     if render::is_json() {
         render::print_json(&res);
         return Ok(());
     }
-    for event in &res.events {
-        render::render_event(event);
+    for message in &res.messages {
+        render::render_message(message);
     }
-    if res.events.is_empty() {
+    if res.messages.is_empty() {
         println!("(no messages)");
     }
     Ok(())
 }
 
-pub async fn check(client: Arc<Client>, actor_id: String, limit: u32, ack: bool) -> Result<()> {
-    let res: DeliveryListResult = client
+pub async fn inbox_list(
+    client: Arc<Client>,
+    actor_id: String,
+    limit: u32,
+    ack: bool,
+) -> Result<()> {
+    let res: InboxListResult = client
         .call(
-            method::DELIVERY_LIST,
+            method::INBOX_LIST,
             json!({
                 "actorId": actor_id,
                 "state": "pending",
@@ -101,25 +138,24 @@ pub async fn check(client: Arc<Client>, actor_id: String, limit: u32, ack: bool)
     if render::is_json() {
         render::print_json(&res);
     } else if res.deliveries.is_empty() {
-        println!("(no pending direct messages)");
+        println!("(no pending inbox items)");
     } else {
         for entry in &res.deliveries {
-            if let Some(event) = entry.event.as_ref() {
-                render::render_event(event);
+            if let Some(message) = entry.message.as_ref() {
+                render::render_message(message);
             } else {
-                println!("pending delivery {}", entry.delivery.event_id);
+                println!("pending delivery {}", entry.delivery.source_id);
             }
         }
     }
     if ack {
         for entry in res.deliveries {
-            let _: ReceiptRecordResult = client
+            let _: DeliveryAckResult = client
                 .call(
-                    method::RECEIPT_RECORD,
+                    method::DELIVERY_ACK,
                     json!({
-                        "eventId": entry.delivery.event_id,
                         "actorId": entry.delivery.actor_id,
-                        "kind": "seen",
+                        "sourceId": entry.delivery.source_id,
                     }),
                 )
                 .await?;
@@ -130,80 +166,29 @@ pub async fn check(client: Arc<Client>, actor_id: String, limit: u32, ack: bool)
 
 pub async fn search(
     client: Arc<Client>,
-    actor_id: String,
+    _actor_id: String,
     query: String,
     target: Option<String>,
     limit: u32,
 ) -> Result<()> {
-    let scope = match target {
-        Some(target) => Some(
-            resolve_target(&client, &actor_id, &target, TargetMode::Read)
-                .await?
-                .scope,
-        ),
-        None => None,
-    };
     let res: MessageSearchResult = client
         .call(
             method::MESSAGE_SEARCH,
             json!({
                 "query": query,
-                "scope": scope,
+                "target": target,
                 "limit": limit,
             }),
         )
         .await?;
     if render::is_json() {
         render::print_json(&res);
-    } else if res.events.is_empty() {
+    } else if res.messages.is_empty() {
         println!("(no matches)");
     } else {
-        for event in &res.events {
-            render::render_event(event);
+        for message in &res.messages {
+            render::render_message(message);
         }
     }
     Ok(())
-}
-
-pub async fn append_content(
-    client: Arc<Client>,
-    actor_id: &str,
-    scope: ScopeRef,
-    text: String,
-    relations: Vec<Relation>,
-) -> Result<()> {
-    let res: EventAppendResult = client
-        .call(
-            method::EVENT_APPEND,
-            json!({
-                "event": {
-                    "type": "content.add",
-                    "actorId": actor_id,
-                    "scope": scope,
-                    "payload": { "contentType": "text/markdown", "text": text },
-                    "relations": relations,
-                }
-            }),
-        )
-        .await?;
-    if render::is_json() {
-        render::print_json(&res);
-    } else {
-        println!("event {}", res.event.id);
-    }
-    Ok(())
-}
-
-fn attachment_relations(ids: Vec<String>) -> Vec<Relation> {
-    ids.into_iter()
-        .map(|id| Relation {
-            kind: RelationKind::AttachesArtifact,
-            target: Ref {
-                kind: RefKind::Artifact,
-                id,
-                _meta: None,
-            },
-            _meta: None,
-        })
-        .collect()
 }

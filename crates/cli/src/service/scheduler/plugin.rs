@@ -15,11 +15,11 @@
 //!    matches the persisted cursor (§8.3 cursor semantics).
 //! 3. `dedupe_once` with the §8.4 key (commits **before** the event
 //!    append so a crash window cannot double-emit).
-//! 4. `runtime.append_content` (or `handoff` if `target_agent` is set)
+//! 4. `runtime.append_content` (or directed `message.send` if `target_agent` is set)
 //!    with `_meta = { service: "scheduler", jobId, fireTimeUtc,
 //!    sourceCursor? }`.
 //! 5. Persist the new cursor (after success) and, if `await_reply`,
-//!    block on `await_responds_to(handoff_event_id, timeout)`.
+//!    block on `await_message_replies(trigger_message_id, timeout)`.
 //!
 //! Per-job `single_in_flight` (default true) rejects overlapping ticks:
 //! the gate is held across the whole fire, so a slow source or a slow
@@ -90,7 +90,7 @@ impl ServicePlugin for SchedulerPlugin {
         // any event in `bind.auto_stop_on` is observed. Today the
         // self_complete sentinel is the only signal scheduler raises;
         // future expansions (e.g., listening for `thread.closed` on
-        // delivery_list) reuse the same Notify.
+        // inbox polling paths reuse the same Notify.
         let stop_on_self_complete = matches!(ctx.spec.lifecycle, ServiceLifecycle::ThreadBound)
             && ctx
                 .spec
@@ -337,10 +337,10 @@ async fn run_job_loop(
 /// Single tick: source → cursor diff → dedupe → append → optional await.
 ///
 /// Returns `Err` only on protocol-level failures the operator must
-/// see (event/append fails, ServiceRuntime error). Source failures
+/// see (message.send fails, ServiceRuntime error). Source failures
 /// (exit ≠ 0, HTTP non-2xx) are warnings, not errors — the next tick
 /// will retry. This matches §8.3's "exit != 0 is failure but doesn't
-/// emit an event"; we don't want a sticky source outage to terminate
+/// emit a message"; we don't want a sticky source outage to terminate
 /// the job loop.
 async fn fire_once(
     state: Arc<JobState>,
@@ -363,18 +363,18 @@ async fn fire_once(
     // §4.7.3: a service plugin (e.g., mr-detector bundle) may signal
     // "this instance is done" by writing a sentinel JSON object as the
     // last line of stdout. We strip the sentinel from the body so it
-    // doesn't leak into the user-visible event, then publish a separate
-    // `service.self_complete` event and notify the run() loop so the
+    // doesn't leak into the user-visible message, then publish a separate
+    // `service.self_complete` message and notify the run() loop so the
     // scheduler can tear the instance down when `auto_stop_on` opts in.
     let (body_vec, self_complete_signal) = strip_self_complete(&raw_body);
     let body = body_vec.as_slice();
     let body_hash = sha256_hex(body);
 
     let scope = scope_ref(&job.scope);
-    let mut event_id: Option<String> = None;
+    let mut message_id: Option<String> = None;
 
     // If the body is empty after stripping the sentinel, skip the
-    // regular content event (a self_complete-only tick has nothing
+    // regular content message (a self_complete-only tick has nothing
     // user-visible to log). Otherwise run the cursor diff / dedupe /
     // append / await chain like a normal tick.
     if !body.is_empty() {
@@ -428,9 +428,16 @@ async fn fire_once(
                     let meta = build_meta(job, fire_time, &body_hash);
                     if let Some(target) = job.target_agent.as_deref() {
                         runtime
-                            .handoff(target, scope.clone(), body_text.clone(), Some(meta))
+                            .send_directed_message(
+                                target,
+                                scope.clone(),
+                                body_text.clone(),
+                                Some(meta),
+                            )
                             .await
-                            .with_context(|| format!("scheduler handoff for job `{}`", job.id))?
+                            .with_context(|| {
+                                format!("scheduler directed message for job `{}`", job.id)
+                            })?
                     } else {
                         runtime
                             .append_content(
@@ -443,7 +450,7 @@ async fn fire_once(
                             .with_context(|| format!("scheduler append for job `{}`", job.id))?
                     }
                 };
-                event_id = Some(id);
+                message_id = Some(id);
 
                 // Cursor save after success.
                 if matches!(job.cursor_by, CursorBy::BodyHash) {
@@ -459,9 +466,9 @@ async fn fire_once(
         }
     }
 
-    // §4.7.3: emit the self_complete event regardless of cursor /
+    // §4.7.3: emit the self_complete message regardless of cursor /
     // dedupe outcome — the bundle saying "I'm done" is itself the
-    // event that matters, and a stuck cursor must not silence it.
+    // message that matters, and a stuck cursor must not silence it.
     if let Some(signal) = self_complete_signal {
         match runtime
             .publish_self_complete(scope.clone(), signal.reason.clone())
@@ -472,7 +479,7 @@ async fn fire_once(
                     job = %job.id,
                     instance = ?runtime.instance_id(),
                     reason = %signal.reason,
-                    event_id = %id,
+                    message_id = %id,
                     "service.self_complete published",
                 );
             }
@@ -489,23 +496,23 @@ async fn fire_once(
     }
 
     // Awaited mode: block until the agent answers (or timeout). Only
-    // meaningful when the tick actually emitted an event.
-    if let Some(event_id) = event_id.as_deref() {
+    // meaningful when the tick actually emitted a message.
+    if let Some(message_id) = message_id.as_deref() {
         if job.await_reply {
             let timeout = Duration::from_secs(job.await_timeout_secs);
-            match runtime.await_responds_to(event_id, timeout).await {
-                Ok(events) if !events.is_empty() => {
+            match runtime.await_message_replies(message_id, timeout).await {
+                Ok(messages) if !messages.is_empty() => {
                     tracing::info!(
                         job = %job.id,
-                        trigger = %event_id,
-                        replies = events.len(),
+                        trigger = %message_id,
+                        replies = messages.len(),
                         "scheduler awaited reply received",
                     );
                 }
                 Ok(_) => {
                     tracing::warn!(
                         job = %job.id,
-                        trigger = %event_id,
+                        trigger = %message_id,
                         timeout_secs = job.await_timeout_secs,
                         "scheduler awaited reply timed out",
                     );
@@ -514,7 +521,7 @@ async fn fire_once(
                     tracing::warn!(
                         job = %job.id,
                         error = ?e,
-                        "await_responds_to error",
+                        "await_message_replies error",
                     );
                 }
             }
@@ -538,8 +545,8 @@ fn scope_ref(s: &ScopeBinding) -> ScopeRef {
 /// Construct the §8.4 dedupe key. Returns `None` when the job opts out
 /// (`DedupeBy::None`).
 ///
-/// `SourceEventId` falls back to the `payload_hash` shape today: until
-/// S4 wires source-side event-id extraction we don't actually have a
+/// `SourceMessageId` falls back to the `payload_hash` shape today: until
+/// S4 wires source-side message-id extraction we don't actually have a
 /// stable id to key on, so the conservative behaviour is to dedupe on
 /// the body-hash anyway. The schema field stays so specs needn't be
 /// rewritten when extraction lands.
@@ -551,7 +558,7 @@ fn build_dedupe_key(
 ) -> Option<String> {
     match job.dedupe_by {
         DedupeBy::None => None,
-        DedupeBy::PayloadHash | DedupeBy::SourceEventId => Some(format!(
+        DedupeBy::PayloadHash | DedupeBy::SourceMessageId => Some(format!(
             "service:{service_id}:job:{}:fire:{}:hash:{}",
             job.id,
             fire_time.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -594,12 +601,12 @@ fn stringify_body(body: &[u8]) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
-/// Emit one artifact + one `status.update` event per non-empty JSON
-/// line in `body`. Returns the id of the *last* event appended so the
-/// caller can drive the regular cursor / await_responds_to bookkeeping.
+/// Emit one artifact + one `status.update` message per non-empty JSON
+/// line in `body`. Returns the id of the *last* message appended so the
+/// caller can drive the regular cursor / await-reply bookkeeping.
 /// A line that fails JSON parse is logged and skipped — one bad line
 /// must not block subsequent transitions in the same tick. When zero
-/// lines are emittable, returns the body-hash-stamped no-op event id
+/// lines are emittable, returns the body-hash-stamped no-op message id
 /// to preserve cursor invariants.
 async fn emit_per_line(
     emit: &EmitConfig,
@@ -615,7 +622,7 @@ async fn emit_per_line(
         anyhow::bail!("unsupported emit mode for job `{}`", job.id);
     }
     let text = String::from_utf8_lossy(body);
-    let mut last_event_id: Option<String> = None;
+    let mut last_message_id: Option<String> = None;
     let template = emit
         .artifact_name_template
         .clone()
@@ -658,7 +665,7 @@ async fn emit_per_line(
             .with_context(|| format!("publish_artifact for job `{}`", job.id))?;
         let mut meta = build_meta(job, fire_time, body_hash);
         meta.insert("artifactName".into(), Value::String(name.clone()));
-        let event_id = runtime
+        let message_id = runtime
             .append_status(
                 scope.clone(),
                 emit.status_event_type.clone(),
@@ -668,7 +675,7 @@ async fn emit_per_line(
             )
             .await
             .with_context(|| format!("append_status for job `{}`", job.id))?;
-        last_event_id = Some(event_id);
+        last_message_id = Some(message_id);
         emitted += 1;
     }
     if emitted == 0 {
@@ -686,7 +693,7 @@ async fn emit_per_line(
             .await?;
         return Ok(id);
     }
-    Ok(last_event_id.expect("emitted > 0 implies last_event_id set"))
+    Ok(last_message_id.expect("emitted > 0 implies last_message_id set"))
 }
 
 /// Substitute `{key}` tokens in `template` with the matching top-level
@@ -1043,7 +1050,7 @@ mod tests {
         let mut v = json!({
             "args": [
                 "--channel={channel.id}",
-                "{channel.workspace}/.joi/repos/manifest.json",
+                "{channel.workspace}/.loom/repos/manifest.json",
                 "{service.data_dir}/cache"
             ]
         });
@@ -1052,7 +1059,7 @@ mod tests {
         assert_eq!(v["args"][0], json!("--channel=chan_repo"));
         assert_eq!(
             v["args"][1],
-            json!("/data/channels/chan_repo/shared/.joi/repos/manifest.json")
+            json!("/data/channels/chan_repo/shared/.loom/repos/manifest.json")
         );
         assert_eq!(v["args"][2], json!("/svc/repo-cache/cache"));
     }

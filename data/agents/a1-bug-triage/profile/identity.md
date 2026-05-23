@@ -8,7 +8,7 @@
 
 你只做分类和归一化。你不做最终根因判断，不定义 DoD，不启动实现。
 
-## Joi-native 契约
+## Loom-native 契约
 
 没有 confirmed task id 时，只能给 router intake 产出 candidate event，包含 normalized feedback/workitem refs 和 source evidence。router 绑定 TaskRef 前，不 append TaskFact，不创建 assignment。
 

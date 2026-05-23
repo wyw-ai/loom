@@ -1,8 +1,8 @@
 # Artifact Contracts
 
-Cross-agent artifact JSON shapes for the joi runtime. Each artifact below
-is published with `joi artifact publish` and referenced via `attaches_artifact`
-on the `content.add` / `handoff.delivery` event that announces it. See
+Cross-agent artifact JSON shapes for the loom runtime. Each artifact below
+is published with `loom artifact publish` and referenced via `attaches_artifact`
+on the `message` / `directed message.delivery` event that announces it. See
 [`channel-topology-design.md`](./channel-topology-design.md) for the
 surrounding actor / event model. **These are stable contracts** —
 producers may extend them with non-required fields (forward compatible),
@@ -20,7 +20,7 @@ Conventions
 - `schema_version` is `"1"` for all contracts in this revision; bumped only
   on incompatible changes.
 - An artifact MUST be byte-identical across reads. To "update" a contract,
-  publish a new artifact and emit a new `content.add` event; do not mutate
+  publish a new artifact and emit a new `message` event; do not mutate
   the previous artifact.
 
 ---
@@ -93,9 +93,9 @@ each criterion's `id` + `must`.
 ## 3. `clone-manifest.json`
 
 Producer: `discovery` / `router`. Consumer:
-`delivery` (and `joi thread create --bootstrap-artifact`).
+`delivery` (and `loom thread create --bootstrap-artifact`).
 
-This shape is *also consumed by* `joi thread create --bootstrap-artifact`
+This shape is *also consumed by* `loom thread create --bootstrap-artifact`
 to populate `mounts[]` on the new thread's `scope.json`. See
 `crates/cli/src/cmd/thread.rs::parse_bootstrap_mounts`.
 
@@ -173,8 +173,8 @@ block as the first non-blank content.
 #### Optional `spec_apply` block (classroom 教学循环收口)
 
 Lesson-plans destined for the `approval.spec_apply` action gate MAY include a
-machine-actionable `spec_apply` block in the frontmatter. `joi spec
-apply --action <event_id>` reads it after the human approves and
+machine-actionable `spec_apply` block in the frontmatter. `loom spec
+apply --action <action_response_message_id>` reads it after the human approves and
 applies the changes to the on-disk AgentSpec / ServiceSpec, then bumps
 the reload-epoch marker so the running host re-spawns the worker.
 
@@ -183,14 +183,14 @@ the reload-epoch marker so the running host re-spawns the worker.
   "schema_version": "1",
   "producer": "teacher",
   "task_id": "task-2024-04-12-classroom-delivery-tweak",
-  "skills": ["a1.delivery.handoff-template"],
+  "skills": ["a1.delivery.directed message-template"],
   "spec_apply": {
     "target": { "kind": "agent", "id": "delivery" },
     "spec_patch": {
       "promptTemplate": "...new system prompt..."
     },
     "bundle_writes": [
-      { "path": "snippets/handoff.md", "contents": "## Handoff\n..." }
+      { "path": "snippets/directed message.md", "contents": "## Directed Message\n..." }
     ]
   }
 }
@@ -209,11 +209,11 @@ the reload-epoch marker so the running host re-spawns the worker.
   into `<spec-dir>/.backups/<utc-timestamp>/` before the new contents
   are written.
 - After writing, the reload epoch for the target is bumped; a host
-  running `joi {agent,service} serve` respawns the worker on the next
+  running `loom {agent,service} serve` respawns the worker on the next
   poll cycle.
-- A `runtime_receipt` artifact (JSON) and a `status.update` event with
+- A `runtime_outcome` artifact (JSON) and a `status.update` event with
   `responds_to` the action.response and `attaches_artifact` the
-  receipt are appended to the original action.request scope so the
+  delivery ack are appended to the original action.request scope so the
   decision is replayable from timeline alone.
 
 ---
@@ -313,7 +313,7 @@ via the existing `task-goal.json` + `definition-of-done.json` +
   "category": "existing_bug",
   "severity": "major",
   "certainty": "high",
-  "suspected_module": "router/handoff",
+  "suspected_module": "router/directed message",
   "next_actor": "router",
   "summary": "Single-line restatement of the user's report.",
   "evidence_refs": [
@@ -368,7 +368,7 @@ verbatim `bug-triage.v1` produced for that feedback.
       "feedback_id": "fbk-2024-04-15-9911",
       "feedback_url": "https://a1.example.com/feedback/9911",
       "title": "MR label sync 回退到上一次状态",
-      "triage_artifact_uri": "joi://artifact/<sha256>",
+      "triage_artifact_uri": "loom://artifact/<sha256>",
       "severity": "major",
       "summary": "用户报告 MR label 在 sync 后又回到旧值。",
       "fix_status": "pending"
@@ -442,7 +442,7 @@ downstream loops can subscribe declaratively.
 {
   "schema_version": "1",
   "producer": "svc_mr_detector",
-  "mr_id": "https://gitlab.alibaba-inc.com/aone/joi-apps/merge_requests/4271",
+  "mr_id": "https://gitlab.alibaba-inc.com/aone/loom-apps/merge_requests/4271",
   "captured_at": "2024-04-15T09:14:02Z",
   "previous_state": {
     "ci_status": "running",
@@ -474,7 +474,7 @@ downstream loops can subscribe declaratively.
 Required: `schema_version`, `producer`, `mr_id`, `captured_at`,
 `current_state`, `delta`, `raw_event_fingerprint`. `previous_state` is
 omitted on the first artifact for an MR. `actionable_summary` is a
-short Chinese summary suitable for a `joi handoff` message body.
+short Chinese summary suitable for a `loom directed message` message body.
 
 ---
 
@@ -493,7 +493,7 @@ thread-bound service host stops the instance.
 {
   "schema_version": "1",
   "producer": "svc_mr_detector",
-  "mr_id": "https://gitlab.alibaba-inc.com/aone/joi-apps/merge_requests/4271",
+  "mr_id": "https://gitlab.alibaba-inc.com/aone/loom-apps/merge_requests/4271",
   "title": "fix: off-by-one in MR label sync",
   "head_sha": "0a1b…",
   "base_sha": "9f8e…",
@@ -536,7 +536,7 @@ the actor under training, the success criteria (delegated to a regular
     "teacher 评分；不通过则修订 SKILL.md 再出一轮",
     "通过后发布新 bundle"
   ],
-  "dod_artifact_uri": "joi://artifact/<sha256>",
+  "dod_artifact_uri": "loom://artifact/<sha256>",
   "captured_at": "2024-04-15T10:00:00Z"
 }
 ```
@@ -566,14 +566,14 @@ the actor's reply is captured for grading. Homework is the input to
   "homework_id": "hw-training-2024-04-15-router-intake-v2-r1",
   "training_id": "training-2024-04-15-router-intake-v2",
   "target_actor": "actor_router",
-  "candidate_bundle_uri": "joi://bundle/actor_router/v2-draft",
+  "candidate_bundle_uri": "loom://bundle/actor_router/v2-draft",
   "items": [
     {
       "prompt_id": "p1",
       "input": "我要做一个新功能：把 router 拆成…（用户原文）",
       "expected_classification": "new_task",
       "actor_reply": "（teacher 在 dry-run 时填）",
-      "actor_handoff_target": "actor_discovery"
+      "actor_directed_target": "actor_discovery"
     }
   ],
   "captured_at": "2024-04-15T10:30:00Z"
@@ -582,7 +582,7 @@ the actor's reply is captured for grading. Homework is the input to
 
 Required: `schema_version`, `producer`, `homework_id`, `training_id`,
 `target_actor`, `candidate_bundle_uri`, `items`, `captured_at`.
-`actor_reply` and `actor_handoff_target` are filled in by the teacher
+`actor_reply` and `actor_directed_target` are filled in by the teacher
 after running the candidate bundle against each prompt.
 
 ---
@@ -609,7 +609,7 @@ overall verdict that classmaster uses to gate `approval.spec_apply`.
     {
       "prompt_id": "p1",
       "result": "pass",
-      "reason": "正确分类为 new_task 并 handoff 给 actor_discovery"
+      "reason": "正确分类为 new_task 并 directed message 给 actor_discovery"
     }
   ],
   "recommendation": "publish",
@@ -649,12 +649,12 @@ production evidence where possible, so classroom can be audited later.
   "target_actor": "actor_delivery",
   "severity": "p0",
   "summary": "delivery created two MRs but only one was registered for watcher",
-  "observed_behavior": "aone/a1 MR CI failed without mr-watcher handoff",
+  "observed_behavior": "aone/a1 MR CI failed without mr-watcher directed message",
   "expected_behavior": "every MR emits mr-opened.v1 and a [mr-opened v1] block",
   "evidence": [
     {
       "kind": "thread",
-      "uri": "joi://thread/thread_9fee4a9462a6",
+      "uri": "loom://thread/thread_9fee4a9462a6",
       "note": "delivery task for base image OpenAPI registration"
     }
   ],
@@ -688,19 +688,19 @@ replace `training-plan.v1`, `homework.v1`, `grading-report.v1`, or
   "target_actor": "actor_delivery",
   "mode": "shadow",
   "input_artifacts": [
-    "joi://artifact/<actor-defect>",
-    "joi://artifact/<training-plan>",
-    "joi://artifact/<definition-of-done>"
+    "loom://artifact/<actor-defect>",
+    "loom://artifact/<training-plan>",
+    "loom://artifact/<definition-of-done>"
   ],
   "output_artifacts": [
-    "joi://artifact/<homework>",
-    "joi://artifact/<grading-report>",
-    "joi://artifact/<lesson-plan>"
+    "loom://artifact/<homework>",
+    "loom://artifact/<grading-report>",
+    "loom://artifact/<lesson-plan>"
   ],
   "verdict": "pass",
   "recommendation": "publish",
   "published": false,
-  "summary": "候选 bundle 已覆盖多 MR 注册、handoff router 和工作区隔离。",
+  "summary": "候选 bundle 已覆盖多 MR 注册、directed message router 和工作区隔离。",
   "risks": [
     "shadow 模式尚未替换生产 actor_delivery"
   ],

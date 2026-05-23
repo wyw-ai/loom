@@ -3,7 +3,7 @@
 //! surface introduced after the migration.
 //!
 //! The migration
-//! deletes the legacy code paths in favour of joi-native
+//! deletes the legacy code paths in favour of Loom-native
 //! agent/service specs. Once the rewrite is done it is easy to
 //! regress by copy-pasting an old recipe; this test is the safety
 //! net.
@@ -12,7 +12,7 @@
 //! else that mentions one of the legacy tokens fails the test with a
 //! file:line list, plus a hint pointing at the design doc.
 //!
-//! Run with `cargo test -p joi-cli --test no_legacy_refs`.
+//! Run with `cargo test -p loom-cli --test no_legacy_refs`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -52,7 +52,7 @@ const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".vscode", ".idea
 
 fn workspace_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // CARGO_MANIFEST_DIR = .../joi-apps/crates/cli; walk up two.
+    // CARGO_MANIFEST_DIR points at crates/cli; walk up two.
     manifest
         .ancestors()
         .nth(2)

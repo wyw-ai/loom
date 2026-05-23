@@ -25,25 +25,22 @@ use crate::store::Store;
 use crate::subscribe::Subscriptions;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "joi-server",
-    about = "Open Multi-Actor Collaboration Protocol v0 server"
-)]
+#[command(name = "loom-server", about = "Loom multi-actor collaboration server")]
 struct Args {
     /// Address to bind, e.g. 127.0.0.1:7878
     #[arg(long, default_value = "127.0.0.1:7878")]
     bind: String,
 
-    /// Data directory (journal + artifacts)
-    #[arg(long, default_value = "./data", env = "JOI_DATA_DIR")]
+    /// Data directory (SQLite store + artifacts)
+    #[arg(long, default_value = "./data", env = "LOOM_DATA_DIR")]
     data_dir: PathBuf,
 
     /// Unix socket to bind for local JSON-line RPC instead of TCP WebSocket.
-    #[arg(long, env = "JOI_UNIX_SOCKET")]
+    #[arg(long, env = "LOOM_UNIX_SOCKET")]
     unix_socket: Option<PathBuf>,
 
     /// Directory to use for local file-based JSON RPC instead of sockets.
-    #[arg(long, env = "JOI_FILE_RPC")]
+    #[arg(long, env = "LOOM_FILE_RPC")]
     file_rpc: Option<PathBuf>,
 }
 
@@ -53,7 +50,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
 
-    let journal = Journal::open(args.data_dir.join("journal.jsonl"))?;
+    let journal = Journal::open_sqlite(args.data_dir.join("loom.sqlite3"))?;
     let store = Store::open(journal)?;
     let subscriptions = Subscriptions::new();
     let artifacts = Arc::new(ArtifactStore::new(
@@ -90,7 +87,7 @@ async fn main() -> Result<()> {
         .route("/rpc", get(ws::ws_upgrade))
         .with_state(state);
     let addr: std::net::SocketAddr = args.bind.parse()?;
-    tracing::info!(%addr, "joi-server listening");
+    tracing::info!(%addr, "loom-server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -99,7 +96,7 @@ async fn main() -> Result<()> {
 async fn serve_file_rpc(state: AppState, root: PathBuf) -> Result<()> {
     ws::spawn_file_rpc(state, root.clone())
         .with_context(|| format!("start file-rpc transport {}", root.display()))?;
-    tracing::info!(root = %root.display(), "joi-server listening on file-rpc directory");
+    tracing::info!(root = %root.display(), "loom-server listening on file-rpc directory");
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -125,7 +122,7 @@ async fn serve_unix(state: AppState, socket: PathBuf) -> Result<()> {
 
     let listener = tokio::net::UnixListener::bind(&socket)
         .with_context(|| format!("bind unix socket {}", socket.display()))?;
-    tracing::info!(socket = %socket.display(), "joi-server listening on unix socket");
+    tracing::info!(socket = %socket.display(), "loom-server listening on unix socket");
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(ws::handle_unix_socket(state.clone(), stream));

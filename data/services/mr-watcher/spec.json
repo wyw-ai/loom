@@ -23,6 +23,12 @@
     ]
   },
   "params_schema": {
+    "required": [
+      "task_id",
+      "repo",
+      "mr",
+      "target_key"
+    ],
     "properties": {
       "task_id": {
         "type": "string"
@@ -60,8 +66,8 @@
           ],
           "env": {
             "MR_WATCHER_STATE_DIR": "{instance.data_dir}",
-            "JOI_BIN": "/home/canfeng/joi-apps/joi",
-            "JOI_SERVER": "ws://127.0.0.1:7878/rpc",
+            "LOOM_BIN": "/home/canfeng/loom-apps/loom",
+            "LOOM_SERVER": "ws://127.0.0.1:7878/rpc",
             "A1_BIN": "/home/canfeng/.local/bin/a1",
             "HTTP_PROXY": "",
             "HTTPS_PROXY": "",
@@ -92,7 +98,7 @@
       "doesNotHandle": [
         "quality judgement",
         "design judgement",
-        "direct handoff",
+        "direct wake message",
         "delivery/examiner assignment creation",
         "merge/platform decisions"
       ],

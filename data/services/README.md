@@ -1,9 +1,9 @@
 # `data/services/` —— ServiceSpec 库
 
-Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi service serve`
+Loom 原生的 `ServiceSpec` 集合，通过 `loom service register` / `loom service serve`
 注册和运行。每个子目录交付：
 
-- `spec.json` —— 单文件 `ServiceSpec`。可被 `joi service validate <path>`
+- `spec.json` —— 单文件 `ServiceSpec`。可被 `loom service validate <path>`
   验证通过。
 - `bundle/*.sh` —— 服务用到的脚本（cron 拉取、手动子命令等）。所有脚本都
   支持 `--dry-run`：纯输出 JSON、不碰文件系统、不联网，便于在 CI / 本机
@@ -23,7 +23,7 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
 | `a1-side-effect-gateway` | scheduler | task-aware thread-bound | 高风险外部写前 | assignment preflight gate |
 
 > Thread bootstrap（按 clone-manifest 准备 thread workspace 仓库目录）由
-> `joi thread create --bootstrap-artifact` 通过 §4.2.1 mounts 投影完成；
+> `loom thread create --bootstrap-artifact` 通过 §4.2.1 mounts 投影完成；
 > 不再需要单独的 `repo-provision` ServiceSpec。`repo-cache` 暴露的裸仓库
 > 缓存通过 `service://repo-cache/cache/<repo_id>` URI 直接被 thread
 > workspace mount 读到。
@@ -34,20 +34,19 @@ Joi 原生的 `ServiceSpec` 集合，通过 `joi service register` / `joi servic
   注册时按 `service_<id>` 生成。
 - `bundle.source` 用工作区相对路径；`installMode: copy` 让 host 在注册时
   把 bundle 拷到 `<service.data_dir>/bundle/<version>/`。
-- Channel-level 服务读 `<channel_ws>/.joi/repos/manifest.json` 等频道工作区
+- Channel-level 服务读 `<channel_ws>/.loom/repos/manifest.json` 等频道工作区
   状态；thread-bound 服务通过参数（`bind.scope = thread` + `params_schema`）
   接受调用方注入的 thread 上下文。
 - **生命周期 / 绑定 / 参数 schema 用顶层字段（p4a 引入）**：
   - `"lifecycle"`：`"channel_singleton"`（默认）或 `"thread_bound"`，下划线 snake_case。
   - `"bind"`：`{ "scope": "thread", "auto_stop_on": ["thread.closed", "service.self_complete"] }`。
-  - `"params_schema"`：JSON Schema 片段，描述 `joi service start --in <thread> --params {...}` 接受的参数。
-  - 兼容期内 `config.{lifecycle,bind,params_schema|paramsSchema}` 仍能被
-    `ServiceSpec::normalize()` 自动提升到顶层；新写的 spec 一律放顶层。
+  - `"params_schema"`：JSON Schema 片段，描述 `loom service start --in <thread> --params {...}` 接受的参数。
+  - 新写的 spec 一律使用顶层字段；旧 `config.*` 提升只作为内部测试覆盖，不作为兼容承诺。
 - thread-bound 服务的"自我完成"协议：在最终回合的 stdout 末尾输出一行
   `{"service.self_complete":true,"reason":"..."}`，host（p4a 落地）会把它转成
   `service.self_complete` 事件并停掉对应实例。
 - 产出 artifact 的形状统一对齐 `docs/artifact-contracts.md`。
-- a1-dev-canfeng 的新版生产路径禁止依赖旧版自动开发 runtime。旧目录可以作为迁移材料保留，但 ServiceSpec 不再指向它。
+- a1-dev-canfeng 的新版生产路径禁止依赖旧版自动开发 runtime；ServiceSpec 不再指向旧目录。
 
 ## 离线冒烟
 

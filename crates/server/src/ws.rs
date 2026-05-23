@@ -276,23 +276,6 @@ pub fn spawn_stream_broadcaster(state: AppState) {
 fn fanout(state: &AppState, ev: StoreEvent) {
     use proto::methods::stream_kind as sk;
 
-    // Trace frames are turn-owner-private; route them by owner actor and
-    // never broadcast on a scope subscription.
-    if let StoreEvent::TraceAppended(frame) = &ev {
-        let Some(turn) = state.store.get_turn(&frame.turn_id) else {
-            tracing::warn!(turn = %frame.turn_id, "trace frame for unknown turn; dropping");
-            return;
-        };
-        let payload = json!({
-            "turnId": frame.turn_id,
-            "frame": frame,
-        });
-        state
-            .subscriptions
-            .send_to_actor(&turn.actor_id, method::TURN_TRACE_UPDATE, payload);
-        return;
-    }
-
     // Channel ACL invite/revoke events: actor-inbox only — never scope fan
     // out (the recipient may not yet be subscribed to anything in this
     // channel). The payload mirrors a stream/update so existing client-side
@@ -387,9 +370,9 @@ fn fanout(state: &AppState, ev: StoreEvent) {
 
     let scope = ev.scope();
     let (kind, data) = match &ev {
-        StoreEvent::EventCreated(e) => (sk::EVENT_CREATED, json!({ "event": e })),
-        StoreEvent::TurnOpened(t) => (sk::TURN_OPENED, json!({ "turn": t })),
-        StoreEvent::TurnClosed(t) => (sk::TURN_CLOSED, json!({ "turn": t })),
+        StoreEvent::MessageCreated(m) => (sk::MESSAGE_CREATED, json!({ "message": m })),
+        StoreEvent::EventCreated(_) => return,
+        StoreEvent::RunUpdated(r) => (sk::RUN_UPDATED, json!({ "run": r })),
         StoreEvent::ThreadCreated(t) => (sk::THREAD_CREATED, json!({ "thread": t })),
         StoreEvent::ThreadUpdated(t) => (sk::THREAD_UPDATED, json!({ "thread": t })),
         StoreEvent::TaskChanged(t) => (sk::TASK_CHANGED, json!({ "task": t })),
@@ -398,13 +381,11 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             json!({ "assignment": assignment, "task": task }),
         ),
         StoreEvent::ArtifactPublished(a) => (sk::ARTIFACT_PUBLISHED, json!({ "artifact": a })),
-        StoreEvent::ReceiptRecorded(r) => (sk::RECEIPT_RECORDED, json!({ "receipt": r })),
         StoreEvent::DeliveryUpdated(d) => (sk::DELIVERY_UPDATED, json!({ "delivery": d })),
         StoreEvent::MachineCommandUpdated(command) => {
             let _ = command.command_id.as_str();
             return;
         }
-        StoreEvent::TraceAppended(_) => unreachable!("trace handled above"),
         StoreEvent::ChannelGranted { .. }
         | StoreEvent::ChannelRevoked { .. }
         | StoreEvent::ChannelCreated(_) => {
@@ -456,95 +437,38 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         }
     }
 
-    // Actor-inbox delivery: when an EventCreated event hands off to an actor,
-    // also push the same stream/update directly to that actor's connection
-    // (if any). This lets a daemon-managed agent worker learn about
-    // its work without having to subscribe to every channel/thread it might
-    // care about. For non-event store events (turn open/close, threads, ...)
-    // there's no hands_off_to to follow, so they only ride the scope fan-out.
-    if let StoreEvent::EventCreated(e) = &ev {
-        use proto::types::{RefKind, RelationKind};
+    // Actor-inbox delivery: new messages with delivery rows are pushed
+    // directly to recipient actor connections. Agents do not subscribe to
+    // every channel; their wake path is the durable delivery queue plus this
+    // immediate fanout.
+    if let StoreEvent::MessageCreated(message) = &ev {
         let mut already_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Don't double-send ordinary self-authored events to an actor whose
-        // own connection is also a scope subscriber. Explicit self-handoffs
-        // are handled as forced deliveries below because they are how an agent
-        // moves a triage turn into a newly-created task thread before it has
-        // subscribed to that thread.
-        already_sent.insert(e.actor_id.clone());
-
-        // Resolve targets up-front: explicit HandsOffTo plus the implicit
-        // RespondsTo reverse-target (the actor whose event is being replied
-        // to). Reverse-delivery makes service plugins reachable without
-        // subscribing to every scope they touch — see store.rs append_event.
-        let has_explicit_actor_handoff = e
-            .relations
-            .iter()
-            .any(|r| matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor);
-        let mut targets: Vec<(String, &'static str, bool)> = Vec::new();
-        for r in &e.relations {
-            match r.kind {
-                RelationKind::HandsOffTo if r.target.kind == RefKind::Actor => {
-                    let force_self = r.target.id == e.actor_id;
-                    targets.push((r.target.id.clone(), "hands_off_to", force_self));
-                }
-                RelationKind::RespondsTo
-                    if r.target.kind == RefKind::Event
-                        && (!has_explicit_actor_handoff || e.kind == "action.response") =>
-                {
-                    if let Some(orig) = state.store.get_event(&r.target.id) {
-                        // Usually self-responses are deliberately ignored by
-                        // the actor-inbox path. Permission approvals are the
-                        // exception: a GUI may be misconfigured with the same
-                        // actor id as the agent runtime, but the response must
-                        // still reach the long-lived daemon worker
-                        // connection so it can unblock the ACP child.
-                        let force_self = e.kind == "action.response"
-                            && orig.kind == "action.request"
-                            && orig.actor_id == e.actor_id;
-                        targets.push((orig.actor_id, "responds_to", force_self));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        for (target_id, reason, force_self) in targets {
-            let dedupe_key = if force_self && target_id == e.actor_id {
-                format!("{target_id}:forced:{reason}")
-            } else {
-                target_id.clone()
-            };
-            if !already_sent.insert(dedupe_key) {
+        already_sent.insert(message.author_actor_id.clone());
+        for target_id in state.store.delivery_recipients_for_source(&message.id) {
+            if !already_sent.insert(target_id.clone()) {
                 continue;
             }
-            // ACL gate the actor-inbox push: an outsider being mentioned
-            // into a private channel must NOT receive the event — invite
-            // them first with `channel/invite`. Public channels or
-            // already-invited actors fall through.
             if !state.store.is_channel_member(
-                &channel_id_for_scope(state, &e.scope).unwrap_or_default(),
+                &channel_id_for_scope(state, &message.scope).unwrap_or_default(),
                 &target_id,
-            ) && !is_public_scope(state, &e.scope)
+            ) && !is_public_scope(state, &message.scope)
             {
                 tracing::debug!(
-                    event = %e.id,
+                    message = %message.id,
                     target = %target_id,
-                    reason = reason,
-                    scope = ?e.scope,
-                    "actor-inbox push skipped: target not a member of private channel",
+                    scope = ?message.scope,
+                    "message actor-inbox push skipped: target not a member of private channel",
                 );
                 continue;
             }
             let delivered =
                 send_actor_inbox(state, &target_id, method::STREAM_UPDATE, payload.clone());
             tracing::debug!(
-                event = %e.id,
-                kind = %e.kind,
-                from = %e.actor_id,
+                message = %message.id,
+                from = %message.author_actor_id,
                 target = %target_id,
-                reason = reason,
                 delivered,
-                "actor-inbox fanout",
+                "message actor-inbox fanout",
             );
         }
     }
@@ -629,7 +553,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use proto::types::{Actor, Ref, RefKind, Relation, RelationKind};
+    use proto::types::{
+        Actor, AudienceKind, AudienceRef, DeliveryPolicy, MessageIntent, MessageKind, Meta,
+    };
     use tokio::sync::oneshot;
 
     use crate::artifacts::ArtifactStore;
@@ -644,7 +570,7 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "joi-ws-tests-{name}-{}",
+            "loom-ws-tests-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock drift")
@@ -701,182 +627,63 @@ mod tests {
     }
 
     #[test]
-    fn fanout_delivers_explicit_self_handoff_through_actor_inbox() {
-        let state = fresh_state("self-handoff-inbox");
+    fn fanout_delivers_message_delivery_through_actor_inbox() {
+        let state = fresh_state("message-inbox");
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         state.subscriptions.add_connection(Connection {
-            id: "conn_emma".into(),
-            actor_id: Some("actor_agent_emma".into()),
+            id: "conn_agent".into(),
+            actor_id: Some("actor_agent".into()),
             tx,
         });
-
-        let channel = state
-            .store
-            .create_channel("story".into(), None)
-            .expect("channel");
-        let root = state
-            .store
-            .append_event(
-                "content.add".into(),
-                "actor_human".into(),
-                ScopeRef {
-                    kind: ScopeKind::Channel,
-                    id: channel.id.clone(),
-                },
-                None,
-                json!({ "text": "@Emma write a story" }),
-                Vec::new(),
-                None,
-            )
-            .expect("root event");
-        let thread = state
-            .store
-            .create_thread(channel.id.clone(), "story task".into(), root.id)
-            .expect("thread");
-        let handoff = state
-            .store
-            .append_event(
-                "content.add".into(),
-                "actor_agent_emma".into(),
-                ScopeRef {
-                    kind: ScopeKind::Thread,
-                    id: thread.id,
-                },
-                None,
-                json!({ "text": "continue in task thread" }),
-                vec![Relation {
-                    kind: RelationKind::HandsOffTo,
-                    target: Ref {
-                        kind: RefKind::Actor,
-                        id: "actor_agent_emma".into(),
-                        _meta: None,
-                    },
-                    _meta: None,
-                }],
-                None,
-            )
-            .expect("self handoff");
-
-        fanout(&state, StoreEvent::EventCreated(handoff.clone()));
-
-        let frame = rx.try_recv().expect("self handoff actor-inbox frame");
-        let value: Value = serde_json::from_str(&frame).expect("json notification");
-        assert_eq!(value["method"], method::STREAM_UPDATE);
-        assert_eq!(
-            value["params"]["kind"],
-            proto::methods::stream_kind::EVENT_CREATED
-        );
-        assert_eq!(value["params"]["data"]["event"]["id"], handoff.id);
-    }
-
-    #[test]
-    fn fanout_does_not_reverse_deliver_explicit_handoff_reply() {
-        let state = fresh_state("explicit-handoff-reply");
-        let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel::<String>();
-        let (examiner_tx, mut examiner_rx) = mpsc::unbounded_channel::<String>();
-        state.subscriptions.add_connection(Connection {
-            id: "conn_delivery".into(),
-            actor_id: Some("actor_delivery".into()),
-            tx: delivery_tx,
-        });
-        state.subscriptions.add_connection(Connection {
-            id: "conn_examiner".into(),
-            actor_id: Some("actor_examiner".into()),
-            tx: examiner_tx,
-        });
         state
             .store
             .upsert_actor(Actor {
-                id: "actor_delivery".into(),
-                display_name: "delivery".into(),
+                id: "actor_agent".into(),
+                display_name: "Agent".into(),
                 kind: ActorKind::Agent,
                 capabilities: None,
                 _meta: None,
             })
-            .expect("delivery actor");
-        state
-            .store
-            .upsert_actor(Actor {
-                id: "actor_examiner".into(),
-                display_name: "examiner".into(),
-                kind: ActorKind::Agent,
-                capabilities: None,
-                _meta: None,
-            })
-            .expect("examiner actor");
-
+            .expect("agent actor");
         let channel = state
             .store
             .create_channel("c".into(), None)
             .expect("channel");
         state
             .store
-            .grant_channel(&channel.id, "actor_delivery")
-            .unwrap();
-        state
+            .grant_channel(&channel.id, "actor_agent")
+            .expect("grant");
+        let message = state
             .store
-            .grant_channel(&channel.id, "actor_examiner")
-            .unwrap();
-        state
-            .store
-            .grant_channel(&channel.id, "actor_router")
-            .unwrap();
-        let scope = ScopeRef {
-            kind: ScopeKind::Channel,
-            id: channel.id.clone(),
-        };
-        let original = state
-            .store
-            .append_event(
-                "content.add".into(),
-                "actor_delivery".into(),
-                scope.clone(),
-                None,
-                json!({ "text": "done" }),
+            .append_message(
+                "actor_human".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "@actor_agent please handle this".into(),
                 Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
                 None,
+                None,
+                Vec::new(),
+                Meta::default(),
             )
-            .expect("original");
-        let handoff = state
-            .store
-            .append_event(
-                "content.add".into(),
-                "actor_router".into(),
-                scope,
-                None,
-                json!({ "text": "please review" }),
-                vec![
-                    Relation {
-                        kind: RelationKind::RespondsTo,
-                        target: Ref {
-                            kind: RefKind::Event,
-                            id: original.id,
-                            _meta: None,
-                        },
-                        _meta: None,
-                    },
-                    Relation {
-                        kind: RelationKind::HandsOffTo,
-                        target: Ref {
-                            kind: RefKind::Actor,
-                            id: "actor_examiner".into(),
-                            _meta: None,
-                        },
-                        _meta: None,
-                    },
-                ],
-                None,
-            )
-            .expect("handoff");
+            .expect("message");
 
-        fanout(&state, StoreEvent::EventCreated(handoff));
+        fanout(&state, StoreEvent::MessageCreated(message.clone()));
 
-        examiner_rx
-            .try_recv()
-            .expect("explicit handoff target should receive actor-inbox frame");
-        assert!(
-            delivery_rx.try_recv().is_err(),
-            "responds_to actor should not also receive actor-inbox frame",
+        let frame = rx.try_recv().expect("message actor-inbox frame");
+        let value: Value = serde_json::from_str(&frame).expect("json notification");
+        assert_eq!(value["method"], method::STREAM_UPDATE);
+        assert_eq!(
+            value["params"]["kind"],
+            proto::methods::stream_kind::MESSAGE_CREATED
         );
+        assert_eq!(value["params"]["data"]["message"]["id"], message.id);
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # provision-thread-ws.sh — set up a fresh per-thread workspace.
 #
-# Reads a clone-manifest (JSON) and creates ${HOME}/joi-workspaces/thread/<thread_id>/repos/<basename>/
+# Reads a clone-manifest (JSON) and creates ${HOME}/loom-workspaces/thread/<thread_id>/repos/<basename>/
 # for every entry. Behavior per entry:
 #   - "worktree":  fresh git clone using the channel's bare mirror as
 #                  --reference, then `git checkout -B <task_branch>
@@ -32,7 +32,7 @@
 set -euo pipefail
 
 MANIFEST=""
-CHAN_ID="${JOI_CHAN_ID:-}"
+CHAN_ID="${LOOM_CHAN_ID:-}"
 
 usage() {
     cat <<'EOF'
@@ -61,8 +61,8 @@ PICKUP_BRANCH=$(jq -r '.pickup_branch // empty' "$MANIFEST")
 [[ -n "$THREAD_ID" ]] || { echo "manifest missing thread_id" >&2; exit 2; }
 [[ -n "$CHAN_ID" ]]   || { echo "missing channel_id (manifest or --chan)" >&2; exit 2; }
 
-SHARED_ROOT="${HOME}/.agentx/channels/${CHAN_ID}/shared/repos"
-WS_ROOT="${HOME}/joi-workspaces/thread/${THREAD_ID}/repos"
+SHARED_ROOT="${LOOM_AGENT_DATA_ROOT:-${HOME}/.local/share/loom/agents}/channels/${CHAN_ID}/shared/repos"
+WS_ROOT="${HOME}/loom-workspaces/thread/${THREAD_ID}/repos"
 mkdir -p "$WS_ROOT"
 
 basename_of() {

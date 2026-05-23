@@ -269,7 +269,7 @@ mod tests {
     }
 
     fn tmpdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("joi-memory-test-{}", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("loom-memory-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

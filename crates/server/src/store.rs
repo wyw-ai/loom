@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -28,9 +28,9 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
+    MessageCreated(Message),
     EventCreated(Event),
-    TurnOpened(Turn),
-    TurnClosed(Turn),
+    RunUpdated(Run),
     ThreadCreated(Thread),
     TaskChanged(Task),
     TaskAssignmentChanged {
@@ -40,13 +40,8 @@ pub enum StoreEvent {
     ChannelCreated(Channel),
     ThreadUpdated(Thread),
     ArtifactPublished(Artifact),
-    ReceiptRecorded(Receipt),
     DeliveryUpdated(Delivery),
     MachineCommandUpdated(MachineCommand),
-    /// Turn-private trace frame. Carried on the same broadcast channel as
-    /// scope events purely so the websocket layer can route it; the fanout
-    /// must NOT broadcast it to scope subscribers — see `ws::fanout`.
-    TraceAppended(TraceFrame),
     /// `actor_id` was just added to `channel_id`'s ACL. ws::fanout pushes
     /// this directly to the affected actor's connection (if any) — never
     /// broadcast to scope subscribers.
@@ -65,8 +60,9 @@ pub enum StoreEvent {
 impl StoreEvent {
     pub fn scope(&self) -> Option<ScopeRef> {
         match self {
+            StoreEvent::MessageCreated(m) => Some(m.scope.clone()),
             StoreEvent::EventCreated(e) => Some(e.scope.clone()),
-            StoreEvent::TurnOpened(t) | StoreEvent::TurnClosed(t) => Some(t.scope.clone()),
+            StoreEvent::RunUpdated(r) => Some(r.scope.clone()),
             StoreEvent::ThreadCreated(c) => Some(ScopeRef {
                 kind: ScopeKind::Channel,
                 id: c.channel_id.clone(),
@@ -84,12 +80,8 @@ impl StoreEvent {
                 id: task.channel_id.clone(),
             }),
             StoreEvent::ArtifactPublished(_) => None,
-            StoreEvent::ReceiptRecorded(_) => None,
             StoreEvent::DeliveryUpdated(_) => None,
             StoreEvent::MachineCommandUpdated(_) => None,
-            // Trace frames are owner-private; ws fanout routes them by
-            // turn owner, never by scope.
-            StoreEvent::TraceAppended(_) => None,
             // ACL grants/revokes are direct-to-actor notifications; ws
             // fanout routes them via `send_to_actor`, not scope subs.
             StoreEvent::ChannelGranted { .. } => None,
@@ -105,6 +97,8 @@ impl StoreEvent {
 struct Inner {
     actors: HashMap<String, Actor>,
     channels: HashMap<String, Channel>,
+    actor_groups: HashMap<String, ActorGroup>,
+    actor_presences: HashMap<(String, String), ActorPresence>,
     threads: HashMap<String, Thread>,
     tasks: HashMap<String, Task>,
     assignments: HashMap<String, TaskAssignment>,
@@ -120,13 +114,21 @@ struct Inner {
     /// scope ref -> ordered events
     events_by_scope: HashMap<ScopeRef, Vec<String>>,
     events: HashMap<String, Event>,
+    /// scope ref -> ordered messages
+    messages_by_scope: HashMap<ScopeRef, Vec<String>>,
+    messages: HashMap<String, Message>,
     /// (turn_id) -> next seq
     turn_seq: HashMap<String, u64>,
-    /// implicit turn used when an event/append arrives with no turn_id, keyed by (actor_id, scope)
+    runs: HashMap<String, Run>,
+    run_frames: HashMap<String, Vec<RunFrame>>,
+    run_seq: HashMap<String, u64>,
+    agent_config_versions: HashMap<String, AgentConfigVersion>,
+    agent_config_activations: HashMap<String, AgentConfigActivation>,
+    coordination_sessions: HashMap<String, CoordinationSession>,
+    coordination_steps: HashMap<String, CoordinationStep>,
     memberships: HashMap<(String, ScopeRef), Membership>,
     deliveries: HashMap<(String, String), Delivery>,
     machine_commands: HashMap<String, MachineCommand>,
-    receipts: HashMap<(String, String, ReceiptKind), Receipt>,
     reminders: HashMap<String, Reminder>,
     artifacts: HashMap<String, Artifact>,
     /// turn id -> ordered trace frames (owner-private; never broadcast)
@@ -326,6 +328,219 @@ impl Store {
         self.inner.read().channels.get(id).cloned()
     }
 
+    // -------- Actor groups --------
+
+    pub fn create_actor_group(
+        &self,
+        channel_id: String,
+        name: String,
+        display_name: Option<String>,
+        member_actor_ids: Vec<String>,
+        wake_agents: bool,
+    ) -> StoreResult<ActorGroup> {
+        let _guard = self.structure_lock.lock();
+        let name = normalize_actor_group_name(&name)?;
+        let display_name = display_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.clone());
+        let member_actor_ids = unique_nonempty(member_actor_ids);
+        {
+            let inner = self.inner.read();
+            if !inner.channels.contains_key(&channel_id) {
+                return Err(StoreError::NotFound(format!("channel {channel_id}")));
+            }
+            if inner
+                .actor_groups
+                .values()
+                .any(|group| group.channel_id == channel_id && group.name == name)
+            {
+                return Err(StoreError::Conflict(format!(
+                    "actor group @{name} already exists in channel {channel_id}"
+                )));
+            }
+            for actor_id in &member_actor_ids {
+                validate_actor_group_member_inner(&inner, &channel_id, actor_id)?;
+            }
+        }
+        let now = Utc::now();
+        let group = ActorGroup {
+            id: format!("agroup_{}", short_id()),
+            channel_id,
+            name,
+            display_name,
+            member_actor_ids,
+            wake_agents,
+            created_at: now,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::ActorGroupUpsert(group.clone()))?;
+        self.inner
+            .write()
+            .actor_groups
+            .insert(group.id.clone(), group.clone());
+        Ok(group)
+    }
+
+    pub fn list_actor_groups(&self, channel_id: Option<&str>) -> Vec<ActorGroup> {
+        let mut groups: Vec<ActorGroup> = self
+            .inner
+            .read()
+            .actor_groups
+            .values()
+            .filter(|group| channel_id.is_none_or(|id| group.channel_id == id))
+            .cloned()
+            .collect();
+        groups.sort_by(|a, b| {
+            a.channel_id
+                .cmp(&b.channel_id)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        groups
+    }
+
+    pub fn get_actor_group(&self, group_id: &str) -> Option<ActorGroup> {
+        self.inner.read().actor_groups.get(group_id).cloned()
+    }
+
+    pub fn add_actor_group_member(
+        &self,
+        group_id: &str,
+        actor_id: &str,
+    ) -> StoreResult<ActorGroup> {
+        let _guard = self.structure_lock.lock();
+        let mut group = self
+            .get_actor_group(group_id)
+            .ok_or_else(|| StoreError::NotFound(format!("actor group {group_id}")))?;
+        {
+            let inner = self.inner.read();
+            validate_actor_group_member_inner(&inner, &group.channel_id, actor_id)?;
+        }
+        if !group.member_actor_ids.iter().any(|id| id == actor_id) {
+            group.member_actor_ids.push(actor_id.to_string());
+            group.member_actor_ids = unique_nonempty(group.member_actor_ids);
+            group.updated_at = Utc::now();
+        }
+        self.journal
+            .append(&Mutation::ActorGroupUpsert(group.clone()))?;
+        self.inner
+            .write()
+            .actor_groups
+            .insert(group.id.clone(), group.clone());
+        Ok(group)
+    }
+
+    pub fn remove_actor_group_member(
+        &self,
+        group_id: &str,
+        actor_id: &str,
+    ) -> StoreResult<ActorGroup> {
+        let _guard = self.structure_lock.lock();
+        let mut group = self
+            .get_actor_group(group_id)
+            .ok_or_else(|| StoreError::NotFound(format!("actor group {group_id}")))?;
+        let before = group.member_actor_ids.len();
+        group.member_actor_ids.retain(|id| id != actor_id);
+        if group.member_actor_ids.len() != before {
+            group.updated_at = Utc::now();
+        }
+        self.journal
+            .append(&Mutation::ActorGroupUpsert(group.clone()))?;
+        self.inner
+            .write()
+            .actor_groups
+            .insert(group.id.clone(), group.clone());
+        Ok(group)
+    }
+
+    pub fn follow_thread(
+        &self,
+        actor_id: String,
+        thread_id: &str,
+        muted: bool,
+    ) -> StoreResult<ActorPresence> {
+        let thread = self
+            .get_thread(thread_id)
+            .ok_or_else(|| StoreError::NotFound(format!("thread {thread_id}")))?;
+        self.validate_scope_actor(
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: thread.id.clone(),
+            },
+            &actor_id,
+        )?;
+        let now = Utc::now();
+        let key = (actor_id.clone(), thread.id.clone());
+        let created_at = self
+            .inner
+            .read()
+            .actor_presences
+            .get(&key)
+            .map(|presence| presence.created_at)
+            .unwrap_or(now);
+        let presence = ActorPresence {
+            actor_id,
+            channel_id: thread.channel_id,
+            thread_id: Some(thread.id),
+            following: true,
+            muted,
+            attention_policy: if muted { "muted" } else { "follow" }.into(),
+            created_at,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::ActorPresenceUpsert(presence.clone()))?;
+        self.inner
+            .write()
+            .actor_presences
+            .insert(key, presence.clone());
+        Ok(presence)
+    }
+
+    pub fn unfollow_thread(&self, actor_id: String, thread_id: &str) -> StoreResult<ActorPresence> {
+        let thread = self
+            .get_thread(thread_id)
+            .ok_or_else(|| StoreError::NotFound(format!("thread {thread_id}")))?;
+        self.validate_scope_actor(
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: thread.id.clone(),
+            },
+            &actor_id,
+        )?;
+        let now = Utc::now();
+        let key = (actor_id.clone(), thread.id.clone());
+        let created_at = self
+            .inner
+            .read()
+            .actor_presences
+            .get(&key)
+            .map(|presence| presence.created_at)
+            .unwrap_or(now);
+        let presence = ActorPresence {
+            actor_id,
+            channel_id: thread.channel_id,
+            thread_id: Some(thread.id),
+            following: false,
+            muted: false,
+            attention_policy: "none".into(),
+            created_at,
+            updated_at: now,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::ActorPresenceUpsert(presence.clone()))?;
+        self.inner
+            .write()
+            .actor_presences
+            .insert(key, presence.clone());
+        Ok(presence)
+    }
+
     pub fn update_channel(&self, id: &str, title: String) -> StoreResult<Channel> {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
@@ -390,6 +605,7 @@ impl Store {
         let removed = {
             let mut inner = self.inner.write();
             let removed = inner.channels.remove(id).is_some();
+            inner.actor_groups.retain(|_, group| group.channel_id != id);
             let task_ids: std::collections::HashSet<String> = inner
                 .tasks
                 .values()
@@ -411,32 +627,32 @@ impl Store {
         &self,
         channel_id: String,
         title: String,
-        root_event_id: String,
+        root_message_id: String,
     ) -> StoreResult<Thread> {
         let _guard = self.structure_lock.lock();
-        self.create_thread_locked(channel_id, title, root_event_id)
+        self.create_thread_locked(channel_id, title, root_message_id)
     }
 
     fn create_thread_locked(
         &self,
         channel_id: String,
         title: String,
-        root_event_id: String,
+        root_message_id: String,
     ) -> StoreResult<Thread> {
         if self.get_channel(&channel_id).is_none() {
             return Err(StoreError::NotFound(format!("channel {channel_id}")));
         }
         let root = self
-            .get_event(&root_event_id)
-            .ok_or_else(|| StoreError::NotFound(format!("event {root_event_id}")))?;
+            .get_message(&root_message_id)
+            .ok_or_else(|| StoreError::NotFound(format!("message {root_message_id}")))?;
         if root.scope.kind != ScopeKind::Channel || root.scope.id != channel_id {
             return Err(StoreError::InvalidState(format!(
-                "thread root event {root_event_id} must belong to channel {channel_id}"
+                "thread root message {root_message_id} must belong to channel {channel_id}"
             )));
         }
-        if let Some(existing) = self.find_thread_by_root(&channel_id, &root_event_id) {
+        if let Some(existing) = self.find_thread_by_root(&channel_id, &root_message_id) {
             return Err(StoreError::Conflict(format!(
-                "thread {} already uses root event {root_event_id}",
+                "thread {} already uses root message {root_message_id}",
                 existing.id
             )));
         }
@@ -444,7 +660,7 @@ impl Store {
             id: format!("thread_{}", short_id()),
             channel_id,
             title,
-            root_event_id,
+            root_message_id,
             archived_at: None,
             _meta: None,
         };
@@ -497,12 +713,12 @@ impl Store {
         self.inner.read().threads.get(id).cloned()
     }
 
-    pub fn find_thread_by_root(&self, channel_id: &str, root_event_id: &str) -> Option<Thread> {
+    pub fn find_thread_by_root(&self, channel_id: &str, root_message_id: &str) -> Option<Thread> {
         self.inner
             .read()
             .threads
             .values()
-            .find(|t| t.channel_id == channel_id && t.root_event_id == root_event_id)
+            .find(|t| t.channel_id == channel_id && t.root_message_id == root_message_id)
             .cloned()
     }
 
@@ -549,7 +765,7 @@ impl Store {
 
     /// Hard-removes the thread row and the events_by_scope index for its
     /// scope so the thread no longer appears in `list_threads` / `read_scope`.
-    /// Event rows, deliveries, receipts, and trace frames are kept on disk;
+    /// Event rows, deliveries, and trace frames are kept on disk;
     /// they become orphaned but harmless because their thread is gone.
     pub fn delete_thread(&self, id: &str) -> StoreResult<bool> {
         if self.get_thread(id).is_none() {
@@ -583,23 +799,23 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn create_task(
         &self,
-        source_event_id: String,
+        source_message_id: String,
         title: Option<String>,
         description: String,
         requester_actor_id: String,
         owner_actor_id: Option<String>,
         status: Option<TaskStatus>,
-        parent_source_event_id: Option<String>,
+        parent_source_message_id: Option<String>,
         parent_task_id: Option<String>,
         practice_contract_epoch: Option<String>,
     ) -> StoreResult<Task> {
         let _guard = self.structure_lock.lock();
         let source = self
-            .get_event(&source_event_id)
-            .ok_or_else(|| StoreError::NotFound(format!("event {source_event_id}")))?;
+            .get_message(&source_message_id)
+            .ok_or_else(|| StoreError::NotFound(format!("message {source_message_id}")))?;
         if source.scope.kind != ScopeKind::Channel {
             return Err(StoreError::InvalidState(format!(
-                "task source event {source_event_id} must be a top-level channel event"
+                "task source message {source_message_id} must be a top-level channel message"
             )));
         }
         let channel_id = source.scope.id.clone();
@@ -615,28 +831,28 @@ impl Store {
                 )));
             }
         }
-        if self.find_task_by_source(&source_event_id).is_some() {
+        if self.find_task_by_source(&source_message_id).is_some() {
             return Err(StoreError::Conflict(format!(
-                "task already exists for source event {source_event_id}"
+                "task already exists for source message {source_message_id}"
             )));
         }
 
         let task_title = title
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| event_title(&source));
-        let canonical_thread_id = match self.find_thread_by_root(&channel_id, &source_event_id) {
+            .unwrap_or_else(|| message_title(&source));
+        let canonical_thread_id = match self.find_thread_by_root(&channel_id, &source_message_id) {
             Some(thread) => thread.id,
             None => match self.create_thread_locked(
                 channel_id.clone(),
                 task_title.clone(),
-                source_event_id.clone(),
+                source_message_id.clone(),
             ) {
                 Ok(thread) => thread.id,
                 Err(StoreError::Conflict(_)) => {
-                    self.find_thread_by_root(&channel_id, &source_event_id)
+                    self.find_thread_by_root(&channel_id, &source_message_id)
                         .ok_or_else(|| {
                             StoreError::Conflict(format!(
-                                "thread already exists for root event {source_event_id}"
+                                "thread already exists for root message {source_message_id}"
                             ))
                         })?
                         .id
@@ -651,9 +867,9 @@ impl Store {
             id: format!("task_{}", short_id()),
             number,
             channel_id,
-            source_event_id,
+            source_message_id,
             canonical_thread_id,
-            parent_source_event_id,
+            parent_source_message_id,
             parent_task_id,
             title: task_title,
             description,
@@ -717,19 +933,19 @@ impl Store {
         rows
     }
 
-    pub fn find_task_by_source(&self, source_event_id: &str) -> Option<Task> {
+    pub fn find_task_by_source(&self, source_message_id: &str) -> Option<Task> {
         self.inner
             .read()
             .tasks
             .values()
-            .find(|task| task.source_event_id == source_event_id)
+            .find(|task| task.source_message_id == source_message_id)
             .cloned()
     }
 
     pub fn list_tasks(
         &self,
         channel_id: Option<&str>,
-        source_event_id: Option<&str>,
+        source_message_id: Option<&str>,
         owner_actor_id: Option<&str>,
         statuses: &[TaskStatus],
     ) -> Vec<Task> {
@@ -738,7 +954,7 @@ impl Store {
             .tasks
             .values()
             .filter(|task| channel_id.is_none_or(|id| task.channel_id == id))
-            .filter(|task| source_event_id.is_none_or(|id| task.source_event_id == id))
+            .filter(|task| source_message_id.is_none_or(|id| task.source_message_id == id))
             .filter(|task| {
                 owner_actor_id.is_none_or(|id| task.owner_actor_id.as_deref() == Some(id))
             })
@@ -810,7 +1026,7 @@ impl Store {
         confidence: TaskRefConfidence,
         status: TaskRefStatus,
         superseded_by: Option<String>,
-        source_event_id: Option<String>,
+        source_message_id: Option<String>,
         created_by_actor_id: String,
     ) -> StoreResult<TaskRef> {
         let _guard = self.structure_lock.lock();
@@ -892,7 +1108,7 @@ impl Store {
             confidence,
             status,
             superseded_by,
-            source_event_id,
+            source_message_id,
             created_by_actor_id,
             created_at: now,
             updated_at: now,
@@ -1518,7 +1734,7 @@ impl Store {
             assignment_type,
             instruction,
             status: TaskAssignmentStatus::Pending,
-            result_event_id: None,
+            result_message_id: None,
             result_summary: String::new(),
             contract,
             idempotency_key: effective_idempotency,
@@ -1574,7 +1790,7 @@ impl Store {
         &self,
         assignment_id: &str,
         status: Option<TaskAssignmentStatus>,
-        result_event_id: Option<String>,
+        result_message_id: Option<String>,
         result_summary: Option<String>,
         result_envelope: Option<serde_json::Value>,
         result_artifact_ids: Vec<String>,
@@ -1585,9 +1801,9 @@ impl Store {
         let mut assignment = self
             .get_assignment(assignment_id)
             .ok_or_else(|| StoreError::NotFound(format!("assignment {assignment_id}")))?;
-        if let Some(event_id) = result_event_id.as_ref() {
-            if self.get_event(event_id).is_none() {
-                return Err(StoreError::NotFound(format!("event {event_id}")));
+        if let Some(message_id) = result_message_id.as_ref() {
+            if self.get_message(message_id).is_none() {
+                return Err(StoreError::NotFound(format!("message {message_id}")));
             }
         }
         if let Some(next_status) = status {
@@ -1618,8 +1834,8 @@ impl Store {
             }
             assignment.status = next_status;
         }
-        if let Some(event_id) = result_event_id {
-            assignment.result_event_id = Some(event_id);
+        if let Some(message_id) = result_message_id {
+            assignment.result_message_id = Some(message_id);
         }
         if let Some(summary) = result_summary {
             assignment.result_summary = summary;
@@ -2310,141 +2526,1303 @@ impl Store {
         Ok(Some(change))
     }
 
-    // -------- Turns --------
+    // -------- Runs --------
 
-    pub fn open_turn(
+    pub fn open_run(
         &self,
         actor_id: String,
         scope: ScopeRef,
-        trigger_event_id: Option<String>,
-    ) -> StoreResult<Turn> {
-        let turn = Turn {
-            id: format!("turn_{}", short_id()),
+        delivery_id: Option<String>,
+        start_reason: Option<String>,
+        agent_config_version_id: String,
+        metadata: Meta,
+    ) -> StoreResult<Run> {
+        if agent_config_version_id.trim().is_empty() {
+            return Err(StoreError::InvalidState(
+                "agent_config_version_id is required".into(),
+            ));
+        }
+        if self
+            .get_agent_config_version(&agent_config_version_id)
+            .is_none()
+        {
+            return Err(StoreError::NotFound(format!(
+                "agent config version {agent_config_version_id}"
+            )));
+        }
+        let start_reason = start_reason
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty());
+        if delivery_id.is_none() && start_reason.is_none() {
+            return Err(StoreError::InvalidState(
+                "run.open requires deliveryId or startReason".into(),
+            ));
+        }
+        self.check_scope_access(&scope, &actor_id)?;
+        {
+            let inner = self.inner.read();
+            if !inner.actors.contains_key(&actor_id) {
+                return Err(StoreError::NotFound(format!("actor {actor_id}")));
+            }
+            if let Some(delivery_id) = delivery_id.as_deref() {
+                let key = (delivery_id.to_string(), actor_id.clone());
+                if !inner.deliveries.contains_key(&key) {
+                    return Err(StoreError::NotFound(format!(
+                        "delivery source={delivery_id} actor={actor_id}"
+                    )));
+                }
+            }
+        }
+        let run = Run {
+            id: format!("run_{}", short_id()),
             actor_id,
             scope,
-            trigger_event_id,
-            status: TurnStatus::Open,
+            delivery_id,
+            start_reason,
+            agent_config_version_id,
+            status: RunStatus::Queued,
             opened_at: Utc::now(),
             closed_at: None,
-            _meta: None,
+            metadata,
         };
-        self.journal.append(&Mutation::TurnOpen(turn.clone()))?;
-        self.inner
-            .write()
-            .turns
-            .insert(turn.id.clone(), turn.clone());
-        self.emit(StoreEvent::TurnOpened(turn.clone()));
-        Ok(turn)
+        self.journal.append(&Mutation::RunUpsert(run.clone()))?;
+        self.inner.write().runs.insert(run.id.clone(), run.clone());
+        self.emit(StoreEvent::RunUpdated(run.clone()));
+        Ok(run)
     }
 
-    pub fn close_turn(&self, turn_id: &str, status: TurnStatus) -> StoreResult<Turn> {
-        let now = Utc::now();
-        self.journal.append(&Mutation::TurnClose {
-            turn_id: turn_id.into(),
-            status,
-            closed_at: now,
-        })?;
-        let mut inner = self.inner.write();
-        let turn = inner
-            .turns
-            .get_mut(turn_id)
-            .ok_or_else(|| StoreError::NotFound(format!("turn {turn_id}")))?;
-        turn.status = status;
-        turn.closed_at = Some(now);
-        let cloned = turn.clone();
-        drop(inner);
-        self.emit(StoreEvent::TurnClosed(cloned.clone()));
-        Ok(cloned)
-    }
-
-    pub fn get_turn(&self, id: &str) -> Option<Turn> {
-        self.inner.read().turns.get(id).cloned()
-    }
-
-    // -------- Turn-private trace --------
-
-    /// Append a turn-private trace frame. Caller passes `kind` and `payload`;
-    /// this method assigns the frame's monotonic per-turn `seq` and a
-    /// `occurred_at` timestamp, persists it to the journal, and emits a
-    /// `StoreEvent::TraceAppended` for the websocket layer to route to the
-    /// turn owner only.
-    ///
-    /// Returns the persisted frame.
-    pub fn append_trace_frame(
+    pub fn append_run_frame(
         &self,
-        turn_id: &str,
-        kind: proto::types::trace::TraceKind,
+        run_id: &str,
+        status: Option<RunStatus>,
+        kind: String,
         payload: serde_json::Value,
-    ) -> StoreResult<TraceFrame> {
-        // Validate turn exists. We do not require it to be Open: callers may
-        // emit a final trace frame as part of the same handler that closes
-        // the turn (order is best-effort; the frame is owner-private anyway).
-        if !self.inner.read().turns.contains_key(turn_id) {
-            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+    ) -> StoreResult<(Run, RunFrame)> {
+        if status.is_some_and(is_terminal_run_status) {
+            return Err(StoreError::InvalidState(
+                "use run.close for terminal run statuses".into(),
+            ));
         }
-
-        let now = Utc::now();
+        let mut run = self
+            .get_run(run_id)
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        if is_terminal_run_status(run.status) {
+            return Err(StoreError::InvalidState(format!(
+                "run {run_id} is already terminal"
+            )));
+        }
+        if let Some(status) = status {
+            run.status = status;
+        }
         let seq = {
             let mut inner = self.inner.write();
-            let entry = inner.trace_seq.entry(turn_id.to_string()).or_insert(0);
+            let entry = inner.run_seq.entry(run_id.to_string()).or_insert(0);
             *entry += 1;
             *entry
         };
-
-        let frame = TraceFrame {
-            turn_id: turn_id.to_string(),
+        let frame = RunFrame {
+            run_id: run_id.to_string(),
             seq,
-            kind,
-            occurred_at: now,
+            kind: if kind.trim().is_empty() {
+                "log".into()
+            } else {
+                kind
+            },
             payload,
-            _meta: None,
+            created_at: Utc::now(),
         };
-        self.journal.append(&Mutation::TraceAppend(frame.clone()))?;
-        self.inner
-            .write()
-            .trace_by_turn
-            .entry(turn_id.to_string())
+        self.journal.append(&Mutation::RunUpsert(run.clone()))?;
+        self.journal
+            .append(&Mutation::RunFrameAppend(frame.clone()))?;
+        let mut inner = self.inner.write();
+        inner.runs.insert(run.id.clone(), run.clone());
+        inner
+            .run_frames
+            .entry(run_id.to_string())
             .or_default()
             .push(frame.clone());
-        self.emit(StoreEvent::TraceAppended(frame.clone()));
-        Ok(frame)
+        drop(inner);
+        self.emit(StoreEvent::RunUpdated(run.clone()));
+        Ok((run, frame))
     }
 
-    /// Read trace frames for a turn. `before_seq` selects frames with
-    /// `seq < before_seq` (older); when `None`, the latest `limit` frames
-    /// are returned. Returns frames in ascending `seq` order along with
-    /// `has_more`.
-    pub fn read_turn_trace(
-        &self,
-        turn_id: &str,
-        limit: u32,
-        before_seq: Option<u64>,
-    ) -> StoreResult<(Vec<TraceFrame>, bool)> {
-        if !self.inner.read().turns.contains_key(turn_id) {
-            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+    pub fn close_run(&self, run_id: &str, status: RunStatus) -> StoreResult<Run> {
+        if !is_terminal_run_status(status) {
+            return Err(StoreError::InvalidState(
+                "run.close requires completed, failed, or canceled".into(),
+            ));
         }
-        let inner = self.inner.read();
-        let frames = match inner.trace_by_turn.get(turn_id) {
-            Some(v) => v.clone(),
-            None => return Ok((vec![], false)),
+        let mut run = self
+            .get_run(run_id)
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        if is_terminal_run_status(run.status) {
+            return Ok(run);
+        }
+        run.status = status;
+        run.closed_at = Some(Utc::now());
+        self.journal.append(&Mutation::RunUpsert(run.clone()))?;
+        self.inner.write().runs.insert(run.id.clone(), run.clone());
+        self.emit(StoreEvent::RunUpdated(run.clone()));
+        Ok(run)
+    }
+
+    pub fn get_run(&self, run_id: &str) -> Option<Run> {
+        self.inner.read().runs.get(run_id).cloned()
+    }
+
+    pub fn message_target_for_scope(&self, scope: &ScopeRef) -> StoreResult<String> {
+        match scope.kind {
+            ScopeKind::Channel => {
+                if self.get_channel(&scope.id).is_none() {
+                    return Err(StoreError::NotFound(format!("channel {}", scope.id)));
+                }
+                Ok(format!("#{}", scope.id))
+            }
+            ScopeKind::Thread => {
+                let thread = self
+                    .get_thread(&scope.id)
+                    .ok_or_else(|| StoreError::NotFound(format!("thread {}", scope.id)))?;
+                Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
+            }
+        }
+    }
+
+    // -------- Agent config versions --------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_agent_config_version(
+        &self,
+        actor_id: String,
+        version: Option<String>,
+        prompt: String,
+        model: String,
+        adapter: String,
+        tools: serde_json::Value,
+        capability_tags: Vec<String>,
+        attention_policy: serde_json::Value,
+        context_policy: serde_json::Value,
+        reply_policy: serde_json::Value,
+        created_by: String,
+        metadata: Meta,
+    ) -> StoreResult<AgentConfigVersion> {
+        if self.get_actor(&actor_id).is_none() {
+            return Err(StoreError::NotFound(format!("actor {actor_id}")));
+        }
+        let version_label = version
+            .map(|version| version.trim().to_string())
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| format!("v{}", Utc::now().timestamp_millis()));
+        let config = AgentConfigVersion {
+            id: format!("acfg_{}", short_id()),
+            actor_id,
+            version: version_label,
+            prompt,
+            model,
+            adapter,
+            tools,
+            capability_tags: unique_nonempty(capability_tags),
+            attention_policy,
+            context_policy,
+            reply_policy,
+            created_by,
+            created_at: Utc::now(),
+            metadata,
         };
-        let end = match before_seq {
-            Some(before) => frames
-                .iter()
-                .position(|f| f.seq >= before)
-                .unwrap_or(frames.len()),
-            None => frames.len(),
+        self.journal
+            .append(&Mutation::AgentConfigVersionPublish(config.clone()))?;
+        self.inner
+            .write()
+            .agent_config_versions
+            .insert(config.id.clone(), config.clone());
+        Ok(config)
+    }
+
+    pub fn activate_agent_config_version(
+        &self,
+        actor_id: String,
+        version_id: String,
+        scope: Option<ScopeRef>,
+        activated_by: String,
+    ) -> StoreResult<(AgentConfigActivation, AgentConfigVersion)> {
+        let version = self
+            .inner
+            .read()
+            .agent_config_versions
+            .get(&version_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("agent config version {version_id}")))?;
+        if version.actor_id != actor_id {
+            return Err(StoreError::InvalidState(format!(
+                "version {version_id} belongs to actor {}, not {actor_id}",
+                version.actor_id
+            )));
+        }
+        if let Some(scope) = scope.as_ref() {
+            self.check_scope_access(scope, &activated_by)?;
+        }
+        let activation = AgentConfigActivation {
+            actor_id,
+            version_id,
+            scope,
+            activated_by,
+            activated_at: Utc::now(),
+        };
+        self.journal
+            .append(&Mutation::AgentConfigActivationUpsert(activation.clone()))?;
+        self.inner.write().agent_config_activations.insert(
+            agent_config_activation_key(&activation.actor_id, activation.scope.as_ref()),
+            activation.clone(),
+        );
+        Ok((activation, version))
+    }
+
+    pub fn get_agent_config_version(&self, version_id: &str) -> Option<AgentConfigVersion> {
+        self.inner
+            .read()
+            .agent_config_versions
+            .get(version_id)
+            .cloned()
+    }
+
+    // -------- Coordination --------
+
+    pub fn propose_coordination_session(
+        &self,
+        owner_actor_id: String,
+        target: String,
+        mode: CoordinationMode,
+        decision_rule: CoordinationDecisionRule,
+        participants: Vec<String>,
+        task_id: Option<String>,
+        thread_root_message_id: Option<String>,
+        plan: serde_json::Value,
+        metadata: Meta,
+    ) -> StoreResult<CoordinationSession> {
+        let _guard = self.structure_lock.lock();
+        let participants = unique_nonempty(participants);
+        if participants.is_empty() {
+            return Err(StoreError::InvalidState(
+                "coordination requires at least one participant".into(),
+            ));
+        }
+        let resolved = self.resolve_message_target_for_append(&target, &owner_actor_id)?;
+        self.check_scope_access(&resolved.scope, &owner_actor_id)?;
+        for actor_id in &participants {
+            self.validate_scope_actor(&resolved.scope, actor_id)?;
+        }
+        if let Some(task_id) = task_id.as_deref() {
+            let task = self
+                .get_task(task_id)
+                .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+            if task.channel_id != scope_channel_id(&resolved.scope, self)? {
+                return Err(StoreError::InvalidState(format!(
+                    "task {task_id} is not attached to coordination target"
+                )));
+            }
+        }
+        let status = match decision_rule {
+            CoordinationDecisionRule::OwnerDecides => CoordinationStatus::Planning,
+            CoordinationDecisionRule::HumanApproval
+            | CoordinationDecisionRule::AllAck
+            | CoordinationDecisionRule::Majority => CoordinationStatus::CollectingResponses,
+        };
+        let now = Utc::now();
+        let session = CoordinationSession {
+            id: format!("coord_{}", short_id()),
+            target: resolved.target,
+            scope: resolved.scope,
+            task_id,
+            thread_root_message_id: thread_root_message_id.or(resolved.thread_root_message_id),
+            owner_actor_id,
+            mode,
+            decision_rule,
+            status,
+            revision: 0,
+            baton_holder_actor_id: None,
+            participants,
+            responses: Vec::new(),
+            plan,
+            created_at: now,
+            updated_at: now,
+            metadata,
+        };
+        self.journal
+            .append(&Mutation::CoordinationSessionUpsert(session.clone()))?;
+        self.inner
+            .write()
+            .coordination_sessions
+            .insert(session.id.clone(), session.clone());
+        Ok(session)
+    }
+
+    pub fn commit_coordination_session(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> StoreResult<CoordinationSession> {
+        let _guard = self.structure_lock.lock();
+        let mut session = self
+            .get_coordination_session(session_id)
+            .ok_or_else(|| StoreError::NotFound(format!("coordination session {session_id}")))?;
+        if session.owner_actor_id != actor_id {
+            return Err(StoreError::InvalidState(format!(
+                "actor {actor_id} cannot commit coordination session {session_id}"
+            )));
+        }
+        if !coordination_decision_satisfied(&session) {
+            return Err(StoreError::InvalidState(format!(
+                "coordination session {session_id} is waiting for required responses"
+            )));
+        }
+        match session.status {
+            CoordinationStatus::Planning
+            | CoordinationStatus::CollectingResponses
+            | CoordinationStatus::Committed => {}
+            CoordinationStatus::Executing
+            | CoordinationStatus::Done
+            | CoordinationStatus::Canceled => {
+                return Err(StoreError::InvalidState(format!(
+                    "coordination session {session_id} cannot be committed from status {:?}",
+                    session.status
+                )));
+            }
+        }
+        session.status = CoordinationStatus::Executing;
+        if session.mode == CoordinationMode::Sequential {
+            session.baton_holder_actor_id = session.participants.first().cloned();
+        }
+        session.updated_at = Utc::now();
+        self.journal
+            .append(&Mutation::CoordinationSessionUpsert(session.clone()))?;
+        self.inner
+            .write()
+            .coordination_sessions
+            .insert(session.id.clone(), session.clone());
+        Ok(session)
+    }
+
+    pub fn respond_coordination_session(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        accept: bool,
+        reason: String,
+    ) -> StoreResult<CoordinationSession> {
+        let _guard = self.structure_lock.lock();
+        let mut session = self
+            .get_coordination_session(session_id)
+            .ok_or_else(|| StoreError::NotFound(format!("coordination session {session_id}")))?;
+        if !session.participants.iter().any(|id| id == actor_id)
+            && session.owner_actor_id != actor_id
+        {
+            return Err(StoreError::InvalidState(format!(
+                "actor {actor_id} is not part of coordination session {session_id}"
+            )));
+        }
+        session
+            .responses
+            .retain(|response| response.actor_id != actor_id);
+        session.responses.push(CoordinationResponse {
+            actor_id: actor_id.to_string(),
+            kind: if accept {
+                CoordinationResponseKind::Ack
+            } else {
+                CoordinationResponseKind::Reject
+            },
+            reason,
+            responded_at: Utc::now(),
+        });
+        session.status = if accept {
+            if coordination_decision_satisfied(&session) {
+                CoordinationStatus::Committed
+            } else {
+                CoordinationStatus::CollectingResponses
+            }
+        } else {
+            CoordinationStatus::Canceled
+        };
+        session.updated_at = Utc::now();
+        self.journal
+            .append(&Mutation::CoordinationSessionUpsert(session.clone()))?;
+        self.inner
+            .write()
+            .coordination_sessions
+            .insert(session.id.clone(), session.clone());
+        Ok(session)
+    }
+
+    pub fn apply_coordination_step(
+        &self,
+        actor_id: String,
+        session_id: &str,
+        base_revision: u64,
+        step_type: CoordinationStepType,
+        output: serde_json::Value,
+        message_body: Option<String>,
+        message_kind: MessageKind,
+    ) -> StoreResult<(CoordinationSession, CoordinationStep, Option<Message>)> {
+        let _guard = self.structure_lock.lock();
+        let mut session = self
+            .get_coordination_session(session_id)
+            .ok_or_else(|| StoreError::NotFound(format!("coordination session {session_id}")))?;
+        validate_coordination_step_actor(&self.inner.read(), &session, &actor_id, base_revision)?;
+
+        let slot_key = match session.mode {
+            CoordinationMode::Sequential => None,
+            CoordinationMode::ParallelReduce | CoordinationMode::Broadcast => {
+                Some(format!("{}:{actor_id}", session.id))
+            }
+        };
+        if let Some(slot_key) = slot_key.as_deref() {
+            let inner = self.inner.read();
+            if inner.coordination_steps.values().any(|step| {
+                step.session_id == session.id
+                    && step.slot_key.as_deref() == Some(slot_key)
+                    && step.status == CoordinationStepStatus::Accepted
+            }) {
+                return Err(StoreError::Conflict(format!(
+                    "coordination slot {slot_key} already accepted"
+                )));
+            }
+        }
+
+        let mut metadata = Meta::default();
+        metadata.insert(
+            "coordinationSessionId".into(),
+            serde_json::json!(session.id.clone()),
+        );
+        metadata.insert(
+            "coordinationBaseRevision".into(),
+            serde_json::json!(base_revision),
+        );
+        metadata.insert(
+            "coordinationStepType".into(),
+            serde_json::to_value(step_type).unwrap_or(serde_json::Value::Null),
+        );
+        let message = match message_body
+            .map(|body| body.trim().to_string())
+            .filter(|body| !body.is_empty())
+        {
+            Some(body) => Some(self.append_message_locked(
+                actor_id.clone(),
+                session.target.clone(),
+                message_kind,
+                body,
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::StatusUpdate,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                session.thread_root_message_id.clone(),
+                Vec::new(),
+                metadata,
+            )?),
+            None => None,
+        };
+
+        let step = CoordinationStep {
+            id: format!("cstep_{}", short_id()),
+            session_id: session.id.clone(),
+            actor_id: actor_id.clone(),
+            step_type,
+            slot_key,
+            base_revision,
+            status: CoordinationStepStatus::Accepted,
+            output_message_id: message.as_ref().map(|message| message.id.clone()),
+            output,
+            created_at: Utc::now(),
+        };
+        let completes_parallel = if matches!(
+            session.mode,
+            CoordinationMode::ParallelReduce | CoordinationMode::Broadcast
+        ) {
+            let inner = self.inner.read();
+            let accepted_count = inner
+                .coordination_steps
+                .values()
+                .filter(|existing| {
+                    existing.session_id == session.id
+                        && existing.status == CoordinationStepStatus::Accepted
+                })
+                .count()
+                + 1;
+            accepted_count >= session.participants.len()
+        } else {
+            false
+        };
+        advance_coordination_after_step(&mut session, &actor_id);
+        if completes_parallel {
+            session.status = CoordinationStatus::Done;
+            session.updated_at = Utc::now();
+        }
+        self.journal
+            .append(&Mutation::CoordinationStepAppend(step.clone()))?;
+        self.journal
+            .append(&Mutation::CoordinationSessionUpsert(session.clone()))?;
+        let mut inner = self.inner.write();
+        inner
+            .coordination_steps
+            .insert(step.id.clone(), step.clone());
+        inner
+            .coordination_sessions
+            .insert(session.id.clone(), session.clone());
+        Ok((session, step, message))
+    }
+
+    pub fn skip_coordination_step(
+        &self,
+        actor_id: String,
+        session_id: &str,
+        base_revision: u64,
+        reason: String,
+    ) -> StoreResult<(CoordinationSession, CoordinationStep)> {
+        let (session, step, _) = self.apply_coordination_step(
+            actor_id,
+            session_id,
+            base_revision,
+            CoordinationStepType::Skip,
+            serde_json::json!({ "reason": reason }),
+            None,
+            MessageKind::System,
+        )?;
+        Ok((session, step))
+    }
+
+    pub fn reassign_coordination_baton(
+        &self,
+        actor_id: String,
+        session_id: &str,
+        from_actor_id: String,
+        to_actor_id: String,
+        base_revision: u64,
+    ) -> StoreResult<(CoordinationSession, CoordinationStep)> {
+        let _guard = self.structure_lock.lock();
+        let mut session = self
+            .get_coordination_session(session_id)
+            .ok_or_else(|| StoreError::NotFound(format!("coordination session {session_id}")))?;
+        if session.mode != CoordinationMode::Sequential {
+            return Err(StoreError::InvalidState(
+                "coordination.reassign is only valid for sequential sessions".into(),
+            ));
+        }
+        if session.revision != base_revision {
+            return Err(StoreError::Conflict(format!(
+                "coordination session {} revision mismatch: expected {}, current {}",
+                session.id, base_revision, session.revision
+            )));
+        }
+        if actor_id != session.owner_actor_id
+            && session.baton_holder_actor_id.as_deref() != Some(actor_id.as_str())
+        {
+            return Err(StoreError::InvalidState(format!(
+                "actor {actor_id} cannot reassign coordination session {session_id}"
+            )));
+        }
+        self.validate_scope_actor(&session.scope, &to_actor_id)?;
+        let Some(pos) = session
+            .participants
+            .iter()
+            .position(|participant| participant == &from_actor_id)
+        else {
+            return Err(StoreError::NotFound(format!(
+                "coordination participant {from_actor_id}"
+            )));
+        };
+        session.participants[pos] = to_actor_id.clone();
+        session.participants = unique_nonempty(session.participants);
+        if session.baton_holder_actor_id.as_deref() == Some(from_actor_id.as_str()) {
+            session.baton_holder_actor_id = Some(to_actor_id.clone());
+        }
+        session.revision += 1;
+        session.updated_at = Utc::now();
+        let step = CoordinationStep {
+            id: format!("cstep_{}", short_id()),
+            session_id: session.id.clone(),
+            actor_id,
+            step_type: CoordinationStepType::Reassign,
+            slot_key: None,
+            base_revision,
+            status: CoordinationStepStatus::Accepted,
+            output_message_id: None,
+            output: serde_json::json!({
+                "fromActorId": from_actor_id,
+                "toActorId": to_actor_id,
+            }),
+            created_at: Utc::now(),
+        };
+        self.journal
+            .append(&Mutation::CoordinationStepAppend(step.clone()))?;
+        self.journal
+            .append(&Mutation::CoordinationSessionUpsert(session.clone()))?;
+        let mut inner = self.inner.write();
+        inner
+            .coordination_steps
+            .insert(step.id.clone(), step.clone());
+        inner
+            .coordination_sessions
+            .insert(session.id.clone(), session.clone());
+        Ok((session, step))
+    }
+
+    pub fn get_coordination_session(&self, session_id: &str) -> Option<CoordinationSession> {
+        self.inner
+            .read()
+            .coordination_sessions
+            .get(session_id)
+            .cloned()
+    }
+
+    // -------- Messages --------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message(
+        &self,
+        author_actor_id: String,
+        target: String,
+        kind: MessageKind,
+        body: String,
+        explicit_mentions: Vec<MessageMention>,
+        explicit_audience: Vec<AudienceRef>,
+        intent: MessageIntent,
+        delivery_policy: DeliveryPolicy,
+        parent_message_id: Option<String>,
+        thread_root_message_id: Option<String>,
+        attachments: Vec<String>,
+        metadata: Meta,
+    ) -> StoreResult<Message> {
+        let _guard = self.structure_lock.lock();
+        self.append_message_locked(
+            author_actor_id,
+            target,
+            kind,
+            body,
+            explicit_mentions,
+            explicit_audience,
+            intent,
+            delivery_policy,
+            parent_message_id,
+            thread_root_message_id,
+            attachments,
+            metadata,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_message_locked(
+        &self,
+        author_actor_id: String,
+        target: String,
+        kind: MessageKind,
+        body: String,
+        explicit_mentions: Vec<MessageMention>,
+        explicit_audience: Vec<AudienceRef>,
+        intent: MessageIntent,
+        delivery_policy: DeliveryPolicy,
+        parent_message_id: Option<String>,
+        thread_root_message_id: Option<String>,
+        attachments: Vec<String>,
+        metadata: Meta,
+    ) -> StoreResult<Message> {
+        if body.trim().is_empty() && attachments.is_empty() {
+            return Err(StoreError::InvalidState("message body is empty".into()));
+        }
+
+        let resolved = self.resolve_message_target_for_append(&target, &author_actor_id)?;
+        self.check_scope_access(&resolved.scope, &author_actor_id)?;
+        self.validate_message_mentions(&resolved.scope, &explicit_mentions)?;
+        self.validate_message_audience(&resolved.scope, &explicit_audience)?;
+        if let Some(parent_id) = parent_message_id.as_deref() {
+            let parent = self
+                .get_message(parent_id)
+                .ok_or_else(|| StoreError::NotFound(format!("message {parent_id}")))?;
+            if parent.scope != resolved.scope {
+                return Err(StoreError::InvalidState(format!(
+                    "parent message {parent_id} is not in target scope"
+                )));
+            }
+        }
+
+        let mut mentions = self.parse_mentions(&resolved.scope, &body)?;
+        merge_mentions(&mut mentions, explicit_mentions);
+        let mut audience = explicit_audience;
+        merge_audience_from_mentions(&mut audience, &mentions);
+
+        let now = Utc::now();
+        let message = Message {
+            id: format!("msg_{}", short_id()),
+            scope: resolved.scope.clone(),
+            target: resolved.target,
+            author_actor_id: author_actor_id.clone(),
+            created_at: now,
+            kind,
+            body,
+            mentions,
+            audience,
+            intent,
+            delivery_policy,
+            parent_message_id,
+            thread_root_message_id: thread_root_message_id.or(resolved.thread_root_message_id),
+            task_id: None,
+            attachments,
+            metadata,
+        };
+
+        self.journal
+            .append(&Mutation::MessageAppend(message.clone()))?;
+        {
+            let mut inner = self.inner.write();
+            inner
+                .messages_by_scope
+                .entry(message.scope.clone())
+                .or_default()
+                .push(message.id.clone());
+            inner.messages.insert(message.id.clone(), message.clone());
+        }
+
+        let _ = self.touch_membership(
+            author_actor_id.clone(),
+            message.scope.clone(),
+            Some(message.id.clone()),
+        );
+
+        for actor_id in self.message_delivery_recipients(&message, resolved.direct_actor.as_deref())
+        {
+            if actor_id == author_actor_id {
+                continue;
+            }
+            let delivery = Delivery {
+                source_id: message.id.clone(),
+                actor_id,
+                state: DeliveryState::Pending,
+                updated_at: now,
+                _meta: None,
+            };
+            self.journal
+                .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+            self.inner.write().deliveries.insert(
+                (delivery.source_id.clone(), delivery.actor_id.clone()),
+                delivery.clone(),
+            );
+            self.emit(StoreEvent::DeliveryUpdated(delivery));
+        }
+
+        self.emit(StoreEvent::MessageCreated(message.clone()));
+        Ok(message)
+    }
+
+    pub fn get_message(&self, id: &str) -> Option<Message> {
+        self.inner.read().messages.get(id).cloned()
+    }
+
+    pub fn read_messages_for_target(
+        &self,
+        actor_id: &str,
+        target: &str,
+        limit: u32,
+        before_message_id: Option<&str>,
+    ) -> StoreResult<(Vec<Message>, bool)> {
+        let resolved = self.resolve_message_target_for_read(target, actor_id)?;
+        self.check_scope_access(&resolved.scope, actor_id)?;
+        let inner = self.inner.read();
+        let ids = match inner.messages_by_scope.get(&resolved.scope) {
+            Some(v) => v.clone(),
+            None => return Ok((Vec::new(), false)),
+        };
+        let end = match before_message_id {
+            Some(before) => ids.iter().position(|id| id == before).unwrap_or(ids.len()),
+            None => ids.len(),
         };
         let limit = limit.max(1) as usize;
         let start = end.saturating_sub(limit);
         let has_more = start > 0;
-        Ok((frames[start..end].to_vec(), has_more))
+        let messages = ids[start..end]
+            .iter()
+            .filter_map(|id| inner.messages.get(id).cloned())
+            .collect();
+        Ok((messages, has_more))
+    }
+
+    pub fn search_message_records(
+        &self,
+        actor_id: &str,
+        query: &str,
+        target: Option<&str>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope_filter = match target {
+            Some(target) => Some(
+                self.resolve_message_target_for_read(target, actor_id)?
+                    .scope,
+            ),
+            None => None,
+        };
+        let limit = limit.max(1) as usize;
+        let inner = self.inner.read();
+        let mut messages: Vec<Message> = inner
+            .messages
+            .values()
+            .filter(|message| scope_filter.as_ref().is_none_or(|s| &message.scope == s))
+            .filter(|message| {
+                scope_filter.is_some() || can_access_scope_inner(&inner, &message.scope, actor_id)
+            })
+            .filter(|message| message.body.to_ascii_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        messages.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        messages.truncate(limit);
+        Ok(messages)
+    }
+
+    fn resolve_message_target_for_append(
+        &self,
+        target: &str,
+        actor_id: &str,
+    ) -> StoreResult<ResolvedMessageTarget> {
+        let target = target.trim();
+        if let Some(raw) = target.strip_prefix('#') {
+            return self.resolve_hash_message_target(raw, true, actor_id);
+        }
+        if let Some(raw) = target.strip_prefix("dm:") {
+            return self.resolve_dm_message_target(raw, true, actor_id);
+        }
+        Err(StoreError::InvalidState(format!(
+            "invalid target `{target}`"
+        )))
+    }
+
+    fn resolve_message_target_for_read(
+        &self,
+        target: &str,
+        actor_id: &str,
+    ) -> StoreResult<ResolvedMessageTarget> {
+        let target = target.trim();
+        if let Some(raw) = target.strip_prefix('#') {
+            return self.resolve_hash_message_target(raw, false, actor_id);
+        }
+        if let Some(raw) = target.strip_prefix("dm:") {
+            return self.resolve_dm_message_target(raw, false, actor_id);
+        }
+        Err(StoreError::InvalidState(format!(
+            "invalid target `{target}`"
+        )))
+    }
+
+    fn resolve_hash_message_target(
+        &self,
+        raw: &str,
+        create_thread: bool,
+        _actor_id: &str,
+    ) -> StoreResult<ResolvedMessageTarget> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(StoreError::InvalidState("invalid target `#`".into()));
+        }
+        let Some((channel_id, root_message_id)) = raw.split_once(':') else {
+            if self.get_channel(raw).is_none() {
+                return Err(StoreError::NotFound(format!("channel {raw}")));
+            }
+            return Ok(ResolvedMessageTarget {
+                scope: ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: raw.to_string(),
+                },
+                target: format!("#{raw}"),
+                thread_root_message_id: None,
+                direct_actor: None,
+            });
+        };
+        if channel_id.is_empty() || root_message_id.is_empty() || root_message_id.contains(':') {
+            return Err(StoreError::InvalidState(format!(
+                "invalid thread target `#{raw}`"
+            )));
+        }
+        let root = self
+            .get_message(root_message_id)
+            .ok_or_else(|| StoreError::NotFound(format!("message {root_message_id}")))?;
+        if root.scope.kind != ScopeKind::Channel || root.scope.id != channel_id {
+            return Err(StoreError::InvalidState(format!(
+                "thread root message {root_message_id} must belong to channel {channel_id}"
+            )));
+        }
+        let thread = match self.find_thread_by_root(channel_id, root_message_id) {
+            Some(thread) => thread,
+            None if create_thread => {
+                self.create_thread_for_message_root(channel_id, root_message_id)?
+            }
+            None => {
+                return Err(StoreError::NotFound(format!(
+                    "thread #{channel_id}:{root_message_id}"
+                )));
+            }
+        };
+        Ok(ResolvedMessageTarget {
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: thread.id,
+            },
+            target: format!("#{channel_id}:{root_message_id}"),
+            thread_root_message_id: Some(root_message_id.to_string()),
+            direct_actor: None,
+        })
+    }
+
+    fn resolve_dm_message_target(
+        &self,
+        raw: &str,
+        create: bool,
+        actor_id: &str,
+    ) -> StoreResult<ResolvedMessageTarget> {
+        let peer = raw.trim().trim_start_matches('@');
+        if peer.is_empty() || peer.contains(':') {
+            return Err(StoreError::InvalidState(format!(
+                "invalid DM target `dm:{raw}`"
+            )));
+        }
+        let peer = self
+            .resolve_actor_alias(peer)
+            .ok_or_else(|| StoreError::NotFound(format!("actor {peer}")))?;
+        if peer == actor_id {
+            return Err(StoreError::InvalidState(
+                "cannot create a direct message with yourself".into(),
+            ));
+        }
+        let title = direct_channel_title(actor_id, &peer);
+        let channel = self
+            .inner
+            .read()
+            .channels
+            .values()
+            .find(|channel| channel.title == title)
+            .cloned();
+        let channel = match channel {
+            Some(channel) => channel,
+            None if create => self.create_direct_channel(&title, actor_id, &peer)?,
+            None => return Err(StoreError::NotFound(format!("direct message with {peer}"))),
+        };
+        Ok(ResolvedMessageTarget {
+            scope: ScopeRef {
+                kind: ScopeKind::Channel,
+                id: channel.id,
+            },
+            target: format!("dm:@{peer}"),
+            thread_root_message_id: None,
+            direct_actor: Some(peer),
+        })
+    }
+
+    fn create_thread_for_message_root(
+        &self,
+        channel_id: &str,
+        root_message_id: &str,
+    ) -> StoreResult<Thread> {
+        let thread = Thread {
+            id: format!("thread_{}", short_id()),
+            channel_id: channel_id.to_string(),
+            title: format!("thread {root_message_id}"),
+            root_message_id: root_message_id.to_string(),
+            archived_at: None,
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::ThreadCreate(thread.clone()))?;
+        self.inner
+            .write()
+            .threads
+            .insert(thread.id.clone(), thread.clone());
+        self.emit(StoreEvent::ThreadCreated(thread.clone()));
+        Ok(thread)
+    }
+
+    fn create_direct_channel(
+        &self,
+        title: &str,
+        actor_id: &str,
+        peer: &str,
+    ) -> StoreResult<Channel> {
+        let channel = Channel {
+            id: format!("chan_{}", short_id()),
+            title: title.to_string(),
+            visibility: ChannelVisibility::Private,
+            members: vec![actor_id.to_string(), peer.to_string()],
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::ChannelCreate(channel.clone()))?;
+        self.inner
+            .write()
+            .channels
+            .insert(channel.id.clone(), channel.clone());
+        self.emit(StoreEvent::ChannelCreated(channel.clone()));
+        Ok(channel)
+    }
+
+    fn parse_mentions(&self, scope: &ScopeRef, body: &str) -> StoreResult<Vec<MessageMention>> {
+        let mut mentions = Vec::new();
+        for (start, token, end) in mention_tokens(body) {
+            let key = token.trim_start_matches('@');
+            let lowered = key.to_ascii_lowercase();
+            let (kind, id) = match lowered.as_str() {
+                "all" => (MessageMentionKind::All, "all".to_string()),
+                "agents" => (MessageMentionKind::Agents, "agents".to_string()),
+                "humans" => (MessageMentionKind::Humans, "humans".to_string()),
+                _ => match self.resolve_actor_alias(key) {
+                    Some(actor_id) => (MessageMentionKind::Actor, actor_id),
+                    None => match self.resolve_actor_group_alias(scope, key) {
+                        Some(group) => (MessageMentionKind::Group, group.id),
+                        None => continue,
+                    },
+                },
+            };
+            mentions.push(MessageMention {
+                actor_or_group_id: id,
+                kind,
+                source: "server_parser".into(),
+                byte_start: start,
+                byte_end: end,
+                display: token.to_string(),
+            });
+        }
+        Ok(mentions)
+    }
+
+    fn validate_message_mentions(
+        &self,
+        scope: &ScopeRef,
+        mentions: &[MessageMention],
+    ) -> StoreResult<()> {
+        for mention in mentions {
+            match mention.kind {
+                MessageMentionKind::Actor => {
+                    self.validate_scope_actor(scope, &mention.actor_or_group_id)?;
+                }
+                MessageMentionKind::Group => {
+                    self.validate_scope_group(scope, &mention.actor_or_group_id)?;
+                }
+                MessageMentionKind::All
+                | MessageMentionKind::Agents
+                | MessageMentionKind::Humans => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_message_audience(
+        &self,
+        scope: &ScopeRef,
+        audience: &[AudienceRef],
+    ) -> StoreResult<()> {
+        for audience in audience {
+            match audience.kind {
+                AudienceKind::Actor => self.validate_scope_actor(scope, &audience.id)?,
+                AudienceKind::Group => self.validate_scope_group(scope, &audience.id)?,
+                AudienceKind::All | AudienceKind::Agents | AudienceKind::Humans => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_actor_alias(&self, raw: &str) -> Option<String> {
+        let key = raw.trim().trim_start_matches('@').to_ascii_lowercase();
+        let inner = self.inner.read();
+        inner.actors.values().find_map(|actor| {
+            let id_lower = actor.id.to_ascii_lowercase();
+            let display_lower = actor.display_name.to_ascii_lowercase();
+            let short = short_actor_alias(&actor.id).to_ascii_lowercase();
+            if key == id_lower || key == display_lower || key == short {
+                Some(actor.id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn resolve_actor_group_alias(&self, scope: &ScopeRef, raw: &str) -> Option<ActorGroup> {
+        let key = raw.trim().trim_start_matches('@').to_ascii_lowercase();
+        if key.is_empty() {
+            return None;
+        }
+        let inner = self.inner.read();
+        let channel_id = scope_channel_id_inner(&inner, scope)?;
+        inner.actor_groups.values().find_map(|group| {
+            if group.channel_id != channel_id {
+                return None;
+            }
+            let display = group.display_name.to_ascii_lowercase();
+            if key == group.id.to_ascii_lowercase() || key == group.name || key == display {
+                Some(group.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn validate_scope_actor(&self, scope: &ScopeRef, actor_id: &str) -> StoreResult<()> {
+        let inner = self.inner.read();
+        if !inner.actors.contains_key(actor_id) {
+            return Err(StoreError::NotFound(format!("actor {actor_id}")));
+        }
+        let Some(channel_id) = scope_channel_id_inner(&inner, scope) else {
+            return Err(StoreError::NotFound(format!(
+                "scope {:?}:{}",
+                scope.kind, scope.id
+            )));
+        };
+        if !is_channel_member_inner(&inner, channel_id, actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "actor {actor_id} is not a member of channel {channel_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_scope_group(&self, scope: &ScopeRef, group_id: &str) -> StoreResult<()> {
+        let inner = self.inner.read();
+        let Some(channel_id) = scope_channel_id_inner(&inner, scope) else {
+            return Err(StoreError::NotFound(format!(
+                "scope {:?}:{}",
+                scope.kind, scope.id
+            )));
+        };
+        let group = inner
+            .actor_groups
+            .get(group_id)
+            .ok_or_else(|| StoreError::NotFound(format!("actor group {group_id}")))?;
+        if group.channel_id != channel_id {
+            return Err(StoreError::InvalidState(format!(
+                "actor group {group_id} is not in channel {channel_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn message_delivery_recipients(
+        &self,
+        message: &Message,
+        direct_actor: Option<&str>,
+    ) -> Vec<String> {
+        let mut recipients = Vec::new();
+        if let Some(actor_id) = direct_actor {
+            recipients.push(actor_id.to_string());
+        }
+        for audience in &message.audience {
+            match audience.kind {
+                AudienceKind::Actor => recipients.push(audience.id.clone()),
+                AudienceKind::All | AudienceKind::Humans => {
+                    recipients
+                        .extend(self.channel_actors_by_kind(&message.scope, ActorKind::Human));
+                }
+                AudienceKind::Agents => {
+                    if message.delivery_policy == DeliveryPolicy::WakeAgent {
+                        recipients
+                            .extend(self.channel_actors_by_kind(&message.scope, ActorKind::Agent));
+                    }
+                }
+                AudienceKind::Group => {
+                    recipients.extend(self.actor_group_delivery_recipients(
+                        &message.scope,
+                        &audience.id,
+                        message.delivery_policy,
+                    ));
+                }
+            }
+        }
+        if message.scope.kind == ScopeKind::Thread {
+            recipients.extend(
+                self.thread_attention_recipients(&message.scope.id, message.audience.is_empty()),
+            );
+        }
+        unique_nonempty(recipients)
+    }
+
+    fn thread_attention_recipients(
+        &self,
+        thread_id: &str,
+        include_task_owner: bool,
+    ) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut recipients: Vec<String> = inner
+            .actor_presences
+            .values()
+            .filter(|presence| presence.thread_id.as_deref() == Some(thread_id))
+            .filter(|presence| presence.following && !presence.muted)
+            .map(|presence| presence.actor_id.clone())
+            .collect();
+        if include_task_owner {
+            recipients.extend(
+                inner
+                    .tasks
+                    .values()
+                    .filter(|task| task.canonical_thread_id == thread_id)
+                    .filter_map(|task| task.owner_actor_id.clone()),
+            );
+        }
+        unique_nonempty(recipients)
+    }
+
+    fn actor_group_delivery_recipients(
+        &self,
+        scope: &ScopeRef,
+        group_id: &str,
+        delivery_policy: DeliveryPolicy,
+    ) -> Vec<String> {
+        let inner = self.inner.read();
+        let Some(channel_id) = scope_channel_id_inner(&inner, scope) else {
+            return Vec::new();
+        };
+        let Some(group) = inner.actor_groups.get(group_id) else {
+            return Vec::new();
+        };
+        if group.channel_id != channel_id {
+            return Vec::new();
+        }
+        group
+            .member_actor_ids
+            .iter()
+            .filter(|actor_id| is_channel_member_inner(&inner, channel_id, actor_id))
+            .filter_map(|actor_id| inner.actors.get(actor_id))
+            .filter(|actor| match actor.kind {
+                ActorKind::Human => true,
+                ActorKind::Agent => {
+                    group.wake_agents && delivery_policy == DeliveryPolicy::WakeAgent
+                }
+                ActorKind::Service => false,
+            })
+            .map(|actor| actor.id.clone())
+            .collect()
+    }
+
+    fn channel_actors_by_kind(&self, scope: &ScopeRef, kind: ActorKind) -> Vec<String> {
+        let inner = self.inner.read();
+        let channel_id = match scope.kind {
+            ScopeKind::Channel => scope.id.as_str(),
+            ScopeKind::Thread => match inner.threads.get(&scope.id) {
+                Some(thread) => thread.channel_id.as_str(),
+                None => return Vec::new(),
+            },
+        };
+        let Some(channel) = inner.channels.get(channel_id) else {
+            return Vec::new();
+        };
+        channel
+            .members
+            .iter()
+            .filter_map(|id| inner.actors.get(id))
+            .filter(|actor| actor.kind == kind)
+            .map(|actor| actor.id.clone())
+            .collect()
     }
 
     // -------- Events --------
 
-    /// Append an event. Implicit-turn behavior: if `turn_id` is None, an implicit Turn
-    /// is opened+closed around this single event.
+    /// Append an internal control/event record into a visible scope.
     #[allow(clippy::too_many_arguments)]
     pub fn append_event(
         &self,
@@ -2474,25 +3852,14 @@ impl Store {
         // Public channels short-circuit to allow.
         self.check_scope_access(&scope, &actor_id)?;
 
-        let (assigned_turn_id, implicit_turn) = if let Some(tid) = turn_id {
-            let t = self
-                .get_turn(&tid)
-                .ok_or_else(|| StoreError::NotFound(format!("turn {tid}")))?;
-            if t.status != TurnStatus::Open {
-                return Err(StoreError::InvalidState(format!("turn {tid} is not open")));
-            }
-            (tid, false)
-        } else {
-            let t = self.open_turn(actor_id.clone(), scope.clone(), None)?;
-            (t.id, true)
-        };
-
         let now = Utc::now();
         let (event_id, seq) = {
-            let mut inner = self.inner.write();
-            let seq_entry = inner.turn_seq.entry(assigned_turn_id.clone()).or_insert(0);
-            *seq_entry += 1;
-            let seq = *seq_entry;
+            let inner = self.inner.write();
+            let seq = inner
+                .events_by_scope
+                .get(&scope)
+                .map(|events| events.len() as u64 + 1)
+                .unwrap_or(1);
             (format!("evt_{}", short_id()), seq)
         };
 
@@ -2501,7 +3868,7 @@ impl Store {
             kind,
             actor_id: actor_id.clone(),
             scope: scope.clone(),
-            turn_id: Some(assigned_turn_id.clone()),
+            turn_id,
             seq,
             occurred_at: now,
             payload,
@@ -2524,16 +3891,16 @@ impl Store {
 
         // Memberships: any actor explicitly targeted joins too.
         for r in &event.relations {
-            if matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor {
+            if matches!(r.kind, RelationKind::DirectedTo) && r.target.kind == RefKind::Actor {
                 let _ = self.touch_membership(r.target.id.clone(), scope.clone(), None);
             }
         }
 
         // Deliveries: explicit directed receivers only.
         for r in &event.relations {
-            if matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor {
+            if matches!(r.kind, RelationKind::DirectedTo) && r.target.kind == RefKind::Actor {
                 let delivery = Delivery {
-                    event_id: event.id.clone(),
+                    source_id: event.id.clone(),
                     actor_id: r.target.id.clone(),
                     state: DeliveryState::Pending,
                     updated_at: now,
@@ -2542,7 +3909,7 @@ impl Store {
                 self.journal
                     .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
                 self.inner.write().deliveries.insert(
-                    (delivery.event_id.clone(), delivery.actor_id.clone()),
+                    (delivery.source_id.clone(), delivery.actor_id.clone()),
                     delivery.clone(),
                 );
                 self.emit(StoreEvent::DeliveryUpdated(delivery));
@@ -2555,10 +3922,10 @@ impl Store {
         // agent's reply via actor-inbox without subscribing to every scope it
         // touches. Self-responses (replying to your own event) are skipped to
         // avoid pending rows the speaker would have to acknowledge themselves.
-        let has_explicit_actor_handoff = event
+        let has_explicit_actor_route = event
             .relations
             .iter()
-            .any(|r| matches!(r.kind, RelationKind::HandsOffTo) && r.target.kind == RefKind::Actor);
+            .any(|r| matches!(r.kind, RelationKind::DirectedTo) && r.target.kind == RefKind::Actor);
         let mut reverse_targets: Vec<String> = Vec::new();
         {
             let inner = self.inner.read();
@@ -2566,7 +3933,7 @@ impl Store {
                 if !matches!(r.kind, RelationKind::RespondsTo) || r.target.kind != RefKind::Event {
                     continue;
                 }
-                if has_explicit_actor_handoff && event.kind != "action.response" {
+                if has_explicit_actor_route && event.kind != "action.response" {
                     continue;
                 }
                 let Some(orig) = inner.events.get(&r.target.id) else {
@@ -2589,7 +3956,7 @@ impl Store {
         }
         for target in reverse_targets {
             let delivery = Delivery {
-                event_id: event.id.clone(),
+                source_id: event.id.clone(),
                 actor_id: target,
                 state: DeliveryState::Pending,
                 updated_at: now,
@@ -2598,7 +3965,7 @@ impl Store {
             self.journal
                 .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
             self.inner.write().deliveries.insert(
-                (delivery.event_id.clone(), delivery.actor_id.clone()),
+                (delivery.source_id.clone(), delivery.actor_id.clone()),
                 delivery.clone(),
             );
             self.emit(StoreEvent::DeliveryUpdated(delivery));
@@ -2610,27 +3977,18 @@ impl Store {
 
         self.emit(StoreEvent::EventCreated(event.clone()));
 
-        if implicit_turn {
-            let _ = self.close_turn(&assigned_turn_id, TurnStatus::Closed);
-        }
-
         Ok(event)
     }
 
-    pub fn get_event(&self, id: &str) -> Option<Event> {
-        self.inner.read().events.get(id).cloned()
-    }
-
-    pub fn find_assignment_handoff_event(&self, assignment_id: &str) -> Option<Event> {
+    pub fn find_assignment_message(&self, assignment_id: &str) -> Option<Message> {
         self.inner
             .read()
-            .events
+            .messages
             .values()
-            .find(|event| {
-                event
-                    .payload
-                    .get("_meta")
-                    .and_then(|meta| meta.get("assignmentId"))
+            .find(|message| {
+                message
+                    .metadata
+                    .get("assignmentId")
                     .and_then(serde_json::Value::as_str)
                     == Some(assignment_id)
             })
@@ -2638,48 +3996,38 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn ensure_assignment_handoff_event(
+    pub fn ensure_assignment_message(
         &self,
         assignment_id: &str,
-        kind: String,
         actor_id: String,
-        scope: ScopeRef,
-        payload: serde_json::Value,
-        relations: Vec<Relation>,
-        meta: Option<Meta>,
-    ) -> StoreResult<Event> {
+        target: String,
+        body: String,
+        audience: Vec<AudienceRef>,
+        intent: MessageIntent,
+        delivery_policy: DeliveryPolicy,
+        metadata: Meta,
+    ) -> StoreResult<Message> {
         let _guard = self.structure_lock.lock();
-        if let Some(event) = self.find_assignment_handoff_event(assignment_id) {
-            return Ok(event);
+        if let Some(message) = self.find_assignment_message(assignment_id) {
+            return Ok(message);
         }
-        self.append_event(kind, actor_id, scope, None, payload, relations, meta)
+        self.append_message_locked(
+            actor_id,
+            target,
+            MessageKind::TaskUpdate,
+            body,
+            Vec::new(),
+            audience,
+            intent,
+            delivery_policy,
+            None,
+            None,
+            Vec::new(),
+            metadata,
+        )
     }
 
-    pub fn read_scope(
-        &self,
-        scope: &ScopeRef,
-        limit: u32,
-        before_event_id: Option<&str>,
-    ) -> (Vec<Event>, bool) {
-        let inner = self.inner.read();
-        let ids = match inner.events_by_scope.get(scope) {
-            Some(v) => v.clone(),
-            None => return (vec![], false),
-        };
-        let end = match before_event_id {
-            Some(before) => ids.iter().position(|id| id == before).unwrap_or(ids.len()),
-            None => ids.len(),
-        };
-        let limit = limit.max(1) as usize;
-        let start = end.saturating_sub(limit);
-        let has_more = start > 0;
-        let slice = ids[start..end]
-            .iter()
-            .filter_map(|id| inner.events.get(id).cloned())
-            .collect();
-        (slice, has_more)
-    }
-
+    #[allow(dead_code)]
     pub fn search_messages(
         &self,
         actor_id: &str,
@@ -2713,14 +4061,14 @@ impl Store {
     }
 
     /// List deliveries for `actor_id`, sorted ascending by `(updated_at,
-    /// event_id)` so the oldest pending row is first — that's the order a
+    /// source_id)` so the oldest pending row is first — that's the order a
     /// host wants to drain its inbox after restart. `state_filter = None`
     /// returns all states; pass `Some(DeliveryState::Pending)` for the
     /// common "what do I still owe processing" query.
     ///
     /// `after` is the exclusive lower bound: only rows strictly greater
-    /// than the supplied `(updated_at, event_id)` pair are returned. The
-    /// handler converts the opaque cursor in `delivery/list` params into
+    /// than the supplied `(updated_at, source_id)` pair are returned. The
+    /// handler converts the opaque cursor in `inbox.list` params into
     /// this pair (see §9.2).
     ///
     /// Caller must apply ACL — this method does not check who is asking.
@@ -2743,7 +4091,7 @@ impl Store {
                     if d.updated_at != *ts {
                         d.updated_at > *ts
                     } else {
-                        d.event_id > *eid
+                        d.source_id > *eid
                     }
                 }
             })
@@ -2752,10 +4100,42 @@ impl Store {
         rows.sort_by(|a, b| {
             a.updated_at
                 .cmp(&b.updated_at)
-                .then_with(|| a.event_id.cmp(&b.event_id))
+                .then_with(|| a.source_id.cmp(&b.source_id))
         });
         rows.truncate(limit);
         rows
+    }
+
+    pub fn delivery_recipients_for_source(&self, source_id: &str) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut recipients: Vec<String> = inner
+            .deliveries
+            .values()
+            .filter(|delivery| delivery.source_id == source_id)
+            .map(|delivery| delivery.actor_id.clone())
+            .collect();
+        recipients.sort();
+        recipients.dedup();
+        recipients
+    }
+
+    pub fn ack_delivery(&self, actor_id: &str, source_id: &str) -> StoreResult<Delivery> {
+        let now = Utc::now();
+        let mut inner = self.inner.write();
+        let key = (source_id.to_string(), actor_id.to_string());
+        let Some(delivery) = inner.deliveries.get_mut(&key) else {
+            return Err(StoreError::NotFound(format!(
+                "delivery source={source_id} actor={actor_id}"
+            )));
+        };
+        delivery.state = DeliveryState::Delivered;
+        delivery.updated_at = now;
+        let delivery = delivery.clone();
+        drop(inner);
+        self.journal
+            .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+        self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
+        Ok(delivery)
     }
 
     // -------- Machine commands --------
@@ -2802,13 +4182,13 @@ impl Store {
         rows
     }
 
-    // -------- Membership / Delivery / Receipt --------
+    // -------- Membership / Delivery --------
 
     pub fn touch_membership(
         &self,
         actor_id: String,
         scope: ScopeRef,
-        last_read_event_id: Option<String>,
+        last_read_source_id: Option<String>,
     ) -> StoreResult<Membership> {
         let now = Utc::now();
         let key = (actor_id.clone(), scope.clone());
@@ -2818,8 +4198,8 @@ impl Store {
             .entry(key)
             .and_modify(|m| {
                 m.updated_at = now;
-                if last_read_event_id.is_some() {
-                    m.last_read_event_id = last_read_event_id.clone();
+                if last_read_source_id.is_some() {
+                    m.last_read_source_id = last_read_source_id.clone();
                 }
             })
             .or_insert_with(|| Membership {
@@ -2827,54 +4207,13 @@ impl Store {
                 scope,
                 joined_at: now,
                 updated_at: now,
-                last_read_event_id,
+                last_read_source_id,
                 _meta: None,
             })
             .clone();
         drop(inner);
         let _ = self.journal.append(&Mutation::MembershipUpsert(m.clone()));
         Ok(m)
-    }
-
-    pub fn record_receipt(
-        &self,
-        event_id: String,
-        actor_id: String,
-        kind: ReceiptKind,
-    ) -> StoreResult<Receipt> {
-        if self.get_event(&event_id).is_none() {
-            return Err(StoreError::NotFound(format!("event {event_id}")));
-        }
-        let receipt = Receipt {
-            event_id: event_id.clone(),
-            actor_id: actor_id.clone(),
-            kind,
-            recorded_at: Utc::now(),
-            _meta: None,
-        };
-        self.journal
-            .append(&Mutation::ReceiptRecord(receipt.clone()))?;
-        self.inner
-            .write()
-            .receipts
-            .insert((event_id, actor_id, kind), receipt.clone());
-        // Mark related delivery as delivered if pending.
-        {
-            let mut inner = self.inner.write();
-            let key = (receipt.event_id.clone(), receipt.actor_id.clone());
-            if let Some(d) = inner.deliveries.get_mut(&key) {
-                d.state = DeliveryState::Delivered;
-                d.updated_at = receipt.recorded_at;
-                let cloned = d.clone();
-                drop(inner);
-                let _ = self
-                    .journal
-                    .append(&Mutation::DeliveryUpsert(cloned.clone()));
-                self.emit(StoreEvent::DeliveryUpdated(cloned));
-            }
-        }
-        self.emit(StoreEvent::ReceiptRecorded(receipt.clone()));
-        Ok(receipt)
     }
 
     // -------- Reminders --------
@@ -3005,7 +4344,7 @@ impl Store {
         for mut reminder in due {
             if let Some(scope) = reminder.scope.clone() {
                 let mut relations = vec![Relation {
-                    kind: RelationKind::HandsOffTo,
+                    kind: RelationKind::DirectedTo,
                     target: Ref {
                         kind: RefKind::Actor,
                         id: reminder.actor_id.clone(),
@@ -3134,6 +4473,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
             for channel in inner.channels.values_mut() {
                 channel.members.retain(|member| member != &actor_id);
             }
+            for group in inner.actor_groups.values_mut() {
+                group.member_actor_ids.retain(|member| member != &actor_id);
+            }
             for task in inner.tasks.values_mut() {
                 if task.owner_actor_id.as_deref() == Some(&actor_id) {
                     task.owner_actor_id = None;
@@ -3143,17 +4485,30 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .memberships
                 .retain(|(member_actor_id, _), _| member_actor_id != &actor_id);
             inner
+                .actor_presences
+                .retain(|(presence_actor_id, _), _| presence_actor_id != &actor_id);
+            inner
                 .deliveries
                 .retain(|(_, target_actor_id), _| target_actor_id != &actor_id);
-            inner
-                .receipts
-                .retain(|(_, receipt_actor_id, _), _| receipt_actor_id != &actor_id);
             inner.assignments.retain(|_, assignment| {
                 assignment.from_actor_id != actor_id && assignment.to_actor_id != actor_id
             });
         }
         Mutation::ChannelCreate(c) => {
             inner.channels.insert(c.id.clone(), c);
+        }
+        Mutation::ActorGroupUpsert(group) => {
+            inner.actor_groups.insert(group.id.clone(), group);
+        }
+        Mutation::ActorGroupDelete { group_id } => {
+            inner.actor_groups.remove(&group_id);
+        }
+        Mutation::ActorPresenceUpsert(presence) => {
+            if let Some(thread_id) = presence.thread_id.clone() {
+                inner
+                    .actor_presences
+                    .insert((presence.actor_id.clone(), thread_id), presence);
+            }
         }
         Mutation::ThreadCreate(t) => {
             inner.threads.insert(t.id.clone(), t);
@@ -3201,6 +4556,47 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 t.closed_at = Some(closed_at);
             }
         }
+        Mutation::RunUpsert(run) => {
+            inner.runs.insert(run.id.clone(), run);
+        }
+        Mutation::RunFrameAppend(frame) => {
+            let entry = inner.run_seq.entry(frame.run_id.clone()).or_insert(0);
+            if frame.seq > *entry {
+                *entry = frame.seq;
+            }
+            inner
+                .run_frames
+                .entry(frame.run_id.clone())
+                .or_default()
+                .push(frame);
+        }
+        Mutation::AgentConfigVersionPublish(config) => {
+            inner
+                .agent_config_versions
+                .insert(config.id.clone(), config);
+        }
+        Mutation::AgentConfigActivationUpsert(activation) => {
+            inner.agent_config_activations.insert(
+                agent_config_activation_key(&activation.actor_id, activation.scope.as_ref()),
+                activation,
+            );
+        }
+        Mutation::CoordinationSessionUpsert(session) => {
+            inner
+                .coordination_sessions
+                .insert(session.id.clone(), session);
+        }
+        Mutation::CoordinationStepAppend(step) => {
+            inner.coordination_steps.insert(step.id.clone(), step);
+        }
+        Mutation::MessageAppend(m) => {
+            inner
+                .messages_by_scope
+                .entry(m.scope.clone())
+                .or_default()
+                .push(m.id.clone());
+            inner.messages.insert(m.id.clone(), m);
+        }
         Mutation::EventAppend(e) => {
             let scope = e.scope.clone();
             inner
@@ -3224,17 +4620,12 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::DeliveryUpsert(d) => {
             inner
                 .deliveries
-                .insert((d.event_id.clone(), d.actor_id.clone()), d);
+                .insert((d.source_id.clone(), d.actor_id.clone()), d);
         }
         Mutation::MachineCommandUpsert(command) => {
             inner
                 .machine_commands
                 .insert(command.command_id.clone(), command);
-        }
-        Mutation::ReceiptRecord(r) => {
-            inner
-                .receipts
-                .insert((r.event_id.clone(), r.actor_id.clone(), r.kind), r);
         }
         Mutation::ReminderUpsert(r) => {
             inner.reminders.insert(r.id.clone(), r);
@@ -3260,6 +4651,12 @@ fn apply(inner: &mut Inner, m: Mutation) {
         }
         Mutation::ChannelDelete { channel_id } => {
             inner.channels.remove(&channel_id);
+            inner
+                .actor_groups
+                .retain(|_, group| group.channel_id != channel_id);
+            inner
+                .actor_presences
+                .retain(|_, presence| presence.channel_id != channel_id);
             let task_ids: std::collections::HashSet<String> = inner
                 .tasks
                 .values()
@@ -3286,6 +4683,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
         }
         Mutation::ThreadDelete { thread_id } => {
             inner.threads.remove(&thread_id);
+            inner
+                .actor_presences
+                .retain(|(_, presence_thread_id), _| presence_thread_id != &thread_id);
             let scope = ScopeRef {
                 kind: ScopeKind::Thread,
                 id: thread_id,
@@ -3321,6 +4721,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
             if let Some(c) = inner.channels.get_mut(&channel_id) {
                 c.members.retain(|m| m != &actor_id);
             }
+            inner.actor_presences.retain(|_, presence| {
+                !(presence.channel_id == channel_id && presence.actor_id == actor_id)
+            });
         }
     }
 }
@@ -3330,14 +4733,182 @@ fn short_id() -> String {
     id[..12].to_string()
 }
 
-fn can_access_scope_inner(inner: &Inner, scope: &ScopeRef, actor_id: &str) -> bool {
-    let channel_id = match scope.kind {
-        ScopeKind::Channel => scope.id.as_str(),
-        ScopeKind::Thread => match inner.threads.get(&scope.id) {
-            Some(thread) => thread.channel_id.as_str(),
-            None => return false,
-        },
+#[derive(Debug, Clone)]
+struct ResolvedMessageTarget {
+    scope: ScopeRef,
+    target: String,
+    thread_root_message_id: Option<String>,
+    direct_actor: Option<String>,
+}
+
+fn mention_tokens(body: &str) -> Vec<(usize, &str, usize)> {
+    let mut out = Vec::new();
+    let mut iter = body.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if ch != '@' {
+            continue;
+        }
+        let start = idx;
+        let mut end = idx + ch.len_utf8();
+        while let Some((next_idx, next_ch)) = iter.peek().copied() {
+            if !is_mention_body_char(next_ch) {
+                break;
+            }
+            end = next_idx + next_ch.len_utf8();
+            iter.next();
+        }
+        if end > start + 1 {
+            out.push((start, &body[start..end], end));
+        }
+    }
+    out
+}
+
+fn is_mention_body_char(ch: char) -> bool {
+    !(ch.is_whitespace()
+        || matches!(
+            ch,
+            ',' | '.'
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | '`'
+                | '，'
+                | '。'
+                | '、'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+        ))
+}
+
+fn merge_mentions(into: &mut Vec<MessageMention>, incoming: Vec<MessageMention>) {
+    for mention in incoming {
+        if !into.iter().any(|existing| {
+            existing.kind == mention.kind
+                && existing.actor_or_group_id == mention.actor_or_group_id
+                && existing.byte_start == mention.byte_start
+                && existing.byte_end == mention.byte_end
+        }) {
+            into.push(mention);
+        }
+    }
+}
+
+fn merge_audience_from_mentions(audience: &mut Vec<AudienceRef>, mentions: &[MessageMention]) {
+    for mention in mentions {
+        let kind = match mention.kind {
+            MessageMentionKind::Actor => AudienceKind::Actor,
+            MessageMentionKind::Group => AudienceKind::Group,
+            MessageMentionKind::All => AudienceKind::All,
+            MessageMentionKind::Agents => AudienceKind::Agents,
+            MessageMentionKind::Humans => AudienceKind::Humans,
+        };
+        if !audience
+            .iter()
+            .any(|entry| entry.kind == kind && entry.id == mention.actor_or_group_id)
+        {
+            audience.push(AudienceRef {
+                kind,
+                id: mention.actor_or_group_id.clone(),
+                display: Some(mention.display.clone()),
+            });
+        }
+    }
+}
+
+fn direct_channel_title(a: &str, b: &str) -> String {
+    let mut ids = [a, b];
+    ids.sort();
+    format!("dm:{}:{}", ids[0], ids[1])
+}
+
+fn short_actor_alias(actor_id: &str) -> &str {
+    actor_id
+        .strip_prefix("actor_agent_")
+        .or_else(|| actor_id.strip_prefix("actor_human_"))
+        .or_else(|| actor_id.strip_prefix("actor_service_"))
+        .or_else(|| actor_id.strip_prefix("actor_"))
+        .unwrap_or(actor_id)
+}
+
+fn normalize_actor_group_name(raw: &str) -> StoreResult<String> {
+    let name = raw.trim().trim_start_matches('@').to_ascii_lowercase();
+    if name.is_empty() {
+        return Err(StoreError::InvalidState(
+            "actor group name cannot be empty".into(),
+        ));
+    }
+    if matches!(name.as_str(), "all" | "agents" | "humans") {
+        return Err(StoreError::InvalidState(format!(
+            "@{name} is a reserved group name"
+        )));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(StoreError::InvalidState(
+            "actor group name cannot be empty".into(),
+        ));
     };
+    if !first.is_ascii_alphanumeric() {
+        return Err(StoreError::InvalidState(format!(
+            "invalid actor group name @{name}"
+        )));
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+        return Err(StoreError::InvalidState(format!(
+            "invalid actor group name @{name}"
+        )));
+    }
+    Ok(name)
+}
+
+fn validate_actor_group_member_inner(
+    inner: &Inner,
+    channel_id: &str,
+    actor_id: &str,
+) -> StoreResult<()> {
+    if !inner.actors.contains_key(actor_id) {
+        return Err(StoreError::NotFound(format!("actor {actor_id}")));
+    }
+    if !is_channel_member_inner(inner, channel_id, actor_id) {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not a member of channel {channel_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn scope_channel_id_inner<'a>(inner: &'a Inner, scope: &'a ScopeRef) -> Option<&'a str> {
+    match scope.kind {
+        ScopeKind::Channel => inner
+            .channels
+            .contains_key(&scope.id)
+            .then_some(scope.id.as_str()),
+        ScopeKind::Thread => inner
+            .threads
+            .get(&scope.id)
+            .map(|thread| thread.channel_id.as_str()),
+    }
+}
+
+fn is_channel_member_inner(inner: &Inner, channel_id: &str, actor_id: &str) -> bool {
     inner
         .channels
         .get(channel_id)
@@ -3347,6 +4918,147 @@ fn can_access_scope_inner(inner: &Inner, scope: &ScopeRef, actor_id: &str) -> bo
         })
 }
 
+fn is_terminal_run_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
+    )
+}
+
+fn agent_config_activation_key(actor_id: &str, scope: Option<&ScopeRef>) -> String {
+    match scope {
+        Some(scope) => format!("{actor_id}:{}:{}", scope_kind_name(scope.kind), scope.id),
+        None => format!("{actor_id}:global"),
+    }
+}
+
+fn scope_kind_name(kind: ScopeKind) -> &'static str {
+    match kind {
+        ScopeKind::Channel => "channel",
+        ScopeKind::Thread => "thread",
+    }
+}
+
+fn coordination_decision_satisfied(session: &CoordinationSession) -> bool {
+    if session
+        .responses
+        .iter()
+        .any(|response| response.kind == CoordinationResponseKind::Reject)
+    {
+        return false;
+    }
+    match session.decision_rule {
+        CoordinationDecisionRule::OwnerDecides => true,
+        CoordinationDecisionRule::HumanApproval => session
+            .responses
+            .iter()
+            .any(|response| response.kind == CoordinationResponseKind::Ack),
+        CoordinationDecisionRule::AllAck => session.participants.iter().all(|actor_id| {
+            session.responses.iter().any(|response| {
+                response.actor_id == *actor_id && response.kind == CoordinationResponseKind::Ack
+            })
+        }),
+        CoordinationDecisionRule::Majority => {
+            let ack_count = session
+                .responses
+                .iter()
+                .filter(|response| response.kind == CoordinationResponseKind::Ack)
+                .count();
+            ack_count > session.participants.len() / 2
+        }
+    }
+}
+
+fn validate_coordination_step_actor(
+    inner: &Inner,
+    session: &CoordinationSession,
+    actor_id: &str,
+    base_revision: u64,
+) -> StoreResult<()> {
+    if session.status != CoordinationStatus::Executing {
+        return Err(StoreError::InvalidState(format!(
+            "coordination session {} is not executing",
+            session.id
+        )));
+    }
+    if !is_channel_member_inner(
+        inner,
+        scope_channel_id_inner(inner, &session.scope).unwrap_or_default(),
+        actor_id,
+    ) {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} cannot access coordination session {}",
+            session.id
+        )));
+    }
+    match session.mode {
+        CoordinationMode::Sequential => {
+            if session.revision != base_revision {
+                return Err(StoreError::Conflict(format!(
+                    "coordination session {} revision mismatch: expected {}, current {}",
+                    session.id, base_revision, session.revision
+                )));
+            }
+            if session.baton_holder_actor_id.as_deref() != Some(actor_id) {
+                return Err(StoreError::InvalidState(format!(
+                    "actor {actor_id} does not hold coordination baton for {}",
+                    session.id
+                )));
+            }
+        }
+        CoordinationMode::ParallelReduce | CoordinationMode::Broadcast => {
+            if !session.participants.iter().any(|id| id == actor_id) {
+                return Err(StoreError::InvalidState(format!(
+                    "actor {actor_id} is not a participant in coordination session {}",
+                    session.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn advance_coordination_after_step(session: &mut CoordinationSession, actor_id: &str) {
+    match session.mode {
+        CoordinationMode::Sequential => {
+            session.revision += 1;
+            let next = session
+                .participants
+                .iter()
+                .position(|participant| participant == actor_id)
+                .and_then(|idx| session.participants.get(idx + 1))
+                .cloned();
+            match next {
+                Some(next) => {
+                    session.baton_holder_actor_id = Some(next);
+                    session.status = CoordinationStatus::Executing;
+                }
+                None => {
+                    session.baton_holder_actor_id = None;
+                    session.status = CoordinationStatus::Done;
+                }
+            }
+        }
+        CoordinationMode::ParallelReduce | CoordinationMode::Broadcast => {
+            session.revision += 1;
+        }
+    }
+    session.updated_at = Utc::now();
+}
+
+fn scope_channel_id(scope: &ScopeRef, store: &Store) -> StoreResult<String> {
+    let inner = store.inner.read();
+    scope_channel_id_inner(&inner, scope)
+        .map(str::to_string)
+        .ok_or_else(|| StoreError::NotFound(format!("scope {:?}:{}", scope.kind, scope.id)))
+}
+
+fn can_access_scope_inner(inner: &Inner, scope: &ScopeRef, actor_id: &str) -> bool {
+    scope_channel_id_inner(inner, scope)
+        .is_some_and(|channel_id| is_channel_member_inner(inner, channel_id, actor_id))
+}
+
+#[allow(dead_code)]
 fn event_search_text(event: &Event) -> String {
     let mut parts = Vec::new();
     if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
@@ -3358,19 +5070,15 @@ fn event_search_text(event: &Event) -> String {
     parts.join("\n").to_ascii_lowercase()
 }
 
-fn event_title(event: &Event) -> String {
-    for key in ["title", "text", "message"] {
-        if let Some(value) = event.payload.get(key).and_then(|v| v.as_str()) {
-            if let Some(line) = value.lines().find(|line| !line.trim().is_empty()) {
-                return line.trim().chars().take(120).collect();
-            }
-        }
+fn message_title(message: &Message) -> String {
+    if let Some(line) = message.body.lines().find(|line| !line.trim().is_empty()) {
+        return line.trim().chars().take(120).collect();
     }
-    format!("Task from {}", event.id)
+    format!("Task from {}", message.id)
 }
 
 fn unique_nonempty(ids: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for id in ids {
         if id.trim().is_empty() {
@@ -3733,7 +5441,7 @@ mod tests {
     /// Per-test journal file under the OS temp dir. We don't bother cleaning
     /// up — the file is tiny and lives in /tmp which the OS will sweep.
     fn fresh_store() -> Arc<Store> {
-        let dir = std::env::temp_dir().join(format!("joi-store-test-{}", Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!("loom-store-test-{}", Uuid::new_v4().simple()));
         let path: PathBuf = dir.join("journal.jsonl");
         let journal = Journal::open(path).expect("open journal");
         Store::open(journal).expect("open store")
@@ -3771,19 +5479,21 @@ mod tests {
         text: &str,
     ) -> String {
         store
-            .append_event(
-                "content.add".into(),
+            .append_message(
                 actor_id.into(),
-                ScopeRef {
-                    kind: ScopeKind::Channel,
-                    id: channel_id.into(),
-                },
+                format!("#{channel_id}"),
+                MessageKind::Human,
+                text.into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
                 None,
-                serde_json::json!({ "text": text }),
-                vec![],
                 None,
+                Vec::new(),
+                Meta::default(),
             )
-            .expect("append root event")
+            .expect("append root message")
             .id
     }
 
@@ -3793,17 +5503,17 @@ mod tests {
         actor_id: &str,
         title: &str,
     ) -> Thread {
-        let root_event_id = append_channel_root(store, channel_id, actor_id, title);
+        let root_message_id = append_channel_root(store, channel_id, actor_id, title);
         store
-            .create_thread(channel_id.into(), title.into(), root_event_id)
+            .create_thread(channel_id.into(), title.into(), root_message_id)
             .expect("create thread")
     }
 
     fn create_owned_task(store: &Arc<Store>, channel_id: &str, title: &str) -> Task {
-        let root_event_id = append_channel_root(store, channel_id, "actor_owner", title);
+        let root_message_id = append_channel_root(store, channel_id, "actor_owner", title);
         store
             .create_task(
-                root_event_id,
+                root_message_id,
                 Some(title.into()),
                 String::new(),
                 "actor_owner".into(),
@@ -3830,6 +5540,541 @@ mod tests {
             _meta: None,
         };
         store.put_artifact(artifact).expect("put artifact")
+    }
+
+    fn test_actor(id: &str, kind: ActorKind, display_name: &str) -> Actor {
+        Actor {
+            id: id.into(),
+            kind,
+            display_name: display_name.into(),
+            capabilities: None,
+            _meta: None,
+        }
+    }
+
+    fn send_test_message(store: &Arc<Store>, actor_id: &str, target: &str, body: &str) -> Message {
+        store
+            .append_message(
+                actor_id.into(),
+                target.into(),
+                MessageKind::Human,
+                body.into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+            )
+            .expect("append message")
+    }
+
+    #[test]
+    fn append_message_parses_middle_mention_and_creates_delivery() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor(
+                "actor_agent_reviewer",
+                ActorKind::Agent,
+                "Reviewer",
+            ))
+            .unwrap();
+        let channel = store
+            .create_channel("backend".into(), Some("actor_alice".into()))
+            .unwrap();
+        store
+            .grant_channel(&channel.id, "actor_agent_reviewer")
+            .unwrap();
+
+        let message = send_test_message(
+            &store,
+            "actor_alice",
+            &format!("#{}", channel.id),
+            "cache looks wrong, @Reviewer please check",
+        );
+
+        assert_eq!(message.mentions.len(), 1);
+        let mention = &message.mentions[0];
+        assert_eq!(mention.kind, MessageMentionKind::Actor);
+        assert_eq!(mention.actor_or_group_id, "actor_agent_reviewer");
+        assert_eq!(
+            &message.body[mention.byte_start..mention.byte_end],
+            "@Reviewer"
+        );
+        let deliveries = store.list_deliveries(
+            "actor_agent_reviewer",
+            Some(DeliveryState::Pending),
+            10,
+            None,
+        );
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].source_id, message.id);
+    }
+
+    #[test]
+    fn followed_thread_replies_create_follower_delivery_and_replay() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_owner", ActorKind::Human, "Owner"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_bob", ActorKind::Human, "Bob"))
+            .unwrap();
+        let channel = store
+            .create_channel("thread-follow".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        let root_message_id = append_channel_root(&store, &channel.id, "actor_owner", "root");
+        let thread = store
+            .create_thread(channel.id.clone(), "root".into(), root_message_id.clone())
+            .unwrap();
+
+        let presence = store
+            .follow_thread("actor_bob".into(), &thread.id, false)
+            .unwrap();
+        assert!(presence.following);
+
+        let reply = send_test_message(
+            &store,
+            "actor_owner",
+            &format!("#{}:{}", channel.id, root_message_id),
+            "thread reply",
+        );
+        let deliveries = store.list_deliveries("actor_bob", Some(DeliveryState::Pending), 10, None);
+        assert!(deliveries
+            .iter()
+            .any(|delivery| delivery.source_id == reply.id));
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        let replayed_reply = send_test_message(
+            &replayed,
+            "actor_owner",
+            &format!("#{}:{}", channel.id, root_message_id),
+            "thread reply after replay",
+        );
+        let replayed_deliveries =
+            replayed.list_deliveries("actor_bob", Some(DeliveryState::Pending), 20, None);
+        assert!(replayed_deliveries
+            .iter()
+            .any(|delivery| delivery.source_id == replayed_reply.id));
+
+        replayed
+            .unfollow_thread("actor_bob".into(), &thread.id)
+            .unwrap();
+        let muted_reply = send_test_message(
+            &replayed,
+            "actor_owner",
+            &format!("#{}:{}", channel.id, root_message_id),
+            "thread reply after unfollow",
+        );
+        let after_unfollow =
+            replayed.list_deliveries("actor_bob", Some(DeliveryState::Pending), 20, None);
+        assert!(!after_unfollow
+            .iter()
+            .any(|delivery| delivery.source_id == muted_reply.id));
+    }
+
+    #[test]
+    fn at_all_notifies_humans_but_does_not_wake_agents_by_default() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_bob", ActorKind::Human, "Bob"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("release".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+
+        let message = send_test_message(
+            &store,
+            "actor_alice",
+            &format!("#{}", channel.id),
+            "@all freeze at 17:00",
+        );
+
+        assert!(message
+            .audience
+            .iter()
+            .any(|audience| audience.kind == AudienceKind::All));
+        assert_eq!(
+            store
+                .list_deliveries("actor_bob", Some(DeliveryState::Pending), 10, None)
+                .len(),
+            1
+        );
+        assert!(store
+            .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn custom_group_mentions_notify_humans_without_waking_agents() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_bob", ActorKind::Human, "Bob"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("review".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let group = store
+            .create_actor_group(
+                channel.id.clone(),
+                "Reviewers".into(),
+                None,
+                vec!["actor_bob".into(), "actor_agent_bot".into()],
+                false,
+            )
+            .expect("create actor group");
+
+        let message = send_test_message(
+            &store,
+            "actor_alice",
+            &format!("#{}", channel.id),
+            "@reviewers please look",
+        );
+
+        assert!(message.mentions.iter().any(|mention| {
+            mention.kind == MessageMentionKind::Group && mention.actor_or_group_id == group.id
+        }));
+        assert_eq!(
+            store
+                .list_deliveries("actor_bob", Some(DeliveryState::Pending), 10, None)
+                .len(),
+            1
+        );
+        assert!(store
+            .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None)
+            .is_empty());
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert_eq!(
+            replayed
+                .get_actor_group(&group.id)
+                .expect("replayed group")
+                .member_actor_ids,
+            vec!["actor_bob", "actor_agent_bot"]
+        );
+    }
+
+    #[test]
+    fn custom_group_wake_policy_wakes_agent_members_in_threads() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("review".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let group = store
+            .create_actor_group(
+                channel.id.clone(),
+                "bots".into(),
+                None,
+                vec!["actor_agent_bot".into()],
+                true,
+            )
+            .expect("create actor group");
+        let root = send_test_message(&store, "actor_alice", &format!("#{}", channel.id), "root");
+        let target = format!("#{}:{}", channel.id, root.id);
+
+        let message = store
+            .append_message(
+                "actor_alice".into(),
+                target,
+                MessageKind::Human,
+                "@bots wake up".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+            )
+            .expect("append group wake message");
+
+        assert!(matches!(message.scope.kind, ScopeKind::Thread));
+        assert!(message.mentions.iter().any(|mention| {
+            mention.kind == MessageMentionKind::Group && mention.actor_or_group_id == group.id
+        }));
+        let deliveries =
+            store.list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].source_id, message.id);
+    }
+
+    #[test]
+    fn run_lifecycle_requires_start_source_and_replays() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("runs".into(), Some("actor_agent_bot".into()))
+            .unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+
+        let err = store
+            .open_run(
+                "actor_agent_bot".into(),
+                scope.clone(),
+                None,
+                None,
+                config.id.clone(),
+                Meta::default(),
+            )
+            .expect_err("run without delivery or explicit reason must fail");
+        assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
+
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                scope,
+                None,
+                Some("manual".into()),
+                config.id.clone(),
+                Meta::default(),
+            )
+            .expect("open run");
+        assert_eq!(run.status, RunStatus::Queued);
+
+        let (running, frame) = store
+            .append_run_frame(
+                &run.id,
+                Some(RunStatus::Running),
+                "progress".into(),
+                serde_json::json!({ "step": "context-ready" }),
+            )
+            .expect("append run frame");
+        assert_eq!(running.status, RunStatus::Running);
+        assert_eq!(frame.seq, 1);
+
+        let closed = store
+            .close_run(&run.id, RunStatus::Completed)
+            .expect("close run");
+        assert_eq!(closed.status, RunStatus::Completed);
+        assert!(closed.closed_at.is_some());
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert_eq!(
+            replayed.get_run(&run.id).expect("replayed run").status,
+            RunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn sequential_coordination_enforces_baton_and_revision() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_owner", ActorKind::Human, "Owner"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_a", ActorKind::Agent, "A"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_b", ActorKind::Agent, "B"))
+            .unwrap();
+        let channel = store
+            .create_channel("coord".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_a").unwrap();
+        store.grant_channel(&channel.id, "actor_b").unwrap();
+
+        let session = store
+            .propose_coordination_session(
+                "actor_owner".into(),
+                format!("#{}", channel.id),
+                CoordinationMode::Sequential,
+                CoordinationDecisionRule::OwnerDecides,
+                vec!["actor_a".into(), "actor_b".into()],
+                None,
+                None,
+                serde_json::json!({ "goal": "count" }),
+                Meta::default(),
+            )
+            .expect("propose coordination");
+        let session = store
+            .commit_coordination_session(&session.id, "actor_owner")
+            .expect("commit coordination");
+        assert_eq!(session.status, CoordinationStatus::Executing);
+        assert_eq!(session.baton_holder_actor_id.as_deref(), Some("actor_a"));
+
+        let err = store
+            .apply_coordination_step(
+                "actor_b".into(),
+                &session.id,
+                0,
+                CoordinationStepType::Work,
+                serde_json::json!({ "count": 2 }),
+                None,
+                MessageKind::Agent,
+            )
+            .expect_err("non-holder cannot step");
+        assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
+
+        let (session, step, _) = store
+            .apply_coordination_step(
+                "actor_a".into(),
+                &session.id,
+                0,
+                CoordinationStepType::Work,
+                serde_json::json!({ "count": 1 }),
+                Some("A counted 1".into()),
+                MessageKind::Agent,
+            )
+            .expect("actor a step");
+        assert_eq!(step.status, CoordinationStepStatus::Accepted);
+        assert_eq!(session.revision, 1);
+        assert_eq!(session.baton_holder_actor_id.as_deref(), Some("actor_b"));
+
+        let err = store
+            .apply_coordination_step(
+                "actor_b".into(),
+                &session.id,
+                0,
+                CoordinationStepType::Work,
+                serde_json::json!({ "count": 2 }),
+                None,
+                MessageKind::Agent,
+            )
+            .expect_err("stale revision rejected");
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+
+        let (done, _, _) = store
+            .apply_coordination_step(
+                "actor_b".into(),
+                &session.id,
+                1,
+                CoordinationStepType::Work,
+                serde_json::json!({ "count": 2 }),
+                None,
+                MessageKind::Agent,
+            )
+            .expect("actor b step");
+        assert_eq!(done.status, CoordinationStatus::Done);
+        assert_eq!(done.revision, 2);
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert_eq!(
+            replayed
+                .get_coordination_session(&session.id)
+                .expect("replayed session")
+                .status,
+            CoordinationStatus::Done
+        );
+    }
+
+    #[test]
+    fn thread_message_target_auto_creates_and_reuses_thread() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        let channel = store
+            .create_channel("backend".into(), Some("actor_alice".into()))
+            .unwrap();
+        let root = send_test_message(&store, "actor_alice", &format!("#{}", channel.id), "root");
+        let target = format!("#{}:{}", channel.id, root.id);
+
+        let first = send_test_message(&store, "actor_alice", &target, "first reply");
+        let second = send_test_message(&store, "actor_alice", &target, "second reply");
+
+        assert_eq!(
+            first.thread_root_message_id.as_deref(),
+            Some(root.id.as_str())
+        );
+        assert_eq!(second.scope, first.scope);
+        assert_eq!(store.list_threads(Some(&channel.id)).len(), 1);
+        let (messages, has_more) = store
+            .read_messages_for_target("actor_alice", &target, 10, None)
+            .expect("read target");
+        assert!(!has_more);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str(), second.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn message_search_respects_private_channel_acl() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_bob", ActorKind::Human, "Bob"))
+            .unwrap();
+        let channel = store
+            .create_channel("private".into(), Some("actor_alice".into()))
+            .unwrap();
+        let message = send_test_message(
+            &store,
+            "actor_alice",
+            &format!("#{}", channel.id),
+            "needle in private channel",
+        );
+
+        assert!(store
+            .search_message_records("actor_bob", "needle", None, 10)
+            .unwrap()
+            .is_empty());
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        let results = store
+            .search_message_records("actor_bob", "needle", None, 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, message.id);
     }
 
     #[test]
@@ -3867,43 +6112,45 @@ mod tests {
     }
 
     #[test]
-    fn create_thread_requires_channel_root_event() {
+    fn create_thread_requires_channel_root_message() {
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
         let t = create_thread_under(&store, &ch.id, "actor_owner", "root");
-        let child_event = store
-            .append_event(
-                "content.add".into(),
+        let child_message = store
+            .append_message(
                 "actor_owner".into(),
-                ScopeRef {
-                    kind: ScopeKind::Thread,
-                    id: t.id.clone(),
-                },
+                format!("#{}:{}", ch.id, t.root_message_id),
+                MessageKind::Human,
+                "thread reply".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
                 None,
-                serde_json::json!({ "text": "thread reply" }),
-                vec![],
                 None,
+                Vec::new(),
+                Meta::default(),
             )
-            .expect("append thread event")
+            .expect("append thread message")
             .id;
 
         let err = store
-            .create_thread(ch.id.clone(), "nested".into(), child_event)
+            .create_thread(ch.id.clone(), "nested".into(), child_message)
             .expect_err("thread-scoped root must be rejected");
         assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
     }
 
     #[test]
-    fn create_thread_rejects_duplicate_root_event() {
+    fn create_thread_rejects_duplicate_root_message() {
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
-        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "root");
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "root");
         store
-            .create_thread(ch.id.clone(), "first".into(), root_event_id.clone())
+            .create_thread(ch.id.clone(), "first".into(), root_message_id.clone())
             .expect("first thread");
 
         let err = store
-            .create_thread(ch.id.clone(), "second".into(), root_event_id)
+            .create_thread(ch.id.clone(), "second".into(), root_message_id)
             .expect_err("duplicate root must be rejected");
         assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
     }
@@ -3969,16 +6216,16 @@ mod tests {
     }
 
     #[test]
-    fn create_task_anchors_to_channel_event_and_creates_canonical_thread() {
+    fn create_task_anchors_to_channel_message_and_creates_canonical_thread() {
         let store = fresh_store();
         let ch = store
             .create_channel("tasks".into(), Some("actor_owner".into()))
             .unwrap();
-        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "write docs");
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "write docs");
 
         let task = store
             .create_task(
-                root_event_id.clone(),
+                root_message_id.clone(),
                 None,
                 "write docs".into(),
                 "actor_owner".into(),
@@ -3991,12 +6238,12 @@ mod tests {
             .expect("create task");
 
         assert_eq!(task.number, 1);
-        assert_eq!(task.source_event_id, root_event_id);
+        assert_eq!(task.source_message_id, root_message_id);
         assert_eq!(task.status, TaskStatus::Claimed);
         let thread = store
             .get_thread(&task.canonical_thread_id)
             .expect("canonical thread");
-        assert_eq!(thread.root_event_id, task.source_event_id);
+        assert_eq!(thread.root_message_id, task.source_message_id);
         assert_eq!(thread.channel_id, ch.id);
 
         let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
@@ -4011,50 +6258,52 @@ mod tests {
         let ch = store
             .create_channel("split".into(), Some("actor_owner".into()))
             .unwrap();
-        let parent_event =
+        let parent_message =
             append_channel_root(&store, &ch.id, "actor_owner", "fix A and inspect B");
-        let child_event = append_channel_root(&store, &ch.id, "actor_owner", "fix A");
+        let child_message = append_channel_root(&store, &ch.id, "actor_owner", "fix A");
         let child = store
             .create_task(
-                child_event,
+                child_message,
                 Some("fix A".into()),
                 String::new(),
                 "actor_owner".into(),
                 Some("actor_owner".into()),
                 Some(TaskStatus::Claimed),
-                Some(parent_event.clone()),
+                Some(parent_message.clone()),
                 None,
                 Some("test@epoch".into()),
             )
             .unwrap();
         assert_eq!(
-            child.parent_source_event_id.as_deref(),
-            Some(parent_event.as_str())
+            child.parent_source_message_id.as_deref(),
+            Some(parent_message.as_str())
         );
     }
 
     #[test]
-    fn create_task_rejects_thread_event_and_duplicate_source() {
+    fn create_task_rejects_thread_message_and_duplicate_source() {
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
         let thread = create_thread_under(&store, &ch.id, "actor_owner", "root");
-        let thread_event = store
-            .append_event(
-                "content.add".into(),
+        let thread_message = store
+            .append_message(
                 "actor_owner".into(),
-                ScopeRef {
-                    kind: ScopeKind::Thread,
-                    id: thread.id,
-                },
+                format!("#{}:{}", ch.id, thread.root_message_id),
+                MessageKind::Human,
+                "child".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
                 None,
-                serde_json::json!({ "text": "child" }),
-                vec![],
                 None,
+                Vec::new(),
+                Meta::default(),
             )
             .unwrap();
         let err = store
             .create_task(
-                thread_event.id,
+                thread_message.id,
                 None,
                 String::new(),
                 "actor_owner".into(),
@@ -4064,13 +6313,13 @@ mod tests {
                 None,
                 None,
             )
-            .expect_err("thread event cannot anchor task");
+            .expect_err("thread message cannot anchor task");
         assert!(matches!(err, StoreError::InvalidState(_)), "got {err:?}");
 
-        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "work");
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "work");
         store
             .create_task(
-                root_event_id.clone(),
+                root_message_id.clone(),
                 None,
                 String::new(),
                 "actor_owner".into(),
@@ -4083,7 +6332,7 @@ mod tests {
             .unwrap();
         let err = store
             .create_task(
-                root_event_id,
+                root_message_id,
                 None,
                 String::new(),
                 "actor_owner".into(),
@@ -4093,27 +6342,27 @@ mod tests {
                 None,
                 None,
             )
-            .expect_err("source event is unique");
+            .expect_err("source message is unique");
         assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
     }
 
     #[test]
-    fn create_task_is_unique_under_concurrent_source_event_claims() {
+    fn create_task_is_unique_under_concurrent_source_message_claims() {
         let store = fresh_store();
         let ch = store
             .create_channel("race".into(), Some("actor_owner".into()))
             .unwrap();
-        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "race task");
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "race task");
         let barrier = Arc::new(Barrier::new(2));
         let handles = (0..2)
             .map(|_| {
                 let store = store.clone();
-                let root_event_id = root_event_id.clone();
+                let root_message_id = root_message_id.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
                     store.create_task(
-                        root_event_id,
+                        root_message_id,
                         Some("race task".into()),
                         String::new(),
                         "actor_owner".into(),
@@ -4149,10 +6398,10 @@ mod tests {
             .create_channel("review".into(), Some("actor_owner".into()))
             .unwrap();
         store.grant_channel(&ch.id, "actor_reviewer").unwrap();
-        let root_event_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
         let task = store
             .create_task(
-                root_event_id,
+                root_message_id,
                 Some("story".into()),
                 String::new(),
                 "actor_owner".into(),
@@ -4175,18 +6424,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(task.status, TaskStatus::WaitingReview);
-        let result_event = store
-            .append_event(
-                "content.add".into(),
+        let result_message = store
+            .append_message(
                 "actor_reviewer".into(),
-                ScopeRef {
-                    kind: ScopeKind::Thread,
-                    id: task.canonical_thread_id.clone(),
-                },
+                format!("#{}:{}", task.channel_id, task.source_message_id),
+                MessageKind::Agent,
+                "looks good".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Review,
+                DeliveryPolicy::NotifyOnly,
                 None,
-                serde_json::json!({ "text": "looks good" }),
-                vec![],
                 None,
+                Vec::new(),
+                Meta::default(),
             )
             .unwrap();
         let (updated, _) = store
@@ -4206,13 +6457,13 @@ mod tests {
             "assignment_id": assignment.id,
             "status": "completed",
             "verdict": "pass",
-            "evidence_refs": [result_event.id.clone()]
+            "evidence_refs": [result_message.id.clone()]
         });
         let (updated, _) = store
             .update_task_assignment(
                 &assignment.id,
                 Some(TaskAssignmentStatus::Completed),
-                Some(result_event.id.clone()),
+                Some(result_message.id.clone()),
                 Some("looks good".into()),
                 Some(envelope),
                 Vec::new(),
@@ -4222,8 +6473,8 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, TaskAssignmentStatus::Completed);
         assert_eq!(
-            updated.result_event_id.as_deref(),
-            Some(result_event.id.as_str())
+            updated.result_message_id.as_deref(),
+            Some(result_message.id.as_str())
         );
 
         let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
@@ -4255,7 +6506,7 @@ mod tests {
                 TaskRefConfidence::Confirmed,
                 TaskRefStatus::Active,
                 None,
-                Some(task_a.source_event_id.clone()),
+                Some(task_a.source_message_id.clone()),
                 "actor_owner".into(),
             )
             .unwrap();
@@ -5595,12 +7846,12 @@ mod tests {
             .id
     }
 
-    fn responds_to(event_id: &str) -> Relation {
+    fn responds_to(source_id: &str) -> Relation {
         Relation {
             kind: RelationKind::RespondsTo,
             target: Ref {
                 kind: RefKind::Event,
-                id: event_id.into(),
+                id: source_id.into(),
                 _meta: None,
             },
             _meta: None,
@@ -5612,7 +7863,7 @@ mod tests {
         // svc_am_bridge appends a question, agent_qa replies with RespondsTo
         // -> question event. The reply event must produce a pending delivery
         // row for svc_am_bridge so a restarted service host can replay it via
-        // the future delivery/list API.
+        // the future inbox.list API.
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
         store.grant_channel(&ch.id, "svc_am_bridge").unwrap();
@@ -5646,14 +7897,14 @@ mod tests {
             .cloned()
             .expect("reverse delivery row exists");
         assert!(matches!(delivery.state, DeliveryState::Pending));
-        assert_eq!(delivery.event_id, reply_id);
+        assert_eq!(delivery.source_id, reply_id);
         assert_eq!(delivery.actor_id, "svc_am_bridge");
     }
 
     #[test]
-    fn explicit_handoff_reply_does_not_reverse_deliver_to_original_actor() {
-        // Reply-as-handoff events may carry both HandsOffTo and RespondsTo.
-        // The explicit handoff target is the only actor that should wake up;
+    fn explicit_route_reply_does_not_reverse_deliver_to_original_actor() {
+        // Reply-as-route events may carry both DirectedTo and RespondsTo.
+        // The explicit route target is the only actor that should wake up;
         // otherwise one user action can start two actor turns.
         let store = fresh_store();
         let ch = store.create_channel("c".into(), None).unwrap();
@@ -5672,7 +7923,7 @@ mod tests {
             scope.clone(),
             vec![],
         );
-        let handoff_id = append_with_relations(
+        let directed_event_id = append_with_relations(
             &store,
             "content.add",
             "actor_router",
@@ -5680,7 +7931,7 @@ mod tests {
             vec![
                 responds_to(&original_id),
                 Relation {
-                    kind: RelationKind::HandsOffTo,
+                    kind: RelationKind::DirectedTo,
                     target: Ref {
                         kind: RefKind::Actor,
                         id: "actor_examiner".into(),
@@ -5693,11 +7944,11 @@ mod tests {
 
         let deliveries = store.inner.read().deliveries.clone();
         assert!(
-            deliveries.contains_key(&(handoff_id.clone(), "actor_examiner".to_string())),
+            deliveries.contains_key(&(directed_event_id.clone(), "actor_examiner".to_string())),
             "explicit target must receive the delivery",
         );
         assert!(
-            !deliveries.contains_key(&(handoff_id, "actor_delivery".to_string())),
+            !deliveries.contains_key(&(directed_event_id, "actor_delivery".to_string())),
             "responds_to target must not also receive the delivery",
         );
     }

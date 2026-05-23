@@ -1,7 +1,7 @@
 # Legacy Agent provider spec 样例
 
 这些文件保留为旧版 provider spec schema 参考。当前运行路径只保留
-`joi daemon`：daemon 从 `~/.joi-apps/desktop.toml` 的 machine agent 配置自动合成
+`loom-daemon`：daemon 从 `~/.loom-apps/desktop.toml` 的 machine agent 配置自动合成
 runtime spec，不再加载这个目录。
 
 | 文件 | 命令 | 备注 |
@@ -12,11 +12,11 @@ runtime spec，不再加载这个目录。
 | [`actor_qoder.json`](actor_qoder.json) | `npx -y @qoder-ai/qodercli@0.1.48 --acp` | Qoder ACP 模式；与 Zed registry 当前版本对齐 |
 
 Qoder 的旧 provider spec 需要跟 Zed registry 使用的 ACP 包版本保持一致。Zed 当前配置
-为 `@qoder-ai/qodercli@0.1.48`；如果 Joi 仍使用旧版
-`@qoder-ai/qodercli@0.1.36`，可能会出现 Zed ACP 可用但 Joi ACP 仍提示
+为 `@qoder-ai/qodercli@0.1.48`；如果 Loom 仍使用旧版
+`@qoder-ai/qodercli@0.1.36`，可能会出现 Zed ACP 可用但 Loom ACP 仍提示
 `Authentication required` 并重新打开浏览器登录的情况。
 
-Qoder 会根据客户端声明的 terminal auth 能力返回登录命令。Joi 会优先执行
+Qoder 会根据客户端声明的 terminal auth 能力返回登录命令。Loom 会优先执行
 Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志提示重新
 登录后重试。
 
@@ -33,7 +33,7 @@ Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志
 
 如果一个 agent runtime 支持在 ACP `session/new` 中指定模型，可以在
 `defaults.models` 或 actor 自己的 `models` 里声明模型菜单。之后在聊天框发送
-`@actor_id /models`，Joi 会弹出选择卡片，
+`@actor_id /models`，Loom 会弹出选择卡片，
 并把选择结果保存到该 actor 的 profile，下次创建 ACP session 时带上选中的
 `model`：
 

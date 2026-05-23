@@ -1,13 +1,12 @@
-//! `joi mcp announcement` — stdio MCP server exposing pinned-announcement
+//! `loom mcp announcement` — stdio MCP server exposing pinned-announcement
 //! tools to the running agent.
 //!
 //! Unlike `mcp_memory` (which reads/writes a local JSONL store), this MCP
-//! is a thin proxy to the running joi-server: each tool call translates to
-//! one `event/append` over the same WebSocket the chat client uses. The
-//! resulting `announcement.set` / `announcement.clear` event lands in the
-//! journal, gets broadcast to every connected client subscribed to the
-//! scope, and the chat TUI's right-side panel reduces it into the new
-//! pinned message.
+//! is a thin proxy to the running loom-server: each tool call translates to
+//! one `message.send` over the same WebSocket the chat client uses. The
+//! resulting message carries `metadata.kind = announcement.set/clear`, gets
+//! broadcast to every connected client subscribed to the scope, and the chat
+//! TUI's right-side panel reduces it into the new pinned message.
 //!
 //! Spawned by `agent_runtime::build_mcp_servers` when an agent's spec opts
 //! into `announcement.mcp = true`. The runtime passes `--actor-id` and
@@ -18,14 +17,15 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use proto::methods::{method, EventAppendResult};
+use proto::methods::{method, MessageSendResult, ThreadListResult};
+use proto::types::{DeliveryPolicy, MessageIntent};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::Client;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "joi-announcement";
+const SERVER_NAME: &str = "loom-announcement";
 
 pub async fn run(actor_id: String, server_url: String) -> Result<()> {
     // Bind the actor up-front so every tool call can reuse the same
@@ -176,7 +176,7 @@ async fn announcement_set(
         .map(|id| {
             vec![json!({
                 "type": "text",
-                "text": format!("{kind} ok (event {id}, scope {scope_kind}/{scope_id})"),
+                "text": format!("{kind} ok (message {id}, scope {scope_kind}/{scope_id})"),
             })]
         })
 }
@@ -200,7 +200,7 @@ async fn announcement_clear(
     .map(|id| {
         vec![json!({
             "type": "text",
-            "text": format!("announcement.clear ok (event {id}, scope {scope_kind}/{scope_id})"),
+            "text": format!("announcement.clear ok (message {id}, scope {scope_kind}/{scope_id})"),
         })]
     })
 }
@@ -213,19 +213,57 @@ async fn publish(
     kind: &str,
     text: &str,
 ) -> Result<String, String> {
-    let payload = json!({
-        "event": {
-            "type": kind,
-            "actorId": actor_id,
-            "scope": { "kind": scope_kind, "id": scope_id },
-            "payload": { "text": text },
-        }
-    });
-    let res: EventAppendResult = client
-        .call(method::EVENT_APPEND, payload)
+    let target = message_target_for_scope(&client, scope_kind, scope_id).await?;
+    let body = if text.trim().is_empty() {
+        "Announcement cleared.".to_string()
+    } else {
+        text.to_string()
+    };
+    let res: MessageSendResult = client
+        .call(
+            method::MESSAGE_SEND,
+            json!({
+                "target": target,
+                "body": body,
+                "intent": MessageIntent::Notify,
+                "deliveryPolicy": DeliveryPolicy::NotifyOnly,
+                "metadata": {
+                    "kind": kind,
+                    "text": text,
+                    "scopeKind": scope_kind,
+                    "scopeId": scope_id,
+                    "publishedBy": actor_id,
+                },
+            }),
+        )
         .await
         .map_err(|e| e.to_string())?;
-    Ok(res.event.id)
+    Ok(res.message.id)
+}
+
+async fn message_target_for_scope(
+    client: &Arc<Client>,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<String, String> {
+    match scope_kind {
+        "channel" => Ok(format!("#{}", scope_id)),
+        "thread" => {
+            let res: ThreadListResult = client
+                .call(method::THREAD_LIST, json!({ "archived": false }))
+                .await
+                .map_err(|e| e.to_string())?;
+            let thread = res
+                .threads
+                .into_iter()
+                .find(|thread| thread.id == scope_id)
+                .ok_or_else(|| format!("thread {scope_id} not found"))?;
+            Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
+        }
+        other => Err(format!(
+            "`scopeKind` must be channel or thread, got `{other}`"
+        )),
+    }
 }
 
 fn require_str(args: &Value, key: &str) -> Result<String, String> {

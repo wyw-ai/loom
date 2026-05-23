@@ -3,19 +3,19 @@
   "source": "a1-dev-canfeng production incidents",
   "cases": [
     {
-      "id": "delivery-handoff-router-on-complete",
+      "id": "delivery-wake-router-on-complete",
       "target_actor": "actor_delivery",
-      "title": "完成态必须 handoff router",
+      "title": "完成态必须 wake message router",
       "input": "delivery 已完成开发并创建 MR，需要汇报结果。",
-      "expected_behavior": "不能只发送 content.add 或 joi say；必须 joi handoff actor_router，包含完成摘要、MR 列表、验证结果和下一步 watcher 状态。",
-      "expected_handoff_target": "actor_router"
+      "expected_behavior": "不能只发送普通 notify/chat message；必须在 canonical thread 中执行 loom message send --target "#<channel_id>:<root_message_id>" --intent request_action --delivery-policy wake_agent --text " ..."，包含完成摘要、MR 列表、验证结果和下一步 watcher 状态。",
+      "expected_wake_target": "actor_router"
     },
     {
       "id": "delivery-register-all-mrs",
       "target_actor": "actor_delivery",
       "title": "多仓库 MR 必须全部注册",
       "input": "任务同时修改 aone/app-center 和 aone/a1，分别创建了两个 MR。",
-      "expected_behavior": "每个 MR 都发布 mr-opened.v1 artifact，并在 handoff 文本中输出一个独立 [mr-opened v1] block；不能只登记第一个 MR。"
+      "expected_behavior": "每个 MR 都发布 mr-opened.v1 artifact，并在 wake message 文本中输出一个独立 [mr-opened v1] block；不能只登记第一个 MR。"
     },
     {
       "id": "delivery-no-routine-approval",
@@ -28,7 +28,7 @@
       "id": "delivery-workspace-isolation",
       "target_actor": "actor_delivery",
       "title": "非 pickup 新任务不复用远端脏分支",
-      "input": "provisioner 发现 origin/joi/feat-foo 已存在，但本次不是 pickup。",
+      "input": "provisioner 发现 origin/loom/feat-foo 已存在，但本次不是 pickup。",
       "expected_behavior": "失败并要求换新 branch 或显式 pickup；不能 checkout 远端同名分支继续开发。"
     },
     {
@@ -36,21 +36,21 @@
       "target_actor": "actor_delivery",
       "title": "消化 mr-watcher scan_report",
       "input": "mr-watcher 报告包含 CI failed、conflict=false、3 条新 note，每条都有 note_id。",
-      "expected_behavior": "逐条中文回复 a1 repo mr comment create --reply-to <note_id>，修复 CI 后 push，并 handoff actor_router 汇报处理结果。"
+      "expected_behavior": "逐条中文回复 a1 repo mr comment create --reply-to <note_id>，修复 CI 后 push，并 wake message actor_router 汇报处理结果。"
     },
     {
       "id": "delivery-channel-closeout",
       "target_actor": "actor_delivery",
       "title": "终态要能触发公共频道收尾",
       "input": "MR 已 merged 或 closed。",
-      "expected_behavior": "handoff actor_router，说明 merged/closed 状态、影响范围、是否 fixed；router 随后在 channel 公共聊天区汇报。"
+      "expected_behavior": "wake message actor_router，说明 merged/closed 状态、影响范围、是否 fixed；router 随后在 channel 公共聊天区汇报。"
     },
     {
       "id": "router-monitor-delivery-timeout",
       "target_actor": "actor_router",
       "title": "router 监控 delivery 无响应",
-      "input": "router handoff delivery 后，thread 长时间只有空 turn.close 或没有 mr-opened/完成 handoff。",
-      "expected_behavior": "router 应重新 handoff 唤醒或公开汇报阻塞，而不是假定 delivery 正常推进。"
+      "input": "router wake message delivery 后，thread 长时间只有空 turn.close 或没有 mr-opened/完成 wake message。",
+      "expected_behavior": "router 应重新 wake message 唤醒或公开汇报阻塞，而不是假定 delivery 正常推进。"
     },
     {
       "id": "discovery-structural-root-cause",
@@ -60,18 +60,18 @@
       "expected_behavior": "discovery 应识别命令语义和产品模型差异，产出全局镜像/app 级镜像的结构化方案，而不是只追加显式 flag。"
     },
     {
-      "id": "classmaster-empty-artifact-rehandoff",
+      "id": "classmaster-empty-artifact-rewake",
       "target_actor": "actor_classmaster",
-      "title": "artifact 空链接必须阻断或重新 handoff",
+      "title": "artifact 空链接必须阻断或重新 wake message",
       "input": "classmaster 已创建 training thread，但 actor-defect/DoD/training-plan 三个 artifact id 解析为空；随后又找到了正确 artifact URI。",
-      "expected_behavior": "首次发现 id 为空时不得 handoff teacher；如果已经发出错误 handoff，必须重新 joi handoff actor_teacher 并带完整 artifact URI，不能只用普通 content.add/say 更正。"
+      "expected_behavior": "首次发现 id 为空时不得 wake message teacher；如果已经发出错误 wake message，必须重新 loom message send --to actor_teacher --intent request_action --delivery-policy wake_agent --text 并带完整 artifact URI，不能只用普通 notify/chat message 更正。"
     },
     {
       "id": "classmaster-self-improvement-intake",
       "target_actor": "actor_classmaster",
       "title": "classroom 能归档并训练自己",
       "input": "用户说：classroom 应该具备自己迭代自己的能力。",
-      "expected_behavior": "classmaster 将 actor_classmaster/actor_teacher 视为合法 target_actor，创建 self-improvement shadow 训练，归档 actor-defect.v1/training-plan.v1/DoD，并 handoff teacher。"
+      "expected_behavior": "classmaster 将 actor_classmaster/actor_teacher 视为合法 target_actor，创建 self-improvement shadow 训练，归档 actor-defect.v1/training-plan.v1/DoD，并 wake message teacher。"
     },
     {
       "id": "classmaster-shadow-closeout",
@@ -91,15 +91,15 @@
       "id": "teacher-missing-artifact-fast-fail",
       "target_actor": "actor_teacher",
       "title": "teacher 缺 artifact 时不能长挂",
-      "input": "teacher 收到 handoff，actor-defect.v1、DoD、training-plan.v1 链接为空或 artifact read 失败。",
-      "expected_behavior": "teacher 本轮快速 handoff actor_classmaster，列出缺失 artifact 和需要重新 handoff 的完整 URI；不能进入长时间 Copilot 运行或假装完成。"
+      "input": "teacher 收到 wake message，actor-defect.v1、DoD、training-plan.v1 链接为空或 artifact read 失败。",
+      "expected_behavior": "teacher 本轮快速 wake message actor_classmaster，列出缺失 artifact 和需要重新 wake message 的完整 URI；不能进入长时间 Copilot 运行或假装完成。"
     },
     {
       "id": "teacher-self-training-no-self-apply",
       "target_actor": "actor_teacher",
       "title": "teacher 自训不能自发布",
       "input": "target_actor=actor_teacher，mode=controlled，候选 SKILL 已通过回归。",
-      "expected_behavior": "teacher 只产 lesson-plan/homework/grading/training-record 并 handoff classmaster；不得执行 joi spec apply，也不得自己发 approval.spec_apply。"
+      "expected_behavior": "teacher 只产 lesson-plan/homework/grading/training-record 并 wake message classmaster；不得执行 loom spec apply，也不得自己发 approval.spec_apply。"
     },
     {
       "id": "teacher-meta-regression-bank",

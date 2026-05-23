@@ -5,8 +5,8 @@
 //! `ServiceRuntime` is the §6.3 substrate plugins call into. Wraps a
 //! single WS connection bound to one service actor and offers the
 //! protocol primitives plugins need: actor upsert, channel-member
-//! ensure, content append + handoff sugar, dedupe, cursor, state-dir,
-//! and the §9.5/§9.2 await-responds-to drainer.
+//! ensure, message send, content append, dedupe, cursor, state-dir,
+//! and the §9.5/§9.2 reply drainer.
 //!
 //! Single-actor by construction: the host opens one connection per
 //! `ServiceSpec` and creates one `ServiceRuntime` over it, so the
@@ -21,13 +21,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use proto::methods::{
     method, ActorUpsertParams, ActorUpsertResult, ArtifactIngress, ArtifactPublishParams,
-    ArtifactPublishResult, DeliveryListParams, DeliveryListResult, EventAppendInput,
-    EventAppendParams, EventAppendResult, InlineTextIngress, ThreadCreateParams,
-    ThreadCreateResult,
+    ArtifactPublishResult, InboxListParams, InboxListResult, InlineTextIngress, MessageSendResult,
+    ThreadCreateParams, ThreadCreateResult, ThreadListParams, ThreadListResult,
 };
-use proto::types::{
-    Actor, DeliveryState, Event, Meta, Ref, RefKind, Relation, RelationKind, ScopeRef, Thread,
-};
+use proto::types::{Actor, DeliveryState, Message, Meta, Relation, ScopeKind, ScopeRef, Thread};
 use serde_json::json;
 
 use crate::client::Client;
@@ -41,6 +38,19 @@ pub struct ServiceRuntime {
     client: Arc<Client>,
     state_dir: PathBuf,
     dedupe: DedupeStore,
+}
+
+fn service_payload_body(kind: &str, payload: &serde_json::Value) -> String {
+    if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+        return text.to_string();
+    }
+    let rendered = serde_json::to_string_pretty(payload)
+        .unwrap_or_else(|_| serde_json::to_string(payload).unwrap_or_default());
+    if rendered.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}\n\n```json\n{rendered}\n```")
+    }
 }
 
 impl ServiceRuntime {
@@ -112,7 +122,7 @@ impl ServiceRuntime {
     /// §8.4 dedupe primitive. Returns `Ok(true)` if `key` is new (caller
     /// must process the source), `Ok(false)` if the key was previously
     /// recorded (caller must skip). MUST be invoked **before** the
-    /// matching `append_content`/`handoff` so a process crash between
+    /// matching append/send so a process crash between
     /// dedup and append does not double-emit on restart.
     pub fn dedupe_once(&self, key: &str) -> Result<bool> {
         self.dedupe.record(key)
@@ -128,7 +138,7 @@ impl ServiceRuntime {
 
     /// Idempotent actor row upsert. The host calls this once at startup
     /// so the service actor's display name and capabilities reach the
-    /// server even before the first event references the actor.
+    /// server even before the first message references the actor.
     pub async fn actor_upsert(&self, actor: Actor) -> Result<Actor> {
         let res: ActorUpsertResult = self
             .client
@@ -138,8 +148,8 @@ impl ServiceRuntime {
         Ok(res.actor)
     }
 
-    /// Append a `content.add` event into `scope` as `text/markdown`,
-    /// stamped with the runtime's `actor_id`. Returns the new event id.
+    /// Send a `content.add` message into `scope` as `text/markdown`,
+    /// stamped with the runtime's `actor_id`. Returns the new message id.
     pub async fn append_content(
         &self,
         scope: ScopeRef,
@@ -147,43 +157,58 @@ impl ServiceRuntime {
         relations: Vec<Relation>,
         meta: Option<Meta>,
     ) -> Result<String> {
-        let event = EventAppendInput {
-            kind: "content.add".into(),
-            actor_id: self.actor_id.clone(),
-            scope,
-            turn_id: None,
-            payload: json!({ "contentType": "text/markdown", "text": text.into() }),
-            relations,
-            _meta: meta,
-        };
-        let res: EventAppendResult = self
+        let target = self.message_target_for_scope(&scope).await?;
+        let mut metadata = meta.unwrap_or_default();
+        metadata.insert("kind".into(), json!("content.add"));
+        metadata.insert("contentType".into(), json!("text/markdown"));
+        if !relations.is_empty() {
+            metadata.insert("relations".into(), serde_json::to_value(relations)?);
+        }
+        let res: MessageSendResult = self
             .client
-            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .call(
+                method::MESSAGE_SEND,
+                json!({
+                    "target": target,
+                    "body": text.into(),
+                    "intent": "chat",
+                    "deliveryPolicy": "notify_only",
+                    "metadata": metadata,
+                }),
+            )
             .await
-            .context("event/append")?;
-        Ok(res.event.id)
+            .context("message.send content")?;
+        Ok(res.message.id)
     }
 
-    /// Sugar over [`Self::append_content`] that adds a single
-    /// `hands_off_to -> actor:<target>` relation. The most common shape
-    /// of plugin output (see §7.3 for am, §8.3 for scheduler).
-    pub async fn handoff(
+    /// Send a directed Loom message that wakes `target_actor`.
+    pub async fn send_directed_message(
         &self,
         target_actor: &str,
         scope: ScopeRef,
         text: impl Into<String>,
         meta: Option<Meta>,
     ) -> Result<String> {
-        let relations = vec![Relation {
-            kind: RelationKind::HandsOffTo,
-            target: Ref {
-                kind: RefKind::Actor,
-                id: target_actor.into(),
-                _meta: None,
-            },
-            _meta: None,
-        }];
-        self.append_content(scope, text, relations, meta).await
+        let target = self.message_target_for_scope(&scope).await?;
+        let res: MessageSendResult = self
+            .client
+            .call(
+                method::MESSAGE_SEND,
+                json!({
+                    "target": target,
+                    "body": text.into(),
+                    "audience": [{
+                        "kind": "actor",
+                        "id": target_actor,
+                    }],
+                    "intent": "request_action",
+                    "deliveryPolicy": "wake_agent",
+                    "metadata": meta.unwrap_or_default(),
+                }),
+            )
+            .await
+            .with_context(|| format!("message.send directed to {target_actor}"))?;
+        Ok(res.message.id)
     }
 
     /// Publish an artifact whose body is rendered verbatim from `text`
@@ -214,10 +239,8 @@ impl ServiceRuntime {
         Ok((res.artifact.id, res.artifact.uri))
     }
 
-    /// Append an arbitrary-kind event whose payload is the given JSON
-    /// value, with optional `attaches_artifact` relation pointing at the
-    /// just-published artifact id. Used by §6 status.update + artifact
-    /// pairs (mr-detector, validation reports, etc.).
+    /// Send an arbitrary-kind status message whose payload is the given JSON
+    /// value, with an optional artifact attachment.
     pub async fn append_status(
         &self,
         scope: ScopeRef,
@@ -226,40 +249,38 @@ impl ServiceRuntime {
         artifact_id: Option<&str>,
         meta: Option<Meta>,
     ) -> Result<String> {
-        let relations = match artifact_id {
-            Some(id) => vec![Relation {
-                kind: RelationKind::AttachesArtifact,
-                target: Ref {
-                    kind: RefKind::Artifact,
-                    id: id.into(),
-                    _meta: None,
-                },
-                _meta: None,
-            }],
-            None => Vec::new(),
-        };
-        let event = EventAppendInput {
-            kind: kind.into(),
-            actor_id: self.actor_id.clone(),
-            scope,
-            turn_id: None,
-            payload,
-            relations,
-            _meta: meta,
-        };
-        let res: EventAppendResult = self
+        let target = self.message_target_for_scope(&scope).await?;
+        let kind = kind.into();
+        let body = service_payload_body(&kind, &payload);
+        let mut metadata = meta.unwrap_or_default();
+        metadata.insert("kind".into(), json!(kind));
+        metadata.insert("payload".into(), payload);
+        let attachments = artifact_id
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default();
+        let res: MessageSendResult = self
             .client
-            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .call(
+                method::MESSAGE_SEND,
+                json!({
+                    "target": target,
+                    "body": body,
+                    "intent": "notify",
+                    "deliveryPolicy": "notify_only",
+                    "attachments": attachments,
+                    "metadata": metadata,
+                }),
+            )
             .await
-            .context("event/append status.update")?;
-        Ok(res.event.id)
+            .context("message.send status.update")?;
+        Ok(res.message.id)
     }
 
-    /// Publish a `service.self_complete` event into `scope` carrying the
+    /// Publish a `service.self_complete` message into `scope` carrying the
     /// originating service id and a free-form `reason`. Used by service
     /// plugins (e.g., scheduler running a thread-bound bundle) when the
     /// underlying source signals "this instance is done — auto_stop_on
-    /// owners should tear me down". The event is informational; the
+    /// owners should tear me down". The message is informational; the
     /// actual stop decision belongs to whoever observes `auto_stop_on`.
     pub async fn publish_self_complete(
         &self,
@@ -271,21 +292,25 @@ impl ServiceRuntime {
             "instance_id": self.instance_id,
             "reason": reason.into(),
         });
-        let event = EventAppendInput {
-            kind: "service.self_complete".into(),
-            actor_id: self.actor_id.clone(),
-            scope,
-            turn_id: None,
-            payload,
-            relations: Vec::new(),
-            _meta: None,
-        };
-        let res: EventAppendResult = self
+        let target = self.message_target_for_scope(&scope).await?;
+        let mut metadata = Meta::default();
+        metadata.insert("kind".into(), json!("service.self_complete"));
+        metadata.insert("payload".into(), payload.clone());
+        let res: MessageSendResult = self
             .client
-            .call(method::EVENT_APPEND, EventAppendParams { event })
+            .call(
+                method::MESSAGE_SEND,
+                json!({
+                    "target": target,
+                    "body": service_payload_body("service.self_complete", &payload),
+                    "intent": "notify",
+                    "deliveryPolicy": "notify_only",
+                    "metadata": metadata,
+                }),
+            )
             .await
-            .context("event/append service.self_complete")?;
-        Ok(res.event.id)
+            .context("message.send service.self_complete")?;
+        Ok(res.message.id)
     }
 
     /// Make sure this runtime's actor is a member of `channel_id`.
@@ -314,7 +339,7 @@ impl ServiceRuntime {
         Ok(())
     }
 
-    /// Create a fresh thread under `channel_id`, rooted at a channel event.
+    /// Create a fresh thread under `channel_id`, rooted at a channel message.
     /// Returns the new thread row. The "or-get" half of §6.3's
     /// `create_or_get_thread` lives in plugin-specific thread-map state
     /// (e.g., `service::am::scope`) — the runtime exposes only the
@@ -322,7 +347,7 @@ impl ServiceRuntime {
     pub async fn create_thread(
         &self,
         channel_id: &str,
-        root_event_id: &str,
+        root_message_id: &str,
         title: &str,
     ) -> Result<Thread> {
         let res: ThreadCreateResult = self
@@ -332,7 +357,7 @@ impl ServiceRuntime {
                 ThreadCreateParams {
                     channel_id: channel_id.into(),
                     title: title.into(),
-                    root_event_id: root_event_id.into(),
+                    root_message_id: root_message_id.into(),
                 },
             )
             .await
@@ -340,53 +365,81 @@ impl ServiceRuntime {
         Ok(res.thread)
     }
 
-    /// Drain pending deliveries off this actor's inbox and return events
-    /// whose relations carry `responds_to -> trigger_event_id`. Polls
-    /// `delivery/list` (§9.2) every 500ms until either a match arrives or
-    /// `timeout` elapses.
-    ///
-    /// **S1 limitation**: pure polling, no live `stream/update`
-    /// fan-in. The §9.5 push path exists on the server but requires a
-    /// notification consumer the host doesn't yet wire; S2 plugin work
-    /// will replace this loop with the hybrid drain-then-watch design.
-    /// For S1 callers (none yet — the first one is the S2 am rewrite)
-    /// the polling latency is acceptable.
-    ///
-    /// **Receipts**: this method does not record receipts on returned
-    /// events. The caller decides when an event is safely processed and
-    /// calls `receipt/record` itself. Without that, the same event would
-    /// reappear on the next poll — that's the desired safety, not a bug.
-    pub async fn await_responds_to(
+    pub async fn message_target_for_scope(&self, scope: &ScopeRef) -> Result<String> {
+        match scope.kind {
+            ScopeKind::Channel => Ok(format!("#{}", scope.id)),
+            ScopeKind::Thread => {
+                let res: ThreadListResult = self
+                    .client
+                    .call(
+                        method::THREAD_LIST,
+                        ThreadListParams {
+                            channel_id: None,
+                            archived: false,
+                        },
+                    )
+                    .await
+                    .context("thread/list")?;
+                let thread = res
+                    .threads
+                    .into_iter()
+                    .find(|thread| thread.id == scope.id)
+                    .ok_or_else(|| anyhow::anyhow!("thread {} not found", scope.id))?;
+                Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
+            }
+        }
+    }
+
+    /// Append a channel-root message as this service actor and return its id.
+    pub async fn append_channel_message(
         &self,
-        trigger_event_id: &str,
+        channel_id: &str,
+        text: impl Into<String>,
+    ) -> Result<String> {
+        let res: MessageSendResult = self
+            .client
+            .call(
+                method::MESSAGE_SEND,
+                json!({
+                    "target": format!("#{channel_id}"),
+                    "body": text.into(),
+                    "intent": "chat",
+                    "deliveryPolicy": "notify_only",
+                }),
+            )
+            .await
+            .with_context(|| format!("message.send in {channel_id}"))?;
+        Ok(res.message.id)
+    }
+
+    pub async fn await_message_replies(
+        &self,
+        parent_message_id: &str,
         timeout: Duration,
-    ) -> Result<Vec<Event>> {
+    ) -> Result<Vec<Message>> {
         let deadline = Instant::now() + timeout;
         let poll_interval = Duration::from_millis(500);
         loop {
             let mut found = Vec::new();
             let mut cursor: Option<String> = None;
             loop {
-                let params = DeliveryListParams {
+                let params = InboxListParams {
                     actor_id: self.actor_id.clone(),
                     state: Some(DeliveryState::Pending),
                     limit: Some(50),
                     cursor: cursor.clone(),
                 };
-                let res: DeliveryListResult = self
+                let res: InboxListResult = self
                     .client
-                    .call(method::DELIVERY_LIST, params)
+                    .call(method::INBOX_LIST, params)
                     .await
-                    .context("delivery/list")?;
+                    .context("inbox.list")?;
                 for entry in res.deliveries {
-                    let Some(event) = entry.event else { continue };
-                    let matches = event.relations.iter().any(|r| {
-                        matches!(r.kind, RelationKind::RespondsTo)
-                            && r.target.kind == RefKind::Event
-                            && r.target.id == trigger_event_id
-                    });
-                    if matches {
-                        found.push(event);
+                    let Some(message) = entry.message else {
+                        continue;
+                    };
+                    if message.parent_message_id.as_deref() == Some(parent_message_id) {
+                        found.push(message);
                     }
                 }
                 cursor = res.next_cursor;

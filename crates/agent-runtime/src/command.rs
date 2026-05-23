@@ -4,7 +4,7 @@
 //! child process and streams every prompt through one ACP session — this adapter
 //! spawns a fresh subprocess for each prompt. State persists across prompts by
 //! delegating to the underlying CLI's own session/resume mechanism (`claude
-//! --resume <id>`, `codex resume`, etc.); joi only bookkeeps the
+//! --resume <id>`, `codex resume`, etc.); loom only bookkeeps the
 //! `(actor_id, scope_id) -> session_id` mapping in
 //! `<agent-client-data>/sessions/<actor>/<scope_id>.json`.
 //!
@@ -216,7 +216,7 @@ impl Adapter for CommandAdapter {
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
         // Command transport does not surface permission prompts (no reverse
-        // channel from the one-shot subprocess back into joi). Anyone calling
+        // channel from the one-shot subprocess back into Loom). Anyone calling
         // this for a command adapter has a bug elsewhere; report it loudly.
         Err("command transport does not support action requests".into())
     }
@@ -256,7 +256,7 @@ impl Adapter for CommandAdapter {
 }
 
 /// Send SIGTERM to `pid`. Unix only — Windows builds get a stub error so
-/// callers know cancel isn't wired there yet (joi-server's audience is Unix).
+/// callers know cancel isn't wired there yet (loom-server's audience is Unix).
 #[cfg(unix)]
 fn signal_child(pid: u32) -> Result<(), String> {
     signal_child_with(pid, libc::SIGTERM)
@@ -448,7 +448,7 @@ fn spawn_and_collect(
         cmd.env(k, v);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
-        cmd.env("JOI_PROMPT", &prompt.content);
+        cmd.env("LOOM_PROMPT", &prompt.content);
     }
     configure_process_group(&mut cmd);
     let mut child = cmd
@@ -1359,7 +1359,7 @@ fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String
         env.entry(k.clone()).or_insert_with(|| v.clone());
     }
     if let Some(model) = active_model(request) {
-        env.entry("JOI_AGENT_MODEL".into()).or_insert(model);
+        env.entry("LOOM_AGENT_MODEL".into()).or_insert(model);
     }
     env
 }
@@ -1385,7 +1385,7 @@ mod tests {
             resume_args: None,
             output_format: CommandOutputFormat::Text,
             prompt_via: PromptVia::Args,
-            sessions_dir: PathBuf::from("/tmp/joi-test-sessions"),
+            sessions_dir: PathBuf::from("/tmp/loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
             command_signature: "sha256:test".into(),
@@ -1770,7 +1770,7 @@ mod tests {
     #[test]
     fn save_session_preserves_created_at_and_updates_last_used() {
         let mut cfg = cfg();
-        let root = std::env::temp_dir().join(format!("joi-command-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
         cfg.sessions_dir = root.join("sessions");
         let scope = named_scope(ScopeKind::Channel, "chan");
 
@@ -1813,13 +1813,13 @@ mod tests {
     #[test]
     fn expanded_env_keeps_spec_values_and_adds_request_defaults() {
         let mut cfg = cfg();
-        cfg.env.insert("JOI_SERVER".into(), "ws://spec".into());
+        cfg.env.insert("LOOM_SERVER".into(), "ws://spec".into());
         cfg.env
             .insert("WORKSPACE".into(), "{agent.workspace}".into());
         let mut request = prompt("hello");
         request
             .env
-            .insert("JOI_SERVER".into(), "ws://runtime".into());
+            .insert("LOOM_SERVER".into(), "ws://runtime".into());
         request
             .env
             .insert("AGENTX_CHANNEL_ID".into(), "channel_1".into());
@@ -1829,7 +1829,10 @@ mod tests {
 
         let env = expanded_env(&cfg, &request);
 
-        assert_eq!(env.get("JOI_SERVER").map(String::as_str), Some("ws://spec"));
+        assert_eq!(
+            env.get("LOOM_SERVER").map(String::as_str),
+            Some("ws://spec")
+        );
         assert_eq!(
             env.get("WORKSPACE").map(String::as_str),
             Some("/tmp/channel/workspace")

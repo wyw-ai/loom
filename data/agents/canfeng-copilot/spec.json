@@ -4,7 +4,7 @@
     "kind": "agent",
     "displayName": "canfeng-copilot",
     "_meta": {
-      "createdBy": "joi-daemon",
+      "createdBy": "loom-daemon",
       "providerId": "copilot",
       "providerName": "GitHub Copilot CLI",
       "transportKind": "command"
@@ -15,7 +15,7 @@
     "command": "/usr/local/bin/copilot",
     "args": [
       "--add-dir",
-      "/home/canfeng/.joi-apps",
+      "/home/canfeng/.loom",
       "--yolo",
       "--output-format",
       "json",

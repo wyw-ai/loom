@@ -1,6 +1,6 @@
 # `data/agents/` — profile-mode agent snapshots
 
-This directory is the repository copy of the currently deployed Joi agent
+This directory is the repository copy of the currently deployed Loom agent
 profiles. Agent behavior now comes from profile files, not legacy skill files.
 
 Each agent directory contains:
@@ -26,7 +26,7 @@ under:
 | --- | --- | --- | --- |
 | `a1-bug-triage` | `actor_a1_bug_triage` | Claude | A1 feedback triage |
 | `router` | `actor_router` | Claude | Human-facing routing and orchestration |
-| `discovery` | `actor_discovery` | Claude | Task discovery, repo analysis, delivery handoff |
+| `discovery` | `actor_discovery` | Claude | Task discovery, repo analysis, delivery wake message |
 | `examiner` | `actor_examiner` | Claude | Spec/MR/design/terminal quality review |
 | `delivery` | `actor_delivery` | Claude | Implementation, MR, review/CI handling |
 | `classmaster` | `actor_classmaster` | Codex | Classroom training control plane |

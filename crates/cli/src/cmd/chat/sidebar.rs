@@ -621,7 +621,7 @@ mod tests {
             id: id.into(),
             channel_id: channel_id.into(),
             title: title.into(),
-            root_event_id: format!("evt_root_{id}"),
+            root_message_id: format!("evt_root_{id}"),
             archived_at: None,
             _meta: None,
         }

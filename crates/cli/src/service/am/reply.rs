@@ -9,7 +9,7 @@
 //!   `am chat <sender> <text>` if no conversation) synchronously, with
 //!   retry/backoff and an optional fallback to chat.
 //! * [`ReplyMode::AsyncSend`] — print a "received, working on it"
-//!   callback, then spawn a detached child of `joi service am-handler
+//!   callback, then spawn a detached child of `loom service am-handler
 //!   --async-reply <payload>`. The child waits for the agent reply and
 //!   sends via `am`.
 //!
@@ -78,9 +78,9 @@ impl Default for AmSendConfig {
 /// Build the DingTalk callback JSON line (no trailing newline).
 /// Mirrors Python `reply_callback`. Public for tests and for the
 /// orchestrator's pending-callback path in async_send mode.
-pub fn callback_line(source_event: &Value, answer: &str) -> String {
-    let sender_id = am_staff_id(&extract::sender(source_event));
-    let conversation_id = extract::conversation(source_event);
+pub fn callback_line(source_payload: &Value, answer: &str) -> String {
+    let sender_id = am_staff_id(&extract::sender(source_payload));
+    let conversation_id = extract::conversation(source_payload);
     let mut msg_param = serde_json::Map::new();
     msg_param.insert("content".into(), json!(answer.trim()));
     if !sender_id.is_empty() {
@@ -96,8 +96,12 @@ pub fn callback_line(source_event: &Value, answer: &str) -> String {
     body.to_string()
 }
 
-pub fn write_callback<W: Write>(out: &mut W, source_event: &Value, answer: &str) -> io::Result<()> {
-    writeln!(out, "{}", callback_line(source_event, answer))?;
+pub fn write_callback<W: Write>(
+    out: &mut W,
+    source_payload: &Value,
+    answer: &str,
+) -> io::Result<()> {
+    writeln!(out, "{}", callback_line(source_payload, answer))?;
     out.flush()
 }
 
@@ -106,9 +110,9 @@ pub fn write_callback<W: Write>(out: &mut W, source_event: &Value, answer: &str)
 /// Returns `Err` only when `reply_strict` is set AND every attempt
 /// (incl. fallback) failed. Otherwise logs and returns `Ok` so the
 /// listener callback path doesn't blow up.
-pub fn send_via_am(cfg: &AmSendConfig, source_event: &Value, answer: &str) -> Result<()> {
-    let conversation_id = extract::conversation(source_event);
-    let sender_id = am_staff_id(&extract::sender(source_event));
+pub fn send_via_am(cfg: &AmSendConfig, source_payload: &Value, answer: &str) -> Result<()> {
+    let conversation_id = extract::conversation(source_payload);
+    let sender_id = am_staff_id(&extract::sender(source_payload));
     let outbound = if cfg.send_plain_text {
         text::plain_am_text(answer, cfg.send_max_chars)
     } else {
@@ -119,7 +123,7 @@ pub fn send_via_am(cfg: &AmSendConfig, source_event: &Value, answer: &str) -> Re
         return Ok(());
     }
     if cfg.dry_run {
-        // Mirror the Python AM_JOI_DRY_RUN: print to stdout and skip.
+        // Mirror the Python AM_LOOM_DRY_RUN: print to stdout and skip.
         println!("{}", outbound);
         return Ok(());
     }
@@ -221,7 +225,7 @@ pub(crate) fn am_staff_id(s: &str) -> String {
     }
 }
 
-/// Spawn a detached `joi service am-handler --service-id <sid>
+/// Spawn a detached `loom service am-handler --service-id <sid>
 /// --async-reply <payload>` child. The parent (listener-callback
 /// process) returns immediately after; the child waits for the agent
 /// reply and sends via `am`.
@@ -400,7 +404,7 @@ mod tests {
         // Strict mode: when every retry of an unspawnable bin fails,
         // we surface the error. (Non-strict would log and Ok.)
         let cfg = AmSendConfig {
-            am_bin: "/definitely/not/a/real/binary/joi-am-test".into(),
+            am_bin: "/definitely/not/a/real/binary/loom-am-test".into(),
             send_attempts: 1,
             send_retry_delay_secs: 0.0,
             reply_strict: true,
@@ -414,7 +418,7 @@ mod tests {
     #[test]
     fn send_via_am_non_strict_swallows_failure() {
         let cfg = AmSendConfig {
-            am_bin: "/definitely/not/a/real/binary/joi-am-test".into(),
+            am_bin: "/definitely/not/a/real/binary/loom-am-test".into(),
             send_attempts: 1,
             send_retry_delay_secs: 0.0,
             send_fallback_chat: false,

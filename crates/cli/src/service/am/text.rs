@@ -1,4 +1,4 @@
-// First user is `joi service am-handler` reply path; allow until S2-5.
+// First user is `loom service am-handler` reply path; allow until S2-5.
 #![allow(dead_code)]
 
 //! Markdown → plain-text flattening for `am` reply sends. Mirrors the

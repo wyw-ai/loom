@@ -427,7 +427,7 @@ pub async fn scope_read(state: State<'_, AppState>, params: Value) -> Result<Val
     state
         .client()
         .await?
-        .call_raw(method::SCOPE_READ, Some(params))
+        .call_raw(method::INTERNAL_SCOPE_READ, Some(params))
         .await
         .map_err(stringify)
 }
@@ -437,7 +437,7 @@ pub async fn event_append(state: State<'_, AppState>, params: Value) -> Result<V
     state
         .client()
         .await?
-        .call_raw(method::EVENT_APPEND, Some(params))
+        .call_raw(method::INTERNAL_EVENT_APPEND, Some(params))
         .await
         .map_err(stringify)
 }

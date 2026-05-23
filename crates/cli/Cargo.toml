@@ -1,16 +1,16 @@
 [package]
-name = "joi-cli"
+name = "loom-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "joi"
+name = "loom"
 path = "src/main.rs"
 
 [[bin]]
-name = "migrate-dev-helper"
-path = "src/bin/migrate_dev_helper.rs"
+name = "loom-daemon"
+path = "src/bin/loom_daemon.rs"
 
 [dependencies]
 proto = { workspace = true }

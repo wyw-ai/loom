@@ -2,14 +2,14 @@
 
 > 状态：Legacy / Superseded。本文是上一阶段 thread + `runtime-tools` 编排方案的历史材料，不再作为新版终态实现依据。新版终态以 `docs/a1-dev-actor-memory-operating-architecture.md` 为准。
 >
-> 本文中的 `start-discovery.sh`、`start-delivery.sh`、独立 discovery/delivery thread 状态机、mr-watcher 直接推进 handoff 等规则，只能作为迁移输入或 bad/normal case 校准材料；新实现必须使用 Joi-native Task、canonical thread、TaskRef、TaskArtifactLink、TaskFact、TaskProjection、TaskAssignmentContract 和 action.request/action.response。
+> 本文中的 `start-discovery.sh`、`start-delivery.sh`、独立 discovery/delivery thread 状态机、mr-watcher 直接推进 directed message 等规则，只能作为迁移输入或 bad/normal case 校准材料；新实现必须使用 Loom-native Task、canonical thread、TaskRef、TaskArtifactLink、TaskFact、TaskProjection、TaskAssignmentContract 和 action.request/action.response。
 
 > 原状态：当前生效方案。现在仅保留为历史参考，帮助识别旧方案迁移遗留。
 
 ## 目标
 
 搭建一套可持续自动化开发系统：有人出题、有人做题、有人独立判题，MR 和 feedback
-终态可追踪，质量问题不会被“自评通过”或并行 handoff 冲掉。
+终态可追踪，质量问题不会被“自评通过”或并行 directed message 冲掉。
 
 核心原则：
 
@@ -21,7 +21,7 @@ discovery 出题，examiner 判题，delivery 做题，mr-watcher 报事实，ro
 
 | 角色 | 做什么 | 不做什么 |
 | --- | --- | --- |
-| `actor_router` | human 入口、状态机 owner、handoff 调度、升级 human、终态汇报 | 不写代码，不做技术质量审查，不替 examiner 判题 |
+| `actor_router` | human 入口、状态机 owner、directed message 调度、升级 human、终态汇报 | 不写代码，不做技术质量审查，不替 examiner 判题 |
 | `actor_discovery` | 理解需求/bug，判断缺陷真实性和 repo scope，产出五件套，spec 通过后启动 delivery | 不自审，不直接启动 delivery，不做 MR 质量复核 |
 | `actor_examiner` | 审五件套、审 MR、审设计争议、审终态 | 不写代码，不改五件套，不建 thread，不直接改 feedback/MR 状态 |
 | `actor_delivery` | 按通过的五件套实现、验证、push、建 MR、处理 CI/comment、回评 feedback | 不改题，不自审，不绕过 examiner，不自行 merge |
@@ -55,7 +55,7 @@ bug_candidate/new_task
 | `delivery_running -> mr_opened` | delivery |
 | `mr_opened -> mr_review_running` | router |
 | `mr_review_running -> mr_needs_changes` | examiner MR 评论 + mr-watcher |
-| `mr_needs_changes -> mr_review_running` | delivery 修完后 handoff router |
+| `mr_needs_changes -> mr_review_running` | delivery 修完后 directed message router |
 | `mr_review_running -> design_dispute` | examiner / delivery / mr-watcher 发现，router 调度 |
 | `mr_review_passed -> merge_gate_waiting` | mr-watcher |
 | `merge_gate_waiting -> merged/closed` | human / Code 平台事实 |
@@ -65,21 +65,21 @@ bug_candidate/new_task
 ## 主流程
 
 1. router 收到 human 或 bug-fix-loop 任务，使用 `start-discovery.sh` 创建独立
-   discovery thread 并 handoff discovery；不要复用 `discovery-desk` 承载任务细节。
+   discovery thread 并 directed message discovery；不要复用 `discovery-desk` 承载任务细节。
 2. discovery 产出三件套并发 `[discovery-ready]`，不启动 delivery。
 3. router 启动 `actor_examiner gate=spec_review`。
 4. spec 通过后，router 要求 discovery 调 `start-delivery.sh` 启动 delivery。
-5. delivery 实现、验证、发 MR，handoff router 并附 `[mr-opened v1]`。
-6. router 启动 `actor_examiner gate=mr_review`。MR 审查 handoff 必须带
-   `--handoff-prefix $'/review [joi]\n'`，让支持 review mode 的 agent 产品优先进入
+5. delivery 实现、验证、发 MR，directed message router 并附 `[mr-opened v1]`。
+6. router 启动 `actor_examiner gate=mr_review`。MR 审查 directed message 必须带
+   `--directed message-prefix $'/review [loom]\n'`，让支持 review mode 的 agent 产品优先进入
    代码审查模式；正文仍从 `gate=mr_review` 开始，spec/design/terminal gate 不加该 prefix。
-7. examiner publish artifact，并在 MR 发 `[examiner-result]` 评论；常规结论不 handoff。
+7. examiner publish artifact，并在 MR 发 `[examiner-result]` 评论；常规结论不 directed message。
 8. mr-watcher 扫 MR 评论/CI/reviewer/终态，统一推进 delivery 或等待 human merge。
 9. MR merged 后，delivery 或 bug-fix-loop 回评 feedback 并改 Fixed；loop 归档并取下一条。
    bugfix-loop 任务的标准归档集合是 discovery thread、bugfix/loop anchor thread、
    delivery thread，按这个产生顺序归档。
 10. terminal archive 必须以真实 CLI 状态为准：历史消息里写过“已归档”不算完成。
-    router 处理 `mr.final` 时必须执行或验证 `joi thread archive <thread_id>`；
+    router 处理 `mr.final` 时必须执行或验证 `loom thread archive <thread_id>`；
     active list 仍能查到的 thread 不允许 no-op。
 11. human 短句恢复（“有权限了 / 再试下 / 权限加好了 / 重新来”）必须回到最近
     blocked MR/thread 做 gate retry；禁止按关键词另起 new_task。若无法唯一定位，先问澄清。
@@ -90,11 +90,11 @@ bug_candidate/new_task
 污染新任务。独立 thread 仍然需要看见频道级只读大库：
 
 ```text
-~/joi-workspaces/thread/<discovery_thread_id>/shared/repos
+~/loom-workspaces/thread/<discovery_thread_id>/shared/repos
   -> ~/.agentx/channels/<channel_id>/shared/repos
 ```
 
-router 必须通过 `~/joi-apps/data/runtime-tools/joi-auto-dev/scripts/start-discovery.sh`
+router 必须通过 `~/loom-apps/data/runtime-tools/loom-auto-dev/scripts/start-discovery.sh`
 创建该 thread 和软链。discovery 只读 `shared/repos` 用于理解仓库结构、历史提交和
 分支状态；更新 repo cache 必须回到 router 走 `cache-ctl.sh`。
 
@@ -162,7 +162,7 @@ A1_CONFIG_DIR=/home/canfeng/.config/a1-examiner a1 repo mr comment create \
 ```
 
 discovery/start-delivery 只传 kbase 引用，不复制规范正文。对每个 `mode=worktree`
-repo，handoff 给 delivery 的格式是：
+repo，directed message 给 delivery 的格式是：
 
 ```text
 - aone/a1: <page-id-1>([aone/a1] 构建与测试命令) <page-id-2>([aone/a1] OpenSpec 开发流程)
@@ -170,7 +170,7 @@ repo，handoff 给 delivery 的格式是：
 
 delivery 在编码每个仓库前必须逐个读取该仓库全部 kbase 规范，保存到 workspace 的
 `repo-specs/<group>__<repo>/` 作为本次执行快照，并按规范执行开发、测试、OpenSpec、
-commit、MR 描述和 review 回复。缺少规范或规范冲突时，delivery 暂停并 handoff router。
+commit、MR 描述和 review 回复。缺少规范或规范冲突时，delivery 暂停并 directed message router。
 
 examiner 在 `mr_review` 中必须检查 delivery 是否读取并遵守目标仓库的 kbase 研发规范。
 违反规范可以作为 `needs_changes`，但必须引用具体规范标题或 page-id。
@@ -211,7 +211,7 @@ channel 只放 human 需要知道或处理的摘要，不放 actor 日志。默�
 - 不展示裸 `thread_id` / `mr_id` / `note_id` / `artifact_id`，除非 human 明确排障。
 - 有 MR/workitem/文档/发布页 URL 时尽量贴 URL；URL 是公共区允许展示的追踪入口。
 - 同一状态只通报一次；内部用 `channel_notice_key` 去重。
-- watcher 扫描报告、handoff/no-op/等待中/本回合结束只留在 thread 或直接静默。
+- watcher 扫描报告、directed message/no-op/等待中/本回合结束只留在 thread 或直接静默。
 
 示例：
 

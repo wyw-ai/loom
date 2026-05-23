@@ -51,7 +51,7 @@ pub fn append(
     profile_dir: Option<PathBuf>,
     summary: String,
     source_channel: String,
-    source_event: Option<String>,
+    source_message: Option<String>,
     status: String,
     record_type: String,
     confidence: String,
@@ -60,8 +60,8 @@ pub fn append(
     json: bool,
 ) -> Result<()> {
     validate_status(&status)?;
-    if status == "accepted" && source_event.as_deref().unwrap_or_default().is_empty() {
-        bail!("accepted memory requires --source-event; append defaults to pending");
+    if status == "accepted" && source_message.as_deref().unwrap_or_default().is_empty() {
+        bail!("accepted memory requires --source-message; append defaults to pending");
     }
     let store = store_for(&actor_id, profile_dir)?;
     let record = MemoryRecord {
@@ -77,7 +77,7 @@ pub fn append(
         source: MemorySource {
             channel_id: source_channel,
             thread_id: String::new(),
-            message_ids: source_event.into_iter().collect(),
+            message_ids: source_message.into_iter().collect(),
         },
         tags,
     };
@@ -118,7 +118,7 @@ pub fn update(
     memory_id: String,
     status: String,
     reason: Option<String>,
-    source_event: Option<String>,
+    source_message: Option<String>,
     json: bool,
 ) -> Result<()> {
     validate_status(&status)?;
@@ -130,15 +130,15 @@ pub fn update(
     if status == "accepted"
         && (record.source.channel_id.trim().is_empty()
             || (record.source.message_ids.is_empty()
-                && source_event.as_deref().unwrap_or_default().is_empty()))
+                && source_message.as_deref().unwrap_or_default().is_empty()))
     {
         bail!("accepted memory requires source channel and source refs");
     }
     record.status = status;
     record.ts = Utc::now().to_rfc3339();
-    if let Some(event_id) = source_event {
-        if !record.source.message_ids.iter().any(|id| id == &event_id) {
-            record.source.message_ids.push(event_id);
+    if let Some(message_id) = source_message {
+        if !record.source.message_ids.iter().any(|id| id == &message_id) {
+            record.source.message_ids.push(message_id);
         }
     }
     if let Some(reason) = reason {
@@ -167,7 +167,7 @@ fn store_for(actor_id: &str, profile_dir: Option<PathBuf>) -> Result<JsonlMemory
 }
 
 fn resolve_profile_dir(actor_id: &str) -> PathBuf {
-    if let Ok(path) = std::env::var("JOI_MEMORY_PROFILE_DIR") {
+    if let Ok(path) = std::env::var("LOOM_MEMORY_PROFILE_DIR") {
         return PathBuf::from(path);
     }
     if let Some(path) = resolve_desktop_machine_profile_dir(actor_id) {

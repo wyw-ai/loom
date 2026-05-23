@@ -4,7 +4,7 @@
     "kind": "agent",
     "displayName": "老师",
     "_meta": {
-      "createdBy": "joi-daemon",
+      "createdBy": "loom-daemon",
       "providerId": "codex",
       "providerName": "Codex CLI",
       "transportKind": "command"
@@ -15,11 +15,11 @@
     "command": "/bin/bash",
     "args": [
       "-lc",
-      "source ~/open-proxy >/dev/null && exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.joi-apps \"$@\"",
-      "joi-codex"
+      "source ~/open-proxy >/dev/null && exec codex exec --skip-git-repo-check --json --sandbox danger-full-access -c sandbox_workspace_write.network_access=true --add-dir /home/canfeng/.loom \"$@\"",
+      "loom-codex"
     ],
     "env": {
-      "JOI_NO_DAEMON": "1"
+      "LOOM_NO_DAEMON": "1"
     },
     "model": "gpt-5.5",
     "modelArgs": [

@@ -183,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn command_passes_env() {
         let mut env = BTreeMap::new();
-        env.insert("MY_TEST_VAR".into(), "joi-scheduler".into());
+        env.insert("MY_TEST_VAR".into(), "loom-scheduler".into());
         let s = Source::Command {
             command: "sh".into(),
             args: vec!["-c".into(), "echo $MY_TEST_VAR".into()],
@@ -191,7 +191,7 @@ mod tests {
             timeout_ms: Some(5_000),
         };
         let body = exec_source(&s).await.unwrap();
-        assert_eq!(String::from_utf8(body).unwrap().trim(), "joi-scheduler");
+        assert_eq!(String::from_utf8(body).unwrap().trim(), "loom-scheduler");
     }
 
     #[tokio::test]
@@ -209,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_missing_binary_errs() {
-        let s = cmd("/no/such/binary/joi-cron", &[]);
+        let s = cmd("/no/such/binary/loom-cron", &[]);
         let err = exec_source(&s).await.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("spawn"), "{msg}");

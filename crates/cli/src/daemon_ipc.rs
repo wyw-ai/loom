@@ -9,8 +9,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config;
 
-pub const ENV_DAEMON_SOCKET: &str = "JOI_DAEMON_SOCKET";
-pub const ENV_NO_DAEMON: &str = "JOI_NO_DAEMON";
+pub const ENV_DAEMON_SOCKET: &str = "LOOM_DAEMON_SOCKET";
+pub const ENV_NO_DAEMON: &str = "LOOM_NO_DAEMON";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketSource {
@@ -118,7 +118,7 @@ pub async fn start_proxy(socket: PathBuf, server_url: String) -> Result<JoinHand
     #[cfg(not(unix))]
     {
         let _ = (socket, server_url);
-        bail!("joi daemon IPC is only supported on Unix platforms");
+        bail!("loom-daemon IPC is only supported on Unix platforms");
     }
 
     #[cfg(unix)]
@@ -167,7 +167,7 @@ async fn prepare_socket_path(socket: &Path) -> Result<()> {
 
     if socket.exists() {
         if UnixStream::connect(socket).await.is_ok() {
-            bail!("joi daemon socket is already active: {}", socket.display());
+            bail!("loom-daemon socket is already active: {}", socket.display());
         }
         std::fs::remove_file(socket)
             .with_context(|| format!("remove stale daemon socket {}", socket.display()))?;

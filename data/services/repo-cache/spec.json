@@ -19,7 +19,7 @@
           "args": [
             "{spec.dir}/bundle/sync.sh",
             "--manifest",
-            "{channel.workspace}/.joi/repos/manifest.json",
+            "{channel.workspace}/.loom/repos/manifest.json",
             "--cache-root",
             "{service.data_dir}/cache"
           ],

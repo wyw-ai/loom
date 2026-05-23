@@ -290,7 +290,7 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "joi-scope-skills-{name}-{}",
+            "loom-scope-skills-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock drift")
@@ -336,23 +336,25 @@ mod tests {
         actor_id: &str,
         title: &str,
     ) -> proto::types::Thread {
-        let root_event_id = store
-            .append_event(
-                "content.add".into(),
+        let root_message_id = store
+            .append_message(
                 actor_id.into(),
-                proto::types::ScopeRef {
-                    kind: proto::types::ScopeKind::Channel,
-                    id: channel_id.into(),
-                },
+                format!("#{channel_id}"),
+                proto::types::MessageKind::Human,
+                title.into(),
+                Vec::new(),
+                Vec::new(),
+                proto::types::MessageIntent::Chat,
+                proto::types::DeliveryPolicy::NotifyOnly,
                 None,
-                serde_json::json!({ "text": title }),
-                vec![],
                 None,
+                Vec::new(),
+                proto::types::Meta::default(),
             )
-            .expect("append root event")
+            .expect("append root message")
             .id;
         store
-            .create_thread(channel_id.into(), title.into(), root_event_id)
+            .create_thread(channel_id.into(), title.into(), root_message_id)
             .expect("thread")
     }
 

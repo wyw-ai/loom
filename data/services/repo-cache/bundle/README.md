@@ -1,7 +1,7 @@
 # repo-cache —— bundle
 
-频道级 scheduler 服务，负责把 `<channel_ws>/.joi/repos/manifest.json` 里列出的
-仓库以裸仓库形式镜像到本地缓存。`joi thread create --bootstrap-artifact` 写入
+频道级 scheduler 服务，负责把 `<channel_ws>/.loom/repos/manifest.json` 里列出的
+仓库以裸仓库形式镜像到本地缓存。`loom thread create --bootstrap-artifact` 写入
 的 thread mounts 直接通过 `service://repo-cache/cache/<repo_id>` 引用此缓存，
 agent serve 在 ensure_scope 时按 mount 用 `git worktree add` / `git clone --shared`
 快速展开 thread workspace 内的 `repos/<repo_id>`。

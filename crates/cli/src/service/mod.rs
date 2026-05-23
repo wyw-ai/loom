@@ -3,14 +3,14 @@
 //! Lives inside `crates/cli` rather than as its own crate so the WS
 //! [`Client`] in `crate::client` can be reused without duplication. The
 //! external API (re-exports below) is structured so a future split into
-//! `crates/joi-client` + `crates/service-runtime` is mostly a `mv` away.
+//! `crates/loom-client` + `crates/service-runtime` is mostly a `mv` away.
 //!
 //! Boundary recap (from §6 / §8.7):
 //!
 //! * [`runtime::ServiceRuntime`] is the substrate plugins call into. It
 //!   wraps a single WS connection bound to one service actor and exposes
 //!   the §6.3 method set: actor upsert, channel-member ensure, content
-//!   append, handoff, await-responds-to, dedupe, cursor, state-dir.
+//!   append, directed message send, reply wait, dedupe, cursor, state-dir.
 //! * [`plugin::ServicePlugin`] is the trait every plugin implements. The
 //!   runtime owns the connection; the plugin only gets a handle and a
 //!   shutdown signal via [`plugin::ServiceContext`].
@@ -19,7 +19,7 @@
 //!   first one (`am`) lands in S2.
 //!
 //! `state` is the file-ops layer for per-service private storage
-//! (`~/.local/share/joi/service-host/services/<sid>/`). Pure I/O, no WS.
+//! (`~/.local/share/loom/service-host/services/<sid>/`). Pure I/O, no WS.
 
 pub mod am;
 pub mod host;

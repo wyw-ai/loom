@@ -67,7 +67,7 @@ router 管状态、human gate、权限 gate、发布 gate
 bug-fix-loop 管队列
 ```
 
-router 不再直接维护规范正文；router 只识别触发条件并 handoff `actor_engineering_standards`。
+router 不再直接维护规范正文；router 只识别触发条件并 directed message `actor_engineering_standards`。
 
 ## kbase 74121 结构升级
 
@@ -164,7 +164,7 @@ validation-plan.json
 
 ```text
 discovery 先确定 target repos / reference repos / 粗方案
-  -> handoff actor_engineering_standards gate=compose_validation_plan
+  -> directed message actor_engineering_standards gate=compose_validation_plan
   -> engineering_standards 读取 kbase 74121 相关规范
   -> publish validation-plan.v1
   -> discovery 把 validation-plan art id 放进 [discovery-ready]
@@ -261,7 +261,7 @@ validation-evidence.v1
 }
 ```
 
-如果 validation plan 要求发布、查询日志或访问环境，但 delivery 没有权限，delivery 必须 handoff router 发起 human / permission gate，不能把任务宣称为验证完成。
+如果 validation plan 要求发布、查询日志或访问环境，但 delivery 没有权限，delivery 必须 directed message router 发起 human / permission gate，不能把任务宣称为验证完成。
 
 ## Gate 变化
 
@@ -290,7 +290,7 @@ examiner 在 `gate=mr_review` 中新增检查：
 
 ## 触发条件
 
-router 应在以下场景 handoff `actor_engineering_standards`：
+router 应在以下场景 directed message `actor_engineering_standards`：
 
 - delivery 报 kbase 74121 规范 `MISSING`。
 - discovery 识别到任务涉及远端服务、发布、配置、数据状态或跨服务链路。
@@ -319,7 +319,7 @@ router 应在以下场景 handoff `actor_engineering_standards`：
 - 更新 `docs/a1-dev-canfeng-final-actors.md`。
 - 定义 `validation-plan.v1` 和 `validation-evidence.v1` artifact schema。
 
-### Phase 2：启动脚本与 handoff
+### Phase 2：启动脚本与 directed message
 
 - `start-delivery.sh` 支持传入 `validation-plan` artifact id。
 - discovery 在 `[discovery-ready]` 中必须带 `validation-plan`，或明确 `validation_not_required`。

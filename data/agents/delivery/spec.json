@@ -4,7 +4,7 @@
     "kind": "agent",
     "displayName": "交付",
     "_meta": {
-      "createdBy": "joi-daemon",
+      "createdBy": "loom-daemon",
       "providerId": "claude",
       "providerName": "Claude Code (GLM-5.1 endpoint)",
       "transportKind": "command",
@@ -27,7 +27,7 @@
     "args": [
       "--bare",
       "--add-dir",
-      "/home/canfeng/.joi-apps",
+      "/home/canfeng/.loom",
       "--permission-mode",
       "bypassPermissions",
       "--output-format",
@@ -36,7 +36,7 @@
       "-p"
     ],
     "env": {
-      "JOI_NO_DAEMON": "1"
+      "LOOM_NO_DAEMON": "1"
     },
     "model": "sonnet",
     "modelArgs": [
@@ -48,7 +48,7 @@
       "resumeArgs": [
         "--bare",
         "--add-dir",
-        "/home/canfeng/.joi-apps",
+        "/home/canfeng/.loom",
         "--permission-mode",
         "bypassPermissions",
         "--output-format",

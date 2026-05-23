@@ -1,6 +1,6 @@
 //! Spec / bundle hot-reload markers. See design §7.1.
 //!
-//! `joi agent reload <actor_id>` and `joi service reload <service_id>`
+//! `loom agent reload <actor_id>` and `loom service reload <service_id>`
 //! drop a small `reload-epoch.json` file under the host data dir for
 //! that actor / service. The owning host process polls this file and
 //! when the epoch advances it tears down the running worker, re-reads
@@ -8,8 +8,7 @@
 //! signature changes are dropped on the next first-turn dispatch.
 //!
 //! Pure filesystem; no server contact and no IPC. The host doing the
-//! polling is the `joi agent serve` process (this binary) or the
-//! `joi service serve` process. Reading / writing the marker is the
+//! polling is the `loom-daemon` process. Reading / writing the marker is the
 //! shared contract.
 
 use std::path::{Path, PathBuf};
@@ -77,7 +76,7 @@ mod tests {
     fn temp() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "joi-reload-tests-{}",
+            "loom-reload-tests-{}",
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

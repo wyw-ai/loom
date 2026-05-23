@@ -89,8 +89,8 @@ graph LR
 ```
 
 三类客户端用同一套 wire 协议跟 server 对话：`connection/open` 上线、
-`message stream` 听流、`message.send` 写事件、`turn/open|close` 打开和关闭 turn、
-`message.read` 拉历史。**Server 不区分对面是人还是 agent**。
+`message stream` 听流、`message.send` 写消息、`run.open/append/close` 记录 agent
+执行，`message.read` 拉历史。**Server 不区分对面是人还是 agent**。
 
 ### 2.2 节点职责
 
@@ -98,7 +98,7 @@ graph LR
 | --- | --- |
 | `loom-server` | 持久化 + scope fanout + actor 注册 + journal 重放 |
 | `loom <subcmd>`（人） | TUI / 一次性命令；每个进程持有人类 actor 的连接 |
-| `loom agent serve`（agent client） | 读本地 agent 配置、按需 spawn agent runtime、为每个被管理的 actor 维护一条到 server 的连接、把 adapter 输出翻译成事件 |
+| `loom agent serve`（agent client） | 读本地 agent 配置、按需 spawn agent runtime、为每个被管理的 actor 维护一条到 server 的连接、把 adapter 输出翻译成 message/run 记录 |
 
 ### 2.3 端到端 sequence（典型 wakeup）
 
@@ -112,24 +112,24 @@ sequenceDiagram
 
     Note over Client: 启动时已 connection/open<br/>+ message stream
     Human->>Server: message.send<br/>(message, directed_to=actor_X)
-    Server-->>Client: message.created (event)
-    Client->>Adapter: dispatch(actor_X, event)
+    Server-->>Client: message.created
+    Client->>Adapter: dispatch(actor_X, message)
     Adapter->>Adapter: ensure_started(actor_X)
     Adapter->>Agent: send_prompt(text)
     Agent-->>Adapter: AdapterEvent::Text(partial)
     Adapter-->>Client: Text(partial)
-    Client->>Server: turn/trace.update (text.delta)
+    Client->>Server: run.append (text.delta)
     Agent-->>Adapter: AdapterEvent::Finished
     Adapter-->>Client: Finished
     Client->>Server: message.send (message)
-    Client->>Server: turn/close
+    Client->>Server: run.close
     Server-->>Human: message.created
 ```
 
 关键点：
 
 - Server 既不感知 adapter 类型，也不感知 ACP/command 子进程是否存在。它只看到
-  `actor_X` 上线了一条连接，写了一条事件。
+  `actor_X` 上线了一条连接，写了一条消息。
 - agent client 持有 `(actor_X) → adapter` 的内存映射，wakeup 完全在 client 进程
   内闭环。
 
@@ -256,7 +256,7 @@ pub enum AdapterEvent {
 
 每个 adapter 实现自己内部到 `AdapterEvent` 的翻译；`AdapterRegistry` 收到
 `AdapterEvent` 之后跑统一翻译层，把它们
-变成 `message.send` / `turn/trace.update` / `turn/close` RPC 调用发回 server。
+变成 `message.send` / `run.append` / `run.close` RPC 调用发回 server。
 
 不同 transport 的保真度差异通过填充 `AdapterEvent` 子集来表达：
 
@@ -408,17 +408,17 @@ sequenceDiagram
     participant Reg as AdapterRegistry
     participant A as Adapter (ACP or Command)
 
-    Server-->>Client: message.created<br/>(event with directed_to=actor_X)
-    Client->>Reg: dispatch_event(actor_X, event)
-    Reg->>Reg: filter: directed_to.target == actor_X<br/>and target.id != event.actor_id
+    Server-->>Client: message.created<br/>(message with audience=actor_X)
+    Client->>Reg: dispatch_message(actor_X, message)
+    Reg->>Reg: filter: audience contains actor_X<br/>and author != actor_X
     Reg->>A: ensure_started(ctx)
     A-->>Reg: started
-    Reg->>Server: turn/open(actor_X, scope, trigger=event.id)
-    Server-->>Reg: turn.id
-    Reg->>A: send_prompt(scope, render_prompt(event))
+    Reg->>Server: run.open(actor_X, scope, trigger=message.id)
+    Server-->>Reg: run.id
+    Reg->>A: send_prompt(scope, render_prompt(message))
     A-->>Reg: AdapterEvent stream
     loop translate_event
-        Reg->>Server: turn/trace.update | message.send | turn/close
+        Reg->>Server: run.append | message.send | run.close
     end
 ```
 
@@ -430,10 +430,10 @@ client 管理的 actor 之一。
 | 步骤 | v0 | v1 |
 | --- | --- | --- |
 | 监听 store | `store.subscribe()`（进程内 broadcast） | `message stream`（跨进程 RPC） |
-| 起 turn | `store.open_turn(...)`（直接调 store） | `turn/open` RPC |
-| 写 trace | `store.append_trace_frame(...)` | `turn/trace.update` RPC |
+| 起 run | `store.open_run(...)`（直接调 store） | `run.open` RPC |
+| 写 trace | `store.append_run_frame(...)` | `run.append` RPC |
 | 写 message | `store.append_event(...)` | `message.send` RPC |
-| 关闭 turn | `store.close_turn(...)` + `store.append_event("turn.close",...)` | `turn/close` RPC |
+| 关闭 run | `store.close_run(...)` | `run.close` RPC |
 
 注意 server 端这些 RPC 在 v0 已经存在（GUI 也用同一组），所以**协议侧零改动**。
 
@@ -473,7 +473,7 @@ client 管理的 actor 之一。
   [`crates/cli/src/cmd/agent_serve.rs`](../crates/cli/src/cmd/agent_serve.rs)
   实现 `loom agent serve [--specs <dir>]`：扫 `~/.config/loom/agents/`，把 provider
   spec 展开成 actor；每个 actor 起一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
-  `directed_to` 翻译成 `turn/open` + `send_prompt` + 流式 trace + `turn/close`。
+  message delivery 翻译成 `run.open` + `send_prompt` + 流式 run frame + `run.close`。
 
 ### Phase E4：清理 server ✅ 已合
 
@@ -493,9 +493,9 @@ client 管理的 actor 之一。
 明确这些**不**在本设计的改动范围内，避免 review 时产生混淆：
 
 - **Wire 协议**（`connection/open` / `message stream` / `message.send` /
-  `turn/open` / `turn/close` / `turn/trace.update` / `message.read` /
+  `run.open` / `run.close` / `run.append` / `message.read` /
   `artifact/*` / `delivery.ack` / `action/respond`）：字段、行为、语义都不变。
-- **Trace 帧形状**：`turn/trace.update` 的 `kind`（text.delta / tool.start /
+- **Trace 帧形状**：`run.append` 的 `kind`（text.delta / tool.start /
   tool.update / tool.end / status / error）与 payload 不变。变的只是发送方从
   server 内部变成 agent client。
 - **Journal 格式**：server 端 [`journal.rs`](../crates/server/src/journal.rs) 不

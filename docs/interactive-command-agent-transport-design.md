@@ -131,7 +131,7 @@ Human / GUI / TUI
 │ loom-server          │
 │ - journal/store     │
 │ - delivery/fanout   │
-│ - turn/trace        │
+│ - run frames        │
 └──────────┬──────────┘
            │ actor inbox / scope update
            ▼

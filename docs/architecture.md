@@ -172,19 +172,19 @@ adapter 细节。
 7. adapter 输出被 worker 写回 server：
    - `message`
    - `action.request`
-   - `turn/trace.append`
-   - `turn.close`
+   - `run.append`
+   - `run.close`
 
 server 在整个过程中只做 journal、fanout、ACL 与持久化。
 
 ## 5. 取消模型
 
-取消由人类客户端调用 `turn/close(status=cancelled)` 发起。
+取消由人类客户端发送 run cancel message 发起。
 
 server 做两件事：
 
 1. 校验调用者是 turn 所在 channel 的 member。
-2. 关闭对应 run/turn 状态，并通过 actor inbox fanout 给 agent actor。
+2. 关闭对应 run 状态，并通过 actor inbox fanout 给 agent actor。
 
 `loom-daemon` 收到该 event 后取消本地 adapter。server 不持有 adapter handle，
 也不会直接 kill 子进程。

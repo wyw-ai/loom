@@ -103,17 +103,17 @@ workspace 已经按 channel 细分。ACP `session/new.cwd` 和 command subproces
    turn。模型决定直接回复，还是把这条 root message claim 成 task 并转到
    canonical thread。
 7. worker 构造 channel-aware prompt 并调用 adapter。
-8. worker 把内容、trace、action request、turn close 写回 server。
+8. worker 把内容、trace、action request、run close 写回 server。
 
 server 只承载协议事实，不持有 runtime handle。
 
 ## 5. 取消闭环
 
-人类客户端取消 turn 时调用 `turn/close(status=cancelled)`。
+人类客户端取消 run 时发送 run cancel message。
 
-server 校验 channel member 后写入 `turn.close` event，并把该 event directed message 给 turn
-owner actor。`loom-daemon` 收到后取消本地 adapter。如果 adapter 已经产生了部分
-文本，agent client 会先 flush 为 `message`，再关闭 turn。
+server 校验 channel member 后关闭 run，并把 cancel message 投递给 run owner
+actor。`loom-daemon` 收到后取消本地 adapter。如果 adapter 已经产生了部分
+文本，agent client 会先 flush 为 `message`，再关闭 run。
 
 ## 6. Runtime 配置
 

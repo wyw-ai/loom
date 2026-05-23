@@ -39,8 +39,6 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "crates/cli/src/cmd/spec.rs",
     "crates/cli/src/cmd/workspace.rs",
     "crates/cli/src/main.rs",
-    "data/agents/README.md",
-    "data/services/repo-cache/bundle/sync.sh",
     // The grep guard test itself (this file) lists the tokens.
     "crates/cli/tests/no_legacy_refs.rs",
 ];

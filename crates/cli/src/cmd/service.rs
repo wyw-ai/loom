@@ -31,8 +31,8 @@ pub(crate) fn default_specs_dir() -> PathBuf {
 ///
 /// * **Flat** — `<dir>/<id>.json` (legacy; used by `loom service register`
 ///   when ops drop a single file under `~/.config/loom/services/`).
-/// * **Nested** — `<dir>/<id>/spec.json` (used by the workspace
-///   `data/services/` tree so each spec can ship a `bundle/` sibling).
+/// * **Nested** — `<dir>/<id>/spec.json` so each spec can ship a `bundle/`
+///   sibling beside the spec.
 ///
 /// Malformed files are logged and skipped — one bad spec must not block
 /// the rest of the fleet (matches `agent_serve::load_specs` behavior).
@@ -451,12 +451,40 @@ mod params_schema_tests {
 #[cfg(test)]
 mod service_spec_loader_tests {
     use super::load_specs;
-    use std::path::PathBuf;
+    use std::fs;
 
     #[test]
-    fn load_real_data_services_preserves_top_level_params_schema() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/services");
-        let specs = load_specs(&dir).expect("load data/services specs");
+    fn load_nested_service_fixture_preserves_top_level_params_schema() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-service-spec-loader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let spec_dir = root.join("neutral-service");
+        fs::create_dir_all(&spec_dir).expect("create spec fixture dir");
+        fs::write(
+            spec_dir.join("spec.json"),
+            r#"{
+              "id": "neutral-service",
+              "kind": "scheduler",
+              "actor": {
+                "id": "actor_service_neutral",
+                "kind": "service",
+                "displayName": "Neutral Service"
+              },
+              "paramsSchema": {
+                "type": "object",
+                "required": ["scope"]
+              }
+            }"#,
+        )
+        .expect("write spec fixture");
+
+        let specs = load_specs(&root).expect("load fixture specs");
+        fs::remove_dir_all(&root).ok();
         let spec_with_schema = specs
             .iter()
             .find(|spec| {

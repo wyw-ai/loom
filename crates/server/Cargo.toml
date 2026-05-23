@@ -26,3 +26,4 @@ hex = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
 rusqlite = { workspace = true }
+dirs = { workspace = true }

@@ -135,28 +135,56 @@ fn default_activate() -> bool {
 #[tauri::command]
 pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    let account = cfg
-        .account
-        .clone()
-        .ok_or_else(|| "account login required before adding a human workspace".to_string())?;
     let id = config::generate_id();
+    let (actor_id, display_name) = workspace_identity_for_new_workspace(&cfg, &id);
     let ws = Workspace {
         id: id.clone(),
         name: args.name,
         server_url: args.server_url,
-        actor_id: account.actor_id.clone(),
-        display_name: account_display_name(&account),
+        actor_id: actor_id.clone(),
+        display_name,
     };
     cfg.workspaces.push(ws);
-    cfg.machines.push(config::default_machine_for_workspace(
-        &id,
-        Some(&account.actor_id),
-    ));
+    cfg.machines
+        .push(config::default_machine_for_workspace(&id, Some(&actor_id)));
     if args.activate {
         cfg.active = Some(id);
     }
     config::save(&cfg).map_err(|e| e.to_string())?;
     Ok(cfg)
+}
+
+fn workspace_identity_for_new_workspace(
+    cfg: &DesktopConfig,
+    workspace_id: &str,
+) -> (String, String) {
+    if let Some(account) = cfg.account.as_ref() {
+        return (account.actor_id.clone(), account_display_name(account));
+    }
+    let local_name = local_display_name();
+    let actor_id = format!("actor_human_local_{}", local_identity_suffix(workspace_id));
+    (actor_id, local_name)
+}
+
+fn local_display_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Local".into())
+}
+
+fn local_identity_suffix(value: &str) -> String {
+    let suffix: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect();
+    if suffix.is_empty() {
+        "workspace".into()
+    } else {
+        suffix
+    }
 }
 
 #[derive(Deserialize)]
@@ -203,10 +231,6 @@ pub async fn connect(
     args: ConnectArgs,
 ) -> Result<Value, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    let account = cfg
-        .account
-        .clone()
-        .ok_or_else(|| "account login required before connecting as a human".to_string())?;
     if apply_account_identity(&mut cfg) {
         config::save(&cfg).map_err(stringify)?;
     }
@@ -232,7 +256,7 @@ pub async fn connect(
         .open_connection(&ws.actor_id, Some(&ws.display_name))
         .await
         .map_err(deep_stringify)?;
-    upsert_human_actor(&client, &account)
+    upsert_workspace_actor(&client, cfg.account.as_ref(), &ws)
         .await
         .map_err(deep_stringify)?;
 
@@ -270,6 +294,35 @@ async fn upsert_human_actor(client: &Arc<Client>, account: &HumanAccount) -> any
                             "email": account.email,
                         },
                         "avatarUrl": account.avatar_url,
+                    },
+                },
+            })),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn upsert_workspace_actor(
+    client: &Arc<Client>,
+    account: Option<&HumanAccount>,
+    workspace: &Workspace,
+) -> anyhow::Result<()> {
+    if let Some(account) = account {
+        return upsert_human_actor(client, account).await;
+    }
+    client
+        .call_raw(
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": workspace.actor_id,
+                    "kind": "human",
+                    "displayName": workspace.display_name,
+                    "_meta": {
+                        "account": {
+                            "provider": "local",
+                            "staffId": workspace.actor_id,
+                        },
                     },
                 },
             })),
@@ -2205,29 +2258,29 @@ fn shell_path_arg(path: &Path) -> String {
 
 fn daemon_start_commands(data_root: &Path, server_url: &str, machine_id: &str) -> (String, String) {
     let data_root_arg = shell_path_arg(data_root);
-    let loom_bin = preferred_loom_binary()
+    let daemon_bin = preferred_daemon_binary()
         .map(|path| shell_path_arg(&path))
-        .unwrap_or_else(|| "loom".into());
+        .unwrap_or_else(|| "loom-daemon".into());
     let serve_command = format!(
-        "LOOM_AGENT_DATA_ROOT={} {} --server {} daemon --machine-id {}",
+        "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {}",
         data_root_arg,
-        loom_bin,
+        daemon_bin,
         shell_arg(server_url),
         shell_arg(machine_id),
     );
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_BIN:-}}\" ]]; then\n  LOOM_BIN={}\nfi\nif [[ ! -x \"$LOOM_BIN\" ]]; then\n  if command -v \"$LOOM_BIN\" >/dev/null 2>&1; then\n    LOOM_BIN=\"$(command -v \"$LOOM_BIN\")\"\n  else\n    LOOM_BIN=\"$(command -v loom)\"\n  fi\nfi\nexec \"$LOOM_BIN\" --server {} daemon --machine-id {}\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {}\n",
         shell_path_arg(data_root),
         shell_path_arg(data_root),
-        loom_bin,
+        daemon_bin,
         shell_arg(server_url),
         shell_arg(machine_id),
     );
     (serve_command, setup_script)
 }
 
-fn preferred_loom_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("LOOM_BIN")
+fn preferred_daemon_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LOOM_DAEMON_BIN")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -2238,10 +2291,15 @@ fn preferred_loom_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("loom"));
+            candidates.push(dir.join("loom-daemon"));
             if dir.file_name().and_then(|name| name.to_str()) == Some("MacOS") {
                 if let Some(contents_dir) = dir.parent() {
-                    candidates.push(contents_dir.join("Resources").join("bin").join("loom"));
+                    candidates.push(
+                        contents_dir
+                            .join("Resources")
+                            .join("bin")
+                            .join("loom-daemon"),
+                    );
                 }
             }
         }
@@ -2254,7 +2312,7 @@ fn preferred_loom_binary() -> Option<PathBuf> {
                 .join("dist")
                 .join("release")
                 .join(triple)
-                .join("loom"),
+                .join("loom-daemon"),
         );
     }
 
@@ -2487,6 +2545,35 @@ mod tests {
             .expect("actor id");
 
         assert_eq!(id, "actor_agent_custom:01");
+    }
+
+    #[test]
+    fn local_workspace_identity_does_not_require_oauth_account() {
+        let cfg = DesktopConfig::default();
+
+        let (actor_id, display_name) = workspace_identity_for_new_workspace(&cfg, "ws_local");
+
+        assert_eq!(actor_id, "actor_human_local_ws_local");
+        assert!(!display_name.trim().is_empty());
+    }
+
+    #[test]
+    fn daemon_start_command_uses_daemon_binary() {
+        let (serve_command, setup_script) = daemon_start_commands(
+            Path::new("/tmp/loom data"),
+            "ws://127.0.0.1:7878/rpc",
+            "machine_test",
+        );
+
+        assert!(
+            serve_command.contains("--server ws://127.0.0.1:7878/rpc --machine-id machine_test")
+        );
+        assert!(!serve_command.contains(" daemon --machine-id "));
+        assert!(setup_script.contains("LOOM_DAEMON_BIN"));
+        assert!(setup_script.contains(
+            "exec \"$LOOM_DAEMON_BIN\" --server ws://127.0.0.1:7878/rpc --machine-id machine_test"
+        ));
+        assert!(!setup_script.contains(" daemon --machine-id "));
     }
 
     #[test]

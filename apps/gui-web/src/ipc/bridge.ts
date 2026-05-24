@@ -10,12 +10,14 @@ import type {
   DeliveryState,
   HumanAccount,
   InboxListEntry,
+  MachineListResult,
   Message,
   MessageIntent,
   Run,
   ScopeRef,
   StreamUpdate,
   Task,
+  TaskAssignmentType,
   Thread,
   Workspace,
 } from "./types";
@@ -115,6 +117,13 @@ export async function channelMembers(
   channelId: string,
 ): Promise<{ members: Actor[] }> {
   return invoke("channel_members", { params: { channelId } });
+}
+
+export async function channelInvite(params: {
+  channelId: string;
+  actorId: string;
+}): Promise<unknown> {
+  return invoke("channel_invite", { params });
 }
 
 export async function threadList(
@@ -232,8 +241,77 @@ export async function taskList(params?: {
   return invoke("task_list", { params: params ?? {} });
 }
 
+export async function taskCreate(params: {
+  sourceMessageId: string;
+  title?: string;
+  description?: string;
+  requesterActorId?: string;
+  ownerActorId?: string;
+  status?: string;
+}): Promise<{ task: Task }> {
+  return invoke("task_create", { params });
+}
+
+export async function taskAssignmentCreate(params: {
+  taskId: string;
+  fromActorId?: string;
+  toActorId: string;
+  assignmentType: TaskAssignmentType;
+  instruction: string;
+  contract?: Record<string, unknown>;
+  idempotencyKey?: string;
+}): Promise<unknown> {
+  const { assignmentType, ...rest } = params;
+  return invoke("task_assignment_create", {
+    params: { ...rest, type: assignmentType },
+  });
+}
+
 export async function actorList(): Promise<{ actors: Actor[] }> {
   return invoke("actor_list");
+}
+
+export async function machineList(): Promise<MachineListResult> {
+  return invoke("machine_list");
+}
+
+export async function machineCheck(): Promise<MachineListResult> {
+  return invoke("machine_check");
+}
+
+export async function machineCreate(args: {
+  name: string;
+  dataRoot?: string;
+}): Promise<MachineListResult> {
+  return invoke("machine_create", { args });
+}
+
+export async function machineRemove(machineId: string): Promise<MachineListResult> {
+  return invoke("machine_remove", { args: { machineId } });
+}
+
+export async function machineAgentCreate(args: {
+  machineId: string;
+  providerId: string;
+  actorId?: string;
+  name: string;
+  description?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+}): Promise<MachineListResult> {
+  return invoke("machine_agent_create", { args });
+}
+
+export async function machineAgentRemove(params: {
+  machineId: string;
+  actorId: string;
+}): Promise<MachineListResult> {
+  return invoke("machine_agent_remove", { args: params });
+}
+
+export async function openLocalPath(path: string): Promise<void> {
+  await invoke("open_local_path", { args: { path } });
 }
 
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {

@@ -1356,6 +1356,12 @@ fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
         .as_ref()
         .map(|account| account.actor_id.trim())
         .filter(|actor_id| !actor_id.is_empty())
+        .or_else(|| {
+            active_workspace_id(cfg)
+                .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+                .map(|workspace| workspace.actor_id.trim())
+                .filter(|actor_id| !actor_id.is_empty())
+        })
 }
 
 fn active_workspace_can_be_recovered(cfg: &DesktopConfig) -> bool {

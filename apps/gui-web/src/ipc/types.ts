@@ -193,6 +193,82 @@ export interface DesktopConfig {
   workspaces: Workspace[];
 }
 
+export interface AgentModelChoice {
+  id: string;
+  label: string;
+  description?: string | null;
+}
+
+export interface MachineAgentProviderInfo {
+  id: string;
+  name: string;
+  transportKind: string;
+  command: string;
+  args: string[];
+  actorCount: number;
+  defaultModel?: string | null;
+  modelChoices: AgentModelChoice[];
+}
+
+export interface AgentSpec {
+  actor: Actor;
+  model?: string | null;
+  autostart?: boolean | null;
+  _meta?: Record<string, unknown>;
+}
+
+export interface AgentInfo {
+  spec: AgentSpec;
+  status: string;
+  pid?: number | null;
+  sessionId?: string | null;
+}
+
+export interface MachineAgentInfo extends AgentInfo {
+  profilePath: string;
+  identityPath: string;
+  soulPath: string;
+}
+
+export interface MachineInfo {
+  workspaceId?: string | null;
+  ownerActorId?: string | null;
+  id: string;
+  name: string;
+  kind: string;
+  source: string;
+  readOnly: boolean;
+  canCommand: boolean;
+  canOpenLocalPath: boolean;
+  capabilities: string[];
+  inventoryRevision: number;
+  inventoryObservedAt?: string | null;
+  status: string;
+  setupStatus: string;
+  connectionStatus: string;
+  connectionActorId: string;
+  dataRoot: string;
+  configDir: string;
+  agentCount: number;
+  onlineAgentCount: number;
+  providers: MachineAgentProviderInfo[];
+  agents: MachineAgentInfo[];
+  serveCommand: string;
+  setupScript: string;
+}
+
+export interface MachineListResult {
+  machines: MachineInfo[];
+}
+
+export type TaskAssignmentType =
+  | "generate"
+  | "review"
+  | "investigate"
+  | "fix"
+  | "verify"
+  | "other";
+
 export interface StreamUpdate {
   kind: string;
   scope: ScopeRef;

@@ -490,6 +490,16 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
     let mut changed = false;
     let account_display = cfg.account.as_ref().map(account_display_name);
     let account_actor_id = active_account_actor_id(cfg).map(ToString::to_string);
+    let workspace_owner_fallbacks = cfg
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                workspace.id.clone(),
+                unique_machine_owner_for_workspace(cfg, &workspace.id),
+            )
+        })
+        .collect::<Vec<_>>();
     for workspace in &mut cfg.workspaces {
         if workspace.name.trim().is_empty() {
             workspace.name = "Local".into();
@@ -502,6 +512,15 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
         if workspace.actor_id.trim().is_empty() {
             if let Some(actor_id) = account_actor_id.as_ref() {
                 workspace.actor_id = actor_id.clone();
+                changed = true;
+            } else if let Some((_, Some(actor_id))) = workspace_owner_fallbacks
+                .iter()
+                .find(|(workspace_id, _)| workspace_id == &workspace.id)
+            {
+                workspace.actor_id = actor_id.clone();
+                changed = true;
+            } else {
+                workspace.actor_id = local_actor_id_for_workspace(&workspace.id);
                 changed = true;
             }
         }
@@ -516,6 +535,29 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
         }
     }
     changed
+}
+
+fn local_actor_id_for_workspace(workspace_id: &str) -> String {
+    format!("actor_human_local_{}", safe_config_key(workspace_id))
+}
+
+fn unique_machine_owner_for_workspace(cfg: &DesktopConfig, workspace_id: &str) -> Option<String> {
+    let mut owners = cfg
+        .machines
+        .iter()
+        .filter(|machine| machine.workspace_id.as_deref() == Some(workspace_id))
+        .filter_map(|machine| machine.owner_actor_id.as_deref())
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners.dedup();
+    if owners.len() == 1 {
+        owners.pop()
+    } else {
+        None
+    }
 }
 
 fn default_machine() -> MachineConfig {
@@ -707,6 +749,8 @@ id = "default"
         assert!(repair_workspace_fields(&mut cfg));
         assert_eq!(cfg.workspaces[0].name, "Local");
         assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
+        assert_eq!(cfg.workspaces[0].actor_id, "actor_human_local_default");
+        assert_eq!(cfg.workspaces[0].display_name, "actor_human_local_default");
     }
 
     #[test]

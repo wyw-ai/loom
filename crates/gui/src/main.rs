@@ -113,8 +113,10 @@ fn main() {
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
-            if let Some(win) = app.get_webview_window("main") {
-                win.open_devtools();
+            if std::env::var_os("LOOM_GUI_OPEN_DEVTOOLS").is_some() {
+                if let Some(win) = app.get_webview_window("main") {
+                    win.open_devtools();
+                }
             }
             let _ = app;
             Ok(())

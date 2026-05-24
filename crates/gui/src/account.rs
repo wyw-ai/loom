@@ -34,13 +34,6 @@ impl OAuthProvider {
         }
     }
 
-    fn id(self) -> &'static str {
-        match self {
-            Self::Google => "google",
-            Self::GitHub => "github",
-        }
-    }
-
     fn display(self) -> &'static str {
         match self {
             Self::Google => "Google",

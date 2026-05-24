@@ -8,12 +8,14 @@ import {
   Circle,
   Github,
   Hash,
+  HardDrive,
   Inbox,
   Loader2,
   LogOut,
   MessageSquare,
   PanelRight,
   Plus,
+  RefreshCw,
   Send,
   Settings,
   Sparkles,
@@ -33,6 +35,8 @@ import {
   type DesktopConfig,
   type HumanAccount,
   type InboxListEntry,
+  type MachineAgentProviderInfo,
+  type MachineInfo,
   type Message,
   type Run,
   type ScopeRef,
@@ -49,6 +53,15 @@ import { cn, formatTime, shortId } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 type View = "chat" | "inbox" | "tasks" | "settings";
+type AgentFormState = {
+  machineId: string;
+  providerId: string;
+  actorId: string;
+  name: string;
+  description: string;
+  model: string;
+  autostart: boolean;
+};
 
 const terminalRunStatuses = new Set(["completed", "failed", "canceled"]);
 
@@ -70,15 +83,30 @@ export function App() {
   const [runs, setRuns] = useState<Record<string, Run>>({});
   const [inbox, setInbox] = useState<InboxListEntry[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [machines, setMachines] = useState<MachineInfo[]>([]);
   const [draft, setDraft] = useState("");
   const [newChannelTitle, setNewChannelTitle] = useState("");
   const [workspaceForm, setWorkspaceForm] = useState({
     name: "Local",
     serverUrl: "ws://127.0.0.1:7878/rpc",
   });
+  const [machineForm, setMachineForm] = useState({
+    name: "Local Daemon",
+    dataRoot: "",
+  });
+  const [agentForm, setAgentForm] = useState<AgentFormState>({
+    machineId: "",
+    providerId: "",
+    actorId: "",
+    name: "Echo",
+    description: "Reply concisely and report completed work.",
+    model: "",
+    autostart: true,
+  });
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
+  const [taskDraft, setTaskDraft] = useState<Message | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const actorIdRef = useRef<string | null>(null);
@@ -108,6 +136,7 @@ export function App() {
   const actorList = Object.values(actors).sort((a, b) =>
     displayName(a).localeCompare(displayName(b)),
   );
+  const agentActors = actorList.filter((actor) => actor.kind === "agent");
   const channelTasks = activeChannel
     ? tasks.filter((task) => task.channelId === activeChannel.id)
     : tasks;
@@ -133,15 +162,6 @@ export function App() {
     window.setTimeout(() => setNotice(null), 3200);
   }, []);
 
-  const loadConfig = useCallback(async () => {
-    try {
-      const next = await ipc.workspacesList();
-      applyConfig(next);
-    } catch (err) {
-      setError(errorText(err));
-    }
-  }, [applyConfig]);
-
   const refreshInbox = useCallback(async (actorId: string) => {
     const result = await ipc.inboxList({
       actorId,
@@ -150,6 +170,30 @@ export function App() {
     });
     setInbox(result.deliveries);
   }, []);
+
+  const applyMachines = useCallback((nextMachines: MachineInfo[]) => {
+    setMachines(nextMachines);
+    setAgentForm((current) => normalizeAgentForm(current, nextMachines));
+  }, []);
+
+  const loadMachines = useCallback(
+    async (check = false) => {
+      const result = check ? await ipc.machineCheck() : await ipc.machineList();
+      applyMachines(result.machines);
+      return result.machines;
+    },
+    [applyMachines],
+  );
+
+  const loadConfig = useCallback(async () => {
+    try {
+      const next = await ipc.workspacesList();
+      applyConfig(next);
+      void loadMachines().catch(() => {});
+    } catch (err) {
+      setError(errorText(err));
+    }
+  }, [applyConfig, loadMachines]);
 
   const loadWorkspaceData = useCallback(
     async (current: Workspace) => {
@@ -184,8 +228,9 @@ export function App() {
       if (inboxResult.status === "fulfilled") {
         setInbox(inboxResult.value.deliveries);
       }
+      void loadMachines().catch(() => {});
     },
-    [account],
+    [account, loadMachines],
   );
 
   const connectWorkspace = useCallback(
@@ -395,6 +440,7 @@ export function App() {
   async function addWorkspace() {
     if (!workspaceForm.name.trim() || !workspaceForm.serverUrl.trim()) return;
     setBusy("workspace:add");
+    setError(null);
     try {
       const next = await ipc.workspaceAdd({
         name: workspaceForm.name.trim(),
@@ -402,6 +448,7 @@ export function App() {
         activate: true,
       });
       applyConfig(next);
+      await loadMachines();
       pushNotice(`Workspace ${workspaceForm.name.trim()} added`);
     } catch (err) {
       setError(errorText(err));
@@ -412,9 +459,11 @@ export function App() {
 
   async function removeWorkspace(id: string) {
     setBusy(`workspace:remove:${id}`);
+    setError(null);
     try {
       const next = await ipc.workspaceRemove(id);
       applyConfig(next);
+      await loadMachines();
       if (workspace?.id === id) {
         setWorkspace(null);
         setConnection("idle");
@@ -423,6 +472,113 @@ export function App() {
       setError(errorText(err));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function checkMachines() {
+    setBusy("machine:check");
+    setError(null);
+    try {
+      await loadMachines(true);
+      pushNotice("Daemon status refreshed");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function createMachine() {
+    const name = machineForm.name.trim();
+    if (!name) return;
+    setBusy("machine:create");
+    setError(null);
+    try {
+      const result = await ipc.machineCreate({
+        name,
+        dataRoot: machineForm.dataRoot.trim() || undefined,
+      });
+      applyMachines(result.machines);
+      setMachineForm({ name: "Local Daemon", dataRoot: "" });
+      pushNotice(`Daemon ${name} added`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeMachine(machineId: string) {
+    setBusy(`machine:remove:${machineId}`);
+    setError(null);
+    try {
+      const result = await ipc.machineRemove(machineId);
+      applyMachines(result.machines);
+      pushNotice("Daemon removed");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function createAgent() {
+    const name = agentForm.name.trim();
+    if (!agentForm.machineId || !agentForm.providerId || !name) return;
+    setBusy("agent:create");
+    setError(null);
+    try {
+      const result = await ipc.machineAgentCreate({
+        machineId: agentForm.machineId,
+        providerId: agentForm.providerId,
+        actorId: agentForm.actorId.trim() || undefined,
+        name,
+        description: agentForm.description.trim(),
+        model: agentForm.model.trim(),
+        autostart: agentForm.autostart,
+      });
+      applyMachines(result.machines);
+      setAgentForm((current) =>
+        normalizeAgentForm({ ...current, actorId: "", name: "Echo" }, result.machines),
+      );
+      if (workspace && connection === "open") {
+        const actorId = agentForm.actorId.trim();
+        if (activeChannel && actorId) {
+          await ensureChannelMembers(activeChannel.id, [actorId]).catch(() => {});
+        }
+        await loadWorkspaceData(workspace);
+      }
+      pushNotice(`Agent ${name} added`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeAgent(machineId: string, actorId: string) {
+    setBusy(`agent:remove:${actorId}`);
+    setError(null);
+    try {
+      const result = await ipc.machineAgentRemove({ machineId, actorId });
+      applyMachines(result.machines);
+      if (workspace && connection === "open") {
+        await loadWorkspaceData(workspace);
+      }
+      pushNotice("Agent removed");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function openLocalPath(path: string) {
+    setError(null);
+    try {
+      await ipc.openLocalPath(path);
+    } catch (err) {
+      setError(errorText(err));
     }
   }
 
@@ -453,17 +609,31 @@ export function App() {
     try {
       const parentMessageId = replyTo?.id;
       const repliedActor = replyTo ? actors[replyTo.authorActorId] : undefined;
+      const mentionedAgents = replyTo
+        ? []
+        : mentionedAgentAudience(body, actors, workspace?.actorId);
       const directedTo =
         repliedActor && repliedActor.id !== workspace?.actorId
           ? [{ kind: "actor" as const, id: repliedActor.id }]
-          : [];
+          : mentionedAgents;
+      const wakesAgent =
+        repliedActor?.kind === "agent" || directedTo.some((audience) => {
+          const actor = actors[audience.id];
+          return actor?.kind === "agent";
+        });
+      if (activeChannel && directedTo.length > 0) {
+        await ensureChannelMembers(
+          activeChannel.id,
+          directedTo.map((audience) => audience.id),
+        );
+      }
       const result = await ipc.messageSend({
         target,
         body,
         parentMessageId,
         audience: directedTo,
-        deliveryPolicy: repliedActor?.kind === "agent" ? "wake_agent" : "notify_only",
-        intent: repliedActor?.kind === "agent" ? "request_action" : "chat",
+        deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
+        intent: wakesAgent ? "request_action" : "chat",
       });
       setMessages((current) => sortMessages(upsert(current, result.message)));
       setDraft("");
@@ -475,7 +645,7 @@ export function App() {
     }
   }
 
-  async function startContext(message: Message) {
+  async function startThread(message: Message) {
     if (!activeChannel) return;
     const existing = channelThreads.find(
       (thread) => thread.rootMessageId === message.id,
@@ -500,6 +670,58 @@ export function App() {
       setActiveThreadId(result.thread.id);
     } catch (err) {
       setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function assignTask(message: Message, agentActorId: string): Promise<boolean> {
+    if (!workspace || !agentActorId) return false;
+    if (!canUseAsTaskSource(message)) {
+      setError("Tasks can only be assigned from top-level channel messages.");
+      return false;
+    }
+    const title = threadTitle(message);
+    const instruction = message.body.trim() || title;
+    setBusy(`task:create:${message.id}`);
+    setError(null);
+    try {
+      await ensureChannelMembers(channelFromMessage(message), [agentActorId]);
+      const existingTasks = await ipc.taskList();
+      let task = existingTasks.tasks.find(
+        (candidate) => candidate.sourceMessageId === message.id,
+      );
+      if (!task) {
+        const created = await ipc.taskCreate({
+          sourceMessageId: message.id,
+          title,
+          description: instruction,
+          requesterActorId: workspace.actorId,
+          ownerActorId: agentActorId,
+          status: "claimed",
+        });
+        task = created.task;
+      }
+      await ipc.taskAssignmentCreate({
+        taskId: task.id,
+        fromActorId: workspace.actorId,
+        toActorId: agentActorId,
+        assignmentType: "fix",
+        instruction,
+        contract: {
+          kind: "gui.message_assignment",
+          sourceMessageId: message.id,
+          channelId: channelFromMessage(message),
+        },
+        idempotencyKey: `gui:${message.id}:${agentActorId}`,
+      });
+      const taskResult = await ipc.taskList();
+      setTasks(sortTasks(taskResult.tasks));
+      pushNotice(`Task #${task.number} assigned`);
+      return true;
+    } catch (err) {
+      setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -543,7 +765,9 @@ export function App() {
   const chatEmpty =
     connection === "open"
       ? activeChannel
-        ? "No messages in this scope."
+        ? activeThread
+          ? "No messages in this thread."
+          : "No messages in this channel."
         : "No channels."
       : "No workspace connection.";
 
@@ -595,10 +819,12 @@ export function App() {
             )}
             <MessageFeed
               actors={actors}
+              agents={agentActors}
               messages={messages}
               emptyText={chatEmpty}
               onReply={setReplyTo}
-              onStartContext={startContext}
+              onStartThread={startThread}
+              onOpenTaskAssign={setTaskDraft}
               onAnswerAction={answerAction}
               activeThread={activeThread}
               busy={busy}
@@ -635,15 +861,26 @@ export function App() {
             busy={busy}
             workspaceForm={workspaceForm}
             setWorkspaceForm={setWorkspaceForm}
+            machineForm={machineForm}
+            setMachineForm={setMachineForm}
+            agentForm={agentForm}
+            setAgentForm={setAgentForm}
+            machines={machines}
             workspaces={workspaces}
             onAddWorkspace={addWorkspace}
             onRemoveWorkspace={removeWorkspace}
+            onCheckMachines={checkMachines}
+            onAddMachine={createMachine}
+            onRemoveMachine={removeMachine}
+            onAddAgent={createAgent}
+            onRemoveAgent={removeAgent}
+            onOpenLocalPath={openLocalPath}
             onLogin={login}
             onLogout={logout}
           />
         )}
       </main>
-      <ContextPanel
+      <StatePanel
         actors={actorList}
         channel={activeChannel}
         channelTasks={channelTasks}
@@ -662,6 +899,18 @@ export function App() {
         <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-border bg-popover px-4 py-2 text-sm shadow-soft">
           {notice}
         </div>
+      )}
+      {taskDraft && (
+        <TaskAssignDialog
+          agents={agentActors}
+          busy={busy === `task:create:${taskDraft.id}`}
+          message={taskDraft}
+          onCancel={() => setTaskDraft(null)}
+          onAssign={async (message, agentActorId) => {
+            const assigned = await assignTask(message, agentActorId);
+            if (assigned) setTaskDraft(null);
+          }}
+        />
       )}
     </div>
   );
@@ -939,7 +1188,7 @@ function ChatHeader({
           </h1>
           {thread && (
             <Badge variant="secondary" className="max-w-[45%] truncate">
-              Context: {thread.title}
+              Thread: {thread.title}
             </Badge>
           )}
         </div>
@@ -959,19 +1208,23 @@ function ChatHeader({
 
 function MessageFeed({
   actors,
+  agents,
   messages,
   emptyText,
   onReply,
-  onStartContext,
+  onStartThread,
+  onOpenTaskAssign,
   onAnswerAction,
   activeThread,
   busy,
 }: {
   actors: Record<string, Actor>;
+  agents: Actor[];
   messages: Message[];
   emptyText: string;
   onReply: (message: Message) => void;
-  onStartContext: (message: Message) => void;
+  onStartThread: (message: Message) => void;
+  onOpenTaskAssign: (message: Message) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
   activeThread: Thread | null;
   busy: string | null;
@@ -990,11 +1243,14 @@ function MessageFeed({
           <MessageRow
             key={message.id}
             actor={actors[message.authorActorId]}
+            agents={agents}
             message={message}
             onReply={onReply}
-            onStartContext={onStartContext}
+            onStartThread={onStartThread}
+            onOpenTaskAssign={onOpenTaskAssign}
             onAnswerAction={onAnswerAction}
-            canStartContext={!activeThread && message.kind !== "system"}
+            canStartThread={!activeThread && canUseAsThreadRoot(message)}
+            canAssignTask={canUseAsTaskSource(message)}
             busy={busy}
           />
         ))}
@@ -1005,19 +1261,25 @@ function MessageFeed({
 
 function MessageRow({
   actor,
+  agents,
   message,
   onReply,
-  onStartContext,
+  onStartThread,
+  onOpenTaskAssign,
   onAnswerAction,
-  canStartContext,
+  canStartThread,
+  canAssignTask,
   busy,
 }: {
   actor?: Actor;
+  agents: Actor[];
   message: Message;
   onReply: (message: Message) => void;
-  onStartContext: (message: Message) => void;
+  onStartThread: (message: Message) => void;
+  onOpenTaskAssign: (message: Message) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
-  canStartContext: boolean;
+  canStartThread: boolean;
+  canAssignTask: boolean;
   busy: string | null;
 }) {
   const actionRequest = messageKind(message) === "action.request";
@@ -1067,15 +1329,26 @@ function MessageRow({
             <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
               Reply
             </Button>
-            {canStartContext && (
+            {canStartThread && (
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => onStartContext(message)}
+                onClick={() => onStartThread(message)}
                 disabled={busy === `thread:create:${message.id}`}
               >
                 <Split size={14} />
-                Context
+                Thread
+              </Button>
+            )}
+            {agents.length > 0 && canAssignTask && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onOpenTaskAssign(message)}
+                disabled={busy === `task:create:${message.id}`}
+              >
+                <Check size={14} />
+                Assign task
               </Button>
             )}
             <span className="self-center font-mono text-[11px] text-muted-foreground">
@@ -1085,6 +1358,83 @@ function MessageRow({
         </div>
       </div>
     </article>
+  );
+}
+
+function TaskAssignDialog({
+  agents,
+  busy,
+  message,
+  onAssign,
+  onCancel,
+}: {
+  agents: Actor[];
+  busy: boolean;
+  message: Message;
+  onAssign: (message: Message, agentActorId: string) => Promise<void> | void;
+  onCancel: () => void;
+}) {
+  const [agentActorId, setAgentActorId] = useState(agents[0]?.id ?? "");
+  useEffect(() => {
+    if (!agentActorId || !agents.some((agent) => agent.id === agentActorId)) {
+      setAgentActorId(agents[0]?.id ?? "");
+    }
+  }, [agentActorId, agents]);
+  const source = threadTitle(message);
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/70 px-4 backdrop-blur-sm">
+      <section className="w-full max-w-md rounded-md border border-border bg-popover p-4 shadow-soft">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold">Assign Task</h2>
+            <div className="mt-1 truncate text-xs text-muted-foreground">
+              {shortId(message.id, 12)}
+            </div>
+          </div>
+          <Button variant="ghost" size="icon" onClick={onCancel} disabled={busy}>
+            <X size={15} />
+          </Button>
+        </div>
+        <div className="mt-4 space-y-3">
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium text-muted-foreground">
+              Source Message
+            </span>
+            <div className="rounded-md border border-border bg-background px-3 py-2 text-sm">
+              {source}
+            </div>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium text-muted-foreground">
+              Agent
+            </span>
+            <select
+              value={agentActorId}
+              onChange={(event) => setAgentActorId(event.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground"
+            >
+              {agents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {displayName(agent)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" size="sm" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => onAssign(message, agentActorId)}
+            disabled={busy || !agentActorId}
+          >
+            Assign
+          </Button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1265,9 +1615,20 @@ function SettingsView({
   busy,
   workspaceForm,
   setWorkspaceForm,
+  machineForm,
+  setMachineForm,
+  agentForm,
+  setAgentForm,
+  machines,
   workspaces,
   onAddWorkspace,
   onRemoveWorkspace,
+  onCheckMachines,
+  onAddMachine,
+  onRemoveMachine,
+  onAddAgent,
+  onRemoveAgent,
+  onOpenLocalPath,
   onLogin,
   onLogout,
 }: {
@@ -1275,15 +1636,32 @@ function SettingsView({
   busy: string | null;
   workspaceForm: { name: string; serverUrl: string };
   setWorkspaceForm: (form: { name: string; serverUrl: string }) => void;
+  machineForm: { name: string; dataRoot: string };
+  setMachineForm: (form: { name: string; dataRoot: string }) => void;
+  agentForm: AgentFormState;
+  setAgentForm: (form: AgentFormState) => void;
+  machines: MachineInfo[];
   workspaces: Workspace[];
   onAddWorkspace: () => void;
   onRemoveWorkspace: (id: string) => void;
+  onCheckMachines: () => void;
+  onAddMachine: () => void;
+  onRemoveMachine: (machineId: string) => void;
+  onAddAgent: () => void;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+  onOpenLocalPath: (path: string) => void;
   onLogin: (provider: ipc.LoginProvider) => void;
   onLogout: () => void;
 }) {
+  const selectedMachine =
+    machines.find((machine) => machine.id === agentForm.machineId) ?? machines[0];
+  const selectedProvider =
+    selectedMachine?.providers.find((provider) => provider.id === agentForm.providerId) ??
+    selectedMachine?.providers[0];
+  const modelChoices = selectedProvider?.modelChoices ?? [];
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <PageHeader title="Settings" detail="Identity and workspaces" />
+      <PageHeader title="Settings" detail="Identity, workspaces, daemons, agents" />
       <div className="min-h-0 flex-1 overflow-y-auto p-5 scrollbar-thin">
         <div className="mx-auto grid max-w-4xl gap-5">
           <div className="rounded-md border border-border bg-card p-4">
@@ -1365,13 +1743,315 @@ function SettingsView({
               ))}
             </div>
           </div>
+
+          <div className="rounded-md border border-border bg-card p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="text-sm font-medium">Daemons</div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onCheckMachines}
+                disabled={busy === "machine:check"}
+              >
+                {busy === "machine:check" ? (
+                  <Loader2 className="animate-spin" size={15} />
+                ) : (
+                  <RefreshCw size={15} />
+                )}
+                Check
+              </Button>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
+              <Input
+                value={machineForm.name}
+                onChange={(event) =>
+                  setMachineForm({ ...machineForm, name: event.target.value })
+                }
+                placeholder="Daemon name"
+              />
+              <Input
+                value={machineForm.dataRoot}
+                onChange={(event) =>
+                  setMachineForm({ ...machineForm, dataRoot: event.target.value })
+                }
+                placeholder="Data root"
+              />
+              <Button onClick={onAddMachine} disabled={busy === "machine:create"}>
+                <Plus size={15} />
+                Add
+              </Button>
+            </div>
+            <div className="mt-4 space-y-3">
+              {machines.length === 0 ? (
+                <MutedLine>No daemons configured.</MutedLine>
+              ) : (
+                machines.map((machine) => (
+                  <MachineCard
+                    key={machine.id}
+                    machine={machine}
+                    busy={busy}
+                    onRemove={onRemoveMachine}
+                    onOpenLocalPath={onOpenLocalPath}
+                    onRemoveAgent={onRemoveAgent}
+                  />
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border bg-card p-4">
+            <div className="mb-3 text-sm font-medium">Add Agent</div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <select
+                value={selectedMachine?.id ?? ""}
+                onChange={(event) =>
+                  setAgentForm(
+                    normalizeAgentForm(
+                      { ...agentForm, machineId: event.target.value, model: "" },
+                      machines,
+                    ),
+                  )
+                }
+                className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+              >
+                {machines.map((machine) => (
+                  <option key={machine.id} value={machine.id}>
+                    {machine.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={selectedProvider?.id ?? ""}
+                onChange={(event) => {
+                  const provider = selectedMachine?.providers.find(
+                    (item) => item.id === event.target.value,
+                  );
+                  setAgentForm({
+                    ...agentForm,
+                    machineId: selectedMachine?.id ?? agentForm.machineId,
+                    providerId: event.target.value,
+                    model: provider?.defaultModel ?? "",
+                  });
+                }}
+                className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                disabled={!selectedMachine || selectedMachine.providers.length === 0}
+              >
+                {(selectedMachine?.providers ?? []).map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.name}
+                  </option>
+                ))}
+              </select>
+              <Input
+                value={agentForm.name}
+                onChange={(event) =>
+                  setAgentForm({ ...agentForm, name: event.target.value })
+                }
+                placeholder="Agent name"
+              />
+              <Input
+                value={agentForm.actorId}
+                onChange={(event) =>
+                  setAgentForm({ ...agentForm, actorId: event.target.value })
+                }
+                placeholder="Actor id"
+              />
+              {modelChoices.length > 0 ? (
+                <select
+                  value={agentForm.model || selectedProvider?.defaultModel || ""}
+                  onChange={(event) =>
+                    setAgentForm({ ...agentForm, model: event.target.value })
+                  }
+                  className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  {modelChoices.map((choice) => (
+                    <option key={choice.id} value={choice.id}>
+                      {choice.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <Input
+                  value={agentForm.model}
+                  onChange={(event) =>
+                    setAgentForm({ ...agentForm, model: event.target.value })
+                  }
+                  placeholder="Model"
+                />
+              )}
+              <label className="flex h-10 items-center gap-2 rounded-md border border-border px-3 text-sm">
+                <input
+                  type="checkbox"
+                  checked={agentForm.autostart}
+                  onChange={(event) =>
+                    setAgentForm({ ...agentForm, autostart: event.target.checked })
+                  }
+                />
+                Autostart
+              </label>
+              <Textarea
+                value={agentForm.description}
+                onChange={(event) =>
+                  setAgentForm({ ...agentForm, description: event.target.value })
+                }
+                placeholder="Agent instructions"
+                className="sm:col-span-2"
+              />
+            </div>
+            <div className="mt-3 flex justify-end">
+              <Button
+                onClick={onAddAgent}
+                disabled={
+                  busy === "agent:create" ||
+                  !selectedMachine ||
+                  !selectedProvider ||
+                  !agentForm.name.trim()
+                }
+              >
+                <Bot size={15} />
+                Add Agent
+              </Button>
+            </div>
+          </div>
         </div>
       </div>
     </section>
   );
 }
 
-function ContextPanel({
+function MachineCard({
+  machine,
+  busy,
+  onRemove,
+  onOpenLocalPath,
+  onRemoveAgent,
+}: {
+  machine: MachineInfo;
+  busy: string | null;
+  onRemove: (machineId: string) => void;
+  onOpenLocalPath: (path: string) => void;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+}) {
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="flex flex-wrap items-start gap-3">
+        <div className="flex h-9 w-9 items-center justify-center rounded-md bg-secondary">
+          <HardDrive size={17} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium">{machine.name}</span>
+            <Badge variant={machine.connectionStatus === "online" ? "success" : "outline"}>
+              {machine.connectionStatus}
+            </Badge>
+            <Badge variant="secondary">{machine.setupStatus}</Badge>
+            {machine.readOnly && <Badge variant="warning">read only</Badge>}
+          </div>
+          <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+            {machine.id}
+          </div>
+        </div>
+        <div className="flex gap-1">
+          {machine.canOpenLocalPath && (
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Open data root"
+              onClick={() => onOpenLocalPath(machine.dataRoot)}
+            >
+              <HardDrive size={15} />
+            </Button>
+          )}
+          {!machine.readOnly && (
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Remove daemon"
+              onClick={() => onRemove(machine.id)}
+              disabled={busy === `machine:remove:${machine.id}`}
+            >
+              <Trash2 size={15} />
+            </Button>
+          )}
+        </div>
+      </div>
+      <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <InfoBlock label="Data" value={machine.dataRoot} />
+        <InfoBlock label="Command" value={machine.serveCommand} />
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {machine.providers.length === 0 ? (
+          <Badge variant="warning">no CLI providers</Badge>
+        ) : (
+          machine.providers.map((provider) => (
+            <ProviderBadge key={provider.id} provider={provider} />
+          ))
+        )}
+      </div>
+      <div className="mt-3 space-y-2">
+        {machine.agents.length === 0 ? (
+          <MutedLine>No agents on this daemon.</MutedLine>
+        ) : (
+          machine.agents.map((agent) => {
+            const actor = agent.spec.actor;
+            return (
+              <div
+                key={actor.id}
+                className="flex items-center gap-3 rounded-md border border-border px-3 py-2"
+              >
+                <ActorAvatar actor={actor} fallback={actor.id} small />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium">
+                    {actor.displayName || actor.id}
+                  </div>
+                  <div className="truncate font-mono text-xs text-muted-foreground">
+                    {actor.id}
+                  </div>
+                </div>
+                <Badge variant={agent.status === "online" ? "success" : "outline"}>
+                  {agent.status}
+                </Badge>
+                {!machine.readOnly && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="Remove agent"
+                    onClick={() => onRemoveAgent(machine.id, actor.id)}
+                    disabled={busy === `agent:remove:${actor.id}`}
+                  >
+                    <Trash2 size={15} />
+                  </Button>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProviderBadge({ provider }: { provider: MachineAgentProviderInfo }) {
+  return (
+    <Badge variant="outline">
+      {provider.name}
+      {provider.actorCount > 0 ? ` (${provider.actorCount})` : ""}
+    </Badge>
+  );
+}
+
+function InfoBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-md border border-border bg-background p-2">
+      <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">
+        {label}
+      </div>
+      <div className="break-all font-mono text-xs text-muted-foreground">{value}</div>
+    </div>
+  );
+}
+
+function StatePanel({
   actors,
   channel,
   channelTasks,
@@ -1566,6 +2246,50 @@ function connectionLabel(connection: ConnectionState) {
   if (connection === "error") return "Connection error";
   if (connection === "closed") return "Disconnected";
   return "Idle";
+}
+
+function normalizeAgentForm(form: AgentFormState, machines: MachineInfo[]): AgentFormState {
+  const machine = machines.find((item) => item.id === form.machineId) ?? machines[0];
+  const provider =
+    machine?.providers.find((item) => item.id === form.providerId) ??
+    machine?.providers[0];
+  return {
+    ...form,
+    machineId: machine?.id ?? "",
+    providerId: provider?.id ?? "",
+    model: form.model || provider?.defaultModel || "",
+  };
+}
+
+function mentionedAgentAudience(
+  body: string,
+  actors: Record<string, Actor>,
+  selfActorId?: string,
+) {
+  return Object.values(actors)
+    .filter((actor) => actor.kind === "agent" && actor.id !== selfActorId)
+    .filter((actor) => body.includes(`@${actor.id}`))
+    .map((actor) => ({ kind: "actor" as const, id: actor.id }));
+}
+
+function canUseAsThreadRoot(message: Message) {
+  return canUseAsTaskSource(message);
+}
+
+function canUseAsTaskSource(message: Message) {
+  return (
+    message.kind !== "system" &&
+    message.scope.kind === "channel" &&
+    !message.parentMessageId &&
+    !message.threadRootMessageId
+  );
+}
+
+async function ensureChannelMembers(channelId: string, actorIds: string[]) {
+  const uniqueActorIds = [...new Set(actorIds.map((id) => id.trim()).filter(Boolean))];
+  await Promise.allSettled(
+    uniqueActorIds.map((actorId) => ipc.channelInvite({ channelId, actorId })),
+  );
 }
 
 function sameScope(a: ScopeRef, b: ScopeRef) {

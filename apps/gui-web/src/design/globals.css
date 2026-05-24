@@ -1,198 +1,86 @@
-@import "./tokens.css";
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-html,
-body,
-#root {
-  height: 100%;
-  margin: 0;
-  overflow: hidden;
+@layer base {
+  :root {
+    color-scheme: dark;
+    --background: 0 0% 7%;
+    --foreground: 210 20% 96%;
+    --card: 0 0% 10%;
+    --card-foreground: 210 20% 96%;
+    --popover: 0 0% 10%;
+    --popover-foreground: 210 20% 96%;
+    --primary: 174 72% 42%;
+    --primary-foreground: 180 20% 7%;
+    --secondary: 166 12% 17%;
+    --secondary-foreground: 210 20% 96%;
+    --muted: 0 0% 15%;
+    --muted-foreground: 215 12% 67%;
+    --accent: 250 18% 20%;
+    --accent-foreground: 210 20% 96%;
+    --destructive: 358 68% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 23%;
+    --input: 0 0% 25%;
+    --ring: 174 72% 42%;
+    --radius: 0.5rem;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+
+  body {
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family:
+      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
 }
 
-body {
-  background: var(--bg-main);
-  color: var(--text-primary);
-  font-family: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "Menlo",
-    "Consolas", monospace;
-  font-size: 14px;
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
+@layer utilities {
+  .stable-scrollbar {
+    scrollbar-gutter: stable;
+  }
 
-/* Custom scrollbars. */
-*::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-*::-webkit-scrollbar-thumb {
-  background: #111111;
-  border: 2px solid #ffffff;
-}
-*::-webkit-scrollbar-thumb:hover {
-  background: #333333;
-}
-*::-webkit-scrollbar-track {
-  background: transparent;
-}
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.45) transparent;
+  }
 
-.stable-scrollbar {
-  scrollbar-gutter: stable;
-}
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
 
-button {
-  cursor: pointer;
-}
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.45);
+    border-radius: 999px;
+  }
 
-.bubble-flash {
-  background: rgba(242, 110, 164, 0.24);
-  transition: background 180ms ease;
-}
-
-.font-display {
-  font-family: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "Menlo",
-    "Consolas", monospace;
-}
-
-.h-panel-header {
-  height: var(--panel-header);
-}
-
-.size-icon-header {
-  width: var(--icon-header);
-  height: var(--icon-header);
-}
-
-.shadow-brutal {
-  box-shadow: var(--brutal-shadow);
-}
-
-.shadow-brutal-sm {
-  box-shadow: var(--brutal-shadow-sm);
-}
-
-.btn-brutal,
-.btn-brutal-sm {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 2px solid #111111;
-  color: #111111;
-  background: #ffffff;
-  box-shadow: var(--brutal-shadow-sm);
-  font-weight: 800;
-  transition:
-    transform 80ms ease,
-    box-shadow 80ms ease,
-    background-color 80ms ease;
-}
-
-.btn-brutal:hover,
-.btn-brutal-sm:hover {
-  box-shadow: var(--brutal-shadow);
-}
-
-.btn-brutal:active,
-.btn-brutal-sm:active {
-  transform: translate(2px, 2px);
-  box-shadow: none;
-}
-
-.btn-brutal-sm {
-  min-height: 28px;
-  min-width: 28px;
-}
-
-.input-brutal {
-  border: 2px solid #111111;
-  background: #ffffff;
-  color: #111111;
-  box-shadow: var(--brutal-shadow-sm);
-  outline: none;
-  padding: 0.625rem 0.75rem;
-}
-
-.input-brutal:focus {
-  background: #fffdf8;
-  box-shadow: var(--brutal-shadow);
-}
-
-.card-brutal {
-  border: 2px solid #111111;
-  background: #ffffff;
-  color: #111111;
-  box-shadow: var(--brutal-shadow);
-}
-
-.chip-brutal {
-  border: 2px solid #111111;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  padding: 0.15rem 0.45rem;
-  font-size: 0.7rem;
-  font-weight: 800;
-  line-height: 1.1;
-}
-
-.scrollbar-none::-webkit-scrollbar {
-  display: none;
-}
-
-.scrollbar-none {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
-}
-
-.prose-chat :where(p, ul, ol, pre, blockquote) {
-  margin: 0.15rem 0;
-}
-
-.prose-chat {
-  max-width: 100%;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.prose-chat :where(p, li, blockquote, h1, h2, h3, h4, h5, h6) {
-  overflow-wrap: anywhere;
-}
-
-.prose-chat :where(pre) {
-  max-width: 100%;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.prose-chat :where(table) {
-  display: block;
-  max-width: 100%;
-  overflow-x: auto;
-}
-
-.prose-chat :where(img, video) {
-  max-width: 100%;
-}
-
-.prose-chat :where(code) {
-  background: #fff0b6;
-  border: 1px solid rgba(17, 17, 17, 0.35);
-  padding: 0 0.2rem;
-}
-
-.prose-chat :where(a) {
-  background: #efe5ff;
-  border: 1px solid rgba(17, 17, 17, 0.35);
-  color: #111111;
-  font-weight: 800;
-  padding: 0 0.2rem;
-  text-decoration: none;
+  .text-balance {
+    text-wrap: balance;
+  }
 }

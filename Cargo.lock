@@ -2267,31 +2267,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "joi-gui"
-version = "0.1.0"
-dependencies = [
- "agent-runtime",
- "anyhow",
- "dirs 5.0.1",
- "futures-util",
- "proto",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-notification",
- "tokio",
- "tokio-tungstenite 0.21.0",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2482,6 +2457,31 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "loom-gui"
+version = "0.1.0"
+dependencies = [
+ "agent-runtime",
+ "anyhow",
+ "dirs 5.0.1",
+ "futures-util",
+ "proto",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-notification",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

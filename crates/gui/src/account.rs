@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, USER_AGENT};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

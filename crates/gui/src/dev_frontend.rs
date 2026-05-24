@@ -44,7 +44,7 @@ mod imp {
                 }
             };
 
-            if wait_for_dev_server(&mut child, Duration::from_secs(10)) {
+            if wait_for_dev_server(&mut child, Duration::from_secs(60)) {
                 tracing::info!("GUI frontend dev server started");
             } else {
                 tracing::warn!("GUI frontend dev server did not become reachable before timeout");

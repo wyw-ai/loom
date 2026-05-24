@@ -2,7 +2,7 @@
 //! Tauri events. The front-end binds listeners in `ipc/bridge.ts`.
 //!
 //! Event names intentionally mirror the notification `method` when there's a
-//! 1:1 mapping, and collapse `stream/update` into `joi://stream` (the
+//! 1:1 mapping, and collapse `stream/update` into `loom://stream` (the
 //! discriminator travels in the payload `kind`).
 
 use std::sync::Arc;
@@ -29,10 +29,7 @@ pub fn spawn(app: AppHandle, client: Arc<Client>) {
         while let Some(n) = rx.recv().await {
             let emitted = match n.method.as_str() {
                 method::STREAM_UPDATE => {
-                    app.emit("joi://stream", n.params.unwrap_or(serde_json::Value::Null))
-                }
-                method::TURN_TRACE_UPDATE => {
-                    app.emit("joi://trace", n.params.unwrap_or(serde_json::Value::Null))
+                    app.emit("loom://stream", n.params.unwrap_or(serde_json::Value::Null))
                 }
                 other => {
                     // Unknown notifications are surfaced under a catch-all so
@@ -41,7 +38,7 @@ pub fn spawn(app: AppHandle, client: Arc<Client>) {
                         "method": other,
                         "params": n.params,
                     });
-                    app.emit("joi://unknown", payload)
+                    app.emit("loom://unknown", payload)
                 }
             };
             if let Err(e) = emitted {
@@ -49,7 +46,7 @@ pub fn spawn(app: AppHandle, client: Arc<Client>) {
             }
         }
         let _ = app.emit(
-            "joi://connection",
+            "loom://connection",
             ConnectionEvent::Closed {
                 reason: Some("notification stream ended".into()),
             },

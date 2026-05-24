@@ -4,7 +4,7 @@
 //! - **Workspace profile** management (`workspaces_list`, `workspaces_save`,
 //!   `workspace_add`, `workspace_remove`, `set_active_workspace`): pure
 //!   local-config manipulation; never touches the server.
-//! - **Server RPCs** (`connect`, `channel_*`, `scope_*`, `event_append`, …):
+//! - **Server RPCs** (`connect`, `channel_*`, `message_*`, `run_*`, …):
 //!   thin wrappers over `Client::call_raw` with JSON pass-through. We
 //!   deliberately avoid typed Rust structs here so schema drift stays
 //!   debuggable on the TypeScript side.
@@ -74,11 +74,9 @@ pub async fn account_login(
     args: AccountLoginArgs,
 ) -> Result<AccountLoginResult, String> {
     let provider = args.provider.trim().to_ascii_lowercase();
-    if provider != "buc" {
-        return Err(format!("unsupported account provider: {}", args.provider));
-    }
-
-    let account = account::login_buc().await.map_err(deep_stringify)?;
+    let account = account::login_oauth(&provider)
+        .await
+        .map_err(deep_stringify)?;
     let avatar_account = account.clone();
     tokio::spawn(async move {
         if let Err(err) = avatar::prefetch_account_avatar(&avatar_account).await {
@@ -227,7 +225,7 @@ pub async fn connect(
         .await
         .map_err(deep_stringify)?;
     client
-        .initialize("joi-gui", env!("CARGO_PKG_VERSION"))
+        .initialize("loom-gui", env!("CARGO_PKG_VERSION"))
         .await
         .map_err(deep_stringify)?;
     let open = client
@@ -240,7 +238,7 @@ pub async fn connect(
 
     forward::spawn(app.clone(), Arc::clone(&client));
     state.set(Some(client)).await;
-    let _ = app.emit("joi://connection", forward::ConnectionEvent::Open);
+    let _ = app.emit("loom://connection", forward::ConnectionEvent::Open);
 
     // Persist the chosen workspace as active.
     let _ = set_active_workspace(WorkspaceIdArgs { id: ws.id.clone() }).await;
@@ -423,21 +421,31 @@ pub async fn scope_unsubscribe(state: State<'_, AppState>, params: Value) -> Res
 }
 
 #[tauri::command]
-pub async fn scope_read(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+pub async fn message_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
         .await?
-        .call_raw(method::INTERNAL_SCOPE_READ, Some(params))
+        .call_raw(method::MESSAGE_LIST, Some(params))
         .await
         .map_err(stringify)
 }
 
 #[tauri::command]
-pub async fn event_append(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+pub async fn message_send(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
         .await?
-        .call_raw(method::INTERNAL_EVENT_APPEND, Some(params))
+        .call_raw(method::MESSAGE_SEND, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn message_read(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_READ, Some(params))
         .await
         .map_err(stringify)
 }
@@ -683,11 +691,21 @@ pub async fn task_change_ack(state: State<'_, AppState>, params: Value) -> Resul
 }
 
 #[tauri::command]
-pub async fn delivery_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+pub async fn inbox_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
         .await?
-        .call_raw(method::DELIVERY_LIST, Some(params))
+        .call_raw(method::INBOX_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn delivery_ack(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::DELIVERY_ACK, Some(params))
         .await
         .map_err(stringify)
 }
@@ -762,11 +780,11 @@ pub async fn artifact_read(state: State<'_, AppState>, params: Value) -> Result<
 }
 
 #[tauri::command]
-pub async fn turn_close(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
         .await?
-        .call_raw(method::TURN_CLOSE, Some(params))
+        .call_raw(method::RUN_CANCEL, Some(params))
         .await
         .map_err(stringify)
 }
@@ -1825,7 +1843,7 @@ fn is_complete_remote_machine_inventory(meta: &RemoteMachineMeta) -> bool {
 async fn temporary_machine_check_client(cfg: &DesktopConfig) -> Option<Arc<Client>> {
     let client = Client::connect(active_server_url(cfg)).await.ok()?;
     client
-        .initialize("joi-gui-machine-check", env!("CARGO_PKG_VERSION"))
+        .initialize("loom-gui-machine-check", env!("CARGO_PKG_VERSION"))
         .await
         .ok()?;
     Some(client)
@@ -2187,29 +2205,29 @@ fn shell_path_arg(path: &Path) -> String {
 
 fn daemon_start_commands(data_root: &Path, server_url: &str, machine_id: &str) -> (String, String) {
     let data_root_arg = shell_path_arg(data_root);
-    let joi_bin = preferred_joi_binary()
+    let loom_bin = preferred_loom_binary()
         .map(|path| shell_path_arg(&path))
-        .unwrap_or_else(|| "joi".into());
+        .unwrap_or_else(|| "loom".into());
     let serve_command = format!(
-        "JOI_AGENT_DATA_ROOT={} {} --server {} daemon --machine-id {}",
+        "LOOM_AGENT_DATA_ROOT={} {} --server {} daemon --machine-id {}",
         data_root_arg,
-        joi_bin,
+        loom_bin,
         shell_arg(server_url),
         shell_arg(machine_id),
     );
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport JOI_AGENT_DATA_ROOT={}\nif [[ -z \"${{JOI_BIN:-}}\" ]]; then\n  JOI_BIN={}\nfi\nif [[ ! -x \"$JOI_BIN\" ]]; then\n  if command -v \"$JOI_BIN\" >/dev/null 2>&1; then\n    JOI_BIN=\"$(command -v \"$JOI_BIN\")\"\n  else\n    JOI_BIN=\"$(command -v joi)\"\n  fi\nfi\nexec \"$JOI_BIN\" --server {} daemon --machine-id {}\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_BIN:-}}\" ]]; then\n  LOOM_BIN={}\nfi\nif [[ ! -x \"$LOOM_BIN\" ]]; then\n  if command -v \"$LOOM_BIN\" >/dev/null 2>&1; then\n    LOOM_BIN=\"$(command -v \"$LOOM_BIN\")\"\n  else\n    LOOM_BIN=\"$(command -v loom)\"\n  fi\nfi\nexec \"$LOOM_BIN\" --server {} daemon --machine-id {}\n",
         shell_path_arg(data_root),
         shell_path_arg(data_root),
-        joi_bin,
+        loom_bin,
         shell_arg(server_url),
         shell_arg(machine_id),
     );
     (serve_command, setup_script)
 }
 
-fn preferred_joi_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("JOI_BIN")
+fn preferred_loom_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LOOM_BIN")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -2220,10 +2238,10 @@ fn preferred_joi_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("joi"));
+            candidates.push(dir.join("loom"));
             if dir.file_name().and_then(|name| name.to_str()) == Some("MacOS") {
                 if let Some(contents_dir) = dir.parent() {
-                    candidates.push(contents_dir.join("Resources").join("bin").join("joi"));
+                    candidates.push(contents_dir.join("Resources").join("bin").join("loom"));
                 }
             }
         }
@@ -2236,7 +2254,7 @@ fn preferred_joi_binary() -> Option<PathBuf> {
                 .join("dist")
                 .join("release")
                 .join(triple)
-                .join("joi"),
+                .join("loom"),
         );
     }
 
@@ -2418,10 +2436,10 @@ mod tests {
 
     fn test_account() -> HumanAccount {
         config::normalize_human_account(HumanAccount {
-            provider: "buc".into(),
+            provider: "github".into(),
             staff_id: "88084".into(),
-            nickname: "星楚".into(),
-            real_name: "陈博俊".into(),
+            nickname: "octocat".into(),
+            real_name: "Octo Cat".into(),
             email: String::new(),
             actor_id: String::new(),
             avatar_url: String::new(),
@@ -2546,7 +2564,7 @@ mod tests {
                         "name": "Remote Box",
                         "kind": "remote",
                         "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                        "configDir": "/home/canfeng/.joi-apps",
+                        "configDir": "/home/canfeng/.loom-apps",
                         "capabilities": ["inventory.read", "connection.status", "machine.command"],
                         "providers": [{
                             "id": "codex",
@@ -2614,7 +2632,7 @@ mod tests {
                 "name": "Remote Box",
                 "kind": "remote",
                 "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.joi-apps",
+                "configDir": "/home/canfeng/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",
@@ -2696,7 +2714,7 @@ mod tests {
                 "name": "Remote Box",
                 "kind": "remote",
                 "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.joi-apps",
+                "configDir": "/home/canfeng/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
                 "agents": []
@@ -2742,7 +2760,7 @@ mod tests {
                 "name": "Other Box",
                 "kind": "remote",
                 "dataRoot": "/home/other/.agentx/machine_other",
-                "configDir": "/home/other/.joi-apps",
+                "configDir": "/home/other/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
                 "agents": []
@@ -2788,7 +2806,7 @@ mod tests {
                 "name": "Remote Box",
                 "kind": "remote",
                 "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.joi-apps",
+                "configDir": "/home/canfeng/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",

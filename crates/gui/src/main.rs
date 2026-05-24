@@ -23,7 +23,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,joi_gui=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,loom_gui=debug")),
         )
         .init();
 
@@ -60,8 +60,9 @@ fn main() {
             ipc::thread_delete,
             ipc::scope_subscribe,
             ipc::scope_unsubscribe,
-            ipc::scope_read,
-            ipc::event_append,
+            ipc::message_list,
+            ipc::message_send,
+            ipc::message_read,
             ipc::task_create,
             ipc::task_get,
             ipc::task_list,
@@ -83,14 +84,15 @@ fn main() {
             ipc::task_assignment_preflight,
             ipc::task_change_list,
             ipc::task_change_ack,
-            ipc::delivery_list,
+            ipc::inbox_list,
+            ipc::delivery_ack,
             ipc::task_workspace_lease_acquire,
             ipc::task_workspace_lease_release,
             ipc::task_workspace_lease_list,
             ipc::artifact_publish,
             ipc::artifact_get,
             ipc::artifact_read,
-            ipc::turn_close,
+            ipc::run_cancel,
             ipc::reminder_list,
             ipc::actor_list,
             ipc::actor_upsert,

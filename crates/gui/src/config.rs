@@ -1,18 +1,18 @@
 //! Local GUI config.
 //!
-//! Layout: `~/.joi-apps/desktop.toml`
+//! Layout: `~/.loom-apps/desktop.toml`
 //!
 //! ```toml
 //! active = "default"
 //!
 //! [account]
-//! provider = "buc"
-//! staff_id = "<staff_id>"
-//! nickname = "bojun"
-//! real_name = "Bo Jun"
-//! email = "bojun@example.com"
-//! actor_id = "actor_human_<staff_id>"
-//! avatar_url = "//work.alibaba-inc.com/photo/<staff_id>.140x140.jpg"
+//! provider = "github"
+//! staff_id = "<provider_subject>"
+//! nickname = "octocat"
+//! real_name = "Octo Cat"
+//! email = "octocat@example.com"
+//! actor_id = "actor_human_github_<provider_subject>"
+//! avatar_url = "https://avatars.githubusercontent.com/u/..."
 //!
 //! [[workspaces]]
 //! id = "default"
@@ -35,7 +35,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const ENV_CONFIG_DIR: &str = "JOI_CONFIG_DIR";
+pub const ENV_CONFIG_DIR: &str = "LOOM_CONFIG_DIR";
+const LEGACY_ENV_CONFIG_DIR: &str = "JOI_CONFIG_DIR";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,9 +54,9 @@ pub struct Workspace {
 
 /// Locally persisted human identity.
 ///
-/// This is profile-only for now: BUC OAuth tokens are used only during login
-/// and are not stored here. The provider field keeps the shape open for future
-/// authentication providers without making workspace identity provider-specific.
+/// This is profile-only for now: OAuth tokens are used only during login and
+/// are not stored here. `staff_id` is retained as the serialized profile
+/// subject for backward compatibility with existing desktop configs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanAccount {
@@ -118,9 +119,12 @@ pub fn config_dir() -> PathBuf {
     if let Some(value) = std::env::var_os(ENV_CONFIG_DIR).filter(|value| !value.is_empty()) {
         return PathBuf::from(value);
     }
+    if let Some(value) = std::env::var_os(LEGACY_ENV_CONFIG_DIR).filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
     dirs::home_dir()
-        .map(|home| home.join(".joi-apps"))
-        .unwrap_or_else(|| PathBuf::from(".joi-apps"))
+        .map(|home| home.join(".loom-apps"))
+        .unwrap_or_else(|| PathBuf::from(".loom-apps"))
 }
 
 pub fn desktop_config_path() -> PathBuf {
@@ -159,18 +163,26 @@ pub fn save(cfg: &DesktopConfig) -> Result<()> {
 }
 
 fn migrate_legacy_configs() {
-    let Some(legacy_root) = legacy_config_dir() else {
-        return;
-    };
     let new_root = config_dir();
-    copy_legacy_file(&legacy_root, &new_root, "cli.toml");
-    copy_legacy_file(&legacy_root, &new_root, "desktop.toml");
+    for legacy_root in legacy_config_dirs() {
+        copy_legacy_file(&legacy_root, &new_root, "cli.toml");
+        copy_legacy_file(&legacy_root, &new_root, "desktop.toml");
+    }
 }
 
-fn legacy_config_dir() -> Option<PathBuf> {
-    dirs::config_dir()
-        .map(|dir| dir.join("joi-apps"))
-        .filter(|dir| dir != &config_dir())
+fn legacy_config_dirs() -> Vec<PathBuf> {
+    let new_root = config_dir();
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".joi-apps"));
+    }
+    if let Some(config) = dirs::config_dir() {
+        roots.push(config.join("joi-apps"));
+    }
+    roots.retain(|dir| dir != &new_root);
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn copy_legacy_file(legacy_root: &Path, new_root: &Path, file_name: &str) {
@@ -222,14 +234,11 @@ pub fn account_display_name(account: &HumanAccount) -> String {
     .to_string()
 }
 
-pub fn human_actor_id_for_staff_id(staff_id: &str) -> String {
-    format!("actor_human_{}", safe_config_key(staff_id.trim()))
-}
-
-pub fn human_avatar_url(staff_id: &str) -> String {
+pub fn human_actor_id_for_subject(provider: &str, subject: &str) -> String {
     format!(
-        "//work.alibaba-inc.com/photo/{}.140x140.jpg",
-        staff_id.trim()
+        "actor_human_{}_{}",
+        safe_config_key(provider.trim()),
+        safe_config_key(subject.trim())
     )
 }
 
@@ -239,8 +248,8 @@ pub fn normalize_human_account(mut account: HumanAccount) -> HumanAccount {
     account.nickname = account.nickname.trim().to_string();
     account.real_name = account.real_name.trim().to_string();
     account.email = account.email.trim().to_string();
-    account.actor_id = human_actor_id_for_staff_id(&account.staff_id);
-    account.avatar_url = human_avatar_url(&account.staff_id);
+    account.actor_id = human_actor_id_for_subject(&account.provider, &account.staff_id);
+    account.avatar_url = account.avatar_url.trim().to_string();
     account
 }
 
@@ -565,34 +574,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_human_account_binds_actor_and_avatar_to_staff_id() {
+    fn normalize_human_account_binds_actor_to_provider_subject() {
         let account = normalize_human_account(HumanAccount {
-            provider: "buc".into(),
+            provider: "github".into(),
             staff_id: " 12345 ".into(),
-            nickname: " bojun ".into(),
-            real_name: " Bo Jun ".into(),
-            email: " bojun@example.com ".into(),
+            nickname: " octocat ".into(),
+            real_name: " Octo Cat ".into(),
+            email: " octocat@example.com ".into(),
             actor_id: "actor_human_random".into(),
-            avatar_url: "old".into(),
+            avatar_url: " https://example.test/avatar.png ".into(),
         });
 
         assert_eq!(account.staff_id, "12345");
-        assert_eq!(account.actor_id, "actor_human_12345");
-        assert_eq!(
-            account.avatar_url,
-            "//work.alibaba-inc.com/photo/12345.140x140.jpg"
-        );
+        assert_eq!(account.actor_id, "actor_human_github_12345");
+        assert_eq!(account.avatar_url, "https://example.test/avatar.png");
     }
 
     #[test]
     fn apply_account_identity_updates_workspace_human_identity() {
         let mut cfg = DesktopConfig {
             account: Some(normalize_human_account(HumanAccount {
-                provider: "buc".into(),
+                provider: "github".into(),
                 staff_id: "12345".into(),
-                nickname: "bojun".into(),
-                real_name: "Bo Jun".into(),
-                email: "bojun@example.com".into(),
+                nickname: "octocat".into(),
+                real_name: "Octo Cat".into(),
+                email: "octocat@example.com".into(),
                 actor_id: String::new(),
                 avatar_url: String::new(),
             })),
@@ -607,8 +613,8 @@ mod tests {
         };
 
         assert!(apply_account_identity(&mut cfg));
-        assert_eq!(cfg.workspaces[0].actor_id, "actor_human_12345");
-        assert_eq!(cfg.workspaces[0].display_name, "bojun");
+        assert_eq!(cfg.workspaces[0].actor_id, "actor_human_github_12345");
+        assert_eq!(cfg.workspaces[0].display_name, "octocat");
     }
 
     #[test]
@@ -616,11 +622,11 @@ mod tests {
         let cfg = DesktopConfig {
             active: Some("default".into()),
             account: Some(normalize_human_account(HumanAccount {
-                provider: "buc".into(),
+                provider: "github".into(),
                 staff_id: "12345".into(),
-                nickname: "bojun".into(),
-                real_name: "Bo Jun".into(),
-                email: "bojun@example.com".into(),
+                nickname: "octocat".into(),
+                real_name: "Octo Cat".into(),
+                email: "octocat@example.com".into(),
                 actor_id: String::new(),
                 avatar_url: String::new(),
             })),
@@ -628,12 +634,12 @@ mod tests {
                 id: "default".into(),
                 name: "Local".into(),
                 server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: "actor_human_12345".into(),
-                display_name: "bojun".into(),
+                actor_id: "actor_human_github_12345".into(),
+                display_name: "octocat".into(),
             }],
             ..DesktopConfig::default()
         };
-        let machine = default_machine_for_workspace("default", Some("actor_human_12345"));
+        let machine = default_machine_for_workspace("default", Some("actor_human_github_12345"));
         let legacy_machine = MachineConfig {
             owner_actor_id: None,
             ..machine.clone()
@@ -705,13 +711,16 @@ id = "default"
 
     #[test]
     fn account_owned_default_machine_uses_owner_scoped_id_and_path() {
-        let machine = default_machine_for_workspace("ws_local", Some("actor_human_12345"));
+        let machine = default_machine_for_workspace("ws_local", Some("actor_human_github_12345"));
 
-        assert_eq!(machine.owner_actor_id.as_deref(), Some("actor_human_12345"));
-        assert_eq!(machine.id, "machine_local_actor_human_12345");
+        assert_eq!(
+            machine.owner_actor_id.as_deref(),
+            Some("actor_human_github_12345")
+        );
+        assert_eq!(machine.id, "machine_local_actor_human_github_12345");
         assert_eq!(
             machine.data_root,
-            "~/.agentx/machines/ws_local/actor_human_12345/local"
+            "~/.agentx/machines/ws_local/actor_human_github_12345/local"
         );
     }
 }

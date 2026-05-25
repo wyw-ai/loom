@@ -398,45 +398,11 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     };
     let payload = json!({ "kind": kind, "scope": scope, "data": data });
-    // ACL gate the scope broadcast: in private channels, drop frames for
-    // any subscriber whose connection isn't bound to a member actor. We
-    // resolve membership once per fanout (not per subscriber) by computing
-    // the channel-owning members set up front.
-    if let Some(members_filter) = scope_acl_filter(state, &scope) {
-        broadcast_filtered(
-            state,
-            &scope,
-            method::STREAM_UPDATE,
-            &payload,
-            &members_filter,
-        );
-    } else {
-        state
-            .subscriptions
-            .broadcast_to_scope(&scope, method::STREAM_UPDATE, payload.clone());
-    }
-    if let StoreEvent::ThreadUpdated(t) = &ev {
-        let thread_scope = ScopeRef {
-            kind: ScopeKind::Thread,
-            id: t.id.clone(),
-        };
+    broadcast_stream_update(state, &scope, &payload);
+    if let Some(thread_scope) = thread_scope_for_event(&ev) {
         let thread_payload =
             json!({ "kind": kind, "scope": thread_scope.clone(), "data": data.clone() });
-        if let Some(members_filter) = scope_acl_filter(state, &thread_scope) {
-            broadcast_filtered(
-                state,
-                &thread_scope,
-                method::STREAM_UPDATE,
-                &thread_payload,
-                &members_filter,
-            );
-        } else {
-            state.subscriptions.broadcast_to_scope(
-                &thread_scope,
-                method::STREAM_UPDATE,
-                thread_payload,
-            );
-        }
+        broadcast_stream_update(state, &thread_scope, &thread_payload);
     }
 
     // Actor-inbox delivery: new messages with delivery rows are pushed
@@ -480,6 +446,39 @@ fn fanout(state: &AppState, ev: StoreEvent) {
             );
         }
     }
+}
+
+fn broadcast_stream_update(state: &AppState, scope: &ScopeRef, payload: &Value) {
+    // ACL gate the scope broadcast: in private channels, drop frames for
+    // any subscriber whose connection isn't bound to a member actor. We
+    // resolve membership once per fanout (not per subscriber) by computing
+    // the channel-owning members set up front.
+    if let Some(members_filter) = scope_acl_filter(state, scope) {
+        broadcast_filtered(
+            state,
+            scope,
+            method::STREAM_UPDATE,
+            payload,
+            &members_filter,
+        );
+    } else {
+        state
+            .subscriptions
+            .broadcast_to_scope(scope, method::STREAM_UPDATE, payload.clone());
+    }
+}
+
+fn thread_scope_for_event(ev: &StoreEvent) -> Option<ScopeRef> {
+    let id = match ev {
+        StoreEvent::ThreadUpdated(thread) => &thread.id,
+        StoreEvent::TaskChanged(task) => &task.canonical_thread_id,
+        StoreEvent::TaskAssignmentChanged { task, .. } => &task.canonical_thread_id,
+        _ => return None,
+    };
+    Some(ScopeRef {
+        kind: ScopeKind::Thread,
+        id: id.clone(),
+    })
 }
 
 fn send_actor_inbox(state: &AppState, actor_id: &str, method: &str, payload: Value) -> usize {
@@ -696,5 +695,72 @@ mod tests {
         assert_eq!(value["params"]["data"]["message"]["id"], message.id);
         assert_eq!(value["params"]["delivery"]["actorId"], "actor_agent");
         assert_eq!(value["params"]["delivery"]["sourceId"], message.id);
+    }
+
+    #[test]
+    fn fanout_delivers_task_changes_to_canonical_thread_subscribers() {
+        let state = fresh_state("task-thread");
+        let channel = state
+            .store
+            .create_channel("tasks".into(), None)
+            .expect("channel");
+        let source = state
+            .store
+            .append_message(
+                "actor_human".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "please do this".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("source message");
+        let task = state
+            .store
+            .create_task(
+                source.id,
+                Some("task".into()),
+                String::new(),
+                "actor_human".into(),
+                Some("actor_agent".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("task");
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_thread".into(),
+            actor_id: Some("actor_human".into()),
+            tx,
+        });
+        let thread_scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: task.canonical_thread_id.clone(),
+        };
+        assert!(state
+            .subscriptions
+            .subscribe("conn_thread", thread_scope.clone()));
+
+        fanout(&state, StoreEvent::TaskChanged(task.clone()));
+
+        let frame = rx.try_recv().expect("task thread frame");
+        let value: Value = serde_json::from_str(&frame).expect("json notification");
+        assert_eq!(value["method"], method::STREAM_UPDATE);
+        assert_eq!(
+            value["params"]["kind"],
+            proto::methods::stream_kind::TASK_CHANGED
+        );
+        assert_eq!(value["params"]["scope"]["kind"], "thread");
+        assert_eq!(value["params"]["scope"]["id"], task.canonical_thread_id);
+        assert_eq!(value["params"]["data"]["task"]["id"], task.id);
     }
 }

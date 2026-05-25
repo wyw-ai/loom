@@ -500,6 +500,11 @@ export function App() {
         if (task) setTasks((current) => sortTasks(upsert(current, task)));
         return;
       }
+      case "task_assignment.changed": {
+        const task = update.data.task as Task | undefined;
+        if (task) setTasks((current) => sortTasks(upsert(current, task)));
+        return;
+      }
       case "delivery.updated": {
         const actorId = actorIdRef.current;
         if (actorId) void refreshInbox(actorId).catch(() => {});

@@ -463,8 +463,14 @@ fn fanout(state: &AppState, ev: StoreEvent) {
                 );
                 continue;
             }
+            let mut inbox_payload = payload.clone();
+            inbox_payload["delivery"] = json!({
+                "sourceId": message.id.clone(),
+                "actorId": target_id.clone(),
+                "source": "actor_inbox",
+            });
             let delivered =
-                send_actor_inbox(state, &target_id, method::STREAM_UPDATE, payload.clone());
+                send_actor_inbox(state, &target_id, method::STREAM_UPDATE, inbox_payload);
             tracing::debug!(
                 message = %message.id,
                 from = %message.author_actor_id,
@@ -688,5 +694,7 @@ mod tests {
             proto::methods::stream_kind::MESSAGE_CREATED
         );
         assert_eq!(value["params"]["data"]["message"]["id"], message.id);
+        assert_eq!(value["params"]["delivery"]["actorId"], "actor_agent");
+        assert_eq!(value["params"]["delivery"]["sourceId"], message.id);
     }
 }

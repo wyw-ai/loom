@@ -3487,12 +3487,47 @@ mod tests {
         assert_eq!(appended.run.status, RunStatus::Running);
         assert_eq!(appended.frame.seq, 1);
 
+        let ignore_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_APPEND,
+            Some(json!({
+                "runId": appended.run.id,
+                "frameKind": "control.no_reply",
+                "payload": {
+                    "reason": "not directed at me",
+                    "triggerSourceId": "msg_source"
+                },
+            })),
+        )
+        .await
+        .expect("run.append control.no_reply");
+        let ignored: RunAppendResult =
+            serde_json::from_value(ignore_value).expect("run ignore result");
+        assert_eq!(
+            ignored
+                .run
+                .metadata
+                .get("noReply")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            ignored
+                .run
+                .metadata
+                .get("replyMode")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
+        assert_eq!(ignored.frame.kind, "control.no_reply");
+
         let close_value = dispatch(
             &state,
             "conn_agent",
             method::RUN_CLOSE,
             Some(json!({
-                "runId": appended.run.id,
+                "runId": ignored.run.id,
                 "status": "completed",
             })),
         )

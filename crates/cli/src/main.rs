@@ -1078,6 +1078,13 @@ enum RunCmd {
         #[arg(long = "payload-json")]
         payload_json: Option<String>,
     },
+    /// Mark the current run as intentionally producing no visible reply.
+    Ignore {
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Close a run with a terminal status.
     Close {
         run_id: String,
@@ -2166,6 +2173,7 @@ async fn main() -> Result<()> {
                 frame_kind,
                 payload_json,
             } => cmd::run::append(client, run_id, status, frame_kind, payload_json).await?,
+            RunCmd::Ignore { run_id, reason } => cmd::run::ignore(client, run_id, reason).await?,
             RunCmd::Close { run_id, status } => cmd::run::close(client, run_id, status).await?,
         },
         Cmd::Coordination { sub } => match sub {
@@ -2700,6 +2708,30 @@ mod tests {
                 assert_eq!(target, "#chan_123");
                 assert_eq!(start_reason.as_deref(), Some("manual"));
                 assert_eq!(agent_config_version_id, "cfg_v1");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_ignore_accepts_optional_run_and_reason() {
+        let args = Args::try_parse_from([
+            "loom",
+            "run",
+            "ignore",
+            "--run-id",
+            "run_123",
+            "--reason",
+            "not directed at me",
+        ])
+        .expect("parse run ignore");
+
+        match args.cmd {
+            Cmd::Run {
+                sub: RunCmd::Ignore { run_id, reason },
+            } => {
+                assert_eq!(run_id.as_deref(), Some("run_123"));
+                assert_eq!(reason.as_deref(), Some("not directed at me"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

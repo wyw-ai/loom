@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::{SecondsFormat, Utc};
 use proto::methods::*;
 use proto::types::{RunStatus, ScopeKind, ScopeRef};
 use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::render;
+
+const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
 
 pub async fn open(
     client: Arc<Client>,
@@ -65,6 +68,92 @@ pub async fn append(
         println!("run {}\tframe={}", res.run.id, res.frame.seq);
     }
     Ok(())
+}
+
+pub async fn ignore(
+    client: Arc<Client>,
+    run_id: Option<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    let run_id = run_id
+        .or_else(|| std::env::var("LOOM_RUN_ID").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .context("run ignore requires --run-id or LOOM_RUN_ID")?;
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "no_visible_reply_needed".into());
+    let trigger_source_id = std::env::var("LOOM_TRIGGER_MESSAGE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let payload = json!({
+        "noReply": true,
+        "replyMode": "none",
+        "reason": reason,
+        "triggerSourceId": trigger_source_id,
+        "createdAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    let local_marked = mark_local_no_reply(&run_id, &payload)
+        .with_context(|| format!("write no-reply marker from {}", LOOM_NO_REPLY_FILE_ENV))?;
+    let result: Result<RunAppendResult> = client
+        .call(
+            method::RUN_APPEND,
+            json!({
+                "runId": run_id,
+                "frameKind": "control.no_reply",
+                "payload": payload,
+            }),
+        )
+        .await
+        .context("run.append control.no_reply");
+    match result {
+        Ok(res) => {
+            if render::is_json() {
+                render::print_json(&json!({
+                    "ignored": true,
+                    "localMarked": local_marked,
+                    "run": res.run,
+                    "frame": res.frame,
+                }));
+            } else {
+                println!("run {}\tignored", res.run.id);
+            }
+        }
+        Err(err) if local_marked => {
+            if render::is_json() {
+                render::print_json(&json!({
+                    "ignored": true,
+                    "localMarked": true,
+                    "auditRecorded": false,
+                    "auditError": err.to_string(),
+                }));
+            } else {
+                println!("run ignored locally (audit failed: {err})");
+            }
+        }
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
+    let Some(path) = std::env::var_os(LOOM_NO_REPLY_FILE_ENV) else {
+        return Ok(false);
+    };
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let marker = json!({
+        "runId": run_id,
+        "payload": payload,
+    });
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    std::fs::write(path, bytes)?;
+    Ok(true)
 }
 
 pub async fn close(client: Arc<Client>, run_id: String, status: String) -> Result<()> {

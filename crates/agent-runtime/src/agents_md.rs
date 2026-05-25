@@ -118,53 +118,78 @@ the current turn. If it says the delivery is addressed to you, the sender is\n\
 asking you to act. Raw `@actor` text by itself is not machine routing; rely on\n\
 Loom delivery metadata and CLI queries instead of parsing mentions.\n\
 \n\
-For a normal reply, write the final user-visible answer as your response. The\n\
-Loom runtime will publish it back to the current scope and link it to the\n\
-trigger message. Do not call `loom message send` just to post that normal final\n\
-answer, or you may duplicate the reply outside the turn. Use the CLI only for\n\
-extra collaboration actions: reading history, sending a separate DM or channel\n\
-message, routing work to another actor, publishing artifacts, asking the user a\n\
-question, or requesting approval.\n\
+Your assistant text is an internal run transcript, not a visible channel/thread\n\
+message. For any visible reply, call `loom --json message send --target ...`\n\
+with the exact text users should see. Do not rely on final assistant text to\n\
+publish a reply. Use final assistant text only for private notes about what you\n\
+did, or keep it empty after tool calls. Use `loom --json run ignore --reason\n\
+\"...\"` when the correct visible behavior is no reply.\n\
 \n\
 Keep progress updates short, state uncertainty when it matters, and include the\n\
 key evidence behind conclusions. If more context is needed, query Loom first.\n\
+Only send messages when you have actionable content: a requested answer, a\n\
+claimed work unit and result, a material state change, a needed question, or a\n\
+real blocker. Do not send visibility-only updates, acknowledgements, or\n\
+\"nothing to do\" summaries.\n\
 \n\
 Hard collaboration rule: claim before work, rebase before send. If a top-level\n\
-message is a work item, claim its source message before doing substantive work.\n\
-If claim fails because another owner exists, stop and do not duplicate the work.\n\
-Before sending any extra visible message with `loom message send`, read the\n\
+message is a work item, try to claim its source message before doing substantive\n\
+work. A successful task claim makes you the lifecycle owner/coordinator; it is\n\
+not a lock over every internal work unit. If claim fails because another owner\n\
+exists, stop for ordinary single-owner work. For shared/multi-agent work (for\n\
+example `@all`, explicit slots, roles, or \"each agent\" instructions), do not\n\
+steal or replace the task owner; instead read the latest canonical thread and\n\
+only participate in an unclaimed internal slot/work unit if one is still needed.\n\
+Before sending any visible message with `loom message send`, read the\n\
 target's latest message, adjust your content to only the still-needed delta,\n\
 and send with `--if-latest <latest_message_id>`. If that send conflicts, read\n\
 latest again and rebase; do not blindly retry the old text.\n\
+`@all` and multi-actor routed work is concurrent by default. Do not assume the\n\
+daemon serialized other agents ahead of you; use the latest thread state as the\n\
+source of truth and rebase your visible output against it.\n\
+When you contribute to shared work owned by another actor, post only the\n\
+still-needed delta in the canonical thread: the internal unit you claimed, the\n\
+result you produced, what remains, and whether the task owner needs to close the\n\
+outer task. Do not complete the outer task unless you are its owner/coordinator.\n\
 \n\
-Task closeout is part of the work, not just a chat summary. When a claimed task\n\
-meets its acceptance criteria, call `loom task complete <task_id> --result ...`\n\
-exactly once before or with the final visible summary. If the task id is not in\n\
-context, query Loom for the task anchored to the source message or thread root.\n\
+Task closeout is part of the work, not just a chat summary. If you are the task\n\
+owner/coordinator and the task meets its acceptance criteria, you must call\n\
+`loom --json task complete <task_id> --result ...` exactly once before or with\n\
+the final visible summary. A message saying \"complete\", \"done\", or a final\n\
+answer without that tool call does not complete the task. If the task id is not\n\
+in context, query Loom for the task anchored to the source message or thread\n\
+root, then complete that task id.\n\
 \n\
 No acknowledgement ping-pong: if the latest routed message only says things\n\
 like \"received\", \"confirmed\", \"done\", \"no further action\", or repeats an\n\
 already-final result, do not reply. If a task is already `done`, `failed`, or\n\
 `canceled` and the message does not ask for new work, produce no visible reply\n\
-and do not send another confirmation.\n\
+and do not send another confirmation. If your decision is \"no action needed\" or\n\
+\"not for me\", call `loom --json run ignore --reason \"not directed at me\"` and\n\
+then end the turn without visible answer text. The runtime will not infer\n\
+no-reply from message text or keyword heuristics. Do not explain the silence.\n\
 \n\
 ### Collaboration routing\n\
 \n\
 Human-to-actor routed messages in a channel common area start as a routing/triage\n\
 turn in that same channel. Decide whether the message is a simple reply or a\n\
-work item. For a simple reply, answer directly in the current scope. For work\n\
+work item. For a simple reply, send the visible answer to the current scope with\n\
+`loom --json message send`. For work\n\
 that is complex, multi-turn, artifact-producing, or needs another actor, first\n\
 claim a task anchored to `LOOM_TRIGGER_MESSAGE_ID`; the server will create or\n\
 reuse the canonical thread for that root message only if you win ownership.\n\
-Then write substantive work, progress, artifacts, reviews, and final results to the\n\
-canonical thread target `#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID`. The\n\
-channel turn should only acknowledge that the task/thread was opened.\n\
+Then write substantive work, progress, artifacts, reviews, and final results with\n\
+`loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\"`.\n\
+The channel turn should only send a short pointer when that pointer is useful.\n\
 \n\
 When you open a task from a channel triage turn, use `loom --json task claim\n\
 --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"`. If claim reports a conflict or an\n\
-existing different owner, do not continue the same work. If it succeeds, do not\n\
-hand off to yourself just to move from the channel into the thread; post thread\n\
-content with `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id>` or\n\
+existing different owner, treat it as an owner conflict, not necessarily a\n\
+shared-work conflict: stop for single-owner work, but for explicit shared work\n\
+continue only with a still-open internal slot/work unit after rebasing against\n\
+the latest thread. If it succeeds, do not hand off to yourself just to move from\n\
+the channel into the thread; post thread content with `loom --json message send\n\
+--target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id>` or\n\
 upload artifacts with that same target, then finish the channel turn with a\n\
 short pointer.\n\
 \n\
@@ -267,18 +292,27 @@ mod tests {
         assert!(out.contains("actor_demo"));
         assert!(out.contains("LOOM_SCOPE_ID"));
         assert!(out.contains("### Runtime contract"));
-        assert!(out.contains("Do not call `loom message send` just to post"));
+        assert!(out.contains("Your assistant text is an internal run transcript"));
+        assert!(out.contains("For any visible reply, call `loom --json message send"));
         assert!(out.contains("Hard collaboration rule: claim before work, rebase before send"));
         assert!(out.contains("loom --json task claim --source-message"));
-        assert!(out.contains("loom task complete <task_id> --result"));
+        assert!(out.contains("Only send messages when you have actionable content"));
+        assert!(out.contains("loom --json task complete <task_id> --result"));
+        assert!(out.contains("A message saying \"complete\", \"done\", or a final"));
         assert!(out.contains("--if-latest <latest_message_id>"));
+        assert!(out.contains("multi-actor routed work is concurrent by default"));
+        assert!(out.contains("A successful task claim makes you the lifecycle owner/coordinator"));
+        assert!(out.contains("only participate in an unclaimed internal slot/work unit"));
+        assert!(out.contains("Do not complete the outer task unless you are its owner/coordinator"));
+        assert!(out.contains("loom --json run ignore --reason"));
+        assert!(out.contains("keyword heuristics"));
+        assert!(out.contains("end the turn without visible answer text"));
         assert!(out.contains(
             "Human-to-actor routed messages in a channel common area start as a routing/triage"
         ));
         assert!(out.contains("Actor-to-actor routed messages are strong task-flow signals"));
-        assert!(
-            out.contains("canonical thread target `#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID`")
-        );
+        assert!(out.contains("loom --json message send --target"));
+        assert!(out.contains("#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID"));
         assert!(out.contains("loom --json inbox list"));
         assert!(out.contains(BEGIN_MARKER));
         assert!(out.contains(END_MARKER));

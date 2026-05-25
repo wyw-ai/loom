@@ -2692,6 +2692,31 @@ impl Store {
         if let Some(status) = status {
             run.status = status;
         }
+        let frame_kind = if kind.trim().is_empty() {
+            "log".into()
+        } else {
+            kind
+        };
+        if frame_kind == "control.no_reply" {
+            run.metadata
+                .insert("noReply".into(), serde_json::json!(true));
+            run.metadata
+                .insert("replyMode".into(), serde_json::json!("none"));
+            if let Some(reason) = payload.get("reason").and_then(serde_json::Value::as_str) {
+                run.metadata
+                    .insert("noReplyReason".into(), serde_json::json!(reason));
+            }
+            if let Some(trigger_source_id) = payload
+                .get("triggerSourceId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                run.metadata.insert(
+                    "noReplyTriggerSourceId".into(),
+                    serde_json::json!(trigger_source_id),
+                );
+            }
+        }
         let seq = {
             let mut inner = self.inner.write();
             let entry = inner.run_seq.entry(run_id.to_string()).or_insert(0);
@@ -2701,11 +2726,7 @@ impl Store {
         let frame = RunFrame {
             run_id: run_id.to_string(),
             seq,
-            kind: if kind.trim().is_empty() {
-                "log".into()
-            } else {
-                kind
-            },
+            kind: frame_kind,
             payload,
             created_at: Utc::now(),
         };
@@ -3349,6 +3370,11 @@ impl Store {
         merge_mentions(&mut mentions, explicit_mentions);
         let mut audience = explicit_audience;
         merge_audience_from_mentions(&mut audience, &mentions);
+        let task_context = resolved
+            .task_id
+            .as_deref()
+            .and_then(|task_id| self.get_task(task_id));
+        let metadata = message_metadata_with_task_context(metadata, task_context.as_ref());
 
         let now = Utc::now();
         let message = Message {
@@ -3365,7 +3391,7 @@ impl Store {
             delivery_policy,
             parent_message_id,
             thread_root_message_id: thread_root_message_id.or(resolved.thread_root_message_id),
-            task_id: None,
+            task_id: task_context.as_ref().map(|task| task.id.clone()),
             attachments,
             reactions: Vec::new(),
             metadata,
@@ -3594,6 +3620,7 @@ impl Store {
                 target: format!("#{raw}"),
                 thread_root_message_id: None,
                 direct_actor: None,
+                task_id: None,
             });
         };
         if channel_id.is_empty() || root_message_id.is_empty() || root_message_id.contains(':') {
@@ -3620,14 +3647,16 @@ impl Store {
                 )));
             }
         };
+        let thread_id = thread.id.clone();
         Ok(ResolvedMessageTarget {
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
-                id: thread.id,
+                id: thread_id.clone(),
             },
             target: format!("#{channel_id}:{root_message_id}"),
             thread_root_message_id: Some(root_message_id.to_string()),
             direct_actor: None,
+            task_id: self.task_id_for_canonical_thread(&thread_id),
         })
     }
 
@@ -3672,7 +3701,17 @@ impl Store {
             target: format!("dm:@{peer}"),
             thread_root_message_id: None,
             direct_actor: Some(peer),
+            task_id: None,
         })
+    }
+
+    fn task_id_for_canonical_thread(&self, thread_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .tasks
+            .values()
+            .find(|task| task.canonical_thread_id == thread_id)
+            .map(|task| task.id.clone())
     }
 
     fn create_thread_for_message_root(
@@ -3901,19 +3940,14 @@ impl Store {
             }
         }
         if message.scope.kind == ScopeKind::Thread {
-            recipients.extend(
-                self.thread_attention_recipients(&message.scope.id, message.audience.is_empty()),
-            );
+            recipients.extend(self.thread_attention_recipients(message));
         }
         unique_nonempty(recipients)
     }
 
-    fn thread_attention_recipients(
-        &self,
-        thread_id: &str,
-        include_task_owner: bool,
-    ) -> Vec<String> {
+    fn thread_attention_recipients(&self, message: &Message) -> Vec<String> {
         let inner = self.inner.read();
+        let thread_id = message.scope.id.as_str();
         let mut recipients: Vec<String> = inner
             .actor_presences
             .values()
@@ -3921,7 +3955,7 @@ impl Store {
             .filter(|presence| presence.following && !presence.muted)
             .map(|presence| presence.actor_id.clone())
             .collect();
-        if include_task_owner {
+        if should_notify_task_owner_for_thread_message(message) {
             recipients.extend(
                 inner
                     .tasks
@@ -4916,6 +4950,7 @@ struct ResolvedMessageTarget {
     target: String,
     thread_root_message_id: Option<String>,
     direct_actor: Option<String>,
+    task_id: Option<String>,
 }
 
 fn mention_tokens(body: &str) -> Vec<(usize, &str, usize)> {
@@ -5266,6 +5301,30 @@ fn unique_nonempty(ids: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+fn message_metadata_with_task_context(mut metadata: Meta, task: Option<&Task>) -> Meta {
+    let Some(task) = task else {
+        return metadata;
+    };
+    metadata.insert("taskId".into(), serde_json::json!(task.id.as_str()));
+    metadata.insert("taskNumber".into(), serde_json::json!(task.number));
+    metadata.insert(
+        "taskStatus".into(),
+        serde_json::to_value(task.status).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(owner) = task.owner_actor_id.as_ref() {
+        metadata.insert("taskOwnerActorId".into(), serde_json::json!(owner));
+    }
+    metadata
+}
+
+fn should_notify_task_owner_for_thread_message(message: &Message) -> bool {
+    message
+        .metadata
+        .get("assignmentStatus")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
 }
 
 fn is_terminal_task_status(status: TaskStatus) -> bool {
@@ -5857,6 +5916,69 @@ mod tests {
         assert!(!after_unfollow
             .iter()
             .any(|delivery| delivery.source_id == muted_reply.id));
+    }
+
+    #[test]
+    fn task_thread_replies_with_explicit_audience_still_notify_owner() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_owner", ActorKind::Agent, "Owner"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_requester", ActorKind::Human, "Requester"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_g", ActorKind::Agent, "G"))
+            .unwrap();
+        let channel = store
+            .create_channel("owner-attention".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_requester").unwrap();
+        store.grant_channel(&channel.id, "actor_agent_g").unwrap();
+        let task = create_owned_task(&store, &channel.id, "shared task");
+
+        let reply = store
+            .append_message(
+                "actor_agent_g".into(),
+                format!("#{}:{}", channel.id, task.source_message_id),
+                MessageKind::Agent,
+                "CLAIM C FILL C=7 BOARD=4127".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_requester".into(),
+                    display: None,
+                }],
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .unwrap();
+
+        let deliveries =
+            store.list_deliveries("actor_owner", Some(DeliveryState::Pending), 10, None);
+        assert!(deliveries
+            .iter()
+            .any(|delivery| delivery.source_id == reply.id));
+        assert_eq!(reply.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            reply
+                .metadata
+                .get("taskId")
+                .and_then(serde_json::Value::as_str),
+            Some(task.id.as_str())
+        );
+        assert_eq!(
+            reply
+                .metadata
+                .get("taskOwnerActorId")
+                .and_then(serde_json::Value::as_str),
+            Some("actor_owner")
+        );
     }
 
     #[test]

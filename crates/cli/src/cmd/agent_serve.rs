@@ -24,15 +24,15 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, BundleInstallMode, ChannelMembersResult, InboxListResult,
-    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
-    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    AgentModelChoice, AgentSpec, BundleInstallMode, InboxListResult, MessageListResult,
+    MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
+    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    Actor, ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta,
-    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus,
+    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, Run, RunStatus,
+    ScopeKind, ScopeRef, TaskAssignmentStatus,
 };
 #[cfg(test)]
 use proto::types::{Event, RefKind, RelationKind};
@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep, Duration, Instant};
+use tokio::time::{interval, sleep, Duration};
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -58,6 +58,8 @@ use crate::daemon_ipc;
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
 const LOOM_CLI_ENV: &str = "LOOM_CLI";
+const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
+const LOCAL_ACTOR_INBOX_DELIVERY_META: &str = "__loom_local_actor_inbox_delivery";
 
 pub async fn run(
     specs_dir_opt: Option<PathBuf>,
@@ -910,6 +912,9 @@ impl AgentPaths {
                 active.trigger_source_id.clone(),
             );
             env.insert("LOOM_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+            if let Some(path) = active.no_reply_file.as_ref() {
+                env.insert(LOOM_NO_REPLY_FILE_ENV.into(), path.display().to_string());
+            }
         }
         env.insert(
             "LOOM_AGENT_PROFILE".into(),
@@ -991,6 +996,20 @@ fn scope_kind_name(kind: ScopeKind) -> &'static str {
         ScopeKind::Channel => "channel",
         ScopeKind::Thread => "thread",
     }
+}
+
+fn run_no_reply_file(logs_dir: &Path, run_id: &str) -> PathBuf {
+    let safe_run_id = run_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    logs_dir.join(format!("{safe_run_id}.no-reply.json"))
 }
 
 fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
@@ -1252,6 +1271,10 @@ struct ActiveTurn {
     /// Actor that triggered the current turn — needed when emitting a
     /// `action.request` so we can hand the choice back to them.
     trigger_actor: String,
+    /// Local side-channel used by `loom run ignore` so the model can end a
+    /// turn without posting a visible final answer.
+    no_reply_file: Option<PathBuf>,
+    no_reply_requested: bool,
     /// Set after a human cancels the turn. The server has already closed the
     /// turn, but we keep this slot occupied until the adapter's eventual
     /// Finished(cancelled) arrives so that stale completion cannot close the
@@ -1389,6 +1412,13 @@ impl WorkerState {
             return None;
         }
         turn.cancel_requested = true;
+        Some(turn.clone())
+    }
+
+    fn mark_no_reply_requested(&self, run_id: &str) -> Option<ActiveTurn> {
+        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let turn = active.values_mut().find(|turn| turn.run_id == run_id)?;
+        turn.no_reply_requested = true;
         Some(turn.clone())
     }
 
@@ -2048,13 +2078,17 @@ async fn notification_loop(
             else {
                 continue;
             };
-            let Ok(message) = serde_json::from_value::<Message>(message_value) else {
+            let Ok(mut message) = serde_json::from_value::<Message>(message_value) else {
                 continue;
             };
-            if !state.remember_source(&message.id) {
+            let inbox_delivery = is_actor_inbox_delivery_for(&params, actor_id);
+            if !is_message_for_us_with_delivery(&message, actor_id, inbox_delivery) {
                 continue;
             }
-            if !is_message_for_us(&message, actor_id) {
+            if inbox_delivery {
+                mark_actor_inbox_delivery(&mut message, actor_id);
+            }
+            if !state.remember_source(&message.id) {
                 continue;
             }
             if message.metadata.get("kind").and_then(Value::as_str) == Some("action.response") {
@@ -2088,6 +2122,18 @@ async fn notification_loop(
                 Ok(TriggerOutcome::Dispatched) => {}
                 Ok(TriggerOutcome::Queued) => {}
                 Err(e) => eprintln!("[{actor_id}] failed to handle message trigger: {e}"),
+            }
+            continue;
+        }
+        if kind == stream_kind::RUN_UPDATED {
+            let Some(run_value) = params.get("data").and_then(|d| d.get("run")).cloned() else {
+                continue;
+            };
+            let Ok(run) = serde_json::from_value::<Run>(run_value) else {
+                continue;
+            };
+            if run.actor_id == actor_id && run_requests_no_reply(&run) {
+                let _ = state.mark_no_reply_requested(&run.id);
             }
             continue;
         }
@@ -2260,17 +2306,27 @@ fn is_for_us(event: &Event, actor_id: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn is_message_for_us(message: &Message, actor_id: &str) -> bool {
+    is_message_for_us_with_delivery(message, actor_id, false)
+}
+
+fn is_inbox_message_for_us(message: &Message, actor_id: &str) -> bool {
+    is_message_for_us_with_delivery(message, actor_id, true)
+}
+
+fn is_message_for_us_with_delivery(
+    message: &Message,
+    actor_id: &str,
+    actor_inbox_delivery: bool,
+) -> bool {
     if message.author_actor_id == actor_id {
-        return false;
-    }
-    if is_terminal_noop_agent_message(message) {
         return false;
     }
     if message.target == format!("dm:@{actor_id}") {
         return true;
     }
-    message.audience.iter().any(|audience| match audience.kind {
+    if message.audience.iter().any(|audience| match audience.kind {
         AudienceKind::Actor => {
             audience.id == actor_id
                 && (message.delivery_policy == DeliveryPolicy::WakeAgent
@@ -2281,126 +2337,76 @@ fn is_message_for_us(message: &Message, actor_id: &str) -> bool {
             message.delivery_policy == DeliveryPolicy::WakeAgent
         }
         AudienceKind::Humans | AudienceKind::Group => false,
-    })
+    }) {
+        return true;
+    }
+    actor_inbox_delivery && message_counts_as_actor_inbox_attention(message, actor_id)
 }
 
-fn is_terminal_noop_agent_message(message: &Message) -> bool {
-    if message.kind != MessageKind::Agent {
-        return false;
-    }
-    if message.metadata.get("kind").and_then(Value::as_str) == Some("action.request") {
-        return false;
-    }
-    let body = message.body.to_lowercase();
-    let terminal_signal = [
-        "no further action",
-        "no further action needed",
-        "no further action required",
-        "task complete",
-        "fully complete",
-        "final result",
-        "final state",
-        "acknowledged",
-        "confirmed",
-        "收到",
-        "确认收到",
-        "无需进一步",
-        "无需继续",
-        "不再追加",
-        "任务完成",
-        "协作完成",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    if !terminal_signal {
-        return false;
-    }
-    let asks_for_work = [
-        "please",
-        "pls",
-        "can you",
-        "could you",
-        "should",
-        "need you",
-        "mark",
-        "run ",
-        "fix",
-        "fill ",
-        "claim ",
-        "请",
-        "需要",
-        "麻烦",
-        "帮",
-        "标记",
-        "修改",
-        "继续处理",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    !asks_for_work
+fn is_actor_inbox_delivery_for(params: &Value, actor_id: &str) -> bool {
+    params
+        .get("delivery")
+        .and_then(|delivery| delivery.get("actorId"))
+        .and_then(Value::as_str)
+        == Some(actor_id)
 }
 
-async fn await_collaboration_turn(
-    client: &Arc<Client>,
-    state: &Arc<WorkerState>,
-    trigger: &AgentTrigger,
-) {
-    let Some(message) = trigger_message(trigger) else {
-        return;
-    };
-    if !is_multi_agent_wake_message(message) {
-        return;
-    }
-    let Some(channel_id) = resolve_channel_for_scope(client, state, &message.scope).await else {
-        return;
-    };
-    let recipients = match collaboration_agent_recipients(client, message, &channel_id).await {
-        Ok(recipients) => recipients,
-        Err(err) => {
-            tracing::debug!(
-                actor = %state.actor_id,
-                message = %message.id,
-                %err,
-                "failed to resolve collaboration recipients"
-            );
-            return;
-        }
-    };
-    let Some(rank) = recipients
-        .iter()
-        .position(|actor_id| actor_id == &state.actor_id)
-    else {
-        return;
-    };
-    if rank == 0 {
-        return;
-    }
-
-    let prior = recipients[..rank].to_vec();
-    let target = reply_target_for_message(message);
-    let deadline = Instant::now() + collaboration_wait_timeout();
-    while Instant::now() < deadline {
-        match prior_collaboration_replies(client, &target, message, &prior).await {
-            Ok(count) if count >= rank => return,
-            Ok(_) => {}
-            Err(err) => {
-                tracing::debug!(
-                    actor = %state.actor_id,
-                    message = %message.id,
-                    target = %target,
-                    %err,
-                    "waiting for collaboration thread history"
-                );
-            }
-        }
-        sleep(collaboration_poll_interval()).await;
-    }
-    tracing::debug!(
-        actor = %state.actor_id,
-        message = %message.id,
-        rank,
-        "collaboration turn wait timed out; dispatching anyway"
+fn mark_actor_inbox_delivery(message: &mut Message, actor_id: &str) {
+    message.metadata.insert(
+        LOCAL_ACTOR_INBOX_DELIVERY_META.into(),
+        json!({
+            "actorId": actor_id,
+            "source": "actor_inbox",
+        }),
     );
+}
+
+fn is_local_actor_inbox_delivery(trigger: &AgentTrigger, actor_id: &str) -> bool {
+    match trigger {
+        AgentTrigger::Message(message) => {
+            message
+                .metadata
+                .get(LOCAL_ACTOR_INBOX_DELIVERY_META)
+                .and_then(|delivery| delivery.get("actorId"))
+                .and_then(Value::as_str)
+                == Some(actor_id)
+        }
+        #[cfg(test)]
+        AgentTrigger::Event(_) => false,
+    }
+}
+
+fn run_requests_no_reply(run: &Run) -> bool {
+    run.metadata
+        .get("noReply")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || run
+            .metadata
+            .get("replyMode")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "none" || value == "ignore")
+}
+
+fn message_counts_as_actor_inbox_attention(message: &Message, actor_id: &str) -> bool {
+    if message.delivery_policy == DeliveryPolicy::Silent {
+        return false;
+    }
+    if message
+        .audience
+        .iter()
+        .any(|audience| audience.kind == AudienceKind::Actor && audience.id == actor_id)
+    {
+        return false;
+    }
+    if message.scope.kind == ScopeKind::Thread {
+        return true;
+    }
+    message.delivery_policy == DeliveryPolicy::WakeAgent
+        && message
+            .audience
+            .iter()
+            .any(|audience| audience.kind == AudienceKind::Group)
 }
 
 fn trigger_message(trigger: &AgentTrigger) -> Option<&Message> {
@@ -2409,164 +2415,6 @@ fn trigger_message(trigger: &AgentTrigger) -> Option<&Message> {
         #[cfg(test)]
         AgentTrigger::Event(_) => None,
     }
-}
-
-fn is_multi_agent_wake_message(message: &Message) -> bool {
-    if message.delivery_policy != DeliveryPolicy::WakeAgent {
-        return false;
-    }
-    if message
-        .audience
-        .iter()
-        .any(|audience| matches!(audience.kind, AudienceKind::All | AudienceKind::Agents))
-    {
-        return true;
-    }
-    message
-        .audience
-        .iter()
-        .filter(|audience| audience.kind == AudienceKind::Actor)
-        .take(2)
-        .count()
-        > 1
-}
-
-async fn collaboration_agent_recipients(
-    client: &Arc<Client>,
-    message: &Message,
-    channel_id: &str,
-) -> Result<Vec<String>> {
-    let members = channel_members(client, channel_id).await?;
-    Ok(collaboration_agent_recipients_from_members(
-        message, &members,
-    ))
-}
-
-async fn channel_members(client: &Arc<Client>, channel_id: &str) -> Result<Vec<Actor>> {
-    let result: ChannelMembersResult = client
-        .call(method::CHANNEL_MEMBERS, json!({ "channelId": channel_id }))
-        .await
-        .with_context(|| format!("channel/members channel={channel_id}"))?;
-    Ok(result.members)
-}
-
-fn collaboration_agent_recipients_from_members(
-    message: &Message,
-    members: &[Actor],
-) -> Vec<String> {
-    let member_agents = members
-        .iter()
-        .filter(|actor| actor.kind == ActorKind::Agent)
-        .map(|actor| actor.id.clone())
-        .collect::<Vec<_>>();
-    let member_agent_set = member_agents.iter().cloned().collect::<HashSet<String>>();
-    let mut recipients = Vec::new();
-    for audience in &message.audience {
-        match audience.kind {
-            AudienceKind::Actor => {
-                if member_agent_set.contains(&audience.id) {
-                    recipients.push(audience.id.clone());
-                }
-            }
-            AudienceKind::All | AudienceKind::Agents => {
-                recipients.extend(member_agents.iter().cloned());
-            }
-            AudienceKind::Group | AudienceKind::Humans => {}
-        }
-    }
-    unique_nonempty_strings(recipients)
-}
-
-async fn prior_collaboration_replies(
-    client: &Arc<Client>,
-    target: &str,
-    trigger: &Message,
-    prior_actor_ids: &[String],
-) -> Result<usize> {
-    let result: MessageListResult = client
-        .call(
-            method::MESSAGE_LIST,
-            json!({
-                "target": target,
-                "limit": 50,
-            }),
-        )
-        .await
-        .with_context(|| format!("message.list target={target}"))?;
-    Ok(count_prior_collaboration_replies(
-        &result.messages,
-        trigger,
-        prior_actor_ids,
-    ))
-}
-
-fn count_prior_collaboration_replies(
-    messages: &[Message],
-    trigger: &Message,
-    prior_actor_ids: &[String],
-) -> usize {
-    let prior = prior_actor_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut answered = HashSet::new();
-    for message in messages {
-        if !prior.contains(message.author_actor_id.as_str()) {
-            continue;
-        }
-        if !message_counts_as_collaboration_reply(message, trigger) {
-            continue;
-        }
-        answered.insert(message.author_actor_id.as_str());
-    }
-    answered.len()
-}
-
-fn message_counts_as_collaboration_reply(message: &Message, trigger: &Message) -> bool {
-    if message.id == trigger.id || message.created_at < trigger.created_at {
-        return false;
-    }
-    if message.metadata.get("kind").and_then(Value::as_str) == Some("run.started_ack") {
-        return false;
-    }
-    if message
-        .metadata
-        .get("trigger_source_id")
-        .or_else(|| message.metadata.get("triggerSourceId"))
-        .and_then(Value::as_str)
-        == Some(trigger.id.as_str())
-    {
-        return true;
-    }
-    if message.parent_message_id.as_deref() == Some(trigger.id.as_str()) {
-        return true;
-    }
-    trigger.scope.kind == ScopeKind::Channel
-        && message.thread_root_message_id.as_deref() == Some(trigger.id.as_str())
-}
-
-fn collaboration_wait_timeout() -> Duration {
-    std::env::var("LOOM_AGENT_COLLAB_WAIT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_secs(60))
-}
-
-fn collaboration_poll_interval() -> Duration {
-    Duration::from_millis(750)
-}
-
-fn unique_nonempty_strings(items: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for item in items {
-        if item.trim().is_empty() || !seen.insert(item.clone()) {
-            continue;
-        }
-        out.push(item);
-    }
-    out
 }
 
 async fn handle_message_trigger(
@@ -2711,7 +2559,7 @@ async fn drain_pending_inbox(
     let now = Utc::now();
     for entry in res.deliveries {
         let source_id = entry.delivery.source_id.clone();
-        if let Some(message) = entry.message {
+        if let Some(mut message) = entry.message {
             if !state.remember_source(&message.id) {
                 if state.has_pending_source(&message.id) || state.has_active_trigger(&message.id) {
                     continue;
@@ -2733,10 +2581,11 @@ async fn drain_pending_inbox(
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            if !is_message_for_us(&message, actor_id) {
+            if !is_inbox_message_for_us(&message, actor_id) {
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
+            mark_actor_inbox_delivery(&mut message, actor_id);
             if message.metadata.get("kind").and_then(Value::as_str) == Some("action.response") {
                 handle_action_response_message(client, state, adapter, &message).await?;
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
@@ -3061,7 +2910,6 @@ async fn dispatch_trigger(
     mut trigger: AgentTrigger,
 ) -> Result<AgentTrigger> {
     loop {
-        await_collaboration_turn(client, state, &trigger).await;
         subscribe_scope(client, state, trigger.scope()).await;
         let run_res: RunOpenResult = client
             .call(
@@ -3080,6 +2928,8 @@ async fn dispatch_trigger(
             .await?;
         let user_text = render_trigger_prompt(client, state, &trigger).await;
         let prompt = compose_envelope_prompt(client, state, &trigger, &user_text).await;
+        let no_reply_file =
+            no_reply_file_for_turn(client, state, trigger.scope(), &run_res.run.id).await;
         let active = ActiveTurn {
             id: run_res.run.id.clone(),
             run_id: run_res.run.id.clone(),
@@ -3090,6 +2940,8 @@ async fn dispatch_trigger(
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
             trigger_actor: trigger.actor_id().to_string(),
+            no_reply_file,
+            no_reply_requested: false,
             cancel_requested: false,
         };
         state.set_turn(active.clone());
@@ -3170,6 +3022,20 @@ async fn build_adapter_prompt(
         ),
         template_vars,
     })
+}
+
+async fn no_reply_file_for_turn(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+    run_id: &str,
+) -> Option<PathBuf> {
+    let channel_id = resolve_channel_for_scope(client, state, scope).await?;
+    let paths = state
+        .paths
+        .ensure_scope(&state.actor_id, &channel_id, scope)
+        .ok()?;
+    Some(run_no_reply_file(&paths.logs, run_id))
 }
 
 async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &ScopeRef) {
@@ -3359,8 +3225,11 @@ fn render_trigger_prompt_with_names(
         .iter()
         .map(|id| actor_label(id, actor_names))
         .collect::<Vec<_>>();
+    let local_inbox_delivery = is_local_actor_inbox_delivery(trigger, local_actor_id);
     let delivery = if delivery_targets.iter().any(|id| id == local_actor_id) {
         "explicit route to you"
+    } else if local_inbox_delivery {
+        "thread/task attention to you"
     } else if delivery_targets.is_empty() {
         "scope message"
     } else {
@@ -3368,6 +3237,11 @@ fn render_trigger_prompt_with_names(
     };
     let visible = if target_labels.is_empty() {
         format!("{from}: {text}")
+    } else if local_inbox_delivery && !delivery_targets.iter().any(|id| id == local_actor_id) {
+        format!(
+            "{from} (visible route -> {}): {text}",
+            target_labels.join(", ")
+        )
     } else {
         format!("route -> {}: {text}", target_labels.join(", "))
     };
@@ -3412,6 +3286,18 @@ fn trigger_task_context(trigger: &AgentTrigger) -> Option<String> {
         .and_then(|value| value.as_u64())
     {
         out.push_str(&format!("Task number: #{number}\n"));
+    }
+    if let Some(status) = trigger
+        .meta_value("taskStatus")
+        .and_then(|value| value.as_str())
+    {
+        out.push_str(&format!("Task status: {status}\n"));
+    }
+    if let Some(owner) = trigger
+        .meta_value("taskOwnerActorId")
+        .and_then(|value| value.as_str())
+    {
+        out.push_str(&format!("Task owner: {owner}\n"));
     }
     if let Some(assignment_id) = trigger
         .meta_value("assignmentId")
@@ -4044,31 +3930,62 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            current scope = {scope_kind}:{scope_id}\n\
          \n\
          You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
-         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, and LOOM_TRIGGER_ACTOR are already injected into your env,\n\
+         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
          so commands like:\n\
            loom --json inbox list --no-ack\n\
            \"$LOOM_CLI\" --json inbox list --no-ack\n\
            loom --json message read --target '#<channel_id>:<root_message_id>'\n\
            loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
+           loom --json run ignore --reason \"not directed at me\"\n\
            loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"\n\
            loom --json task complete <task_id> --result \"short outcome summary\"\n\
            loom --json artifact get <art_id|artifact://...>\n\
            loom --json task assign <task_id> --to <actor_id> --type <type> --instruction <text> --contract-file <path>\n\
            loom --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
            loom --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
+        Assistant text is internal run transcript only. It is not published to\n\
+        the channel or thread. For any visible reply, call\n\
+        `loom --json message send --target ... --text ...`; after that, final\n\
+        assistant text may be empty or a private note. When no visible reply is\n\
+        needed, call `loom --json run ignore --reason \"...\"`.\n\
+        Only send messages when you have actionable content: a requested\n\
+        answer, a claimed work unit and result, a material state change, a\n\
+        needed question, or a real blocker. Do not send visibility-only\n\
+        updates, acknowledgements, or \"nothing to do\" summaries.\n\
         Hard collaboration rule: claim before work, rebase before send. If a\n\
-        top-level message is a work item, claim it by source message before\n\
-        doing substantive work. If claim fails because another owner exists,\n\
-        stop and do not duplicate the work. Before sending extra visible\n\
-        messages with `loom message send`, read latest, adjust your content to\n\
-        the still-needed delta, and send with `--if-latest <message_id>`.\n\
-        If a claimed task reaches its acceptance criteria, close it with\n\
-        `loom task complete <task_id> --result ...`; do not leave completion as\n\
-        chat text only.\n\
+        top-level message is a work item, try to claim it by source message\n\
+        before doing substantive work. A successful task claim makes you the\n\
+        lifecycle owner/coordinator; it is not a lock over every internal work\n\
+        unit. If claim fails because another owner exists, stop for ordinary\n\
+        single-owner work. For shared/multi-agent work (`@all`, explicit slots,\n\
+        roles, or \"each agent\" instructions), do not steal the task owner;\n\
+        read the latest canonical thread and only participate in an unclaimed\n\
+        internal slot/work unit if one is still needed. Before sending any\n\
+        visible messages with `loom message send`, read latest, adjust your\n\
+        content to the still-needed delta, and send with `--if-latest <message_id>`.\n\
+        `@all` and multi-actor routed work is concurrent by default. Do not\n\
+        assume the daemon serialized other agents ahead of you; use the latest\n\
+        thread state as the source of truth and rebase visible output against it.\n\
+        When you contribute to shared work owned by another actor, post only\n\
+        the still-needed delta in the canonical thread: the internal unit you\n\
+        claimed, the result you produced, what remains, and whether the task\n\
+        owner needs to close the outer task. Do not complete the outer task\n\
+        unless you are its owner/coordinator.\n\
+        If you are the task owner/coordinator and the task reaches its\n\
+        acceptance criteria, you must call\n\
+        `loom --json task complete <task_id> --result ...` exactly once before\n\
+        or with the final visible summary. A message saying \"complete\", \"done\",\n\
+        or a final answer without that tool call does not complete the task. If\n\
+        the task id is not in context, query Loom for the task anchored to the\n\
+        source message or thread root, then complete that task id.\n\
         No acknowledgement ping-pong: if the latest routed message is only a\n\
         confirmation, receipt, already-final result, or \"no further action\",\n\
         do not reply. For terminal tasks, stay silent unless the message asks\n\
-        for new work.\n\
+        for new work. If your decision is \"no action needed\" or \"not for me\",\n\
+        call `loom --json run ignore --reason \"not directed at me\"` and then\n\
+        end the turn without visible answer text. The runtime will not infer\n\
+        no-reply from message text or keyword heuristics. Do not send a\n\
+        confirmation or explain the silence.\n\
         `loom task assign` requires a machine-readable contract. Do not fall back\n\
         to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
@@ -4150,17 +4067,25 @@ async fn translate_one(
             if active.cancel_requested {
                 return Ok(());
             }
-            if is_partial {
+            if turn_no_reply_requested(&active) {
+                if !is_partial {
+                    let _ = state.take_text(&active.id);
+                }
+            } else if is_partial {
                 state.push_text(&active.id, &content);
-            } else {
+            } else if agent_text_auto_publish_enabled() {
                 if let Some(text) = state.take_text(&active.id) {
+                    if let Some(text) = visible_agent_text_for_turn(&active, &text) {
+                        let meta = build_turn_base_meta(&active);
+                        flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                    }
+                }
+                if let Some(text) = visible_agent_text_for_turn(&active, &content) {
                     let meta = build_turn_base_meta(&active);
                     flush_text(client, actor_id, &active, text, Some(meta)).await?;
                 }
-                if let Some(text) = non_empty_agent_text(&content) {
-                    let meta = build_turn_base_meta(&active);
-                    flush_text(client, actor_id, &active, text, Some(meta)).await?;
-                }
+            } else {
+                let _ = state.take_text(&active.id);
             }
             append_trace(
                 client,
@@ -4268,12 +4193,19 @@ async fn translate_one(
                 );
                 return Ok(());
             };
-            if active.cancel_requested {
+            if active.cancel_requested || turn_no_reply_requested(&active) {
                 let _ = state.take_text(&active.id);
-            } else if let Some(text) = state.take_text(&active.id) {
-                let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                flush_text(client, actor_id, &active, text, Some(meta)).await?;
-            } else if !success {
+            } else if agent_text_auto_publish_enabled() {
+                if let Some(text) = state.take_text(&active.id) {
+                    if let Some(text) = visible_agent_text_for_turn(&active, &text) {
+                        let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
+                        flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                    }
+                }
+            } else {
+                let _ = state.take_text(&active.id);
+            }
+            if !success && agent_text_auto_publish_enabled() {
                 if let Some(text) = failed_turn_text(&summary) {
                     let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
                     flush_text(client, actor_id, &active, text, Some(meta)).await?;
@@ -4406,6 +4338,34 @@ fn non_empty_agent_text(text: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn agent_text_auto_publish_enabled() -> bool {
+    agent_text_auto_publish_enabled_from_env(std::env::var("LOOM_AGENT_AUTO_PUBLISH_FINAL").ok())
+}
+
+fn agent_text_auto_publish_enabled_from_env(value: Option<String>) -> bool {
+    value
+        .as_deref()
+        .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+fn visible_agent_text_for_turn(active: &ActiveTurn, text: &str) -> Option<String> {
+    let text = non_empty_agent_text(text)?;
+    if turn_no_reply_requested(active) {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn turn_no_reply_requested(active: &ActiveTurn) -> bool {
+    active.no_reply_requested
+        || active
+            .no_reply_file
+            .as_ref()
+            .is_some_and(|path| path.is_file())
 }
 
 async fn append_trace(
@@ -4833,16 +4793,6 @@ mod tests {
         }
     }
 
-    fn sample_actor(id: &str, display: &str, kind: ActorKind) -> Actor {
-        Actor {
-            id: id.into(),
-            display_name: display.into(),
-            kind,
-            capabilities: None,
-            _meta: None,
-        }
-    }
-
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -4996,6 +4946,8 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "human_alice".into(),
+            no_reply_file: Some(root.join("no-reply.json")),
+            no_reply_requested: false,
             cancel_requested: false,
         };
         let env = paths.scope_env(
@@ -5027,6 +4979,11 @@ mod tests {
             Some("chan_demo")
         );
         assert_eq!(env.get("LOOM_RUN_ID").map(String::as_str), Some("run_demo"));
+        let expected_no_reply_file = root.join("no-reply.json").display().to_string();
+        assert_eq!(
+            env.get(LOOM_NO_REPLY_FILE_ENV).map(String::as_str),
+            Some(expected_no_reply_file.as_str())
+        );
         assert_eq!(
             env.get("LOOM_TRIGGER_MESSAGE_ID").map(String::as_str),
             Some("msg_trigger")
@@ -5164,7 +5121,81 @@ mod tests {
     }
 
     #[test]
-    fn terminal_agent_ack_does_not_wake_agent_worker() {
+    fn thread_attention_inbox_delivery_wakes_agent_worker() {
+        let mut message = sample_message(
+            "msg_thread_attention",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_g".into();
+        message.kind = MessageKind::Agent;
+        message.body = "CLAIM C FILL C=7 BOARD=4127".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_human_requester".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        assert!(!is_message_for_us(&message, "actor_agent_echo"));
+        assert!(is_inbox_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn explicit_notify_only_actor_inbox_delivery_still_does_not_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_notify",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        assert!(!is_inbox_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn explicit_noop_text_does_not_override_delivery_routing() {
+        let mut message = sample_message(
+            "msg_noop",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.kind = MessageKind::Agent;
+        message.body = "No action needed - message is routed to boyd, not me.".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+
+        assert!(is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn explicit_terminal_text_does_not_override_delivery_routing() {
         let mut message = sample_message(
             "msg_terminal",
             ScopeRef {
@@ -5187,7 +5218,7 @@ mod tests {
         }];
         message.delivery_policy = DeliveryPolicy::WakeAgent;
 
-        assert!(!is_message_for_us(&message, "actor_agent_echo"));
+        assert!(is_message_for_us(&message, "actor_agent_echo"));
     }
 
     #[test]
@@ -5235,81 +5266,80 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_recipients_preserve_channel_agent_order() {
-        let mut message = sample_message(
-            "msg_all",
-            ScopeRef {
-                kind: ScopeKind::Channel,
-                id: "chan_demo".into(),
+    fn visible_agent_text_does_not_apply_content_heuristics() {
+        let active = ActiveTurn {
+            id: "turn_demo".into(),
+            run_id: "run_demo".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
             },
-            "#chan_demo",
-            None,
-            None,
-        );
-        message.audience = vec![proto::types::AudienceRef {
-            kind: AudienceKind::All,
-            id: "all".into(),
-            display: Some("@all".into()),
-        }];
-        let members = vec![
-            sample_actor("actor_human_boyd", "boyd", ActorKind::Human),
-            sample_actor("actor_agent_qzz", "Qzz", ActorKind::Agent),
-            sample_actor("actor_agent_echo", "Echo", ActorKind::Agent),
-            sample_actor("actor_agent_g", "G", ActorKind::Agent),
-        ];
+            trigger_source_id: "msg_trigger".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_demo:msg_root".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_agent_qzz".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        };
 
         assert_eq!(
-            collaboration_agent_recipients_from_members(&message, &members),
-            vec![
-                "actor_agent_qzz".to_string(),
-                "actor_agent_echo".to_string(),
-                "actor_agent_g".to_string()
-            ]
+            visible_agent_text_for_turn(
+                &active,
+                "No action needed - message is routed to boyd, not me."
+            )
+            .as_deref(),
+            Some("No action needed - message is routed to boyd, not me.")
+        );
+        assert_eq!(
+            visible_agent_text_for_turn(&active, "CLAIM C\nFILL C=7\nBOARD=4127").as_deref(),
+            Some("CLAIM C\nFILL C=7\nBOARD=4127")
         );
     }
 
     #[test]
-    fn prior_collaboration_replies_count_unique_prior_agents() {
-        let trigger = sample_message(
-            "msg_root",
-            ScopeRef {
-                kind: ScopeKind::Channel,
-                id: "chan_demo".into(),
-            },
-            "#chan_demo",
-            None,
-            None,
-        );
-        let mut echo_reply = sample_message(
-            "msg_echo_1",
-            ScopeRef {
+    fn agent_text_auto_publish_is_legacy_opt_in() {
+        assert!(!agent_text_auto_publish_enabled_from_env(None));
+        assert!(!agent_text_auto_publish_enabled_from_env(Some(
+            "false".into()
+        )));
+        assert!(agent_text_auto_publish_enabled_from_env(Some("1".into())));
+        assert!(agent_text_auto_publish_enabled_from_env(Some(
+            "true".into()
+        )));
+    }
+
+    #[test]
+    fn run_ignore_marker_suppresses_visible_output() {
+        let root = temp_path("no-reply-marker");
+        std::fs::create_dir_all(&root).expect("create marker dir");
+        let marker = root.join("run_1.no-reply.json");
+        std::fs::write(&marker, "{}").expect("write marker");
+        let active = ActiveTurn {
+            id: "turn_demo".into(),
+            run_id: "run_demo".into(),
+            scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
             },
-            "#chan_demo:msg_root",
-            None,
-            Some("msg_root"),
-        );
-        echo_reply.author_actor_id = "actor_agent_echo".into();
-        echo_reply.kind = MessageKind::Agent;
-        echo_reply
-            .metadata
-            .insert("trigger_source_id".into(), serde_json::json!("msg_root"));
-        let mut echo_duplicate = echo_reply.clone();
-        echo_duplicate.id = "msg_echo_2".into();
-        let mut ack = echo_reply.clone();
-        ack.id = "msg_ack".into();
-        ack.metadata
-            .insert("kind".into(), serde_json::json!("run.started_ack"));
+            trigger_source_id: "msg_trigger".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_demo:msg_root".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_boyd".into(),
+            no_reply_file: Some(marker),
+            no_reply_requested: false,
+            cancel_requested: false,
+        };
 
         assert_eq!(
-            count_prior_collaboration_replies(
-                &[ack, echo_reply, echo_duplicate],
-                &trigger,
-                &["actor_agent_echo".into(), "actor_agent_qzz".into()],
-            ),
-            1
+            visible_agent_text_for_turn(&active, "Standing by quietly."),
+            None
         );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5346,6 +5376,35 @@ mod tests {
         assert!(context.contains("Recent Loom conversation"));
         assert!(context.contains("Echo (@actor_agent_echo): 1"));
         assert!(!context.contains("@actor_human"));
+    }
+
+    #[test]
+    fn trigger_task_context_includes_status_and_owner() {
+        let mut message = sample_message(
+            "msg_task",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.metadata.insert("taskId".into(), json!("task_123"));
+        message.metadata.insert("taskNumber".into(), json!(7));
+        message
+            .metadata
+            .insert("taskStatus".into(), json!("claimed"));
+        message
+            .metadata
+            .insert("taskOwnerActorId".into(), json!("actor_agent_echo"));
+
+        let context = trigger_task_context(&AgentTrigger::Message(message)).expect("task context");
+
+        assert!(context.contains("Task id: task_123"));
+        assert!(context.contains("Task number: #7"));
+        assert!(context.contains("Task status: claimed"));
+        assert!(context.contains("Task owner: actor_agent_echo"));
     }
 
     #[test]
@@ -5410,6 +5469,44 @@ mod tests {
         assert!(prompt.contains("Delivery: explicit route to you"));
         assert!(prompt.contains("route -> G仔 (@actor_agent_g_1234):"));
         assert!(prompt.contains("Emma (@actor_agent_emma_142b6f2d)"));
+    }
+
+    #[test]
+    fn actor_inbox_thread_attention_prompt_is_not_rendered_as_other_actor_route() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_boyd".into(), "boyd".into());
+        actor_names.insert("actor_agent_echo".into(), "Echo".into());
+        actor_names.insert("actor_agent_qzz".into(), "Qzz".into());
+        let mut message = sample_message(
+            "msg_claim_a",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_qzz".into();
+        message.kind = MessageKind::Agent;
+        message.body = "CLAIM A\nFILL A=4".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_human_boyd".into(),
+            display: None,
+        }];
+        mark_actor_inbox_delivery(&mut message, "actor_agent_echo");
+
+        let prompt = render_trigger_prompt_with_names(
+            "actor_agent_echo",
+            "Echo",
+            &AgentTrigger::Message(message),
+            &actor_names,
+        );
+
+        assert!(prompt.contains("Delivery: thread/task attention to you"));
+        assert!(!prompt.contains("Delivery: explicit route to another actor"));
+        assert!(prompt.contains("Qzz (@actor_agent_qzz) (visible route -> boyd"));
     }
 
     #[test]
@@ -5744,6 +5841,8 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
             cancel_requested: false,
         });
 
@@ -5976,6 +6075,8 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
             cancel_requested: false,
         });
         let queued_channel = Event {
@@ -6060,6 +6161,8 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "mr-watcher".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
             cancel_requested: false,
         });
 

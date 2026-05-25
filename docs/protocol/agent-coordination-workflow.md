@@ -46,9 +46,13 @@ Thread 不是 owner。进入 thread、订阅 thread、或在 thread 里发言，
 ```text
 1. claim 顶层 source message。
 2. claim 成功后，只在 canonical thread 推进实质工作。
-3. claim 失败后，停止执行；最多在 owner thread 里做被请求的 review / 补充。
-4. 完成后在 canonical thread 交付 summary / artifact。
-5. 更新 task 状态为 waiting_review / done / failed / canceled。
+3. claim 失败后，不抢占 owner；普通单 owner 工作停止执行。若顶层消息明确要求
+   共享/多 agent 协作（@all、槽位、角色分工、each agent），读取 owner thread
+   最新状态后，只参与仍未被 claim 的内部 work unit。
+4. 非 owner 参与共享 work unit 时，只在 canonical thread 交付增量：已 claim 的内部
+   单元、产出、剩余项，以及 owner 是否需要收尾；不更新外层 task 终态。
+5. owner 感知 canonical thread 的后续进展，并在满足验收条件后更新 task 状态为
+   waiting_review / done / failed / canceled。
 ```
 
 ## 3. Claim 语义
@@ -194,13 +198,34 @@ loom --json message send \
 所有 agent prompt / AGENTS.md 必须表达同一规则：
 
 ```text
+assistant 普通输出是内部 run transcript，不会发布到 channel/thread。任何用户可见回复
+都必须显式调用 `loom --json message send --target ... --text ...`。
+
 开工前 claim，发送前 rebase。
 
-如果顶层消息是工作项，必须先 claim source message。claim 失败就停止，不重复做。
+只有在有 actionable content 时才发送可见消息：回答明确问题、声明并完成内部 work
+unit、报告实质状态变化、提出必要问题、或说明真实 blocker。不要发送纯可见性更新、
+ACK 或“无需处理”总结。
+
+如果顶层消息是工作项，必须先 claim source message。claim 成功代表外层
+owner/coordinator，不代表锁住所有内部 work unit。claim 失败时，普通单 owner 工作
+停止；明确共享/多 agent 工作可以继续参与尚未被 claim 的内部 slot/role/work unit，
+但不能抢占 task owner。
 claim 成功后，只在 canonical thread 推进。
+非 owner 在共享任务中完成内部 slot/role/work unit 后，应把线程消息写成 owner 可直接
+接手的状态增量；外层 task 只能由 owner/coordinator 收尾。
 
 发送任何额外可见消息前，先读取目标最新消息；如果内容已经被覆盖，跳过或只补充
 delta；如果仍需发送，携带 if-latest 条件。失败后重新读取并调整，不盲目重发。
+
+如果判断当前唤醒不需要任何可见回复，不能发送“无需处理”之类 ACK；必须调用
+`loom --json run ignore --reason "<reason>"` 结束本轮。runtime 将记录 no-reply
+审计元数据，并抑制本轮最终文本发布。runtime 不根据消息正文关键词推断 no-reply；
+“no action needed”等文本不是控制信号。
+
+owner/coordinator 判断任务满足验收条件时，必须调用
+`loom --json task complete <task_id> --result "<summary>"`。只在线程里写“完成了”、
+“BOARD=...”或最终答案不算完成 task。
 ```
 
 Prompt 不能只建议“礼貌协作”，必须明确工具命令和失败后的停止条件。

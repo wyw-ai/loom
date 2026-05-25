@@ -130,7 +130,13 @@ claim：
 - task 已由同一 actor 拥有时，幂等成功。
 - task 已由其他 actor 拥有或已终态时，返回 conflict / invalid state，不覆盖 owner。
 
-agent 收到 claim 失败后必须停止同一工作，不能在 channel 或 thread 里输出替代性交付。
+agent 收到 claim 失败后必须区分两层语义：task claim 失败表示不能抢占外层
+owner/coordinator；对普通单 owner 工作必须停止，不在 channel 或 thread 里输出替代
+性交付。对明确的共享/多 agent 工作（例如 @all、槽位、角色分工、each agent），
+可以在读取 canonical thread 最新状态后，只参与尚未被 claim 的内部 work unit。
+非 owner 完成内部 work unit 后，只输出 owner 可接手的状态增量，不更新外层 task
+终态；canonical thread 的后续消息会投递给 task owner，由 owner/coordinator 负责
+最终 closeout。
 
 ### Task identity / refs
 
@@ -364,6 +370,18 @@ task-scoped action.response 都可以产生 durable task change delivery。
 ack 只表示 owner 已经完成后续处理或明确记录无需处理；单纯收到通知不应 ack。
 server 会拒绝空 ack：ack 必须带 reason，或带 result artifact/fact/evidence refs
 表示已经产生了可追踪处理结果；同一 delivery 不能重复 ack。
+
+对普通 agent turn，如果判断“不需要回复/不是给我/已有结果”，不能向 thread 写
+“no action needed” ACK。agent 应调用 `loom --json run ignore --reason "<reason>"`
+作为显式 no-reply 出口；该命令记录 run no-reply 元数据，并让 runtime 抑制本轮最终
+文本发布。runtime 不根据消息正文关键词兜底判断 no-reply；no-reply 必须来自显式
+控制帧或本地 marker。
+
+agent 普通 assistant 输出只进入内部 run transcript，不发布到 channel/thread。agent
+只有在有 actionable content 时才通过 `loom --json message send` 发送可见消息。
+owner/coordinator 在验收条件满足时必须调用
+`loom --json task complete <task_id> --result "<summary>"`；纯文本“任务完成”“done”
+“BOARD=...”或最终答案不能替代 task 状态更新。
 
 ### Action task association
 

@@ -7,6 +7,12 @@
 - `Thread` 仍然是某条 channel root event 下的上下文边界。
 - `Task` 记录这条 root event 是否是一项可领取、可追踪、可验收的工作。
 
+多 agent 协作的硬规则见
+[agent-coordination-workflow.md](./agent-coordination-workflow.md)：开工前 claim，发送前
+rebase。也就是说，工作型顶层消息必须先通过 `task.claim` 获得 owner；往 thread /
+channel 发送额外可见消息前，应先读取目标最新消息，并用 `message.send.ifLatestMessageId`
+做提交前检查。
+
 ## 数据关系
 
 ```text
@@ -105,6 +111,27 @@ Assignment type:
 - 自动复用或创建 canonical thread。
 - 保存 opaque parent 和 practice epoch 字段；server 不解释实践层语义。
 
+### `task.claim`
+
+`task.claim` 是 owner CAS。调用方可以按 task id claim，也可以直接按 source message
+claim：
+
+```json
+{
+  "sourceMessageId": "msg_...",
+  "actorId": "actor_worker"
+}
+```
+
+语义：
+
+- source message 尚无 task 时，原子创建 task，owner = actor，status = claimed。
+- task 已存在但没有 owner 且非终态时，设置 owner = actor，status = claimed。
+- task 已由同一 actor 拥有时，幂等成功。
+- task 已由其他 actor 拥有或已终态时，返回 conflict / invalid state，不覆盖 owner。
+
+agent 收到 claim 失败后必须停止同一工作，不能在 channel 或 thread 里输出替代性交付。
+
 ### Task identity / refs
 
 TaskRef 是 task 的通用身份索引，解决 continuation、外部回调和多任务交错时
@@ -201,6 +228,22 @@ thread 文本拼业务状态。
 ### `task/list`
 
 按 channel、owner、source event、status 过滤。返回 caller 有权限看到的 task。
+
+### `message.send` rebase guard
+
+`message.send` 支持可选 `ifLatestMessageId`：
+
+```json
+{
+  "target": "#chan_123:msg_root",
+  "body": "只发送基于最新上下文的 delta",
+  "ifLatestMessageId": "msg_latest"
+}
+```
+
+server 只在目标 scope 当前最新 message id 等于 `ifLatestMessageId` 时写入。若不匹配，
+返回 conflict。调用方应重新 `message.read`，把待发内容 rebase 到最新上下文后再决定
+发送、只发 delta，或跳过。
 
 ### `task/update`
 
@@ -367,9 +410,11 @@ server 会在 canonical thread 里追加一条 `hands_off_to` assignment
 
 ```bash
 joi --json task create --source-event <event_id> --title "整理文档" --owner <actor_id>
+joi --json task claim --source-message <channel_message_id>
+joi --json task claim <task_id>
 joi --json task list --source-event <event_id>
 joi --json task show <task_id>
-joi --json message send --target '#<channel_id>:<root_event_id>' --text "任务进度..."
+joi --json message send --target '#<channel_id>:<root_event_id>' --if-latest <latest_message_id> --text "任务进度..."
 joi --json handoff <actor_id> --target '#<channel_id>:<root_event_id>' --message "请接手..."
 joi --json task update <task_id> --status in_progress
 joi --json task assign <task_id> --to <actor_id> --type review --instruction "请评审" --contract-file assignment-contract.json

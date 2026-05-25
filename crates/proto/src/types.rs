@@ -82,6 +82,8 @@ fn default_visibility() -> ChannelVisibility {
 pub struct Channel {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub topic: String,
     /// `Public` for back-compat (channels in journals predating the ACL
     /// roll-out deserialize via `default_visibility`); newly-created
     /// channels with a known creator are `Private`.
@@ -493,6 +495,14 @@ pub struct MessageMention {
     pub display: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReaction {
+    pub emoji: String,
+    #[serde(default)]
+    pub actor_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -521,6 +531,8 @@ pub struct Message {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<MessageReaction>,
     #[serde(default, rename = "metadata")]
     pub metadata: Meta,
 }

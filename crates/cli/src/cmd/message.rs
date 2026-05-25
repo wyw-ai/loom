@@ -17,6 +17,7 @@ pub async fn send(
     text: Option<String>,
     intent: Option<String>,
     delivery_policy: Option<String>,
+    if_latest: Option<String>,
     attachment_ids: Vec<String>,
 ) -> Result<()> {
     let target = resolve_send_target(target, to)?;
@@ -45,6 +46,9 @@ pub async fn send(
     }
     if let Some(delivery_policy) = delivery_policy {
         params["deliveryPolicy"] = serde_json::to_value(delivery_policy)?;
+    }
+    if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
+        params["ifLatestMessageId"] = json!(if_latest);
     }
     let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
     if render::is_json() {

@@ -13,6 +13,7 @@ export type ChannelVisibility = "public" | "private";
 export interface Channel {
   id: string;
   title: string;
+  topic?: string;
   visibility: ChannelVisibility;
   members: string[];
   _meta?: Record<string, unknown>;
@@ -74,6 +75,11 @@ export interface MessageMention {
   display: string;
 }
 
+export interface MessageReaction {
+  emoji: string;
+  actorIds: string[];
+}
+
 export interface Message {
   id: string;
   scope: ScopeRef;
@@ -90,6 +96,7 @@ export interface Message {
   threadRootMessageId?: string | null;
   taskId?: string | null;
   attachments: string[];
+  reactions: MessageReaction[];
   metadata: Record<string, unknown>;
 }
 

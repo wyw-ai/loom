@@ -5,11 +5,12 @@
 //! 1:1 mapping, and collapse `stream/update` into `loom://stream` (the
 //! discriminator travels in the payload `kind`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use proto::methods::method;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Mutex;
 
 use crate::ws::Client;
 
@@ -20,12 +21,15 @@ pub enum ConnectionEvent {
     Closed { reason: Option<String> },
 }
 
-pub fn spawn(app: AppHandle, client: Arc<Client>) {
+pub fn spawn(app: AppHandle, current_client: Arc<Mutex<Option<Arc<Client>>>>, client: Arc<Client>) {
     tokio::spawn(async move {
+        let client_ref = Arc::downgrade(&client);
         let Some(mut rx) = client.take_notifications().await else {
             tracing::warn!("notifications channel already taken — forward not started");
             return;
         };
+        drop(client);
+
         while let Some(n) = rx.recv().await {
             let emitted = match n.method.as_str() {
                 method::STREAM_UPDATE => {
@@ -45,11 +49,35 @@ pub fn spawn(app: AppHandle, client: Arc<Client>) {
                 tracing::warn!(error = %e, "emit failed");
             }
         }
-        let _ = app.emit(
-            "loom://connection",
-            ConnectionEvent::Closed {
-                reason: Some("notification stream ended".into()),
-            },
-        );
+
+        if clear_if_current(&current_client, &client_ref).await {
+            let _ = app.emit(
+                "loom://connection",
+                ConnectionEvent::Closed {
+                    reason: Some("connection lost".into()),
+                },
+            );
+        } else {
+            tracing::debug!("stale notification stream ended after client replacement");
+        }
     });
+}
+
+async fn clear_if_current(
+    current_client: &Arc<Mutex<Option<Arc<Client>>>>,
+    client_ref: &Weak<Client>,
+) -> bool {
+    let Some(disconnected) = client_ref.upgrade() else {
+        return false;
+    };
+    let mut current = current_client.lock().await;
+    if current
+        .as_ref()
+        .is_some_and(|client| Arc::ptr_eq(client, &disconnected))
+    {
+        *current = None;
+        true
+    } else {
+        false
+    }
 }

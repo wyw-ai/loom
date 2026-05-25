@@ -129,25 +129,43 @@ question, or requesting approval.\n\
 Keep progress updates short, state uncertainty when it matters, and include the\n\
 key evidence behind conclusions. If more context is needed, query Loom first.\n\
 \n\
+Hard collaboration rule: claim before work, rebase before send. If a top-level\n\
+message is a work item, claim its source message before doing substantive work.\n\
+If claim fails because another owner exists, stop and do not duplicate the work.\n\
+Before sending any extra visible message with `loom message send`, read the\n\
+target's latest message, adjust your content to only the still-needed delta,\n\
+and send with `--if-latest <latest_message_id>`. If that send conflicts, read\n\
+latest again and rebase; do not blindly retry the old text.\n\
+\n\
+Task closeout is part of the work, not just a chat summary. When a claimed task\n\
+meets its acceptance criteria, call `loom task complete <task_id> --result ...`\n\
+exactly once before or with the final visible summary. If the task id is not in\n\
+context, query Loom for the task anchored to the source message or thread root.\n\
+\n\
+No acknowledgement ping-pong: if the latest routed message only says things\n\
+like \"received\", \"confirmed\", \"done\", \"no further action\", or repeats an\n\
+already-final result, do not reply. If a task is already `done`, `failed`, or\n\
+`canceled` and the message does not ask for new work, produce no visible reply\n\
+and do not send another confirmation.\n\
+\n\
 ### Collaboration routing\n\
 \n\
 Human-to-actor routed messages in a channel common area start as a routing/triage\n\
 turn in that same channel. Decide whether the message is a simple reply or a\n\
 work item. For a simple reply, answer directly in the current scope. For work\n\
 that is complex, multi-turn, artifact-producing, or needs another actor, first\n\
-create or reuse a task anchored to `LOOM_TRIGGER_MESSAGE_ID`; the server will\n\
-create or reuse the canonical thread for that root message. Then write\n\
-substantive work, progress, artifacts, reviews, and final results to the\n\
+claim a task anchored to `LOOM_TRIGGER_MESSAGE_ID`; the server will create or\n\
+reuse the canonical thread for that root message only if you win ownership.\n\
+Then write substantive work, progress, artifacts, reviews, and final results to the\n\
 canonical thread target `#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID`. The\n\
 channel turn should only acknowledge that the task/thread was opened.\n\
 \n\
-When you open a task from a channel triage turn, use `loom --json task create\n\
---source-message \"$LOOM_TRIGGER_MESSAGE_ID\" --owner \"$LOOM_ACTOR\" --status claimed`.\n\
-If task creation reports a conflict, use `loom --json task list --source-message\n\
-\"$LOOM_TRIGGER_MESSAGE_ID\"` and reuse the existing task/thread. Do not hand off\n\
-to yourself just to move from the channel into the thread; post thread content\n\
-with `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\"`\n\
-or upload artifacts with that same target, then finish the channel turn with a\n\
+When you open a task from a channel triage turn, use `loom --json task claim\n\
+--source-message \"$LOOM_TRIGGER_MESSAGE_ID\"`. If claim reports a conflict or an\n\
+existing different owner, do not continue the same work. If it succeeds, do not\n\
+hand off to yourself just to move from the channel into the thread; post thread\n\
+content with `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id>` or\n\
+upload artifacts with that same target, then finish the channel turn with a\n\
 short pointer.\n\
 \n\
 If the latest message already includes `Task id:` or `Assignment id:`, you are\n\
@@ -161,7 +179,7 @@ ask the requester, or update the task to `done`.\n\
 Actor-to-actor routed messages are strong task-flow signals. When you delegate a\n\
 substantial subtask to another actor from a channel common area, create or\n\
 reuse a task first, then send a routed message to the canonical thread target, for\n\
-example `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --text \"@actor_id ...\" --intent request_action --delivery-policy wake_agent`.\n\
+example `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id ...\" --intent request_action --delivery-policy wake_agent`.\n\
 If the current scope is already the right thread, use the current thread scope\n\
 or its canonical target instead of creating another one. Keep follow-up work,\n\
 evidence, review requests, and the final answer in that thread. The parent\n\
@@ -199,6 +217,7 @@ Send messages, DMs, attachments, and reminders:\n\
 \n\
 ```\n\
 loom --json message send --target '#<channel_id>' --text \"thread title\"   # returns message.id\n\
+loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
 loom --json message send --target '#<channel_id>:<root_message_id>' <<'LOOMMSG'\n\
 message body\n\
 LOOMMSG\n\
@@ -206,6 +225,8 @@ loom --json message send --to <actor_id> <<'LOOMMSG'\n\
 private note\n\
 LOOMMSG\n\
 loom --json message send --target '#<channel_id>:<root_message_id>' --text \"@actor_id please take this\" --intent request_action --delivery-policy wake_agent\n\
+loom --json task claim --source-message <channel_message_id>\n\
+loom --json task claim <task_id>\n\
 loom --json task create --source-message <channel_message_id> --title \"work title\" --owner \"$LOOM_ACTOR\"\n\
 loom --json task update <task_id> --status in_progress|waiting_review|done --result \"summary\"\n\
 loom --json task assign <task_id> --to <actor_id> --type review --instruction \"review this\"\n\
@@ -247,6 +268,10 @@ mod tests {
         assert!(out.contains("LOOM_SCOPE_ID"));
         assert!(out.contains("### Runtime contract"));
         assert!(out.contains("Do not call `loom message send` just to post"));
+        assert!(out.contains("Hard collaboration rule: claim before work, rebase before send"));
+        assert!(out.contains("loom --json task claim --source-message"));
+        assert!(out.contains("loom task complete <task_id> --result"));
+        assert!(out.contains("--if-latest <latest_message_id>"));
         assert!(out.contains(
             "Human-to-actor routed messages in a channel common area start as a routing/triage"
         ));

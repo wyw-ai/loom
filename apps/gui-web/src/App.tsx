@@ -16,12 +16,14 @@ import {
   PanelRight,
   Plus,
   RefreshCw,
+  Reply,
   Send,
   Settings,
   Sparkles,
   Split,
   Trash2,
   User,
+  Users,
   X,
 } from "lucide-react";
 
@@ -31,6 +33,7 @@ import {
   scopeKey,
   threadTarget,
   type Actor,
+  type AudienceRef,
   type Channel,
   type DesktopConfig,
   type HumanAccount,
@@ -53,6 +56,7 @@ import { cn, formatTime, shortId } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 type View = "chat" | "inbox" | "tasks" | "settings";
+type SettingsStep = "workspace" | "daemon" | "agent";
 type AgentFormState = {
   machineId: string;
   providerId: string;
@@ -63,7 +67,7 @@ type AgentFormState = {
   autostart: boolean;
 };
 
-const terminalRunStatuses = new Set(["completed", "failed", "canceled"]);
+const quickReactionEmojis = ["👍", "✅", "👀"];
 
 export function App() {
   const [config, setConfig] = useState<DesktopConfig>({
@@ -80,7 +84,7 @@ export function App() {
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [actors, setActors] = useState<Record<string, Actor>>({});
-  const [runs, setRuns] = useState<Record<string, Run>>({});
+  const [, setRuns] = useState<Record<string, Run>>({});
   const [inbox, setInbox] = useState<InboxListEntry[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [machines, setMachines] = useState<MachineInfo[]>([]);
@@ -106,11 +110,14 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
-  const [taskDraft, setTaskDraft] = useState<Message | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const actorIdRef = useRef<string | null>(null);
   const targetRef = useRef<string | null>(null);
+  const workspaceRef = useRef<Workspace | null>(null);
+  const autoReconnectRef = useRef(false);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
@@ -130,16 +137,23 @@ export function App() {
       ? { kind: "thread", id: activeThread.id }
       : { kind: "channel", id: activeChannel.id }
     : null;
-  const openRuns = Object.values(runs).filter(
-    (run) => !terminalRunStatuses.has(run.status),
-  );
   const actorList = Object.values(actors).sort((a, b) =>
     displayName(a).localeCompare(displayName(b)),
   );
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
+  const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
+  const channelAgentActors = activeChannel
+    ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
+    : [];
   const channelTasks = activeChannel
     ? tasks.filter((task) => task.channelId === activeChannel.id)
     : tasks;
+  const tasksBySourceMessageId: Record<string, Task> = Object.fromEntries(
+    tasks.map((task) => [task.sourceMessageId, task]),
+  );
+  const activeThreadTask = activeThread
+    ? tasksBySourceMessageId[activeThread.rootMessageId] ?? null
+    : null;
 
   const applyConfig = useCallback((next: DesktopConfig) => {
     setConfig(next);
@@ -147,12 +161,16 @@ export function App() {
       ? next.workspaces.find((candidate) => candidate.id === next.active)
       : next.workspaces[0];
     if (active) {
-      setWorkspace((current) =>
-        current && next.workspaces.some((candidate) => candidate.id === current.id)
-          ? current
-          : active,
-      );
+      setWorkspace((current) => {
+        const selected =
+          current && next.workspaces.some((candidate) => candidate.id === current.id)
+            ? current
+            : active;
+        workspaceRef.current = selected;
+        return selected;
+      });
     } else {
+      workspaceRef.current = null;
       setWorkspace(null);
     }
   }, []);
@@ -160,6 +178,13 @@ export function App() {
   const pushNotice = useCallback((text: string) => {
     setNotice(text);
     window.setTimeout(() => setNotice(null), 3200);
+  }, []);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
   }, []);
 
   const refreshInbox = useCallback(async (actorId: string) => {
@@ -234,34 +259,50 @@ export function App() {
   );
 
   const connectWorkspace = useCallback(
-    async (workspaceId: string) => {
-      setBusy(`connect:${workspaceId}`);
+    async (workspaceId: string, options: { automatic?: boolean } = {}) => {
+      const automatic = options.automatic === true;
+      if (!automatic) {
+        autoReconnectRef.current = true;
+        reconnectAttemptRef.current = 0;
+      }
+      clearReconnectTimer();
+      if (!automatic) setBusy(`connect:${workspaceId}`);
       setConnection("connecting");
-      setError(null);
+      setError(automatic ? "Connection lost. Reconnecting..." : null);
       try {
         const result = await ipc.connect(workspaceId);
+        workspaceRef.current = result.workspace;
+        autoReconnectRef.current = true;
         setWorkspace(result.workspace);
         setConnection("open");
+        reconnectAttemptRef.current = 0;
         await loadWorkspaceData(result.workspace);
-        pushNotice(`Connected to ${result.workspace.name}`);
+        pushNotice(
+          automatic
+            ? `Reconnected to ${result.workspace.name}`
+            : `Connected to ${result.workspace.name}`,
+        );
       } catch (err) {
         setConnection("error");
-        setError(errorText(err));
+        setError(automatic ? "Connection lost. Reconnecting..." : errorText(err));
       } finally {
-        setBusy(null);
+        if (!automatic) setBusy(null);
       }
     },
-    [loadWorkspaceData, pushNotice],
+    [clearReconnectTimer, loadWorkspaceData, pushNotice],
   );
 
   const disconnect = useCallback(async () => {
+    autoReconnectRef.current = false;
+    reconnectAttemptRef.current = 0;
+    clearReconnectTimer();
     try {
       await ipc.disconnect();
     } catch {
       /* local state still closes */
     }
     setConnection("closed");
-  }, []);
+  }, [clearReconnectTimer]);
 
   useEffect(() => {
     let unlistenStream: (() => void) | null = null;
@@ -273,9 +314,12 @@ export function App() {
     });
     void ipc.onConnection((event) => {
       if (event.state === "closed") {
+        autoReconnectRef.current = true;
         setConnection("closed");
-        setError(event.reason ?? "connection closed");
+        setError("Connection lost. Reconnecting...");
       } else {
+        if (workspaceRef.current) autoReconnectRef.current = true;
+        reconnectAttemptRef.current = 0;
         setConnection("open");
       }
     }).then((off) => {
@@ -289,8 +333,49 @@ export function App() {
   }, [loadConfig]);
 
   useEffect(() => {
+    workspaceRef.current = workspace;
+  }, [workspace]);
+
+  useEffect(() => {
+    if (
+      !autoReconnectRef.current ||
+      !workspace ||
+      (connection !== "closed" && connection !== "error")
+    ) {
+      return;
+    }
+
+    const attempt = reconnectAttemptRef.current + 1;
+    reconnectAttemptRef.current = attempt;
+    const delay = reconnectDelayMs(attempt);
+    const timer = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      void connectWorkspace(workspace.id, { automatic: true });
+    }, delay);
+    reconnectTimerRef.current = timer;
+
+    return () => {
+      if (reconnectTimerRef.current === timer) {
+        window.clearTimeout(timer);
+        reconnectTimerRef.current = null;
+      }
+    };
+  }, [connectWorkspace, connection, workspace]);
+
+  useEffect(() => {
     if (!activeChannel || connection !== "open") return;
     let alive = true;
+    void ipc
+      .channelMembers(activeChannel.id)
+      .then((result) => {
+        if (!alive) return;
+        setActors((current) => {
+          const next = { ...current };
+          for (const actor of result.members) next[actor.id] = actor;
+          return next;
+        });
+      })
+      .catch(() => {});
     void ipc
       .threadList(activeChannel.id)
       .then((result) => {
@@ -304,7 +389,7 @@ export function App() {
     return () => {
       alive = false;
     };
-  }, [activeChannel?.id, connection]);
+  }, [activeChannel?.id, activeChannel?.members.join("|"), connection]);
 
   useEffect(() => {
     activeScopeRef.current = activeScope;
@@ -321,6 +406,7 @@ export function App() {
       .messageList({ target, limit: 150 })
       .then((result) => {
         if (!alive) return;
+        setError(null);
         setMessages(sortMessages(result.messages));
       })
       .catch((err) => setError(errorText(err)));
@@ -334,6 +420,7 @@ export function App() {
   function handleStream(update: StreamUpdate) {
     switch (update.kind) {
       case "channel.created":
+      case "channel.updated":
       case "channel.invited": {
         const channel = update.data.channel as Channel | undefined;
         if (channel) setChannels((current) => sortChannels(upsert(current, channel)));
@@ -390,6 +477,19 @@ export function App() {
         }
         return;
       }
+      case "message.updated": {
+        const message = update.data.message as Message | undefined;
+        if (!message) return;
+        if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
+          setMessages((current) => sortMessages(upsert(current, message)));
+        }
+        setInbox((current) =>
+          current.map((item) =>
+            item.delivery.sourceId === message.id ? { ...item, message } : item,
+          ),
+        );
+        return;
+      }
       case "run.updated": {
         const run = update.data.run as Run | undefined;
         if (run) setRuns((current) => ({ ...current, [run.id]: run }));
@@ -425,7 +525,11 @@ export function App() {
   async function logout() {
     setBusy("logout");
     try {
+      autoReconnectRef.current = false;
+      reconnectAttemptRef.current = 0;
+      clearReconnectTimer();
       applyConfig(await ipc.accountLogout());
+      workspaceRef.current = null;
       setWorkspace(null);
       setConnection("idle");
       setChannels([]);
@@ -465,6 +569,10 @@ export function App() {
       applyConfig(next);
       await loadMachines();
       if (workspace?.id === id) {
+        autoReconnectRef.current = false;
+        reconnectAttemptRef.current = 0;
+        clearReconnectTimer();
+        workspaceRef.current = null;
         setWorkspace(null);
         setConnection("idle");
       }
@@ -524,17 +632,34 @@ export function App() {
 
   async function createAgent() {
     const name = agentForm.name.trim();
-    if (!agentForm.machineId || !agentForm.providerId || !name) return;
+    const machine = resolveAgentMachine(agentForm, machines);
+    const provider = resolveAgentProvider(agentForm, machine);
+    if (!machine) {
+      setError("Add a daemon before creating an agent.");
+      return;
+    }
+    if (!machineCanCreateAgent(machine)) {
+      setError(`Daemon ${machine.name} is read-only or does not support agent creation.`);
+      return;
+    }
+    if (!provider) {
+      setError(`No agent CLI provider is available for ${machine.name}.`);
+      return;
+    }
+    if (!name) {
+      setError("Agent name is required.");
+      return;
+    }
     setBusy("agent:create");
     setError(null);
     try {
       const result = await ipc.machineAgentCreate({
-        machineId: agentForm.machineId,
-        providerId: agentForm.providerId,
+        machineId: machine.id,
+        providerId: provider.id,
         actorId: agentForm.actorId.trim() || undefined,
         name,
         description: agentForm.description.trim(),
-        model: agentForm.model.trim(),
+        model: agentForm.model.trim() || provider.defaultModel || "",
         autostart: agentForm.autostart,
       });
       applyMachines(result.machines);
@@ -542,10 +667,6 @@ export function App() {
         normalizeAgentForm({ ...current, actorId: "", name: "Echo" }, result.machines),
       );
       if (workspace && connection === "open") {
-        const actorId = agentForm.actorId.trim();
-        if (activeChannel && actorId) {
-          await ensureChannelMembers(activeChannel.id, [actorId]).catch(() => {});
-        }
         await loadWorkspaceData(workspace);
       }
       pushNotice(`Agent ${name} added`);
@@ -566,6 +687,56 @@ export function App() {
         await loadWorkspaceData(workspace);
       }
       pushNotice("Agent removed");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function inviteMemberToChannel(channelId: string, actorId: string) {
+    const actor = actors[actorId];
+    setBusy(`channel:invite:${channelId}:${actorId}`);
+    setError(null);
+    try {
+      const result = await ipc.channelInvite({ channelId, actorId });
+      setChannels((current) => sortChannels(upsert(current, result.channel)));
+      pushNotice(`${actor ? displayName(actor) : actorId} added to channel`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeMemberFromChannel(channelId: string, actorId: string) {
+    const actor = actors[actorId];
+    setBusy(`channel:revoke:${channelId}:${actorId}`);
+    setError(null);
+    try {
+      const result = await ipc.channelRevoke({ channelId, actorId });
+      setChannels((current) => sortChannels(upsert(current, result.channel)));
+      pushNotice(`${actor ? displayName(actor) : actorId} removed from channel`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function updateChannelTopic(channelId: string, topic: string) {
+    const channel = channels.find((item) => item.id === channelId);
+    if (!channel) return;
+    setBusy(`channel:topic:${channelId}`);
+    setError(null);
+    try {
+      const result = await ipc.channelUpdate({
+        channelId,
+        title: channel.title,
+        topic,
+      });
+      setChannels((current) => sortChannels(upsert(current, result.channel)));
+      pushNotice("Channel topic updated");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -609,24 +780,29 @@ export function App() {
     try {
       const parentMessageId = replyTo?.id;
       const repliedActor = replyTo ? actors[replyTo.authorActorId] : undefined;
-      const mentionedAgents = replyTo
-        ? []
-        : mentionedAgentAudience(body, actors, workspace?.actorId);
-      const directedTo =
+      const mentionedAudience = mentionAudience(body, actors, workspace?.actorId);
+      const replyAudience =
         repliedActor && repliedActor.id !== workspace?.actorId
           ? [{ kind: "actor" as const, id: repliedActor.id }]
-          : mentionedAgents;
-      const wakesAgent =
-        repliedActor?.kind === "agent" || directedTo.some((audience) => {
-          const actor = actors[audience.id];
-          return actor?.kind === "agent";
-        });
-      if (activeChannel && directedTo.length > 0) {
-        await ensureChannelMembers(
-          activeChannel.id,
-          directedTo.map((audience) => audience.id),
+          : [];
+      const directedTo = uniqueAudience([...replyAudience, ...mentionedAudience]);
+      const unavailableAgents = activeChannel
+        ? directedTo.filter(
+            (audience) =>
+              audience.kind === "actor" && !isChannelMember(activeChannel, audience.id),
+          )
+        : [];
+      if (unavailableAgents.length > 0) {
+        setError(
+          `Add ${unavailableAgents
+            .map((audience) => actorName(actors, audience.id))
+            .join(", ")} to this channel before mentioning them.`,
         );
+        return;
       }
+      const wakesAgent = directedTo.some((audience) =>
+        audienceWakesAgent(audience, actors),
+      );
       const result = await ipc.messageSend({
         target,
         body,
@@ -675,53 +851,17 @@ export function App() {
     }
   }
 
-  async function assignTask(message: Message, agentActorId: string): Promise<boolean> {
-    if (!workspace || !agentActorId) return false;
-    if (!canUseAsTaskSource(message)) {
-      setError("Tasks can only be assigned from top-level channel messages.");
-      return false;
-    }
-    const title = threadTitle(message);
-    const instruction = message.body.trim() || title;
-    setBusy(`task:create:${message.id}`);
+  async function toggleMessageReaction(message: Message, emoji: string) {
+    setBusy(`message:reaction:${message.id}:${emoji}`);
     setError(null);
     try {
-      await ensureChannelMembers(channelFromMessage(message), [agentActorId]);
-      const existingTasks = await ipc.taskList();
-      let task = existingTasks.tasks.find(
-        (candidate) => candidate.sourceMessageId === message.id,
-      );
-      if (!task) {
-        const created = await ipc.taskCreate({
-          sourceMessageId: message.id,
-          title,
-          description: instruction,
-          requesterActorId: workspace.actorId,
-          ownerActorId: agentActorId,
-          status: "claimed",
-        });
-        task = created.task;
-      }
-      await ipc.taskAssignmentCreate({
-        taskId: task.id,
-        fromActorId: workspace.actorId,
-        toActorId: agentActorId,
-        assignmentType: "fix",
-        instruction,
-        contract: {
-          kind: "gui.message_assignment",
-          sourceMessageId: message.id,
-          channelId: channelFromMessage(message),
-        },
-        idempotencyKey: `gui:${message.id}:${agentActorId}`,
+      const result = await ipc.messageReactionToggle({
+        messageId: message.id,
+        emoji,
       });
-      const taskResult = await ipc.taskList();
-      setTasks(sortTasks(taskResult.tasks));
-      pushNotice(`Task #${task.number} assigned`);
-      return true;
+      setMessages((current) => sortMessages(upsert(current, result.message)));
     } catch (err) {
       setError(errorText(err));
-      return false;
     } finally {
       setBusy(null);
     }
@@ -771,43 +911,60 @@ export function App() {
         : "No channels."
       : "No workspace connection.";
 
+  const showChatChrome = view === "chat";
+
   return (
-    <div className="grid h-screen w-screen grid-cols-[64px_minmax(280px,320px)_minmax(0,1fr)] overflow-hidden bg-background text-foreground xl:grid-cols-[64px_320px_minmax(0,1fr)_320px]">
+    <div
+      className={cn(
+        "grid h-screen w-screen overflow-hidden bg-background text-foreground",
+        showChatChrome
+          ? "grid-cols-[64px_minmax(280px,320px)_minmax(0,1fr)] xl:grid-cols-[64px_320px_minmax(0,1fr)_320px]"
+          : "grid-cols-[64px_minmax(0,1fr)]",
+      )}
+    >
       <Rail view={view} setView={setView} inboxCount={inbox.length} connection={connection} />
-      <Sidebar
-        account={account}
-        busy={busy}
-        channels={channels}
-        connection={connection}
-        newChannelTitle={newChannelTitle}
-        setNewChannelTitle={setNewChannelTitle}
-        activeChannelId={activeChannelId}
-        activeThreadId={activeThreadId}
-        threadsByChannel={threadsByChannel}
-        workspace={workspace}
-        workspaces={workspaces}
-        onAddChannel={createChannel}
-        onConnect={connectWorkspace}
-        onDisconnect={disconnect}
-        onLogin={login}
-        onLogout={logout}
-        onSelectChannel={(id) => {
-          setView("chat");
-          setActiveChannelId(id);
-          setActiveThreadId(null);
-        }}
-        onSelectThread={(thread) => {
-          setView("chat");
-          setActiveChannelId(thread.channelId);
-          setActiveThreadId(thread.id);
-        }}
-      />
-      <main className="flex min-h-0 min-w-0 flex-col border-r border-border bg-background">
+      {showChatChrome && (
+        <Sidebar
+          account={account}
+          busy={busy}
+          channels={channels}
+          connection={connection}
+          newChannelTitle={newChannelTitle}
+          setNewChannelTitle={setNewChannelTitle}
+          activeChannelId={activeChannelId}
+          activeThreadId={activeThreadId}
+          threadsByChannel={threadsByChannel}
+          workspace={workspace}
+          workspaces={workspaces}
+          onAddChannel={createChannel}
+          onConnect={connectWorkspace}
+          onDisconnect={disconnect}
+          onLogin={login}
+          onLogout={logout}
+          onSelectChannel={(id) => {
+            setView("chat");
+            setActiveChannelId(id);
+            setActiveThreadId(null);
+          }}
+          onSelectThread={(thread) => {
+            setView("chat");
+            setActiveChannelId(thread.channelId);
+            setActiveThreadId(thread.id);
+          }}
+        />
+      )}
+      <main
+        className={cn(
+          "flex min-h-0 min-w-0 flex-col bg-background",
+          showChatChrome && "border-r border-border",
+        )}
+      >
         {view === "chat" ? (
           <>
             <ChatHeader
               channel={activeChannel}
               thread={activeThread}
+              task={activeThreadTask}
               target={target}
               connection={connection}
               onClearThread={() => setActiveThreadId(null)}
@@ -819,14 +976,16 @@ export function App() {
             )}
             <MessageFeed
               actors={actors}
-              agents={agentActors}
               messages={messages}
+              tasksBySourceMessageId={tasksBySourceMessageId}
+              channelThreads={channelThreads}
               emptyText={chatEmpty}
               onReply={setReplyTo}
               onStartThread={startThread}
-              onOpenTaskAssign={setTaskDraft}
+              onToggleReaction={toggleMessageReaction}
               onAnswerAction={answerAction}
               activeThread={activeThread}
+              currentActorId={workspace?.actorId ?? null}
               busy={busy}
             />
             <Composer
@@ -837,80 +996,76 @@ export function App() {
               actorName={replyTo ? actorName(actors, replyTo.authorActorId) : ""}
               onClearReply={() => setReplyTo(null)}
               onSend={sendMessage}
+              mentionAgents={channelAgentActors}
               busy={busy === "message:send"}
             />
           </>
         ) : view === "inbox" ? (
-          <InboxView
-            actors={actors}
-            inbox={inbox}
-            onOpen={(message) => {
-              if (!message) return;
-              setView("chat");
-              setActiveChannelId(channelFromMessage(message));
-              setActiveThreadId(threadIdForMessage(threadsByChannel, message));
-            }}
-            onAnswer={answerAction}
-            busy={busy}
-          />
+          <>
+            <ErrorBanner error={error} />
+            <InboxView
+              actors={actors}
+              inbox={inbox}
+              onOpen={(message) => {
+                if (!message) return;
+                setView("chat");
+                setActiveChannelId(channelFromMessage(message));
+                setActiveThreadId(threadIdForMessage(threadsByChannel, message));
+              }}
+              onAnswer={answerAction}
+              busy={busy}
+            />
+          </>
         ) : view === "tasks" ? (
-          <TasksView tasks={tasks} channels={channels} />
+          <>
+            <ErrorBanner error={error} />
+            <TasksView tasks={tasks} channels={channels} />
+          </>
         ) : (
-          <SettingsView
-            account={account}
-            busy={busy}
-            workspaceForm={workspaceForm}
-            setWorkspaceForm={setWorkspaceForm}
-            machineForm={machineForm}
-            setMachineForm={setMachineForm}
-            agentForm={agentForm}
-            setAgentForm={setAgentForm}
-            machines={machines}
-            workspaces={workspaces}
-            onAddWorkspace={addWorkspace}
-            onRemoveWorkspace={removeWorkspace}
-            onCheckMachines={checkMachines}
-            onAddMachine={createMachine}
-            onRemoveMachine={removeMachine}
-            onAddAgent={createAgent}
-            onRemoveAgent={removeAgent}
-            onOpenLocalPath={openLocalPath}
-            onLogin={login}
-            onLogout={logout}
-          />
+          <>
+            <ErrorBanner error={error} />
+            <SettingsView
+              account={account}
+              busy={busy}
+              workspaceForm={workspaceForm}
+              setWorkspaceForm={setWorkspaceForm}
+              machineForm={machineForm}
+              setMachineForm={setMachineForm}
+              agentForm={agentForm}
+              setAgentForm={setAgentForm}
+              machines={machines}
+              workspaces={workspaces}
+              onAddWorkspace={addWorkspace}
+              onRemoveWorkspace={removeWorkspace}
+              onCheckMachines={checkMachines}
+              onAddMachine={createMachine}
+              onRemoveMachine={removeMachine}
+              onAddAgent={createAgent}
+              onRemoveAgent={removeAgent}
+              onOpenLocalPath={openLocalPath}
+              onLogin={login}
+              onLogout={logout}
+            />
+          </>
         )}
       </main>
-      <StatePanel
-        actors={actorList}
-        channel={activeChannel}
-        channelTasks={channelTasks}
-        inboxCount={inbox.length}
-        openRuns={openRuns}
-        thread={activeThread}
-        onCancelRun={(runId) => {
-          setBusy(`run:${runId}:cancel`);
-          void ipc
-            .runCancel({ runId, reason: "cancelled from Loom Desktop" })
-            .catch((err) => setError(errorText(err)))
-            .finally(() => setBusy(null));
-        }}
-      />
+      {showChatChrome && (
+        <ChannelPanel
+          actors={actors}
+          memberCandidates={memberCandidates}
+          channel={activeChannel}
+          channelTasks={channelTasks}
+          thread={activeThread}
+          busy={busy}
+          onInviteMember={inviteMemberToChannel}
+          onRemoveMember={removeMemberFromChannel}
+          onUpdateTopic={updateChannelTopic}
+        />
+      )}
       {notice && (
         <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-border bg-popover px-4 py-2 text-sm shadow-soft">
           {notice}
         </div>
-      )}
-      {taskDraft && (
-        <TaskAssignDialog
-          agents={agentActors}
-          busy={busy === `task:create:${taskDraft.id}`}
-          message={taskDraft}
-          onCancel={() => setTaskDraft(null)}
-          onAssign={async (message, agentActorId) => {
-            const assigned = await assignTask(message, agentActorId);
-            if (assigned) setTaskDraft(null);
-          }}
-        />
       )}
     </div>
   );
@@ -1166,16 +1321,19 @@ function Sidebar({
 function ChatHeader({
   channel,
   thread,
+  task,
   target,
   connection,
   onClearThread,
 }: {
   channel: Channel | null;
   thread: Thread | null;
+  task: Task | null;
   target: string | null;
   connection: ConnectionState;
   onClearThread: () => void;
 }) {
+  const topic = channelTopic(channel);
   return (
     <header className="flex h-16 shrink-0 items-center gap-3 border-b border-border px-5">
       <div className="flex h-10 w-10 items-center justify-center rounded-md bg-secondary">
@@ -1188,12 +1346,15 @@ function ChatHeader({
           </h1>
           {thread && (
             <Badge variant="secondary" className="max-w-[45%] truncate">
-              Thread: {thread.title}
+              {thread.title}
             </Badge>
           )}
+          {thread && (task ? <TaskStateBadge task={task} /> : <NoTaskBadge />)}
         </div>
-        <div className="truncate font-mono text-xs text-muted-foreground">
-          {target ?? connectionLabel(connection)}
+        <div className="truncate text-xs text-muted-foreground">
+          {thread
+            ? `#${channel?.title ?? "channel"} / ${thread.title}`
+            : topic || target || connectionLabel(connection)}
         </div>
       </div>
       {thread && (
@@ -1208,28 +1369,36 @@ function ChatHeader({
 
 function MessageFeed({
   actors,
-  agents,
   messages,
+  tasksBySourceMessageId,
+  channelThreads,
   emptyText,
   onReply,
   onStartThread,
-  onOpenTaskAssign,
+  onToggleReaction,
   onAnswerAction,
   activeThread,
+  currentActorId,
   busy,
 }: {
   actors: Record<string, Actor>;
-  agents: Actor[];
   messages: Message[];
+  tasksBySourceMessageId: Record<string, Task>;
+  channelThreads: Thread[];
   emptyText: string;
   onReply: (message: Message) => void;
   onStartThread: (message: Message) => void;
-  onOpenTaskAssign: (message: Message) => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
   activeThread: Thread | null;
+  currentActorId: string | null;
   busy: string | null;
 }) {
-  if (messages.length === 0) {
+  const workflowSourceIds = new Set(
+    messages.filter(isWorkflowMessage).map((message) => message.id),
+  );
+  const visibleMessages = messages.filter((message) => !isHiddenProtocolMessage(message));
+  if (visibleMessages.length === 0) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
         {emptyText}
@@ -1239,21 +1408,33 @@ function MessageFeed({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 scrollbar-thin">
       <div className="mx-auto flex max-w-4xl flex-col gap-3">
-        {messages.map((message) => (
-          <MessageRow
-            key={message.id}
-            actor={actors[message.authorActorId]}
-            agents={agents}
-            message={message}
-            onReply={onReply}
-            onStartThread={onStartThread}
-            onOpenTaskAssign={onOpenTaskAssign}
-            onAnswerAction={onAnswerAction}
-            canStartThread={!activeThread && canUseAsThreadRoot(message)}
-            canAssignTask={canUseAsTaskSource(message)}
-            busy={busy}
-          />
-        ))}
+        {visibleMessages.map((message) => {
+          const threadSummary = activeThread
+            ? null
+            : channelThreads.find((thread) => thread.rootMessageId === message.id) ?? null;
+          const sourceTask =
+            !activeThread && message.scope.kind === "channel"
+              ? tasksBySourceMessageId[message.id] ?? null
+              : null;
+          return (
+            <MessageRow
+              key={message.id}
+              actor={actors[message.authorActorId]}
+              actors={actors}
+              message={message}
+              workflowSourceIds={workflowSourceIds}
+              onReply={onReply}
+              onStartThread={onStartThread}
+              onToggleReaction={onToggleReaction}
+              onAnswerAction={onAnswerAction}
+              canStartThread={!activeThread && canUseAsThreadRoot(message)}
+              threadSummary={threadSummary}
+              sourceTask={sourceTask}
+              currentActorId={currentActorId}
+              busy={busy}
+            />
+          );
+        })}
       </div>
     </div>
   );
@@ -1261,29 +1442,42 @@ function MessageFeed({
 
 function MessageRow({
   actor,
-  agents,
+  actors,
   message,
+  workflowSourceIds,
   onReply,
   onStartThread,
-  onOpenTaskAssign,
+  onToggleReaction,
   onAnswerAction,
   canStartThread,
-  canAssignTask,
+  threadSummary,
+  sourceTask,
+  currentActorId,
   busy,
 }: {
   actor?: Actor;
-  agents: Actor[];
+  actors: Record<string, Actor>;
   message: Message;
+  workflowSourceIds: Set<string>;
   onReply: (message: Message) => void;
   onStartThread: (message: Message) => void;
-  onOpenTaskAssign: (message: Message) => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
   canStartThread: boolean;
-  canAssignTask: boolean;
+  threadSummary: Thread | null;
+  sourceTask: Task | null;
+  currentActorId: string | null;
   busy: string | null;
 }) {
   const actionRequest = messageKind(message) === "action.request";
   const choices = actionChoices(message);
+  const reactions = message.reactions ?? [];
+  if (isWorkflowMessage(message)) {
+    return <WorkflowEventRow actor={actor} actors={actors} message={message} />;
+  }
+  if (isWorkflowResultMessage(message, workflowSourceIds)) {
+    return <WorkflowResultRow actor={actor} message={message} />;
+  }
   return (
     <article
       className={cn(
@@ -1300,6 +1494,7 @@ function MessageRow({
             <Badge variant={actor?.kind === "agent" ? "success" : "outline"}>
               {actor?.kind ?? message.kind}
             </Badge>
+            {sourceTask && <TaskStateBadge task={sourceTask} />}
             {message.parentMessageId && (
               <span className="font-mono text-xs text-muted-foreground">
                 reply {shortId(message.parentMessageId)}
@@ -1309,7 +1504,64 @@ function MessageRow({
           <div className="prose prose-invert mt-1 max-w-none break-words text-sm leading-6">
             <ReactMarkdown>{message.body || metadataText(message)}</ReactMarkdown>
           </div>
-          {actionRequest && (
+          {reactions.length > 0 && (
+            <div className="mt-2 flex min-h-7 flex-wrap items-center gap-1.5">
+              {reactions.map((reaction) => {
+                const selected = Boolean(
+                  currentActorId && reaction.actorIds.includes(currentActorId),
+                );
+                return (
+                  <button
+                    key={reaction.emoji}
+                    type="button"
+                    className={cn(
+                      "inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors",
+                      selected
+                        ? "border-primary/60 bg-primary/15 text-primary"
+                        : "border-border bg-secondary/60 text-foreground hover:border-primary/40",
+                    )}
+                    title={reaction.actorIds
+                      .map((actorId) => actorName(actors, actorId))
+                      .join(", ")}
+                    disabled={busy === `message:reaction:${message.id}:${reaction.emoji}`}
+                    onClick={() => onToggleReaction(message, reaction.emoji)}
+                  >
+                    <span className="text-sm leading-none">{reaction.emoji}</span>
+                    <span>{reaction.actorIds.length}</span>
+                  </button>
+                );
+              })}
+              <div className="flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                {quickReactionEmojis.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-transparent text-sm text-muted-foreground transition-colors hover:border-border hover:bg-secondary hover:text-foreground"
+                    title={`React ${emoji}`}
+                    disabled={busy === `message:reaction:${message.id}:${emoji}`}
+                    onClick={() => onToggleReaction(message, emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {threadSummary && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="flex w-fit max-w-full items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                onClick={() => onStartThread(message)}
+              >
+                <Split size={14} />
+                <span className="font-medium text-foreground">Thread</span>
+                <span className="min-w-0 truncate">{threadSummary.title}</span>
+              </button>
+              {!sourceTask && <NoTaskBadge />}
+            </div>
+          )}
+          {actionRequest && choices.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-2">
               {choices.map((choice) => (
                 <Button
@@ -1327,9 +1579,24 @@ function MessageRow({
           )}
           <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
             <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
+              <Reply size={14} />
               Reply
             </Button>
-            {canStartThread && (
+            <div className="flex gap-1">
+              {quickReactionEmojis.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                  title={`React ${emoji}`}
+                  disabled={busy === `message:reaction:${message.id}:${emoji}`}
+                  onClick={() => onToggleReaction(message, emoji)}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+            {canStartThread && !threadSummary && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -1338,17 +1605,6 @@ function MessageRow({
               >
                 <Split size={14} />
                 Thread
-              </Button>
-            )}
-            {agents.length > 0 && canAssignTask && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onOpenTaskAssign(message)}
-                disabled={busy === `task:create:${message.id}`}
-              >
-                <Check size={14} />
-                Assign task
               </Button>
             )}
             <span className="self-center font-mono text-[11px] text-muted-foreground">
@@ -1361,80 +1617,69 @@ function MessageRow({
   );
 }
 
-function TaskAssignDialog({
-  agents,
-  busy,
-  message,
-  onAssign,
-  onCancel,
-}: {
-  agents: Actor[];
-  busy: boolean;
-  message: Message;
-  onAssign: (message: Message, agentActorId: string) => Promise<void> | void;
-  onCancel: () => void;
-}) {
-  const [agentActorId, setAgentActorId] = useState(agents[0]?.id ?? "");
-  useEffect(() => {
-    if (!agentActorId || !agents.some((agent) => agent.id === agentActorId)) {
-      setAgentActorId(agents[0]?.id ?? "");
-    }
-  }, [agentActorId, agents]);
-  const source = threadTitle(message);
+function TaskStateBadge({ task }: { task: Task }) {
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/70 px-4 backdrop-blur-sm">
-      <section className="w-full max-w-md rounded-md border border-border bg-popover p-4 shadow-soft">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h2 className="text-sm font-semibold">Assign Task</h2>
-            <div className="mt-1 truncate text-xs text-muted-foreground">
-              {shortId(message.id, 12)}
-            </div>
-          </div>
-          <Button variant="ghost" size="icon" onClick={onCancel} disabled={busy}>
-            <X size={15} />
-          </Button>
-        </div>
-        <div className="mt-4 space-y-3">
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-muted-foreground">
-              Source Message
-            </span>
-            <div className="rounded-md border border-border bg-background px-3 py-2 text-sm">
-              {source}
-            </div>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-muted-foreground">
-              Agent
-            </span>
-            <select
-              value={agentActorId}
-              onChange={(event) => setAgentActorId(event.target.value)}
-              className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground"
-            >
-              {agents.map((agent) => (
-                <option key={agent.id} value={agent.id}>
-                  {displayName(agent)}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="mt-4 flex justify-end gap-2">
-          <Button variant="outline" size="sm" onClick={onCancel} disabled={busy}>
-            Cancel
-          </Button>
-          <Button
-            size="sm"
-            onClick={() => onAssign(message, agentActorId)}
-            disabled={busy || !agentActorId}
-          >
-            Assign
-          </Button>
-        </div>
-      </section>
+    <Badge variant={taskBadgeVariant(task)} title={task.id}>
+      Task #{task.number} · {task.status}
+    </Badge>
+  );
+}
+
+function NoTaskBadge() {
+  return (
+    <Badge variant="outline" className="text-muted-foreground">
+      No task
+    </Badge>
+  );
+}
+
+function taskBadgeVariant(task: Task): "outline" | "success" | "warning" {
+  if (task.status === "done") return "success";
+  if (task.status === "failed" || task.status === "canceled") return "warning";
+  return "outline";
+}
+
+function WorkflowEventRow({
+  actor,
+  actors,
+  message,
+}: {
+  actor?: Actor;
+  actors: Record<string, Actor>;
+  message: Message;
+}) {
+  const summary = workflowSummary(message, actors);
+  return (
+    <div className="mx-auto flex max-w-[80%] items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+      <Check size={14} />
+      <span className="min-w-0 flex-1 truncate">{summary}</span>
+      <span>{formatTime(message.createdAt)}</span>
+      {actor && <Badge variant="outline">{displayName(actor)}</Badge>}
     </div>
+  );
+}
+
+function WorkflowResultRow({
+  actor,
+  message,
+}: {
+  actor?: Actor;
+  message: Message;
+}) {
+  return (
+    <article className="group rounded-md px-3 py-2 transition-colors hover:bg-accent/40">
+      <div className="flex items-start gap-3">
+        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium">{actor ? displayName(actor) : message.authorActorId}</span>
+            <span className="text-xs text-muted-foreground">{formatTime(message.createdAt)}</span>
+            <Badge variant="success">task result</Badge>
+          </div>
+          <div className="mt-1 text-sm leading-6">{workflowResultSummary(message)}</div>
+        </div>
+      </div>
+    </article>
   );
 }
 
@@ -1446,6 +1691,7 @@ function Composer({
   actorName,
   onClearReply,
   onSend,
+  mentionAgents,
   busy,
 }: {
   draft: string;
@@ -1455,8 +1701,53 @@ function Composer({
   actorName: string;
   onClearReply: () => void;
   onSend: () => void;
+  mentionAgents: Actor[];
   busy: boolean;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [caretIndex, setCaretIndex] = useState(draft.length);
+  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
+  const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const activeMention = activeMentionQuery(draft, caretIndex);
+  const mentionKey = activeMention
+    ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`
+    : null;
+  const mentionOptions = activeMention
+    ? mentionCandidates(mentionAgents, activeMention)
+    : [];
+  const showMentions =
+    !disabled &&
+    !busy &&
+    activeMention !== null &&
+    dismissedMentionKey !== mentionKey &&
+    mentionOptions.length > 0;
+  const effectiveMentionIndex = mentionOptions.length
+    ? Math.min(selectedMentionIndex, mentionOptions.length - 1)
+    : 0;
+  const selectedMention = showMentions ? mentionOptions[effectiveMentionIndex] : null;
+
+  useEffect(() => {
+    setSelectedMentionIndex(0);
+  }, [mentionKey]);
+
+  function syncCaret(element: HTMLTextAreaElement) {
+    setCaretIndex(element.selectionStart ?? element.value.length);
+  }
+
+  function chooseMention(option: MentionOption) {
+    const before = draft.slice(0, option.start);
+    const after = draft.slice(option.end).replace(/^\s*/, "");
+    const next = `${before}${option.token} ${after}`;
+    const nextCaret = before.length + option.token.length + 1;
+    setDraft(next);
+    setCaretIndex(nextCaret);
+    setDismissedMentionKey(null);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
   return (
     <footer className="border-t border-border p-4">
       <div className="mx-auto max-w-4xl">
@@ -1468,11 +1759,86 @@ function Composer({
             </button>
           </div>
         )}
-        <div className="flex items-end gap-2">
+        <div className="relative flex items-end gap-2">
+          {showMentions && (
+            <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-md border border-border bg-popover shadow-soft">
+              <div className="border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Mentions
+              </div>
+              <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
+                {mentionOptions.map((option, index) => (
+                  <button
+                    key={`${option.kind}:${option.id}`}
+                    type="button"
+                    className={cn(
+                      "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
+                      index === effectiveMentionIndex
+                        ? "bg-accent text-accent-foreground"
+                        : "hover:bg-accent/60",
+                    )}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      chooseMention(option);
+                    }}
+                  >
+                    {option.actor ? (
+                      <ActorAvatar actor={option.actor} fallback={option.actor.id} small />
+                    ) : (
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
+                        <Users size={14} />
+                      </span>
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium">{option.title}</span>
+                      <span className="block truncate text-xs text-muted-foreground">
+                        {option.detail}
+                      </span>
+                    </span>
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {option.token}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <Textarea
+            ref={textareaRef}
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              syncCaret(event.currentTarget);
+              setDismissedMentionKey(null);
+            }}
+            onClick={(event) => syncCaret(event.currentTarget)}
+            onKeyUp={(event) => syncCaret(event.currentTarget)}
             onKeyDown={(event) => {
+              if (showMentions) {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setSelectedMentionIndex((index) =>
+                    (index + 1) % mentionOptions.length,
+                  );
+                  return;
+                }
+                if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setSelectedMentionIndex((index) =>
+                    (index - 1 + mentionOptions.length) % mentionOptions.length,
+                  );
+                  return;
+                }
+                if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
+                  event.preventDefault();
+                  chooseMention(selectedMention);
+                  return;
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setDismissedMentionKey(mentionKey);
+                  return;
+                }
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 onSend();
@@ -1653,268 +2019,445 @@ function SettingsView({
   onLogin: (provider: ipc.LoginProvider) => void;
   onLogout: () => void;
 }) {
-  const selectedMachine =
-    machines.find((machine) => machine.id === agentForm.machineId) ?? machines[0];
-  const selectedProvider =
-    selectedMachine?.providers.find((provider) => provider.id === agentForm.providerId) ??
-    selectedMachine?.providers[0];
+  const [step, setStep] = useState<SettingsStep>("workspace");
+  const selectedMachine = resolveAgentMachine(agentForm, machines);
+  const selectedProvider = resolveAgentProvider(agentForm, selectedMachine);
   const modelChoices = selectedProvider?.modelChoices ?? [];
+  const workspaceReady = workspaces.length > 0;
+  const daemonReady = machines.length > 0;
+  const agentReady = Boolean(
+    selectedMachine &&
+      selectedProvider &&
+      machineCanCreateAgent(selectedMachine) &&
+      agentForm.name.trim(),
+  );
+
+  useEffect(() => {
+    if (!workspaceReady && step !== "workspace") {
+      setStep("workspace");
+    } else if (step === "agent" && !daemonReady) {
+      setStep("daemon");
+    }
+  }, [daemonReady, step, workspaceReady]);
+
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <PageHeader title="Settings" detail="Identity, workspaces, daemons, agents" />
+      <PageHeader title="Settings" detail="Workspace setup" />
       <div className="min-h-0 flex-1 overflow-y-auto p-5 scrollbar-thin">
-        <div className="mx-auto grid max-w-4xl gap-5">
-          <div className="rounded-md border border-border bg-card p-4">
-            <div className="mb-3 text-sm font-medium">Account</div>
-            {account ? (
-              <div className="flex items-center gap-3">
-                <Avatar account={account} />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium">{accountName(account)}</div>
-                  <div className="truncate text-sm text-muted-foreground">
-                    {account.email || account.staffId}
-                  </div>
-                </div>
-                <Button variant="outline" onClick={onLogout} disabled={busy === "logout"}>
-                  <LogOut size={15} />
-                  Sign out
-                </Button>
-              </div>
-            ) : (
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => onLogin("github")} disabled={busy === "login:github"}>
-                  <Github size={15} />
-                  GitHub
-                </Button>
-                <Button variant="outline" onClick={() => onLogin("google")} disabled={busy === "login:google"}>
-                  Google
-                </Button>
-              </div>
-            )}
-          </div>
-
-          <div className="rounded-md border border-border bg-card p-4">
-            <div className="mb-3 text-sm font-medium">Add Workspace</div>
-            <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
-              <Input
-                value={workspaceForm.name}
-                onChange={(event) =>
-                  setWorkspaceForm({ ...workspaceForm, name: event.target.value })
-                }
-                placeholder="Name"
-              />
-              <Input
-                value={workspaceForm.serverUrl}
-                onChange={(event) =>
-                  setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
-                }
-                placeholder="ws://127.0.0.1:7878/rpc"
-              />
-              <Button onClick={onAddWorkspace} disabled={busy === "workspace:add"}>
-                <Plus size={15} />
-                Add
-              </Button>
-            </div>
-          </div>
-
-          <div className="rounded-md border border-border bg-card p-4">
-            <div className="mb-3 text-sm font-medium">Workspaces</div>
-            <div className="space-y-2">
-              {workspaces.map((workspace) => (
-                <div
-                  key={workspace.id}
-                  className="flex items-center gap-3 rounded-md border border-border px-3 py-2"
-                >
+        <div className="mx-auto grid max-w-6xl gap-5 lg:grid-cols-[230px_minmax(0,1fr)]">
+          <aside className="space-y-4">
+            <div className="rounded-md border border-border bg-card p-4">
+              {account ? (
+                <div className="flex items-center gap-3">
+                  <Avatar account={account} />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium">{workspace.name}</div>
-                    <div className="truncate font-mono text-xs text-muted-foreground">
-                      {workspace.serverUrl}
+                    <div className="truncate font-medium">{accountName(account)}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {account.email || account.staffId || account.provider}
                     </div>
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => onRemoveWorkspace(workspace.id)}
-                    disabled={busy === `workspace:remove:${workspace.id}`}
-                  >
-                    <Trash2 size={16} />
+                  <Button variant="ghost" size="icon" onClick={onLogout} disabled={busy === "logout"}>
+                    <LogOut size={15} />
                   </Button>
                 </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="rounded-md border border-border bg-card p-4">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="text-sm font-medium">Daemons</div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onCheckMachines}
-                disabled={busy === "machine:check"}
-              >
-                {busy === "machine:check" ? (
-                  <Loader2 className="animate-spin" size={15} />
-                ) : (
-                  <RefreshCw size={15} />
-                )}
-                Check
-              </Button>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
-              <Input
-                value={machineForm.name}
-                onChange={(event) =>
-                  setMachineForm({ ...machineForm, name: event.target.value })
-                }
-                placeholder="Daemon name"
-              />
-              <Input
-                value={machineForm.dataRoot}
-                onChange={(event) =>
-                  setMachineForm({ ...machineForm, dataRoot: event.target.value })
-                }
-                placeholder="Data root"
-              />
-              <Button onClick={onAddMachine} disabled={busy === "machine:create"}>
-                <Plus size={15} />
-                Add
-              </Button>
-            </div>
-            <div className="mt-4 space-y-3">
-              {machines.length === 0 ? (
-                <MutedLine>No daemons configured.</MutedLine>
               ) : (
-                machines.map((machine) => (
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-sm font-medium">Account</div>
+                    <div className="text-xs text-muted-foreground">Optional identity</div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button size="sm" onClick={() => onLogin("github")} disabled={busy === "login:github"}>
+                      <Github size={14} />
+                      GitHub
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={() => onLogin("google")} disabled={busy === "login:google"}>
+                      Google
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="rounded-md border border-border bg-card p-2">
+              <SettingsStepButton
+                active={step === "workspace"}
+                complete={workspaceReady}
+                label="Workspace"
+                detail={`${workspaces.length} configured`}
+                onClick={() => setStep("workspace")}
+              />
+              <SettingsStepButton
+                active={step === "daemon"}
+                complete={daemonReady}
+                label="Daemon"
+                detail={`${machines.length} available`}
+                disabled={!workspaceReady}
+                onClick={() => setStep("daemon")}
+              />
+              <SettingsStepButton
+                active={step === "agent"}
+                complete={machines.some((machine) => machine.agentCount > 0)}
+                label="Agent"
+                detail={selectedMachine ? selectedMachine.name : "choose daemon"}
+                disabled={!workspaceReady || !daemonReady}
+                onClick={() => setStep("agent")}
+              />
+            </div>
+          </aside>
+
+          <div className="min-w-0">
+            {step === "workspace" && (
+              <div className="space-y-4">
+                <SettingsSection
+                  title="Workspace"
+                  detail="Connect the GUI to a Loom server profile."
+                >
+                  <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
+                    <Input
+                      value={workspaceForm.name}
+                      onChange={(event) =>
+                        setWorkspaceForm({ ...workspaceForm, name: event.target.value })
+                      }
+                      placeholder="Name"
+                    />
+                    <Input
+                      value={workspaceForm.serverUrl}
+                      onChange={(event) =>
+                        setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
+                      }
+                      placeholder="ws://127.0.0.1:7878/rpc"
+                    />
+                    <Button onClick={onAddWorkspace} disabled={busy === "workspace:add"}>
+                      <Plus size={15} />
+                      Add
+                    </Button>
+                  </div>
+                </SettingsSection>
+                <SettingsSection title="Configured Workspaces" detail="Profiles saved on this Mac.">
+                  <div className="space-y-2">
+                    {workspaces.length === 0 ? (
+                      <MutedLine>No workspaces configured.</MutedLine>
+                    ) : (
+                      workspaces.map((workspace) => (
+                        <div
+                          key={workspace.id}
+                          className="flex items-center gap-3 rounded-md border border-border px-3 py-2"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium">{workspace.name}</div>
+                            <div className="truncate font-mono text-xs text-muted-foreground">
+                              {workspace.serverUrl}
+                            </div>
+                          </div>
+                          <Badge variant="outline">{workspace.displayName || workspace.actorId}</Badge>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Remove workspace"
+                            onClick={() => onRemoveWorkspace(workspace.id)}
+                            disabled={busy === `workspace:remove:${workspace.id}`}
+                          >
+                            <Trash2 size={16} />
+                          </Button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <div className="mt-4 flex justify-end">
+                    <Button onClick={() => setStep("daemon")} disabled={!workspaceReady}>
+                      Continue
+                    </Button>
+                  </div>
+                </SettingsSection>
+              </div>
+            )}
+
+            {step === "daemon" && (
+              <div className="space-y-4">
+                <SettingsSection
+                  title="Daemons"
+                  detail="A daemon hosts local or remote agents for the active workspace."
+                  action={
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={onCheckMachines}
+                      disabled={busy === "machine:check"}
+                    >
+                      {busy === "machine:check" ? (
+                        <Loader2 className="animate-spin" size={15} />
+                      ) : (
+                        <RefreshCw size={15} />
+                      )}
+                      Check
+                    </Button>
+                  }
+                >
+                  <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
+                    <Input
+                      value={machineForm.name}
+                      onChange={(event) =>
+                        setMachineForm({ ...machineForm, name: event.target.value })
+                      }
+                      placeholder="Daemon name"
+                    />
+                    <Input
+                      value={machineForm.dataRoot}
+                      onChange={(event) =>
+                        setMachineForm({ ...machineForm, dataRoot: event.target.value })
+                      }
+                      placeholder="Data root"
+                    />
+                    <Button onClick={onAddMachine} disabled={busy === "machine:create"}>
+                      <Plus size={15} />
+                      Add
+                    </Button>
+                  </div>
+                </SettingsSection>
+                <div className="space-y-3">
+                  {machines.length === 0 ? (
+                    <EmptyState icon={HardDrive} text="No daemons configured." />
+                  ) : (
+                    machines.map((machine) => (
+                      <MachineCard
+                        key={machine.id}
+                        machine={machine}
+                        busy={busy}
+                        onRemove={onRemoveMachine}
+                        onOpenLocalPath={onOpenLocalPath}
+                        onRemoveAgent={onRemoveAgent}
+                      />
+                    ))
+                  )}
+                </div>
+                <div className="flex justify-between">
+                  <Button variant="outline" onClick={() => setStep("workspace")}>
+                    Workspace
+                  </Button>
+                  <Button onClick={() => setStep("agent")} disabled={!daemonReady}>
+                    Add Agent
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {step === "agent" && (
+              <div className="space-y-4">
+                <SettingsSection
+                  title="Add Agent"
+                  detail="Pick a daemon first, then choose the runtime provider and identity."
+                >
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <select
+                      value={selectedMachine?.id ?? ""}
+                      onChange={(event) =>
+                        setAgentForm(
+                          normalizeAgentForm(
+                            { ...agentForm, machineId: event.target.value, model: "" },
+                            machines,
+                          ),
+                        )
+                      }
+                      className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                    >
+                      {machines.map((machine) => (
+                        <option
+                          key={machine.id}
+                          value={machine.id}
+                          disabled={!machineCanCreateAgent(machine)}
+                        >
+                          {machine.name}
+                          {!machineCanCreateAgent(machine) ? " (read-only)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={selectedProvider?.id ?? ""}
+                      onChange={(event) => {
+                        const provider = selectedMachine?.providers.find(
+                          (item) => item.id === event.target.value,
+                        );
+                        setAgentForm({
+                          ...agentForm,
+                          machineId: selectedMachine?.id ?? agentForm.machineId,
+                          providerId: event.target.value,
+                          model: provider?.defaultModel ?? "",
+                        });
+                      }}
+                      className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                      disabled={!selectedMachine || selectedMachine.providers.length === 0}
+                    >
+                      {(selectedMachine?.providers ?? []).map((provider) => (
+                        <option key={provider.id} value={provider.id}>
+                          {provider.name}
+                        </option>
+                      ))}
+                    </select>
+                    <Input
+                      value={agentForm.name}
+                      onChange={(event) =>
+                        setAgentForm({ ...agentForm, name: event.target.value })
+                      }
+                      placeholder="Agent name"
+                    />
+                    <Input
+                      value={agentForm.actorId}
+                      onChange={(event) =>
+                        setAgentForm({ ...agentForm, actorId: event.target.value })
+                      }
+                      placeholder="Actor id (optional)"
+                    />
+                    {modelChoices.length > 0 ? (
+                      <select
+                        value={agentForm.model || selectedProvider?.defaultModel || ""}
+                        onChange={(event) =>
+                          setAgentForm({ ...agentForm, model: event.target.value })
+                        }
+                        className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+                      >
+                        {modelChoices.map((choice) => (
+                          <option key={choice.id} value={choice.id}>
+                            {choice.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <Input
+                        value={agentForm.model}
+                        onChange={(event) =>
+                          setAgentForm({ ...agentForm, model: event.target.value })
+                        }
+                        placeholder="Model"
+                      />
+                    )}
+                    <label className="flex h-10 items-center gap-2 rounded-md border border-border px-3 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={agentForm.autostart}
+                        onChange={(event) =>
+                          setAgentForm({ ...agentForm, autostart: event.target.checked })
+                        }
+                      />
+                      Autostart
+                    </label>
+                    <Textarea
+                      value={agentForm.description}
+                      onChange={(event) =>
+                        setAgentForm({ ...agentForm, description: event.target.value })
+                      }
+                      placeholder="Agent instructions"
+                      className="sm:col-span-2"
+                    />
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-sm text-muted-foreground">
+                      {!selectedMachine
+                        ? "No daemon selected."
+                        : !machineCanCreateAgent(selectedMachine)
+                          ? "This daemon is read-only for the current account."
+                          : !selectedProvider
+                            ? "No CLI provider detected for this daemon."
+                            : `${selectedProvider.name} on ${selectedMachine.name}`}
+                    </div>
+                    <Button
+                      onClick={onAddAgent}
+                      disabled={busy === "agent:create" || !agentReady}
+                    >
+                      {busy === "agent:create" ? (
+                        <Loader2 className="animate-spin" size={15} />
+                      ) : (
+                        <Bot size={15} />
+                      )}
+                      Add Agent
+                    </Button>
+                  </div>
+                </SettingsSection>
+                {selectedMachine && (
                   <MachineCard
-                    key={machine.id}
-                    machine={machine}
+                    machine={selectedMachine}
                     busy={busy}
                     onRemove={onRemoveMachine}
                     onOpenLocalPath={onOpenLocalPath}
                     onRemoveAgent={onRemoveAgent}
                   />
-                ))
-              )}
-            </div>
-          </div>
-
-          <div className="rounded-md border border-border bg-card p-4">
-            <div className="mb-3 text-sm font-medium">Add Agent</div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <select
-                value={selectedMachine?.id ?? ""}
-                onChange={(event) =>
-                  setAgentForm(
-                    normalizeAgentForm(
-                      { ...agentForm, machineId: event.target.value, model: "" },
-                      machines,
-                    ),
-                  )
-                }
-                className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-              >
-                {machines.map((machine) => (
-                  <option key={machine.id} value={machine.id}>
-                    {machine.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={selectedProvider?.id ?? ""}
-                onChange={(event) => {
-                  const provider = selectedMachine?.providers.find(
-                    (item) => item.id === event.target.value,
-                  );
-                  setAgentForm({
-                    ...agentForm,
-                    machineId: selectedMachine?.id ?? agentForm.machineId,
-                    providerId: event.target.value,
-                    model: provider?.defaultModel ?? "",
-                  });
-                }}
-                className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                disabled={!selectedMachine || selectedMachine.providers.length === 0}
-              >
-                {(selectedMachine?.providers ?? []).map((provider) => (
-                  <option key={provider.id} value={provider.id}>
-                    {provider.name}
-                  </option>
-                ))}
-              </select>
-              <Input
-                value={agentForm.name}
-                onChange={(event) =>
-                  setAgentForm({ ...agentForm, name: event.target.value })
-                }
-                placeholder="Agent name"
-              />
-              <Input
-                value={agentForm.actorId}
-                onChange={(event) =>
-                  setAgentForm({ ...agentForm, actorId: event.target.value })
-                }
-                placeholder="Actor id"
-              />
-              {modelChoices.length > 0 ? (
-                <select
-                  value={agentForm.model || selectedProvider?.defaultModel || ""}
-                  onChange={(event) =>
-                    setAgentForm({ ...agentForm, model: event.target.value })
-                  }
-                  className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                >
-                  {modelChoices.map((choice) => (
-                    <option key={choice.id} value={choice.id}>
-                      {choice.label}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <Input
-                  value={agentForm.model}
-                  onChange={(event) =>
-                    setAgentForm({ ...agentForm, model: event.target.value })
-                  }
-                  placeholder="Model"
-                />
-              )}
-              <label className="flex h-10 items-center gap-2 rounded-md border border-border px-3 text-sm">
-                <input
-                  type="checkbox"
-                  checked={agentForm.autostart}
-                  onChange={(event) =>
-                    setAgentForm({ ...agentForm, autostart: event.target.checked })
-                  }
-                />
-                Autostart
-              </label>
-              <Textarea
-                value={agentForm.description}
-                onChange={(event) =>
-                  setAgentForm({ ...agentForm, description: event.target.value })
-                }
-                placeholder="Agent instructions"
-                className="sm:col-span-2"
-              />
-            </div>
-            <div className="mt-3 flex justify-end">
-              <Button
-                onClick={onAddAgent}
-                disabled={
-                  busy === "agent:create" ||
-                  !selectedMachine ||
-                  !selectedProvider ||
-                  !agentForm.name.trim()
-                }
-              >
-                <Bot size={15} />
-                Add Agent
-              </Button>
-            </div>
+                )}
+                <div className="flex justify-start">
+                  <Button variant="outline" onClick={() => setStep("daemon")}>
+                    Daemons
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
+    </section>
+  );
+}
+
+function SettingsStepButton({
+  active,
+  complete,
+  disabled,
+  label,
+  detail,
+  onClick,
+}: {
+  active: boolean;
+  complete: boolean;
+  disabled?: boolean;
+  label: string;
+  detail: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors",
+        active ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+        disabled && "cursor-not-allowed opacity-50 hover:bg-transparent hover:text-muted-foreground",
+      )}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <span
+        className={cn(
+          "flex h-6 w-6 shrink-0 items-center justify-center rounded-md border text-xs",
+          complete ? "border-emerald-400/60 text-emerald-300" : "border-border",
+        )}
+      >
+        {complete ? <Check size={13} /> : <Circle size={10} />}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium">{label}</span>
+        <span className="block truncate text-xs">{detail}</span>
+      </span>
+    </button>
+  );
+}
+
+function SettingsSection({
+  title,
+  detail,
+  action,
+  children,
+}: {
+  title: string;
+  detail: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded-md border border-border bg-card p-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium">{title}</div>
+          <div className="mt-1 text-sm text-muted-foreground">{detail}</div>
+        </div>
+        {action}
+      </div>
+      {children}
     </section>
   );
 }
@@ -2051,67 +2594,152 @@ function InfoBlock({ label, value }: { label: string; value: string }) {
   );
 }
 
-function StatePanel({
+function ChannelPanel({
   actors,
+  memberCandidates,
   channel,
   channelTasks,
-  inboxCount,
-  openRuns,
   thread,
-  onCancelRun,
+  busy,
+  onInviteMember,
+  onRemoveMember,
+  onUpdateTopic,
 }: {
-  actors: Actor[];
+  actors: Record<string, Actor>;
+  memberCandidates: Actor[];
   channel: Channel | null;
   channelTasks: Task[];
-  inboxCount: number;
-  openRuns: Run[];
   thread: Thread | null;
-  onCancelRun: (runId: string) => void;
+  busy: string | null;
+  onInviteMember: (channelId: string, actorId: string) => void;
+  onRemoveMember: (channelId: string, actorId: string) => void;
+  onUpdateTopic: (channelId: string, topic: string) => void;
 }) {
+  const [selectedMemberId, setSelectedMemberId] = useState("");
+  const [topicDraft, setTopicDraft] = useState("");
+  const members = channel
+    ? channel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId))
+    : [];
+  const availableMembers = channel
+    ? memberCandidates.filter((actor) => canAddChannelMember(channel, actor))
+    : [];
+  useEffect(() => {
+    if (
+      !selectedMemberId ||
+      !availableMembers.some((actor) => actor.id === selectedMemberId)
+    ) {
+      setSelectedMemberId(availableMembers[0]?.id ?? "");
+    }
+  }, [availableMembers, selectedMemberId]);
+  useEffect(() => {
+    setTopicDraft(channelTopic(channel));
+  }, [channel?.id, channel?.topic]);
+  const topicChanged = Boolean(channel && topicDraft.trim() !== channelTopic(channel));
   return (
     <aside className="hidden min-h-0 min-w-0 flex-col bg-card xl:flex">
       <div className="border-b border-border p-4">
-        <div className="text-sm font-medium">Protocol State</div>
+        <div className="text-sm font-medium">{channel?.title ?? "Channel"}</div>
         <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
-          {thread ? `thread:${thread.id}` : channel ? `channel:${channel.id}` : "idle"}
+          {thread ? `Thread: ${thread.title}` : channel ? channel.visibility : "Not connected"}
         </div>
+        {channel && !thread && (
+          <div className="mt-4 space-y-2">
+            <label className="text-[11px] font-medium uppercase text-muted-foreground">
+              Topic
+            </label>
+            <Textarea
+              value={topicDraft}
+              onChange={(event) => setTopicDraft(event.target.value)}
+              placeholder="Set a channel topic"
+              className="min-h-16 resize-none text-sm"
+            />
+            <div className="flex justify-end">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!topicChanged || busy === `channel:topic:${channel.id}`}
+                onClick={() => onUpdateTopic(channel.id, topicDraft.trim())}
+              >
+                Save
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-4 scrollbar-thin">
-        <PanelBlock title="Runs" count={openRuns.length}>
-          {openRuns.length === 0 ? (
-            <MutedLine>No active runs.</MutedLine>
-          ) : (
-            openRuns.map((run) => (
-              <div key={run.id} className="rounded-md border border-border p-3">
-                <div className="flex items-center gap-2">
-                  <Bot size={15} />
-                  <span className="min-w-0 flex-1 truncate text-sm">{run.actorId}</span>
-                  <Badge variant="success">{run.status}</Badge>
-                </div>
-                <Button
-                  className="mt-3 w-full"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onCancelRun(run.id)}
-                >
-                  Cancel
-                </Button>
-              </div>
-            ))
-          )}
-        </PanelBlock>
-        <PanelBlock title="Inbox" count={inboxCount}>
-          <MutedLine>{inboxCount} pending deliveries.</MutedLine>
-        </PanelBlock>
-        <PanelBlock title="Members" count={channel?.members.length ?? actors.length}>
+        <PanelBlock title="Members" count={members.length}>
           <div className="space-y-2">
-            {actors.slice(0, 12).map((actor) => (
+            {members.map((actor) => (
               <div key={actor.id} className="flex items-center gap-2">
                 <ActorAvatar actor={actor} fallback={actor.id} small />
                 <div className="min-w-0 flex-1 truncate text-sm">{displayName(actor)}</div>
                 <Badge variant="outline">{actor.kind}</Badge>
+                {channel && canRemoveChannelMember(channel, actor.id) && (
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    title={`Remove ${displayName(actor)}`}
+                    disabled={busy === `channel:revoke:${channel.id}:${actor.id}`}
+                    onClick={() => onRemoveMember(channel.id, actor.id)}
+                    className="h-7 w-7"
+                  >
+                    {busy === `channel:revoke:${channel.id}:${actor.id}` ? (
+                      <Loader2 className="animate-spin" size={13} />
+                    ) : (
+                      <X size={13} />
+                    )}
+                  </Button>
+                )}
               </div>
             ))}
+            {channel && members.length === 0 && (
+              <MutedLine>No explicit members.</MutedLine>
+            )}
+            {channel?.visibility === "public" && (
+              <MutedLine>Public channel; explicit members are managed here.</MutedLine>
+            )}
+            {channel && (
+              <div className="rounded-md border border-border p-2">
+                <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                  <Users size={13} />
+                  Add member
+                </div>
+                <div className="flex gap-2">
+                  <select
+                    value={selectedMemberId}
+                    onChange={(event) => setSelectedMemberId(event.target.value)}
+                    disabled={availableMembers.length === 0}
+                    className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground disabled:opacity-60"
+                  >
+                    {availableMembers.length === 0 ? (
+                      <option value="">No candidates</option>
+                    ) : (
+                      availableMembers.map((actor) => (
+                        <option key={actor.id} value={actor.id}>
+                          {displayName(actor)} - {actor.kind}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={
+                      !selectedMemberId ||
+                      busy === `channel:invite:${channel.id}:${selectedMemberId}`
+                    }
+                    onClick={() => onInviteMember(channel.id, selectedMemberId)}
+                  >
+                    {busy === `channel:invite:${channel.id}:${selectedMemberId}` ? (
+                      <Loader2 className="animate-spin" size={14} />
+                    ) : (
+                      <Plus size={14} />
+                    )}
+                    Add
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </PanelBlock>
         <PanelBlock title="Tasks" count={channelTasks.length}>
@@ -2136,6 +2764,15 @@ function PageHeader({ title, detail }: { title: string; detail: string }) {
       <h1 className="text-base font-semibold">{title}</h1>
       <span className="text-sm text-muted-foreground">{detail}</span>
     </header>
+  );
+}
+
+function ErrorBanner({ error }: { error: string | null }) {
+  if (!error) return null;
+  return (
+    <div className="border-b border-destructive/40 bg-destructive/10 px-4 py-2 text-sm text-destructive-foreground">
+      {error}
+    </div>
   );
 }
 
@@ -2240,6 +2877,10 @@ function actorName(actors: Record<string, Actor>, actorId: string) {
   return actors[actorId] ? displayName(actors[actorId]) : actorId;
 }
 
+function channelTopic(channel: Channel | null | undefined) {
+  return typeof channel?.topic === "string" ? channel.topic.trim() : "";
+}
+
 function connectionLabel(connection: ConnectionState) {
   if (connection === "open") return "Connected";
   if (connection === "connecting") return "Connecting";
@@ -2248,11 +2889,13 @@ function connectionLabel(connection: ConnectionState) {
   return "Idle";
 }
 
+function reconnectDelayMs(attempt: number) {
+  return Math.min(15_000, 500 * 2 ** Math.max(0, attempt - 1));
+}
+
 function normalizeAgentForm(form: AgentFormState, machines: MachineInfo[]): AgentFormState {
-  const machine = machines.find((item) => item.id === form.machineId) ?? machines[0];
-  const provider =
-    machine?.providers.find((item) => item.id === form.providerId) ??
-    machine?.providers[0];
+  const machine = resolveAgentMachine(form, machines);
+  const provider = resolveAgentProvider(form, machine);
   return {
     ...form,
     machineId: machine?.id ?? "",
@@ -2261,22 +2904,173 @@ function normalizeAgentForm(form: AgentFormState, machines: MachineInfo[]): Agen
   };
 }
 
-function mentionedAgentAudience(
+function resolveAgentMachine(
+  form: AgentFormState,
+  machines: MachineInfo[],
+): MachineInfo | undefined {
+  const current = machines.find((item) => item.id === form.machineId);
+  if (current && machineCanCreateAgent(current)) return current;
+  return (
+    machines.find((machine) => machineCanCreateAgent(machine) && machine.providers.length > 0) ??
+    machines.find(machineCanCreateAgent) ??
+    current ??
+    machines[0]
+  );
+}
+
+function resolveAgentProvider(
+  form: AgentFormState,
+  machine?: MachineInfo,
+): MachineAgentProviderInfo | undefined {
+  return (
+    machine?.providers.find((item) => item.id === form.providerId) ??
+    machine?.providers[0]
+  );
+}
+
+function machineCanCreateAgent(machine: MachineInfo) {
+  return (
+    !machine.readOnly &&
+    (machine.capabilities.includes("agent.create") ||
+      (machine.canCommand && machine.capabilities.includes("machine.command")))
+  );
+}
+
+function mentionAudience(
   body: string,
   actors: Record<string, Actor>,
   selfActorId?: string,
-) {
-  return Object.values(actors)
-    .filter((actor) => actor.kind === "agent" && actor.id !== selfActorId)
-    .filter((actor) => body.includes(`@${actor.id}`))
-    .map((actor) => ({ kind: "actor" as const, id: actor.id }));
+): AudienceRef[] {
+  const audience: AudienceRef[] = [];
+  const actorList = Object.values(actors);
+  for (const rawToken of mentionTokens(body)) {
+    const key = rawToken.toLowerCase();
+    if (key === "all") {
+      audience.push({ kind: "all", id: "all", display: "@all" });
+      continue;
+    }
+    if (key === "agents") {
+      audience.push({ kind: "agents", id: "agents", display: "@agents" });
+      continue;
+    }
+    if (key === "humans") {
+      audience.push({ kind: "humans", id: "humans", display: "@humans" });
+      continue;
+    }
+    const actor = actorList.find((candidate) => {
+      if (candidate.id === selfActorId) return false;
+      return (
+        candidate.id.toLowerCase() === key ||
+        displayName(candidate).toLowerCase() === key ||
+        shortActorAlias(candidate.id).toLowerCase() === key
+      );
+    });
+    if (actor) audience.push({ kind: "actor", id: actor.id, display: `@${rawToken}` });
+  }
+  return uniqueAudience(audience);
+}
+
+function mentionTokens(body: string) {
+  return Array.from(body.matchAll(/@([^\s,.;:!?()[\]{}<>"'`]+)/g), (match) => match[1]);
+}
+
+type ActiveMention = {
+  start: number;
+  end: number;
+  query: string;
+};
+
+type MentionOption = {
+  kind: "all" | "actor";
+  id: string;
+  token: string;
+  title: string;
+  detail: string;
+  start: number;
+  end: number;
+  actor?: Actor;
+};
+
+function activeMentionQuery(body: string, caretIndex: number): ActiveMention | null {
+  const prefix = body.slice(0, caretIndex);
+  const match = /(^|\s)@([^\s@]*)$/.exec(prefix);
+  if (!match) return null;
+  const query = match[2] ?? "";
+  return {
+    start: match.index + match[1].length,
+    end: caretIndex,
+    query,
+  };
+}
+
+function mentionCandidates(agents: Actor[], active: ActiveMention): MentionOption[] {
+  const query = active.query.toLowerCase();
+  const options: MentionOption[] = [
+    {
+      kind: "all",
+      id: "all",
+      token: "@all",
+      title: "All",
+      detail: "Notify everyone in this channel",
+      start: active.start,
+      end: active.end,
+    },
+    ...agents.map((agent) => {
+      const token = mentionTokenForActor(agent);
+      return {
+        kind: "actor" as const,
+        id: agent.id,
+        token,
+        title: displayName(agent),
+        detail: agent.id,
+        start: active.start,
+        end: active.end,
+        actor: agent,
+      };
+    }),
+  ];
+  if (!query) return options;
+  return options.filter((option) =>
+    [option.token.slice(1), option.title, option.detail]
+      .map((value) => value.toLowerCase())
+      .some((value) => value.includes(query)),
+  );
+}
+
+function uniqueAudience(audience: AudienceRef[]) {
+  const seen = new Set<string>();
+  return audience.filter((entry) => {
+    const key = `${entry.kind}:${entry.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function audienceWakesAgent(audience: AudienceRef, actors: Record<string, Actor>) {
+  if (audience.kind === "all" || audience.kind === "agents") return true;
+  if (audience.kind !== "actor") return false;
+  return actors[audience.id]?.kind === "agent";
+}
+
+function mentionTokenForActor(actor: Actor) {
+  const name = displayName(actor).trim();
+  if (name && !/[\s,.;:!?()[\]{}<>"'`@]/.test(name)) {
+    return `@${name}`;
+  }
+  return `@${shortActorAlias(actor.id)}`;
+}
+
+function shortActorAlias(actorId: string) {
+  return (
+    actorId.replace(
+      /^(actor_agent_|actor_human_|actor_service_|actor_)/,
+      "",
+    ) || actorId
+  );
 }
 
 function canUseAsThreadRoot(message: Message) {
-  return canUseAsTaskSource(message);
-}
-
-function canUseAsTaskSource(message: Message) {
   return (
     message.kind !== "system" &&
     message.scope.kind === "channel" &&
@@ -2285,11 +3079,85 @@ function canUseAsTaskSource(message: Message) {
   );
 }
 
-async function ensureChannelMembers(channelId: string, actorIds: string[]) {
-  const uniqueActorIds = [...new Set(actorIds.map((id) => id.trim()).filter(Boolean))];
-  await Promise.allSettled(
-    uniqueActorIds.map((actorId) => ipc.channelInvite({ channelId, actorId })),
+function isChannelMember(channel: Channel, actorId: string) {
+  return channel.visibility === "public" || channel.members.includes(actorId);
+}
+
+function isExplicitChannelMember(channel: Channel, actorId: string) {
+  return channel.members.includes(actorId);
+}
+
+function canAddChannelMember(channel: Channel, actor: Actor) {
+  return actor.kind !== "service" && !isExplicitChannelMember(channel, actor.id);
+}
+
+function canRemoveChannelMember(channel: Channel, actorId: string) {
+  if (!isExplicitChannelMember(channel, actorId)) return false;
+  if (channel.visibility === "public") return true;
+  return channel.members[0] !== actorId;
+}
+
+function fallbackActor(actorId: string): Actor {
+  if (actorId.startsWith("actor_agent_")) return { id: actorId, kind: "agent" };
+  if (actorId.startsWith("actor_service_")) return { id: actorId, kind: "service" };
+  return { id: actorId, kind: "human" };
+}
+
+function isWorkflowMessage(message: Message) {
+  return (
+    message.kind === "task_update" ||
+    message.intent === "assign_task" ||
+    typeof message.metadata?.assignmentId === "string" ||
+    /^Assignment\s+\S+.*\bcompleted\b/i.test(message.body.trim())
   );
+}
+
+function isWorkflowResultMessage(message: Message, workflowSourceIds: Set<string>) {
+  return (
+    message.kind === "agent" &&
+    Boolean(message.parentMessageId && workflowSourceIds.has(message.parentMessageId))
+  );
+}
+
+function isHiddenProtocolMessage(message: Message) {
+  return /^(accepted|declined):\s*(accepted|declined)$/i.test(message.body.trim());
+}
+
+function workflowSummary(message: Message, actors: Record<string, Actor>) {
+  const taskNumber = numberMetadata(message, "taskNumber");
+  const taskLabel = taskNumber ? `Task #${taskNumber}` : "Task";
+  const recipient = message.audience.find((audience) => audience.kind === "actor")?.id;
+  if (message.intent === "assign_task") {
+    return recipient
+      ? `${taskLabel} assigned to ${actorName(actors, recipient)}`
+      : `${taskLabel} assigned`;
+  }
+  if (/completed/i.test(message.body)) {
+    return `${taskLabel} completed`;
+  }
+  return `${taskLabel} updated`;
+}
+
+function workflowResultSummary(message: Message) {
+  const resultLine = message.body
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => /^Result summary:/i.test(line));
+  if (resultLine) return resultLine.replace(/^Result summary:\s*/i, "");
+
+  const usefulLines = message.body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^let me\b/i.test(line))
+    .filter((line) => !/\bloom\b.*\b(cli|socket|PATH)\b/i.test(line))
+    .filter((line) => !/^found a loom binary/i.test(line));
+  return usefulLines.at(-1) ?? "Task result posted.";
+}
+
+function numberMetadata(message: Message, key: string) {
+  const value = message.metadata?.[key];
+  return typeof value === "number" ? value : null;
 }
 
 function sameScope(a: ScopeRef, b: ScopeRef) {
@@ -2348,13 +3216,10 @@ function actionChoices(message: Message) {
       })
       .filter((choice): choice is { id: string; label: string; accepted: boolean } =>
         Boolean(choice),
-      );
+    );
     if (parsed.length > 0) return parsed;
   }
-  return [
-    { id: "accepted", label: "Approve", accepted: true },
-    { id: "declined", label: "Decline", accepted: false },
-  ];
+  return [];
 }
 
 function messageTitle(message: Message) {

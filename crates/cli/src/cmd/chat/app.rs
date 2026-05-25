@@ -688,6 +688,7 @@ mod tests {
             Channel {
                 id: "ch_design".into(),
                 title: "design".into(),
+                topic: String::new(),
                 visibility: ChannelVisibility::Private,
                 members: vec!["actor_human_current".into(), "actor_agent_alpha".into()],
                 _meta: None,
@@ -695,6 +696,7 @@ mod tests {
             Channel {
                 id: "ch_lobby".into(),
                 title: "lobby".into(),
+                topic: String::new(),
                 visibility: ChannelVisibility::Public,
                 members: vec!["actor_agent_gamma".into()],
                 _meta: None,
@@ -751,6 +753,7 @@ mod tests {
         sidebar.replace_channels(vec![Channel {
             id: "ch_lobby".into(),
             title: "lobby".into(),
+            topic: String::new(),
             visibility: ChannelVisibility::Public,
             members: vec![],
             _meta: None,

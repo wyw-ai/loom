@@ -13,6 +13,7 @@
 - [interactive-command-agent-transport-design.md](./interactive-command-agent-transport-design.md) —— interactive command transport 设计
 - [gui-desktop-design.md](./gui-desktop-design.md) —— Loom Desktop GUI 设计与设计 token 来源
 - [protocol/task-workflow.md](./protocol/task-workflow.md) —— channel 顶层消息上的 task / assignment 闭环模型和 CLI/RPC 用法
+- [protocol/agent-coordination-workflow.md](./protocol/agent-coordination-workflow.md) —— 多 agent “开工前 claim，发送前 rebase”的协作协议
 
 ## 频道 / actor 拓扑
 

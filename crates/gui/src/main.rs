@@ -12,8 +12,6 @@ mod state;
 mod ws;
 
 use std::sync::Arc;
-
-#[cfg(debug_assertions)]
 use tauri::Manager;
 use tokio::sync::Mutex;
 
@@ -63,6 +61,7 @@ fn main() {
             ipc::message_list,
             ipc::message_send,
             ipc::message_read,
+            ipc::message_reaction_toggle,
             ipc::task_create,
             ipc::task_get,
             ipc::task_list,
@@ -112,6 +111,10 @@ fn main() {
             ipc::machine_agent_remove,
         ])
         .setup(|app| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
             #[cfg(debug_assertions)]
             if std::env::var_os("LOOM_GUI_OPEN_DEVTOOLS").is_some() {
                 if let Some(win) = app.get_webview_window("main") {

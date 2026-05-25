@@ -29,6 +29,7 @@ pub type StoreResult<T> = Result<T, StoreError>;
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
     MessageCreated(Message),
+    MessageUpdated(Message),
     EventCreated(Event),
     RunUpdated(Run),
     ThreadCreated(Thread),
@@ -42,6 +43,7 @@ pub enum StoreEvent {
     ArtifactPublished(Artifact),
     DeliveryUpdated(Delivery),
     MachineCommandUpdated(MachineCommand),
+    ChannelUpdated(Channel),
     /// `actor_id` was just added to `channel_id`'s ACL. ws::fanout pushes
     /// this directly to the affected actor's connection (if any) — never
     /// broadcast to scope subscribers.
@@ -60,7 +62,7 @@ pub enum StoreEvent {
 impl StoreEvent {
     pub fn scope(&self) -> Option<ScopeRef> {
         match self {
-            StoreEvent::MessageCreated(m) => Some(m.scope.clone()),
+            StoreEvent::MessageCreated(m) | StoreEvent::MessageUpdated(m) => Some(m.scope.clone()),
             StoreEvent::EventCreated(e) => Some(e.scope.clone()),
             StoreEvent::RunUpdated(r) => Some(r.scope.clone()),
             StoreEvent::ThreadCreated(c) => Some(ScopeRef {
@@ -74,6 +76,10 @@ impl StoreEvent {
             StoreEvent::TaskChanged(t) => Some(ScopeRef {
                 kind: ScopeKind::Channel,
                 id: t.channel_id.clone(),
+            }),
+            StoreEvent::ChannelUpdated(c) => Some(ScopeRef {
+                kind: ScopeKind::Channel,
+                id: c.id.clone(),
             }),
             StoreEvent::TaskAssignmentChanged { task, .. } => Some(ScopeRef {
                 kind: ScopeKind::Channel,
@@ -217,6 +223,15 @@ impl Store {
         title: String,
         creator_actor_id: Option<String>,
     ) -> StoreResult<Channel> {
+        self.create_channel_with_topic(title, String::new(), creator_actor_id)
+    }
+
+    pub fn create_channel_with_topic(
+        &self,
+        title: String,
+        topic: String,
+        creator_actor_id: Option<String>,
+    ) -> StoreResult<Channel> {
         let (visibility, members) = match creator_actor_id {
             Some(id) => (ChannelVisibility::Private, vec![id]),
             None => (ChannelVisibility::Public, Vec::new()),
@@ -224,6 +239,7 @@ impl Store {
         let channel = Channel {
             id: format!("chan_{}", short_id()),
             title,
+            topic,
             visibility,
             members,
             _meta: None,
@@ -290,6 +306,7 @@ impl Store {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
         })?;
+        self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         self.emit(StoreEvent::ChannelGranted {
             channel: updated.clone(),
             actor_id: actor_id.to_string(),
@@ -313,6 +330,7 @@ impl Store {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
         })?;
+        self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         self.emit(StoreEvent::ChannelRevoked {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
@@ -541,13 +559,19 @@ impl Store {
         Ok(presence)
     }
 
-    pub fn update_channel(&self, id: &str, title: String) -> StoreResult<Channel> {
+    pub fn update_channel(
+        &self,
+        id: &str,
+        title: String,
+        topic: Option<String>,
+    ) -> StoreResult<Channel> {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
         }
         self.journal.append(&Mutation::ChannelUpdate {
             channel_id: id.to_string(),
             title: title.clone(),
+            topic: topic.clone(),
         })?;
         let mut inner = self.inner.write();
         let ch = inner
@@ -555,7 +579,13 @@ impl Store {
             .get_mut(id)
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
         ch.title = title;
-        Ok(ch.clone())
+        if let Some(topic) = topic {
+            ch.topic = topic;
+        }
+        let updated = ch.clone();
+        drop(inner);
+        self.emit(StoreEvent::ChannelUpdated(updated.clone()));
+        Ok(updated)
     }
 
     /// Default (`cascade = false`) refuses when the channel still contains
@@ -1004,6 +1034,54 @@ impl Store {
                 task.artifact_ids.push(id);
             }
         }
+        task.updated_at = Utc::now();
+        self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
+        self.inner
+            .write()
+            .tasks
+            .insert(task.id.clone(), task.clone());
+        self.emit(StoreEvent::TaskChanged(task.clone()));
+        Ok(task)
+    }
+
+    pub fn claim_task(&self, task_id: &str, owner_actor_id: String) -> StoreResult<Task> {
+        let _guard = self.structure_lock.lock();
+        let mut task = self
+            .get_task(task_id)
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        if is_terminal_task_status(task.status) {
+            return Err(StoreError::InvalidState(format!(
+                "task {task_id} cannot be claimed from terminal status {:?}",
+                task.status
+            )));
+        }
+        if !self.is_channel_member(&task.channel_id, &owner_actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "task owner {owner_actor_id} is not a member of channel {}",
+                task.channel_id
+            )));
+        }
+        if let Some(existing_owner) = task.owner_actor_id.as_ref() {
+            if existing_owner == &owner_actor_id {
+                if task.status != TaskStatus::Todo {
+                    return Ok(task);
+                }
+                task.status = TaskStatus::Claimed;
+                task.updated_at = Utc::now();
+                self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
+                self.inner
+                    .write()
+                    .tasks
+                    .insert(task.id.clone(), task.clone());
+                self.emit(StoreEvent::TaskChanged(task.clone()));
+                return Ok(task);
+            }
+            return Err(StoreError::Conflict(format!(
+                "task {task_id} is already claimed by {existing_owner}"
+            )));
+        }
+        task.owner_actor_id = Some(owner_actor_id);
+        task.status = TaskStatus::Claimed;
         task.updated_at = Utc::now();
         self.journal.append(&Mutation::TaskUpsert(task.clone()))?;
         self.inner
@@ -3016,6 +3094,7 @@ impl Store {
                 session.thread_root_message_id.clone(),
                 Vec::new(),
                 metadata,
+                None,
             )?),
             None => None,
         };
@@ -3189,6 +3268,7 @@ impl Store {
         thread_root_message_id: Option<String>,
         attachments: Vec<String>,
         metadata: Meta,
+        if_latest_message_id: Option<String>,
     ) -> StoreResult<Message> {
         let _guard = self.structure_lock.lock();
         self.append_message_locked(
@@ -3204,6 +3284,7 @@ impl Store {
             thread_root_message_id,
             attachments,
             metadata,
+            if_latest_message_id,
         )
     }
 
@@ -3222,6 +3303,7 @@ impl Store {
         thread_root_message_id: Option<String>,
         attachments: Vec<String>,
         metadata: Meta,
+        if_latest_message_id: Option<String>,
     ) -> StoreResult<Message> {
         if body.trim().is_empty() && attachments.is_empty() {
             return Err(StoreError::InvalidState("message body is empty".into()));
@@ -3229,6 +3311,27 @@ impl Store {
 
         let resolved = self.resolve_message_target_for_append(&target, &author_actor_id)?;
         self.check_scope_access(&resolved.scope, &author_actor_id)?;
+        if let Some(expected) = if_latest_message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let latest = {
+                let inner = self.inner.read();
+                inner
+                    .messages_by_scope
+                    .get(&resolved.scope)
+                    .and_then(|ids| ids.last())
+                    .cloned()
+            };
+            if latest.as_deref() != Some(expected) {
+                return Err(StoreError::Conflict(format!(
+                    "message target {} has latest message {}, expected {expected}",
+                    resolved.target,
+                    latest.as_deref().unwrap_or("<none>")
+                )));
+            }
+        }
         self.validate_message_mentions(&resolved.scope, &explicit_mentions)?;
         self.validate_message_audience(&resolved.scope, &explicit_audience)?;
         if let Some(parent_id) = parent_message_id.as_deref() {
@@ -3264,6 +3367,7 @@ impl Store {
             thread_root_message_id: thread_root_message_id.or(resolved.thread_root_message_id),
             task_id: None,
             attachments,
+            reactions: Vec::new(),
             metadata,
         };
 
@@ -3312,6 +3416,59 @@ impl Store {
 
     pub fn get_message(&self, id: &str) -> Option<Message> {
         self.inner.read().messages.get(id).cloned()
+    }
+
+    pub fn toggle_message_reaction(
+        &self,
+        actor_id: String,
+        message_id: &str,
+        emoji: String,
+    ) -> StoreResult<Message> {
+        let emoji = emoji.trim().to_string();
+        if emoji.is_empty() {
+            return Err(StoreError::InvalidState("reaction emoji is empty".into()));
+        }
+        if emoji.chars().count() > 16 {
+            return Err(StoreError::InvalidState(
+                "reaction emoji is too long".into(),
+            ));
+        }
+
+        let mut message = self
+            .get_message(message_id)
+            .ok_or_else(|| StoreError::NotFound(format!("message {message_id}")))?;
+        self.check_scope_access(&message.scope, &actor_id)?;
+
+        match message
+            .reactions
+            .iter_mut()
+            .find(|reaction| reaction.emoji == emoji)
+        {
+            Some(reaction) if reaction.actor_ids.iter().any(|id| id == &actor_id) => {
+                reaction.actor_ids.retain(|id| id != &actor_id);
+            }
+            Some(reaction) => {
+                reaction.actor_ids.push(actor_id);
+                reaction.actor_ids.sort();
+                reaction.actor_ids.dedup();
+            }
+            None => message.reactions.push(MessageReaction {
+                emoji,
+                actor_ids: vec![actor_id],
+            }),
+        }
+        message
+            .reactions
+            .retain(|reaction| !reaction.actor_ids.is_empty());
+
+        self.journal
+            .append(&Mutation::MessageUpdate(message.clone()))?;
+        self.inner
+            .write()
+            .messages
+            .insert(message.id.clone(), message.clone());
+        self.emit(StoreEvent::MessageUpdated(message.clone()));
+        Ok(message)
     }
 
     pub fn read_messages_for_target(
@@ -3550,6 +3707,7 @@ impl Store {
         let channel = Channel {
             id: format!("chan_{}", short_id()),
             title: title.to_string(),
+            topic: String::new(),
             visibility: ChannelVisibility::Private,
             members: vec![actor_id.to_string(), peer.to_string()],
             _meta: None,
@@ -3715,7 +3873,15 @@ impl Store {
         for audience in &message.audience {
             match audience.kind {
                 AudienceKind::Actor => recipients.push(audience.id.clone()),
-                AudienceKind::All | AudienceKind::Humans => {
+                AudienceKind::All => {
+                    recipients
+                        .extend(self.channel_actors_by_kind(&message.scope, ActorKind::Human));
+                    if message.delivery_policy == DeliveryPolicy::WakeAgent {
+                        recipients
+                            .extend(self.channel_actors_by_kind(&message.scope, ActorKind::Agent));
+                    }
+                }
+                AudienceKind::Humans => {
                     recipients
                         .extend(self.channel_actors_by_kind(&message.scope, ActorKind::Human));
                 }
@@ -4024,6 +4190,7 @@ impl Store {
             None,
             Vec::new(),
             metadata,
+            None,
         )
     }
 
@@ -4597,6 +4764,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .push(m.id.clone());
             inner.messages.insert(m.id.clone(), m);
         }
+        Mutation::MessageUpdate(m) => {
+            inner.messages.insert(m.id.clone(), m);
+        }
         Mutation::EventAppend(e) => {
             let scope = e.scope.clone();
             inner
@@ -4644,9 +4814,16 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .or_default()
                 .push(frame);
         }
-        Mutation::ChannelUpdate { channel_id, title } => {
+        Mutation::ChannelUpdate {
+            channel_id,
+            title,
+            topic,
+        } => {
             if let Some(c) = inner.channels.get_mut(&channel_id) {
                 c.title = title;
+                if let Some(topic) = topic {
+                    c.topic = topic;
+                }
             }
         }
         Mutation::ChannelDelete { channel_id } => {
@@ -5492,6 +5669,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("append root message")
             .id
@@ -5567,6 +5745,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("append message")
     }
@@ -5721,6 +5900,58 @@ mod tests {
     }
 
     #[test]
+    fn at_all_with_wake_policy_wakes_agent_members() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_bob", ActorKind::Human, "Bob"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("release".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+
+        let message = store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "@all count together".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("append @all wake message");
+
+        assert!(message
+            .audience
+            .iter()
+            .any(|audience| audience.kind == AudienceKind::All));
+        assert_eq!(
+            store
+                .list_deliveries("actor_bob", Some(DeliveryState::Pending), 10, None)
+                .len(),
+            1
+        );
+        let agent_deliveries =
+            store.list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None);
+        assert_eq!(agent_deliveries.len(), 1);
+        assert_eq!(agent_deliveries[0].source_id, message.id);
+    }
+
+    #[test]
     fn custom_group_mentions_notify_humans_without_waking_agents() {
         let store = fresh_store();
         store
@@ -5817,6 +6048,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("append group wake message");
 
@@ -6084,15 +6316,48 @@ mod tests {
             .create_channel("orig title".into(), None)
             .expect("create channel");
         let updated = store
-            .update_channel(&ch.id, "renamed".into())
+            .update_channel(&ch.id, "renamed".into(), Some("project notes".into()))
             .expect("update channel");
         assert_eq!(updated.title, "renamed");
+        assert_eq!(updated.topic, "project notes");
         assert_eq!(store.get_channel(&ch.id).unwrap().title, "renamed");
+        assert_eq!(store.get_channel(&ch.id).unwrap().topic, "project notes");
 
         // Re-open from the same journal: the rename must replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let store2 = Store::open(journal).unwrap();
         assert_eq!(store2.get_channel(&ch.id).unwrap().title, "renamed");
+        assert_eq!(store2.get_channel(&ch.id).unwrap().topic, "project notes");
+    }
+
+    #[test]
+    fn message_reaction_toggle_persists_via_replay() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        let channel = store
+            .create_channel("reactions".into(), Some("actor_alice".into()))
+            .unwrap();
+        let message = send_test_message(&store, "actor_alice", &format!("#{}", channel.id), "hi");
+
+        let reacted = store
+            .toggle_message_reaction("actor_alice".into(), &message.id, "✅".into())
+            .expect("add reaction");
+        assert_eq!(reacted.reactions.len(), 1);
+        assert_eq!(reacted.reactions[0].actor_ids, vec!["actor_alice"]);
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        assert_eq!(
+            replayed.get_message(&message.id).unwrap().reactions[0].emoji,
+            "✅"
+        );
+
+        let cleared = replayed
+            .toggle_message_reaction("actor_alice".into(), &message.id, "✅".into())
+            .expect("remove reaction");
+        assert!(cleared.reactions.is_empty());
     }
 
     #[test]
@@ -6130,6 +6395,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("append thread message")
             .id;
@@ -6299,6 +6565,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .unwrap();
         let err = store
@@ -6438,6 +6705,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .unwrap();
         let (updated, _) = store
@@ -7720,7 +7988,7 @@ mod tests {
     fn update_or_delete_missing_channel_returns_not_found() {
         let store = fresh_store();
         let err = store
-            .update_channel("chan_missing", "x".into())
+            .update_channel("chan_missing", "x".into(), None)
             .expect_err("must be NotFound");
         assert!(matches!(err, StoreError::NotFound(_)));
         let err = store

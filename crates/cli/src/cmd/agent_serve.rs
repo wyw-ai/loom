@@ -24,15 +24,15 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, BundleInstallMode, InboxListResult, MessageSendResult,
-    PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    AgentModelChoice, AgentSpec, BundleInstallMode, ChannelMembersResult, InboxListResult,
+    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
+    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, RunStatus, ScopeKind,
-    ScopeRef, TaskAssignmentStatus,
+    Actor, ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta,
+    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus,
 };
 #[cfg(test)]
 use proto::types::{Event, RefKind, RelationKind};
@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, sleep, Duration, Instant};
 
 use agent_runtime::acp::{AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -57,6 +57,7 @@ use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+const LOOM_CLI_ENV: &str = "LOOM_CLI";
 
 pub async fn run(
     specs_dir_opt: Option<PathBuf>,
@@ -304,13 +305,108 @@ fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
     Ok(Some(spec))
 }
 
-/// The path to *this* loom binary. Used as the `command` for the
-/// auto-injected Loom MCP server entries; falls back to the bare
-/// name `"loom"` (hoping it's on PATH) if we can't resolve our own exe.
+/// The path to the Loom CLI. `loom-daemon` is often launched by absolute path,
+/// so `current_exe()` points at `loom-daemon`; agents need the sibling `loom`
+/// binary instead.
 fn current_loom_binary() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .or_else(|| Some(PathBuf::from("loom")))
+    resolve_loom_cli_binary().or_else(|| Some(PathBuf::from("loom")))
+}
+
+fn resolve_loom_cli_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(LOOM_CLI_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| is_executable_file(path))
+    {
+        return Some(path);
+    }
+
+    if let Ok(current) = std::env::current_exe() {
+        if executable_stem_is(&current, "loom") && is_executable_file(&current) {
+            return Some(current);
+        }
+        if let Some(parent) = current.parent() {
+            let sibling = parent.join(executable_name("loom"));
+            if is_executable_file(&sibling) {
+                return Some(sibling);
+            }
+        }
+    }
+
+    find_executable_on_path("loom")
+}
+
+fn inject_loom_cli_env(env: &mut BTreeMap<String, String>, loom_binary: Option<&Path>) {
+    let Some(loom_binary) = loom_binary else {
+        return;
+    };
+    env.entry(LOOM_CLI_ENV.into())
+        .or_insert_with(|| loom_binary.display().to_string());
+    if let Some(parent) = loom_binary.parent() {
+        prepend_path_dir(env, parent);
+    }
+}
+
+fn prepend_path_dir(env: &mut BTreeMap<String, String>, dir: &Path) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    let existing = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let mut dirs = vec![dir.to_path_buf()];
+    dirs.extend(std::env::split_paths(&existing).filter(|path| path != dir));
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        env.insert("PATH".into(), joined.to_string_lossy().into_owned());
+    }
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(executable_name(name));
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn executable_name(stem: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{stem}.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        stem.to_string()
+    }
+}
+
+fn executable_stem_is(path: &Path, expected: &str) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == expected)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 pub struct MachineCommandTask {
@@ -792,6 +888,7 @@ impl AgentPaths {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         let mut env = BTreeMap::new();
         env.insert("LOOM_SERVER".into(), server_url.to_string());
+        inject_loom_cli_env(&mut env, resolve_loom_cli_binary().as_deref());
         if let Some(socket) = daemon_ipc::env_socket_path() {
             env.insert("LOOM_DAEMON_SOCKET".into(), socket.display().to_string());
             env.insert(
@@ -1065,7 +1162,7 @@ impl AgentTrigger {
 
     fn reply_target(&self) -> Option<String> {
         match self {
-            AgentTrigger::Message(message) => Some(message.target.clone()),
+            AgentTrigger::Message(message) => Some(reply_target_for_message(message)),
             #[cfg(test)]
             AgentTrigger::Event(_) => None,
         }
@@ -1073,6 +1170,18 @@ impl AgentTrigger {
 
     fn is_message(&self) -> bool {
         matches!(self, AgentTrigger::Message(_))
+    }
+}
+
+fn reply_target_for_message(message: &Message) -> String {
+    match message.scope.kind {
+        ScopeKind::Thread => message.target.clone(),
+        ScopeKind::Channel
+            if message.parent_message_id.is_none() && message.thread_root_message_id.is_none() =>
+        {
+            format!("#{}:{}", message.scope.id, message.id)
+        }
+        ScopeKind::Channel => message.target.clone(),
     }
 }
 
@@ -1095,8 +1204,9 @@ struct WorkerState {
     /// triggers are kept ahead of service callbacks within the same scope so
     /// stale automation cannot starve an explicit user request.
     pending_triggers: Mutex<HashMap<String, VecDeque<AgentTrigger>>>,
-    /// Per-turn streaming text buffer; flushed as a single `content.add` on
-    /// `Finished`, once final usage metadata is available.
+    /// Per-turn streaming text buffer. Token/chunk streams are buffered until
+    /// the adapter reports a message boundary; complete assistant messages are
+    /// emitted to chat immediately.
     text_buffer: Mutex<HashMap<String, String>>,
     /// Provider session usage accumulated per scope. ACP, command, and
     /// interactive transports all use scope as the session boundary here.
@@ -1764,6 +1874,9 @@ fn build_adapter(
         .map(|(k, v)| (k.clone(), paths.expand(v, Some(bundle_paths))))
         .collect();
     let mut command_env = spec.transport.env.clone();
+    let loom_binary = current_loom_binary();
+    inject_loom_cli_env(&mut process_env, loom_binary.as_deref());
+    inject_loom_cli_env(&mut command_env, loom_binary.as_deref());
     process_env
         .entry("LOOM_SERVER".into())
         .or_insert_with(|| server_url.to_string());
@@ -1828,7 +1941,6 @@ fn build_adapter(
 
     match spec.transport.kind.as_str() {
         "acp_stdio" => {
-            let loom_binary = current_loom_binary();
             let mcp_servers = agent_runtime::build_mcp_servers(
                 loom_binary.as_deref(),
                 &spec.actor.id,
@@ -2152,14 +2264,309 @@ fn is_message_for_us(message: &Message, actor_id: &str) -> bool {
     if message.author_actor_id == actor_id {
         return false;
     }
+    if is_terminal_noop_agent_message(message) {
+        return false;
+    }
     if message.target == format!("dm:@{actor_id}") {
         return true;
     }
     message.audience.iter().any(|audience| match audience.kind {
-        AudienceKind::Actor => audience.id == actor_id,
-        AudienceKind::Agents => message.delivery_policy == DeliveryPolicy::WakeAgent,
-        AudienceKind::All | AudienceKind::Humans | AudienceKind::Group => false,
+        AudienceKind::Actor => {
+            audience.id == actor_id
+                && (message.delivery_policy == DeliveryPolicy::WakeAgent
+                    || message.metadata.get("kind").and_then(Value::as_str)
+                        == Some("action.request"))
+        }
+        AudienceKind::All | AudienceKind::Agents => {
+            message.delivery_policy == DeliveryPolicy::WakeAgent
+        }
+        AudienceKind::Humans | AudienceKind::Group => false,
     })
+}
+
+fn is_terminal_noop_agent_message(message: &Message) -> bool {
+    if message.kind != MessageKind::Agent {
+        return false;
+    }
+    if message.metadata.get("kind").and_then(Value::as_str) == Some("action.request") {
+        return false;
+    }
+    let body = message.body.to_lowercase();
+    let terminal_signal = [
+        "no further action",
+        "no further action needed",
+        "no further action required",
+        "task complete",
+        "fully complete",
+        "final result",
+        "final state",
+        "acknowledged",
+        "confirmed",
+        "收到",
+        "确认收到",
+        "无需进一步",
+        "无需继续",
+        "不再追加",
+        "任务完成",
+        "协作完成",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    if !terminal_signal {
+        return false;
+    }
+    let asks_for_work = [
+        "please",
+        "pls",
+        "can you",
+        "could you",
+        "should",
+        "need you",
+        "mark",
+        "run ",
+        "fix",
+        "fill ",
+        "claim ",
+        "请",
+        "需要",
+        "麻烦",
+        "帮",
+        "标记",
+        "修改",
+        "继续处理",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    !asks_for_work
+}
+
+async fn await_collaboration_turn(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    trigger: &AgentTrigger,
+) {
+    let Some(message) = trigger_message(trigger) else {
+        return;
+    };
+    if !is_multi_agent_wake_message(message) {
+        return;
+    }
+    let Some(channel_id) = resolve_channel_for_scope(client, state, &message.scope).await else {
+        return;
+    };
+    let recipients = match collaboration_agent_recipients(client, message, &channel_id).await {
+        Ok(recipients) => recipients,
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                message = %message.id,
+                %err,
+                "failed to resolve collaboration recipients"
+            );
+            return;
+        }
+    };
+    let Some(rank) = recipients
+        .iter()
+        .position(|actor_id| actor_id == &state.actor_id)
+    else {
+        return;
+    };
+    if rank == 0 {
+        return;
+    }
+
+    let prior = recipients[..rank].to_vec();
+    let target = reply_target_for_message(message);
+    let deadline = Instant::now() + collaboration_wait_timeout();
+    while Instant::now() < deadline {
+        match prior_collaboration_replies(client, &target, message, &prior).await {
+            Ok(count) if count >= rank => return,
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    message = %message.id,
+                    target = %target,
+                    %err,
+                    "waiting for collaboration thread history"
+                );
+            }
+        }
+        sleep(collaboration_poll_interval()).await;
+    }
+    tracing::debug!(
+        actor = %state.actor_id,
+        message = %message.id,
+        rank,
+        "collaboration turn wait timed out; dispatching anyway"
+    );
+}
+
+fn trigger_message(trigger: &AgentTrigger) -> Option<&Message> {
+    match trigger {
+        AgentTrigger::Message(message) => Some(message),
+        #[cfg(test)]
+        AgentTrigger::Event(_) => None,
+    }
+}
+
+fn is_multi_agent_wake_message(message: &Message) -> bool {
+    if message.delivery_policy != DeliveryPolicy::WakeAgent {
+        return false;
+    }
+    if message
+        .audience
+        .iter()
+        .any(|audience| matches!(audience.kind, AudienceKind::All | AudienceKind::Agents))
+    {
+        return true;
+    }
+    message
+        .audience
+        .iter()
+        .filter(|audience| audience.kind == AudienceKind::Actor)
+        .take(2)
+        .count()
+        > 1
+}
+
+async fn collaboration_agent_recipients(
+    client: &Arc<Client>,
+    message: &Message,
+    channel_id: &str,
+) -> Result<Vec<String>> {
+    let members = channel_members(client, channel_id).await?;
+    Ok(collaboration_agent_recipients_from_members(
+        message, &members,
+    ))
+}
+
+async fn channel_members(client: &Arc<Client>, channel_id: &str) -> Result<Vec<Actor>> {
+    let result: ChannelMembersResult = client
+        .call(method::CHANNEL_MEMBERS, json!({ "channelId": channel_id }))
+        .await
+        .with_context(|| format!("channel/members channel={channel_id}"))?;
+    Ok(result.members)
+}
+
+fn collaboration_agent_recipients_from_members(
+    message: &Message,
+    members: &[Actor],
+) -> Vec<String> {
+    let member_agents = members
+        .iter()
+        .filter(|actor| actor.kind == ActorKind::Agent)
+        .map(|actor| actor.id.clone())
+        .collect::<Vec<_>>();
+    let member_agent_set = member_agents.iter().cloned().collect::<HashSet<String>>();
+    let mut recipients = Vec::new();
+    for audience in &message.audience {
+        match audience.kind {
+            AudienceKind::Actor => {
+                if member_agent_set.contains(&audience.id) {
+                    recipients.push(audience.id.clone());
+                }
+            }
+            AudienceKind::All | AudienceKind::Agents => {
+                recipients.extend(member_agents.iter().cloned());
+            }
+            AudienceKind::Group | AudienceKind::Humans => {}
+        }
+    }
+    unique_nonempty_strings(recipients)
+}
+
+async fn prior_collaboration_replies(
+    client: &Arc<Client>,
+    target: &str,
+    trigger: &Message,
+    prior_actor_ids: &[String],
+) -> Result<usize> {
+    let result: MessageListResult = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({
+                "target": target,
+                "limit": 50,
+            }),
+        )
+        .await
+        .with_context(|| format!("message.list target={target}"))?;
+    Ok(count_prior_collaboration_replies(
+        &result.messages,
+        trigger,
+        prior_actor_ids,
+    ))
+}
+
+fn count_prior_collaboration_replies(
+    messages: &[Message],
+    trigger: &Message,
+    prior_actor_ids: &[String],
+) -> usize {
+    let prior = prior_actor_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut answered = HashSet::new();
+    for message in messages {
+        if !prior.contains(message.author_actor_id.as_str()) {
+            continue;
+        }
+        if !message_counts_as_collaboration_reply(message, trigger) {
+            continue;
+        }
+        answered.insert(message.author_actor_id.as_str());
+    }
+    answered.len()
+}
+
+fn message_counts_as_collaboration_reply(message: &Message, trigger: &Message) -> bool {
+    if message.id == trigger.id || message.created_at < trigger.created_at {
+        return false;
+    }
+    if message.metadata.get("kind").and_then(Value::as_str) == Some("run.started_ack") {
+        return false;
+    }
+    if message
+        .metadata
+        .get("trigger_source_id")
+        .or_else(|| message.metadata.get("triggerSourceId"))
+        .and_then(Value::as_str)
+        == Some(trigger.id.as_str())
+    {
+        return true;
+    }
+    if message.parent_message_id.as_deref() == Some(trigger.id.as_str()) {
+        return true;
+    }
+    trigger.scope.kind == ScopeKind::Channel
+        && message.thread_root_message_id.as_deref() == Some(trigger.id.as_str())
+}
+
+fn collaboration_wait_timeout() -> Duration {
+    std::env::var("LOOM_AGENT_COLLAB_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(60))
+}
+
+fn collaboration_poll_interval() -> Duration {
+    Duration::from_millis(750)
+}
+
+fn unique_nonempty_strings(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if item.trim().is_empty() || !seen.insert(item.clone()) {
+            continue;
+        }
+        out.push(item);
+    }
+    out
 }
 
 async fn handle_message_trigger(
@@ -2326,7 +2733,7 @@ async fn drain_pending_inbox(
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            if entry.delivery.actor_id != actor_id && !is_message_for_us(&message, actor_id) {
+            if !is_message_for_us(&message, actor_id) {
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
@@ -2654,6 +3061,7 @@ async fn dispatch_trigger(
     mut trigger: AgentTrigger,
 ) -> Result<AgentTrigger> {
     loop {
+        await_collaboration_turn(client, state, &trigger).await;
         subscribe_scope(client, state, trigger.scope()).await;
         let run_res: RunOpenResult = client
             .call(
@@ -2819,6 +3227,95 @@ async fn render_trigger_prompt(
         prompt.push_str(&context);
     }
     prompt
+}
+
+async fn recent_conversation_context(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    trigger: &AgentTrigger,
+) -> String {
+    let Some(message) = trigger_message(trigger) else {
+        return String::new();
+    };
+    let target = reply_target_for_message(message);
+    let result: Result<MessageListResult> = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({
+                "target": target,
+                "limit": 20,
+            }),
+        )
+        .await
+        .with_context(|| format!("message.list target={target}"));
+    let messages = match result {
+        Ok(result) => result.messages,
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                message = %message.id,
+                %err,
+                "recent conversation context unavailable"
+            );
+            return String::new();
+        }
+    };
+    if messages.is_empty() {
+        return String::new();
+    }
+    let actor_names = actor_display_map_for_prompt(client, state).await;
+    format_recent_conversation_context(&messages, message, &actor_names)
+}
+
+fn format_recent_conversation_context(
+    messages: &[Message],
+    trigger: &Message,
+    actor_names: &HashMap<String, String>,
+) -> String {
+    let lines = messages
+        .iter()
+        .filter(|message| message.id != trigger.id)
+        .filter(|message| message.created_at <= Utc::now())
+        .filter(|message| {
+            message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
+        })
+        .filter_map(|message| {
+            let body = compact_message_body(&message.body);
+            if body.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "- {}: {}",
+                actor_label(&message.author_actor_id, actor_names),
+                body
+            ))
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "=== Recent Loom conversation ===\n\
+         These are prior messages in the same thread/channel. Continue from them; do not repeat a number or answer another actor already supplied.\n{}",
+        lines.join("\n")
+    )
+}
+
+fn compact_message_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 800 {
+        compact
+    } else {
+        format!("{}...", compact.chars().take(800).collect::<String>())
+    }
+}
+
+fn join_prompt_sections(sections: impl IntoIterator<Item = String>) -> String {
+    sections
+        .into_iter()
+        .filter(|section| !section.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 async fn actor_display_map_for_prompt(
@@ -3198,7 +3695,9 @@ async fn compose_envelope_prompt(
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
     let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
-    let runtime_context = local_time_manifest();
+    let conversation_context = recent_conversation_context(client, state, trigger).await;
+    let runtime_context =
+        join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
     let scope_bootstrap = if first_turn || command_transport_without_resume(&state.spec) {
         seed_manifest(&state.actor_id, scope)
     } else {
@@ -3258,7 +3757,7 @@ async fn compose_envelope_prompt(
             identity_spec,
             memory_spec,
             channel_id: channel_id.as_deref(),
-            thread_context: "",
+            thread_context: &conversation_context,
             runtime_context: &runtime_context,
             user_message: &user_text,
             scope_bootstrap: &scope_bootstrap,
@@ -3544,15 +4043,32 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            actor id      = {actor_id}\n\
            current scope = {scope_kind}:{scope_id}\n\
          \n\
-         You can shell out to the `loom` CLI for server access. LOOM_SERVER,\n\
-         LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, and LOOM_TRIGGER_ACTOR are already injected into your env,\n\
+         You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
+         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, and LOOM_TRIGGER_ACTOR are already injected into your env,\n\
          so commands like:\n\
            loom --json inbox list --no-ack\n\
+           \"$LOOM_CLI\" --json inbox list --no-ack\n\
            loom --json message read --target '#<channel_id>:<root_message_id>'\n\
+           loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
+           loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"\n\
+           loom --json task complete <task_id> --result \"short outcome summary\"\n\
            loom --json artifact get <art_id|artifact://...>\n\
            loom --json task assign <task_id> --to <actor_id> --type <type> --instruction <text> --contract-file <path>\n\
            loom --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
            loom --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
+        Hard collaboration rule: claim before work, rebase before send. If a\n\
+        top-level message is a work item, claim it by source message before\n\
+        doing substantive work. If claim fails because another owner exists,\n\
+        stop and do not duplicate the work. Before sending extra visible\n\
+        messages with `loom message send`, read latest, adjust your content to\n\
+        the still-needed delta, and send with `--if-latest <message_id>`.\n\
+        If a claimed task reaches its acceptance criteria, close it with\n\
+        `loom task complete <task_id> --result ...`; do not leave completion as\n\
+        chat text only.\n\
+        No acknowledgement ping-pong: if the latest routed message is only a\n\
+        confirmation, receipt, already-final result, or \"no further action\",\n\
+        do not reply. For terminal tasks, stay silent unless the message asks\n\
+        for new work.\n\
         `loom task assign` requires a machine-readable contract. Do not fall back\n\
         to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
@@ -3625,7 +4141,7 @@ async fn translate_one(
         AdapterEvent::Text {
             scope: _,
             content,
-            is_partial: _,
+            is_partial,
         } => {
             let Some(active) = active else {
                 tracing::warn!(actor = %actor_id, "Text event without matching active turn; dropping");
@@ -3634,7 +4150,18 @@ async fn translate_one(
             if active.cancel_requested {
                 return Ok(());
             }
-            state.push_text(&active.id, &content);
+            if is_partial {
+                state.push_text(&active.id, &content);
+            } else {
+                if let Some(text) = state.take_text(&active.id) {
+                    let meta = build_turn_base_meta(&active);
+                    flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                }
+                if let Some(text) = non_empty_agent_text(&content) {
+                    let meta = build_turn_base_meta(&active);
+                    flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                }
+            }
             append_trace(
                 client,
                 &active.run_id,
@@ -3819,6 +4346,15 @@ fn failed_turn_text(summary: &str) -> Option<String> {
     }
 }
 
+fn parent_message_id_for_reply_target(trigger_source_id: &str, target: &str) -> Option<String> {
+    let root_message_id = target.strip_prefix('#').and_then(|raw| raw.split_once(':'));
+    if root_message_id.is_some_and(|(_, root_message_id)| root_message_id == trigger_source_id) {
+        None
+    } else {
+        Some(trigger_source_id.to_string())
+    }
+}
+
 fn build_turn_meta(
     state: &WorkerState,
     active: &ActiveTurn,
@@ -3837,6 +4373,15 @@ fn build_turn_meta(
         cumulative,
     };
 
+    let mut meta = build_turn_base_meta(active);
+    meta.insert(
+        "token_usage".into(),
+        serde_json::to_value(&usage_meta).unwrap_or(Value::Null),
+    );
+    meta
+}
+
+fn build_turn_base_meta(active: &ActiveTurn) -> Meta {
     let mut meta = Meta::new();
     meta.insert(
         "trigger_source_id".into(),
@@ -3851,11 +4396,16 @@ fn build_turn_meta(
         "prompt_breakdown".into(),
         serde_json::to_value(&active.prompt_breakdown).unwrap_or(Value::Null),
     );
-    meta.insert(
-        "token_usage".into(),
-        serde_json::to_value(&usage_meta).unwrap_or(Value::Null),
-    );
     meta
+}
+
+fn non_empty_agent_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 async fn append_trace(
@@ -3931,11 +4481,12 @@ async fn append_run_started_ack(
         metadata
     };
     let result = if let Some(target) = active.reply_target.as_deref() {
+        let parent_message_id = parent_message_id_for_reply_target(trigger.id(), target);
         send_agent_message(
             client,
             target,
             "已收到，正在处理。".into(),
-            Some(trigger.id().to_string()),
+            parent_message_id,
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,
             DeliveryPolicy::NotifyOnly,
@@ -4147,11 +4698,13 @@ async fn flush_text(
 ) -> Result<()> {
     if active.trigger_is_message {
         if let Some(target) = active.reply_target.as_deref() {
+            let parent_message_id =
+                parent_message_id_for_reply_target(&active.trigger_source_id, target);
             return send_agent_message(
                 client,
                 target,
                 text,
-                Some(active.trigger_source_id.clone()),
+                parent_message_id,
                 Some(active.trigger_actor.clone()),
                 MessageIntent::Chat,
                 DeliveryPolicy::NotifyOnly,
@@ -4214,7 +4767,7 @@ mod tests {
     use proto::methods::{
         AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, TriggerSpec,
     };
-    use proto::types::{Actor, ActorKind, Ref, Relation};
+    use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
         AgentSpec {
@@ -4249,6 +4802,44 @@ mod tests {
             announcement: None,
             trigger: None,
             prompt_template: None,
+        }
+    }
+
+    fn sample_message(
+        id: &str,
+        scope: ScopeRef,
+        target: &str,
+        parent_message_id: Option<&str>,
+        thread_root_message_id: Option<&str>,
+    ) -> Message {
+        Message {
+            id: id.into(),
+            scope,
+            target: target.into(),
+            author_actor_id: "actor_human".into(),
+            created_at: Utc::now(),
+            kind: MessageKind::Human,
+            body: "ping".into(),
+            mentions: Vec::new(),
+            audience: Vec::new(),
+            intent: MessageIntent::Chat,
+            delivery_policy: DeliveryPolicy::WakeAgent,
+            parent_message_id: parent_message_id.map(ToString::to_string),
+            thread_root_message_id: thread_root_message_id.map(ToString::to_string),
+            task_id: None,
+            attachments: Vec::new(),
+            reactions: Vec::new(),
+            metadata: Meta::default(),
+        }
+    }
+
+    fn sample_actor(id: &str, display: &str, kind: ActorKind) -> Actor {
+        Actor {
+            id: id.into(),
+            display_name: display.into(),
+            kind,
+            capabilities: None,
+            _meta: None,
         }
     }
 
@@ -4453,6 +5044,308 @@ mod tests {
         assert!(env.get("LOOM_LOCAL_UTC_OFFSET").is_some());
         assert!(env.get("LOOM_LOCAL_TIMEZONE").is_some());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn inject_loom_cli_env_sets_absolute_cli_and_prepends_path() {
+        let mut env = BTreeMap::new();
+        env.insert("PATH".into(), "/usr/bin:/bin".into());
+        let loom = Path::new("/opt/loom/bin").join("loom");
+
+        inject_loom_cli_env(&mut env, Some(&loom));
+
+        assert_eq!(
+            env.get(LOOM_CLI_ENV).map(String::as_str),
+            Some("/opt/loom/bin/loom")
+        );
+        let paths = std::env::split_paths(env.get("PATH").expect("PATH")).collect::<Vec<_>>();
+        assert_eq!(paths.first(), Some(&PathBuf::from("/opt/loom/bin")));
+        assert!(paths.contains(&PathBuf::from("/usr/bin")));
+        assert!(paths.contains(&PathBuf::from("/bin")));
+    }
+
+    #[test]
+    fn top_level_channel_message_replies_target_thread() {
+        let message = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+
+        assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn thread_message_preserves_thread_target() {
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+
+        assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn thread_root_reply_target_omits_invalid_channel_parent() {
+        assert_eq!(
+            parent_message_id_for_reply_target("msg_root", "#chan_demo:msg_root"),
+            None
+        );
+        assert_eq!(
+            parent_message_id_for_reply_target("msg_reply", "#chan_demo:msg_root"),
+            Some("msg_reply".into())
+        );
+        assert_eq!(
+            parent_message_id_for_reply_target("msg_channel", "#chan_demo"),
+            Some("msg_channel".into())
+        );
+    }
+
+    #[test]
+    fn all_wake_message_is_deliverable_to_agent_worker() {
+        let mut message = sample_message(
+            "msg_all",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::All,
+            id: "all".into(),
+            display: Some("@all".into()),
+        }];
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+
+        assert!(is_message_for_us(&message, "actor_agent_echo"));
+
+        message.delivery_policy = DeliveryPolicy::NotifyOnly;
+        assert!(!is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn actor_notify_only_message_does_not_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_notify",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        assert!(!is_message_for_us(&message, "actor_agent_echo"));
+
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+        assert!(is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn terminal_agent_ack_does_not_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_terminal",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.kind = MessageKind::Agent;
+        message.body =
+            "Acknowledged. Task complete: A=4, B=12, C=7 -> BOARD=4127. No further action needed."
+                .into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+
+        assert!(!is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn terminal_agent_message_with_work_request_can_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_closeout",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.kind = MessageKind::Agent;
+        message.body =
+            "Task complete: A=4, B=12, C=7. Please mark the task complete with this result.".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+
+        assert!(is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn dm_notify_only_message_still_wakes_target_agent() {
+        let mut message = sample_message(
+            "msg_dm",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "dm:@actor_agent_echo",
+            None,
+            None,
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        assert!(is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn collaboration_recipients_preserve_channel_agent_order() {
+        let mut message = sample_message(
+            "msg_all",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::All,
+            id: "all".into(),
+            display: Some("@all".into()),
+        }];
+        let members = vec![
+            sample_actor("actor_human_boyd", "boyd", ActorKind::Human),
+            sample_actor("actor_agent_qzz", "Qzz", ActorKind::Agent),
+            sample_actor("actor_agent_echo", "Echo", ActorKind::Agent),
+            sample_actor("actor_agent_g", "G", ActorKind::Agent),
+        ];
+
+        assert_eq!(
+            collaboration_agent_recipients_from_members(&message, &members),
+            vec![
+                "actor_agent_qzz".to_string(),
+                "actor_agent_echo".to_string(),
+                "actor_agent_g".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prior_collaboration_replies_count_unique_prior_agents() {
+        let trigger = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        let mut echo_reply = sample_message(
+            "msg_echo_1",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            None,
+            Some("msg_root"),
+        );
+        echo_reply.author_actor_id = "actor_agent_echo".into();
+        echo_reply.kind = MessageKind::Agent;
+        echo_reply
+            .metadata
+            .insert("trigger_source_id".into(), serde_json::json!("msg_root"));
+        let mut echo_duplicate = echo_reply.clone();
+        echo_duplicate.id = "msg_echo_2".into();
+        let mut ack = echo_reply.clone();
+        ack.id = "msg_ack".into();
+        ack.metadata
+            .insert("kind".into(), serde_json::json!("run.started_ack"));
+
+        assert_eq!(
+            count_prior_collaboration_replies(
+                &[ack, echo_reply, echo_duplicate],
+                &trigger,
+                &["actor_agent_echo".into(), "actor_agent_qzz".into()],
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_conversation_context_names_prior_agent_replies() {
+        let trigger = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        let mut reply = sample_message(
+            "msg_echo",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            None,
+            Some("msg_root"),
+        );
+        reply.author_actor_id = "actor_agent_echo".into();
+        reply.kind = MessageKind::Agent;
+        reply.body = "1".into();
+        let mut names = HashMap::new();
+        names.insert("actor_agent_echo".into(), "Echo".into());
+
+        let context =
+            format_recent_conversation_context(&[trigger.clone(), reply], &trigger, &names);
+
+        assert!(context.contains("Recent Loom conversation"));
+        assert!(context.contains("Echo (@actor_agent_echo): 1"));
+        assert!(!context.contains("@actor_human"));
     }
 
     #[test]

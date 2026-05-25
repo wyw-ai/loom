@@ -611,6 +611,7 @@ mod tests {
         Channel {
             id: id.into(),
             title: title.into(),
+            topic: String::new(),
             visibility: ChannelVisibility::Public,
             members: Vec::new(),
             _meta: None,

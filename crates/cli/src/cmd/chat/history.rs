@@ -1193,6 +1193,7 @@ mod tests {
             thread_root_message_id: Some("msg_root".into()),
             task_id: None,
             attachments: Vec::new(),
+            reactions: Vec::new(),
             metadata: Default::default(),
         }
     }

@@ -570,7 +570,10 @@ fn absolute_path(path: &Path) -> PathBuf {
 }
 
 fn find_command_in_path(candidates: &[&str], path: &OsString) -> Option<PathBuf> {
-    let path_dirs = std::env::split_paths(path).collect::<Vec<_>>();
+    let mut path_dirs = std::env::split_paths(path).collect::<Vec<_>>();
+    path_dirs.extend(fallback_command_dirs());
+    path_dirs.sort();
+    path_dirs.dedup();
     for candidate in candidates {
         let candidate_path = Path::new(candidate);
         if candidate_path.components().count() > 1 && is_executable(candidate_path) {
@@ -584,6 +587,34 @@ fn find_command_in_path(candidates: &[&str], path: &OsString) -> Option<PathBuf>
         }
     }
     None
+}
+
+fn fallback_command_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ];
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join(".bun").join("bin"));
+        let nvm_node_root = home.join(".nvm").join("versions").join("node");
+        if let Ok(entries) = std::fs::read_dir(nvm_node_root) {
+            dirs.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().join("bin"))
+                    .filter(|path| path.is_dir()),
+            );
+        }
+    }
+    dirs
 }
 
 fn is_executable(path: &Path) -> bool {

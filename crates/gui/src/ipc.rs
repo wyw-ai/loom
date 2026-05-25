@@ -260,7 +260,7 @@ pub async fn connect(
         .await
         .map_err(deep_stringify)?;
 
-    forward::spawn(app.clone(), Arc::clone(&client));
+    forward::spawn(app.clone(), Arc::clone(&state.inner), Arc::clone(&client));
     state.set(Some(client)).await;
     let _ = app.emit("loom://connection", forward::ConnectionEvent::Open);
 
@@ -499,6 +499,19 @@ pub async fn message_read(state: State<'_, AppState>, params: Value) -> Result<V
         .client()
         .await?
         .call_raw(method::MESSAGE_READ, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn message_reaction_toggle(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_REACTION_TOGGLE, Some(params))
         .await
         .map_err(stringify)
 }
@@ -1654,6 +1667,12 @@ async fn merge_server_machine_inventory(
         return;
     };
     for actor in actors {
+        if let Some(meta) = remote_machine_meta_from_actor(actor) {
+            if is_legacy_remote_machine_inventory(&meta) {
+                cleanup_legacy_remote_machine_inventory(client, actor, &meta).await;
+                continue;
+            }
+        }
         let Some(machine) = server_machine_info_from_actor(actor, cfg, server_url) else {
             continue;
         };
@@ -1781,6 +1800,9 @@ fn server_machine_info_from_actor(
     if !is_complete_remote_machine_inventory(&meta) {
         return None;
     }
+    if is_legacy_remote_machine_inventory(&meta) {
+        return None;
+    }
     let connection_actor_id = actor.get("id")?.as_str()?.to_string();
     let machine_id = meta.machine_id.clone();
     let name = meta.name.clone();
@@ -1891,6 +1913,40 @@ fn is_complete_remote_machine_inventory(meta: &RemoteMachineMeta) -> bool {
         && !meta.capabilities.is_empty()
         && meta.revision != 0
         && !meta.observed_at.trim().is_empty()
+}
+
+fn is_legacy_remote_machine_inventory(meta: &RemoteMachineMeta) -> bool {
+    meta.role == "machine"
+        && meta.source == "daemon"
+        && meta.machine_id.starts_with("machine_")
+        && meta.machine_id.contains("_actor_human_")
+}
+
+async fn cleanup_legacy_remote_machine_inventory(
+    client: &Arc<Client>,
+    actor: &Value,
+    meta: &RemoteMachineMeta,
+) {
+    let mut actor_ids = Vec::new();
+    if let Some(actor_id) = actor.get("id").and_then(Value::as_str) {
+        actor_ids.push(actor_id.to_string());
+    }
+    actor_ids.extend(
+        meta.agents
+            .iter()
+            .map(|agent| agent.actor_id.clone())
+            .filter(|actor_id| !is_supported_remote_actor_id(actor_id)),
+    );
+    delete_actors_from_server(Some(client.clone()), &actor_ids).await;
+}
+
+fn is_supported_remote_actor_id(actor_id: &str) -> bool {
+    let trimmed = actor_id.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
 }
 
 async fn temporary_machine_check_client(cfg: &DesktopConfig) -> Option<Arc<Client>> {
@@ -2430,6 +2486,10 @@ fn actor_id_from_input(
     display_name: &str,
     machine_id: &str,
 ) -> anyhow::Result<String> {
+    const ACTOR_ID_PREFIX: &str = "actor_agent_";
+    const ACTOR_ID_SUFFIX_LEN: usize = 8;
+    const MAX_ACTOR_ID_LEN: usize = 64;
+
     let trimmed = value.trim();
     if trimmed.is_empty() {
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
@@ -2440,7 +2500,12 @@ fn actor_id_from_input(
         } else {
             display_slug
         };
-        return Ok(format!("actor_agent_{}_{}", stem, suffix));
+        let max_stem_len = MAX_ACTOR_ID_LEN - ACTOR_ID_PREFIX.len() - 1 - ACTOR_ID_SUFFIX_LEN;
+        let stem = truncate_slug(&stem, max_stem_len);
+        return Ok(format!("{ACTOR_ID_PREFIX}{stem}_{suffix}"));
+    }
+    if trimmed.len() > MAX_ACTOR_ID_LEN {
+        anyhow::bail!("actor id must be at most {MAX_ACTOR_ID_LEN} characters")
     }
     if trimmed
         .chars()
@@ -2457,7 +2522,18 @@ fn compact_machine_slug(machine_id: &str) -> String {
         .strip_prefix("machine_")
         .filter(|rest| !rest.is_empty())
         .unwrap_or(slug.as_str());
+    let compact = compact
+        .split_once("_actor_")
+        .map(|(head, _)| head)
+        .unwrap_or(compact);
     format!("machine_{compact}")
+}
+
+fn truncate_slug(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+    value.chars().take(max_len).collect()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -2530,6 +2606,7 @@ mod tests {
         let id = actor_id_from_input("", "G仔", "machine_macbook_01").expect("actor id");
 
         assert!(id.starts_with("actor_agent_machine_macbook_01_"));
+        assert!(id.len() <= 64);
     }
 
     #[test]
@@ -2537,6 +2614,16 @@ mod tests {
         let id = actor_id_from_input("", "Reviewer", "machine_macbook_01").expect("actor id");
 
         assert!(id.starts_with("actor_agent_reviewer_"));
+        assert!(id.len() <= 64);
+    }
+
+    #[test]
+    fn generated_actor_id_truncates_long_machine_owner_slug() {
+        let id = actor_id_from_input("", "Q", "machine_abbb0e0b_actor_human_local_ws_abbb0e0b")
+            .expect("actor id");
+
+        assert!(id.starts_with("actor_agent_machine_abbb0e0b_"));
+        assert!(id.len() <= 64);
     }
 
     #[test]
@@ -2545,6 +2632,15 @@ mod tests {
             .expect("actor id");
 
         assert_eq!(id, "actor_agent_custom:01");
+    }
+
+    #[test]
+    fn explicit_actor_id_rejects_overlong_values() {
+        let id = format!("actor_agent_{}", "x".repeat(80));
+
+        let err = actor_id_from_input(&id, "G仔", "machine_macbook_01").expect_err("overlong id");
+
+        assert!(err.to_string().contains("at most 64"));
     }
 
     #[test]
@@ -2935,18 +3031,33 @@ mod tests {
 
     #[test]
     fn server_machine_inventory_ignores_legacy_machine_actor_meta() {
+        let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
-            account: Some(test_account()),
+            account: Some(account.clone()),
             workspaces: vec![],
             machines: vec![],
         };
         let actor = json!({
-            "id": "actor_service_machine_old",
+            "id": "actor_service_machine_abbb0e0b_actor_human_local_ws_abbb0e0b",
             "kind": "service",
+            "displayName": "Old Local Machine",
             "_meta": {
                 "role": "machine",
-                "machineId": "machine_old"
+                "source": "daemon",
+                "machineId": "machine_abbb0e0b_actor_human_local_ws_abbb0e0b",
+                "inventoryVersion": 2,
+                "revision": 7,
+                "observedAt": "2026-05-13T10:50:00Z",
+                "workspaceId": "default",
+                "ownerActorId": account.actor_id,
+                "name": "Old Local Machine",
+                "kind": "local",
+                "dataRoot": "/Users/boyd/.agentx/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local",
+                "configDir": "/Users/boyd/.loom-apps",
+                "capabilities": ["inventory.read", "connection.status", "machine.command", "agent.create"],
+                "providers": [],
+                "agents": []
             }
         });
 

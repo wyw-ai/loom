@@ -132,6 +132,7 @@ pub async fn dispatch(
         method::MESSAGE_SEND => message_send(state, connection_id, params),
         method::MESSAGE_LIST => message_list(state, connection_id, params),
         method::MESSAGE_READ => message_read(state, connection_id, params),
+        method::MESSAGE_REACTION_TOGGLE => message_reaction_toggle(state, connection_id, params),
         method::MESSAGE_SEARCH => message_search(state, connection_id, params),
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
         method::ARTIFACT_GET => artifact_get(state, params),
@@ -334,10 +335,14 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
         Some(id) => Some(id),
         None => state.subscriptions.actor_for_connection(connection_id),
     };
-    let channel = state
-        .store
-        .create_channel(p.title, creator)
-        .map_err(map_store_err)?;
+    let channel = if p.topic.trim().is_empty() {
+        state.store.create_channel(p.title, creator)
+    } else {
+        state
+            .store
+            .create_channel_with_topic(p.title, p.topic, creator)
+    }
+    .map_err(map_store_err)?;
     if let Some(actor_id) = channel.members.first() {
         if let Err(e) =
             state
@@ -463,7 +468,7 @@ fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ChannelUpdateParams = parse_params(params)?;
     let channel = state
         .store
-        .update_channel(&p.channel_id, p.title)
+        .update_channel(&p.channel_id, p.title, p.topic)
         .map_err(map_store_err)?;
     ok(ChannelUpdateResult { channel })
 }
@@ -775,17 +780,70 @@ fn task_claim(state: &AppState, connection_id: &str, params: Option<Value>) -> H
     let p: TaskClaimParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
     let owner = p.actor_id.unwrap_or_else(|| caller.clone());
-    let task = task_state_transition(
-        state,
-        &caller,
-        &p.task_id,
-        Some(TaskStatus::Claimed),
-        Some(owner),
-        None,
-        None,
-        Vec::new(),
-        "claimed",
-    )?;
+    let task_id = match (p.task_id, p.source_message_id) {
+        (Some(task_id), None) => task_id,
+        (None, Some(source_message_id)) => {
+            let source = state
+                .store
+                .get_message(&source_message_id)
+                .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "source message"))?;
+            state
+                .store
+                .check_scope_access(&source.scope, &caller)
+                .map_err(map_store_err)?;
+            match state.store.create_task(
+                source_message_id.clone(),
+                None,
+                String::new(),
+                caller.clone(),
+                Some(owner.clone()),
+                Some(TaskStatus::Claimed),
+                None,
+                None,
+                None,
+            ) {
+                Ok(task) => {
+                    append_task_state_message(state, &caller, &task, "claimed")?;
+                    return ok(TaskUpdateResult { task });
+                }
+                Err(StoreError::Conflict(_)) => {
+                    state
+                        .store
+                        .find_task_by_source(&source_message_id)
+                        .ok_or_else(|| {
+                            ErrorObject::new(
+                                ErrorCode::APP_CONFLICT,
+                                format!(
+                                    "task already exists for source message {source_message_id}"
+                                ),
+                            )
+                        })?
+                        .id
+                }
+                Err(err) => return Err(map_store_err(err)),
+            }
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                "pass exactly one of taskId or sourceMessageId",
+            ))
+        }
+    };
+    let existing = state
+        .store
+        .get_task(&task_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "task"))?;
+    ensure_task_access(state, &existing, &caller)?;
+    let claim_would_change = existing.owner_actor_id.as_deref() != Some(owner.as_str())
+        || existing.status == TaskStatus::Todo;
+    let task = state
+        .store
+        .claim_task(&task_id, owner)
+        .map_err(map_store_err)?;
+    if claim_would_change {
+        append_task_state_message(state, &caller, &task, "claimed")?;
+    }
     ok(TaskUpdateResult { task })
 }
 
@@ -933,6 +991,7 @@ fn append_task_state_message(
             Some(task.source_message_id.clone()),
             Vec::new(),
             metadata,
+            None,
         )
         .map(|_| ())
         .map_err(map_store_err)
@@ -1579,6 +1638,7 @@ fn emit_assignment_return_message(
         None,
         Vec::new(),
         metadata,
+        None,
     ) {
         tracing::warn!(
             task = %task.id,
@@ -1732,6 +1792,7 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
             None,
             Vec::new(),
             metadata,
+            None,
         )
         .map_err(map_store_err)?;
     let run = state
@@ -1932,6 +1993,7 @@ fn message_send(state: &AppState, connection_id: &str, params: Option<Value>) ->
             p.thread_root_message_id,
             p.attachments,
             p.metadata,
+            p.if_latest_message_id,
         )
         .map_err(map_store_err)?;
     ok(MessageSendResult { message })
@@ -1971,6 +2033,20 @@ fn message_read(state: &AppState, connection_id: &str, params: Option<Value>) ->
         .check_scope_access(&message.scope, &actor_id)
         .map_err(map_store_err)?;
     ok(MessageReadResult { message })
+}
+
+fn message_reaction_toggle(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: MessageReactionToggleParams = parse_params(params)?;
+    let actor_id = caller_actor(state, connection_id)?;
+    let message = state
+        .store
+        .toggle_message_reaction(actor_id, &p.message_id, p.emoji)
+        .map_err(map_store_err)?;
+    ok(MessageReactionToggleResult { message })
 }
 
 fn message_search(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -3637,6 +3713,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("append root message")
             .id
@@ -3697,6 +3774,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .unwrap();
         assert!(state
@@ -3728,6 +3806,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .unwrap();
         assert!(!state
@@ -3811,6 +3890,121 @@ mod tests {
             })
             .count();
         assert!(task_updates >= 2);
+    }
+
+    #[tokio::test]
+    async fn task_claim_by_source_message_is_owner_cas() {
+        let state = fresh_state("task-claim-source-cas");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_conn(&state, "conn_reviewer", "actor_reviewer").await;
+        let channel = state
+            .store
+            .create_channel("backend".into(), Some("actor_owner".into()))
+            .unwrap();
+        state
+            .store
+            .grant_channel(&channel.id, "actor_reviewer")
+            .unwrap();
+        let root_message_id = append_channel_root(&state, &channel.id, "actor_owner", "please fix");
+
+        let claimed_value = dispatch(
+            &state,
+            "conn_reviewer",
+            method::TASK_CLAIM,
+            Some(json!({ "sourceMessageId": root_message_id })),
+        )
+        .await
+        .expect("first source claim");
+        let claimed: TaskUpdateResult = serde_json::from_value(claimed_value).unwrap();
+        assert_eq!(claimed.task.status, TaskStatus::Claimed);
+        assert_eq!(
+            claimed.task.owner_actor_id.as_deref(),
+            Some("actor_reviewer")
+        );
+
+        let reclaim_err = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_CLAIM,
+            Some(json!({ "sourceMessageId": claimed.task.source_message_id })),
+        )
+        .await
+        .expect_err("other owner cannot steal claim");
+        assert_eq!(reclaim_err.code, ErrorCode::APP_CONFLICT);
+
+        let same_owner = dispatch(
+            &state,
+            "conn_reviewer",
+            method::TASK_CLAIM,
+            Some(json!({ "sourceMessageId": claimed.task.source_message_id })),
+        )
+        .await
+        .expect("same owner reclaim is idempotent");
+        let same_owner: TaskUpdateResult = serde_json::from_value(same_owner).unwrap();
+        assert_eq!(same_owner.task.id, claimed.task.id);
+    }
+
+    #[tokio::test]
+    async fn message_send_if_latest_rejects_stale_base() {
+        let state = fresh_state("message-send-if-latest");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        open_conn(&state, "conn_bob", "actor_bob").await;
+        let channel = state
+            .store
+            .create_channel("chat".into(), Some("actor_alice".into()))
+            .unwrap();
+        state.store.grant_channel(&channel.id, "actor_bob").unwrap();
+
+        let first_value = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEND,
+            Some(json!({
+                "target": format!("#{}", channel.id),
+                "body": "first",
+            })),
+        )
+        .await
+        .expect("first send");
+        let first: MessageSendResult = serde_json::from_value(first_value).unwrap();
+
+        let second_value = dispatch(
+            &state,
+            "conn_bob",
+            method::MESSAGE_SEND,
+            Some(json!({
+                "target": format!("#{}", channel.id),
+                "body": "second",
+                "ifLatestMessageId": first.message.id.clone(),
+            })),
+        )
+        .await
+        .expect("send against latest base");
+        let second: MessageSendResult = serde_json::from_value(second_value).unwrap();
+
+        let stale_err = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEND,
+            Some(json!({
+                "target": format!("#{}", channel.id),
+                "body": "stale",
+                "ifLatestMessageId": first.message.id.clone(),
+            })),
+        )
+        .await
+        .expect_err("stale send should conflict");
+        assert_eq!(stale_err.code, ErrorCode::APP_CONFLICT);
+
+        let messages = state
+            .store
+            .read_messages_for_target("actor_alice", &format!("#{}", channel.id), 10, None)
+            .unwrap()
+            .0;
+        assert_eq!(
+            messages.last().map(|message| message.id.as_str()),
+            Some(second.message.id.as_str())
+        );
     }
 
     #[test]
@@ -4094,6 +4288,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("result message");
 
@@ -4741,6 +4936,7 @@ mod tests {
                 None,
                 vec![],
                 Meta::new(),
+                None,
             )
             .expect("append message")
             .id

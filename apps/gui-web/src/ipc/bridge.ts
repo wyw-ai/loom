@@ -109,8 +109,17 @@ export async function channelList(): Promise<{ channels: Channel[] }> {
 export async function channelCreate(params: {
   title: string;
   actorId?: string;
+  topic?: string;
 }): Promise<{ channel: Channel }> {
   return invoke("channel_create", { params });
+}
+
+export async function channelUpdate(params: {
+  channelId: string;
+  title: string;
+  topic?: string;
+}): Promise<{ channel: Channel }> {
+  return invoke("channel_update", { params });
 }
 
 export async function channelMembers(
@@ -122,8 +131,15 @@ export async function channelMembers(
 export async function channelInvite(params: {
   channelId: string;
   actorId: string;
-}): Promise<unknown> {
+}): Promise<{ channel: Channel }> {
   return invoke("channel_invite", { params });
+}
+
+export async function channelRevoke(params: {
+  channelId: string;
+  actorId: string;
+}): Promise<{ channel: Channel }> {
+  return invoke("channel_revoke", { params });
 }
 
 export async function threadList(
@@ -182,6 +198,7 @@ export async function messageSend(params: {
   body: string;
   parentMessageId?: string;
   threadRootMessageId?: string;
+  ifLatestMessageId?: string;
   audience?: AudienceRef[];
   intent?: MessageIntent;
   deliveryPolicy?: DeliveryPolicy;
@@ -197,6 +214,9 @@ export async function messageSend(params: {
       ...(params.threadRootMessageId
         ? { threadRootMessageId: params.threadRootMessageId }
         : {}),
+      ...(params.ifLatestMessageId
+        ? { ifLatestMessageId: params.ifLatestMessageId }
+        : {}),
       audience: params.audience ?? [],
       intent: params.intent ?? "chat",
       deliveryPolicy: params.deliveryPolicy ?? "notify_only",
@@ -209,6 +229,13 @@ export async function messageRead(
   messageId: string,
 ): Promise<{ message: Message }> {
   return invoke("message_read", { params: { messageId } });
+}
+
+export async function messageReactionToggle(params: {
+  messageId: string;
+  emoji: string;
+}): Promise<{ message: Message }> {
+  return invoke("message_reaction_toggle", { params });
 }
 
 export async function runCancel(params: {
@@ -236,7 +263,9 @@ export async function deliveryAck(params: {
 
 export async function taskList(params?: {
   channelId?: string;
+  sourceMessageId?: string;
   ownerActorId?: string;
+  statuses?: Task["status"][];
 }): Promise<{ tasks: Task[] }> {
   return invoke("task_list", { params: params ?? {} });
 }

@@ -50,6 +50,7 @@ pub enum Mutation {
     CoordinationSessionUpsert(CoordinationSession),
     CoordinationStepAppend(CoordinationStep),
     MessageAppend(Message),
+    MessageUpdate(Message),
     EventAppend(Event),
     MembershipUpsert(Membership),
     DeliveryUpsert(Delivery),
@@ -62,6 +63,8 @@ pub enum Mutation {
     ChannelUpdate {
         channel_id: String,
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
     },
     ChannelDelete {
         channel_id: String,

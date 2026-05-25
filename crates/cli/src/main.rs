@@ -674,9 +674,12 @@ enum TaskCmd {
         #[arg(long = "artifact-id")]
         artifact_ids: Vec<String>,
     },
-    /// Claim a task for this actor or an explicit actor.
+    /// Claim a task for this actor or an explicit actor. Pass either a task id
+    /// or --source-message to atomically create/claim the message-anchored task.
     Claim {
-        task_id: String,
+        task_id: Option<String>,
+        #[arg(long = "source-message")]
+        source_message: Option<String>,
         #[arg(long)]
         actor: Option<String>,
     },
@@ -1015,6 +1018,9 @@ enum MessageCmd {
         /// Delivery policy: notify_only, wake_agent, route_by_intent, silent.
         #[arg(long = "delivery-policy")]
         delivery_policy: Option<String>,
+        /// Only send if this is still the latest message in the target scope.
+        #[arg(long = "if-latest")]
+        if_latest: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -1772,6 +1778,7 @@ async fn main() -> Result<()> {
                 text,
                 intent,
                 delivery_policy,
+                if_latest,
                 attachment_ids,
             } => {
                 cmd::message::send(
@@ -1782,6 +1789,7 @@ async fn main() -> Result<()> {
                     text,
                     intent,
                     delivery_policy,
+                    if_latest,
                     attachment_ids,
                 )
                 .await?
@@ -1849,7 +1857,11 @@ async fn main() -> Result<()> {
                 result,
                 artifact_ids,
             } => cmd::task::update(client, task_id, status, owner, result, artifact_ids).await?,
-            TaskCmd::Claim { task_id, actor } => cmd::task::claim(client, task_id, actor).await?,
+            TaskCmd::Claim {
+                task_id,
+                source_message,
+                actor,
+            } => cmd::task::claim(client, task_id, source_message, actor).await?,
             TaskCmd::Complete {
                 task_id,
                 result,
@@ -2504,6 +2516,8 @@ mod tests {
             "request_action",
             "--delivery-policy",
             "wake_agent",
+            "--if-latest",
+            "msg_latest",
             "--text",
             "please review",
         ])
@@ -2517,6 +2531,7 @@ mod tests {
                         to,
                         intent,
                         delivery_policy,
+                        if_latest,
                         text,
                         ..
                     },
@@ -2525,7 +2540,38 @@ mod tests {
                 assert_eq!(to.as_deref(), Some("actor_reviewer"));
                 assert_eq!(intent.as_deref(), Some("request_action"));
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
+                assert_eq!(if_latest.as_deref(), Some("msg_latest"));
                 assert_eq!(text.as_deref(), Some("please review"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_claim_accepts_source_message_guard() {
+        let args = Args::try_parse_from([
+            "loom",
+            "task",
+            "claim",
+            "--source-message",
+            "msg_root",
+            "--actor",
+            "actor_worker",
+        ])
+        .expect("parse task claim");
+
+        match args.cmd {
+            Cmd::Task {
+                sub:
+                    TaskCmd::Claim {
+                        task_id,
+                        source_message,
+                        actor,
+                    },
+            } => {
+                assert_eq!(task_id, None);
+                assert_eq!(source_message.as_deref(), Some("msg_root"));
+                assert_eq!(actor.as_deref(), Some("actor_worker"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

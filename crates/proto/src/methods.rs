@@ -70,6 +70,7 @@ pub mod method {
     pub const MESSAGE_SEND: &str = "message.send";
     pub const MESSAGE_LIST: &str = "message.list";
     pub const MESSAGE_READ: &str = "message.read";
+    pub const MESSAGE_REACTION_TOGGLE: &str = "message.reaction.toggle";
     pub const MESSAGE_SEARCH: &str = "message.search";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
@@ -232,6 +233,8 @@ fn default_limit() -> u32 {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelCreateParams {
     pub title: String,
+    #[serde(default)]
+    pub topic: String,
     /// When provided, the new channel is created `Private` and the creator
     /// is its sole initial member. When omitted, the channel is created
     /// `Public`.
@@ -295,6 +298,8 @@ pub struct ChannelMembersResult {
 pub struct ChannelUpdateParams {
     pub channel_id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,7 +518,10 @@ pub struct TaskUpdateResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskClaimParams {
-    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
 }
@@ -1289,6 +1297,12 @@ pub struct MessageSendParams {
     pub attachments: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Optional optimistic-send guard. When present, the server appends only
+    /// if the resolved target scope's latest message id is exactly this value.
+    /// Agents use it for send-time rebase: read latest, adjust content, then
+    /// send with this base id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_latest_message_id: Option<String>,
     #[serde(default)]
     pub metadata: Meta,
 }
@@ -1330,6 +1344,18 @@ pub struct MessageReadParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageReadResult {
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionToggleParams {
+    pub message_id: String,
+    pub emoji: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReactionToggleResult {
     pub message: Message,
 }
 
@@ -2954,8 +2980,10 @@ pub mod stream_kind {
     /// Broadcast when a new channel is created. Public channels go to
     /// all connections; private channels go to the creator only.
     pub const CHANNEL_CREATED: &str = "channel.created";
+    pub const CHANNEL_UPDATED: &str = "channel.updated";
     pub const RUN_UPDATED: &str = "run.updated";
     pub const MESSAGE_CREATED: &str = "message.created";
+    pub const MESSAGE_UPDATED: &str = "message.updated";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     pub const DELIVERY_UPDATED: &str = "delivery.updated";
     /// Direct-to-actor notification: the recipient was added to a channel

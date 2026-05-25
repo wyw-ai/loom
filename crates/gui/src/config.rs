@@ -28,6 +28,7 @@
 //! On first launch we migrate the TUI's `cli.toml` into a starter workspace
 //! named "Local" so the operator doesn't face an empty picker.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use agent_runtime::discovery::AgentProviderOverride;
@@ -382,14 +383,7 @@ pub fn default_machine_for_workspace(
     owner_actor_id: Option<&str>,
 ) -> MachineConfig {
     let workspace_key = safe_config_key(workspace_id);
-    let suffix = workspace_key
-        .strip_prefix("ws_")
-        .unwrap_or(workspace_key.as_str());
     let owner_key = owner_actor_id.map(safe_config_key);
-    let id_suffix = owner_key
-        .as_deref()
-        .map(|owner| format!("{suffix}_{owner}"))
-        .unwrap_or_else(|| suffix.to_string());
     let data_key = owner_key
         .as_deref()
         .map(|owner| format!("{owner}/local"))
@@ -397,7 +391,7 @@ pub fn default_machine_for_workspace(
     MachineConfig {
         workspace_id: Some(workspace_id.to_string()),
         owner_actor_id: owner_actor_id.map(ToString::to_string),
-        id: format!("machine_{id_suffix}"),
+        id: default_machine_id_for_workspace(workspace_id),
         name: "Local Machine".into(),
         kind: default_machine_kind(),
         data_root: machine_data_root_expr(&workspace_key, &data_key),
@@ -457,6 +451,9 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
             changed = true;
         }
     }
+    if cleanup_machine_configs(&mut cfg) {
+        changed = true;
+    }
 
     let active_owner_actor_id = active_owner_actor_id(&cfg);
     let workspace_ids: Vec<String> = cfg
@@ -484,6 +481,145 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
         save(&cfg).ok();
     }
     cfg
+}
+
+fn default_machine_id_for_workspace(workspace_id: &str) -> String {
+    let workspace_key = safe_config_key(workspace_id);
+    let suffix = workspace_key
+        .strip_prefix("ws_")
+        .unwrap_or(workspace_key.as_str());
+    format!("machine_{suffix}")
+}
+
+fn cleanup_machine_configs(cfg: &mut DesktopConfig) -> bool {
+    let before_len = cfg.machines.len();
+    let active_workspace = active_workspace_id(cfg).map(ToString::to_string);
+    let active_owner = active_owner_actor_id(cfg);
+    let known_workspaces = cfg
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+    let mut cleaned: Vec<MachineConfig> = Vec::new();
+
+    for mut machine in std::mem::take(&mut cfg.machines) {
+        if machine.workspace_id.is_none() && !cfg.workspaces.is_empty() {
+            machine.workspace_id = active_workspace.clone();
+            changed = true;
+        }
+        if let Some(workspace_id) = machine.workspace_id.as_deref() {
+            if known_workspaces.contains(workspace_id) {
+                if let Some(owner_actor_id) = active_owner.as_deref() {
+                    if machine
+                        .owner_actor_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|owner| !owner.is_empty())
+                        .is_none()
+                    {
+                        machine.owner_actor_id = Some(owner_actor_id.to_string());
+                        changed = true;
+                    }
+                    if should_canonicalize_machine_id(&machine.id, workspace_id, owner_actor_id) {
+                        let next_id = default_machine_id_for_workspace(workspace_id);
+                        if machine.id != next_id {
+                            machine.id = next_id;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let before_agents = machine.agents.len();
+        machine
+            .agents
+            .retain(|agent| is_supported_agent_actor_id(&agent.actor_id));
+        if machine.agents.len() != before_agents {
+            changed = true;
+        }
+
+        if merge_machine_config(&mut cleaned, machine) {
+            changed = true;
+        }
+    }
+
+    changed |= cleaned.len() != before_len;
+    cfg.machines = cleaned;
+    changed
+}
+
+fn should_canonicalize_machine_id(
+    machine_id: &str,
+    workspace_id: &str,
+    owner_actor_id: &str,
+) -> bool {
+    machine_id == "local"
+        || machine_id == legacy_owner_scoped_machine_id(workspace_id, owner_actor_id)
+        || is_legacy_owner_scoped_machine_id(machine_id)
+}
+
+fn legacy_owner_scoped_machine_id(workspace_id: &str, owner_actor_id: &str) -> String {
+    let workspace_key = safe_config_key(workspace_id);
+    let suffix = workspace_key
+        .strip_prefix("ws_")
+        .unwrap_or(workspace_key.as_str());
+    format!("machine_{}_{}", suffix, safe_config_key(owner_actor_id))
+}
+
+fn is_legacy_owner_scoped_machine_id(machine_id: &str) -> bool {
+    machine_id.starts_with("machine_") && machine_id.contains("_actor_human_")
+}
+
+fn is_supported_agent_actor_id(actor_id: &str) -> bool {
+    let trimmed = actor_id.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+}
+
+fn merge_machine_config(machines: &mut Vec<MachineConfig>, machine: MachineConfig) -> bool {
+    let Some(existing) = machines.iter_mut().find(|existing| {
+        existing.workspace_id == machine.workspace_id
+            && existing.owner_actor_id == machine.owner_actor_id
+            && existing.id == machine.id
+    }) else {
+        machines.push(machine);
+        return false;
+    };
+
+    if existing.name.trim().is_empty() || existing.name == "Local Machine" {
+        existing.name = machine.name;
+    }
+    if existing.kind.trim().is_empty() {
+        existing.kind = machine.kind;
+    }
+    if existing.data_root.trim().is_empty() || existing.data_root == default_agent_data_root_expr()
+    {
+        existing.data_root = machine.data_root;
+    }
+    for provider in machine.providers {
+        if !existing
+            .providers
+            .iter()
+            .any(|existing_provider| existing_provider.id == provider.id)
+        {
+            existing.providers.push(provider);
+        }
+    }
+    for agent in machine.agents {
+        if !existing
+            .agents
+            .iter()
+            .any(|existing_agent| existing_agent.actor_id == agent.actor_id)
+        {
+            existing.agents.push(agent);
+        }
+    }
+    true
 }
 
 fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
@@ -761,10 +897,69 @@ id = "default"
             machine.owner_actor_id.as_deref(),
             Some("actor_human_github_12345")
         );
-        assert_eq!(machine.id, "machine_local_actor_human_github_12345");
+        assert_eq!(machine.id, "machine_local");
         assert_eq!(
             machine.data_root,
             "~/.agentx/machines/ws_local/actor_human_github_12345/local"
         );
+    }
+
+    #[test]
+    fn load_rewrites_legacy_owner_scoped_machine_ids() {
+        let cfg = DesktopConfig {
+            active: Some("ws_abbb0e0b".into()),
+            account: None,
+            workspaces: vec![Workspace {
+                id: "ws_abbb0e0b".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: "actor_human_local_ws_abbb0e0b".into(),
+                display_name: "boyd".into(),
+            }],
+            machines: vec![
+                MachineConfig {
+                    workspace_id: Some("ws_abbb0e0b".into()),
+                    owner_actor_id: None,
+                    id: "local".into(),
+                    name: "Local Machine".into(),
+                    kind: "local".into(),
+                    data_root: "~/.agentx".into(),
+                    providers: Vec::new(),
+                    agents: Vec::new(),
+                },
+                MachineConfig {
+                    workspace_id: Some("ws_abbb0e0b".into()),
+                    owner_actor_id: Some("actor_human_local_ws_abbb0e0b".into()),
+                    id: "machine_abbb0e0b_actor_human_local_ws_abbb0e0b".into(),
+                    name: "Local Machine".into(),
+                    kind: "local".into(),
+                    data_root: "~/.agentx/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local"
+                        .into(),
+                    providers: Vec::new(),
+                    agents: vec![MachineAgentConfig {
+                        provider_id: "codex".into(),
+                        actor_id:
+                            "actor_agent_machine_abbb0e0b_actor_human_local_ws_abbb0e0b_45b7a479"
+                                .into(),
+                        name: "legacy".into(),
+                        description: String::new(),
+                        model: String::new(),
+                        reasoning_effort: String::new(),
+                        autostart: false,
+                    }],
+                },
+            ],
+        };
+
+        let mut cfg = cfg;
+        assert!(cleanup_machine_configs(&mut cfg));
+
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machines[0].id, "machine_abbb0e0b");
+        assert_eq!(
+            cfg.machines[0].owner_actor_id.as_deref(),
+            Some("actor_human_local_ws_abbb0e0b")
+        );
+        assert!(cfg.machines[0].agents.is_empty());
     }
 }

@@ -371,11 +371,13 @@ fn fanout(state: &AppState, ev: StoreEvent) {
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::MessageCreated(m) => (sk::MESSAGE_CREATED, json!({ "message": m })),
+        StoreEvent::MessageUpdated(m) => (sk::MESSAGE_UPDATED, json!({ "message": m })),
         StoreEvent::EventCreated(_) => return,
         StoreEvent::RunUpdated(r) => (sk::RUN_UPDATED, json!({ "run": r })),
         StoreEvent::ThreadCreated(t) => (sk::THREAD_CREATED, json!({ "thread": t })),
         StoreEvent::ThreadUpdated(t) => (sk::THREAD_UPDATED, json!({ "thread": t })),
         StoreEvent::TaskChanged(t) => (sk::TASK_CHANGED, json!({ "task": t })),
+        StoreEvent::ChannelUpdated(c) => (sk::CHANNEL_UPDATED, json!({ "channel": c })),
         StoreEvent::TaskAssignmentChanged { assignment, task } => (
             sk::TASK_ASSIGNMENT_CHANGED,
             json!({ "assignment": assignment, "task": task }),
@@ -672,6 +674,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Meta::default(),
+                None,
             )
             .expect("message");
 

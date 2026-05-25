@@ -109,11 +109,19 @@ impl ScopeSkills {
     fn desired_actor_targets(&self, channel: &Channel) -> io::Result<BTreeMap<String, PathBuf>> {
         let mut desired = BTreeMap::new();
         for actor_id in &channel.members {
-            if let Some(target) = self.source.target_for_actor(actor_id)? {
+            if let Some(target) = self.target_for_actor_projection(actor_id)? {
                 desired.insert(actor_id.clone(), target);
             }
         }
         Ok(desired)
+    }
+
+    fn target_for_actor_projection(&self, actor_id: &str) -> io::Result<Option<PathBuf>> {
+        match self.source.target_for_actor(actor_id) {
+            Ok(target) => Ok(target),
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     fn sync_scope_targets(
@@ -350,6 +358,7 @@ mod tests {
                 None,
                 Vec::new(),
                 proto::types::Meta::default(),
+                None,
             )
             .expect("append root message")
             .id;
@@ -394,6 +403,36 @@ mod tests {
             std::fs::read_link(&thread_link).expect("thread link"),
             bundle_root
         );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reconcile_skips_invalid_historical_actor_ids() {
+        let root = temp_path("reconcile-invalid-actor");
+        let bundle_root = root.join("published").join("actor_alice");
+        let store = test_store(&root, &[("actor_alice", bundle_root.as_path())]).expect("store");
+        let channel = store
+            .create_channel("dojo".into(), Some("actor_alice".into()))
+            .expect("channel");
+        let invalid_actor_id =
+            "actor_agent_machine_abbb0e0b_actor_human_local_ws_abbb0e0b_45b7a479";
+        store
+            .grant_channel(&channel.id, invalid_actor_id)
+            .expect("grant invalid historical member");
+        let manager = ScopeSkills::new(root.join("data").join("workspaces"), root.join("agents"))
+            .expect("manager");
+
+        manager.reconcile(&store).expect("reconcile");
+
+        let channel_skills = root
+            .join("data")
+            .join("workspaces")
+            .join("channel")
+            .join(&channel.id)
+            .join("skills");
+        assert!(channel_skills.join("actor_alice").exists());
+        assert!(!channel_skills.join(invalid_actor_id).exists());
 
         std::fs::remove_dir_all(root).ok();
     }

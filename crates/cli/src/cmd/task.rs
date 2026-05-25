@@ -171,11 +171,23 @@ pub async fn update(
     Ok(())
 }
 
-pub async fn claim(client: Arc<Client>, task_id: String, actor: Option<String>) -> Result<()> {
+pub async fn claim(
+    client: Arc<Client>,
+    task_id: Option<String>,
+    source_message: Option<String>,
+    actor: Option<String>,
+) -> Result<()> {
+    if task_id.is_some() == source_message.is_some() {
+        bail!("pass exactly one of <task_id> or --source-message");
+    }
     let res: TaskUpdateResult = client
         .call(
             method::TASK_CLAIM,
-            json!({ "taskId": task_id, "actorId": actor }),
+            json!({
+                "taskId": task_id,
+                "sourceMessageId": source_message,
+                "actorId": actor,
+            }),
         )
         .await?;
     print_task_update(res);

@@ -750,6 +750,7 @@ mod tests {
             thread_root_message_id: None,
             task_id: None,
             attachments: Vec::new(),
+            reactions: Vec::new(),
             metadata,
         };
         let notification = proto::Notification {

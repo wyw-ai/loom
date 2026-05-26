@@ -207,13 +207,6 @@
     box-shadow: 0 1px 2px rgb(16 24 40 / 0.03);
   }
 
-  .avatar-surface {
-    background:
-      radial-gradient(circle at 30% 24%, rgb(255 255 255 / 0.82) 0 18%, transparent 19%),
-      radial-gradient(circle at 78% 76%, rgb(116 226 190 / 0.34) 0 22%, transparent 23%),
-      linear-gradient(135deg, #eef5ff 0%, #f8f4ff 50%, #e8fbf3 100%);
-  }
-
   .search-pill {
     display: flex;
     height: 40px;

@@ -1,5 +1,18 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
-import type { ComponentType, FormEvent, PointerEvent, ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import type {
+  ComponentType,
+  CSSProperties,
+  FormEvent,
+  PointerEvent,
+  ReactNode,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import {
   Activity,
@@ -21,14 +34,12 @@ import {
   LogOut,
   MessageSquare,
   Pencil,
-  PanelRight,
   Plus,
   RefreshCw,
   Reply,
   Search,
   Send,
   Server,
-  Shield,
   Smile,
   Split,
   Trash2,
@@ -66,7 +77,7 @@ import { cn, formatTime, shortId } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 type View = "chat" | "threads" | "channels" | "inbox" | "tasks" | "spaces" | "account" | "settings";
-type DetailTab = "details" | "members" | "threads";
+type ChannelPanelTab = "threads" | "members" | "tasks";
 type ChannelGroup = {
   id: string;
   title: string;
@@ -99,6 +110,17 @@ type ChannelPointerDrag = {
   startY: number;
   pointerId: number;
   dragging: boolean;
+};
+type PanelResizeKind = "sidebar" | "detail";
+type PanelSizes = {
+  sidebar: number;
+  detail: number;
+};
+type PanelResizeDrag = {
+  kind: PanelResizeKind;
+  startX: number;
+  sidebar: number;
+  detail: number;
 };
 type ThreadActivityStats = {
   replyCount: number;
@@ -140,16 +162,38 @@ type AgentMemberEntry = {
   machine: MachineInfo;
   agent: MachineInfo["agents"][number];
 };
+type ChannelMemberPresence = {
+  online: boolean;
+  label: string;
+  status: string;
+};
+type ChannelMemberPanelItem = {
+  actor: Actor;
+  presence: ChannelMemberPresence;
+};
 
 const supportedReactionEmojis = ["👍", "👀", "✅", "🥳", "💔"];
-const avatarCount = 60;
-const agentAvatarIndexes = [32, 56, 5, 15, 43, 45] as const;
+const avatarCount = 25;
+const agentAvatarIndexes = [1, 5, 10, 15, 20, 25] as const;
 const avatarLibraryUrls = Array.from(
   { length: avatarCount },
   (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
 );
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 const ungroupedChannelGroupId = "__ungrouped";
+const panelLayoutStorageKey = "loom:panel-layout:v1";
+const detailPanelBreakpoint = 1280;
+const railWidth = 72;
+const resizeHandleWidth = 8;
+const sidebarMinWidth = 216;
+const sidebarMaxWidth = 420;
+const detailMinWidth = 280;
+const detailMaxWidth = 560;
+const mainMinWidth = 360;
+const defaultPanelSizes: PanelSizes = {
+  sidebar: 286,
+  detail: 340,
+};
 
 export function App() {
   const [config, setConfig] = useState<DesktopConfig>({
@@ -197,6 +241,10 @@ export function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
+  const [channelPanelTab, setChannelPanelTab] = useState<ChannelPanelTab | null>(null);
+  const [panelSizes, setPanelSizes] = useState<PanelSizes>(() => loadPanelSizes());
+  const [viewportWidth, setViewportWidth] = useState(() => initialViewportWidth());
+  const [resizingPanel, setResizingPanel] = useState<PanelResizeKind | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -206,6 +254,8 @@ export function App() {
   const autoReconnectRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
+  const panelResizeDragRef = useRef<PanelResizeDrag | null>(null);
+  const panelResizeCleanupRef = useRef<(() => void) | null>(null);
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
@@ -231,9 +281,6 @@ export function App() {
   );
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
   const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
-  const activeChannelMembers = activeChannel
-    ? activeChannel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId))
-    : [];
   const channelAgentActors = activeChannel
     ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
     : [];
@@ -427,6 +474,24 @@ export function App() {
   useEffect(() => {
     workspaceRef.current = workspace;
   }, [workspace]);
+
+  useEffect(() => {
+    savePanelSizes(panelSizes);
+  }, [panelSizes]);
+
+  useEffect(() => {
+    const updateViewport = () => setViewportWidth(initialViewportWidth());
+    updateViewport();
+    window.addEventListener("resize", updateViewport);
+    return () => window.removeEventListener("resize", updateViewport);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      panelResizeCleanupRef.current?.();
+      document.body.classList.remove("is-resizing-panels");
+    };
+  }, []);
 
   useEffect(() => {
     setChannelGroups(loadChannelGroups(channelGroupsKey));
@@ -940,26 +1005,6 @@ export function App() {
     }
   }
 
-  async function updateChannelTopic(channelId: string, topic: string) {
-    const channel = channels.find((item) => item.id === channelId);
-    if (!channel) return;
-    setBusy(`channel:topic:${channelId}`);
-    setError(null);
-    try {
-      const result = await ipc.channelUpdate({
-        channelId,
-        title: channel.title,
-        topic,
-      });
-      setChannels((current) => sortChannels(upsert(current, result.channel)));
-      pushNotice("Channel topic updated");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function openLocalPath(path: string) {
     setError(null);
     try {
@@ -981,6 +1026,7 @@ export function App() {
       setChannels((current) => sortChannels(upsert(current, result.channel)));
       setActiveChannelId(result.channel.id);
       setActiveThreadId(null);
+      setChannelPanelTab(null);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1083,6 +1129,7 @@ export function App() {
     );
     if (existing) {
       setActiveThreadId(existing.id);
+      setChannelPanelTab(null);
       return;
     }
     setBusy(`thread:create:${message.id}`);
@@ -1099,6 +1146,7 @@ export function App() {
         ),
       }));
       setActiveThreadId(result.thread.id);
+      setChannelPanelTab(null);
       setThreadStatsById((current) => ({
         ...current,
         [result.thread.id]: emptyThreadStats(),
@@ -1241,9 +1289,7 @@ export function App() {
   const chatEmpty =
     connection === "open"
       ? activeChannel
-        ? activeThread
-          ? "No messages in this thread."
-          : "No messages in this channel."
+        ? "No messages in this channel."
         : "No channels."
       : "No space connection.";
 
@@ -1254,9 +1300,88 @@ export function App() {
     view === "inbox" ||
     view === "tasks" ||
     view === "settings";
-  const showChatDetail = view === "chat";
+  const showChatDetail =
+    view === "chat" &&
+    (Boolean(activeThread) || (Boolean(channelPanelTab) && Boolean(activeChannel)));
+  const detailVisibleInGrid =
+    showChatDetail && viewportWidth >= detailPanelBreakpoint;
+  const fittedPanelSizes = fitPanelSizes(
+    panelSizes,
+    viewportWidth,
+    detailVisibleInGrid,
+  );
+  const shellStyle = {
+    "--sidebar-width": `${fittedPanelSizes.sidebar}px`,
+    "--detail-width": `${fittedPanelSizes.detail}px`,
+    "--main-min-width": `${mainMinWidth}px`,
+  } as CSSProperties;
+  const cleanupPanelResize = () => {
+    panelResizeCleanupRef.current?.();
+    panelResizeCleanupRef.current = null;
+    panelResizeDragRef.current = null;
+    setResizingPanel(null);
+    document.body.classList.remove("is-resizing-panels");
+  };
+  const applyPanelResize = (
+    drag: PanelResizeDrag,
+    clientX: number,
+    width = initialViewportWidth(),
+  ) => {
+    const delta = clientX - drag.startX;
+    const next =
+      drag.kind === "sidebar"
+        ? { sidebar: drag.sidebar + delta, detail: drag.detail }
+        : { sidebar: drag.sidebar, detail: drag.detail - delta };
+    setPanelSizes(fitPanelSizes(next, width, width >= detailPanelBreakpoint && showChatDetail));
+  };
+  const startPanelResize = (
+    event: PointerEvent<HTMLButtonElement>,
+    kind: PanelResizeKind,
+  ) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    cleanupPanelResize();
+    const drag: PanelResizeDrag = {
+      kind,
+      startX: event.clientX,
+      sidebar: panelSizes.sidebar,
+      detail: panelSizes.detail,
+    };
+    panelResizeDragRef.current = drag;
+    setResizingPanel(kind);
+    document.body.classList.add("is-resizing-panels");
+    const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
+      const current = panelResizeDragRef.current;
+      if (!current) return;
+      moveEvent.preventDefault();
+      applyPanelResize(current, moveEvent.clientX);
+    };
+    const handlePointerUp = (upEvent: globalThis.PointerEvent) => {
+      const current = panelResizeDragRef.current;
+      if (current) applyPanelResize(current, upEvent.clientX);
+      cleanupPanelResize();
+    };
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", cleanupPanelResize);
+    panelResizeCleanupRef.current = () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", cleanupPanelResize);
+    };
+  };
+  const resizePanelByKeyboard = (kind: PanelResizeKind, delta: number) => {
+    setPanelSizes((current) => {
+      const next =
+        kind === "sidebar"
+          ? { ...current, sidebar: current.sidebar + delta }
+          : { ...current, detail: current.detail - delta };
+      return fitPanelSizes(next, viewportWidth, detailVisibleInGrid);
+    });
+  };
   const selectWorkspace = (workspaceId: string) => {
     setView("chat");
+    setChannelPanelTab(null);
     if (workspace?.id !== workspaceId || connection !== "open") {
       void connectWorkspace(workspaceId);
     }
@@ -1265,13 +1390,11 @@ export function App() {
   return (
     <div
       className={cn(
-        "grid h-screen w-screen overflow-hidden bg-[#f5f6fa] text-foreground",
-        showChatDetail
-          ? "grid-cols-[72px_minmax(244px,286px)_minmax(0,1fr)] xl:grid-cols-[72px_286px_minmax(0,1fr)_340px]"
-          : showWorkspaceChrome
-            ? "grid-cols-[72px_minmax(244px,286px)_minmax(0,1fr)] xl:grid-cols-[72px_286px_minmax(0,1fr)]"
-            : "grid-cols-[72px_minmax(0,1fr)]",
+        "app-shell h-screen w-screen overflow-hidden bg-[#f5f6fa] text-foreground",
+        showWorkspaceChrome && "app-shell-workspace",
+        showChatDetail && "app-shell-detail",
       )}
+      style={shellStyle}
     >
       <Rail
         account={account}
@@ -1306,31 +1429,39 @@ export function App() {
             setView("chat");
             setActiveChannelId(id);
             setActiveThreadId(null);
+            setChannelPanelTab(null);
           }}
           onSelectThread={(thread) => {
             setView("chat");
             setActiveChannelId(thread.channelId);
             setActiveThreadId(thread.id);
+            setChannelPanelTab(null);
           }}
           onToggleChannelGroup={toggleChannelGroup}
         />
       )}
+      {showWorkspaceChrome && (
+        <ResizeHandle
+          active={resizingPanel === "sidebar"}
+          label="Resize sidebar"
+          onKeyboardResize={(delta) => resizePanelByKeyboard("sidebar", delta)}
+          onPointerDown={(event) => startPanelResize(event, "sidebar")}
+        />
+      )}
       <main
-        className={cn(
-          "flex min-h-0 min-w-0 flex-col bg-white",
-          showChatDetail && "border-r border-[#e2e6ef]",
-        )}
+        className="flex min-h-0 min-w-0 flex-col bg-white"
       >
         {view === "chat" ? (
           <>
             <ChatHeader
               channel={activeChannel}
-              thread={activeThread}
-              task={activeThreadTask}
               target={target}
-              members={activeChannelMembers}
               connection={connection}
-              onClearThread={() => setActiveThreadId(null)}
+              activePanel={activeThread ? null : channelPanelTab}
+              onOpenPanel={(panel) => {
+                setActiveThreadId(null);
+                setChannelPanelTab((current) => (current === panel ? null : panel));
+              }}
             />
             {error && (
               <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">
@@ -1339,6 +1470,7 @@ export function App() {
             )}
             <MessageFeed
               actors={actors}
+              feedKey={target ?? "channel:none"}
               messages={messages}
               tasksBySourceMessageId={tasksBySourceMessageId}
               channelThreads={channelThreads}
@@ -1382,6 +1514,7 @@ export function App() {
               onSelectThread={(thread) => {
                 setActiveChannelId(thread.channelId);
                 setActiveThreadId(thread.id);
+                setChannelPanelTab(null);
               }}
               onCloseThread={() => setActiveThreadId(null)}
               onSendThreadMessage={sendThreadMessage}
@@ -1402,6 +1535,7 @@ export function App() {
               onSelectChannel={(channelId) => {
                 setActiveChannelId(channelId);
                 setActiveThreadId(null);
+                setChannelPanelTab(null);
               }}
             />
           </>
@@ -1416,6 +1550,7 @@ export function App() {
                 setView("chat");
                 setActiveChannelId(channelFromMessage(message));
                 setActiveThreadId(threadIdForMessage(threadsByChannel, message));
+                setChannelPanelTab(null);
               }}
               onAnswer={answerAction}
               busy={busy}
@@ -1473,6 +1608,15 @@ export function App() {
         )}
       </main>
       {showChatDetail && (
+        <ResizeHandle
+          active={resizingPanel === "detail"}
+          className="hidden xl:block"
+          label="Resize details panel"
+          onKeyboardResize={(delta) => resizePanelByKeyboard("detail", delta)}
+          onPointerDown={(event) => startPanelResize(event, "detail")}
+        />
+      )}
+      {showChatDetail && (
         activeThread ? (
           <ThreadPanel
             actors={actors}
@@ -1486,24 +1630,34 @@ export function App() {
             task={activeThreadTask}
             thread={activeThread}
             busy={busy}
+            className="hidden min-h-0 min-w-0 flex-col bg-white xl:flex"
             onClose={() => setActiveThreadId(null)}
             onSend={sendThreadMessage}
             onToggleReaction={toggleMessageReaction}
           />
-        ) : (
+        ) : channelPanelTab && activeChannel ? (
           <ChannelPanel
-          actors={actors}
-          memberCandidates={memberCandidates}
-          channel={activeChannel}
-          channelTasks={channelTasks}
-          channelThreads={channelThreads}
-          thread={activeThread}
-          busy={busy}
-          onInviteMember={inviteMemberToChannel}
-          onRemoveMember={removeMemberFromChannel}
-          onUpdateTopic={updateChannelTopic}
-        />
-        )
+            actors={actors}
+            memberCandidates={memberCandidates}
+            channel={activeChannel}
+            channelMessages={messages}
+            channelTasks={channelTasks}
+            channelThreads={channelThreads}
+            currentActorId={workspace?.actorId ?? null}
+            machines={machines}
+            threadStatsById={threadStatsById}
+            tab={channelPanelTab}
+            busy={busy}
+            onClose={() => setChannelPanelTab(null)}
+            onSelectTab={setChannelPanelTab}
+            onSelectThread={(thread) => {
+              setActiveThreadId(thread.id);
+              setChannelPanelTab(null);
+            }}
+            onInviteMember={inviteMemberToChannel}
+            onRemoveMember={removeMemberFromChannel}
+          />
+        ) : null
       )}
       {notice && (
         <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-border bg-popover px-4 py-2 text-sm shadow-soft">
@@ -1622,6 +1776,39 @@ function Rail({
         </button>
       </div>
     </nav>
+  );
+}
+
+function ResizeHandle({
+  active,
+  className,
+  label,
+  onKeyboardResize,
+  onPointerDown,
+}: {
+  active: boolean;
+  className?: string;
+  label: string;
+  onKeyboardResize: (delta: number) => void;
+  onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      className={cn("resize-handle", active && "resize-handle-active", className)}
+      onKeyDown={(event) => {
+        const step = event.shiftKey ? 32 : 16;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          onKeyboardResize(-step);
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          onKeyboardResize(step);
+        }
+      }}
+      onPointerDown={onPointerDown}
+    />
   );
 }
 
@@ -1879,7 +2066,7 @@ function Sidebar({
 
   useEffect(() => () => cleanupChannelDragListeners(), []);
   return (
-    <aside className="flex min-h-0 min-w-0 flex-col border-r border-[#e2e6ef] bg-[#fbfbfd]">
+    <aside className="flex min-h-0 min-w-0 flex-col bg-[#fbfbfd]">
       <div className="border-b border-[#edf0f5] p-3">
         <div className="space-y-1">
           {navItems.map((item) => {
@@ -2186,73 +2373,73 @@ function Sidebar({
 
 function ChatHeader({
   channel,
-  thread,
-  task,
   target,
-  members,
   connection,
-  onClearThread,
+  activePanel,
+  onOpenPanel,
 }: {
   channel: Channel | null;
-  thread: Thread | null;
-  task: Task | null;
   target: string | null;
-  members: Actor[];
   connection: ConnectionState;
-  onClearThread: () => void;
+  activePanel: ChannelPanelTab | null;
+  onOpenPanel: (panel: ChannelPanelTab) => void;
 }) {
   const topic = channelTopic(channel);
+  const panelActions: Array<{
+    id: ChannelPanelTab;
+    title: string;
+    icon: ComponentType<{ size?: string | number; className?: string }>;
+  }> = [
+    { id: "threads", title: "Threads", icon: Split },
+    { id: "members", title: "Members", icon: Users },
+    { id: "tasks", title: "Tasks", icon: Check },
+  ];
   return (
     <header className="flex h-[86px] shrink-0 items-center gap-4 border-b border-[#e2e6ef] bg-white px-6">
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex h-8 w-8 shrink-0 items-center justify-center text-[#303849]">
-            {thread ? <Split size={26} /> : <Hash size={26} />}
+            <Hash size={26} />
           </span>
           <h1 className="min-w-0 truncate text-[22px] font-bold leading-tight text-[#111827]">
             {channel ? channel.title : "Space"}
           </h1>
-          {thread && (
-            <Badge
-              variant="secondary"
-              className="hidden max-w-[220px] shrink truncate bg-[#f1efff] text-[#5843d7] 2xl:inline-flex"
-            >
-              {thread.title}
-            </Badge>
-          )}
-          {thread && task ? <TaskStateBadge task={task} /> : null}
         </div>
         <div className="mt-1 truncate pl-11 text-sm text-[#485063]">
-          {thread
-            ? `#${channel?.title ?? "channel"} / ${thread.title}`
-            : topic || target || connectionLabel(connection)}
+          {topic || target || connectionLabel(connection)}
         </div>
       </div>
-      <div className="hidden items-center gap-2 lg:flex">
-        {members.length > 0 && (
-          <div className="member-pill h-10 px-2.5" title="Channel members">
-            <AvatarStack actors={members} max={4} small />
-            <span className="pl-1 text-sm font-bold text-[#303849]">{members.length}</span>
-          </div>
-        )}
+      <div className="flex shrink-0 items-center gap-1.5">
+        {panelActions.map((item) => {
+          const Icon = item.icon;
+          const selected = activePanel === item.id;
+          return (
+            <Button
+              key={item.id}
+              variant="outline"
+              size="icon"
+              title={item.title}
+              aria-label={item.title}
+              aria-pressed={selected}
+              disabled={!channel}
+              onClick={() => onOpenPanel(item.id)}
+              className={cn(
+                "relative h-9 w-9 shrink-0 rounded-lg",
+                selected && "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]",
+              )}
+            >
+              <Icon size={15} />
+            </Button>
+          );
+        })}
       </div>
-      {thread && (
-        <Button
-          variant="outline"
-          size="icon"
-          title="Back to channel"
-          onClick={onClearThread}
-          className="h-9 w-9 shrink-0 rounded-lg"
-        >
-          <PanelRight size={15} />
-        </Button>
-      )}
     </header>
   );
 }
 
 function MessageFeed({
   actors,
+  feedKey,
   messages,
   tasksBySourceMessageId,
   channelThreads,
@@ -2266,6 +2453,7 @@ function MessageFeed({
   busy,
 }: {
   actors: Record<string, Actor>;
+  feedKey: string;
   messages: Message[];
   tasksBySourceMessageId: Record<string, Task>;
   channelThreads: Thread[];
@@ -2283,6 +2471,15 @@ function MessageFeed({
   );
   const visibleMessages = messages.filter((message) => !isHiddenProtocolMessage(message));
   const messageGroups = groupMessagesByDate(visibleMessages);
+  const messageListKey = visibleMessages
+    .map((message) => `${message.id}:${message.createdAt}:${message.body.length}`)
+    .join("|");
+  const feedScroll = useStickToBottomScroll({
+    contentKey: messageListKey,
+    itemCount: visibleMessages.length,
+    scrollKey: feedKey,
+  });
+
   if (visibleMessages.length === 0) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
@@ -2293,7 +2490,11 @@ function MessageFeed({
     );
   }
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto bg-white px-5 py-2 soft-scrollbar">
+    <div
+      ref={feedScroll.ref}
+      className="min-h-0 flex-1 overflow-y-auto bg-white px-5 py-2 soft-scrollbar"
+      onScroll={feedScroll.onScroll}
+    >
       <div className="mx-auto flex max-w-4xl flex-col gap-2">
         {messageGroups.map((group) => (
           <Fragment key={group.key}>
@@ -2616,16 +2817,14 @@ function ThreadSummaryRow({
 
 function TaskStateBadge({ task }: { task: Task }) {
   return (
-    <Badge variant={taskBadgeVariant(task)} title={task.id}>
+    <Badge
+      variant="outline"
+      title={task.id}
+      className={cn("whitespace-nowrap font-semibold", taskStatusBadgeClass(task.status))}
+    >
       Task #{task.number} · {task.status}
     </Badge>
   );
-}
-
-function taskBadgeVariant(task: Task): "outline" | "success" | "warning" {
-  if (task.status === "done") return "success";
-  if (task.status === "failed" || task.status === "canceled") return "warning";
-  return "outline";
 }
 
 function WorkflowEventRow({
@@ -2887,19 +3086,40 @@ function ThreadPanel({
   const rootMessage = thread
     ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
     : null;
-  const displayMessages = stitchThreadMessages(rootMessage, messages);
+  const replyMessages = messages.filter(
+    (message) =>
+      !isHiddenProtocolMessage(message) &&
+      (!rootMessage || message.id !== rootMessage.id),
+  );
+  const replyGroups = groupMessagesByDate(replyMessages);
   const starter = rootMessage ? actors[rootMessage.authorActorId] : undefined;
+  const threadScrollKey = thread?.id ?? "thread:none";
+  const threadContentKey = [
+    rootMessage
+      ? `${rootMessage.id}:${rootMessage.createdAt}:${rootMessage.body.length}`
+      : "root:none",
+    ...replyMessages.map(
+      (message) => `${message.id}:${message.createdAt}:${message.body.length}`,
+    ),
+  ].join("|");
+  const threadScroll = useStickToBottomScroll({
+    contentKey: threadContentKey,
+    itemCount: replyMessages.length + (rootMessage ? 1 : 0),
+    scrollKey: threadScrollKey,
+  });
   return (
     <aside
       className={cn(
-        "min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-[#fbfbfd]",
-        className ?? "hidden xl:flex",
+        "min-h-0 min-w-0 flex-col bg-white",
+        className ?? "hidden border-l border-[#e2e6ef] xl:flex",
       )}
     >
-      <div className="shrink-0 border-b border-[#edf0f5] bg-white px-5 py-4">
-        <div className="flex items-start justify-between gap-3">
+      <div className="flex min-h-[86px] shrink-0 items-center border-b border-[#e2e6ef] bg-white px-5 py-3">
+        <div className="flex min-w-0 flex-1 items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="text-lg font-bold text-[#111827]">Thread</div>
+            <div className="min-w-0 truncate text-lg font-bold text-[#111827]">
+              {thread?.title ?? "Thread"}
+            </div>
             <div className="mt-0.5 truncate text-sm text-[#485063]">
               {thread
                 ? starter
@@ -2908,7 +3128,7 @@ function ThreadPanel({
                 : "Select a thread"}
             </div>
             {task && (
-              <div className="mt-2">
+              <div className="mt-2 flex">
                 <TaskStateBadge task={task} />
               </div>
             )}
@@ -2921,25 +3141,69 @@ function ThreadPanel({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 soft-scrollbar">
+      <div
+        ref={threadScroll.ref}
+        className="min-h-0 flex-1 overflow-y-auto bg-white soft-scrollbar"
+        onScroll={threadScroll.onScroll}
+      >
         {!thread ? (
-          <EmptyState icon={Split} text="Select a thread." />
-        ) : displayMessages.length === 0 ? (
-          <EmptyState icon={MessageSquare} text="No replies in this thread." />
+          <div className="p-4">
+            <EmptyState icon={Split} text="Select a thread." />
+          </div>
         ) : (
-          <div className="space-y-3">
-            {displayMessages.map((message) => (
-              <ThreadMessageCard
-                key={message.id}
-                actor={actors[message.authorActorId]}
-                actors={actors}
-                currentActorId={currentActorId}
-                message={message}
-                root={Boolean(rootMessage && message.id === rootMessage.id)}
-                busy={busy}
-                onToggleReaction={onToggleReaction}
-              />
-            ))}
+          <div>
+            <section className="border-b border-[#edf0f5] bg-white px-5 py-4">
+              <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
+                <Split size={13} />
+                Original message
+              </div>
+              {rootMessage ? (
+                <ThreadConversationMessage
+                  actor={starter}
+                  actors={actors}
+                  busy={busy}
+                  currentActorId={currentActorId}
+                  message={rootMessage}
+                  onToggleReaction={onToggleReaction}
+                  root
+                />
+              ) : (
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6">
+                  <MutedLine>Original message unavailable.</MutedLine>
+                </div>
+              )}
+            </section>
+
+            <section className="bg-white px-5 py-2">
+              {replyMessages.length === 0 ? (
+                <div className="py-8">
+                  <EmptyState icon={MessageSquare} text="No replies in this thread." />
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {replyGroups.map((group) => (
+                    <Fragment key={group.key}>
+                      <div className="date-divider px-0">
+                        <span />
+                        <div>{group.label}</div>
+                        <span />
+                      </div>
+                      {group.messages.map((message) => (
+                        <ThreadConversationMessage
+                          key={message.id}
+                          actor={actors[message.authorActorId]}
+                          actors={actors}
+                          busy={busy}
+                          currentActorId={currentActorId}
+                          message={message}
+                          onToggleReaction={onToggleReaction}
+                        />
+                      ))}
+                    </Fragment>
+                  ))}
+                </div>
+              )}
+            </section>
           </div>
         )}
       </div>
@@ -2955,21 +3219,21 @@ function ThreadPanel({
   );
 }
 
-function ThreadMessageCard({
+function ThreadConversationMessage({
   actor,
   actors,
   currentActorId,
   message,
-  root,
   busy,
+  root = false,
   onToggleReaction,
 }: {
   actor?: Actor;
   actors: Record<string, Actor>;
   currentActorId: string | null;
   message: Message;
-  root: boolean;
   busy: string | null;
+  root?: boolean;
   onToggleReaction: (message: Message, emoji: string) => void;
 }) {
   const reactions = message.reactions ?? [];
@@ -2981,22 +3245,22 @@ function ThreadMessageCard({
   return (
     <article
       className={cn(
-        "thread-message-card",
-        root ? "thread-message-card-root" : "thread-message-card-reply",
+        "group rounded-xl px-4 py-3 transition-colors",
+        root ? "bg-[#fbfbfd]" : "hover:bg-[#f7f8fb]",
       )}
     >
-      <div className="flex items-start gap-3">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} small />
+      <div className="flex items-start gap-4">
+        <ActorAvatar actor={actor} fallback={message.authorActorId} />
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-bold text-[#111827]">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-[#111827]">
               {actor ? displayName(actor) : message.authorActorId}
             </span>
-            <span className="shrink-0 text-xs font-medium text-[#667085]">
+            <span className="text-xs font-medium text-[#667085]">
               {formatTime(message.createdAt)}
             </span>
           </div>
-          <div className="message-markdown mt-1 text-sm leading-5 text-[#111827]">
+          <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
             <ReactMarkdown>{displayBody}</ReactMarkdown>
           </div>
           {pollChoices.length > 0 && (
@@ -3005,39 +3269,49 @@ function ThreadMessageCard({
           {attachments.length > 0 && (
             <AttachmentStack attachments={attachments} />
           )}
-          <div className="mt-2 flex min-h-7 flex-wrap items-center gap-1.5">
-            {reactions.map((reaction) => {
-              const selected = Boolean(
-                currentActorId && reaction.actorIds.includes(currentActorId),
-              );
-              return (
-                <button
-                  key={reaction.emoji}
-                  type="button"
-                  className={cn(
-                    "reaction-chip h-7 px-2.5 text-xs",
-                    selected
-                      ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
-                      : "border-[#e2e5ed] bg-white text-[#31394a]",
-                  )}
-                  title={reaction.actorIds
-                    .map((actorId) => actorName(actors, actorId))
-                    .join(", ")}
-                  disabled={busy === `message:reaction:${message.id}:${reaction.emoji}`}
-                  onClick={() => onToggleReaction(message, reaction.emoji)}
-                >
-                  <span>{reaction.emoji}</span>
-                  <span>{reaction.actorIds.length}</span>
-                </button>
-              );
-            })}
-            <ReactionPicker
-              busy={busy}
-              compact
-              message={message}
-              onToggleReaction={onToggleReaction}
-            />
-          </div>
+          {reactions.length > 0 ? (
+            <div className="mt-3 flex min-h-7 flex-wrap items-center gap-1.5">
+              {reactions.map((reaction) => {
+                const selected = Boolean(
+                  currentActorId && reaction.actorIds.includes(currentActorId),
+                );
+                return (
+                  <button
+                    key={reaction.emoji}
+                    type="button"
+                    className={cn(
+                      "reaction-chip",
+                      selected
+                        ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
+                        : "border-[#e2e5ed] bg-white text-[#31394a]",
+                    )}
+                    title={reaction.actorIds
+                      .map((actorId) => actorName(actors, actorId))
+                      .join(", ")}
+                    disabled={busy === `message:reaction:${message.id}:${reaction.emoji}`}
+                    onClick={() => onToggleReaction(message, reaction.emoji)}
+                  >
+                    <span className="text-sm leading-none">{reaction.emoji}</span>
+                    <span>{reaction.actorIds.length}</span>
+                  </button>
+                );
+              })}
+              <ReactionPicker
+                busy={busy}
+                compact
+                message={message}
+                onToggleReaction={onToggleReaction}
+              />
+            </div>
+          ) : (
+            <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
+              <ReactionPicker
+                busy={busy}
+                message={message}
+                onToggleReaction={onToggleReaction}
+              />
+            </div>
+          )}
         </div>
       </div>
     </article>
@@ -3238,7 +3512,7 @@ function ThreadsView({
           task={activeThreadTask}
           thread={activeThread}
           busy={busy}
-          className="flex xl:flex"
+          className="flex border-l border-[#e2e6ef] xl:flex"
           onClose={onCloseThread}
           onSend={onSendThreadMessage}
           onToggleReaction={onToggleReaction}
@@ -3544,7 +3818,12 @@ function TasksView({
                   </div>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Badge variant="outline">{task.status}</Badge>
+                  <Badge
+                    variant="outline"
+                    className={cn("font-semibold", taskStatusBadgeClass(task.status))}
+                  >
+                    {task.status}
+                  </Badge>
                   <span>{channelsById[task.channelId]?.title ?? task.channelId}</span>
                 </div>
               </div>
@@ -4823,38 +5102,56 @@ function ChannelPanel({
   actors,
   memberCandidates,
   channel,
+  channelMessages,
   channelTasks,
   channelThreads,
-  thread,
+  currentActorId,
+  machines,
+  threadStatsById,
+  tab,
   busy,
+  onClose,
+  onSelectTab,
+  onSelectThread,
   onInviteMember,
   onRemoveMember,
-  onUpdateTopic,
 }: {
   actors: Record<string, Actor>;
   memberCandidates: Actor[];
   channel: Channel | null;
+  channelMessages: Message[];
   channelTasks: Task[];
   channelThreads: Thread[];
-  thread: Thread | null;
+  currentActorId: string | null;
+  machines: MachineInfo[];
+  threadStatsById: Record<string, ThreadActivityStats>;
+  tab: ChannelPanelTab;
   busy: string | null;
+  onClose: () => void;
+  onSelectTab: (tab: ChannelPanelTab) => void;
+  onSelectThread: (thread: Thread) => void;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
-  onUpdateTopic: (channelId: string, topic: string) => void;
 }) {
-  void thread;
   return (
     <ChannelDetailPanel
       actors={actors}
       memberCandidates={memberCandidates}
       channel={channel}
+      channelMessages={channelMessages}
       channelTasks={channelTasks}
       channelThreads={channelThreads}
+      currentActorId={currentActorId}
+      machines={machines}
+      threadStatsById={threadStatsById}
+      tab={tab}
       busy={busy}
-      className="hidden min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-[#fbfbfd] xl:flex"
+      className="hidden min-h-0 min-w-0 flex-col bg-[#fbfbfd] xl:flex"
+      onClose={onClose}
+      onSelectTab={onSelectTab}
+      onSelectThread={onSelectThread}
       onInviteMember={onInviteMember}
       onRemoveMember={onRemoveMember}
-      onUpdateTopic={onUpdateTopic}
     />
   );
 }
@@ -4863,28 +5160,40 @@ function ChannelDetailPanel({
   actors,
   memberCandidates,
   channel,
+  channelMessages,
   channelTasks,
   channelThreads,
+  currentActorId,
+  machines,
+  threadStatsById,
+  tab,
   busy,
   className,
+  onClose,
+  onSelectTab,
+  onSelectThread,
   onInviteMember,
   onRemoveMember,
-  onUpdateTopic,
 }: {
   actors: Record<string, Actor>;
   memberCandidates: Actor[];
   channel: Channel | null;
+  channelMessages: Message[];
   channelTasks: Task[];
   channelThreads: Thread[];
+  currentActorId: string | null;
+  machines: MachineInfo[];
+  threadStatsById: Record<string, ThreadActivityStats>;
+  tab: ChannelPanelTab;
   busy: string | null;
   className?: string;
+  onClose: () => void;
+  onSelectTab: (tab: ChannelPanelTab) => void;
+  onSelectThread: (thread: Thread) => void;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
-  onUpdateTopic: (channelId: string, topic: string) => void;
 }) {
   const [memberQuery, setMemberQuery] = useState("");
-  const [tab, setTab] = useState<DetailTab>("details");
-  const [topicDraft, setTopicDraft] = useState("");
   const members = channel
     ? channel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId))
     : [];
@@ -4896,62 +5205,71 @@ function ChannelDetailPanel({
     if (!query) return true;
     return `${displayName(actor)} ${actor.id} ${actor.kind}`.toLowerCase().includes(query);
   });
-  useEffect(() => {
-    setTopicDraft(channelTopic(channel));
-  }, [channel?.id, channel?.topic]);
-  const topicChanged = Boolean(channel && topicDraft.trim() !== channelTopic(channel));
+  const rootMessagesById = new Map(channelMessages.map((message) => [message.id, message]));
+  const memberRows = members.map((actor) => ({
+    actor,
+    presence: memberPresence(actor, machines, currentActorId),
+  }));
+  const onlineMembers = memberRows.filter((item) => item.presence.online);
+  const offlineMembers = memberRows.filter((item) => !item.presence.online);
+  const panelTitle = channelPanelTitle(tab);
+  const panelDetail = channel
+    ? `#${channel.title} · ${channelPanelDetail(tab, channelThreads.length, members.length, channelTasks.length)}`
+    : "Not connected";
+  const tabs: Array<{ id: ChannelPanelTab; label: string; count: number }> = [
+    { id: "threads", label: "Threads", count: channelThreads.length },
+    { id: "members", label: "Members", count: members.length },
+    { id: "tasks", label: "Tasks", count: channelTasks.length },
+  ];
   return (
     <aside className={cn("min-h-0 min-w-0 flex-col bg-[#fbfbfd]", className ?? "flex")}>
       <div className="border-b border-[#edf0f5] bg-white p-5">
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 items-center gap-3">
             <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#6784f4] to-[#4d3ed7] text-white shadow-sm">
-              <Hash size={24} />
+              {tab === "threads" ? (
+                <Split size={24} />
+              ) : tab === "members" ? (
+                <Users size={24} />
+              ) : (
+                <Check size={24} />
+              )}
             </div>
             <div className="min-w-0">
               <div className="truncate text-lg font-bold text-[#111827]">
-                {channel?.title ?? "Channel"}
+                {panelTitle}
               </div>
               <div className="mt-1 truncate text-sm text-[#485063]">
                 {channel
-                  ? `${capitalize(channel.visibility)} · ${members.length} members`
+                  ? `#${channel.title} · ${panelDetail}`
                   : "Not connected"}
               </div>
             </div>
           </div>
+          <button className="composer-icon" type="button" title="Close panel" onClick={onClose}>
+            <X size={16} />
+          </button>
         </div>
-        {channel && (
-          <div className="mt-5 flex gap-2">
-            <Button
-              className="h-9 flex-1 rounded-lg bg-[#503ed4] text-white shadow-sm hover:bg-[#4635c5]"
-              disabled={availableMembers.length === 0}
-              onClick={() => setTab("members")}
-            >
-              <UserPlus size={15} />
-              Add Member
-            </Button>
-          </div>
-        )}
       </div>
 
       <div className="grid h-12 shrink-0 grid-cols-3 border-b border-[#edf0f5] bg-white px-5">
-        {(["details", "members", "threads"] as DetailTab[]).map((item) => (
+        {tabs.map((item) => (
           <button
-            key={item}
+            key={item.id}
             type="button"
             className={cn(
               "relative text-sm font-semibold capitalize text-[#667085]",
-              tab === item && "text-[#503ed4]",
+              tab === item.id && "text-[#503ed4]",
             )}
-            onClick={() => setTab(item)}
+            onClick={() => onSelectTab(item.id)}
           >
-            {item}
-            {item === "members" && members.length > 0 ? (
+            {item.label}
+            {item.count > 0 && (
               <span className="ml-1 rounded-full bg-[#f1efff] px-1.5 py-0.5 text-[10px] text-[#5843d7]">
-                {members.length}
+                {item.count}
               </span>
-            ) : null}
-            {tab === item && (
+            )}
+            {tab === item.id && (
               <span className="absolute inset-x-1 bottom-0 h-0.5 rounded-full bg-[#503ed4]" />
             )}
           </button>
@@ -4961,186 +5279,437 @@ function ChannelDetailPanel({
       <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
         {!channel ? (
           <EmptyState icon={Hash} text="Select a channel." />
-        ) : tab === "details" ? (
-          <div className="space-y-6">
-            <section>
-              <h3 className="mb-2 text-sm font-bold text-[#111827]">About this channel</h3>
-              <p className="text-sm leading-5 text-[#303849]">
-                {channelTopic(channel) ||
-                  "Use this channel to coordinate work, share updates, and keep threaded discussions organized."}
-              </p>
-            </section>
-            <section className="space-y-3">
-              <DetailRow
-                icon={Shield}
-                title="Posting permissions"
-                text={
-                  channel.visibility === "public"
-                    ? "All members can view. Explicit members can be managed here."
-                    : "Private channel. Only invited members can view and post."
-                }
-              />
-              <DetailRow
-                icon={MessageSquare}
-                title="Thread behavior"
-                text="Use threads to keep focused discussions attached to the message that started them."
-              />
-            </section>
-            <section className="space-y-2">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-bold text-[#111827]">Members ({members.length})</h3>
-                <button
-                  className="text-xs font-semibold text-[#503ed4]"
-                  type="button"
-                  onClick={() => setTab("members")}
-                >
-                  View all
-                </button>
-              </div>
-              <AvatarStack actors={members} max={7} />
-            </section>
-            <section className="space-y-2">
-              <label className="text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-                Topic
-              </label>
-              <Textarea
-                value={topicDraft}
-                onChange={(event) => setTopicDraft(event.target.value)}
-                placeholder="Set a channel topic"
-                className="min-h-16 resize-none rounded-xl border-[#dfe3ec] bg-white text-sm shadow-none"
-              />
-              <div className="flex justify-end">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={!topicChanged || busy === `channel:topic:${channel.id}`}
-                  onClick={() => onUpdateTopic(channel.id, topicDraft.trim())}
-                >
-                  Save
-                </Button>
-              </div>
-            </section>
-          </div>
+        ) : tab === "threads" ? (
+          <ChannelThreadsPanel
+            actors={actors}
+            rootMessagesById={rootMessagesById}
+            threadStatsById={threadStatsById}
+            threads={channelThreads}
+            onSelectThread={onSelectThread}
+          />
         ) : tab === "members" ? (
-          <div className="space-y-3">
-            <div className="member-picker-card">
-              <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
-                <UserPlus size={13} />
-                Add member
-              </div>
-              <label className="mb-3 flex h-9 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-[#667085]">
-                <Search size={14} />
-                <input
-                  value={memberQuery}
-                  onChange={(event) => setMemberQuery(event.target.value)}
-                  placeholder="Search people and agents"
-                  className="min-w-0 flex-1 bg-transparent text-sm text-[#303849] outline-none placeholder:text-[#98a2b3]"
-                />
-              </label>
-              <div className="space-y-2">
-                {filteredAvailableMembers.length === 0 ? (
-                  <MutedLine>
-                    {availableMembers.length === 0
-                      ? "No candidates available."
-                      : "No matching candidates."}
-                  </MutedLine>
-                ) : (
-                  filteredAvailableMembers.slice(0, 8).map((actor) => {
-                    const inviteBusy = busy === `channel:invite:${channel.id}:${actor.id}`;
-                    return (
-                      <div key={actor.id} className="member-candidate-row">
-                        <ActorAvatar actor={actor} fallback={actor.id} small />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-semibold text-[#303849]">
-                            {displayName(actor)}
-                          </div>
-                          <div className="truncate text-xs text-[#667085]">
-                            {actor.kind} · {shortActorAlias(actor.id)}
-                          </div>
-                        </div>
-                        <Button
-                          size="sm"
-                          className="h-8 rounded-lg bg-[#503ed4] px-3 text-white hover:bg-[#4635c5]"
-                          disabled={inviteBusy}
-                          onClick={() => onInviteMember(channel.id, actor.id)}
-                        >
-                          {inviteBusy ? (
-                            <Loader2 className="animate-spin" size={13} />
-                          ) : (
-                            <Plus size={13} />
-                          )}
-                          Add
-                        </Button>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </div>
-            {members.map((actor) => (
-              <div
-                key={actor.id}
-                className="flex items-center gap-3 rounded-xl border border-[#edf0f5] bg-white px-3 py-2"
-              >
-                <ActorAvatar actor={actor} fallback={actor.id} small />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-semibold text-[#303849]">
-                    {displayName(actor)}
-                  </div>
-                  <div className="truncate text-xs text-[#667085]">{actor.kind}</div>
-                </div>
-                {channel && canRemoveChannelMember(channel, actor.id) && (
-                  <button
-                    type="button"
-                    title={`Remove ${displayName(actor)}`}
-                    disabled={busy === `channel:revoke:${channel.id}:${actor.id}`}
-                    onClick={() => onRemoveMember(channel.id, actor.id)}
-                    className="composer-icon h-7 min-w-7 text-[#667085]"
-                  >
-                    {busy === `channel:revoke:${channel.id}:${actor.id}` ? (
-                      <Loader2 className="animate-spin" size={13} />
-                    ) : (
-                      <X size={13} />
-                    )}
-                  </button>
-                )}
-              </div>
-            ))}
-            {members.length === 0 && <MutedLine>No explicit members.</MutedLine>}
-          </div>
+          <ChannelMembersPanel
+            availableMembers={availableMembers}
+            busy={busy}
+            channel={channel}
+            filteredAvailableMembers={filteredAvailableMembers}
+            memberQuery={memberQuery}
+            offlineMembers={offlineMembers}
+            onlineMembers={onlineMembers}
+            setMemberQuery={setMemberQuery}
+            onInviteMember={onInviteMember}
+            onRemoveMember={onRemoveMember}
+          />
         ) : (
-          <div className="space-y-2">
-            {channelThreads.map((item) => (
-              <div key={item.id} className="rounded-xl border border-[#edf0f5] bg-white p-3">
-                <div className="truncate text-sm font-semibold text-[#303849]">
-                  {item.title}
-                </div>
-                <div className="mt-1 text-xs text-[#667085]">
-                  Started from {shortId(item.rootMessageId)}
-                </div>
-              </div>
-            ))}
-            {channelThreads.length === 0 && <MutedLine>No threads in this channel.</MutedLine>}
-            {channelTasks.length > 0 && (
-              <div className="pt-3">
-                <PanelBlock title="Tasks" count={channelTasks.length}>
-                  <div className="space-y-2">
-                    {channelTasks.slice(0, 5).map((task) => (
-                      <div key={task.id} className="rounded-xl border border-[#dfe3ec] bg-white p-3">
-                        <div className="truncate text-sm font-semibold text-[#303849]">
-                          {task.title}
-                        </div>
-                        <div className="mt-1 text-xs text-[#667085]">{task.status}</div>
-                      </div>
-                    ))}
-                  </div>
-                </PanelBlock>
-              </div>
-            )}
-          </div>
+          <ChannelTasksPanel actors={actors} tasks={channelTasks} />
         )}
       </div>
     </aside>
+  );
+}
+
+function ChannelThreadsPanel({
+  actors,
+  rootMessagesById,
+  threadStatsById,
+  threads,
+  onSelectThread,
+}: {
+  actors: Record<string, Actor>;
+  rootMessagesById: Map<string, Message>;
+  threadStatsById: Record<string, ThreadActivityStats>;
+  threads: Thread[];
+  onSelectThread: (thread: Thread) => void;
+}) {
+  if (threads.length === 0) {
+    return <EmptyState icon={Split} text="No threads in this channel." />;
+  }
+  return (
+    <div className="space-y-3">
+      {threads.map((thread) => (
+        <ChannelThreadCard
+          key={thread.id}
+          actors={actors}
+          rootMessage={rootMessagesById.get(thread.rootMessageId) ?? null}
+          thread={thread}
+          threadStats={threadStatsById[thread.id]}
+          onSelect={() => onSelectThread(thread)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ChannelThreadCard({
+  actors,
+  rootMessage,
+  thread,
+  threadStats,
+  onSelect,
+}: {
+  actors: Record<string, Actor>;
+  rootMessage: Message | null;
+  thread: Thread;
+  threadStats?: ThreadActivityStats;
+  onSelect: () => void;
+}) {
+  const starter = rootMessage ? actors[rootMessage.authorActorId] : undefined;
+  const participants = threadParticipants(thread, actors, starter, threadStats);
+  const replyCount = threadReplyCount(thread, threadStats);
+  const lastReply = threadLastReplyLabel(thread, threadStats);
+  const preview = rootMessage
+    ? rootMessage.body || metadataText(rootMessage)
+    : `Started from ${shortId(thread.rootMessageId)}`;
+  const replyLabel =
+    typeof replyCount === "number"
+      ? `${replyCount}${threadStats?.hasMoreReplies ? "+" : ""} replies`
+      : "Thread";
+  return (
+    <button
+      type="button"
+      className="w-full rounded-xl border border-[#e2e6ef] bg-white p-4 text-left shadow-[0_1px_2px_rgb(16_24_40_/_0.03)] transition hover:border-[#cdd3e5] hover:shadow-[0_10px_24px_rgb(16_24_40_/_0.07)]"
+      onClick={onSelect}
+    >
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
+          <Split size={17} />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-start justify-between gap-2">
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-bold text-[#111827]">
+                {thread.title}
+              </span>
+              <span className="mt-1 line-clamp-2 text-xs leading-5 text-[#596174]">
+                {starter ? `${displayName(starter)}: ` : ""}
+                {preview}
+              </span>
+            </span>
+            <span className="shrink-0 text-xs font-medium text-[#8a93a5]">
+              {rootMessage ? formatTime(rootMessage.createdAt) : shortId(thread.id, 5)}
+            </span>
+          </span>
+          <span className="mt-3 flex min-w-0 items-center gap-2">
+            <AvatarStack actors={participants} max={4} small />
+            <span className="min-w-0 truncate text-xs font-bold text-[#503ed4]">
+              {replyLabel}
+            </span>
+            {lastReply && (
+              <span className="shrink-0 text-xs font-medium text-[#667085]">
+                Last {lastReply}
+              </span>
+            )}
+          </span>
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function ChannelMembersPanel({
+  availableMembers,
+  busy,
+  channel,
+  filteredAvailableMembers,
+  memberQuery,
+  offlineMembers,
+  onlineMembers,
+  setMemberQuery,
+  onInviteMember,
+  onRemoveMember,
+}: {
+  availableMembers: Actor[];
+  busy: string | null;
+  channel: Channel;
+  filteredAvailableMembers: Actor[];
+  memberQuery: string;
+  offlineMembers: ChannelMemberPanelItem[];
+  onlineMembers: ChannelMemberPanelItem[];
+  setMemberQuery: (value: string) => void;
+  onInviteMember: (channelId: string, actorId: string) => void;
+  onRemoveMember: (channelId: string, actorId: string) => void;
+}) {
+  return (
+    <div className="space-y-4">
+      <ChannelMemberGroup
+        busy={busy}
+        channel={channel}
+        items={onlineMembers}
+        title="在线"
+        onRemoveMember={onRemoveMember}
+      />
+      <ChannelMemberGroup
+        busy={busy}
+        channel={channel}
+        items={offlineMembers}
+        title="离线"
+        onRemoveMember={onRemoveMember}
+      />
+      {onlineMembers.length === 0 && offlineMembers.length === 0 && (
+        <MutedLine>No explicit members.</MutedLine>
+      )}
+      <div className="member-picker-card">
+        <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
+          <UserPlus size={13} />
+          Add member
+        </div>
+        <label className="mb-3 flex h-9 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-[#667085]">
+          <Search size={14} />
+          <input
+            value={memberQuery}
+            onChange={(event) => setMemberQuery(event.target.value)}
+            placeholder="Search people and agents"
+            className="min-w-0 flex-1 bg-transparent text-sm text-[#303849] outline-none placeholder:text-[#98a2b3]"
+          />
+        </label>
+        <div className="space-y-2">
+          {filteredAvailableMembers.length === 0 ? (
+            <MutedLine>
+              {availableMembers.length === 0
+                ? "No candidates available."
+                : "No matching candidates."}
+            </MutedLine>
+          ) : (
+            filteredAvailableMembers.slice(0, 8).map((actor) => {
+              const inviteBusy = busy === `channel:invite:${channel.id}:${actor.id}`;
+              return (
+                <div key={actor.id} className="member-candidate-row">
+                  <ActorAvatar actor={actor} fallback={actor.id} small />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold text-[#303849]">
+                      {displayName(actor)}
+                    </div>
+                    <div className="truncate text-xs text-[#667085]">
+                      {actorKindLabel(actor)} · {shortActorAlias(actor.id)}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="h-8 rounded-lg bg-[#503ed4] px-3 text-white hover:bg-[#4635c5]"
+                    disabled={inviteBusy}
+                    onClick={() => onInviteMember(channel.id, actor.id)}
+                  >
+                    {inviteBusy ? (
+                      <Loader2 className="animate-spin" size={13} />
+                    ) : (
+                      <Plus size={13} />
+                    )}
+                    Add
+                  </Button>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChannelMemberGroup({
+  busy,
+  channel,
+  items,
+  title,
+  onRemoveMember,
+}: {
+  busy: string | null;
+  channel: Channel;
+  items: ChannelMemberPanelItem[];
+  title: string;
+  onRemoveMember: (channelId: string, actorId: string) => void;
+}) {
+  if (items.length === 0) return null;
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center gap-2 px-1 text-xs font-bold text-[#596174]">
+        <span>{title}</span>
+        <span className="rounded-full bg-[#eef0f6] px-1.5 py-0.5 text-[10px] text-[#667085]">
+          {items.length}
+        </span>
+      </div>
+      <div className="space-y-2">
+        {items.map(({ actor, presence }) => (
+          <ChannelMemberRow
+            key={actor.id}
+            actor={actor}
+            busy={busy}
+            channel={channel}
+            presence={presence}
+            onRemoveMember={onRemoveMember}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ChannelMemberRow({
+  actor,
+  busy,
+  channel,
+  presence,
+  onRemoveMember,
+}: {
+  actor: Actor;
+  busy: string | null;
+  channel: Channel;
+  presence: ChannelMemberPresence;
+  onRemoveMember: (channelId: string, actorId: string) => void;
+}) {
+  const revokeBusy = busy === `channel:revoke:${channel.id}:${actor.id}`;
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-[#edf0f5] bg-white px-3 py-2.5 shadow-[0_1px_2px_rgb(16_24_40_/_0.03)]">
+      <span className="relative shrink-0">
+        <ActorAvatar actor={actor} fallback={actor.id} small />
+        <span
+          className={cn(
+            "absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white",
+            statusDotClass(presence.status),
+          )}
+        />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="truncate text-sm font-semibold text-[#303849]">
+            {displayName(actor)}
+          </div>
+          <span className="shrink-0 rounded-md bg-[#f5f3ff] px-1.5 py-0.5 text-[10px] font-bold text-[#6652e8]">
+            {actorKindLabel(actor)}
+          </span>
+        </div>
+        <div className="truncate text-xs text-[#667085]">
+          {presence.label}
+          {actor.kind === "agent" && presence.status !== "offline"
+            ? ` · ${presence.status}`
+            : ""}
+        </div>
+      </div>
+      {canRemoveChannelMember(channel, actor.id) && (
+        <button
+          type="button"
+          title={`Remove ${displayName(actor)}`}
+          disabled={revokeBusy}
+          onClick={() => onRemoveMember(channel.id, actor.id)}
+          className="composer-icon h-7 min-w-7 text-[#667085]"
+        >
+          {revokeBusy ? <Loader2 className="animate-spin" size={13} /> : <X size={13} />}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ChannelTasksPanel({
+  actors,
+  tasks,
+}: {
+  actors: Record<string, Actor>;
+  tasks: Task[];
+}) {
+  const groups = channelTaskGroups(tasks);
+  if (tasks.length === 0) {
+    return <EmptyState icon={Check} text="No tasks in this channel." />;
+  }
+  return (
+    <div className="space-y-5">
+      {groups.map((group) => (
+        <section key={group.id} className="space-y-2">
+          <div className="flex items-center gap-2 px-1 text-xs font-bold text-[#596174]">
+            <span>{group.title}</span>
+            <span className="rounded-full bg-[#eef0f6] px-1.5 py-0.5 text-[10px] text-[#667085]">
+              {group.tasks.length}
+            </span>
+          </div>
+          <div className="space-y-2">
+            {group.tasks.map((task) => (
+              <ChannelTaskCard key={task.id} actors={actors} task={task} />
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function ChannelTaskCard({
+  actors,
+  task,
+}: {
+  actors: Record<string, Actor>;
+  task: Task;
+}) {
+  const ownerId = task.ownerActorId || task.requesterActorId;
+  const owner = ownerId ? actors[ownerId] ?? fallbackActor(ownerId) : null;
+  const progress = taskProgressPercent(task);
+  const done = task.status === "done";
+  const active = task.status === "in_progress" || task.status === "waiting_review";
+  return (
+    <div className="rounded-xl border border-[#e2e6ef] bg-white p-3 shadow-[0_1px_2px_rgb(16_24_40_/_0.03)]">
+      <div className="flex items-start gap-3">
+        <span
+          className={cn(
+            "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border",
+            done
+              ? "border-[#5b46e8] bg-[#5b46e8] text-white"
+              : active
+                ? "border-[#5b46e8] bg-[#f4f2ff] text-[#5b46e8]"
+                : "border-[#b8bfce] bg-white text-transparent",
+          )}
+        >
+          {done ? <Check size={12} /> : active ? <span className="h-2 w-2 rounded-full bg-current" /> : null}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <div className="line-clamp-2 text-sm font-bold leading-5 text-[#111827]">
+                {task.title}
+              </div>
+              <div className="mt-1 truncate text-xs text-[#667085]">
+                Source {shortId(task.sourceMessageId)}
+              </div>
+            </div>
+            <Badge
+              variant="outline"
+              title={task.id}
+              className={cn(
+                "shrink-0 whitespace-nowrap font-semibold",
+                taskStatusBadgeClass(task.status),
+              )}
+            >
+              Task #{task.number}
+            </Badge>
+          </div>
+          {progress !== null && (
+            <div className="mt-3 flex items-center gap-3">
+              <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-[#e7e9f3]">
+                <span
+                  className="block h-full rounded-full bg-[#5b46e8]"
+                  style={{ width: `${progress}%` }}
+                />
+              </span>
+              <span className="w-9 text-right text-xs font-semibold text-[#667085]">
+                {progress}%
+              </span>
+            </div>
+          )}
+          <div className="mt-3 flex items-center justify-between gap-2 text-xs text-[#667085]">
+            <span className="flex min-w-0 items-center gap-1.5">
+              <Clock size={13} />
+              <span className="truncate">{formatShortDateTime(task.updatedAt)}</span>
+            </span>
+            {owner && (
+              <span className="flex min-w-0 items-center gap-1.5">
+                <ActorAvatar actor={owner} fallback={owner.id} small />
+                <span className="max-w-[86px] truncate font-semibold text-[#485063]">
+                  {displayName(owner)}
+                </span>
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -5174,28 +5743,6 @@ function EmptyState({
       <Icon size={28} />
       <div className="text-sm">{text}</div>
     </div>
-  );
-}
-
-function PanelBlock({
-  title,
-  count,
-  children,
-}: {
-  title: string;
-  count: number;
-  children: ReactNode;
-}) {
-  return (
-    <section className="mb-5">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="text-xs font-semibold uppercase tracking-wide text-[#667085]">
-          {title}
-        </div>
-        <Badge variant="outline">{count}</Badge>
-      </div>
-      {children}
-    </section>
   );
 }
 
@@ -5276,26 +5823,117 @@ function AvatarStack({
   );
 }
 
-function DetailRow({
-  icon: Icon,
-  title,
-  text,
+function useStickToBottomScroll({
+  contentKey,
+  itemCount,
+  scrollKey,
 }: {
-  icon: ComponentType<{ size?: string | number; className?: string }>;
-  title: string;
-  text: string;
+  contentKey: string;
+  itemCount: number;
+  scrollKey: string;
 }) {
-  return (
-    <div className="grid grid-cols-[22px_1fr] gap-3">
-      <span className="mt-0.5 flex h-6 w-6 items-center justify-center rounded-md bg-[#f1efff] text-[#503ed4]">
-        <Icon size={14} />
-      </span>
-      <div>
-        <div className="text-sm font-bold text-[#111827]">{title}</div>
-        <div className="mt-1 text-sm leading-5 text-[#596174]">{text}</div>
-      </div>
-    </div>
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+
+  useLayoutEffect(() => {
+    stickToBottomRef.current = true;
+  }, [scrollKey]);
+
+  useLayoutEffect(() => {
+    if (itemCount === 0) {
+      stickToBottomRef.current = true;
+      return;
+    }
+    const element = scrollRef.current;
+    if (!element || !stickToBottomRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      element.scrollTop = element.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [contentKey, itemCount, scrollKey]);
+
+  const onScroll = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const distanceFromBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 160;
+  }, []);
+
+  return { onScroll, ref: scrollRef };
+}
+
+function initialViewportWidth() {
+  return typeof window === "undefined" ? 1440 : window.innerWidth;
+}
+
+function loadPanelSizes(): PanelSizes {
+  if (typeof window === "undefined") return defaultPanelSizes;
+  try {
+    const raw = window.localStorage.getItem(panelLayoutStorageKey);
+    if (!raw) return defaultPanelSizes;
+    const parsed = JSON.parse(raw) as Partial<PanelSizes>;
+    return fitPanelSizes(
+      {
+        sidebar:
+          typeof parsed.sidebar === "number"
+            ? parsed.sidebar
+            : defaultPanelSizes.sidebar,
+        detail:
+          typeof parsed.detail === "number"
+            ? parsed.detail
+            : defaultPanelSizes.detail,
+      },
+      initialViewportWidth(),
+      initialViewportWidth() >= detailPanelBreakpoint,
+    );
+  } catch {
+    return defaultPanelSizes;
+  }
+}
+
+function savePanelSizes(sizes: PanelSizes) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(panelLayoutStorageKey, JSON.stringify(sizes));
+  } catch {
+    /* local-only preference; ignore quota or privacy-mode failures */
+  }
+}
+
+function fitPanelSizes(
+  sizes: PanelSizes,
+  viewportWidth: number,
+  detailVisible: boolean,
+): PanelSizes {
+  const sidebarMaxForViewport = detailVisible
+    ? viewportWidth -
+      railWidth -
+      resizeHandleWidth * 2 -
+      mainMinWidth -
+      detailMinWidth
+    : viewportWidth - railWidth - resizeHandleWidth - 240;
+  const sidebar = clampNumber(
+    sizes.sidebar,
+    sidebarMinWidth,
+    Math.max(sidebarMinWidth, Math.min(sidebarMaxWidth, sidebarMaxForViewport)),
   );
+  const detailMaxForViewport =
+    viewportWidth -
+    railWidth -
+    resizeHandleWidth * 2 -
+    sidebar -
+    mainMinWidth;
+  const detail = clampNumber(
+    sizes.detail,
+    detailMinWidth,
+    Math.max(detailMinWidth, Math.min(detailMaxWidth, detailMaxForViewport)),
+  );
+  return { sidebar, detail };
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function channelGroupStorageKey(workspace: Workspace | null) {
@@ -5405,12 +6043,6 @@ function flattenThreads(
       }),
     )
     .sort((a, b) => a.title.localeCompare(b.title));
-}
-
-function stitchThreadMessages(rootMessage: Message | null, replies: Message[]) {
-  if (!rootMessage) return replies;
-  if (replies.some((message) => message.id === rootMessage.id)) return replies;
-  return [rootMessage, ...replies];
 }
 
 function agentMemberEntries(machines: MachineInfo[]): AgentMemberEntry[] {
@@ -5554,11 +6186,160 @@ function connectionLabel(connection: ConnectionState) {
   return "Idle";
 }
 
+function channelPanelTitle(tab: ChannelPanelTab) {
+  if (tab === "threads") return "线程";
+  if (tab === "members") return "成员";
+  return "任务";
+}
+
+function channelPanelDetail(
+  tab: ChannelPanelTab,
+  threadCount: number,
+  memberCount: number,
+  taskCount: number,
+) {
+  if (tab === "threads") return `${threadCount} active threads`;
+  if (tab === "members") return `${memberCount} members`;
+  return `${taskCount} tasks`;
+}
+
+function actorKindLabel(actor: Actor) {
+  if (actor.kind === "agent") return "智能体";
+  if (actor.kind === "service") return "服务";
+  return "成员";
+}
+
+function memberPresence(
+  actor: Actor,
+  machines: MachineInfo[],
+  currentActorId: string | null,
+): ChannelMemberPresence {
+  if (actor.id === currentActorId) {
+    return { online: true, label: "在线", status: "online" };
+  }
+  if (actor.kind === "agent") {
+    const entry = findAgentMemberEntry(machines, actor.id);
+    if (!entry) return { online: false, label: "离线", status: "offline" };
+    const rawStatus = entry.agent.status || "offline";
+    const online = isOnlinePresenceStatus(rawStatus, entry.agent);
+    return {
+      online,
+      label: online ? "在线" : "离线",
+      status: rawStatus,
+    };
+  }
+  return { online: false, label: "离线", status: "offline" };
+}
+
+function findAgentMemberEntry(
+  machines: MachineInfo[],
+  actorId: string,
+): AgentMemberEntry | null {
+  for (const machine of machines) {
+    const agent = machine.agents.find((item) => item.spec.actor.id === actorId);
+    if (agent) return { machine, agent };
+  }
+  return null;
+}
+
+function isOnlinePresenceStatus(
+  status: string,
+  agent: MachineInfo["agents"][number],
+) {
+  const normalized = status.toLowerCase();
+  if (["online", "connected", "running", "busy", "idle", "active"].includes(normalized)) {
+    return true;
+  }
+  if (["offline", "stopped", "disconnected", "failed", "error", "exited"].includes(normalized)) {
+    return false;
+  }
+  return Boolean(agent.pid || agent.sessionId);
+}
+
 function statusDotClass(status: string) {
-  if (status === "online" || status === "connected") return "bg-emerald-400";
-  if (status === "connecting" || status === "pending") return "bg-amber-400";
-  if (status === "error" || status === "failed") return "bg-red-400";
+  const normalized = status.toLowerCase();
+  if (["online", "connected", "running", "busy", "idle", "active"].includes(normalized)) {
+    return "bg-emerald-400";
+  }
+  if (normalized === "connecting" || normalized === "pending") return "bg-amber-400";
+  if (normalized === "error" || normalized === "failed") return "bg-red-400";
   return "bg-[#98a2b3]";
+}
+
+function taskStatusBadgeClass(status: Task["status"]) {
+  switch (status) {
+    case "todo":
+      return "border-slate-200 bg-slate-100 text-slate-700";
+    case "claimed":
+      return "border-violet-200 bg-violet-50 text-violet-700";
+    case "in_progress":
+      return "border-blue-200 bg-blue-50 text-blue-700";
+    case "waiting_review":
+      return "border-amber-200 bg-amber-50 text-amber-700";
+    case "done":
+      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    case "failed":
+      return "border-red-200 bg-red-50 text-red-700";
+    case "canceled":
+      return "border-slate-200 bg-slate-100 text-slate-500";
+  }
+}
+
+function channelTaskGroups(tasks: Task[]) {
+  const groups = [
+    {
+      id: "todo",
+      title: "待办",
+      tasks: tasks.filter((task) => task.status === "todo" || task.status === "claimed"),
+    },
+    {
+      id: "active",
+      title: "进行中",
+      tasks: tasks.filter(
+        (task) => task.status === "in_progress" || task.status === "waiting_review",
+      ),
+    },
+    {
+      id: "done",
+      title: "已完成",
+      tasks: tasks.filter((task) => task.status === "done"),
+    },
+    {
+      id: "other",
+      title: "其他",
+      tasks: tasks.filter(
+        (task) =>
+          task.status === "failed" ||
+          task.status === "canceled" ||
+          ![
+            "todo",
+            "claimed",
+            "in_progress",
+            "waiting_review",
+            "done",
+          ].includes(task.status),
+      ),
+    },
+  ];
+  return groups.filter((group) => group.tasks.length > 0);
+}
+
+function taskProgressPercent(task: Task) {
+  if (task.status === "in_progress") return 60;
+  if (task.status === "waiting_review") return 85;
+  if (task.status === "done") return 100;
+  return null;
+}
+
+function formatShortDateTime(value: string) {
+  const date = parseMessageDate(value);
+  if (!date) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function reconnectDelayMs(attempt: number) {

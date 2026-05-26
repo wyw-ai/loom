@@ -601,6 +601,9 @@ fn apply_machine_command(
             if let Some(value) = command.get("autostart").and_then(Value::as_bool) {
                 agent.autostart = value;
             }
+            if let Some(value) = optional_trimmed_str(command, "avatarUrl") {
+                agent.avatar_url = value;
+            }
             let updated = agent.clone();
             save_desktop_config(&cfg)?;
             *selected_machine = cfg.machines[machine_index].clone();
@@ -730,6 +733,12 @@ fn agent_config_from_command(command: &Value, machine_id: &str) -> Result<Machin
             .get("autostart")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        avatar_url: command
+            .get("avatarUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
     })
 }
 
@@ -901,6 +910,8 @@ struct MachineAgentConfig {
     reasoning_effort: String,
     #[serde(default)]
     autostart: bool,
+    #[serde(default)]
+    avatar_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1567,6 +1578,7 @@ fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
         model: non_empty(agent.model.trim()),
         reasoning_effort: non_empty(agent.reasoning_effort.trim()),
         autostart: agent.autostart,
+        avatar_url: non_empty(agent.avatar_url.trim()),
     }
 }
 
@@ -1668,6 +1680,7 @@ mod tests {
             model: String::new(),
             reasoning_effort: String::new(),
             autostart: true,
+            avatar_url: String::new(),
         }
     }
 
@@ -1745,6 +1758,7 @@ mod tests {
             model: Some("gpt-5.5".into()),
             reasoning_effort: Some("xhigh".into()),
             autostart: false,
+            avatar_url: None,
         };
         let mut specs = provider_specs_from_agent_definitions(&[provider], &[definition])
             .into_iter()
@@ -1863,6 +1877,7 @@ mod tests {
                 model: String::new(),
                 reasoning_effort: String::new(),
                 autostart: true,
+                avatar_url: String::new(),
             }],
         };
         let mut cfg = DesktopConfig {

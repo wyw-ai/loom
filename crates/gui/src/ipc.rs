@@ -937,6 +937,8 @@ pub struct AgentCreateArgs {
     pub reasoning_effort: String,
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default)]
+    pub avatar_url: String,
 }
 
 #[tauri::command]
@@ -1007,6 +1009,8 @@ pub struct AgentUpdateArgs {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub autostart: Option<bool>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 #[tauri::command]
@@ -1039,6 +1043,7 @@ pub async fn agent_update(
                     "model": args.model,
                     "reasoningEffort": args.reasoning_effort,
                     "autostart": args.autostart,
+                    "avatarUrl": args.avatar_url,
                 }),
             )
             .await?;
@@ -1048,17 +1053,20 @@ pub async fn agent_update(
                 .ok_or_else(|| {
                     format!("machine inventory disappeared after update: {machine_id}")
                 })?;
-            return remote
+            let info = remote
                 .agents
                 .into_iter()
                 .find(|agent| agent.info.spec.actor.id == actor_id)
                 .map(|agent| agent.info)
                 .ok_or_else(|| {
                     format!("updated agent not found in remote inventory: {}", actor_id)
-                });
+                })?;
+            upsert_agent_actor_to_server(state.try_client().await, &info).await;
+            return Ok(info);
         }
     }
     if let Some(info) = update_machine_agent_in_config(&args).map_err(stringify)? {
+        upsert_agent_actor_to_server(state.try_client().await, &info).await;
         return Ok(info);
     }
     Err(format!(
@@ -1427,6 +1435,7 @@ pub async fn machine_agent_create(
                 "model": args.model,
                 "reasoningEffort": args.reasoning_effort,
                 "autostart": args.autostart,
+                "avatarUrl": args.avatar_url,
             }),
         )
         .await?;
@@ -1470,6 +1479,7 @@ pub async fn machine_agent_create(
         model: args.model.trim().to_string(),
         reasoning_effort: args.reasoning_effort.trim().to_string(),
         autostart: args.autostart,
+        avatar_url: args.avatar_url.trim().to_string(),
     });
     config::save(&cfg).map_err(stringify)?;
     if let Some(client) = state.try_client().await {
@@ -1568,6 +1578,27 @@ async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[Str
         {
             tracing::warn!(%actor_id, %err, "failed to delete actor from server");
         }
+    }
+}
+
+async fn upsert_agent_actor_to_server(client: Option<Arc<Client>>, info: &AgentInfo) {
+    let Some(client) = client else {
+        return;
+    };
+    if let Err(err) = client
+        .call_raw(
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": &info.spec.actor,
+            })),
+        )
+        .await
+    {
+        tracing::warn!(
+            actor_id = %info.spec.actor.id,
+            %err,
+            "failed to upsert updated agent actor to server"
+        );
     }
 }
 
@@ -2415,6 +2446,7 @@ fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
         model: non_empty(agent.model.trim()),
         reasoning_effort: non_empty(agent.reasoning_effort.trim()),
         autostart: agent.autostart,
+        avatar_url: non_empty(agent.avatar_url.trim()),
     }
 }
 
@@ -2468,6 +2500,9 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
         }
         if let Some(autostart) = args.autostart {
             agent.autostart = autostart;
+        }
+        if let Some(avatar_url) = args.avatar_url.as_deref() {
+            agent.avatar_url = avatar_url.trim().to_string();
         }
     }
 
@@ -2597,6 +2632,7 @@ mod tests {
                 model: String::new(),
                 reasoning_effort: String::new(),
                 autostart: false,
+                avatar_url: String::new(),
             }],
         }
     }

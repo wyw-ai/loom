@@ -54,6 +54,7 @@ pub struct AgentDefinition {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub autostart: bool,
+    pub avatar_url: Option<String>,
 }
 
 struct ProviderDef {
@@ -222,6 +223,14 @@ fn actor_spec_from_definition(
         .filter(|reasoning_effort| !reasoning_effort.is_empty())
     {
         meta.insert("reasoningEffort".into(), json!(reasoning_effort));
+    }
+    if let Some(avatar_url) = definition
+        .avatar_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|avatar_url| !avatar_url.is_empty())
+    {
+        meta.insert("avatarUrl".into(), json!(avatar_url));
     }
 
     AgentActorSpec {
@@ -827,6 +836,7 @@ mod tests {
                 model: None,
                 reasoning_effort: None,
                 autostart: true,
+                avatar_url: None,
             }],
         );
 

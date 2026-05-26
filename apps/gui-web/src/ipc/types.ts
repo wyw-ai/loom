@@ -95,7 +95,7 @@ export interface Message {
   parentMessageId?: string | null;
   threadRootMessageId?: string | null;
   taskId?: string | null;
-  attachments: string[];
+  attachments?: string[];
   reactions: MessageReaction[];
   metadata: Record<string, unknown>;
 }
@@ -206,6 +206,15 @@ export interface AgentModelChoice {
   description?: string | null;
 }
 
+export interface AgentModelSpec {
+  default?: string | null;
+  choices: AgentModelChoice[];
+}
+
+export interface AgentIdentitySpec {
+  description?: string | null;
+}
+
 export interface MachineAgentProviderInfo {
   id: string;
   name: string;
@@ -219,6 +228,8 @@ export interface MachineAgentProviderInfo {
 
 export interface AgentSpec {
   actor: Actor;
+  models?: AgentModelSpec | null;
+  identity?: AgentIdentitySpec | null;
   model?: string | null;
   autostart?: boolean | null;
   _meta?: Record<string, unknown>;

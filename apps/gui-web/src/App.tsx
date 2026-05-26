@@ -144,7 +144,6 @@ type AgentMemberEntry = {
 const supportedReactionEmojis = ["👍", "👀", "✅", "🥳", "💔"];
 const avatarCount = 60;
 const agentAvatarIndexes = [32, 56, 5, 15, 43, 45] as const;
-const avatarSurfaceClass = "avatar-surface";
 const avatarLibraryUrls = Array.from(
   { length: avatarCount },
   (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
@@ -4498,10 +4497,7 @@ function AgentMemberDetail({
             <img
               alt=""
               src={draft.avatarUrl || actorAvatarUrl(actor, actor.id)}
-              className={cn(
-                "h-16 w-16 shrink-0 rounded-xl border border-white object-cover shadow-sm",
-                avatarSurfaceClass,
-              )}
+              className="h-16 w-16 shrink-0 rounded-xl border border-white object-cover shadow-sm"
             />
             <div className="min-w-0">
               <h2 className="truncate text-xl font-bold text-[#111827]">
@@ -4547,8 +4543,7 @@ function AgentMemberDetail({
                   title={url.split("/").pop() ?? "Avatar"}
                   disabled={!canEdit}
                   className={cn(
-                    "flex aspect-square items-center justify-center rounded-lg border p-1 transition-colors",
-                    avatarSurfaceClass,
+                    "flex aspect-square items-center justify-center rounded-lg border bg-white p-1 transition-colors",
                     draft.avatarUrl === url
                       ? "border-[#8f82ff] ring-2 ring-[#e4e0ff]"
                       : "border-[#edf0f5] hover:border-[#c8c1ff]",
@@ -5214,10 +5209,7 @@ function Avatar({ account }: { account: HumanAccount }) {
     <img
       alt=""
       src={src}
-      className={cn(
-        "h-10 w-10 rounded-xl border border-white object-cover shadow-sm",
-        avatarSurfaceClass,
-      )}
+      className="h-10 w-10 rounded-xl border border-white object-cover shadow-sm"
     />
   );
 }
@@ -5238,7 +5230,6 @@ function ActorAvatar({
       src={src}
       className={cn(
         "shrink-0 rounded-xl border border-white object-cover shadow-sm",
-        avatarSurfaceClass,
         small ? "h-7 w-7" : "h-10 w-10",
       )}
       title={actor?.id ?? fallback}
@@ -5266,7 +5257,6 @@ function AvatarStack({
           src={actorAvatarUrl(actor, actor.id)}
           className={cn(
             "-ml-2 rounded-full border-2 border-white object-cover shadow-sm first:ml-0",
-            avatarSurfaceClass,
             small ? "h-6 w-6" : "h-8 w-8",
           )}
           title={displayName(actor)}

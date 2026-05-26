@@ -739,6 +739,14 @@ impl Store {
         threads
     }
 
+    pub fn attach_thread_activity_meta(&self, threads: Vec<Thread>) -> Vec<Thread> {
+        let inner = self.inner.read();
+        threads
+            .into_iter()
+            .map(|thread| attach_thread_activity_meta_inner(&inner, thread))
+            .collect()
+    }
+
     pub fn get_thread(&self, id: &str) -> Option<Thread> {
         self.inner.read().threads.get(id).cloned()
     }
@@ -5301,6 +5309,43 @@ fn unique_nonempty(ids: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+fn attach_thread_activity_meta_inner(inner: &Inner, mut thread: Thread) -> Thread {
+    let scope = ScopeRef {
+        kind: ScopeKind::Thread,
+        id: thread.id.clone(),
+    };
+    let mut reply_count = 0usize;
+    let mut participant_actor_ids = Vec::new();
+    let mut last_reply_at = None;
+
+    if let Some(message_ids) = inner.messages_by_scope.get(&scope) {
+        for message in message_ids
+            .iter()
+            .filter_map(|message_id| inner.messages.get(message_id))
+        {
+            reply_count += 1;
+            participant_actor_ids.push(message.author_actor_id.clone());
+            if last_reply_at
+                .map(|current| message.created_at > current)
+                .unwrap_or(true)
+            {
+                last_reply_at = Some(message.created_at);
+            }
+        }
+    }
+
+    let meta = thread._meta.get_or_insert_with(Meta::default);
+    meta.insert("replyCount".into(), serde_json::json!(reply_count));
+    meta.insert(
+        "participantActorIds".into(),
+        serde_json::json!(unique_nonempty(participant_actor_ids)),
+    );
+    if let Some(timestamp) = last_reply_at {
+        meta.insert("lastReplyAt".into(), serde_json::json!(timestamp));
+    }
+    thread
 }
 
 fn message_metadata_with_task_context(mut metadata: Meta, task: Option<&Task>) -> Meta {

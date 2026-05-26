@@ -1,28 +1,38 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { ComponentType, ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import type { ComponentType, FormEvent, PointerEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import {
+  Activity,
+  AtSign,
   Bell,
   Bot,
   Check,
-  Circle,
+  ChevronDown,
+  Clock,
+  FileText,
+  Folder,
   Github,
+  GripVertical,
   Hash,
   HardDrive,
-  Inbox,
+  Home,
+  Lock,
   Loader2,
   LogOut,
   MessageSquare,
+  Pencil,
   PanelRight,
   Plus,
   RefreshCw,
   Reply,
+  Search,
   Send,
-  Settings,
-  Sparkles,
+  Server,
+  Shield,
+  Smile,
   Split,
   Trash2,
-  User,
+  UserPlus,
   Users,
   X,
 } from "lucide-react";
@@ -55,8 +65,48 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn, formatTime, shortId } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
-type View = "chat" | "inbox" | "tasks" | "settings";
-type SettingsStep = "workspace" | "daemon" | "agent";
+type View = "chat" | "threads" | "channels" | "inbox" | "tasks" | "spaces" | "account" | "settings";
+type DetailTab = "details" | "members" | "threads";
+type ChannelGroup = {
+  id: string;
+  title: string;
+  channelIds: string[];
+  collapsed: boolean;
+};
+type ChannelGroupSection = {
+  id: string;
+  title: string;
+  channels: Channel[];
+  collapsed: boolean;
+  local: boolean;
+};
+type ThreadWithChannel = Thread & {
+  channel: Channel;
+};
+type ActionChoice = {
+  id: string;
+  label: string;
+  accepted: boolean;
+  votes?: number;
+};
+type BodyPoll = {
+  question: string;
+  choices: ActionChoice[];
+};
+type ChannelPointerDrag = {
+  channelId: string;
+  startX: number;
+  startY: number;
+  pointerId: number;
+  dragging: boolean;
+};
+type ThreadActivityStats = {
+  replyCount: number;
+  replyMessageIds: string[];
+  participantActorIds: string[];
+  hasMoreReplies: boolean;
+  lastReplyAt: string | null;
+};
 type AgentFormState = {
   machineId: string;
   providerId: string;
@@ -66,8 +116,41 @@ type AgentFormState = {
   model: string;
   autostart: boolean;
 };
+type AgentUpdatePatch = {
+  machineId: string;
+  actorId: string;
+  displayName: string;
+  description: string;
+  providerId?: string;
+  model: string;
+  reasoningEffort: string;
+  autostart: boolean;
+  avatarUrl: string;
+};
+type AgentSettingsDraft = {
+  displayName: string;
+  description: string;
+  providerId: string;
+  model: string;
+  reasoningEffort: string;
+  autostart: boolean;
+  avatarUrl: string;
+};
+type AgentMemberEntry = {
+  machine: MachineInfo;
+  agent: MachineInfo["agents"][number];
+};
 
-const quickReactionEmojis = ["👍", "✅", "👀"];
+const supportedReactionEmojis = ["👍", "👀", "✅", "🥳", "💔"];
+const avatarCount = 60;
+const agentAvatarIndexes = [32, 56, 5, 15, 43, 45] as const;
+const avatarSurfaceClass = "avatar-surface";
+const avatarLibraryUrls = Array.from(
+  { length: avatarCount },
+  (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
+);
+const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
+const ungroupedChannelGroupId = "__ungrouped";
 
 export function App() {
   const [config, setConfig] = useState<DesktopConfig>({
@@ -79,23 +162,28 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [channelGroups, setChannelGroups] = useState<ChannelGroup[]>(() =>
+    loadChannelGroups(channelGroupStorageKey(null)),
+  );
   const [threadsByChannel, setThreadsByChannel] = useState<Record<string, Thread[]>>({});
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [threadMessages, setThreadMessages] = useState<Message[]>([]);
+  const [threadStatsById, setThreadStatsById] = useState<Record<string, ThreadActivityStats>>({});
   const [actors, setActors] = useState<Record<string, Actor>>({});
   const [, setRuns] = useState<Record<string, Run>>({});
   const [inbox, setInbox] = useState<InboxListEntry[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [machines, setMachines] = useState<MachineInfo[]>([]);
   const [draft, setDraft] = useState("");
-  const [newChannelTitle, setNewChannelTitle] = useState("");
+  const [threadDraft, setThreadDraft] = useState("");
   const [workspaceForm, setWorkspaceForm] = useState({
     name: "Local",
     serverUrl: "ws://127.0.0.1:7878/rpc",
   });
   const [machineForm, setMachineForm] = useState({
-    name: "Local Daemon",
+    name: "Local Host",
     dataRoot: "",
   });
   const [agentForm, setAgentForm] = useState<AgentFormState>({
@@ -112,6 +200,7 @@ export function App() {
   const [replyTo, setReplyTo] = useState<Message | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
+  const activeThreadScopeRef = useRef<ScopeRef | null>(null);
   const actorIdRef = useRef<string | null>(null);
   const targetRef = useRef<string | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
@@ -122,26 +211,30 @@ export function App() {
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
   const activeChannel = channels.find((channel) => channel.id === activeChannelId) ?? null;
+  const channelGroupsKey = channelGroupStorageKey(workspace);
   const channelThreads = activeChannel
     ? threadsByChannel[activeChannel.id] ?? []
     : [];
   const activeThread =
     channelThreads.find((thread) => thread.id === activeThreadId) ?? null;
-  const target = activeChannel
-    ? activeThread
-      ? threadTarget(activeThread)
-      : channelTarget(activeChannel.id)
-    : null;
+  const target = activeChannel ? channelTarget(activeChannel.id) : null;
+  const threadMessageTarget = activeThread ? threadTarget(activeThread) : null;
   const activeScope: ScopeRef | null = activeChannel
-    ? activeThread
-      ? { kind: "thread", id: activeThread.id }
-      : { kind: "channel", id: activeChannel.id }
+    ? { kind: "channel", id: activeChannel.id }
     : null;
+  const activeThreadScope: ScopeRef | null = activeThread
+    ? { kind: "thread", id: activeThread.id }
+    : null;
+  const allThreads = flattenThreads(threadsByChannel, channels);
+  const channelIdsKey = channels.map((channel) => channel.id).join("|");
   const actorList = Object.values(actors).sort((a, b) =>
     displayName(a).localeCompare(displayName(b)),
   );
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
   const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
+  const activeChannelMembers = activeChannel
+    ? activeChannel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId))
+    : [];
   const channelAgentActors = activeChannel
     ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
     : [];
@@ -337,6 +430,10 @@ export function App() {
   }, [workspace]);
 
   useEffect(() => {
+    setChannelGroups(loadChannelGroups(channelGroupsKey));
+  }, [channelGroupsKey]);
+
+  useEffect(() => {
     if (
       !autoReconnectRef.current ||
       !workspace ||
@@ -392,6 +489,33 @@ export function App() {
   }, [activeChannel?.id, activeChannel?.members.join("|"), connection]);
 
   useEffect(() => {
+    if (connection !== "open" || channels.length === 0) return;
+    let alive = true;
+    void Promise.allSettled(
+      channels.map((channel) =>
+        ipc.threadList(channel.id).then((result) => ({
+          channelId: channel.id,
+          threads: result.threads,
+        })),
+      ),
+    ).then((results) => {
+      if (!alive) return;
+      setThreadsByChannel((current) => {
+        const next = { ...current };
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            next[result.value.channelId] = sortThreads(result.value.threads);
+          }
+        }
+        return next;
+      });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [channelIdsKey, connection]);
+
+  useEffect(() => {
     activeScopeRef.current = activeScope;
     targetRef.current = target;
     if (!activeScope || !target || connection !== "open") {
@@ -407,7 +531,7 @@ export function App() {
       .then((result) => {
         if (!alive) return;
         setError(null);
-        setMessages(sortMessages(result.messages));
+        setMessages(sortMessages(result.messages.map(normalizeMessage)));
       })
       .catch((err) => setError(errorText(err)));
 
@@ -416,6 +540,43 @@ export function App() {
       void ipc.scopeUnsubscribe(activeScope).catch(() => {});
     };
   }, [activeScope ? scopeKey(activeScope) : null, connection, target]);
+
+  useEffect(() => {
+    activeThreadScopeRef.current = activeThreadScope;
+    if (!activeThreadScope || !threadMessageTarget || connection !== "open") {
+      setThreadMessages([]);
+      return;
+    }
+
+    let alive = true;
+    setThreadMessages([]);
+    void ipc.scopeSubscribe(activeThreadScope).catch(() => {});
+    void ipc
+      .messageList({ target: threadMessageTarget, limit: 100 })
+      .then((result) => {
+        if (!alive) return;
+        setError(null);
+        const sorted = sortMessages(result.messages.map(normalizeMessage));
+        setThreadMessages(sorted);
+        setThreadStatsById((current) => ({
+          ...current,
+          [activeThreadScope.id]: threadStatsFromMessages(
+            sorted,
+            result.pageInfo?.hasMore ?? false,
+          ),
+        }));
+      })
+      .catch((err) => setError(errorText(err)));
+
+    return () => {
+      alive = false;
+      void ipc.scopeUnsubscribe(activeThreadScope).catch(() => {});
+    };
+  }, [
+    activeThreadScope ? scopeKey(activeThreadScope) : null,
+    connection,
+    threadMessageTarget,
+  ]);
 
   function handleStream(update: StreamUpdate) {
     switch (update.kind) {
@@ -466,14 +627,24 @@ export function App() {
                       state: "pending",
                       updatedAt: message.createdAt,
                     },
-                    message,
+                    message: normalizeMessage(message),
                   },
                   ...current,
                 ],
           );
         }
         if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
-          setMessages((current) => sortMessages(upsert(current, message)));
+          setMessages((current) => sortMessages(upsertMessage(current, message)));
+        }
+        if (message.scope.kind === "thread") {
+          setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
+        }
+        if (
+          update.scope &&
+          activeThreadScopeRef.current &&
+          sameScope(update.scope, activeThreadScopeRef.current)
+        ) {
+          setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
         }
         return;
       }
@@ -481,11 +652,23 @@ export function App() {
         const message = update.data.message as Message | undefined;
         if (!message) return;
         if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
-          setMessages((current) => sortMessages(upsert(current, message)));
+          setMessages((current) => sortMessages(upsertMessage(current, message)));
+        }
+        if (message.scope.kind === "thread") {
+          setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
+        }
+        if (
+          update.scope &&
+          activeThreadScopeRef.current &&
+          sameScope(update.scope, activeThreadScopeRef.current)
+        ) {
+          setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
         }
         setInbox((current) =>
           current.map((item) =>
-            item.delivery.sourceId === message.id ? { ...item, message } : item,
+            item.delivery.sourceId === message.id
+              ? { ...item, message: normalizeMessage(message) }
+              : item,
           ),
         );
         return;
@@ -539,6 +722,7 @@ export function App() {
       setConnection("idle");
       setChannels([]);
       setMessages([]);
+      setThreadMessages([]);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -558,7 +742,8 @@ export function App() {
       });
       applyConfig(next);
       await loadMachines();
-      pushNotice(`Workspace ${workspaceForm.name.trim()} added`);
+      setWorkspaceForm({ name: "Local", serverUrl: "ws://127.0.0.1:7878/rpc" });
+      pushNotice(`Space ${workspaceForm.name.trim()} added`);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -593,7 +778,7 @@ export function App() {
     setError(null);
     try {
       await loadMachines(true);
-      pushNotice("Daemon status refreshed");
+      pushNotice("Agent host status refreshed");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -612,8 +797,8 @@ export function App() {
         dataRoot: machineForm.dataRoot.trim() || undefined,
       });
       applyMachines(result.machines);
-      setMachineForm({ name: "Local Daemon", dataRoot: "" });
-      pushNotice(`Daemon ${name} added`);
+      setMachineForm({ name: "Local Host", dataRoot: "" });
+      pushNotice(`Agent host ${name} added`);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -627,7 +812,7 @@ export function App() {
     try {
       const result = await ipc.machineRemove(machineId);
       applyMachines(result.machines);
-      pushNotice("Daemon removed");
+      pushNotice("Agent host removed");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -640,15 +825,15 @@ export function App() {
     const machine = resolveAgentMachine(agentForm, machines);
     const provider = resolveAgentProvider(agentForm, machine);
     if (!machine) {
-      setError("Add a daemon before creating an agent.");
+      setError("Add an agent host before creating an agent.");
       return;
     }
     if (!machineCanCreateAgent(machine)) {
-      setError(`Daemon ${machine.name} is read-only or does not support agent creation.`);
+      setError(`Agent host ${machine.name} is read-only or does not support agent creation.`);
       return;
     }
     if (!provider) {
-      setError(`No agent CLI provider is available for ${machine.name}.`);
+      setError(`No agent runtime is available for ${machine.name}.`);
       return;
     }
     if (!name) {
@@ -692,6 +877,33 @@ export function App() {
         await loadWorkspaceData(workspace);
       }
       pushNotice("Agent removed");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function updateAgent(patch: AgentUpdatePatch) {
+    setBusy(`agent:update:${patch.actorId}`);
+    setError(null);
+    try {
+      await ipc.agentUpdate({
+        machineId: patch.machineId,
+        actorId: patch.actorId,
+        displayName: patch.displayName.trim(),
+        description: patch.description.trim(),
+        providerId: patch.providerId,
+        model: patch.model.trim(),
+        reasoningEffort: patch.reasoningEffort.trim(),
+        autostart: patch.autostart,
+        avatarUrl: patch.avatarUrl.trim(),
+      });
+      await loadMachines();
+      if (workspace && connection === "open") {
+        await loadWorkspaceData(workspace);
+      }
+      pushNotice("Agent settings saved");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -758,8 +970,8 @@ export function App() {
     }
   }
 
-  async function createChannel() {
-    const title = newChannelTitle.trim();
+  async function createChannelWithTitle(rawTitle: string) {
+    const title = rawTitle.trim();
     if (!title || !workspace) return;
     setBusy("channel:create");
     try {
@@ -770,7 +982,6 @@ export function App() {
       setChannels((current) => sortChannels(upsert(current, result.channel)));
       setActiveChannelId(result.channel.id);
       setActiveThreadId(null);
-      setNewChannelTitle("");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -816,9 +1027,49 @@ export function App() {
         deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
         intent: wakesAgent ? "request_action" : "chat",
       });
-      setMessages((current) => sortMessages(upsert(current, result.message)));
+      setMessages((current) => sortMessages(upsertMessage(current, result.message)));
       setDraft("");
       setReplyTo(null);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function sendThreadMessage() {
+    const body = threadDraft.trim();
+    if (!body || !threadMessageTarget) return;
+    setBusy("thread:message:send");
+    try {
+      const mentionedAudience = mentionAudience(body, actors, workspace?.actorId);
+      const unavailableAgents = activeChannel
+        ? mentionedAudience.filter(
+            (audience) =>
+              audience.kind === "actor" && !isChannelMember(activeChannel, audience.id),
+          )
+        : [];
+      if (unavailableAgents.length > 0) {
+        setError(
+          `Add ${unavailableAgents
+            .map((audience) => actorName(actors, audience.id))
+            .join(", ")} to this channel before mentioning them.`,
+        );
+        return;
+      }
+      const wakesAgent = mentionedAudience.some((audience) =>
+        audienceWakesAgent(audience, actors),
+      );
+      const result = await ipc.messageSend({
+        target: threadMessageTarget,
+        body,
+        audience: mentionedAudience,
+        deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
+        intent: wakesAgent ? "request_action" : "chat",
+      });
+      setThreadMessages((current) => sortMessages(upsertMessage(current, result.message)));
+      setThreadStatsById((current) => upsertThreadStatsMessage(current, result.message));
+      setThreadDraft("");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -849,6 +1100,10 @@ export function App() {
         ),
       }));
       setActiveThreadId(result.thread.id);
+      setThreadStatsById((current) => ({
+        ...current,
+        [result.thread.id]: emptyThreadStats(),
+      }));
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -864,7 +1119,12 @@ export function App() {
         messageId: message.id,
         emoji,
       });
-      setMessages((current) => sortMessages(upsert(current, result.message)));
+      setMessages((current) => sortMessages(upsertMessage(current, result.message)));
+      setThreadMessages((current) =>
+        current.some((item) => item.id === result.message.id)
+          ? sortMessages(upsertMessage(current, result.message))
+          : current,
+      );
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -907,6 +1167,78 @@ export function App() {
     }
   }
 
+  const updateChannelGroups = useCallback(
+    (updater: (current: ChannelGroup[]) => ChannelGroup[]) => {
+      setChannelGroups((current) => {
+        const next = normalizeChannelGroups(updater(current));
+        saveChannelGroups(channelGroupsKey, next);
+        return next;
+      });
+    },
+    [channelGroupsKey],
+  );
+
+  const addChannelGroup = useCallback((title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    updateChannelGroups((current) => [
+      ...current,
+      {
+        id: `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        title: trimmed,
+        channelIds: [],
+        collapsed: false,
+      },
+    ]);
+  }, [updateChannelGroups]);
+
+  const renameChannelGroup = useCallback(
+    (groupId: string, title: string) => {
+      const trimmed = title.trim();
+      if (!trimmed) return;
+      updateChannelGroups((current) =>
+        current.map((item) =>
+          item.id === groupId ? { ...item, title: trimmed } : item,
+        ),
+      );
+    },
+    [updateChannelGroups],
+  );
+
+  const removeChannelGroup = useCallback(
+    (groupId: string) => {
+      updateChannelGroups((current) => current.filter((item) => item.id !== groupId));
+    },
+    [updateChannelGroups],
+  );
+
+  const toggleChannelGroup = useCallback(
+    (groupId: string) => {
+      updateChannelGroups((current) =>
+        current.map((item) =>
+          item.id === groupId ? { ...item, collapsed: !item.collapsed } : item,
+        ),
+      );
+    },
+    [updateChannelGroups],
+  );
+
+  const moveChannelToGroup = useCallback(
+    (channelId: string, groupId: string) => {
+      updateChannelGroups((current) =>
+        current.map((group) => {
+          const channelIds = group.channelIds.filter((id) => id !== channelId);
+          if (group.id === groupId && groupId !== ungroupedChannelGroupId) {
+            channelIds.push(channelId);
+            return { ...group, channelIds, collapsed: false };
+          }
+          return { ...group, channelIds };
+        }),
+      );
+    },
+    [updateChannelGroups],
+  );
+
   const chatEmpty =
     connection === "open"
       ? activeChannel
@@ -914,38 +1246,63 @@ export function App() {
           ? "No messages in this thread."
           : "No messages in this channel."
         : "No channels."
-      : "No workspace connection.";
+      : "No space connection.";
 
-  const showChatChrome = view === "chat";
+  const showWorkspaceChrome =
+    view === "chat" ||
+    view === "threads" ||
+    view === "channels" ||
+    view === "inbox" ||
+    view === "tasks" ||
+    view === "settings";
+  const showChatDetail = view === "chat";
+  const selectWorkspace = (workspaceId: string) => {
+    setView("chat");
+    if (workspace?.id !== workspaceId || connection !== "open") {
+      void connectWorkspace(workspaceId);
+    }
+  };
 
   return (
     <div
       className={cn(
-        "grid h-screen w-screen overflow-hidden bg-background text-foreground",
-        showChatChrome
-          ? "grid-cols-[64px_minmax(280px,320px)_minmax(0,1fr)] xl:grid-cols-[64px_320px_minmax(0,1fr)_320px]"
-          : "grid-cols-[64px_minmax(0,1fr)]",
+        "grid h-screen w-screen overflow-hidden bg-[#f5f6fa] text-foreground",
+        showChatDetail
+          ? "grid-cols-[72px_minmax(244px,286px)_minmax(0,1fr)] xl:grid-cols-[72px_286px_minmax(0,1fr)_340px]"
+          : showWorkspaceChrome
+            ? "grid-cols-[72px_minmax(244px,286px)_minmax(0,1fr)] xl:grid-cols-[72px_286px_minmax(0,1fr)]"
+            : "grid-cols-[72px_minmax(0,1fr)]",
       )}
     >
-      <Rail view={view} setView={setView} inboxCount={inbox.length} connection={connection} />
-      {showChatChrome && (
+      <Rail
+        account={account}
+        busy={busy}
+        connection={connection}
+        workspace={workspace}
+        workspaces={workspaces}
+        onSelectWorkspace={selectWorkspace}
+        onDisconnect={disconnect}
+        onOpenHome={() => setView("chat")}
+        onOpenSpaces={() => setView("spaces")}
+        onOpenAccount={() => setView("account")}
+      />
+      {showWorkspaceChrome && (
         <Sidebar
-          account={account}
-          busy={busy}
+          view={view}
+          setView={setView}
           channels={channels}
+          channelGroups={channelGroups}
           connection={connection}
-          newChannelTitle={newChannelTitle}
-          setNewChannelTitle={setNewChannelTitle}
           activeChannelId={activeChannelId}
           activeThreadId={activeThreadId}
           threadsByChannel={threadsByChannel}
-          workspace={workspace}
-          workspaces={workspaces}
-          onAddChannel={createChannel}
-          onConnect={connectWorkspace}
-          onDisconnect={disconnect}
-          onLogin={login}
-          onLogout={logout}
+          onAddChannel={(title) => {
+            void createChannelWithTitle(title);
+          }}
+          onAddChannelGroup={addChannelGroup}
+          onMoveChannelToGroup={moveChannelToGroup}
+          onRemoveChannelGroup={removeChannelGroup}
+          onRenameChannelGroup={renameChannelGroup}
           onSelectChannel={(id) => {
             setView("chat");
             setActiveChannelId(id);
@@ -956,12 +1313,13 @@ export function App() {
             setActiveChannelId(thread.channelId);
             setActiveThreadId(thread.id);
           }}
+          onToggleChannelGroup={toggleChannelGroup}
         />
       )}
       <main
         className={cn(
-          "flex min-h-0 min-w-0 flex-col bg-background",
-          showChatChrome && "border-r border-border",
+          "flex min-h-0 min-w-0 flex-col bg-white",
+          showChatDetail && "border-r border-[#e2e6ef]",
         )}
       >
         {view === "chat" ? (
@@ -971,11 +1329,12 @@ export function App() {
               thread={activeThread}
               task={activeThreadTask}
               target={target}
+              members={activeChannelMembers}
               connection={connection}
               onClearThread={() => setActiveThreadId(null)}
             />
             {error && (
-              <div className="border-b border-destructive/40 bg-destructive/10 px-4 py-2 text-sm text-destructive-foreground">
+              <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">
                 {error}
               </div>
             )}
@@ -984,12 +1343,12 @@ export function App() {
               messages={messages}
               tasksBySourceMessageId={tasksBySourceMessageId}
               channelThreads={channelThreads}
+              threadStatsById={threadStatsById}
               emptyText={chatEmpty}
               onReply={setReplyTo}
               onStartThread={startThread}
               onToggleReaction={toggleMessageReaction}
               onAnswerAction={answerAction}
-              activeThread={activeThread}
               currentActorId={workspace?.actorId ?? null}
               busy={busy}
             />
@@ -1003,6 +1362,48 @@ export function App() {
               onSend={sendMessage}
               mentionAgents={channelAgentActors}
               busy={busy === "message:send"}
+            />
+          </>
+        ) : view === "threads" ? (
+          <>
+            <ErrorBanner error={error} />
+            <ThreadsView
+              actors={actors}
+              channels={channels}
+              messages={messages}
+              threadMessages={threadMessages}
+              threadStatsById={threadStatsById}
+              threads={allThreads}
+              activeChannelId={activeChannelId}
+              activeThread={activeThread}
+              activeThreadTask={activeThreadTask}
+              currentActorId={workspace?.actorId ?? null}
+              threadDraft={threadDraft}
+              setThreadDraft={setThreadDraft}
+              onSelectThread={(thread) => {
+                setActiveChannelId(thread.channelId);
+                setActiveThreadId(thread.id);
+              }}
+              onCloseThread={() => setActiveThreadId(null)}
+              onSendThreadMessage={sendThreadMessage}
+              onToggleReaction={toggleMessageReaction}
+              busy={busy}
+              disabled={connection !== "open" || !threadMessageTarget}
+            />
+          </>
+        ) : view === "channels" ? (
+          <>
+            <ErrorBanner error={error} />
+            <ChannelsView
+              actors={actors}
+              channels={channels}
+              channelGroups={channelGroups}
+              threadsByChannel={threadsByChannel}
+              activeChannel={activeChannel}
+              onSelectChannel={(channelId) => {
+                setActiveChannelId(channelId);
+                setActiveThreadId(null);
+              }}
             />
           </>
         ) : view === "inbox" ? (
@@ -1026,46 +1427,84 @@ export function App() {
             <ErrorBanner error={error} />
             <TasksView tasks={tasks} channels={channels} />
           </>
+        ) : view === "spaces" ? (
+          <>
+            <ErrorBanner error={error} />
+            <SpacesView
+              busy={busy}
+              connection={connection}
+              workspace={workspace}
+              workspaceForm={workspaceForm}
+              setWorkspaceForm={setWorkspaceForm}
+              workspaces={workspaces}
+              onAddWorkspace={addWorkspace}
+              onRemoveWorkspace={removeWorkspace}
+              onSelectWorkspace={selectWorkspace}
+            />
+          </>
+        ) : view === "account" ? (
+          <>
+            <ErrorBanner error={error} />
+            <AccountView
+              account={account}
+              busy={busy}
+              onLogin={login}
+              onLogout={logout}
+            />
+          </>
         ) : (
           <>
             <ErrorBanner error={error} />
             <SettingsView
-              account={account}
               busy={busy}
-              workspaceForm={workspaceForm}
-              setWorkspaceForm={setWorkspaceForm}
               machineForm={machineForm}
               setMachineForm={setMachineForm}
               agentForm={agentForm}
               setAgentForm={setAgentForm}
               machines={machines}
-              workspaces={workspaces}
-              onAddWorkspace={addWorkspace}
-              onRemoveWorkspace={removeWorkspace}
               onCheckMachines={checkMachines}
               onAddMachine={createMachine}
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
+              onUpdateAgent={updateAgent}
               onRemoveAgent={removeAgent}
               onOpenLocalPath={openLocalPath}
-              onLogin={login}
-              onLogout={logout}
             />
           </>
         )}
       </main>
-      {showChatChrome && (
-        <ChannelPanel
+      {showChatDetail && (
+        activeThread ? (
+          <ThreadPanel
+            actors={actors}
+            channel={activeChannel}
+            channelMessages={messages}
+            currentActorId={workspace?.actorId ?? null}
+            disabled={connection !== "open" || !threadMessageTarget}
+            draft={threadDraft}
+            messages={threadMessages}
+            setDraft={setThreadDraft}
+            task={activeThreadTask}
+            thread={activeThread}
+            busy={busy}
+            onClose={() => setActiveThreadId(null)}
+            onSend={sendThreadMessage}
+            onToggleReaction={toggleMessageReaction}
+          />
+        ) : (
+          <ChannelPanel
           actors={actors}
           memberCandidates={memberCandidates}
           channel={activeChannel}
           channelTasks={channelTasks}
+          channelThreads={channelThreads}
           thread={activeThread}
           busy={busy}
           onInviteMember={inviteMemberToChannel}
           onRemoveMember={removeMemberFromChannel}
           onUpdateTopic={updateChannelTopic}
         />
+        )
       )}
       {notice && (
         <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-border bg-popover px-4 py-2 text-sm shadow-soft">
@@ -1077,246 +1516,669 @@ export function App() {
 }
 
 function Rail({
-  view,
-  setView,
-  inboxCount,
+  account,
+  busy,
   connection,
+  workspace,
+  workspaces,
+  onSelectWorkspace,
+  onDisconnect,
+  onOpenHome,
+  onOpenSpaces,
+  onOpenAccount,
 }: {
-  view: View;
-  setView: (view: View) => void;
-  inboxCount: number;
+  account: HumanAccount | null;
+  busy: string | null;
   connection: ConnectionState;
+  workspace: Workspace | null;
+  workspaces: Workspace[];
+  onSelectWorkspace: (workspaceId: string) => void;
+  onDisconnect: () => void;
+  onOpenHome: () => void;
+  onOpenSpaces: () => void;
+  onOpenAccount: () => void;
 }) {
-  const items = [
-    { id: "chat" as const, icon: MessageSquare, label: "Chat" },
-    { id: "inbox" as const, icon: Inbox, label: "Inbox" },
-    { id: "tasks" as const, icon: Check, label: "Tasks" },
-    { id: "settings" as const, icon: Settings, label: "Settings" },
-  ];
   return (
-    <nav className="flex min-h-0 flex-col items-center border-r border-border bg-card py-3">
-      <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md bg-primary text-primary-foreground">
-        <Sparkles size={20} />
-      </div>
-      <div className="flex flex-1 flex-col gap-2">
-        {items.map((item) => {
-          const Icon = item.icon;
+    <nav className="flex min-h-0 flex-col items-center border-r border-[#e2e6ef] bg-[#f7f8fb] px-2.5 py-4">
+      <button
+        type="button"
+        title="Home"
+        className="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-[#6f58f6] to-[#4b36d8] text-base font-bold text-white shadow-sm ring-1 ring-white/60"
+        onClick={onOpenHome}
+      >
+        L
+      </button>
+      <div className="flex flex-1 flex-col items-center gap-2">
+        {workspaces.map((item) => {
+          const selected = item.id === workspace?.id;
           return (
             <button
               key={item.id}
-              title={item.label}
+              title={item.name}
               className={cn(
-                "relative flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
-                view === item.id && "bg-accent text-foreground",
+                "relative flex h-10 w-10 items-center justify-center rounded-xl border text-sm font-bold transition-colors",
+                selected
+                  ? "border-[#6e5bf2] bg-white text-[#5843d7] shadow-sm ring-2 ring-[#d9d4ff]"
+                  : "border-[#dfe3ec] bg-white/70 text-[#303849] hover:border-[#c8cee0] hover:bg-white",
               )}
-              onClick={() => setView(item.id)}
+              onClick={() => onSelectWorkspace(item.id)}
+              disabled={busy === `connect:${item.id}`}
             >
-              <Icon size={18} />
-              {item.id === "inbox" && inboxCount > 0 && (
-                <span className="absolute -right-1 -top-1 min-w-5 rounded-full bg-amber-400 px-1 text-center text-[10px] font-bold text-black">
-                  {inboxCount}
-                </span>
+              {busy === `connect:${item.id}` ? (
+                <Loader2 className="animate-spin" size={15} />
+              ) : (
+                workspaceInitials(item)
+              )}
+              {selected && connection === "open" && (
+                <span className="absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full border-2 border-[#f7f8fb] bg-emerald-400" />
               )}
             </button>
           );
         })}
-      </div>
-      <Circle
-        size={12}
-        className={cn(
-          connection === "open" && "fill-emerald-400 text-emerald-400",
-          connection === "connecting" && "fill-amber-400 text-amber-400",
-          connection === "error" && "fill-red-400 text-red-400",
-          (connection === "idle" || connection === "closed") &&
-            "fill-muted-foreground text-muted-foreground",
+        {workspaces.length === 0 && (
+          <button
+            type="button"
+            title="Add space"
+            className="flex h-10 w-10 items-center justify-center rounded-xl border border-[#dfe3ec] bg-white/70 text-[#667085] transition-colors hover:bg-white hover:text-[#5843d7]"
+            onClick={onOpenSpaces}
+          >
+            <Plus size={18} />
+          </button>
         )}
-      />
+        {workspaces.length > 0 && (
+          <button
+            type="button"
+            title="Manage spaces"
+            className="mt-1 flex h-9 w-9 items-center justify-center rounded-xl border border-[#dfe3ec] bg-white/50 text-[#667085] transition-colors hover:bg-white hover:text-[#5843d7]"
+            onClick={onOpenSpaces}
+          >
+            <Plus size={17} />
+          </button>
+        )}
+      </div>
+      <div className="flex flex-col items-center gap-3">
+        {connection === "open" ? (
+          <button
+            type="button"
+            title="Disconnect"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-white hover:text-[#5843d7]"
+            onClick={onDisconnect}
+          >
+            <LogOut size={16} />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          title={account ? `${accountName(account)} account` : "Account"}
+          className="relative"
+          onClick={onOpenAccount}
+        >
+          {account ? (
+            <Avatar account={account} />
+          ) : (
+            <span className="flex h-10 w-10 items-center justify-center rounded-xl border border-[#dfe3ec] bg-white text-sm font-bold text-[#667085]">
+              <Users size={17} />
+            </span>
+          )}
+        </button>
+      </div>
     </nav>
   );
 }
 
 function Sidebar({
-  account,
-  busy,
+  view,
+  setView,
   channels,
+  channelGroups,
   connection,
-  newChannelTitle,
-  setNewChannelTitle,
   activeChannelId,
   activeThreadId,
   threadsByChannel,
-  workspace,
-  workspaces,
   onAddChannel,
-  onConnect,
-  onDisconnect,
-  onLogin,
-  onLogout,
+  onAddChannelGroup,
+  onMoveChannelToGroup,
+  onRemoveChannelGroup,
+  onRenameChannelGroup,
   onSelectChannel,
   onSelectThread,
+  onToggleChannelGroup,
 }: {
-  account: HumanAccount | null;
-  busy: string | null;
+  view: View;
+  setView: (view: View) => void;
   channels: Channel[];
+  channelGroups: ChannelGroup[];
   connection: ConnectionState;
-  newChannelTitle: string;
-  setNewChannelTitle: (value: string) => void;
   activeChannelId: string | null;
   activeThreadId: string | null;
   threadsByChannel: Record<string, Thread[]>;
-  workspace: Workspace | null;
-  workspaces: Workspace[];
-  onAddChannel: () => void;
-  onConnect: (workspaceId: string) => void;
-  onDisconnect: () => void;
-  onLogin: (provider: ipc.LoginProvider) => void;
-  onLogout: () => void;
+  onAddChannel: (title: string) => void;
+  onAddChannelGroup: (title: string) => void;
+  onMoveChannelToGroup: (channelId: string, groupId: string) => void;
+  onRemoveChannelGroup: (groupId: string) => void;
+  onRenameChannelGroup: (groupId: string, title: string) => void;
   onSelectChannel: (channelId: string) => void;
   onSelectThread: (thread: Thread) => void;
+  onToggleChannelGroup: (groupId: string) => void;
 }) {
-  return (
-    <aside className="flex min-h-0 min-w-0 flex-col border-r border-border bg-card">
-      <div className="border-b border-border p-4">
-        {account ? (
-          <div className="flex items-center gap-3">
-            <Avatar account={account} />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium">{accountName(account)}</div>
-              <div className="truncate text-xs text-muted-foreground">
-                {account.provider}
-              </div>
-            </div>
-            <Button variant="ghost" size="icon" title="Sign out" onClick={onLogout}>
-              <LogOut size={16} />
-            </Button>
-          </div>
-        ) : (
-          <div className="space-y-3">
-            <div>
-              <div className="text-sm font-medium">Loom Desktop</div>
-              <div className="text-xs text-muted-foreground">Third-party identity</div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <Button
-                variant="outline"
-                onClick={() => onLogin("github")}
-                disabled={busy === "login:github"}
-              >
-                <Github size={15} />
-                GitHub
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => onLogin("google")}
-                disabled={busy === "login:google"}
-              >
-                <span className="text-sm font-semibold">G</span>
-                Google
-              </Button>
-            </div>
-          </div>
-        )}
-      </div>
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
+  const [createKind, setCreateKind] = useState<"channel" | "section" | null>(null);
+  const [createTitle, setCreateTitle] = useState("");
+  const [editingSectionId, setEditingSectionId] = useState<string | null>(null);
+  const [sectionTitleDraft, setSectionTitleDraft] = useState("");
+  const [deleteSectionId, setDeleteSectionId] = useState<string | null>(null);
+  const [draggingChannelId, setDraggingChannelId] = useState<string | null>(null);
+  const [dragOverSectionId, setDragOverSectionId] = useState<string | null>(null);
+  const dragSessionRef = useRef<ChannelPointerDrag | null>(null);
+  const dragListenerCleanupRef = useRef<(() => void) | null>(null);
+  const suppressChannelClickRef = useRef<string | null>(null);
+  const sections = channelGroupSections(channelGroups, channels);
+  const navItems = [
+    { id: "chat" as const, label: "Home", icon: Home },
+    { id: "threads" as const, label: "Threads", icon: MessageSquare },
+    { id: "inbox" as const, label: "Mentions", icon: AtSign },
+    { id: "tasks" as const, label: "Activity", icon: Activity },
+    { id: "channels" as const, label: "All Channels", icon: Hash },
+    { id: "settings" as const, label: "Hosts", icon: Server },
+  ];
+  const closeCreateMenu = () => {
+    setCreateMenuOpen(false);
+    setCreateKind(null);
+    setCreateTitle("");
+  };
 
-      <div className="border-b border-border p-3">
-        <div className="mb-2 flex items-center justify-between">
-          <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-            Workspaces
-          </span>
-          {connection === "open" ? (
-            <Button variant="ghost" size="sm" onClick={onDisconnect}>
-              Disconnect
-            </Button>
-          ) : null}
-        </div>
+  const handleOpenCreate = (kind: "channel" | "section") => {
+    setCreateKind(kind);
+    setCreateTitle("");
+  };
+
+  const handleCreateSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const title = createTitle.trim();
+    if (!title || !createKind) return;
+    if (createKind === "channel") {
+      if (connection !== "open") return;
+      onAddChannel(title);
+    } else {
+      onAddChannelGroup(title);
+    }
+    closeCreateMenu();
+  };
+
+  const startRenameSection = (section: ChannelGroupSection) => {
+    setEditingSectionId(section.id);
+    setSectionTitleDraft(section.title);
+    setDeleteSectionId(null);
+  };
+
+  const submitRenameSection = (
+    event: FormEvent<HTMLFormElement>,
+    sectionId: string,
+  ) => {
+    event.preventDefault();
+    const title = sectionTitleDraft.trim();
+    if (!title) return;
+    onRenameChannelGroup(sectionId, title);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+  };
+
+  const confirmDeleteSection = (sectionId: string) => {
+    onRemoveChannelGroup(sectionId);
+    if (editingSectionId === sectionId) {
+      setEditingSectionId(null);
+      setSectionTitleDraft("");
+    }
+    setDeleteSectionId(null);
+  };
+
+  const sectionIdAtPoint = (x: number, y: number) => {
+    const element = document.elementFromPoint(x, y);
+    const section = element?.closest("[data-channel-section-id]") as HTMLElement | null;
+    return section?.dataset.channelSectionId ?? null;
+  };
+
+  const cleanupChannelDragListeners = () => {
+    dragListenerCleanupRef.current?.();
+    dragListenerCleanupRef.current = null;
+  };
+
+  const updateChannelDragAtPoint = (
+    clientX: number,
+    clientY: number,
+    pointerId: number,
+    preventDefault?: () => void,
+  ) => {
+    const session = dragSessionRef.current;
+    if (!session || session.pointerId !== pointerId) return;
+    const distance =
+      Math.abs(clientX - session.startX) + Math.abs(clientY - session.startY);
+    if (!session.dragging && distance < 6) return;
+    if (!session.dragging) {
+      session.dragging = true;
+      closeCreateMenu();
+      setDraggingChannelId(session.channelId);
+    }
+    preventDefault?.();
+    setDragOverSectionId(sectionIdAtPoint(clientX, clientY));
+  };
+
+  const finishChannelDragAtPoint = (
+    clientX: number,
+    clientY: number,
+    pointerId: number,
+    preventDefault?: () => void,
+    stopPropagation?: () => void,
+  ) => {
+    const session = dragSessionRef.current;
+    if (!session || session.pointerId !== pointerId) return;
+    const didDrag = session.dragging;
+    const sectionId = didDrag
+      ? sectionIdAtPoint(clientX, clientY) ?? dragOverSectionId
+      : null;
+    dragSessionRef.current = null;
+    cleanupChannelDragListeners();
+    if (didDrag) {
+      preventDefault?.();
+      stopPropagation?.();
+      suppressChannelClickRef.current = session.channelId;
+      window.setTimeout(() => {
+        if (suppressChannelClickRef.current === session.channelId) {
+          suppressChannelClickRef.current = null;
+        }
+      }, 120);
+      if (sectionId) onMoveChannelToGroup(session.channelId, sectionId);
+    }
+    setDraggingChannelId(null);
+    setDragOverSectionId(null);
+  };
+
+  const cancelChannelDrag = () => {
+    cleanupChannelDragListeners();
+    dragSessionRef.current = null;
+    setDraggingChannelId(null);
+    setDragOverSectionId(null);
+  };
+
+  const beginChannelDrag = (
+    event: PointerEvent<HTMLElement>,
+    channelId: string,
+  ) => {
+    if (event.button !== 0) return;
+    cleanupChannelDragListeners();
+    dragSessionRef.current = {
+      channelId,
+      startX: event.clientX,
+      startY: event.clientY,
+      pointerId: event.pointerId,
+      dragging: false,
+    };
+    const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
+      updateChannelDragAtPoint(
+        moveEvent.clientX,
+        moveEvent.clientY,
+        moveEvent.pointerId,
+        () => moveEvent.preventDefault(),
+      );
+    };
+    const handlePointerUp = (upEvent: globalThis.PointerEvent) => {
+      finishChannelDragAtPoint(
+        upEvent.clientX,
+        upEvent.clientY,
+        upEvent.pointerId,
+        () => upEvent.preventDefault(),
+        () => upEvent.stopPropagation(),
+      );
+    };
+    const handlePointerCancel = (cancelEvent: globalThis.PointerEvent) => {
+      if (dragSessionRef.current?.pointerId === cancelEvent.pointerId) {
+        cancelChannelDrag();
+      }
+    };
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    dragListenerCleanupRef.current = () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+    };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      /* Some webviews do not support pointer capture; window listeners still handle drag. */
+    }
+  };
+
+  const updateChannelDrag = (event: PointerEvent<HTMLElement>) => {
+    updateChannelDragAtPoint(
+      event.clientX,
+      event.clientY,
+      event.pointerId,
+      () => event.preventDefault(),
+    );
+  };
+
+  const finishChannelDrag = (event: PointerEvent<HTMLElement>) => {
+    const session = dragSessionRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      /* Ignore pointer-capture differences across desktop webviews. */
+    }
+    finishChannelDragAtPoint(
+      event.clientX,
+      event.clientY,
+      event.pointerId,
+      () => event.preventDefault(),
+      () => event.stopPropagation(),
+    );
+  };
+
+  useEffect(() => () => cleanupChannelDragListeners(), []);
+  return (
+    <aside className="flex min-h-0 min-w-0 flex-col border-r border-[#e2e6ef] bg-[#fbfbfd]">
+      <div className="border-b border-[#edf0f5] p-3">
         <div className="space-y-1">
-          {workspaces.map((item) => (
-            <button
-              key={item.id}
-              className={cn(
-                "flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent",
-                workspace?.id === item.id && "bg-accent",
-              )}
-              onClick={() => onConnect(item.id)}
-              disabled={busy === `connect:${item.id}`}
-            >
-              {busy === `connect:${item.id}` ? (
-                <Loader2 className="animate-spin" size={14} />
-              ) : (
-                <Circle
-                  size={10}
-                  className={cn(
-                    workspace?.id === item.id && connection === "open"
-                      ? "fill-emerald-400 text-emerald-400"
-                      : "text-muted-foreground",
-                  )}
-                />
-              )}
-              <span className="min-w-0 flex-1 truncate">{item.name}</span>
-            </button>
-          ))}
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const selected = view === item.id;
+            return (
+              <button
+                key={item.id}
+                className={cn("nav-row h-9 text-sm", selected && "nav-row-active")}
+                onClick={() => {
+                  closeCreateMenu();
+                  setView(item.id);
+                }}
+              >
+                <Icon size={16} />
+                <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              </button>
+            );
+          })}
         </div>
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col">
-        <div className="flex items-center gap-2 border-b border-border p-3">
-          <Input
-            value={newChannelTitle}
-            onChange={(event) => setNewChannelTitle(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") onAddChannel();
-            }}
-            placeholder="New channel"
-            disabled={connection !== "open"}
-          />
-          <Button
-            variant="secondary"
-            size="icon"
-            onClick={onAddChannel}
-            disabled={connection !== "open" || !newChannelTitle.trim()}
-          >
-            <Plus size={16} />
-          </Button>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-2 scrollbar-thin">
-          {channels.map((channel) => {
-            const selected = channel.id === activeChannelId && !activeThreadId;
-            const threads = threadsByChannel[channel.id] ?? [];
-            return (
-              <div key={channel.id} className="mb-1">
-                <button
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent",
-                    selected && "bg-accent text-accent-foreground",
-                  )}
-                  onClick={() => onSelectChannel(channel.id)}
-                >
-                  <Hash size={15} />
-                  <span className="min-w-0 flex-1 truncate">{channel.title}</span>
-                  <Badge variant="outline" className="text-[10px]">
-                    {threads.length}
-                  </Badge>
-                </button>
-                {channel.id === activeChannelId && threads.length > 0 && (
-                  <div className="ml-4 mt-1 space-y-1 border-l border-border pl-2">
-                    {threads.map((thread) => (
+        <div className="border-b border-[#edf0f5] p-3">
+          <div className="flex items-center justify-between px-1">
+            <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+              Channels
+            </span>
+            <div className="relative">
+              <button
+                type="button"
+                className="composer-icon h-6 min-w-6"
+                title="Create channel or section"
+                aria-haspopup="menu"
+                aria-expanded={createMenuOpen}
+                onClick={() => {
+                  if (createMenuOpen) {
+                    closeCreateMenu();
+                  } else {
+                    setCreateMenuOpen(true);
+                  }
+                }}
+              >
+                <Plus size={15} />
+              </button>
+              {createMenuOpen && (
+                <div className="absolute right-0 top-7 z-30 w-64 rounded-lg border border-[#dfe3ec] bg-white p-1 text-sm shadow-soft">
+                  {!createKind ? (
+                    <>
                       <button
-                        key={thread.id}
-                        className={cn(
-                          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground",
-                          activeThreadId === thread.id && "bg-accent text-foreground",
-                        )}
-                        onClick={() => onSelectThread(thread)}
+                        type="button"
+                        className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+                        onClick={() => handleOpenCreate("channel")}
                       >
-                        <Split size={13} />
-                        <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+                        <Hash size={15} />
+                        New channel
                       </button>
-                    ))}
+                      <button
+                        type="button"
+                        className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+                        onClick={() => handleOpenCreate("section")}
+                      >
+                        <Folder size={15} />
+                        New section
+                      </button>
+                    </>
+                  ) : (
+                    <form className="grid gap-2 p-2" onSubmit={handleCreateSubmit}>
+                      <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-[#667085]">
+                        {createKind === "channel" ? <Hash size={13} /> : <Folder size={13} />}
+                        {createKind === "channel" ? "New channel" : "New section"}
+                      </div>
+                      <Input
+                        autoFocus
+                        value={createTitle}
+                        onChange={(event) => setCreateTitle(event.target.value)}
+                        placeholder={createKind === "channel" ? "Channel name" : "Section name"}
+                        className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                      />
+                      {createKind === "channel" && connection !== "open" && (
+                        <div className="text-xs font-medium text-amber-700">
+                          Connect a space before creating a channel.
+                        </div>
+                      )}
+                      <div className="flex justify-end gap-2 pt-1">
+                        <Button type="button" variant="outline" size="sm" onClick={() => setCreateKind(null)}>
+                          Back
+                        </Button>
+                        <Button
+                          type="submit"
+                          size="sm"
+                          disabled={
+                            !createTitle.trim() ||
+                            (createKind === "channel" && connection !== "open")
+                          }
+                        >
+                          Create
+                        </Button>
+                      </div>
+                    </form>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
+          {sections.map((section) => (
+            <div
+              key={section.id}
+              data-channel-section-id={section.id}
+              className={cn(
+                "mb-3 rounded-lg transition-colors",
+                draggingChannelId &&
+                  dragOverSectionId === section.id &&
+                  "channel-drop-target",
+              )}
+            >
+              {(section.local || channelGroups.length > 0) && (
+                <div className="channel-group-header group/channelgroup">
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                    onClick={() => section.local && onToggleChannelGroup(section.id)}
+                    disabled={!section.local}
+                  >
+                    {section.local ? (
+                      section.collapsed ? (
+                        <ChevronDown size={13} className="-rotate-90 text-[#667085]" />
+                      ) : (
+                        <ChevronDown size={13} className="text-[#667085]" />
+                      )
+                    ) : (
+                      <span className="w-[13px]" />
+                    )}
+                    <span className="min-w-0 truncate">{section.title}</span>
+                    <span className="count-badge ml-1 h-5 min-w-5 text-[10px]">
+                      {section.channels.length}
+                    </span>
+                  </button>
+                  {section.local && (
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        className="composer-icon h-6 min-w-6"
+                        title="Rename section"
+                        onClick={() => startRenameSection(section)}
+                      >
+                        <Pencil size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        className="composer-icon h-6 min-w-6 text-red-500 hover:text-red-600"
+                        title="Delete section"
+                        onClick={() => {
+                          setDeleteSectionId(section.id);
+                          setEditingSectionId(null);
+                          setSectionTitleDraft("");
+                        }}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {editingSectionId === section.id && (
+                <form
+                  className="channel-section-editor"
+                  onSubmit={(event) => submitRenameSection(event, section.id)}
+                >
+                  <Input
+                    autoFocus
+                    value={sectionTitleDraft}
+                    onChange={(event) => setSectionTitleDraft(event.target.value)}
+                    placeholder="Section name"
+                    className="h-8 rounded-lg border-[#dfe3ec] bg-white text-xs shadow-none"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setEditingSectionId(null);
+                      setSectionTitleDraft("");
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button type="submit" size="sm" disabled={!sectionTitleDraft.trim()}>
+                    Save
+                  </Button>
+                </form>
+              )}
+              {deleteSectionId === section.id && (
+                <div className="channel-section-editor">
+                  <div className="min-w-0 flex-1 text-xs font-medium text-[#667085]">
+                    Delete "{section.title}"? Channels stay available.
                   </div>
-                )}
-              </div>
-            );
-          })}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDeleteSectionId(null)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button type="button" size="sm" onClick={() => confirmDeleteSection(section.id)}>
+                    Delete
+                  </Button>
+                </div>
+              )}
+              {!section.collapsed && (
+                <div className="mt-1 space-y-1">
+                  {section.channels.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-[#8a93a5]">
+                      {section.local ? "Drop channels here." : "No channels yet."}
+                    </div>
+                  ) : (
+                    section.channels.map((channel) => {
+                      const selected = channel.id === activeChannelId && !activeThreadId;
+                      const threads = threadsByChannel[channel.id] ?? [];
+                      return (
+                        <div
+                          key={channel.id}
+                          className={cn(
+                            "group/channel",
+                            draggingChannelId === channel.id && "opacity-45",
+                          )}
+                        >
+                          <div className="flex items-center gap-1">
+                            <button
+                              className={cn(
+                                "channel-row min-w-0 flex-1 touch-none select-none",
+                                draggingChannelId === channel.id && "cursor-grabbing",
+                                selected && "channel-row-active",
+                              )}
+                              onPointerDown={(event) => beginChannelDrag(event, channel.id)}
+                              onPointerMove={updateChannelDrag}
+                              onPointerUp={finishChannelDrag}
+                              onPointerCancel={cancelChannelDrag}
+                              onClick={() => {
+                                if (suppressChannelClickRef.current === channel.id) {
+                                  suppressChannelClickRef.current = null;
+                                  return;
+                                }
+                                closeCreateMenu();
+                                onSelectChannel(channel.id);
+                              }}
+                            >
+                              <GripVertical
+                                size={13}
+                                className={cn(
+                                  "shrink-0 text-[#98a2b3] opacity-0 transition-opacity group-hover/channel:opacity-100",
+                                  selected && "text-white/70",
+                                )}
+                              />
+                              <Hash size={15} />
+                              <span className="min-w-0 flex-1 truncate">{channel.title}</span>
+                              <Badge
+                                variant="outline"
+                                className={cn(
+                                  "ml-auto h-5 border-transparent bg-[#f1efff] px-1.5 text-[10px] text-[#5843d7]",
+                                  selected && "bg-white/20 text-white",
+                                )}
+                              >
+                                {threads.length}
+                              </Badge>
+                            </button>
+                          </div>
+                          {channel.id === activeChannelId && threads.length > 0 && (
+                            <div className="ml-4 mt-1 space-y-1 border-l border-[#e1e5ef] pl-2">
+                              {threads.map((thread) => (
+                                <button
+                                  key={thread.id}
+                                  className={cn(
+                                    "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs font-medium text-[#667085] hover:bg-[#f0f1f8] hover:text-[#303849]",
+                                    activeThreadId === thread.id && "bg-[#eeeaff] text-[#5843d7]",
+                                  )}
+                                  onClick={() => {
+                                    closeCreateMenu();
+                                    onSelectThread(thread);
+                                  }}
+                                >
+                                  <Split size={13} />
+                                  <span className="min-w-0 flex-1 truncate">{thread.title}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       </div>
     </aside>
@@ -1328,6 +2190,7 @@ function ChatHeader({
   thread,
   task,
   target,
+  members,
   connection,
   onClearThread,
 }: {
@@ -1335,37 +2198,54 @@ function ChatHeader({
   thread: Thread | null;
   task: Task | null;
   target: string | null;
+  members: Actor[];
   connection: ConnectionState;
   onClearThread: () => void;
 }) {
   const topic = channelTopic(channel);
   return (
-    <header className="flex h-16 shrink-0 items-center gap-3 border-b border-border px-5">
-      <div className="flex h-10 w-10 items-center justify-center rounded-md bg-secondary">
-        {thread ? <Split size={18} /> : <Hash size={18} />}
-      </div>
+    <header className="flex h-[86px] shrink-0 items-center gap-4 border-b border-[#e2e6ef] bg-white px-6">
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <h1 className="truncate text-base font-semibold">
-            {channel ? channel.title : "Workspace"}
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center text-[#303849]">
+            {thread ? <Split size={26} /> : <Hash size={26} />}
+          </span>
+          <h1 className="min-w-0 truncate text-[22px] font-bold leading-tight text-[#111827]">
+            {channel ? channel.title : "Space"}
           </h1>
           {thread && (
-            <Badge variant="secondary" className="max-w-[45%] truncate">
+            <Badge
+              variant="secondary"
+              className="hidden max-w-[220px] shrink truncate bg-[#f1efff] text-[#5843d7] 2xl:inline-flex"
+            >
               {thread.title}
             </Badge>
           )}
-          {thread && (task ? <TaskStateBadge task={task} /> : <NoTaskBadge />)}
+          {thread && task ? <TaskStateBadge task={task} /> : null}
         </div>
-        <div className="truncate text-xs text-muted-foreground">
+        <div className="mt-1 truncate pl-11 text-sm text-[#485063]">
           {thread
             ? `#${channel?.title ?? "channel"} / ${thread.title}`
             : topic || target || connectionLabel(connection)}
         </div>
       </div>
+      <div className="hidden items-center gap-2 lg:flex">
+        {members.length > 0 && (
+          <div className="member-pill h-10 px-2.5" title="Channel members">
+            <AvatarStack actors={members} max={4} small />
+            <span className="pl-1 text-sm font-bold text-[#303849]">{members.length}</span>
+          </div>
+        )}
+      </div>
       {thread && (
-        <Button variant="outline" size="sm" onClick={onClearThread}>
+        <Button
+          variant="outline"
+          size="icon"
+          title="Back to channel"
+          onClick={onClearThread}
+          className="h-9 w-9 shrink-0 rounded-lg"
+        >
           <PanelRight size={15} />
-          Channel
         </Button>
       )}
     </header>
@@ -1377,12 +2257,12 @@ function MessageFeed({
   messages,
   tasksBySourceMessageId,
   channelThreads,
+  threadStatsById,
   emptyText,
   onReply,
   onStartThread,
   onToggleReaction,
   onAnswerAction,
-  activeThread,
   currentActorId,
   busy,
 }: {
@@ -1390,12 +2270,12 @@ function MessageFeed({
   messages: Message[];
   tasksBySourceMessageId: Record<string, Task>;
   channelThreads: Thread[];
+  threadStatsById: Record<string, ThreadActivityStats>;
   emptyText: string;
   onReply: (message: Message) => void;
   onStartThread: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
-  activeThread: Thread | null;
   currentActorId: string | null;
   busy: string | null;
 }) {
@@ -1403,43 +2283,57 @@ function MessageFeed({
     messages.filter(isWorkflowMessage).map((message) => message.id),
   );
   const visibleMessages = messages.filter((message) => !isHiddenProtocolMessage(message));
+  const messageGroups = groupMessagesByDate(visibleMessages);
   if (visibleMessages.length === 0) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
-        {emptyText}
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
+        <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-8 py-10 text-center">
+          {emptyText}
+        </div>
       </div>
     );
   }
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 scrollbar-thin">
-      <div className="mx-auto flex max-w-4xl flex-col gap-3">
-        {visibleMessages.map((message) => {
-          const threadSummary = activeThread
-            ? null
-            : channelThreads.find((thread) => thread.rootMessageId === message.id) ?? null;
-          const sourceTask =
-            !activeThread && message.scope.kind === "channel"
-              ? tasksBySourceMessageId[message.id] ?? null
-              : null;
-          return (
-            <MessageRow
-              key={message.id}
-              actor={actors[message.authorActorId]}
-              actors={actors}
-              message={message}
-              workflowSourceIds={workflowSourceIds}
-              onReply={onReply}
-              onStartThread={onStartThread}
-              onToggleReaction={onToggleReaction}
-              onAnswerAction={onAnswerAction}
-              canStartThread={!activeThread && canUseAsThreadRoot(message)}
-              threadSummary={threadSummary}
-              sourceTask={sourceTask}
-              currentActorId={currentActorId}
-              busy={busy}
-            />
-          );
-        })}
+    <div className="min-h-0 flex-1 overflow-y-auto bg-white px-5 py-2 soft-scrollbar">
+      <div className="mx-auto flex max-w-4xl flex-col gap-2">
+        {messageGroups.map((group) => (
+          <Fragment key={group.key}>
+            <div className="date-divider">
+              <span />
+              <div>{group.label}</div>
+              <span />
+            </div>
+            {group.messages.map((message) => {
+              const threadSummary =
+                channelThreads.find((thread) => thread.rootMessageId === message.id) ?? null;
+              const sourceTask =
+                message.scope.kind === "channel"
+                  ? tasksBySourceMessageId[message.id] ?? null
+                  : null;
+              return (
+                <MessageRow
+                  key={message.id}
+                  actor={actors[message.authorActorId]}
+                  actors={actors}
+                  message={message}
+                  workflowSourceIds={workflowSourceIds}
+                  onReply={onReply}
+                  onStartThread={onStartThread}
+                  onToggleReaction={onToggleReaction}
+                  onAnswerAction={onAnswerAction}
+                  canStartThread={canUseAsThreadRoot(message)}
+                  threadSummary={threadSummary}
+                  threadStats={
+                    threadSummary ? threadStatsById[threadSummary.id] : undefined
+                  }
+                  sourceTask={sourceTask}
+                  currentActorId={currentActorId}
+                  busy={busy}
+                />
+              );
+            })}
+          </Fragment>
+        ))}
       </div>
     </div>
   );
@@ -1456,6 +2350,7 @@ function MessageRow({
   onAnswerAction,
   canStartThread,
   threadSummary,
+  threadStats,
   sourceTask,
   currentActorId,
   busy,
@@ -1470,13 +2365,18 @@ function MessageRow({
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
   canStartThread: boolean;
   threadSummary: Thread | null;
+  threadStats?: ThreadActivityStats;
   sourceTask: Task | null;
   currentActorId: string | null;
   busy: string | null;
 }) {
   const actionRequest = messageKind(message) === "action.request";
+  const bodyPoll = actionRequest ? null : bodyPollFromMessage(message);
   const choices = actionChoices(message);
+  const pollChoices = choices.length > 0 ? choices : bodyPoll?.choices ?? [];
+  const displayBody = bodyPoll?.question || message.body || metadataText(message);
   const reactions = message.reactions ?? [];
+  const attachments = message.attachments ?? [];
   if (isWorkflowMessage(message)) {
     return <WorkflowEventRow actor={actor} actors={actors} message={message} />;
   }
@@ -1486,19 +2386,16 @@ function MessageRow({
   return (
     <article
       className={cn(
-        "group rounded-md px-3 py-2 transition-colors hover:bg-accent/40",
-        actionRequest && "border border-amber-400/40 bg-amber-400/10",
+        "group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]",
+        actionRequest && "border border-amber-300 bg-amber-50",
       )}
     >
-      <div className="flex items-start gap-3">
+      <div className="flex items-start gap-4">
         <ActorAvatar actor={actor} fallback={message.authorActorId} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium">{actor ? displayName(actor) : message.authorActorId}</span>
-            <span className="text-xs text-muted-foreground">{formatTime(message.createdAt)}</span>
-            <Badge variant={actor?.kind === "agent" ? "success" : "outline"}>
-              {actor?.kind ?? message.kind}
-            </Badge>
+            <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
+            <span className="text-xs font-medium text-[#667085]">{formatTime(message.createdAt)}</span>
             {sourceTask && <TaskStateBadge task={sourceTask} />}
             {message.parentMessageId && (
               <span className="font-mono text-xs text-muted-foreground">
@@ -1506,11 +2403,25 @@ function MessageRow({
               </span>
             )}
           </div>
-          <div className="prose prose-invert mt-1 max-w-none break-words text-sm leading-6">
-            <ReactMarkdown>{message.body || metadataText(message)}</ReactMarkdown>
+          <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
+            <ReactMarkdown>{displayBody}</ReactMarkdown>
           </div>
+          {attachments.length > 0 && (
+            <AttachmentStack attachments={attachments} />
+          )}
+          {pollChoices.length > 0 && (
+            <PollCard
+              choices={pollChoices}
+              disabled={!actionRequest || Boolean(busy?.startsWith(`action:${message.id}:`))}
+              onChoose={
+                actionRequest
+                  ? (choice) => onAnswerAction(message, choice.id, choice.accepted)
+                  : undefined
+              }
+            />
+          )}
           {reactions.length > 0 && (
-            <div className="mt-2 flex min-h-7 flex-wrap items-center gap-1.5">
+            <div className="mt-3 flex min-h-7 flex-wrap items-center gap-1.5">
               {reactions.map((reaction) => {
                 const selected = Boolean(
                   currentActorId && reaction.actorIds.includes(currentActorId),
@@ -1520,10 +2431,10 @@ function MessageRow({
                     key={reaction.emoji}
                     type="button"
                     className={cn(
-                      "inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors",
+                      "reaction-chip",
                       selected
-                        ? "border-primary/60 bg-primary/15 text-primary"
-                        : "border-border bg-secondary/60 text-foreground hover:border-primary/40",
+                        ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
+                        : "border-[#e2e5ed] bg-white text-[#31394a]",
                     )}
                     title={reaction.actorIds
                       .map((actorId) => actorName(actors, actorId))
@@ -1536,71 +2447,35 @@ function MessageRow({
                   </button>
                 );
               })}
-              <div className="flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-                {quickReactionEmojis.map((emoji) => (
-                  <button
-                    key={emoji}
-                    type="button"
-                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-transparent text-sm text-muted-foreground transition-colors hover:border-border hover:bg-secondary hover:text-foreground"
-                    title={`React ${emoji}`}
-                    disabled={busy === `message:reaction:${message.id}:${emoji}`}
-                    onClick={() => onToggleReaction(message, emoji)}
-                  >
-                    {emoji}
-                  </button>
-                ))}
-              </div>
+              <ReactionPicker
+                busy={busy}
+                compact
+                message={message}
+                onToggleReaction={onToggleReaction}
+              />
             </div>
           )}
           {threadSummary && (
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                className="flex w-fit max-w-full items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-                onClick={() => onStartThread(message)}
-              >
-                <Split size={14} />
-                <span className="font-medium text-foreground">Thread</span>
-                <span className="min-w-0 truncate">{threadSummary.title}</span>
-              </button>
-              {!sourceTask && <NoTaskBadge />}
-            </div>
-          )}
-          {actionRequest && choices.length > 0 && (
-            <div className="mt-3 flex flex-wrap gap-2">
-              {choices.map((choice) => (
-                <Button
-                  key={choice.id}
-                  size="sm"
-                  variant={choice.accepted ? "default" : "outline"}
-                  disabled={busy?.startsWith(`action:${message.id}:`)}
-                  onClick={() => onAnswerAction(message, choice.id, choice.accepted)}
-                >
-                  {choice.accepted ? <Check size={14} /> : <X size={14} />}
-                  {choice.label}
-                </Button>
-              ))}
-            </div>
+            <ThreadSummaryRow
+              actors={actors}
+              rootAuthor={actor}
+              thread={threadSummary}
+              threadStats={threadStats}
+              onOpen={() => onStartThread(message)}
+            />
           )}
           <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
             <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
               <Reply size={14} />
               Reply
             </Button>
-            <div className="flex gap-1">
-              {quickReactionEmojis.map((emoji) => (
-                <button
-                  key={emoji}
-                  type="button"
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-md text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-                  title={`React ${emoji}`}
-                  disabled={busy === `message:reaction:${message.id}:${emoji}`}
-                  onClick={() => onToggleReaction(message, emoji)}
-                >
-                  {emoji}
-                </button>
-              ))}
-            </div>
+            {reactions.length === 0 && (
+              <ReactionPicker
+                busy={busy}
+                message={message}
+                onToggleReaction={onToggleReaction}
+              />
+            )}
             {canStartThread && !threadSummary && (
               <Button
                 variant="ghost"
@@ -1622,18 +2497,128 @@ function MessageRow({
   );
 }
 
+function AttachmentStack({ attachments }: { attachments: string[] }) {
+  return (
+    <div className="mt-3 grid max-w-[560px] gap-2">
+      {attachments.slice(0, 3).map((attachment) => (
+        <AttachmentCard key={attachment} attachment={attachment} />
+      ))}
+    </div>
+  );
+}
+
+function AttachmentCard({ attachment }: { attachment: string }) {
+  const title = attachmentTitle(attachment);
+  const kind = attachmentKind(attachment);
+  return (
+    <div className="attachment-card">
+      <div className="attachment-icon">
+        <FileText size={18} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-bold text-[#303849]">{title}</div>
+        <div className="mt-0.5 truncate text-xs font-medium text-[#667085]">{kind}</div>
+      </div>
+      <div className="attachment-preview" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+    </div>
+  );
+}
+
+function PollCard({
+  choices,
+  disabled,
+  onChoose,
+}: {
+  choices: ActionChoice[];
+  disabled: boolean;
+  onChoose?: (choice: ActionChoice) => void;
+}) {
+  const totalVotes = choices.reduce((sum, choice) => sum + (choice.votes ?? 0), 0);
+  const fallbackMax = choices.length;
+  return (
+    <div className="poll-card">
+      {choices.map((choice, index) => {
+        const votes = choice.votes ?? (totalVotes === 0 ? fallbackMax - index : 0);
+        const denominator = totalVotes || fallbackMax || 1;
+        const percent = Math.max(6, Math.round((votes / denominator) * 100));
+        return (
+          <button
+            key={choice.id}
+            type="button"
+            className="poll-choice"
+            disabled={disabled || !onChoose}
+            onClick={() => onChoose?.(choice)}
+          >
+            <span className="poll-letter">{choice.id.slice(0, 1).toUpperCase()}</span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-semibold text-[#303849]">
+                {choice.label}
+              </span>
+              <span className="mt-1 block h-0.5 overflow-hidden rounded-full bg-[#e7e9f3]">
+                <span
+                  className="block h-full rounded-full bg-[#5a47e9]"
+                  style={{ width: `${percent}%` }}
+                />
+              </span>
+            </span>
+            <span className="w-8 text-right text-sm font-bold text-[#303849]">
+              {votes}
+            </span>
+          </button>
+        );
+      })}
+      <div className="mt-2 flex items-center gap-2 px-1 text-xs font-medium text-[#667085]">
+        <span>{totalVotes || choices.length} votes</span>
+        <span>•</span>
+        <span>Poll closes soon</span>
+      </div>
+    </div>
+  );
+}
+
+function ThreadSummaryRow({
+  actors,
+  rootAuthor,
+  thread,
+  threadStats,
+  onOpen,
+}: {
+  actors: Record<string, Actor>;
+  rootAuthor?: Actor;
+  thread: Thread;
+  threadStats?: ThreadActivityStats;
+  onOpen: () => void;
+}) {
+  const participants = threadParticipants(thread, actors, rootAuthor, threadStats);
+  const replyCount = threadReplyCount(thread, threadStats);
+  const lastReply = threadLastReplyLabel(thread, threadStats);
+  return (
+    <button type="button" className="thread-summary-row" onClick={onOpen}>
+      <AvatarStack actors={participants} max={4} small />
+      <span className="min-w-0 truncate text-xs font-bold text-[#503ed4]">
+        {typeof replyCount === "number"
+          ? `${replyCount}${threadStats?.hasMoreReplies ? "+" : ""} ${
+              replyCount === 1 ? "reply" : "replies"
+            }`
+          : "Thread"}
+      </span>
+      {lastReply && (
+        <span className="shrink-0 text-xs font-medium text-[#667085]">
+          Last reply {lastReply}
+        </span>
+      )}
+    </button>
+  );
+}
+
 function TaskStateBadge({ task }: { task: Task }) {
   return (
     <Badge variant={taskBadgeVariant(task)} title={task.id}>
       Task #{task.number} · {task.status}
-    </Badge>
-  );
-}
-
-function NoTaskBadge() {
-  return (
-    <Badge variant="outline" className="text-muted-foreground">
-      No task
     </Badge>
   );
 }
@@ -1655,7 +2640,7 @@ function WorkflowEventRow({
 }) {
   const summary = workflowSummary(message, actors);
   return (
-    <div className="mx-auto flex max-w-[80%] items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+    <div className="mx-auto flex max-w-[80%] items-center gap-2 rounded-xl border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
       <Check size={14} />
       <span className="min-w-0 flex-1 truncate">{summary}</span>
       <span>{formatTime(message.createdAt)}</span>
@@ -1672,16 +2657,16 @@ function WorkflowResultRow({
   message: Message;
 }) {
   return (
-    <article className="group rounded-md px-3 py-2 transition-colors hover:bg-accent/40">
-      <div className="flex items-start gap-3">
+    <article className="group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]">
+      <div className="flex items-start gap-4">
         <ActorAvatar actor={actor} fallback={message.authorActorId} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium">{actor ? displayName(actor) : message.authorActorId}</span>
+            <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
             <span className="text-xs text-muted-foreground">{formatTime(message.createdAt)}</span>
             <Badge variant="success">task result</Badge>
           </div>
-          <div className="mt-1 text-sm leading-6">{workflowResultSummary(message)}</div>
+          <div className="mt-1 text-sm leading-6 text-[#303849]">{workflowResultSummary(message)}</div>
         </div>
       </div>
     </article>
@@ -1754,20 +2739,20 @@ function Composer({
   }
 
   return (
-    <footer className="border-t border-border p-4">
+    <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
       <div className="mx-auto max-w-4xl">
         {replyTo && (
-          <div className="mb-2 flex items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-xs text-muted-foreground">
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
             <span className="min-w-0 flex-1 truncate">Replying to {actorName}</span>
             <button onClick={onClearReply}>
               <X size={14} />
             </button>
           </div>
         )}
-        <div className="relative flex items-end gap-2">
+        <div className="composer-box relative">
           {showMentions && (
-            <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-md border border-border bg-popover shadow-soft">
-              <div className="border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-xl border border-[#dfe3ec] bg-white shadow-soft">
+              <div className="border-b border-[#edf0f5] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
                 Mentions
               </div>
               <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
@@ -1778,8 +2763,8 @@ function Composer({
                     className={cn(
                       "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
                       index === effectiveMentionIndex
-                        ? "bg-accent text-accent-foreground"
-                        : "hover:bg-accent/60",
+                        ? "bg-[#f1efff] text-[#5843d7]"
+                        : "hover:bg-[#f7f8fb]",
                     )}
                     onMouseDown={(event) => {
                       event.preventDefault();
@@ -1851,18 +2836,609 @@ function Composer({
             }}
             disabled={disabled}
             placeholder={disabled ? "Connect and select a channel" : "Message"}
-            className="max-h-48 min-h-16"
+            className="max-h-48 min-h-[44px] flex-1 border-0 bg-transparent px-0 py-1 shadow-none focus-visible:ring-0"
           />
           <Button
             size="icon"
             onClick={onSend}
             disabled={disabled || !draft.trim() || busy}
+            className="h-9 w-9 rounded-lg"
           >
             {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
           </Button>
         </div>
       </div>
     </footer>
+  );
+}
+
+function ThreadPanel({
+  actors,
+  channel,
+  channelMessages,
+  currentActorId,
+  disabled,
+  draft,
+  messages,
+  setDraft,
+  task,
+  thread,
+  busy,
+  className,
+  onClose,
+  onSend,
+  onToggleReaction,
+}: {
+  actors: Record<string, Actor>;
+  channel: Channel | null;
+  channelMessages: Message[];
+  currentActorId: string | null;
+  disabled: boolean;
+  draft: string;
+  messages: Message[];
+  setDraft: (value: string) => void;
+  task: Task | null;
+  thread: Thread | null;
+  busy: string | null;
+  className?: string;
+  onClose: () => void;
+  onSend: () => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
+}) {
+  const rootMessage = thread
+    ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
+    : null;
+  const displayMessages = stitchThreadMessages(rootMessage, messages);
+  const starter = rootMessage ? actors[rootMessage.authorActorId] : undefined;
+  return (
+    <aside
+      className={cn(
+        "min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-[#fbfbfd]",
+        className ?? "hidden xl:flex",
+      )}
+    >
+      <div className="shrink-0 border-b border-[#edf0f5] bg-white px-5 py-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-lg font-bold text-[#111827]">Thread</div>
+            <div className="mt-0.5 truncate text-sm text-[#485063]">
+              {thread
+                ? starter
+                  ? `Started by ${displayName(starter)} in #${channel?.title ?? "channel"}`
+                  : `#${channel?.title ?? "channel"}`
+                : "Select a thread"}
+            </div>
+            {task && (
+              <div className="mt-2">
+                <TaskStateBadge task={task} />
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1">
+            <button className="composer-icon" type="button" title="Close" onClick={onClose}>
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 soft-scrollbar">
+        {!thread ? (
+          <EmptyState icon={Split} text="Select a thread." />
+        ) : displayMessages.length === 0 ? (
+          <EmptyState icon={MessageSquare} text="No replies in this thread." />
+        ) : (
+          <div className="space-y-3">
+            {displayMessages.map((message) => (
+              <ThreadMessageCard
+                key={message.id}
+                actor={actors[message.authorActorId]}
+                actors={actors}
+                currentActorId={currentActorId}
+                message={message}
+                root={Boolean(rootMessage && message.id === rootMessage.id)}
+                busy={busy}
+                onToggleReaction={onToggleReaction}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <ThreadComposer
+        draft={draft}
+        setDraft={setDraft}
+        disabled={disabled || !thread}
+        busy={busy === "thread:message:send"}
+        onSend={onSend}
+      />
+    </aside>
+  );
+}
+
+function ThreadMessageCard({
+  actor,
+  actors,
+  currentActorId,
+  message,
+  root,
+  busy,
+  onToggleReaction,
+}: {
+  actor?: Actor;
+  actors: Record<string, Actor>;
+  currentActorId: string | null;
+  message: Message;
+  root: boolean;
+  busy: string | null;
+  onToggleReaction: (message: Message, emoji: string) => void;
+}) {
+  const reactions = message.reactions ?? [];
+  const bodyPoll = bodyPollFromMessage(message);
+  const choices = actionChoices(message);
+  const pollChoices = choices.length > 0 ? choices : bodyPoll?.choices ?? [];
+  const displayBody = bodyPoll?.question || message.body || metadataText(message);
+  const attachments = message.attachments ?? [];
+  return (
+    <article
+      className={cn(
+        "thread-message-card",
+        root ? "thread-message-card-root" : "thread-message-card-reply",
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <ActorAvatar actor={actor} fallback={message.authorActorId} small />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm font-bold text-[#111827]">
+              {actor ? displayName(actor) : message.authorActorId}
+            </span>
+            <span className="shrink-0 text-xs font-medium text-[#667085]">
+              {formatTime(message.createdAt)}
+            </span>
+          </div>
+          <div className="message-markdown mt-1 text-sm leading-5 text-[#111827]">
+            <ReactMarkdown>{displayBody}</ReactMarkdown>
+          </div>
+          {pollChoices.length > 0 && (
+            <PollCard choices={pollChoices} disabled />
+          )}
+          {attachments.length > 0 && (
+            <AttachmentStack attachments={attachments} />
+          )}
+          <div className="mt-2 flex min-h-7 flex-wrap items-center gap-1.5">
+            {reactions.map((reaction) => {
+              const selected = Boolean(
+                currentActorId && reaction.actorIds.includes(currentActorId),
+              );
+              return (
+                <button
+                  key={reaction.emoji}
+                  type="button"
+                  className={cn(
+                    "reaction-chip h-7 px-2.5 text-xs",
+                    selected
+                      ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
+                      : "border-[#e2e5ed] bg-white text-[#31394a]",
+                  )}
+                  title={reaction.actorIds
+                    .map((actorId) => actorName(actors, actorId))
+                    .join(", ")}
+                  disabled={busy === `message:reaction:${message.id}:${reaction.emoji}`}
+                  onClick={() => onToggleReaction(message, reaction.emoji)}
+                >
+                  <span>{reaction.emoji}</span>
+                  <span>{reaction.actorIds.length}</span>
+                </button>
+              );
+            })}
+            <ReactionPicker
+              busy={busy}
+              compact
+              message={message}
+              onToggleReaction={onToggleReaction}
+            />
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function ReactionPicker({
+  busy,
+  compact = false,
+  message,
+  onToggleReaction,
+}: {
+  busy: string | null;
+  compact?: boolean;
+  message: Message;
+  onToggleReaction: (message: Message, emoji: string) => void;
+}) {
+  return (
+    <div className={cn("reaction-picker", compact && "h-7")}>
+      <button
+        type="button"
+        className={cn(
+          "composer-icon reaction-picker-trigger rounded-full",
+          compact ? "h-7 min-w-7" : "h-8 min-w-8",
+        )}
+        title="Add reaction"
+        aria-label="Add reaction"
+        aria-haspopup="true"
+      >
+        <Smile size={compact ? 14 : 15} />
+      </button>
+      <div className="reaction-picker-menu" role="menu" aria-label="Choose reaction">
+        {supportedReactionEmojis.map((emoji) => (
+          <button
+            key={emoji}
+            type="button"
+            className={cn("reaction-picker-option", compact && "h-7 w-7 text-sm")}
+            title={`React ${emoji}`}
+            aria-label={`React ${emoji}`}
+            disabled={busy === `message:reaction:${message.id}:${emoji}`}
+            onClick={() => onToggleReaction(message, emoji)}
+            role="menuitem"
+          >
+            {emoji}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ThreadComposer({
+  draft,
+  setDraft,
+  disabled,
+  busy,
+  onSend,
+}: {
+  draft: string;
+  setDraft: (value: string) => void;
+  disabled: boolean;
+  busy: boolean;
+  onSend: () => void;
+}) {
+  return (
+    <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
+      <div className="composer-box composer-box-compact relative">
+        <Textarea
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              onSend();
+            }
+          }}
+          disabled={disabled}
+          placeholder={disabled ? "Select a thread" : "Reply in thread..."}
+          className="max-h-36 min-h-[42px] flex-1 border-0 bg-transparent px-0 py-1 text-sm shadow-none focus-visible:ring-0"
+        />
+        <Button
+          size="icon"
+          onClick={onSend}
+          disabled={disabled || !draft.trim() || busy}
+          className="h-9 w-9 rounded-lg bg-[#503ed4] text-white hover:bg-[#4635c5]"
+        >
+          {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
+        </Button>
+      </div>
+    </footer>
+  );
+}
+
+function ThreadsView({
+  actors,
+  channels,
+  messages,
+  threadMessages,
+  threadStatsById,
+  threads,
+  activeChannelId,
+  activeThread,
+  activeThreadTask,
+  currentActorId,
+  threadDraft,
+  setThreadDraft,
+  onSelectThread,
+  onCloseThread,
+  onSendThreadMessage,
+  onToggleReaction,
+  busy,
+  disabled,
+}: {
+  actors: Record<string, Actor>;
+  channels: Channel[];
+  messages: Message[];
+  threadMessages: Message[];
+  threadStatsById: Record<string, ThreadActivityStats>;
+  threads: ThreadWithChannel[];
+  activeChannelId: string | null;
+  activeThread: Thread | null;
+  activeThreadTask: Task | null;
+  currentActorId: string | null;
+  threadDraft: string;
+  setThreadDraft: (value: string) => void;
+  onSelectThread: (thread: Thread) => void;
+  onCloseThread: () => void;
+  onSendThreadMessage: () => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
+  busy: string | null;
+  disabled: boolean;
+}) {
+  const [query, setQuery] = useState("");
+  const activeChannel = activeChannelId
+    ? channels.find((channel) => channel.id === activeChannelId) ?? null
+    : null;
+  const filteredThreads = threads.filter((thread) => {
+    const text = `${thread.title} ${thread.channel.title}`.toLowerCase();
+    return text.includes(query.trim().toLowerCase());
+  });
+  const rootMessagesById = new Map(messages.map((message) => [message.id, message]));
+  return (
+    <section className="flex min-h-0 flex-1 flex-col bg-white">
+      <div className="flex h-[96px] shrink-0 items-center justify-between border-b border-[#e2e6ef] bg-white px-6">
+        <div>
+          <h1 className="text-[22px] font-bold text-[#111827]">All Threads</h1>
+          <p className="mt-1 text-sm text-[#485063]">
+            Track and resolve conversations across all channels.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="search-pill h-10 w-[250px]">
+            <Search size={16} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search threads"
+              className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[#8a93a5]"
+            />
+          </label>
+        </div>
+      </div>
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(420px,1fr)_460px] bg-[#fbfbfd]">
+        <div className="min-h-0 overflow-y-auto border-r border-[#e2e6ef] p-4 soft-scrollbar">
+          <div className="mb-4 flex items-center justify-between gap-2 text-xs font-semibold text-[#667085]">
+            <span>{filteredThreads.length} threads</span>
+            <span>Newest activity first</span>
+          </div>
+          <div className="space-y-2">
+            {filteredThreads.map((thread) => (
+              <ThreadListCard
+                key={thread.id}
+                actors={actors}
+                rootMessage={rootMessagesById.get(thread.rootMessageId) ?? null}
+                replyCount={
+                  activeThread?.id === thread.id
+                    ? threadMessages.length
+                    : threadStatsById[thread.id]?.replyCount
+                }
+                selected={activeThread?.id === thread.id}
+                thread={thread}
+                threadStats={threadStatsById[thread.id]}
+                onSelect={() => onSelectThread(thread)}
+              />
+            ))}
+            {filteredThreads.length === 0 && <EmptyState icon={Split} text="No threads." />}
+          </div>
+        </div>
+        <ThreadPanel
+          actors={actors}
+          channel={activeChannel}
+          channelMessages={messages}
+          currentActorId={currentActorId}
+          disabled={disabled}
+          draft={threadDraft}
+          messages={threadMessages}
+          setDraft={setThreadDraft}
+          task={activeThreadTask}
+          thread={activeThread}
+          busy={busy}
+          className="flex xl:flex"
+          onClose={onCloseThread}
+          onSend={onSendThreadMessage}
+          onToggleReaction={onToggleReaction}
+        />
+      </div>
+    </section>
+  );
+}
+
+function ThreadListCard({
+  actors,
+  rootMessage,
+  replyCount,
+  selected,
+  thread,
+  threadStats,
+  onSelect,
+}: {
+  actors: Record<string, Actor>;
+  rootMessage: Message | null;
+  replyCount?: number;
+  selected: boolean;
+  thread: ThreadWithChannel;
+  threadStats?: ThreadActivityStats;
+  onSelect: () => void;
+}) {
+  const starter = rootMessage ? actors[rootMessage.authorActorId] : null;
+  const participants = threadParticipants(thread, actors, starter ?? undefined, threadStats);
+  const effectiveReplyCount = replyCount ?? threadReplyCount(thread, threadStats);
+  const preview = rootMessage
+    ? rootMessage.body || metadataText(rootMessage)
+    : "Open the conversation to review the latest replies.";
+  return (
+    <button
+      type="button"
+      className={cn("thread-list-card", selected && "thread-list-card-active")}
+      onClick={onSelect}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-[#596174]">
+            <Hash size={13} />
+            <span className="truncate">{thread.channel.title}</span>
+          </div>
+          <div className="truncate text-base font-bold text-[#111827]">{thread.title}</div>
+        </div>
+        <span className="shrink-0 text-xs font-medium text-[#667085]">
+          {rootMessage ? formatTime(rootMessage.createdAt) : "Thread"}
+        </span>
+      </div>
+      <p className="mt-2 line-clamp-2 text-sm leading-5 text-[#485063]">
+        {starter ? `${displayName(starter)}: ` : ""}
+        {preview}
+      </p>
+      <div className="mt-3 flex items-center gap-2">
+        <AvatarStack actors={participants} max={5} small />
+        <span className="rounded-full bg-[#f1efff] px-2 py-1 text-xs font-bold text-[#5843d7]">
+          {typeof effectiveReplyCount === "number"
+            ? `${Math.max(0, effectiveReplyCount)}${threadStats?.hasMoreReplies ? "+" : ""} ${
+                effectiveReplyCount === 1 ? "reply" : "replies"
+              }`
+            : participants.length > 0
+              ? `${participants.length} ${
+                  participants.length === 1 ? "participant" : "participants"
+                }`
+              : "Thread"}
+        </span>
+        <span className="rounded-full border border-[#dfe3ec] bg-white px-2 py-1 text-xs font-semibold text-[#667085]">
+          {shortId(thread.rootMessageId, 5)}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function ChannelsView({
+  actors,
+  channels,
+  channelGroups,
+  threadsByChannel,
+  activeChannel,
+  onSelectChannel,
+}: {
+  actors: Record<string, Actor>;
+  channels: Channel[];
+  channelGroups: ChannelGroup[];
+  threadsByChannel: Record<string, Thread[]>;
+  activeChannel: Channel | null;
+  onSelectChannel: (channelId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const filteredChannels = channels.filter((channel) => {
+    const text = `${channel.title} ${channel.topic ?? ""} ${channel.visibility}`.toLowerCase();
+    return text.includes(query.trim().toLowerCase());
+  });
+  const sections = channelGroupSections(channelGroups, filteredChannels);
+  return (
+    <section className="flex min-h-0 flex-1 flex-col bg-white">
+      <div className="flex h-[96px] shrink-0 items-center justify-between border-b border-[#e2e6ef] bg-white px-6">
+        <div>
+          <h1 className="text-[22px] font-bold text-[#111827]">Channels</h1>
+          <p className="mt-1 text-sm text-[#485063]">
+            Durable spaces for teams and topics. Create channels or sections from the sidebar plus.
+          </p>
+        </div>
+        <div className="text-sm font-semibold text-[#667085]">
+          {filteredChannels.length} visible
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto bg-[#fbfbfd] p-6 soft-scrollbar">
+        <label className="mb-5 flex h-10 max-w-[340px] items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-[#667085]">
+          <Search size={16} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search channels"
+            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[#8a93a5]"
+          />
+        </label>
+        <div className="channel-table">
+          <div className="channel-table-head">
+            <span>Channel</span>
+            <span>Type</span>
+            <span>Members</span>
+            <span>Activity</span>
+          </div>
+          {sections.map((section) => (
+            <div key={section.id}>
+              {(section.local || channelGroups.length > 0) && (
+                <div className="channel-table-group">
+                  {section.title}
+                  <span>({section.channels.length} channels)</span>
+                </div>
+              )}
+              {section.channels.map((channel) => (
+                <ChannelTableRow
+                  key={channel.id}
+                  actors={actors}
+                  channel={channel}
+                  selected={activeChannel?.id === channel.id}
+                  threads={threadsByChannel[channel.id] ?? []}
+                  onSelect={() => onSelectChannel(channel.id)}
+                />
+              ))}
+            </div>
+          ))}
+          {filteredChannels.length === 0 && <EmptyState icon={Hash} text="No channels." />}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ChannelTableRow({
+  actors,
+  channel,
+  selected,
+  threads,
+  onSelect,
+}: {
+  actors: Record<string, Actor>;
+  channel: Channel;
+  selected: boolean;
+  threads: Thread[];
+  onSelect: () => void;
+}) {
+  const members = channel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId));
+  return (
+    <button
+      type="button"
+      className={cn("channel-table-row", selected && "channel-table-row-active")}
+      onClick={onSelect}
+    >
+      <span className="flex min-w-0 items-center gap-3">
+        <span className="channel-icon">
+          <Hash size={17} />
+        </span>
+        <span className="min-w-0 text-left">
+          <span className="block truncate text-sm font-bold text-[#111827]">
+            # {channel.title}
+          </span>
+          <span className="block truncate text-xs text-[#596174]">
+            {channelTopic(channel) || `${threads.length} active threads`}
+          </span>
+        </span>
+      </span>
+      <span className="flex items-center gap-1 text-xs font-medium text-[#667085]">
+        {channel.visibility === "private" && <Lock size={12} />}
+        {capitalize(channel.visibility)}
+      </span>
+      <span className="flex items-center">
+        <AvatarStack actors={members} max={4} small />
+        <span className="ml-2 text-xs font-semibold text-[#596174]">{members.length}</span>
+      </span>
+      <span className="flex items-center gap-2 text-xs font-medium text-[#667085]">
+        <Clock size={13} />
+        {threads.length > 0 ? `${threads.length} threads` : "No threads"}
+      </span>
+    </button>
   );
 }
 
@@ -1981,464 +3557,470 @@ function TasksView({
   );
 }
 
-function SettingsView({
-  account,
+function SpacesView({
   busy,
+  connection,
+  workspace,
   workspaceForm,
   setWorkspaceForm,
-  machineForm,
-  setMachineForm,
-  agentForm,
-  setAgentForm,
-  machines,
   workspaces,
   onAddWorkspace,
   onRemoveWorkspace,
-  onCheckMachines,
-  onAddMachine,
-  onRemoveMachine,
-  onAddAgent,
-  onRemoveAgent,
-  onOpenLocalPath,
-  onLogin,
-  onLogout,
+  onSelectWorkspace,
 }: {
-  account: HumanAccount | null;
   busy: string | null;
+  connection: ConnectionState;
+  workspace: Workspace | null;
   workspaceForm: { name: string; serverUrl: string };
   setWorkspaceForm: (form: { name: string; serverUrl: string }) => void;
-  machineForm: { name: string; dataRoot: string };
-  setMachineForm: (form: { name: string; dataRoot: string }) => void;
-  agentForm: AgentFormState;
-  setAgentForm: (form: AgentFormState) => void;
-  machines: MachineInfo[];
   workspaces: Workspace[];
   onAddWorkspace: () => void;
   onRemoveWorkspace: (id: string) => void;
-  onCheckMachines: () => void;
-  onAddMachine: () => void;
-  onRemoveMachine: (machineId: string) => void;
-  onAddAgent: () => void;
-  onRemoveAgent: (machineId: string, actorId: string) => void;
-  onOpenLocalPath: (path: string) => void;
-  onLogin: (provider: ipc.LoginProvider) => void;
-  onLogout: () => void;
+  onSelectWorkspace: (workspaceId: string) => void;
 }) {
-  const [step, setStep] = useState<SettingsStep>("workspace");
-  const selectedMachine = resolveAgentMachine(agentForm, machines);
-  const selectedProvider = resolveAgentProvider(agentForm, selectedMachine);
-  const modelChoices = selectedProvider?.modelChoices ?? [];
-  const workspaceReady = workspaces.length > 0;
-  const daemonReady = machines.length > 0;
-  const agentReady = Boolean(
-    selectedMachine &&
-      selectedProvider &&
-      machineCanCreateAgent(selectedMachine) &&
-      agentForm.name.trim(),
-  );
-
-  useEffect(() => {
-    if (!workspaceReady && step !== "workspace") {
-      setStep("workspace");
-    } else if (step === "agent" && !daemonReady) {
-      setStep("daemon");
-    }
-  }, [daemonReady, step, workspaceReady]);
-
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <PageHeader title="Settings" detail="Workspace setup" />
-      <div className="min-h-0 flex-1 overflow-y-auto p-5 scrollbar-thin">
-        <div className="mx-auto grid max-w-6xl gap-5 lg:grid-cols-[230px_minmax(0,1fr)]">
-          <aside className="space-y-4">
-            <div className="rounded-md border border-border bg-card p-4">
-              {account ? (
-                <div className="flex items-center gap-3">
-                  <Avatar account={account} />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-medium">{accountName(account)}</div>
-                    <div className="truncate text-xs text-muted-foreground">
-                      {account.email || account.staffId || account.provider}
-                    </div>
-                  </div>
-                  <Button variant="ghost" size="icon" onClick={onLogout} disabled={busy === "logout"}>
-                    <LogOut size={15} />
-                  </Button>
-                </div>
+      <PageHeader title="Spaces" detail="Choose or add a server connection" />
+      <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
+        <div className="mx-auto max-w-4xl space-y-4">
+          <SettingsSection title="Add Space" detail="Save a connection target in the side rail.">
+            <form
+              className="grid gap-3 sm:grid-cols-[180px_1fr_auto]"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onAddWorkspace();
+              }}
+            >
+              <Input
+                value={workspaceForm.name}
+                onChange={(event) =>
+                  setWorkspaceForm({ ...workspaceForm, name: event.target.value })
+                }
+                placeholder="Name"
+              />
+              <Input
+                value={workspaceForm.serverUrl}
+                onChange={(event) =>
+                  setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
+                }
+                placeholder="ws://127.0.0.1:7878/rpc"
+              />
+              <Button
+                type="submit"
+                disabled={
+                  busy === "workspace:add" ||
+                  !workspaceForm.name.trim() ||
+                  !workspaceForm.serverUrl.trim()
+                }
+              >
+                {busy === "workspace:add" ? (
+                  <Loader2 className="animate-spin" size={15} />
+                ) : (
+                  <Plus size={15} />
+                )}
+                Add Space
+              </Button>
+            </form>
+          </SettingsSection>
+
+          <SettingsSection title="Saved Spaces" detail="The side rail uses this list for switching.">
+            <div className="space-y-2">
+              {workspaces.length === 0 ? (
+                <MutedLine>No spaces configured.</MutedLine>
               ) : (
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-medium">Account</div>
-                    <div className="text-xs text-muted-foreground">Optional identity</div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button size="sm" onClick={() => onLogin("github")} disabled={busy === "login:github"}>
-                      <Github size={14} />
-                      GitHub
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => onLogin("google")} disabled={busy === "login:google"}>
-                      Google
-                    </Button>
-                  </div>
-                </div>
+                workspaces.map((item) => {
+                  const selected = item.id === workspace?.id;
+                  const connecting = busy === `connect:${item.id}`;
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex items-center gap-3 rounded-lg border border-[#dfe3ec] bg-[#fbfbfd] px-3 py-3"
+                    >
+                      <span
+                        className={cn(
+                          "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-sm font-bold",
+                          selected
+                            ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
+                            : "border-[#dfe3ec] bg-white text-[#303849]",
+                        )}
+                      >
+                        {workspaceInitials(item)}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <div className="truncate text-sm font-bold text-[#111827]">
+                            {item.name}
+                          </div>
+                          <Badge
+                            variant={
+                              selected && connection === "open" ? "success" : "outline"
+                            }
+                          >
+                            {selected ? connectionLabel(connection) : "Saved"}
+                          </Badge>
+                        </div>
+                        <div className="mt-1 truncate font-mono text-xs text-[#667085]">
+                          {item.serverUrl}
+                        </div>
+                      </div>
+                      <Button
+                        variant={selected && connection === "open" ? "outline" : "default"}
+                        size="sm"
+                        onClick={() => onSelectWorkspace(item.id)}
+                        disabled={connecting}
+                      >
+                        {connecting ? (
+                          <Loader2 className="animate-spin" size={14} />
+                        ) : selected && connection === "open" ? (
+                          <Check size={14} />
+                        ) : null}
+                        {selected && connection === "open" ? "Open" : "Connect"}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Remove space"
+                        onClick={() => onRemoveWorkspace(item.id)}
+                        disabled={busy === `workspace:remove:${item.id}`}
+                      >
+                        <Trash2 size={16} />
+                      </Button>
+                    </div>
+                  );
+                })
               )}
             </div>
-            <div className="rounded-md border border-border bg-card p-2">
-              <SettingsStepButton
-                active={step === "workspace"}
-                complete={workspaceReady}
-                label="Workspace"
-                detail={`${workspaces.length} configured`}
-                onClick={() => setStep("workspace")}
-              />
-              <SettingsStepButton
-                active={step === "daemon"}
-                complete={daemonReady}
-                label="Daemon"
-                detail={`${machines.length} available`}
-                disabled={!workspaceReady}
-                onClick={() => setStep("daemon")}
-              />
-              <SettingsStepButton
-                active={step === "agent"}
-                complete={machines.some((machine) => machine.agentCount > 0)}
-                label="Agent"
-                detail={selectedMachine ? selectedMachine.name : "choose daemon"}
-                disabled={!workspaceReady || !daemonReady}
-                onClick={() => setStep("agent")}
-              />
-            </div>
-          </aside>
-
-          <div className="min-w-0">
-            {step === "workspace" && (
-              <div className="space-y-4">
-                <SettingsSection
-                  title="Workspace"
-                  detail="Connect the GUI to a Loom server profile."
-                >
-                  <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
-                    <Input
-                      value={workspaceForm.name}
-                      onChange={(event) =>
-                        setWorkspaceForm({ ...workspaceForm, name: event.target.value })
-                      }
-                      placeholder="Name"
-                    />
-                    <Input
-                      value={workspaceForm.serverUrl}
-                      onChange={(event) =>
-                        setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
-                      }
-                      placeholder="ws://127.0.0.1:7878/rpc"
-                    />
-                    <Button onClick={onAddWorkspace} disabled={busy === "workspace:add"}>
-                      <Plus size={15} />
-                      Add
-                    </Button>
-                  </div>
-                </SettingsSection>
-                <SettingsSection title="Configured Workspaces" detail="Profiles saved on this Mac.">
-                  <div className="space-y-2">
-                    {workspaces.length === 0 ? (
-                      <MutedLine>No workspaces configured.</MutedLine>
-                    ) : (
-                      workspaces.map((workspace) => (
-                        <div
-                          key={workspace.id}
-                          className="flex items-center gap-3 rounded-md border border-border px-3 py-2"
-                        >
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate text-sm font-medium">{workspace.name}</div>
-                            <div className="truncate font-mono text-xs text-muted-foreground">
-                              {workspace.serverUrl}
-                            </div>
-                          </div>
-                          <Badge variant="outline">{workspace.displayName || workspace.actorId}</Badge>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            title="Remove workspace"
-                            onClick={() => onRemoveWorkspace(workspace.id)}
-                            disabled={busy === `workspace:remove:${workspace.id}`}
-                          >
-                            <Trash2 size={16} />
-                          </Button>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                  <div className="mt-4 flex justify-end">
-                    <Button onClick={() => setStep("daemon")} disabled={!workspaceReady}>
-                      Continue
-                    </Button>
-                  </div>
-                </SettingsSection>
-              </div>
-            )}
-
-            {step === "daemon" && (
-              <div className="space-y-4">
-                <SettingsSection
-                  title="Daemons"
-                  detail="A daemon hosts local or remote agents for the active workspace."
-                  action={
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={onCheckMachines}
-                      disabled={busy === "machine:check"}
-                    >
-                      {busy === "machine:check" ? (
-                        <Loader2 className="animate-spin" size={15} />
-                      ) : (
-                        <RefreshCw size={15} />
-                      )}
-                      Check
-                    </Button>
-                  }
-                >
-                  <div className="grid gap-3 sm:grid-cols-[180px_1fr_auto]">
-                    <Input
-                      value={machineForm.name}
-                      onChange={(event) =>
-                        setMachineForm({ ...machineForm, name: event.target.value })
-                      }
-                      placeholder="Daemon name"
-                    />
-                    <Input
-                      value={machineForm.dataRoot}
-                      onChange={(event) =>
-                        setMachineForm({ ...machineForm, dataRoot: event.target.value })
-                      }
-                      placeholder="Data root"
-                    />
-                    <Button onClick={onAddMachine} disabled={busy === "machine:create"}>
-                      <Plus size={15} />
-                      Add
-                    </Button>
-                  </div>
-                </SettingsSection>
-                <div className="space-y-3">
-                  {machines.length === 0 ? (
-                    <EmptyState icon={HardDrive} text="No daemons configured." />
-                  ) : (
-                    machines.map((machine) => (
-                      <MachineCard
-                        key={machine.id}
-                        machine={machine}
-                        busy={busy}
-                        onRemove={onRemoveMachine}
-                        onOpenLocalPath={onOpenLocalPath}
-                        onRemoveAgent={onRemoveAgent}
-                      />
-                    ))
-                  )}
-                </div>
-                <div className="flex justify-between">
-                  <Button variant="outline" onClick={() => setStep("workspace")}>
-                    Workspace
-                  </Button>
-                  <Button onClick={() => setStep("agent")} disabled={!daemonReady}>
-                    Add Agent
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {step === "agent" && (
-              <div className="space-y-4">
-                <SettingsSection
-                  title="Add Agent"
-                  detail="Pick a daemon first, then choose the runtime provider and identity."
-                >
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <select
-                      value={selectedMachine?.id ?? ""}
-                      onChange={(event) =>
-                        setAgentForm(
-                          normalizeAgentForm(
-                            { ...agentForm, machineId: event.target.value, model: "" },
-                            machines,
-                          ),
-                        )
-                      }
-                      className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                    >
-                      {machines.map((machine) => (
-                        <option
-                          key={machine.id}
-                          value={machine.id}
-                          disabled={!machineCanCreateAgent(machine)}
-                        >
-                          {machine.name}
-                          {!machineCanCreateAgent(machine) ? " (read-only)" : ""}
-                        </option>
-                      ))}
-                    </select>
-                    <select
-                      value={selectedProvider?.id ?? ""}
-                      onChange={(event) => {
-                        const provider = selectedMachine?.providers.find(
-                          (item) => item.id === event.target.value,
-                        );
-                        setAgentForm({
-                          ...agentForm,
-                          machineId: selectedMachine?.id ?? agentForm.machineId,
-                          providerId: event.target.value,
-                          model: provider?.defaultModel ?? "",
-                        });
-                      }}
-                      className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                      disabled={!selectedMachine || selectedMachine.providers.length === 0}
-                    >
-                      {(selectedMachine?.providers ?? []).map((provider) => (
-                        <option key={provider.id} value={provider.id}>
-                          {provider.name}
-                        </option>
-                      ))}
-                    </select>
-                    <Input
-                      value={agentForm.name}
-                      onChange={(event) =>
-                        setAgentForm({ ...agentForm, name: event.target.value })
-                      }
-                      placeholder="Agent name"
-                    />
-                    <Input
-                      value={agentForm.actorId}
-                      onChange={(event) =>
-                        setAgentForm({ ...agentForm, actorId: event.target.value })
-                      }
-                      placeholder="Actor id (optional)"
-                    />
-                    {modelChoices.length > 0 ? (
-                      <select
-                        value={agentForm.model || selectedProvider?.defaultModel || ""}
-                        onChange={(event) =>
-                          setAgentForm({ ...agentForm, model: event.target.value })
-                        }
-                        className="h-10 rounded-md border border-input bg-background px-3 text-sm"
-                      >
-                        {modelChoices.map((choice) => (
-                          <option key={choice.id} value={choice.id}>
-                            {choice.label}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <Input
-                        value={agentForm.model}
-                        onChange={(event) =>
-                          setAgentForm({ ...agentForm, model: event.target.value })
-                        }
-                        placeholder="Model"
-                      />
-                    )}
-                    <label className="flex h-10 items-center gap-2 rounded-md border border-border px-3 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={agentForm.autostart}
-                        onChange={(event) =>
-                          setAgentForm({ ...agentForm, autostart: event.target.checked })
-                        }
-                      />
-                      Autostart
-                    </label>
-                    <Textarea
-                      value={agentForm.description}
-                      onChange={(event) =>
-                        setAgentForm({ ...agentForm, description: event.target.value })
-                      }
-                      placeholder="Agent instructions"
-                      className="sm:col-span-2"
-                    />
-                  </div>
-                  <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-                    <div className="text-sm text-muted-foreground">
-                      {!selectedMachine
-                        ? "No daemon selected."
-                        : !machineCanCreateAgent(selectedMachine)
-                          ? "This daemon is read-only for the current account."
-                          : !selectedProvider
-                            ? "No CLI provider detected for this daemon."
-                            : `${selectedProvider.name} on ${selectedMachine.name}`}
-                    </div>
-                    <Button
-                      onClick={onAddAgent}
-                      disabled={busy === "agent:create" || !agentReady}
-                    >
-                      {busy === "agent:create" ? (
-                        <Loader2 className="animate-spin" size={15} />
-                      ) : (
-                        <Bot size={15} />
-                      )}
-                      Add Agent
-                    </Button>
-                  </div>
-                </SettingsSection>
-                {selectedMachine && (
-                  <MachineCard
-                    machine={selectedMachine}
-                    busy={busy}
-                    onRemove={onRemoveMachine}
-                    onOpenLocalPath={onOpenLocalPath}
-                    onRemoveAgent={onRemoveAgent}
-                  />
-                )}
-                <div className="flex justify-start">
-                  <Button variant="outline" onClick={() => setStep("daemon")}>
-                    Daemons
-                  </Button>
-                </div>
-              </div>
-            )}
-          </div>
+          </SettingsSection>
         </div>
       </div>
     </section>
   );
 }
 
-function SettingsStepButton({
-  active,
-  complete,
-  disabled,
-  label,
-  detail,
-  onClick,
+function AccountView({
+  account,
+  busy,
+  onLogin,
+  onLogout,
 }: {
-  active: boolean;
-  complete: boolean;
-  disabled?: boolean;
-  label: string;
-  detail: string;
-  onClick: () => void;
+  account: HumanAccount | null;
+  busy: string | null;
+  onLogin: (provider: ipc.LoginProvider) => void;
+  onLogout: () => void;
 }) {
   return (
-    <button
-      type="button"
-      className={cn(
-        "flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors",
-        active ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-        disabled && "cursor-not-allowed opacity-50 hover:bg-transparent hover:text-muted-foreground",
-      )}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      <span
+    <section className="flex min-h-0 flex-1 flex-col">
+      <PageHeader title="Account" detail="Identity and sign-in" />
+      <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
+        <div className="mx-auto max-w-2xl">
+          <SettingsSection title="Account" detail="Used for presence and local ownership.">
+            {account ? (
+              <div className="space-y-5">
+                <div className="flex items-center gap-3">
+                  <Avatar account={account} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-base font-bold text-[#111827]">
+                      {accountName(account)}
+                    </div>
+                    <div className="truncate text-sm text-[#667085]">
+                      {account.email || account.staffId || capitalize(account.provider)}
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    onClick={onLogout}
+                    disabled={busy === "logout"}
+                  >
+                    <LogOut size={15} />
+                    Sign Out
+                  </Button>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <AccountField label="Provider" value={capitalize(account.provider)} />
+                  <AccountField label="Actor ID" value={account.actorId} mono />
+                  <AccountField label="Staff ID" value={account.staffId || "-"} />
+                  <AccountField label="Email" value={account.email || "-"} />
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={() => onLogin("github")} disabled={busy === "login:github"}>
+                  <Github size={15} />
+                  GitHub
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => onLogin("google")}
+                  disabled={busy === "login:google"}
+                >
+                  Google
+                </Button>
+              </div>
+            )}
+          </SettingsSection>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AccountField({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="min-w-0 rounded-lg border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2">
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+        {label}
+      </div>
+      <div
         className={cn(
-          "flex h-6 w-6 shrink-0 items-center justify-center rounded-md border text-xs",
-          complete ? "border-emerald-400/60 text-emerald-300" : "border-border",
+          "mt-1 truncate text-sm font-semibold text-[#303849]",
+          mono && "font-mono",
         )}
       >
-        {complete ? <Check size={13} /> : <Circle size={10} />}
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium">{label}</span>
-        <span className="block truncate text-xs">{detail}</span>
-      </span>
-    </button>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({
+  busy,
+  machineForm,
+  setMachineForm,
+  agentForm,
+  setAgentForm,
+  machines,
+  onCheckMachines,
+  onAddMachine,
+  onRemoveMachine,
+  onAddAgent,
+  onUpdateAgent,
+  onRemoveAgent,
+  onOpenLocalPath,
+}: {
+  busy: string | null;
+  machineForm: { name: string; dataRoot: string };
+  setMachineForm: (form: { name: string; dataRoot: string }) => void;
+  agentForm: AgentFormState;
+  setAgentForm: (form: AgentFormState) => void;
+  machines: MachineInfo[];
+  onCheckMachines: () => void;
+  onAddMachine: () => void;
+  onRemoveMachine: (machineId: string) => void;
+  onAddAgent: () => void;
+  onUpdateAgent: (patch: AgentUpdatePatch) => void;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+  onOpenLocalPath: (path: string) => void;
+}) {
+  const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
+  const [hostComposerOpen, setHostComposerOpen] = useState(false);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const memberEntries = agentMemberEntries(machines);
+  const selectedMemberEntry =
+    selectedAgentId === null
+      ? null
+      : memberEntries.find((entry) => entry.agent.spec.actor.id === selectedAgentId) ?? null;
+  const selectedMachine =
+    selectedMemberEntry?.machine ??
+    machines.find((machine) => machine.id === selectedMachineId) ??
+    machines.find((machine) => machine.id === agentForm.machineId) ??
+    machines[0];
+
+  useEffect(() => {
+    if (machines.length === 0) {
+      if (selectedMachineId) setSelectedMachineId(null);
+      return;
+    }
+    if (selectedMachineId && machines.some((machine) => machine.id === selectedMachineId)) {
+      return;
+    }
+    const nextMachine =
+      machines.find((machine) => machine.id === agentForm.machineId) ?? machines[0];
+    setSelectedMachineId(nextMachine.id);
+    setAgentForm(agentFormForMachine(agentForm, nextMachine));
+  }, [agentForm, machines, selectedMachineId, setAgentForm]);
+
+  useEffect(() => {
+    if (
+      selectedAgentId &&
+      !memberEntries.some((entry) => entry.agent.spec.actor.id === selectedAgentId)
+    ) {
+      setSelectedAgentId(null);
+    }
+  }, [memberEntries, selectedAgentId]);
+
+  function selectMachine(machine: MachineInfo) {
+    setSelectedMachineId(machine.id);
+    setSelectedAgentId(null);
+    setAgentForm(agentFormForMachine(agentForm, machine));
+  }
+
+  function selectAgent(entry: AgentMemberEntry) {
+    setSelectedMachineId(entry.machine.id);
+    setSelectedAgentId(entry.agent.spec.actor.id);
+    setAgentForm(agentFormForMachine(agentForm, entry.machine));
+  }
+
+  return (
+    <section className="flex min-h-0 flex-1 flex-col">
+      <PageHeader title="Hosts" detail="Workspace-bound runtimes and agents" />
+      <div className="min-h-0 flex-1 overflow-hidden bg-white">
+        <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(208px,224px)_minmax(0,1fr)]">
+          <aside className="flex min-h-0 flex-col border-r border-[#e2e6ef] bg-[#fbfbfd]">
+            <div className="border-b border-[#edf0f5] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                    Hosts
+                  </div>
+                  <div className="mt-1 text-sm font-bold text-[#111827]">
+                    {machines.length} configured
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    title="Refresh hosts"
+                    onClick={onCheckMachines}
+                    disabled={busy === "machine:check"}
+                    className="h-9 w-9 rounded-lg border-[#dfe3ec] bg-white"
+                  >
+                    {busy === "machine:check" ? (
+                      <Loader2 className="animate-spin" size={15} />
+                    ) : (
+                      <RefreshCw size={15} />
+                    )}
+                  </Button>
+                  <Button
+                    variant={hostComposerOpen ? "secondary" : "outline"}
+                    size="icon"
+                    title={hostComposerOpen ? "Close add host" : "Add host"}
+                    onClick={() => setHostComposerOpen((open) => !open)}
+                    className="h-9 w-9 rounded-lg border-[#dfe3ec] bg-white"
+                  >
+                    {hostComposerOpen ? <X size={15} /> : <Plus size={15} />}
+                  </Button>
+                </div>
+              </div>
+            </div>
+            {hostComposerOpen && (
+              <form
+                className="border-b border-[#edf0f5] bg-white p-4"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  onAddMachine();
+                }}
+              >
+                <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                  <Plus size={13} />
+                  Add Host
+                </div>
+                <div className="space-y-2">
+                  <Input
+                    value={machineForm.name}
+                    onChange={(event) =>
+                      setMachineForm({ ...machineForm, name: event.target.value })
+                    }
+                    placeholder="Host name"
+                    className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                  />
+                  <Input
+                    value={machineForm.dataRoot}
+                    onChange={(event) =>
+                      setMachineForm({ ...machineForm, dataRoot: event.target.value })
+                    }
+                    placeholder="Data root"
+                    className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                  />
+                  <Button
+                    type="submit"
+                    className="w-full rounded-lg"
+                    disabled={busy === "machine:create" || !machineForm.name.trim()}
+                  >
+                    <Plus size={15} />
+                    Add Host
+                  </Button>
+                </div>
+              </form>
+            )}
+            <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
+              <div className="space-y-2">
+                {machines.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
+                    No hosts configured.
+                  </div>
+                ) : (
+                  machines.map((machine) => (
+                    <HostListItem
+                      key={machine.id}
+                      machine={machine}
+                      selected={selectedMachine?.id === machine.id}
+                      onSelect={() => selectMachine(machine)}
+                    />
+                  ))
+                )}
+              </div>
+              <div className="mt-5 border-t border-[#edf0f5] pt-4">
+                <div className="mb-2 flex items-center justify-between px-1">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                    Members
+                  </div>
+                  <span className="count-badge">{memberEntries.length}</span>
+                </div>
+                <div className="space-y-1.5">
+                  {memberEntries.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
+                      No agents configured.
+                    </div>
+                  ) : (
+                    memberEntries.map((entry) => (
+                      <MemberListItem
+                        key={`${entry.machine.id}:${entry.agent.spec.actor.id}`}
+                        entry={entry}
+                        selected={selectedMemberEntry?.agent.spec.actor.id === entry.agent.spec.actor.id}
+                        onSelect={() => selectAgent(entry)}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          <div className="min-h-0 overflow-y-auto bg-white soft-scrollbar">
+            {selectedMemberEntry ? (
+              <AgentMemberDetail
+                entry={selectedMemberEntry}
+                busy={busy}
+                onUpdateAgent={onUpdateAgent}
+                onRemoveAgent={onRemoveAgent}
+              />
+            ) : selectedMachine ? (
+              <MachineCard
+                machine={selectedMachine}
+                busy={busy}
+                agentForm={agentForm}
+                setAgentForm={setAgentForm}
+                onAddAgent={onAddAgent}
+                onRemove={onRemoveMachine}
+                onOpenLocalPath={onOpenLocalPath}
+                onRemoveAgent={onRemoveAgent}
+              />
+            ) : (
+              <EmptyState icon={Server} text="No hosts configured." />
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -2454,11 +4036,11 @@ function SettingsSection({
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-md border border-border bg-card p-4">
+    <section className="rounded-xl border border-[#dfe3ec] bg-white p-4 shadow-sm">
       <div className="mb-4 flex items-start justify-between gap-3">
         <div>
-          <div className="text-sm font-medium">{title}</div>
-          <div className="mt-1 text-sm text-muted-foreground">{detail}</div>
+          <div className="text-sm font-bold text-[#111827]">{title}</div>
+          <div className="mt-1 text-sm text-[#667085]">{detail}</div>
         </div>
         {action}
       </div>
@@ -2467,115 +4049,692 @@ function SettingsSection({
   );
 }
 
+function HostListItem({
+  machine,
+  selected,
+  onSelect,
+}: {
+  machine: MachineInfo;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-xl border px-3 py-3 text-left transition-colors",
+        selected
+          ? "border-[#bdb7ff] bg-[#f6f4ff] shadow-sm"
+          : "border-transparent bg-transparent hover:border-[#dfe3ec] hover:bg-white",
+      )}
+      onClick={onSelect}
+    >
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-[#6f83f7] to-[#4e3ad5] text-white">
+        <Server size={17} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="truncate text-sm font-bold text-[#111827]">{machine.name}</span>
+          <span className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass(machine.connectionStatus))} />
+        </span>
+        <span className="mt-1 block truncate text-xs text-[#667085]">
+          {machine.providers.length} runtimes · {machine.onlineAgentCount}/{machine.agentCount} agents online
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function MemberListItem({
+  entry,
+  selected,
+  onSelect,
+}: {
+  entry: AgentMemberEntry;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const actor = entry.agent.spec.actor;
+
+  return (
+    <button
+      type="button"
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors",
+        selected
+          ? "border-[#bdb7ff] bg-[#f6f4ff] shadow-sm"
+          : "border-transparent bg-transparent hover:border-[#dfe3ec] hover:bg-white",
+      )}
+      onClick={onSelect}
+    >
+      <ActorAvatar actor={actor} fallback={actor.id} small />
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="truncate text-sm font-bold text-[#111827]">
+            {agentDisplayName(entry.agent)}
+          </span>
+          <span className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass(entry.agent.status))} />
+        </span>
+        <span className="mt-0.5 block truncate text-xs text-[#667085]">
+          {entry.machine.name}
+        </span>
+      </span>
+    </button>
+  );
+}
+
 function MachineCard({
   machine,
   busy,
+  agentForm,
+  setAgentForm,
+  onAddAgent,
   onRemove,
   onOpenLocalPath,
   onRemoveAgent,
 }: {
   machine: MachineInfo;
   busy: string | null;
+  agentForm: AgentFormState;
+  setAgentForm: (form: AgentFormState) => void;
+  onAddAgent: () => void;
   onRemove: (machineId: string) => void;
   onOpenLocalPath: (path: string) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
+  const selectedProvider = resolveAgentProvider(agentForm, machine);
+  const modelChoices = selectedProvider?.modelChoices ?? [];
+  const canCreateAgent = machineCanCreateAgent(machine);
+  const agentReady = Boolean(
+    canCreateAgent && selectedProvider && agentForm.name.trim(),
+  );
+  const createStatusText = !canCreateAgent
+    ? "This host is read-only for the current account."
+    : !selectedProvider
+      ? "No runtime detected for this host."
+      : `${selectedProvider.name} on ${machine.name}`;
+  const [agentComposerOpen, setAgentComposerOpen] = useState(false);
+
+  useEffect(() => {
+    setAgentComposerOpen(false);
+  }, [machine.id]);
+
+  function updateAgentForm(patch: Partial<AgentFormState>) {
+    setAgentForm({
+      ...agentForm,
+      machineId: machine.id,
+      providerId: selectedProvider?.id ?? agentForm.providerId,
+      ...patch,
+    });
+  }
+
   return (
-    <div className="rounded-md border border-border p-3">
-      <div className="flex flex-wrap items-start gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-md bg-secondary">
-          <HardDrive size={17} />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium">{machine.name}</span>
-            <Badge variant={machine.connectionStatus === "online" ? "success" : "outline"}>
-              {machine.connectionStatus}
-            </Badge>
-            <Badge variant="secondary">{machine.setupStatus}</Badge>
-            {machine.readOnly && <Badge variant="warning">read only</Badge>}
+    <div className="min-h-full bg-white">
+      <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <div className="flex flex-wrap items-start justify-between gap-6">
+          <div className="flex min-w-0 items-start gap-4">
+            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#6f83f7] to-[#4e3ad5] text-white shadow-sm">
+              <HardDrive size={25} />
+            </div>
+            <div className="min-w-0">
+              <h2 className="truncate text-xl font-bold text-[#111827]">
+                {machine.name}
+              </h2>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+                <span
+                  className={cn(
+                    "h-2 w-2 rounded-full",
+                    statusDotClass(machine.connectionStatus),
+                  )}
+                />
+                <span>{capitalize(machine.connectionStatus)}</span>
+                <span className="text-[#a0a6b3]">/</span>
+                <span className="font-mono text-xs">{machine.id}</span>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="secondary">{machine.setupStatus}</Badge>
+                <Badge variant="outline">{machine.kind}</Badge>
+                {machine.readOnly && <Badge variant="warning">read only</Badge>}
+              </div>
+            </div>
           </div>
-          <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
-            {machine.id}
+
+          <div className="flex flex-wrap items-start gap-6">
+            <HostMetric label="Runtimes" value={machine.providers.length} />
+            <HostMetric label="Agents" value={machine.agentCount} />
+            <HostMetric label="Online" value={machine.onlineAgentCount} />
+            {machine.canOpenLocalPath && (
+              <Button
+                variant="outline"
+                size="sm"
+                title="Open data root"
+                onClick={() => onOpenLocalPath(machine.dataRoot)}
+                className="rounded-lg border-[#dfe3ec] bg-white"
+              >
+                <HardDrive size={15} />
+                Open Data
+              </Button>
+            )}
           </div>
         </div>
-        <div className="flex gap-1">
-          {machine.canOpenLocalPath && (
-            <Button
-              variant="ghost"
-              size="icon"
-              title="Open data root"
-              onClick={() => onOpenLocalPath(machine.dataRoot)}
-            >
-              <HardDrive size={15} />
-            </Button>
+      </section>
+
+      <HostDetailSection title="Name">
+        <div className="text-sm font-semibold text-[#111827]">{machine.name}</div>
+      </HostDetailSection>
+
+      <HostDetailSection title="Info">
+        <div className="divide-y divide-[#edf0f5]">
+          <HostInfoRow label="Source">
+            {machine.source || "Not set"}
+          </HostInfoRow>
+          <HostInfoRow label="Data Root" mono>
+            {machine.dataRoot || "Not set"}
+          </HostInfoRow>
+          <HostInfoRow label="Config Dir" mono>
+            {machine.configDir || "Not set"}
+          </HostInfoRow>
+          <HostInfoRow label="Connection Actor" mono>
+            {machine.connectionActorId || "Not set"}
+          </HostInfoRow>
+          <HostInfoRow label="Serve Command" mono>
+            {machine.serveCommand || "Not set"}
+          </HostInfoRow>
+          <HostInfoRow label="Detected Runtimes">
+            <div className="flex flex-wrap gap-2">
+              {machine.providers.length === 0 ? (
+                <Badge variant="warning">no runtimes detected</Badge>
+              ) : (
+                machine.providers.map((provider) => (
+                  <ProviderBadge key={provider.id} provider={provider} />
+                ))
+              )}
+            </div>
+          </HostInfoRow>
+          <HostInfoRow label="Inventory">
+            Revision {machine.inventoryRevision}
+            {machine.inventoryObservedAt
+              ? ` · observed ${formatTime(machine.inventoryObservedAt)}`
+              : ""}
+          </HostInfoRow>
+        </div>
+      </HostDetailSection>
+
+      <HostDetailSection
+        title="Agents on this Host"
+        count={machine.agents.length}
+        action={
+          <Button
+            onClick={() => setAgentComposerOpen((open) => !open)}
+            disabled={!agentComposerOpen && !canCreateAgent}
+            className="rounded-lg"
+          >
+            {agentComposerOpen ? <X size={15} /> : <Plus size={15} />}
+            {agentComposerOpen ? "Close" : "Create Agent"}
+          </Button>
+        }
+      >
+        <div className="space-y-2">
+          {machine.agents.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+              No agents on this host.
+            </div>
+          ) : (
+            machine.agents.map((agent) => (
+              <HostAgentRow
+                key={agent.spec.actor.id}
+                agent={agent}
+                machine={machine}
+                busy={busy}
+                onRemoveAgent={onRemoveAgent}
+              />
+            ))
           )}
-          {!machine.readOnly && (
+        </div>
+
+        {agentComposerOpen && (
+          <form
+            className="mt-5 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] p-4 shadow-sm"
+            onSubmit={(event) => {
+              event.preventDefault();
+              onAddAgent();
+            }}
+          >
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]">
+                <Bot size={14} />
+                New Agent
+              </div>
+              <Badge variant={canCreateAgent ? "outline" : "warning"}>
+                {canCreateAgent ? "available" : "read only"}
+              </Badge>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <select
+                value={selectedProvider?.id ?? ""}
+                onChange={(event) => {
+                  const provider = machine.providers.find(
+                    (item) => item.id === event.target.value,
+                  );
+                  setAgentForm({
+                    ...agentForm,
+                    machineId: machine.id,
+                    providerId: event.target.value,
+                    model: provider?.defaultModel ?? "",
+                  });
+                }}
+                className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+                disabled={machine.providers.length === 0 || !canCreateAgent}
+              >
+                {machine.providers.length === 0 ? (
+                  <option value="">No runtimes</option>
+                ) : (
+                  machine.providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))
+                )}
+              </select>
+              <Input
+                value={agentForm.name}
+                onChange={(event) => updateAgentForm({ name: event.target.value })}
+                placeholder="Agent name"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canCreateAgent}
+              />
+              <Input
+                value={agentForm.actorId}
+                onChange={(event) => updateAgentForm({ actorId: event.target.value })}
+                placeholder="Actor id (optional)"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canCreateAgent}
+              />
+              {modelChoices.length > 0 ? (
+                <select
+                  value={agentForm.model || selectedProvider?.defaultModel || ""}
+                  onChange={(event) => updateAgentForm({ model: event.target.value })}
+                  className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+                  disabled={!canCreateAgent}
+                >
+                  {modelChoices.map((choice) => (
+                    <option key={choice.id} value={choice.id}>
+                      {choice.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <Input
+                  value={agentForm.model}
+                  onChange={(event) => updateAgentForm({ model: event.target.value })}
+                  placeholder="Model"
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                  disabled={!canCreateAgent}
+                />
+              )}
+              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+                <input
+                  type="checkbox"
+                  checked={agentForm.autostart}
+                  onChange={(event) =>
+                    updateAgentForm({ autostart: event.target.checked })
+                  }
+                  disabled={!canCreateAgent}
+                />
+                Autostart
+              </label>
+              <Textarea
+                value={agentForm.description}
+                onChange={(event) => updateAgentForm({ description: event.target.value })}
+                placeholder="Agent instructions"
+                className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2 xl:col-span-4"
+                disabled={!canCreateAgent}
+              />
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="text-xs font-medium text-[#667085]">
+                {createStatusText}
+              </div>
+              <Button
+                type="submit"
+                disabled={busy === "agent:create" || !agentReady}
+                className="rounded-lg"
+              >
+                {busy === "agent:create" ? (
+                  <Loader2 className="animate-spin" size={15} />
+                ) : (
+                  <Plus size={15} />
+                )}
+                Create Agent
+              </Button>
+            </div>
+          </form>
+        )}
+      </HostDetailSection>
+
+      <HostDetailSection title="Actions">
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-bold text-[#111827]">Delete Host</div>
+            <div className="mt-1 text-sm text-[#667085]">
+              Permanently remove this host after its agents are deleted.
+            </div>
+          </div>
+          {!machine.readOnly ? (
             <Button
-              variant="ghost"
-              size="icon"
-              title="Remove daemon"
+              variant="destructive"
+              size="sm"
+              title="Remove host"
               onClick={() => onRemove(machine.id)}
               disabled={busy === `machine:remove:${machine.id}`}
+              className="rounded-lg"
             >
               <Trash2 size={15} />
+              Delete Host
             </Button>
+          ) : (
+            <Badge variant="warning">read only</Badge>
           )}
         </div>
-      </div>
-      <div className="mt-3 grid gap-3 md:grid-cols-2">
-        <InfoBlock label="Data" value={machine.dataRoot} />
-        <InfoBlock label="Command" value={machine.serveCommand} />
-      </div>
-      <div className="mt-3 flex flex-wrap gap-2">
-        {machine.providers.length === 0 ? (
-          <Badge variant="warning">no CLI providers</Badge>
-        ) : (
-          machine.providers.map((provider) => (
-            <ProviderBadge key={provider.id} provider={provider} />
-          ))
-        )}
-      </div>
-      <div className="mt-3 space-y-2">
-        {machine.agents.length === 0 ? (
-          <MutedLine>No agents on this daemon.</MutedLine>
-        ) : (
-          machine.agents.map((agent) => {
-            const actor = agent.spec.actor;
-            return (
-              <div
-                key={actor.id}
-                className="flex items-center gap-3 rounded-md border border-border px-3 py-2"
-              >
-                <ActorAvatar actor={actor} fallback={actor.id} small />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">
-                    {actor.displayName || actor.id}
-                  </div>
-                  <div className="truncate font-mono text-xs text-muted-foreground">
-                    {actor.id}
-                  </div>
-                </div>
+      </HostDetailSection>
+    </div>
+  );
+}
+
+function AgentMemberDetail({
+  entry,
+  busy,
+  onUpdateAgent,
+  onRemoveAgent,
+}: {
+  entry: AgentMemberEntry;
+  busy: string | null;
+  onUpdateAgent: (patch: AgentUpdatePatch) => void;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+}) {
+  const { machine, agent } = entry;
+  const actor = agent.spec.actor;
+  const [draft, setDraft] = useState<AgentSettingsDraft>(() =>
+    agentSettingsDraft(machine, agent),
+  );
+  const selectedProvider = providerForAgent(machine, agent, draft.providerId);
+  const modelChoices =
+    selectedProvider?.modelChoices.length
+      ? selectedProvider.modelChoices
+      : agent.spec.models?.choices ?? [];
+  const saving = busy === `agent:update:${actor.id}`;
+  const removing = busy === `agent:remove:${actor.id}`;
+  const canEdit = !machine.readOnly;
+
+  useEffect(() => {
+    setDraft(agentSettingsDraft(machine, agent));
+  }, [machine.id, agent]);
+
+  function updateDraft(patch: Partial<AgentSettingsDraft>) {
+    setDraft((current) => ({ ...current, ...patch }));
+  }
+
+  function saveAgent() {
+    onUpdateAgent({
+      machineId: machine.id,
+      actorId: actor.id,
+      displayName: draft.displayName,
+      description: draft.description,
+      providerId: draft.providerId || undefined,
+      model: draft.model,
+      reasoningEffort: draft.reasoningEffort,
+      autostart: draft.autostart,
+      avatarUrl: draft.avatarUrl,
+    });
+  }
+
+  return (
+    <div className="min-h-full bg-white">
+      <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <div className="flex flex-wrap items-start justify-between gap-6">
+          <div className="flex min-w-0 items-start gap-4">
+            <img
+              alt=""
+              src={draft.avatarUrl || actorAvatarUrl(actor, actor.id)}
+              className={cn(
+                "h-16 w-16 shrink-0 rounded-xl border border-white object-cover shadow-sm",
+                avatarSurfaceClass,
+              )}
+            />
+            <div className="min-w-0">
+              <h2 className="truncate text-xl font-bold text-[#111827]">
+                {draft.displayName || agentDisplayName(agent)}
+              </h2>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+                <span className={cn("h-2 w-2 rounded-full", statusDotClass(agent.status))} />
+                <span>{capitalize(agent.status)}</span>
+                <span className="text-[#a0a6b3]">/</span>
+                <span className="font-mono text-xs">{actor.id}</span>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
                 <Badge variant={agent.status === "online" ? "success" : "outline"}>
                   {agent.status}
                 </Badge>
-                {!machine.readOnly && (
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title="Remove agent"
-                    onClick={() => onRemoveAgent(machine.id, actor.id)}
-                    disabled={busy === `agent:remove:${actor.id}`}
-                  >
-                    <Trash2 size={15} />
-                  </Button>
-                )}
+                <Badge variant="secondary">{machine.name}</Badge>
+                {machine.readOnly && <Badge variant="warning">read only</Badge>}
               </div>
-            );
-          })
-        )}
-      </div>
+            </div>
+          </div>
+          <Button
+            onClick={saveAgent}
+            disabled={!canEdit || saving || !draft.displayName.trim()}
+            className="rounded-lg"
+          >
+            {saving ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}
+            Save Changes
+          </Button>
+        </div>
+      </section>
+
+      <HostDetailSection title="Profile">
+        <div className="grid gap-5 xl:grid-cols-[minmax(260px,0.42fr)_minmax(0,1fr)]">
+          <div className="min-w-0">
+            <div className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+              Avatar Library
+            </div>
+            <div className="grid max-h-64 grid-cols-[repeat(auto-fill,minmax(38px,1fr))] gap-2 overflow-y-auto rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3 soft-scrollbar">
+              {avatarLibraryUrls.map((url) => (
+                <button
+                  key={url}
+                  type="button"
+                  title={url.split("/").pop() ?? "Avatar"}
+                  disabled={!canEdit}
+                  className={cn(
+                    "flex aspect-square items-center justify-center rounded-lg border p-1 transition-colors",
+                    avatarSurfaceClass,
+                    draft.avatarUrl === url
+                      ? "border-[#8f82ff] ring-2 ring-[#e4e0ff]"
+                      : "border-[#edf0f5] hover:border-[#c8c1ff]",
+                  )}
+                  onClick={() => updateDraft({ avatarUrl: url })}
+                >
+                  <img alt="" src={url} className="h-full w-full rounded-md object-cover" />
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid content-start gap-3 md:grid-cols-2">
+            <Input
+              value={draft.displayName}
+              onChange={(event) => updateDraft({ displayName: event.target.value })}
+              placeholder="Display name"
+              className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+              disabled={!canEdit}
+            />
+            <Input
+              value={actor.id}
+              readOnly
+              className="h-10 rounded-lg border-[#dfe3ec] bg-[#fbfbfd] font-mono text-xs shadow-none"
+            />
+            <Textarea
+              value={draft.description}
+              onChange={(event) => updateDraft({ description: event.target.value })}
+              placeholder="Agent instructions"
+              className="min-h-32 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
+              disabled={!canEdit}
+            />
+          </div>
+        </div>
+      </HostDetailSection>
+
+      <HostDetailSection title="Runtime Configuration">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <select
+            value={selectedProvider?.id ?? draft.providerId}
+            onChange={(event) => {
+              const provider = machine.providers.find(
+                (item) => item.id === event.target.value,
+              );
+              updateDraft({
+                providerId: event.target.value,
+                model: provider?.defaultModel ?? draft.model,
+              });
+            }}
+            className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+            disabled={!canEdit || machine.providers.length === 0}
+          >
+            {machine.providers.length === 0 ? (
+              <option value="">No runtimes</option>
+            ) : (
+              machine.providers.map((provider) => (
+                <option key={provider.id} value={provider.id}>
+                  {provider.name}
+                </option>
+              ))
+            )}
+          </select>
+          {modelChoices.length > 0 ? (
+            <select
+              value={draft.model}
+              onChange={(event) => updateDraft({ model: event.target.value })}
+              className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+              disabled={!canEdit}
+            >
+              {modelChoices.map((choice) => (
+                <option key={choice.id} value={choice.id}>
+                  {choice.label || choice.id}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <Input
+              value={draft.model}
+              onChange={(event) => updateDraft({ model: event.target.value })}
+              placeholder="Model"
+              className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+              disabled={!canEdit}
+            />
+          )}
+          <select
+            value={draft.reasoningEffort}
+            onChange={(event) => updateDraft({ reasoningEffort: event.target.value })}
+            className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+            disabled={!canEdit}
+          >
+            {reasoningEffortChoices.map((choice) => (
+              <option key={choice || "default"} value={choice}>
+                {choice ? capitalize(choice) : "Default reasoning"}
+              </option>
+            ))}
+          </select>
+          <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+            <input
+              type="checkbox"
+              checked={draft.autostart}
+              onChange={(event) => updateDraft({ autostart: event.target.checked })}
+              disabled={!canEdit}
+            />
+            Autostart
+          </label>
+        </div>
+      </HostDetailSection>
+
+      <HostDetailSection title="Info">
+        <div className="divide-y divide-[#edf0f5]">
+          <HostInfoRow label="Host">{machine.name}</HostInfoRow>
+          <HostInfoRow label="Actor ID" mono>{actor.id}</HostInfoRow>
+          <HostInfoRow label="Profile Path" mono>{agent.profilePath || "Not set"}</HostInfoRow>
+          <HostInfoRow label="Identity Path" mono>{agent.identityPath || "Not set"}</HostInfoRow>
+          <HostInfoRow label="Soul Path" mono>{agent.soulPath || "Not set"}</HostInfoRow>
+        </div>
+      </HostDetailSection>
+
+      <HostDetailSection title="Actions">
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-bold text-[#111827]">Remove Agent</div>
+            <div className="mt-1 text-sm text-[#667085]">
+              Remove this member from {machine.name}.
+            </div>
+          </div>
+          {!machine.readOnly ? (
+            <Button
+              variant="destructive"
+              size="sm"
+              title="Remove agent"
+              onClick={() => onRemoveAgent(machine.id, actor.id)}
+              disabled={removing}
+              className="rounded-lg"
+            >
+              {removing ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
+              Remove Agent
+            </Button>
+          ) : (
+            <Badge variant="warning">read only</Badge>
+          )}
+        </div>
+      </HostDetailSection>
     </div>
+  );
+}
+
+function HostMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="min-w-20 border-l border-[#dfe3ec] pl-4">
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+        {label}
+      </div>
+      <div className="mt-1 text-xl font-bold text-[#111827]">{value}</div>
+    </div>
+  );
+}
+
+function HostDetailSection({
+  title,
+  count,
+  action,
+  children,
+}: {
+  title: string;
+  count?: number;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="border-b border-[#dfe3ec] px-6 py-5 lg:px-8">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+            {title}
+          </div>
+          {typeof count === "number" && (
+            <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
+              {count}
+            </span>
+          )}
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -2588,13 +4747,79 @@ function ProviderBadge({ provider }: { provider: MachineAgentProviderInfo }) {
   );
 }
 
-function InfoBlock({ label, value }: { label: string; value: string }) {
+function HostInfoRow({
+  label,
+  children,
+  mono,
+}: {
+  label: string;
+  children: ReactNode;
+  mono?: boolean;
+}) {
   return (
-    <div className="min-w-0 rounded-md border border-border bg-background p-2">
-      <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">
+    <div className="grid gap-2 py-3 first:pt-0 last:pb-0 sm:grid-cols-[160px_minmax(0,1fr)]">
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
         {label}
       </div>
-      <div className="break-all font-mono text-xs text-muted-foreground">{value}</div>
+      <div
+        className={cn(
+          "min-w-0 text-sm text-[#303849]",
+          mono && "break-all font-mono text-xs text-[#485063]",
+        )}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function HostAgentRow({
+  agent,
+  machine,
+  busy,
+  onRemoveAgent,
+}: {
+  agent: MachineInfo["agents"][number];
+  machine: MachineInfo;
+  busy: string | null;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+}) {
+  const actor = agent.spec.actor;
+
+  return (
+    <div className="grid min-h-[62px] grid-cols-[minmax(0,1fr)_auto] items-center gap-4 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-4 py-3">
+      <div className="flex min-w-0 items-center gap-3">
+        <ActorAvatar actor={actor} fallback={actor.id} small />
+        <div className="min-w-0">
+          <div className="truncate text-sm font-bold text-[#111827]">
+            {actor.displayName || actor.id}
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-[#667085]">
+            <span className="font-mono">
+              {agentModelValue(agent) || shortActorAlias(actor.id)}
+            </span>
+            <span className="text-[#a0a6b3]">/</span>
+            <span>{agent.spec.autostart ? "autostart" : "manual"}</span>
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <Badge variant={agent.status === "online" ? "success" : "outline"}>
+          {agent.status}
+        </Badge>
+        {!machine.readOnly && (
+          <Button
+            variant="ghost"
+            size="icon"
+            title="Remove agent"
+            onClick={() => onRemoveAgent(machine.id, actor.id)}
+            disabled={busy === `agent:remove:${actor.id}`}
+            className="rounded-lg"
+          >
+            <Trash2 size={15} />
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -2604,6 +4829,7 @@ function ChannelPanel({
   memberCandidates,
   channel,
   channelTasks,
+  channelThreads,
   thread,
   busy,
   onInviteMember,
@@ -2614,13 +4840,55 @@ function ChannelPanel({
   memberCandidates: Actor[];
   channel: Channel | null;
   channelTasks: Task[];
+  channelThreads: Thread[];
   thread: Thread | null;
   busy: string | null;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
   onUpdateTopic: (channelId: string, topic: string) => void;
 }) {
-  const [selectedMemberId, setSelectedMemberId] = useState("");
+  void thread;
+  return (
+    <ChannelDetailPanel
+      actors={actors}
+      memberCandidates={memberCandidates}
+      channel={channel}
+      channelTasks={channelTasks}
+      channelThreads={channelThreads}
+      busy={busy}
+      className="hidden min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-[#fbfbfd] xl:flex"
+      onInviteMember={onInviteMember}
+      onRemoveMember={onRemoveMember}
+      onUpdateTopic={onUpdateTopic}
+    />
+  );
+}
+
+function ChannelDetailPanel({
+  actors,
+  memberCandidates,
+  channel,
+  channelTasks,
+  channelThreads,
+  busy,
+  className,
+  onInviteMember,
+  onRemoveMember,
+  onUpdateTopic,
+}: {
+  actors: Record<string, Actor>;
+  memberCandidates: Actor[];
+  channel: Channel | null;
+  channelTasks: Task[];
+  channelThreads: Thread[];
+  busy: string | null;
+  className?: string;
+  onInviteMember: (channelId: string, actorId: string) => void;
+  onRemoveMember: (channelId: string, actorId: string) => void;
+  onUpdateTopic: (channelId: string, topic: string) => void;
+}) {
+  const [memberQuery, setMemberQuery] = useState("");
+  const [tab, setTab] = useState<DetailTab>("details");
   const [topicDraft, setTopicDraft] = useState("");
   const members = channel
     ? channel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId))
@@ -2628,136 +4896,254 @@ function ChannelPanel({
   const availableMembers = channel
     ? memberCandidates.filter((actor) => canAddChannelMember(channel, actor))
     : [];
-  useEffect(() => {
-    if (
-      !selectedMemberId ||
-      !availableMembers.some((actor) => actor.id === selectedMemberId)
-    ) {
-      setSelectedMemberId(availableMembers[0]?.id ?? "");
-    }
-  }, [availableMembers, selectedMemberId]);
+  const filteredAvailableMembers = availableMembers.filter((actor) => {
+    const query = memberQuery.trim().toLowerCase();
+    if (!query) return true;
+    return `${displayName(actor)} ${actor.id} ${actor.kind}`.toLowerCase().includes(query);
+  });
   useEffect(() => {
     setTopicDraft(channelTopic(channel));
   }, [channel?.id, channel?.topic]);
   const topicChanged = Boolean(channel && topicDraft.trim() !== channelTopic(channel));
   return (
-    <aside className="hidden min-h-0 min-w-0 flex-col bg-card xl:flex">
-      <div className="border-b border-border p-4">
-        <div className="text-sm font-medium">{channel?.title ?? "Channel"}</div>
-        <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
-          {thread ? `Thread: ${thread.title}` : channel ? channel.visibility : "Not connected"}
-        </div>
-        {channel && !thread && (
-          <div className="mt-4 space-y-2">
-            <label className="text-[11px] font-medium uppercase text-muted-foreground">
-              Topic
-            </label>
-            <Textarea
-              value={topicDraft}
-              onChange={(event) => setTopicDraft(event.target.value)}
-              placeholder="Set a channel topic"
-              className="min-h-16 resize-none text-sm"
-            />
-            <div className="flex justify-end">
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={!topicChanged || busy === `channel:topic:${channel.id}`}
-                onClick={() => onUpdateTopic(channel.id, topicDraft.trim())}
-              >
-                Save
-              </Button>
+    <aside className={cn("min-h-0 min-w-0 flex-col bg-[#fbfbfd]", className ?? "flex")}>
+      <div className="border-b border-[#edf0f5] bg-white p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#6784f4] to-[#4d3ed7] text-white shadow-sm">
+              <Hash size={24} />
             </div>
+            <div className="min-w-0">
+              <div className="truncate text-lg font-bold text-[#111827]">
+                {channel?.title ?? "Channel"}
+              </div>
+              <div className="mt-1 truncate text-sm text-[#485063]">
+                {channel
+                  ? `${capitalize(channel.visibility)} · ${members.length} members`
+                  : "Not connected"}
+              </div>
+            </div>
+          </div>
+        </div>
+        {channel && (
+          <div className="mt-5 flex gap-2">
+            <Button
+              className="h-9 flex-1 rounded-lg bg-[#503ed4] text-white shadow-sm hover:bg-[#4635c5]"
+              disabled={availableMembers.length === 0}
+              onClick={() => setTab("members")}
+            >
+              <UserPlus size={15} />
+              Add Member
+            </Button>
           </div>
         )}
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 scrollbar-thin">
-        <PanelBlock title="Members" count={members.length}>
-          <div className="space-y-2">
+
+      <div className="grid h-12 shrink-0 grid-cols-3 border-b border-[#edf0f5] bg-white px-5">
+        {(["details", "members", "threads"] as DetailTab[]).map((item) => (
+          <button
+            key={item}
+            type="button"
+            className={cn(
+              "relative text-sm font-semibold capitalize text-[#667085]",
+              tab === item && "text-[#503ed4]",
+            )}
+            onClick={() => setTab(item)}
+          >
+            {item}
+            {item === "members" && members.length > 0 ? (
+              <span className="ml-1 rounded-full bg-[#f1efff] px-1.5 py-0.5 text-[10px] text-[#5843d7]">
+                {members.length}
+              </span>
+            ) : null}
+            {tab === item && (
+              <span className="absolute inset-x-1 bottom-0 h-0.5 rounded-full bg-[#503ed4]" />
+            )}
+          </button>
+        ))}
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
+        {!channel ? (
+          <EmptyState icon={Hash} text="Select a channel." />
+        ) : tab === "details" ? (
+          <div className="space-y-6">
+            <section>
+              <h3 className="mb-2 text-sm font-bold text-[#111827]">About this channel</h3>
+              <p className="text-sm leading-5 text-[#303849]">
+                {channelTopic(channel) ||
+                  "Use this channel to coordinate work, share updates, and keep threaded discussions organized."}
+              </p>
+            </section>
+            <section className="space-y-3">
+              <DetailRow
+                icon={Shield}
+                title="Posting permissions"
+                text={
+                  channel.visibility === "public"
+                    ? "All members can view. Explicit members can be managed here."
+                    : "Private channel. Only invited members can view and post."
+                }
+              />
+              <DetailRow
+                icon={MessageSquare}
+                title="Thread behavior"
+                text="Use threads to keep focused discussions attached to the message that started them."
+              />
+            </section>
+            <section className="space-y-2">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-[#111827]">Members ({members.length})</h3>
+                <button
+                  className="text-xs font-semibold text-[#503ed4]"
+                  type="button"
+                  onClick={() => setTab("members")}
+                >
+                  View all
+                </button>
+              </div>
+              <AvatarStack actors={members} max={7} />
+            </section>
+            <section className="space-y-2">
+              <label className="text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+                Topic
+              </label>
+              <Textarea
+                value={topicDraft}
+                onChange={(event) => setTopicDraft(event.target.value)}
+                placeholder="Set a channel topic"
+                className="min-h-16 resize-none rounded-xl border-[#dfe3ec] bg-white text-sm shadow-none"
+              />
+              <div className="flex justify-end">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!topicChanged || busy === `channel:topic:${channel.id}`}
+                  onClick={() => onUpdateTopic(channel.id, topicDraft.trim())}
+                >
+                  Save
+                </Button>
+              </div>
+            </section>
+          </div>
+        ) : tab === "members" ? (
+          <div className="space-y-3">
+            <div className="member-picker-card">
+              <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
+                <UserPlus size={13} />
+                Add member
+              </div>
+              <label className="mb-3 flex h-9 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-[#667085]">
+                <Search size={14} />
+                <input
+                  value={memberQuery}
+                  onChange={(event) => setMemberQuery(event.target.value)}
+                  placeholder="Search people and agents"
+                  className="min-w-0 flex-1 bg-transparent text-sm text-[#303849] outline-none placeholder:text-[#98a2b3]"
+                />
+              </label>
+              <div className="space-y-2">
+                {filteredAvailableMembers.length === 0 ? (
+                  <MutedLine>
+                    {availableMembers.length === 0
+                      ? "No candidates available."
+                      : "No matching candidates."}
+                  </MutedLine>
+                ) : (
+                  filteredAvailableMembers.slice(0, 8).map((actor) => {
+                    const inviteBusy = busy === `channel:invite:${channel.id}:${actor.id}`;
+                    return (
+                      <div key={actor.id} className="member-candidate-row">
+                        <ActorAvatar actor={actor} fallback={actor.id} small />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-semibold text-[#303849]">
+                            {displayName(actor)}
+                          </div>
+                          <div className="truncate text-xs text-[#667085]">
+                            {actor.kind} · {shortActorAlias(actor.id)}
+                          </div>
+                        </div>
+                        <Button
+                          size="sm"
+                          className="h-8 rounded-lg bg-[#503ed4] px-3 text-white hover:bg-[#4635c5]"
+                          disabled={inviteBusy}
+                          onClick={() => onInviteMember(channel.id, actor.id)}
+                        >
+                          {inviteBusy ? (
+                            <Loader2 className="animate-spin" size={13} />
+                          ) : (
+                            <Plus size={13} />
+                          )}
+                          Add
+                        </Button>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
             {members.map((actor) => (
-              <div key={actor.id} className="flex items-center gap-2">
+              <div
+                key={actor.id}
+                className="flex items-center gap-3 rounded-xl border border-[#edf0f5] bg-white px-3 py-2"
+              >
                 <ActorAvatar actor={actor} fallback={actor.id} small />
-                <div className="min-w-0 flex-1 truncate text-sm">{displayName(actor)}</div>
-                <Badge variant="outline">{actor.kind}</Badge>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-semibold text-[#303849]">
+                    {displayName(actor)}
+                  </div>
+                  <div className="truncate text-xs text-[#667085]">{actor.kind}</div>
+                </div>
                 {channel && canRemoveChannelMember(channel, actor.id) && (
-                  <Button
-                    size="icon"
-                    variant="ghost"
+                  <button
+                    type="button"
                     title={`Remove ${displayName(actor)}`}
                     disabled={busy === `channel:revoke:${channel.id}:${actor.id}`}
                     onClick={() => onRemoveMember(channel.id, actor.id)}
-                    className="h-7 w-7"
+                    className="composer-icon h-7 min-w-7 text-[#667085]"
                   >
                     {busy === `channel:revoke:${channel.id}:${actor.id}` ? (
                       <Loader2 className="animate-spin" size={13} />
                     ) : (
                       <X size={13} />
                     )}
-                  </Button>
+                  </button>
                 )}
               </div>
             ))}
-            {channel && members.length === 0 && (
-              <MutedLine>No explicit members.</MutedLine>
-            )}
-            {channel?.visibility === "public" && (
-              <MutedLine>Public channel; explicit members are managed here.</MutedLine>
-            )}
-            {channel && (
-              <div className="rounded-md border border-border p-2">
-                <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
-                  <Users size={13} />
-                  Add member
-                </div>
-                <div className="flex gap-2">
-                  <select
-                    value={selectedMemberId}
-                    onChange={(event) => setSelectedMemberId(event.target.value)}
-                    disabled={availableMembers.length === 0}
-                    className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground disabled:opacity-60"
-                  >
-                    {availableMembers.length === 0 ? (
-                      <option value="">No candidates</option>
-                    ) : (
-                      availableMembers.map((actor) => (
-                        <option key={actor.id} value={actor.id}>
-                          {displayName(actor)} - {actor.kind}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={
-                      !selectedMemberId ||
-                      busy === `channel:invite:${channel.id}:${selectedMemberId}`
-                    }
-                    onClick={() => onInviteMember(channel.id, selectedMemberId)}
-                  >
-                    {busy === `channel:invite:${channel.id}:${selectedMemberId}` ? (
-                      <Loader2 className="animate-spin" size={14} />
-                    ) : (
-                      <Plus size={14} />
-                    )}
-                    Add
-                  </Button>
-                </div>
-              </div>
-            )}
+            {members.length === 0 && <MutedLine>No explicit members.</MutedLine>}
           </div>
-        </PanelBlock>
-        <PanelBlock title="Tasks" count={channelTasks.length}>
+        ) : (
           <div className="space-y-2">
-            {channelTasks.slice(0, 8).map((task) => (
-              <div key={task.id} className="rounded-md border border-border p-2">
-                <div className="truncate text-sm font-medium">{task.title}</div>
-                <div className="mt-1 text-xs text-muted-foreground">{task.status}</div>
+            {channelThreads.map((item) => (
+              <div key={item.id} className="rounded-xl border border-[#edf0f5] bg-white p-3">
+                <div className="truncate text-sm font-semibold text-[#303849]">
+                  {item.title}
+                </div>
+                <div className="mt-1 text-xs text-[#667085]">
+                  Started from {shortId(item.rootMessageId)}
+                </div>
               </div>
             ))}
-            {channelTasks.length === 0 && <MutedLine>No tasks in this channel.</MutedLine>}
+            {channelThreads.length === 0 && <MutedLine>No threads in this channel.</MutedLine>}
+            {channelTasks.length > 0 && (
+              <div className="pt-3">
+                <PanelBlock title="Tasks" count={channelTasks.length}>
+                  <div className="space-y-2">
+                    {channelTasks.slice(0, 5).map((task) => (
+                      <div key={task.id} className="rounded-xl border border-[#dfe3ec] bg-white p-3">
+                        <div className="truncate text-sm font-semibold text-[#303849]">
+                          {task.title}
+                        </div>
+                        <div className="mt-1 text-xs text-[#667085]">{task.status}</div>
+                      </div>
+                    ))}
+                  </div>
+                </PanelBlock>
+              </div>
+            )}
           </div>
-        </PanelBlock>
+        )}
       </div>
     </aside>
   );
@@ -2765,9 +5151,9 @@ function ChannelPanel({
 
 function PageHeader({ title, detail }: { title: string; detail: string }) {
   return (
-    <header className="flex h-16 shrink-0 items-center justify-between border-b border-border px-5">
-      <h1 className="text-base font-semibold">{title}</h1>
-      <span className="text-sm text-muted-foreground">{detail}</span>
+    <header className="flex h-[86px] shrink-0 items-center justify-between border-b border-[#e2e6ef] bg-white px-6">
+      <h1 className="text-[22px] font-bold text-[#111827]">{title}</h1>
+      <span className="text-sm font-medium text-[#667085]">{detail}</span>
     </header>
   );
 }
@@ -2775,7 +5161,7 @@ function PageHeader({ title, detail }: { title: string; detail: string }) {
 function ErrorBanner({ error }: { error: string | null }) {
   if (!error) return null;
   return (
-    <div className="border-b border-destructive/40 bg-destructive/10 px-4 py-2 text-sm text-destructive-foreground">
+    <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">
       {error}
     </div>
   );
@@ -2789,7 +5175,7 @@ function EmptyState({
   text: string;
 }) {
   return (
-    <div className="flex min-h-80 flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border text-muted-foreground">
+    <div className="flex min-h-80 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] text-[#667085]">
       <Icon size={28} />
       <div className="text-sm">{text}</div>
     </div>
@@ -2808,7 +5194,7 @@ function PanelBlock({
   return (
     <section className="mb-5">
       <div className="mb-2 flex items-center justify-between">
-        <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        <div className="text-xs font-semibold uppercase tracking-wide text-[#667085]">
           {title}
         </div>
         <Badge variant="outline">{count}</Badge>
@@ -2823,19 +5209,16 @@ function MutedLine({ children }: { children: ReactNode }) {
 }
 
 function Avatar({ account }: { account: HumanAccount }) {
-  if (account.avatarUrl) {
-    return (
-      <img
-        alt=""
-        src={account.avatarUrl}
-        className="h-10 w-10 rounded-md object-cover"
-      />
-    );
-  }
+  const src = account.avatarUrl || avatarUrlForSeed(account.actorId || accountName(account));
   return (
-    <div className="flex h-10 w-10 items-center justify-center rounded-md bg-secondary">
-      <User size={18} />
-    </div>
+    <img
+      alt=""
+      src={src}
+      className={cn(
+        "h-10 w-10 rounded-xl border border-white object-cover shadow-sm",
+        avatarSurfaceClass,
+      )}
+    />
   );
 }
 
@@ -2848,17 +5231,288 @@ function ActorAvatar({
   fallback: string;
   small?: boolean;
 }) {
+  const src = actorAvatarUrl(actor, fallback);
   return (
-    <div
+    <img
+      alt=""
+      src={src}
       className={cn(
-        "flex shrink-0 items-center justify-center rounded-md bg-secondary text-secondary-foreground",
-        small ? "h-7 w-7" : "h-9 w-9",
+        "shrink-0 rounded-xl border border-white object-cover shadow-sm",
+        avatarSurfaceClass,
+        small ? "h-7 w-7" : "h-10 w-10",
       )}
       title={actor?.id ?? fallback}
-    >
-      {actor?.kind === "agent" ? <Bot size={small ? 14 : 17} /> : <User size={small ? 14 : 17} />}
+    />
+  );
+}
+
+function AvatarStack({
+  actors,
+  max,
+  small,
+}: {
+  actors: Actor[];
+  max: number;
+  small?: boolean;
+}) {
+  const visible = actors.slice(0, max);
+  const overflow = Math.max(0, actors.length - visible.length);
+  return (
+    <div className="flex items-center">
+      {visible.map((actor, index) => (
+        <img
+          key={`${actor.id}:${index}`}
+          alt=""
+          src={actorAvatarUrl(actor, actor.id)}
+          className={cn(
+            "-ml-2 rounded-full border-2 border-white object-cover shadow-sm first:ml-0",
+            avatarSurfaceClass,
+            small ? "h-6 w-6" : "h-8 w-8",
+          )}
+          title={displayName(actor)}
+        />
+      ))}
+      {overflow > 0 && (
+        <span
+          className={cn(
+            "-ml-2 inline-flex items-center justify-center rounded-full border-2 border-white bg-[#f1efff] text-[10px] font-bold text-[#5843d7]",
+            small ? "h-6 min-w-6 px-1" : "h-8 min-w-8 px-1.5",
+          )}
+        >
+          +{overflow}
+        </span>
+      )}
     </div>
   );
+}
+
+function DetailRow({
+  icon: Icon,
+  title,
+  text,
+}: {
+  icon: ComponentType<{ size?: string | number; className?: string }>;
+  title: string;
+  text: string;
+}) {
+  return (
+    <div className="grid grid-cols-[22px_1fr] gap-3">
+      <span className="mt-0.5 flex h-6 w-6 items-center justify-center rounded-md bg-[#f1efff] text-[#503ed4]">
+        <Icon size={14} />
+      </span>
+      <div>
+        <div className="text-sm font-bold text-[#111827]">{title}</div>
+        <div className="mt-1 text-sm leading-5 text-[#596174]">{text}</div>
+      </div>
+    </div>
+  );
+}
+
+function channelGroupStorageKey(workspace: Workspace | null) {
+  return `loom:channel-groups:v1:${workspace?.id ?? "global"}`;
+}
+
+function loadChannelGroups(key: string): ChannelGroup[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? normalizeChannelGroups(JSON.parse(raw)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveChannelGroups(key: string, groups: ChannelGroup[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(groups));
+  } catch {
+    /* local-only preference; ignore quota or privacy-mode failures */
+  }
+}
+
+function normalizeChannelGroups(value: unknown): ChannelGroup[] {
+  if (!Array.isArray(value)) return [];
+  const seenGroupIds = new Set<string>();
+  return value.flatMap((item, index) => {
+    if (!item || typeof item !== "object") return [];
+    const candidate = item as Partial<ChannelGroup>;
+    const rawId =
+      typeof candidate.id === "string" && candidate.id.trim()
+        ? candidate.id.trim()
+        : `local-${index}`;
+    const id = seenGroupIds.has(rawId) ? `${rawId}-${index}` : rawId;
+    seenGroupIds.add(id);
+    const title =
+      typeof candidate.title === "string" && candidate.title.trim()
+        ? candidate.title.trim()
+        : "Untitled";
+    const channelIds = Array.isArray(candidate.channelIds)
+      ? Array.from(
+          new Set(
+            candidate.channelIds.filter(
+              (channelId): channelId is string =>
+                typeof channelId === "string" && channelId.length > 0,
+            ),
+          ),
+        )
+      : [];
+    return [
+      {
+        id,
+        title,
+        channelIds,
+        collapsed: Boolean(candidate.collapsed),
+      },
+    ];
+  });
+}
+
+function channelGroupSections(
+  groups: ChannelGroup[],
+  channels: Channel[],
+): ChannelGroupSection[] {
+  const channelsById = new Map(channels.map((channel) => [channel.id, channel]));
+  const assigned = new Set<string>();
+  const sections: ChannelGroupSection[] = groups.map((group) => {
+    const groupChannels = group.channelIds.flatMap((channelId) => {
+      const channel = channelsById.get(channelId);
+      if (!channel || assigned.has(channel.id)) return [];
+      assigned.add(channel.id);
+      return [channel];
+    });
+    return {
+      id: group.id,
+      title: group.title,
+      channels: groupChannels,
+      collapsed: group.collapsed,
+      local: true,
+    };
+  });
+  const ungroupedChannels = channels.filter((channel) => !assigned.has(channel.id));
+  if (groups.length === 0 || ungroupedChannels.length > 0) {
+    sections.push({
+      id: ungroupedChannelGroupId,
+      title: groups.length === 0 ? "Channels" : "Ungrouped",
+      channels: ungroupedChannels,
+      collapsed: false,
+      local: false,
+    });
+  }
+  return sections;
+}
+
+function flattenThreads(
+  threadsByChannel: Record<string, Thread[]>,
+  channels: Channel[],
+): ThreadWithChannel[] {
+  const channelsById = new Map(channels.map((channel) => [channel.id, channel]));
+  return Object.values(threadsByChannel)
+    .flatMap((threads) =>
+      threads.flatMap((thread) => {
+        const channel = channelsById.get(thread.channelId);
+        return channel ? [{ ...thread, channel }] : [];
+      }),
+    )
+    .sort((a, b) => a.title.localeCompare(b.title));
+}
+
+function stitchThreadMessages(rootMessage: Message | null, replies: Message[]) {
+  if (!rootMessage) return replies;
+  if (replies.some((message) => message.id === rootMessage.id)) return replies;
+  return [rootMessage, ...replies];
+}
+
+function agentMemberEntries(machines: MachineInfo[]): AgentMemberEntry[] {
+  return machines.flatMap((machine) =>
+    machine.agents.map((agent) => ({ machine, agent })),
+  );
+}
+
+function agentDisplayName(agent: MachineInfo["agents"][number]) {
+  return displayName(agent.spec.actor);
+}
+
+function agentModelValue(agent: MachineInfo["agents"][number]) {
+  return agent.spec.model ?? agent.spec.models?.default ?? "";
+}
+
+function agentDescriptionValue(agent: MachineInfo["agents"][number]) {
+  return agent.spec.identity?.description ?? "";
+}
+
+function agentReasoningEffort(agent: MachineInfo["agents"][number]) {
+  const value = agent.spec.actor._meta?.reasoningEffort;
+  return typeof value === "string" ? value : "";
+}
+
+function agentAvatarValue(agent: MachineInfo["agents"][number]) {
+  return metadataAvatarUrl(agent.spec.actor._meta) ?? actorAvatarUrl(agent.spec.actor, agent.spec.actor.id);
+}
+
+function providerForAgent(
+  machine: MachineInfo,
+  agent: MachineInfo["agents"][number],
+  preferredProviderId?: string,
+) {
+  const preferred = machine.providers.find((provider) => provider.id === preferredProviderId);
+  if (preferred) return preferred;
+  const model = agentModelValue(agent);
+  return (
+    machine.providers.find(
+      (provider) =>
+        provider.defaultModel === model ||
+        provider.modelChoices.some((choice) => choice.id === model),
+    ) ??
+    (machine.providers.length === 1 ? machine.providers[0] : undefined) ??
+    machine.providers[0]
+  );
+}
+
+function agentSettingsDraft(
+  machine: MachineInfo,
+  agent: MachineInfo["agents"][number],
+): AgentSettingsDraft {
+  const provider = providerForAgent(machine, agent);
+  return {
+    displayName: agentDisplayName(agent),
+    description: agentDescriptionValue(agent),
+    providerId: provider?.id ?? "",
+    model: agentModelValue(agent) || provider?.defaultModel || "",
+    reasoningEffort: agentReasoningEffort(agent),
+    autostart: Boolean(agent.spec.autostart),
+    avatarUrl: agentAvatarValue(agent),
+  };
+}
+
+function actorAvatarUrl(actor: Actor | undefined, fallback: string) {
+  const metaAvatar = actor?._meta ? metadataAvatarUrl(actor._meta) : null;
+  if (metaAvatar) return metaAvatar;
+  const seed = `${actor?.kind ?? "actor"}:${actor?.id ?? fallback}:${actor ? displayName(actor) : ""}`;
+  return avatarUrlForSeed(seed, actor?.kind);
+}
+
+function metadataAvatarUrl(meta: unknown) {
+  if (!meta || typeof meta !== "object") return null;
+  const value = (meta as { avatarUrl?: unknown }).avatarUrl;
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function avatarUrlForSeed(seed: string, kind: Actor["kind"] = "human") {
+  const hash = stableHash(seed);
+  const index =
+    kind === "agent"
+      ? agentAvatarIndexes[hash % agentAvatarIndexes.length]
+      : (hash % avatarCount) + 1;
+  return `/avatars/avatar-${String(index).padStart(2, "0")}.png`;
+}
+
+function stableHash(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
 }
 
 function accountToActor(account: HumanAccount): Actor {
@@ -2874,8 +5528,24 @@ function accountName(account: HumanAccount) {
   return account.nickname || account.realName || account.email || account.staffId;
 }
 
+function workspaceInitials(workspace: Workspace) {
+  const words = workspace.name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const initials =
+    words.length > 1
+      ? `${words[0][0] ?? ""}${words[1][0] ?? ""}`
+      : (words[0] ?? workspace.id).slice(0, 2);
+  return initials.toUpperCase();
+}
+
 function displayName(actor: Actor) {
   return actor.displayName || actor.id;
+}
+
+function capitalize(value: string) {
+  return value ? `${value[0].toUpperCase()}${value.slice(1)}` : value;
 }
 
 function actorName(actors: Record<string, Actor>, actorId: string) {
@@ -2894,6 +5564,13 @@ function connectionLabel(connection: ConnectionState) {
   return "Idle";
 }
 
+function statusDotClass(status: string) {
+  if (status === "online" || status === "connected") return "bg-emerald-400";
+  if (status === "connecting" || status === "pending") return "bg-amber-400";
+  if (status === "error" || status === "failed") return "bg-red-400";
+  return "bg-[#98a2b3]";
+}
+
 function reconnectDelayMs(attempt: number) {
   return Math.min(15_000, 500 * 2 ** Math.max(0, attempt - 1));
 }
@@ -2909,16 +5586,28 @@ function normalizeAgentForm(form: AgentFormState, machines: MachineInfo[]): Agen
   };
 }
 
+function agentFormForMachine(
+  form: AgentFormState,
+  machine?: MachineInfo,
+): AgentFormState {
+  const provider = resolveAgentProvider(form, machine);
+  return {
+    ...form,
+    machineId: machine?.id ?? "",
+    providerId: provider?.id ?? "",
+    model: provider?.defaultModel || "",
+  };
+}
+
 function resolveAgentMachine(
   form: AgentFormState,
   machines: MachineInfo[],
 ): MachineInfo | undefined {
   const current = machines.find((item) => item.id === form.machineId);
-  if (current && machineCanCreateAgent(current)) return current;
   return (
+    current ??
     machines.find((machine) => machineCanCreateAgent(machine) && machine.providers.length > 0) ??
     machines.find(machineCanCreateAgent) ??
-    current ??
     machines[0]
   );
 }
@@ -3183,6 +5872,74 @@ function sortMessages(items: Message[]) {
   return [...items].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
+function normalizeMessage(message: Message): Message {
+  return {
+    ...message,
+    attachments: message.attachments ?? [],
+    reactions: message.reactions ?? [],
+  };
+}
+
+function upsertMessage(items: Message[], message: Message) {
+  return upsert(items, normalizeMessage(message));
+}
+
+function groupMessagesByDate(messages: Message[]) {
+  const groups = new Map<
+    string,
+    { key: string; label: string; messages: Message[] }
+  >();
+  for (const message of messages) {
+    const key = messageDateKey(message.createdAt);
+    const group = groups.get(key);
+    if (group) {
+      group.messages.push(message);
+    } else {
+      groups.set(key, {
+        key,
+        label: messageDateLabel(message.createdAt),
+        messages: [message],
+      });
+    }
+  }
+  return Array.from(groups.values());
+}
+
+function messageDateKey(value: string) {
+  const date = parseMessageDate(value);
+  if (!date) return "undated";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function messageDateLabel(value: string) {
+  const date = parseMessageDate(value);
+  if (!date) return "Undated";
+  const today = startOfLocalDay(new Date());
+  const day = startOfLocalDay(date);
+  const diffDays = Math.round((today.getTime() - day.getTime()) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  const sameYear = date.getFullYear() === today.getFullYear();
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
+  }).format(date);
+}
+
+function parseMessageDate(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function startOfLocalDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
 function sortTasks(items: Task[]) {
   return [...items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
@@ -3207,24 +5964,220 @@ function messageIsActionRequestFor(message: Message, actorId: string | null) {
   );
 }
 
-function actionChoices(message: Message) {
+function actionChoices(message: Message): ActionChoice[] {
   const raw = message.metadata?.choices;
   if (Array.isArray(raw)) {
     const parsed = raw
-      .map((choice) => {
-        if (!choice || typeof choice !== "object") return null;
+      .flatMap((choice): ActionChoice[] => {
+        if (!choice || typeof choice !== "object") return [];
         const record = choice as Record<string, unknown>;
         const id = String(record.id ?? record.label ?? "");
-        if (!id) return null;
+        if (!id) return [];
         const label = String(record.label ?? id);
-        return { id, label, accepted: !/reject|decline|cancel|no/i.test(label) };
-      })
-      .filter((choice): choice is { id: string; label: string; accepted: boolean } =>
-        Boolean(choice),
-    );
+        return [
+          {
+            id,
+            label,
+            accepted: !/reject|decline|cancel|no/i.test(label),
+            votes: votesFromChoice(record),
+          },
+        ];
+      });
     if (parsed.length > 0) return parsed;
   }
   return [];
+}
+
+function bodyPollFromMessage(message: Message): BodyPoll | null {
+  const lines = message.body.split("\n");
+  const choices: ActionChoice[] = [];
+  const questionLines: string[] = [];
+  let foundChoice = false;
+  for (const line of lines) {
+    const match = /^\s*([A-Za-z])[\).]\s+(.+?)\s*$/.exec(line);
+    if (match) {
+      foundChoice = true;
+      choices.push({
+        id: match[1].toUpperCase(),
+        label: match[2],
+        accepted: true,
+      });
+    } else if (!foundChoice || line.trim()) {
+      questionLines.push(line);
+    }
+  }
+  if (choices.length < 2) return null;
+  const question = questionLines.join("\n").trim() || messageTitle(message);
+  return { question, choices };
+}
+
+function threadParticipants(
+  thread: Thread,
+  actors: Record<string, Actor>,
+  rootAuthor?: Actor,
+  stats?: ThreadActivityStats,
+) {
+  const metaActorIds = stats?.participantActorIds.length
+    ? stats.participantActorIds
+    : metadataStringArray(thread._meta, [
+        "participantActorIds",
+        "participants",
+        "replyActorIds",
+      ]);
+  const candidates = [
+    ...(rootAuthor ? [rootAuthor] : []),
+    ...metaActorIds.map((actorId) => actors[actorId] ?? fallbackActor(actorId)),
+  ];
+  const seen = new Set<string>();
+  return candidates.filter((actor) => {
+    if (seen.has(actor.id)) return false;
+    seen.add(actor.id);
+    return true;
+  });
+}
+
+function threadReplyCount(thread: Thread, stats?: ThreadActivityStats) {
+  if (typeof stats?.replyCount === "number") return stats.replyCount;
+  const replyCount = metadataNumber(thread._meta, ["replyCount", "replies"]);
+  if (replyCount !== null) return Math.max(0, replyCount);
+  const messageCount = metadataNumber(thread._meta, ["messageCount"]);
+  return messageCount === null ? null : Math.max(0, messageCount - 1);
+}
+
+function threadLastReplyLabel(thread: Thread, stats?: ThreadActivityStats) {
+  const raw =
+    stats?.lastReplyAt ??
+    metadataString(thread._meta, ["lastReplyAt", "lastMessageAt", "updatedAt"]);
+  return raw ? formatTime(raw) : null;
+}
+
+function emptyThreadStats(): ThreadActivityStats {
+  return {
+    replyCount: 0,
+    replyMessageIds: [],
+    participantActorIds: [],
+    hasMoreReplies: false,
+    lastReplyAt: null,
+  };
+}
+
+function threadStatsFromMessages(
+  messages: Message[],
+  hasMoreReplies = false,
+): ThreadActivityStats {
+  const sorted = sortMessages(messages).filter(
+    (message) => !isHiddenProtocolMessage(message),
+  );
+  const participantActorIds = uniqueStrings(
+    sorted.map((message) => message.authorActorId),
+  );
+  return {
+    replyCount: sorted.length,
+    replyMessageIds: sorted.map((message) => message.id),
+    participantActorIds,
+    hasMoreReplies,
+    lastReplyAt: sorted.at(-1)?.createdAt ?? null,
+  };
+}
+
+function upsertThreadStatsMessage(
+  current: Record<string, ThreadActivityStats>,
+  message: Message,
+) {
+  if (message.scope.kind !== "thread" || isHiddenProtocolMessage(message)) return current;
+  const previous = current[message.scope.id] ?? emptyThreadStats();
+  const knownMessage = previous.replyMessageIds.includes(message.id);
+  return {
+    ...current,
+    [message.scope.id]: {
+      replyCount: knownMessage ? previous.replyCount : previous.replyCount + 1,
+      replyMessageIds: knownMessage
+        ? previous.replyMessageIds
+        : [...previous.replyMessageIds, message.id],
+      participantActorIds: uniqueStrings([
+        ...previous.participantActorIds,
+        message.authorActorId,
+      ]),
+      hasMoreReplies: previous.hasMoreReplies,
+      lastReplyAt:
+        !previous.lastReplyAt || message.createdAt > previous.lastReplyAt
+          ? message.createdAt
+          : previous.lastReplyAt,
+    },
+  };
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.filter((value) => value.length > 0)));
+}
+
+function metadataString(meta: unknown, keys: string[]) {
+  if (!meta || typeof meta !== "object") return null;
+  const record = meta as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return null;
+}
+
+function metadataNumber(meta: unknown, keys: string[]) {
+  if (!meta || typeof meta !== "object") return null;
+  const record = meta as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function metadataStringArray(meta: unknown, keys: string[]) {
+  if (!meta || typeof meta !== "object") return [];
+  const record = meta as Record<string, unknown>;
+  for (const key of keys) {
+    const value = record[key];
+    if (Array.isArray(value)) {
+      return value.filter(
+        (item): item is string => typeof item === "string" && item.length > 0,
+      );
+    }
+  }
+  return [];
+}
+
+function votesFromChoice(record: Record<string, unknown>) {
+  for (const key of ["votes", "voteCount", "count"]) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  const actorIds = record.actorIds ?? record.voterIds ?? record.votesByActor;
+  if (Array.isArray(actorIds)) return actorIds.length;
+  return undefined;
+}
+
+function attachmentTitle(value: string) {
+  const clean = value.trim();
+  if (!clean) return "Attachment";
+  try {
+    const url = new URL(clean);
+    return decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? url.hostname);
+  } catch {
+    return clean.split(/[\\/]/).filter(Boolean).at(-1) ?? clean;
+  }
+}
+
+function attachmentKind(value: string) {
+  const lower = value.toLowerCase();
+  if (lower.endsWith(".fig") || lower.includes("figma")) return "Figma File";
+  if (lower.endsWith(".pdf")) return "PDF File";
+  if (lower.endsWith(".doc") || lower.endsWith(".docx") || lower.includes("doc")) {
+    return "Google Doc";
+  }
+  if (lower.endsWith(".sheet") || lower.endsWith(".xlsx") || lower.endsWith(".csv")) {
+    return "Spreadsheet";
+  }
+  if (lower.match(/\.(png|jpe?g|webp|gif)$/)) return "Image";
+  return "File";
 }
 
 function messageTitle(message: Message) {

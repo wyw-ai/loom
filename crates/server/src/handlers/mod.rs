@@ -534,6 +534,11 @@ fn thread_create(state: &AppState, connection_id: &str, params: Option<Value>) -
     {
         warn_projection_failure("thread_create.sync_thread_channel_memberships", e);
     }
+    let thread = state
+        .store
+        .attach_thread_activity_meta(vec![thread])
+        .pop()
+        .expect("one thread");
     ok(ThreadCreateResult { thread })
 }
 
@@ -560,6 +565,7 @@ fn thread_list(state: &AppState, connection_id: &str, params: Option<Value>) -> 
                 .unwrap_or(false),
         })
         .collect();
+    let threads = state.store.attach_thread_activity_meta(threads);
     ok(ThreadListResult { threads })
 }
 
@@ -584,6 +590,11 @@ fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -
         .store
         .update_thread(&p.thread_id, p.title)
         .map_err(map_store_err)?;
+    let thread = state
+        .store
+        .attach_thread_activity_meta(vec![thread])
+        .pop()
+        .expect("one thread");
     ok(ThreadUpdateResult { thread })
 }
 
@@ -608,6 +619,11 @@ fn thread_archive(state: &AppState, connection_id: &str, params: Option<Value>) 
         .store
         .archive_thread(&p.thread_id, p.archived)
         .map_err(map_store_err)?;
+    let thread = state
+        .store
+        .attach_thread_activity_meta(vec![thread])
+        .pop()
+        .expect("one thread");
     ok(ThreadArchiveResult { thread })
 }
 
@@ -4889,6 +4905,78 @@ mod tests {
             titles.contains(&"in-a") && !titles.contains(&"in-b"),
             "alice must see in-a but not in-b; got {titles:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn thread_list_includes_reply_summary_metadata() {
+        let state = fresh_state("thread-summary");
+        let channel = state
+            .store
+            .create_channel("summary".into(), Some("actor_alice".into()))
+            .expect("create channel");
+        state.store.grant_channel(&channel.id, "actor_bob").unwrap();
+        state
+            .store
+            .grant_channel(&channel.id, "actor_charlie")
+            .unwrap();
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "root");
+        let target = format!("#{}:{}", channel.id, thread.root_message_id);
+        for (actor_id, body) in [
+            ("actor_bob", "first reply"),
+            ("actor_alice", "second reply"),
+        ] {
+            state
+                .store
+                .append_message(
+                    actor_id.into(),
+                    target.clone(),
+                    MessageKind::Human,
+                    body.into(),
+                    Vec::new(),
+                    Vec::new(),
+                    MessageIntent::Chat,
+                    DeliveryPolicy::NotifyOnly,
+                    None,
+                    None,
+                    Vec::new(),
+                    Meta::default(),
+                    None,
+                )
+                .expect("append thread reply");
+        }
+
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        let value = dispatch(
+            &state,
+            "conn_alice",
+            method::THREAD_LIST,
+            Some(json!({ "channelId": channel.id })),
+        )
+        .await
+        .expect("thread/list");
+        let result: ThreadListResult = serde_json::from_value(value).expect("list result");
+        let listed = result
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == thread.id)
+            .expect("listed thread");
+        let meta = listed._meta.as_ref().expect("thread summary meta");
+        assert_eq!(meta.get("replyCount").and_then(Value::as_u64), Some(2));
+        let participant_ids = meta
+            .get("participantActorIds")
+            .and_then(Value::as_array)
+            .expect("participantActorIds");
+        assert_eq!(participant_ids.len(), 2);
+        assert!(participant_ids
+            .iter()
+            .any(|id| id.as_str() == Some("actor_alice")));
+        assert!(participant_ids
+            .iter()
+            .any(|id| id.as_str() == Some("actor_bob")));
+        assert!(!participant_ids
+            .iter()
+            .any(|id| id.as_str() == Some("actor_charlie")));
+        assert!(meta.get("lastReplyAt").and_then(Value::as_str).is_some());
     }
 
     #[tokio::test]

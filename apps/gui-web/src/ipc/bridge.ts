@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
+  AgentInfo,
   Actor,
   AudienceRef,
   Channel,
@@ -181,7 +182,7 @@ export async function messageList(params: {
   target: string;
   limit?: number;
   beforeMessageId?: string;
-}): Promise<{ messages: Message[]; pageInfo: { hasMore: boolean } }> {
+}): Promise<{ messages: Message[]; pageInfo?: { hasMore?: boolean } }> {
   return invoke("message_list", {
     params: {
       target: params.target,
@@ -328,8 +329,23 @@ export async function machineAgentCreate(args: {
   model?: string;
   reasoningEffort?: string;
   autostart?: boolean;
+  avatarUrl?: string;
 }): Promise<MachineListResult> {
   return invoke("machine_agent_create", { args });
+}
+
+export async function agentUpdate(args: {
+  machineId?: string;
+  actorId: string;
+  displayName?: string;
+  description?: string;
+  providerId?: string;
+  model?: string;
+  reasoningEffort?: string;
+  autostart?: boolean;
+  avatarUrl?: string;
+}): Promise<AgentInfo> {
+  return invoke("agent_update", { args });
 }
 
 export async function machineAgentRemove(params: {

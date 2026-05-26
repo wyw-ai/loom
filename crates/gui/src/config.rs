@@ -102,6 +102,8 @@ pub struct MachineAgentConfig {
     pub reasoning_effort: String,
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default)]
+    pub avatar_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -946,6 +948,7 @@ id = "default"
                         model: String::new(),
                         reasoning_effort: String::new(),
                         autostart: false,
+                        avatar_url: String::new(),
                     }],
                 },
             ],

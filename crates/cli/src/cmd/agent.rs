@@ -138,6 +138,8 @@ struct MachineAgentConfig {
     reasoning_effort: String,
     #[serde(default)]
     autostart: bool,
+    #[serde(default)]
+    avatar_url: String,
 }
 
 fn load_desktop_config() -> Result<DesktopConfig> {
@@ -176,6 +178,7 @@ fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
         model: non_empty(agent.model.trim()),
         reasoning_effort: non_empty(agent.reasoning_effort.trim()),
         autostart: agent.autostart,
+        avatar_url: non_empty(agent.avatar_url.trim()),
     }
 }
 

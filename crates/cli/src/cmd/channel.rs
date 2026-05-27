@@ -37,11 +37,11 @@ pub async fn list(client: Arc<Client>) -> Result<()> {
     Ok(())
 }
 
-pub async fn delete(client: Arc<Client>, channel_id: String, cascade: bool) -> Result<()> {
+pub async fn delete(client: Arc<Client>, channel_id: String) -> Result<()> {
     let res: ChannelDeleteResult = client
         .call(
             method::CHANNEL_DELETE,
-            json!({ "channelId": channel_id, "cascade": cascade }),
+            json!({ "channelId": channel_id, "cascade": true }),
         )
         .await?;
     if render::is_json() {

@@ -199,6 +199,16 @@ const avatarLibraryUrls = Array.from(
 );
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 const ungroupedChannelGroupId = "__ungrouped";
+const channelContextMenuWidthPx = 44 * 4;
+const channelContextMenuItemHeightPx = 36;
+const channelContextMenuItemCount = 2;
+const channelContextMenuPaddingPx = 4;
+const channelContextMenuBorderPx = 1;
+const channelContextMenuViewportPaddingPx = 8;
+const channelContextMenuHeightPx =
+  channelContextMenuPaddingPx * 2 +
+  channelContextMenuItemHeightPx * channelContextMenuItemCount +
+  channelContextMenuBorderPx * 2;
 const panelLayoutStorageKey = "loom:panel-layout:v1";
 const detailPanelBreakpoint = 1280;
 const railWidth = 72;
@@ -2113,8 +2123,20 @@ function Sidebar({
     setSectionTitleDraft("");
     setChannelContextMenu({
       channelId: channel.id,
-      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 184)),
-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 96)),
+      x: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          event.clientX,
+          window.innerWidth - channelContextMenuWidthPx - channelContextMenuViewportPaddingPx,
+        ),
+      ),
+      y: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          event.clientY,
+          window.innerHeight - channelContextMenuHeightPx - channelContextMenuViewportPaddingPx,
+        ),
+      ),
     });
   };
 
@@ -2646,14 +2668,21 @@ function Sidebar({
         contextMenuChannel &&
         createPortal(
           <div
-            className="fixed z-50 w-44 rounded-lg border border-[#dfe3ec] bg-white p-1 text-sm shadow-soft"
-            style={{ left: channelContextMenu.x, top: channelContextMenu.y }}
+            className="fixed z-50 rounded-lg border border-[#dfe3ec] bg-white p-1 text-sm shadow-soft"
+            style={{
+              left: channelContextMenu.x,
+              top: channelContextMenu.y,
+              width: channelContextMenuWidthPx,
+            }}
+            role="menu"
+            aria-label={`Channel actions for ${contextMenuChannel.title}`}
             onClick={(event) => event.stopPropagation()}
             onContextMenu={(event) => event.preventDefault()}
           >
             <button
               type="button"
               className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+              role="menuitem"
               onClick={() => startRenameChannel(contextMenuChannel)}
             >
               <Pencil size={14} />
@@ -2662,6 +2691,7 @@ function Sidebar({
             <button
               type="button"
               className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-red-600 hover:bg-red-50"
+              role="menuitem"
               onClick={() => requestDeleteChannel(contextMenuChannel.id)}
             >
               <Trash2 size={14} />

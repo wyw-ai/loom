@@ -312,9 +312,9 @@ pub struct ChannelUpdateResult {
 pub struct ChannelDeleteParams {
     pub channel_id: String,
     /// When true, child threads are deleted in the same call before the
-    /// channel itself is removed. Defaults to true so deleting a channel
-    /// removes the channel's thread tree as one operation.
-    #[serde(default = "default_true")]
+    /// channel itself is removed. Defaults to false so older clients that omit
+    /// the field keep the non-destructive behavior.
+    #[serde(default)]
     pub cascade: bool,
 }
 
@@ -974,11 +974,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channel_delete_defaults_to_cascade() {
+    fn channel_delete_defaults_to_non_cascade() {
         let params: ChannelDeleteParams =
             serde_json::from_value(serde_json::json!({ "channelId": "chan_123" })).unwrap();
         assert_eq!(params.channel_id, "chan_123");
-        assert!(params.cascade);
+        assert!(!params.cascade);
     }
 
     #[test]

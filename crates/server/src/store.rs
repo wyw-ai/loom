@@ -44,6 +44,11 @@ pub enum StoreEvent {
     DeliveryUpdated(Delivery),
     MachineCommandUpdated(MachineCommand),
     ChannelUpdated(Channel),
+    ChannelDeleted {
+        channel_id: String,
+        visibility: ChannelVisibility,
+        members: Vec<String>,
+    },
     /// `actor_id` was just added to `channel_id`'s ACL. ws::fanout pushes
     /// this directly to the affected actor's connection (if any) — never
     /// broadcast to scope subscribers.
@@ -81,6 +86,7 @@ impl StoreEvent {
                 kind: ScopeKind::Channel,
                 id: c.id.clone(),
             }),
+            StoreEvent::ChannelDeleted { .. } => None,
             StoreEvent::TaskAssignmentChanged { task, .. } => Some(ScopeRef {
                 kind: ScopeKind::Channel,
                 id: task.channel_id.clone(),
@@ -594,9 +600,9 @@ impl Store {
     /// — soft-delete, events left orphaned) before the channel row is
     /// removed. Returns `(removed_channel, removed_thread_count)`.
     pub fn delete_channel(&self, id: &str, cascade: bool) -> StoreResult<(bool, u32)> {
-        if self.get_channel(id).is_none() {
-            return Err(StoreError::NotFound(format!("channel {id}")));
-        }
+        let channel = self
+            .get_channel(id)
+            .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
         // Snapshot child ids under read lock so we can release it before the
         // per-thread `delete_thread` calls (each takes its own write lock).
         let child_ids: Vec<String> = self
@@ -648,6 +654,13 @@ impl Store {
                 .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
             removed
         };
+        if removed {
+            self.emit(StoreEvent::ChannelDeleted {
+                channel_id: channel.id,
+                visibility: channel.visibility,
+                members: channel.members,
+            });
+        }
         Ok((removed, deleted_threads))
     }
 

@@ -4830,6 +4830,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_delete_without_cascade_refuses_non_empty_channel() {
+        let state = fresh_state("channel-delete-no-cascade");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        create_thread_under(&state, &channel.id, "actor_owner", "child");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+
+        let err = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_DELETE,
+            Some(json!({ "channelId": channel.id })),
+        )
+        .await
+        .expect_err("delete should require explicit cascade");
+
+        assert_eq!(err.code, ErrorCode::APP_CONFLICT);
+        assert!(state.store.get_channel(&channel.id).is_some());
+        assert_eq!(state.store.list_threads(Some(&channel.id)).len(), 1);
+    }
+
+    #[tokio::test]
     async fn thread_create_refuses_non_member_in_private_channel() {
         let state = fresh_state("auto");
         let channel = state

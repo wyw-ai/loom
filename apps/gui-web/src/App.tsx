@@ -15,8 +15,6 @@ import type {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import {
-  Activity,
-  AtSign,
   Bell,
   Bot,
   Check,
@@ -1861,10 +1859,10 @@ function Sidebar({
   const sections = channelGroupSections(channelGroups, channels);
   const navItems = [
     { id: "chat" as const, label: "Home", icon: Home },
-    { id: "threads" as const, label: "Threads", icon: MessageSquare },
-    { id: "inbox" as const, label: "Mentions", icon: AtSign },
-    { id: "tasks" as const, label: "Activity", icon: Activity },
     { id: "channels" as const, label: "All Channels", icon: Hash },
+    { id: "threads" as const, label: "Threads", icon: MessageSquare },
+    { id: "inbox" as const, label: "Inbox", icon: Bell },
+    { id: "tasks" as const, label: "Tasks", icon: Check },
     { id: "settings" as const, label: "Hosts", icon: Server },
   ];
   const closeCreateMenu = () => {

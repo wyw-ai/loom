@@ -206,7 +206,9 @@ package_gui_dmg() {
 
   local target="aarch64-apple-darwin"
   local src_loom="$DIST_DIR/$PROFILE/$target/loom"
+  local src_daemon="$DIST_DIR/$PROFILE/$target/loom-daemon"
   ensure_file "$src_loom"
+  ensure_file "$src_daemon"
 
   log "building GUI app bundle for $target"
   (
@@ -224,7 +226,8 @@ package_gui_dmg() {
   local resources_dir="$app/Contents/Resources/bin"
   mkdir -p "$resources_dir"
   cp "$src_loom" "$resources_dir/loom"
-  chmod 0755 "$resources_dir/loom"
+  cp "$src_daemon" "$resources_dir/loom-daemon"
+  chmod 0755 "$resources_dir/loom" "$resources_dir/loom-daemon"
 
   if command -v codesign >/dev/null 2>&1; then
     codesign --force --deep --sign - "$app"

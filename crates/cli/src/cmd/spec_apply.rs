@@ -1,17 +1,17 @@
-//! `joi spec apply --action <event_id>` — classroom教学循环最后一公里
+//! `loom spec apply --action <message_id>` — classroom教学循环最后一公里
 //! (design §4.4 / §7.1, e2e-readiness-review M5).
 //!
-//! Consumes an `action.response` event whose `responds_to` request is
-//! `requestType = approval.spec_apply` and whose payload says the user
-//! accepted. Reads the lesson-plan artifact attached to the request,
+//! Consumes an `action.response` message whose parent request has
+//! `requestType = approval.spec_apply` metadata and whose response metadata
+//! says the user accepted. Reads the lesson-plan artifact attached to the request,
 //! pulls its JSON frontmatter, and if the frontmatter carries a
 //! `spec_apply` block, applies the plan: deep-merges `spec_patch` onto
 //! the on-disk AgentSpec / ServiceSpec, writes any `bundle_writes`
 //! files under the spec's `bundle/` sibling, then bumps the
-//! reload-epoch marker so a running `joi {agent,service} serve` host
-//! re-spawns the worker. Records a `runtime_receipt` artifact + a
-//! `status.update` event in the original action.request scope so the
-//! decision is replayable from timeline alone.
+//! reload-epoch marker so a running `loom-daemon` host
+//! re-spawns the worker. Records a `runtime_outcome` artifact + a
+//! `spec_apply.completed` status message in the original action.request
+//! scope so the decision is replayable from timeline alone.
 //!
 //! Lesson-plan frontmatter contract for the apply path (extends
 //! `docs/artifact-contracts.md` §4):
@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use proto::methods::*;
-use proto::types::{Event, RefKind, RelationKind, ScopeRef};
+use proto::types::{DeliveryPolicy, Message, MessageIntent};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -50,45 +50,51 @@ use crate::client::Client;
 
 const REQUEST_TYPE: &str = "approval.spec_apply";
 
-/// Entry point for `joi spec apply --action <event_id>`.
+/// Entry point for `loom spec apply --action <message_id>`.
 pub async fn run(
     client: Arc<Client>,
     actor_id: String,
-    action_event_id: String,
+    action_message_id: String,
     dry_run: bool,
 ) -> Result<()> {
-    let response = find_event(&client, &action_event_id)
-        .await?
-        .ok_or_else(|| anyhow!("event {action_event_id} not found in any thread"))?;
-    if response.kind != "action.response" {
+    let response = fetch_message(&client, &action_message_id).await?;
+    if response.metadata.get("kind").and_then(Value::as_str) != Some("action.response") {
         bail!(
-            "event {action_event_id} is `{}`, expected `action.response`",
-            response.kind
+            "message {action_message_id} is `{}`, expected `action.response`",
+            response
+                .metadata
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
         );
     }
     let response_kind = response
-        .payload
-        .get("kind")
+        .metadata
+        .get("responseKind")
+        .or_else(|| response.metadata.get("kind"))
         .and_then(Value::as_str)
         .unwrap_or("");
     if response_kind != "accepted" {
         bail!(
-            "action.response payload.kind = `{response_kind}` (expected `accepted`); refusing to apply"
+            "action.response metadata.responseKind = `{response_kind}` (expected `accepted`); refusing to apply"
         );
     }
 
     let request_id = response
-        .relations
-        .iter()
-        .find(|r| matches!(r.kind, RelationKind::RespondsTo) && r.target.kind == RefKind::Event)
-        .map(|r| r.target.id.clone())
-        .ok_or_else(|| anyhow!("action.response has no responds_to → event relation"))?;
+        .parent_message_id
+        .clone()
+        .or_else(|| {
+            response
+                .metadata
+                .get("requestMessageId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .ok_or_else(|| anyhow!("action.response has no parentMessageId"))?;
 
-    let request = find_event(&client, &request_id)
-        .await?
-        .ok_or_else(|| anyhow!("action.request {request_id} not found"))?;
+    let request = fetch_message(&client, &request_id).await?;
     let req_type = request
-        .payload
+        .metadata
         .get("requestType")
         .and_then(Value::as_str)
         .unwrap_or("");
@@ -99,15 +105,19 @@ pub async fn run(
     }
 
     let artifact_id = request
-        .relations
-        .iter()
-        .find(|r| {
-            matches!(r.kind, RelationKind::AttachesArtifact) && r.target.kind == RefKind::Artifact
+        .attachments
+        .first()
+        .cloned()
+        .or_else(|| {
+            request
+                .metadata
+                .get("lessonPlanArtifactId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
         })
-        .map(|r| r.target.id.clone())
         .ok_or_else(|| {
             anyhow!(
-                "action.request {request_id} has no attaches_artifact relation; \
+                "action.request {request_id} has no attached artifact; \
                  cannot find lesson-plan to apply"
             )
         })?;
@@ -143,24 +153,24 @@ pub async fn run(
         return Ok(());
     }
 
-    // Receipt artifact + status event so the decision lives in timeline.
-    let receipt = json!({
+    // Outcome artifact + status event so the decision lives in timeline.
+    let outcome_record = json!({
         "schema_version": "1",
-        "producer": "joi-spec-apply",
-        "action_event_id": action_event_id,
-        "request_event_id": request_id,
+        "producer": "loom-spec-apply",
+        "action_message_id": action_message_id,
+        "request_message_id": request_id,
         "lesson_plan_artifact_id": artifact_id,
         "target": { "kind": plan.target_kind_str(), "id": plan.target_id },
         "outcome": outcome,
     });
-    let receipt_text = serde_json::to_string_pretty(&receipt)?;
-    let receipt_name = format!("runtime-receipt-{}.json", action_event_id);
+    let outcome_text = serde_json::to_string_pretty(&outcome_record)?;
+    let outcome_name = format!("runtime-outcome-{}.json", action_message_id);
 
     let publish_params = ArtifactPublishParams {
         ingress: ArtifactIngress::InlineText(InlineTextIngress {
-            name: receipt_name.clone(),
+            name: outcome_name.clone(),
             media_type: "application/json".into(),
-            text: receipt_text,
+            text: outcome_text,
         }),
         created_by: actor_id.clone(),
         scope: Some(request.scope.clone()),
@@ -168,30 +178,37 @@ pub async fn run(
     let publish: ArtifactPublishResult = client
         .call(method::ARTIFACT_PUBLISH, publish_params)
         .await
-        .context("publish runtime_receipt artifact")?;
+        .context("publish runtime_outcome artifact")?;
 
-    let status_payload = json!({
+    let metadata = json!({
         "kind": "spec_apply.completed",
         "target": { "kind": outcome["target_kind"], "id": outcome["target_id"] },
         "epoch_ms": outcome["epoch_ms"],
+        "actionMessageId": action_message_id,
+        "requestMessageId": request_id,
     });
-    let status_event = json!({
-        "type": "status.update",
-        "actorId": actor_id,
-        "scope": scope_value(&request.scope),
-        "payload": status_payload,
-        "relations": [
-            { "kind": "responds_to", "target": { "kind": "event", "id": action_event_id } },
-            { "kind": "attaches_artifact", "target": { "kind": "artifact", "id": publish.artifact.id } },
-        ],
-    });
-    let _: EventAppendResult = client
-        .call(method::EVENT_APPEND, json!({"event": status_event}))
+    let _: MessageSendResult = client
+        .call(
+            method::MESSAGE_SEND,
+            json!({
+                "target": request.target,
+                "body": format!(
+                    "Spec apply completed for {}:{}.",
+                    plan.target_kind_str(),
+                    plan.target_id
+                ),
+                "intent": MessageIntent::StatusUpdate,
+                "deliveryPolicy": DeliveryPolicy::NotifyOnly,
+                "parentMessageId": action_message_id,
+                "attachments": [publish.artifact.id.clone()],
+                "metadata": metadata,
+            }),
+        )
         .await
-        .context("append spec_apply.completed status.update")?;
+        .context("message.send spec_apply.completed status.update")?;
 
     println!(
-        "applied spec_apply for {}:{}; epoch_ms={}; receipt artifact={}",
+        "applied spec_apply for {}:{}; epoch_ms={}; outcome artifact={}",
         plan.target_kind_str(),
         plan.target_id,
         outcome["epoch_ms"],
@@ -447,23 +464,12 @@ pub(crate) fn deep_merge(target: &mut Value, patch: Value) {
     }
 }
 
-/// Walk every thread the server knows about and return the first event
-/// with `id == event_id`. Mirrors `cmd::action::fetch_event_scope` but
-/// returns the full event so we can read payload + relations.
-async fn find_event(client: &Client, event_id: &str) -> Result<Option<Event>> {
-    let lst: ThreadListResult = client.call(method::THREAD_LIST, json!({})).await?;
-    for t in lst.threads {
-        let res: ScopeReadResult = client
-            .call(
-                method::SCOPE_READ,
-                json!({ "scope": { "kind": "thread", "id": t.id }, "limit": 500 }),
-            )
-            .await?;
-        if let Some(ev) = res.events.into_iter().find(|e| e.id == event_id) {
-            return Ok(Some(ev));
-        }
-    }
-    Ok(None)
+async fn fetch_message(client: &Client, message_id: &str) -> Result<Message> {
+    let res: MessageReadResult = client
+        .call(method::MESSAGE_READ, json!({ "messageId": message_id }))
+        .await
+        .with_context(|| format!("message/read {message_id}"))?;
+    Ok(res.message)
 }
 
 async fn read_artifact_text(client: &Client, artifact_id: &str) -> Result<String> {
@@ -482,10 +488,6 @@ async fn read_artifact_text(client: &Client, artifact_id: &str) -> Result<String
         );
     }
     Ok(res.content)
-}
-
-fn scope_value(scope: &ScopeRef) -> Value {
-    serde_json::to_value(scope).unwrap_or(Value::Null)
 }
 
 /// Extract the JSON object from the first ```` ```json ```` fenced

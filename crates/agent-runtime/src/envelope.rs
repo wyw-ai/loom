@@ -34,7 +34,7 @@ pub struct PromptSection {
 /// formatted by `MemoryRenderer`) are passed through verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct EnvelopeInput<'a> {
-    /// Runtime actor identity resolved by Joi itself. Unlike the profile
+    /// Runtime actor identity resolved by Loom itself. Unlike the profile
     /// identity markdown, this is protocol metadata (actor id/display name)
     /// and should be injected every prompt.
     pub actor_context: &'a str,
@@ -94,7 +94,7 @@ pub fn compose_prompt(input: &EnvelopeInput<'_>) -> (String, Vec<PromptSection>)
     );
 
     // User message is always last, even if blank — an empty user message is
-    // a legitimate wake-up signal (e.g. a bare handoff) and the model still
+    // a legitimate wake-up signal (e.g. a bare directed message) and the model still
     // needs to see the delimiter.
     sections.push(PromptSection {
         name: "user_message",
@@ -140,7 +140,7 @@ use crate::profile::read_markdown_file;
 /// (profile dir, specs, current channel) once and hand it in.
 #[derive(Debug)]
 pub struct BuildContext<'a> {
-    /// Joi-resolved actor identity section. Stable for this actor, so callers
+    /// Loom-resolved actor identity section. Stable for this actor, so callers
     /// should keep volatile facts out of it for better prompt-cache reuse.
     pub actor_context: &'a str,
     /// Absolute path to this actor's profile dir. Identity / soul files
@@ -160,10 +160,10 @@ pub struct BuildContext<'a> {
     pub thread_context: &'a str,
     /// Dynamic runtime facts that should be refreshed for every turn.
     pub runtime_context: &'a str,
-    /// The user's message (or equivalent handoff payload). Goes verbatim
+    /// The user's message (or equivalent directed payload). Goes verbatim
     /// into the final `=== User message ===` block.
     pub user_message: &'a str,
-    /// Scope bootstrap text (joi CLI manifest). Empty string when this is
+    /// Scope bootstrap text (loom CLI manifest). Empty string when this is
     /// not the first prompt in the (actor, scope).
     pub scope_bootstrap: &'a str,
 }
@@ -254,13 +254,13 @@ mod tests {
     fn full_envelope_orders_sections() {
         let (body, sections) = compose_prompt(&EnvelopeInput {
             actor_context:
-                "=== System: Joi actor identity ===\nYou are Coder (@actor_agent_coder).",
+                "=== System: Loom actor identity ===\nYou are Coder (@actor_agent_coder).",
             identity_markdown: "# role",
             soul_markdown: "# style",
             bootstrap_memory: "Bootstrap memory:\n- [fact / high] a",
             turn_memory: "Relevant memory:\n- [note / medium] b",
             runtime_context: "",
-            scope_bootstrap: "=== joi bootstrap ===\nscope: thread:x",
+            scope_bootstrap: "=== loom bootstrap ===\nscope: thread:x",
             user_message: "hi",
         });
         let names: Vec<_> = sections.iter().map(|s| s.name).collect();
@@ -284,14 +284,14 @@ mod tests {
     fn actor_context_is_injected_before_profile_identity() {
         let (body, sections) = compose_prompt(&EnvelopeInput {
             actor_context:
-                "=== System: Joi actor identity ===\nYou are Coder (@actor_agent_coder).",
+                "=== System: Loom actor identity ===\nYou are Coder (@actor_agent_coder).",
             identity_markdown: "# role",
             user_message: "hi",
             ..Default::default()
         });
         let names: Vec<_> = sections.iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["actor_context", "identity", "user_message"]);
-        assert!(body.find("Joi actor identity").unwrap() < body.find("Agent identity:").unwrap());
+        assert!(body.find("Loom actor identity").unwrap() < body.find("Agent identity:").unwrap());
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
     fn stable_scope_bootstrap_precedes_dynamic_runtime_context_for_cache_reuse() {
         let (body, sections) = compose_prompt(&EnvelopeInput {
             runtime_context: "=== System: Local time context ===\nCurrent local time: x",
-            scope_bootstrap: "=== joi bootstrap ===\nscope: thread:x",
+            scope_bootstrap: "=== loom bootstrap ===\nscope: thread:x",
             user_message: "hi",
             ..Default::default()
         });
@@ -320,7 +320,7 @@ mod tests {
             names,
             vec!["scope_bootstrap", "runtime_context", "user_message"]
         );
-        assert!(body.find("joi bootstrap").unwrap() < body.find("Local time context").unwrap());
+        assert!(body.find("loom bootstrap").unwrap() < body.find("Local time context").unwrap());
         assert!(
             body.find("Local time context").unwrap() < body.find("=== User message ===").unwrap()
         );

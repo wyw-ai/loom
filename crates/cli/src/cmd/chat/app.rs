@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use proto::types::{Event, ScopeKind, ScopeRef};
+use proto::types::{Message, ScopeKind, ScopeRef};
 
 use super::draft::DraftInput;
 use super::history::History;
@@ -17,11 +17,11 @@ pub enum Mode {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PickerKind {
-    /// Pick a target actor for a handoff. Optional pending message.
-    HandoffTarget,
+    /// Pick a target actor for a directed message.
+    DirectTarget,
     /// Pick a pending action.request to respond to.
     Action,
-    /// Pick an existing event as the next reply target.
+    /// Pick an existing message as the next reply target.
     Reply,
     /// Pick an actor to invite into a specific channel. The picker is
     /// pre-filtered to actors that are NOT already members; the channel
@@ -32,12 +32,12 @@ pub enum PickerKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyTarget {
-    pub event_id: String,
+    pub message_id: String,
     pub preview: String,
 }
 
-/// Light snapshot of an open turn the client has observed via `turn.opened`
-/// and not yet seen `turn.closed` for.
+/// Light snapshot of an open agent run the client has observed via
+/// `run.updated` and not yet seen in a terminal status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTurn {
     pub turn_id: String,
@@ -58,11 +58,11 @@ pub struct App {
     /// Inline @-mention dropdown above the input box. Visible whenever the
     /// input starts with `@`. Selecting an entry rewrites the leading
     /// `@<filter>` token to `@<actor_id> ` so the user can append a
-    /// handoff message before pressing Enter.
+    /// directed message before pressing Enter.
     pub at_menu: Option<Picker>,
     pub actor_id: String,
     /// Id of the currently bound scope. Empty = no scope bound (launched
-    /// `joi chat` without `--in`/`--channel`). When non-empty, `scope_kind`
+    /// `loom chat` without `--in`/`--channel`). When non-empty, `scope_kind`
     /// disambiguates whether this is a thread or a channel scope.
     pub thread_id: String,
     /// Kind of the currently bound scope. `Thread` by default for
@@ -73,14 +73,14 @@ pub struct App {
     /// Best-effort kind ("agent" / "human" / "service") per actor id; used
     /// only as a hint label in the @-mention picker.
     pub actor_kinds: HashMap<String, String>,
-    /// Agent actors from `actor/list`. `@...` is a fast handoff shortcut and
+    /// Agent actors from `actor/list`. `@...` is a fast directed-send shortcut and
     /// should not surface every historical human actor.
     pub agent_ids: HashSet<String>,
     /// Runtime status per agent when a future source provides it.
     pub agent_statuses: HashMap<String, String>,
     pub reply_target: Option<ReplyTarget>,
-    /// Turns the server has told us are open and not yet closed. Keyed by
-    /// turn id; populated from `turn.opened` / `turn.closed` notifications.
+    /// Runs the server has told us are open and not yet terminal. Keyed by run
+    /// id; populated from `run.updated` notifications.
     /// Used by Esc-cancel and the in-flight status bar.
     pub open_turns: HashMap<String, OpenTurn>,
     pub selected_history_idx: Option<usize>,
@@ -280,8 +280,8 @@ impl App {
         self.status = msg.into();
     }
 
-    pub fn ingest_event(&mut self, ev: &Event) {
-        self.history.push_event(ev);
+    pub fn ingest_message(&mut self, message: &Message) {
+        self.history.push_message(message);
         if self.auto_follow {
             self.selected_history_idx = self.history.newest_replyable_index();
         }
@@ -290,10 +290,10 @@ impl App {
     /// Rebuild the inline @-mention dropdown from the current input. Visible
     /// whenever input starts with `@`; filters by what comes after `@` and
     /// before the first space (so once the user types `@actor_x ` and starts
-    /// the message body, the menu disappears and Enter sends a handoff).
+    /// the message body, the menu disappears and Enter sends a directed message).
     ///
     /// In a private channel the picker is restricted to actors the operator
-    /// can actually hand off to without first inviting: members of the
+    /// can actually message without first inviting: members of the
     /// current channel ∪ "公区" actors (today: union of all Public channel
     /// memberships). Non-members are deliberately *not* listed — explicit
     /// invitation goes through the dedicated invite picker.
@@ -418,7 +418,7 @@ impl App {
 
     /// Rebuild the slash-command dropdown from the current input. The menu
     /// is shown whenever input starts with `/`; it filters by what comes
-    /// after the slash so e.g. `/ha` highlights `/handoff`.
+    /// after the slash so e.g. `/as` highlights `/ask`.
     pub fn update_slash_menu(&mut self) {
         let input = self.input.display_text();
         if let Some(rest) = input.strip_prefix('/') {
@@ -442,10 +442,10 @@ impl App {
         }
     }
 
-    pub fn open_handoff_picker(&mut self, items: Vec<PickerItem>) {
-        let picker = Picker::new("Hand off to…", items);
+    pub fn open_direct_picker(&mut self, items: Vec<PickerItem>) {
+        let picker = Picker::new("Send to…", items);
         self.picker = Some(picker);
-        self.mode = Mode::Picker(PickerKind::HandoffTarget);
+        self.mode = Mode::Picker(PickerKind::DirectTarget);
     }
 
     /// Number of `action.request` events the local actor still owes a
@@ -491,7 +491,7 @@ impl App {
             .map(|(id, label)| PickerItem::new(id, label))
             .collect::<Vec<_>>();
         if items.is_empty() {
-            self.set_status("no replyable events in this thread");
+            self.set_status("no replyable messages in this thread");
             return;
         }
         let picker = Picker::new("Reply to…", items);
@@ -504,9 +504,9 @@ impl App {
         self.mode = Mode::Normal;
     }
 
-    pub fn set_reply_target(&mut self, event_id: String, preview: String) {
+    pub fn set_reply_target(&mut self, message_id: String, preview: String) {
         self.reply_target = Some(ReplyTarget {
-            event_id: event_id.clone(),
+            message_id: message_id.clone(),
             preview: preview.clone(),
         });
         self.set_status(format!("reply → {}", preview));
@@ -554,7 +554,7 @@ impl App {
                 self.auto_follow = false;
             }
             None if self.selected_history_idx.is_none() => {
-                self.set_status("no replyable events in this thread");
+                self.set_status("no replyable messages in this thread");
             }
             None => {}
         }
@@ -611,18 +611,16 @@ fn short_actor_ref(id: &str) -> String {
 
 pub fn slash_command_items() -> Vec<PickerItem> {
     vec![
-        PickerItem::new("/handoff", "Hand off to an agent or human")
-            .with_hint("offer turn to another actor"),
-        PickerItem::new("/reply", "Reply to a previous event")
-            .with_hint("sets replies_to for the next message"),
+        PickerItem::new("/ask", "Send to an agent or human")
+            .with_hint("direct the next message to another actor"),
+        PickerItem::new("/reply", "Reply to a previous message")
+            .with_hint("sets the parent message for the next send"),
         PickerItem::new("/action", "Respond to a pending action.request"),
         PickerItem::new("/agents", "List active agents in the thread"),
         PickerItem::new("/cancel", "Cancel an in-flight agent turn")
             .with_hint("/cancel @agent for a specific one"),
         PickerItem::new("/invite", "Invite an actor into the current channel"),
         PickerItem::new("/members", "List members of the current channel"),
-        PickerItem::new("/announce", "Pin an announcement to the right panel")
-            .with_hint("/announce clear to remove"),
         PickerItem::new("/quit", "Leave the chat"),
     ]
 }
@@ -690,6 +688,7 @@ mod tests {
             Channel {
                 id: "ch_design".into(),
                 title: "design".into(),
+                topic: String::new(),
                 visibility: ChannelVisibility::Private,
                 members: vec!["actor_human_current".into(), "actor_agent_alpha".into()],
                 _meta: None,
@@ -697,6 +696,7 @@ mod tests {
             Channel {
                 id: "ch_lobby".into(),
                 title: "lobby".into(),
+                topic: String::new(),
                 visibility: ChannelVisibility::Public,
                 members: vec!["actor_agent_gamma".into()],
                 _meta: None,
@@ -708,7 +708,7 @@ mod tests {
                 id: "thread_demo".into(),
                 channel_id: "ch_design".into(),
                 title: "demo".into(),
-                root_event_id: "evt_root".into(),
+                root_message_id: "evt_root".into(),
                 archived_at: None,
                 _meta: None,
             }],
@@ -753,6 +753,7 @@ mod tests {
         sidebar.replace_channels(vec![Channel {
             id: "ch_lobby".into(),
             title: "lobby".into(),
+            topic: String::new(),
             visibility: ChannelVisibility::Public,
             members: vec![],
             _meta: None,
@@ -763,7 +764,7 @@ mod tests {
                 id: "thread_demo".into(),
                 channel_id: "ch_lobby".into(),
                 title: "demo".into(),
-                root_event_id: "evt_root".into(),
+                root_message_id: "evt_root".into(),
                 archived_at: None,
                 _meta: None,
             }],
@@ -843,10 +844,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "older".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_1".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_1".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         app.history.bubbles.push(Bubble {
             actor_id: "system".into(),
@@ -854,10 +854,9 @@ mod tests {
             kind: BubbleKind::System,
             text: "system".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: None,
+            reply_to_source_id: None,
+            trailing_source_id: None,
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
         app.history.bubbles.push(Bubble {
             actor_id: "actor_agent_beta".into(),
@@ -865,10 +864,9 @@ mod tests {
             kind: BubbleKind::Stream,
             text: "newer".into(),
             ts: Utc::now(),
-            reply_to_event_id: None,
-            trailing_event_id: Some("evt_2".into()),
+            reply_to_source_id: None,
+            trailing_source_id: Some("evt_2".into()),
             delivery: DeliveryState::NotApplicable,
-            handoff_target: None,
         });
 
         app.select_older_history();

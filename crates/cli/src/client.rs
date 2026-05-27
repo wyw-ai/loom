@@ -131,7 +131,7 @@ impl Client {
     #[cfg(not(unix))]
     pub async fn connect_daemon_socket(_path: &Path) -> Result<Arc<Self>> {
         Err(anyhow!(
-            "joi daemon IPC is only supported on Unix platforms"
+            "loom-daemon IPC is only supported on Unix platforms"
         ))
     }
 
@@ -261,7 +261,7 @@ impl Client {
                 method::INITIALIZE,
                 Some(json!({
                     "protocolVersion": proto::PROTOCOL_VERSION,
-                    "clientInfo": { "name": "joi-cli", "title": "Joi CLI", "version": env!("CARGO_PKG_VERSION") },
+                    "clientInfo": { "name": "loom-cli", "title": "Loom CLI", "version": env!("CARGO_PKG_VERSION") },
                 })),
             )
             .await?;
@@ -280,7 +280,7 @@ impl Client {
     /// Open a connection bound to `actor_id` with an explicit `actor_kind`
     /// (`"human"` or `"agent"`). The daemon-managed agent worker uses this to
     /// register one connection per managed agent so the server's actor-inbox
-    /// delivery routes hands_off_to events to the right WS.
+    /// delivery routes directed_to events to the right WS.
     pub async fn open_connection_as(
         &self,
         actor_id: &str,

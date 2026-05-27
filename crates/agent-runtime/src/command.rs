@@ -4,7 +4,7 @@
 //! child process and streams every prompt through one ACP session — this adapter
 //! spawns a fresh subprocess for each prompt. State persists across prompts by
 //! delegating to the underlying CLI's own session/resume mechanism (`claude
-//! --resume <id>`, `codex resume`, etc.); joi only bookkeeps the
+//! --resume <id>`, `codex resume`, etc.); loom only bookkeeps the
 //! `(actor_id, scope_id) -> session_id` mapping in
 //! `<agent-client-data>/sessions/<actor>/<scope_id>.json`.
 //!
@@ -216,7 +216,7 @@ impl Adapter for CommandAdapter {
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
         // Command transport does not surface permission prompts (no reverse
-        // channel from the one-shot subprocess back into joi). Anyone calling
+        // channel from the one-shot subprocess back into Loom). Anyone calling
         // this for a command adapter has a bug elsewhere; report it loudly.
         Err("command transport does not support action requests".into())
     }
@@ -256,7 +256,7 @@ impl Adapter for CommandAdapter {
 }
 
 /// Send SIGTERM to `pid`. Unix only — Windows builds get a stub error so
-/// callers know cancel isn't wired there yet (joi-server's audience is Unix).
+/// callers know cancel isn't wired there yet (loom-server's audience is Unix).
 #[cfg(unix)]
 fn signal_child(pid: u32) -> Result<(), String> {
     signal_child_with(pid, libc::SIGTERM)
@@ -448,7 +448,7 @@ fn spawn_and_collect(
         cmd.env(k, v);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
-        cmd.env("JOI_PROMPT", &prompt.content);
+        cmd.env("LOOM_PROMPT", &prompt.content);
     }
     configure_process_group(&mut cmd);
     let mut child = cmd
@@ -507,6 +507,7 @@ fn spawn_and_collect(
     });
 
     let mut collected_stdout = String::new();
+    let mut emitted_text = false;
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
@@ -523,7 +524,7 @@ fn spawn_and_collect(
     loop {
         while let Ok(line) = stdout_rx.try_recv() {
             last_stdout_at = Instant::now();
-            collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+            emitted_text |= collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
         }
 
         if let Some(status) = child
@@ -575,7 +576,8 @@ fn spawn_and_collect(
         match stdout_rx.recv_timeout(wait_for) {
             Ok(line) => {
                 last_stdout_at = Instant::now();
-                collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout)
+                emitted_text |=
+                    collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -592,7 +594,7 @@ fn spawn_and_collect(
     };
     let _ = stdout_handle.join();
     for line in stdout_rx.try_iter() {
-        collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+        emitted_text |= collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
     }
     let collected_stderr = stderr_handle.join().unwrap_or_default();
     let exit_code = exit.code().unwrap_or(-1);
@@ -650,7 +652,7 @@ fn spawn_and_collect(
                 });
             }
         }
-        CommandOutputFormat::CodexStreamJson => {
+        CommandOutputFormat::CodexStreamJson if !emitted_text => {
             if let Some(content) = extract_codex_json_final_text(&collected_stdout) {
                 let _ = sender.send(AdapterEvent::Text {
                     scope: Some(prompt.scope.clone()),
@@ -659,6 +661,7 @@ fn spawn_and_collect(
                 });
             }
         }
+        CommandOutputFormat::CodexStreamJson => {}
         _ => {
             // Force a buffer flush downstream by emitting an empty
             // is_partial=false Text frame; the runtime's `take_text_buffer`
@@ -700,20 +703,20 @@ fn collect_stdout_line(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     line: &str,
     collected_stdout: &mut String,
-) {
+) -> bool {
     collected_stdout.push_str(line);
     let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
     match cfg.output_format {
         CommandOutputFormat::NdjsonLines => {
-            translate_ndjson_line(parsed_line, &prompt.scope, sender);
+            translate_ndjson_line(parsed_line, &prompt.scope, sender)
         }
         CommandOutputFormat::ClaudeStreamJson => {
-            translate_claude_stream_line(parsed_line, &prompt.scope, sender);
+            translate_claude_stream_line(parsed_line, &prompt.scope, sender)
         }
         CommandOutputFormat::CodexStreamJson => {
-            translate_codex_event_line(parsed_line, &prompt.scope, sender);
+            translate_codex_event_line(parsed_line, &prompt.scope, sender)
         }
-        CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => {}
+        CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => false,
     }
 }
 
@@ -734,12 +737,13 @@ fn translate_ndjson_line(
     line: &str,
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
-) {
+) -> bool {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    let mut emitted_text = false;
     match kind {
         "text" => {
             if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
@@ -748,6 +752,7 @@ fn translate_ndjson_line(
                     content: t.to_string(),
                     is_partial: true,
                 });
+                emitted_text = true;
             }
         }
         "tool" => {
@@ -786,18 +791,20 @@ fn translate_ndjson_line(
         // outside the per-line loop, so nothing to do here.
         _ => {}
     }
+    emitted_text
 }
 
 fn translate_claude_stream_line(
     line: &str,
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
-) {
+) -> bool {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let outer = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    let mut emitted_text = false;
     match outer {
         "assistant" => {
             let blocks = v
@@ -813,8 +820,9 @@ fn translate_claude_stream_line(
                             let _ = sender.send(AdapterEvent::Text {
                                 scope: Some(scope.clone()),
                                 content: t.to_string(),
-                                is_partial: true,
+                                is_partial: false,
                             });
+                            emitted_text = true;
                         }
                     }
                     "tool_use" => {
@@ -839,19 +847,65 @@ fn translate_claude_stream_line(
         "user" | "system" | "result" => {}
         _ => {}
     }
+    emitted_text
 }
 
 fn translate_codex_event_line(
     line: &str,
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
-) {
+) -> bool {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
+    let mut emitted_text = false;
     if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
         match t {
+            "task_complete" | "task.completed" => {
+                if let Some(text) = string_at_paths(
+                    &v,
+                    &["/last_agent_message", "/lastAgentMessage", "/message"],
+                )
+                .or_else(|| {
+                    v.get("last_agent_message")
+                        .and_then(codex_response_item_text)
+                })
+                .or_else(|| codex_content_text(v.get("last_agent_message")?))
+                .and_then(non_blank)
+                {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(scope.clone()),
+                        content: text,
+                        is_partial: false,
+                    });
+                    emitted_text = true;
+                }
+            }
+            "agent_message" | "agent.message" => {
+                if let Some(text) = codex_message_event_text(&v).and_then(non_blank) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(scope.clone()),
+                        content: text,
+                        is_partial: false,
+                    });
+                    emitted_text = true;
+                }
+            }
+            "item_completed" | "item.completed" | "raw_response_item" | "raw.response_item" => {
+                if let Some(text) = v
+                    .get("item")
+                    .and_then(codex_response_item_text)
+                    .and_then(non_blank)
+                {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(scope.clone()),
+                        content: text,
+                        is_partial: false,
+                    });
+                    emitted_text = true;
+                }
+            }
             "tool_call" => {
                 let name = v
                     .get("name")
@@ -877,6 +931,7 @@ fn translate_codex_event_line(
             _ => {}
         }
     }
+    emitted_text
 }
 
 fn extract_codex_json_final_text(stdout: &str) -> Option<String> {
@@ -1359,7 +1414,7 @@ fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String
         env.entry(k.clone()).or_insert_with(|| v.clone());
     }
     if let Some(model) = active_model(request) {
-        env.entry("JOI_AGENT_MODEL".into()).or_insert(model);
+        env.entry("LOOM_AGENT_MODEL".into()).or_insert(model);
     }
     env
 }
@@ -1385,7 +1440,7 @@ mod tests {
             resume_args: None,
             output_format: CommandOutputFormat::Text,
             prompt_via: PromptVia::Args,
-            sessions_dir: PathBuf::from("/tmp/joi-test-sessions"),
+            sessions_dir: PathBuf::from("/tmp/loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
             command_signature: "sha256:test".into(),
@@ -1625,6 +1680,87 @@ mod tests {
     }
 
     #[test]
+    fn claude_stream_assistant_text_is_a_complete_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll inspect it."}]}}"#;
+
+        assert!(translate_claude_stream_line(line, &scope(), &tx));
+
+        match rx.try_recv().expect("text event") {
+            AdapterEvent::Text {
+                content,
+                is_partial,
+                ..
+            } => {
+                assert_eq!(content, "I'll inspect it.");
+                assert!(!is_partial);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_stream_item_completed_emits_complete_messages() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let first = r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"First"}}"#;
+        let final_msg = r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Final"}}"#;
+
+        assert!(translate_codex_event_line(first, &scope(), &tx));
+        assert!(translate_codex_event_line(final_msg, &scope(), &tx));
+
+        let mut messages = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AdapterEvent::Text {
+                    content,
+                    is_partial,
+                    ..
+                } => {
+                    assert!(!is_partial);
+                    messages.push(content);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(messages, vec!["First", "Final"]);
+    }
+
+    #[test]
+    fn codex_stream_does_not_duplicate_completed_messages_at_process_end() {
+        let mut cfg = cfg();
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' \
+             '{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"First\"}}' \
+             '{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"Final\"}}'"
+                .into(),
+        ];
+        cfg.output_format = CommandOutputFormat::CodexStreamJson;
+        cfg.prompt_via = PromptVia::Stdin;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert_eq!(outcome.exit_code, 0);
+        let mut messages = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Text {
+                content,
+                is_partial,
+                ..
+            } = event
+            {
+                assert!(!is_partial);
+                messages.push(content);
+            }
+        }
+        assert_eq!(messages, vec!["First", "Final"]);
+    }
+
+    #[test]
     fn template_expands_scope_and_session_and_prompt() {
         let cfg = cfg();
         let request = prompt("hello world");
@@ -1770,7 +1906,7 @@ mod tests {
     #[test]
     fn save_session_preserves_created_at_and_updates_last_used() {
         let mut cfg = cfg();
-        let root = std::env::temp_dir().join(format!("joi-command-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
         cfg.sessions_dir = root.join("sessions");
         let scope = named_scope(ScopeKind::Channel, "chan");
 
@@ -1813,13 +1949,13 @@ mod tests {
     #[test]
     fn expanded_env_keeps_spec_values_and_adds_request_defaults() {
         let mut cfg = cfg();
-        cfg.env.insert("JOI_SERVER".into(), "ws://spec".into());
+        cfg.env.insert("LOOM_SERVER".into(), "ws://spec".into());
         cfg.env
             .insert("WORKSPACE".into(), "{agent.workspace}".into());
         let mut request = prompt("hello");
         request
             .env
-            .insert("JOI_SERVER".into(), "ws://runtime".into());
+            .insert("LOOM_SERVER".into(), "ws://runtime".into());
         request
             .env
             .insert("AGENTX_CHANNEL_ID".into(), "channel_1".into());
@@ -1829,7 +1965,10 @@ mod tests {
 
         let env = expanded_env(&cfg, &request);
 
-        assert_eq!(env.get("JOI_SERVER").map(String::as_str), Some("ws://spec"));
+        assert_eq!(
+            env.get("LOOM_SERVER").map(String::as_str),
+            Some("ws://spec")
+        );
         assert_eq!(
             env.get("WORKSPACE").map(String::as_str),
             Some("/tmp/channel/workspace")

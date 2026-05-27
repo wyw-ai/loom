@@ -42,12 +42,12 @@ const channels = [
 
 const messages = {
   "product-lab": [
-    ["human", "canfeng", "handoff -> @router: 这条反馈像是已有缺陷，先判断是否需要进入修复流程。"],
+    ["human", "canfeng", "directed -> @router: 这条反馈像是已有缺陷，先判断是否需要进入修复流程。"],
     ["agent", "router", "已在 channel scope 打开判断 turn。复杂任务会创建 task 并交给 discovery。"],
-    ["service", "joi-server", "event stored: content.add + hands_off_to(actor_router) / delivery pending"],
+    ["service", "loom-server", "message stored: message.send + directed_to(actor_router) / delivery pending"],
   ],
   "discovery-desk": [
-    ["agent", "discovery", "已读取 root event、历史 artifact 和仓库索引，正在产出 task-brief.v1。"],
+    ["agent", "discovery", "已读取 root message、历史 artifact 和仓库索引，正在产出 task-brief.v1。"],
     ["service", "repo-cache", "artifact linked: clone_manifest.v1 已准备好 worktree / ro_link mounts。"],
     ["human", "canfeng", "DoD 里补一条：修复后必须附 CI 结果和 MR 链接。"],
   ],
@@ -89,8 +89,8 @@ const actors = [
 ];
 
 const machines = [
-  { id: "local-macbook", name: "Local MacBook", status: "connected", root: "~/.joi", agents: ["canfeng", "discovery", "router"], cpu: "14%", memory: "2.1 GB" },
-  { id: "runner-02", name: "Runner 02", status: "remote", root: "/srv/joi", agents: ["delivery", "service-ci"], cpu: "38%", memory: "6.4 GB" },
+  { id: "local-macbook", name: "Local MacBook", status: "connected", root: "~/.loom", agents: ["canfeng", "discovery", "router"], cpu: "14%", memory: "2.1 GB" },
+  { id: "runner-02", name: "Runner 02", status: "remote", root: "/srv/loom", agents: ["delivery", "service-ci"], cpu: "38%", memory: "6.4 GB" },
 ];
 
 const side = document.querySelector("#workbench-side");
@@ -209,14 +209,14 @@ function renderChat() {
     ${
       state.chatTab === "chat"
         ? `
-          <div class="announcement"><strong>handoff</strong><span>Directed delivery keeps the next actor, scope, task, and approval state visible.</span></div>
+          <div class="announcement"><strong>directed message</strong><span>Directed delivery keeps the next actor, scope, task, and approval state visible.</span></div>
           <div class="content-area">
             <div class="message-list">
               ${scopeMessages().map(([kind, actor, text]) => bubble(kind, actor, text)).join("")}
             </div>
           </div>
           <div class="composer">
-            <div class="streaming" id="streaming-bar">event stream open / ${state.messageSeq} events</div>
+            <div class="streaming" id="streaming-bar">message stream open / ${state.messageSeq} messages</div>
             <form id="prompt-form">
               <input id="prompt-input" autocomplete="off" placeholder="Message #${title}, @agent, or /task" />
               <button class="btn btn--primary" type="submit">Send</button>
@@ -273,9 +273,9 @@ function renderInbox() {
         <div><button class="btn btn--primary" data-action="approve">Approve</button><button class="btn" data-action="reject">Reject</button></div>
       </article>
       <article class="approval-card">
-        <b>router requests ops handoff</b>
+        <b>router requests ops attention</b>
         <p>ops-bridge / live-triage needs an agent to read trace artifacts.</p>
-        <div><button class="btn btn--primary" data-action="handoff">Handoff</button><button class="btn">Defer</button></div>
+        <div><button class="btn btn--primary" data-action="direct-message">Direct</button><button class="btn">Defer</button></div>
       </article>
     </div>
   `;
@@ -340,7 +340,7 @@ function renderSettings() {
       <div><h2>Settings</h2><p>Workspace profile and connection controls</p></div>
     </header>
     <div class="settings-panel">
-      <label><span>Workspace</span><input value="Joi Lab" readonly /></label>
+      <label><span>Workspace</span><input value="Loom Lab" readonly /></label>
       <label><span>Server URL</span><input value="http://127.0.0.1:8787" readonly /></label>
       <label><span>Desktop notifications</span><button class="btn btn--primary" data-action="toggle">Enabled</button></label>
     </div>
@@ -460,7 +460,7 @@ function bindEvents() {
       appendMessage("human", "canfeng", text);
       input.value = "";
       window.setTimeout(() => {
-        appendMessage("agent", "router", "已读取当前 scope 历史，并把建议写回为 content.add。需要权限时会发出 action.request。");
+        appendMessage("agent", "router", "已读取当前 scope 历史，并把建议写回为 message.send。需要权限时会发出 action.request。");
       }, 360);
     });
   }
@@ -470,11 +470,11 @@ function handleAction(action) {
   const actions = {
     search: () => pushToast("Quick switch palette opened"),
     saved: () => pushToast("Saved view opened"),
-    stop: () => appendMessage("service", "joi-daemon", "agent process control belongs to joi daemon; stop request acknowledged."),
+    stop: () => appendMessage("service", "loom-daemon", "agent process control belongs to loom-daemon; stop request acknowledged."),
     rename: () => pushToast("Rename channel modal opened"),
     approve: () => appendMessage("service", "service:ci", "action.result: approved by human; promotion started."),
     reject: () => appendMessage("service", "service:ci", "action.result: rejected by human; no external action executed."),
-    handoff: () => appendMessage("human", "canfeng", "handoff -> @ops-agent: read trace artifacts and report next step."),
+    "direct-message": () => appendMessage("human", "canfeng", "directed -> @ops-agent: read trace artifacts and report next step."),
     "new-task": () => {
       tasks.unshift({ id: `task-${190 + tasks.length}`, channel: parentChannelId(), title: "New task from workspace", status: "todo", owner: "canfeng", artifacts: 0 });
       pushToast("task/create recorded");
@@ -489,7 +489,7 @@ function handleAction(action) {
 }
 
 function renderDownloads() {
-  const release = window.JOI_RELEASE_DOWNLOADS || {};
+  const release = window.LOOM_RELEASE_DOWNLOADS || {};
   const artifacts = Array.isArray(release.artifacts) ? release.artifacts : [];
   const publicArtifacts = artifacts
     .filter((item) => item.kind === "gui" || item.kind === "installer")
@@ -514,7 +514,7 @@ function renderDownloads() {
       return `
       <article class="download-card download-card--${item.kind}">
         <small>${isInstaller ? "install.sh" : "dmg"}</small>
-        <b>${isInstaller ? "Install script" : "Joi Desktop for macOS"}</b>
+        <b>${isInstaller ? "Install script" : "Loom Desktop for macOS"}</b>
         <p>${formatBytes(item.size)} · sha256 ${String(item.sha256).slice(0, 12)}...</p>
         ${isInstaller ? `<pre>curl -fsSL ${item.downloadUrl} | sh -s -- --module all -y</pre>` : ""}
         <a class="btn btn--primary" href="${item.downloadUrl}" target="_blank" rel="noreferrer">${isInstaller ? "Download install.sh" : "Download DMG"}</a>

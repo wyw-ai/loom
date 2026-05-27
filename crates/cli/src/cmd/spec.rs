@@ -1,11 +1,11 @@
-//! `joi agent spec` / `joi service spec` / `joi agent bundle` — read-only
+//! `loom agent spec` / `loom service spec` / `loom agent bundle` — read-only
 //! spec and bundle inspection. Lets a teaching agent (e.g. `teacher`) or
 //! ops examine deployed AgentSpec / ServiceSpec / bundle layouts without
 //! touching the runtime.
 //!
-//! These commands do not contact the joi-server. Specs and bundles are
-//! local config artifacts owned by the operator running `joi agent serve`
-//! / `joi service serve` on the same host.
+//! These commands do not contact the loom-server. Specs and bundles are
+//! local config artifacts owned by the operator running `loom-daemon`
+//! on the same host.
 
 use std::path::PathBuf;
 
@@ -199,12 +199,10 @@ pub fn bundle_get(actor_id: String, file: Option<String>, list: bool) -> Result<
 fn resolve_bundle_dir(actor_id: &str) -> Result<PathBuf> {
     // Match `agent_serve.rs`'s default_data_root semantics so a teacher
     // sees the same bundle the runtime will pick on this host.
-    let data_root = std::env::var_os("JOI_AGENT_DATA_ROOT")
-        .or_else(|| std::env::var_os("AGENTHUB_HOME"))
-        .or_else(|| std::env::var_os("AGENTX_HOME"))
+    let data_root = std::env::var_os("LOOM_AGENT_DATA_ROOT")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|d| d.join(".agentx")))
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve agent data root"))?;
+        .or_else(|| dirs::data_dir().map(|d| d.join("loom").join("agents")))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"));
     let candidate = data_root
         .join("agents")
         .join(actor_id)
@@ -212,7 +210,7 @@ fn resolve_bundle_dir(actor_id: &str) -> Result<PathBuf> {
         .join("current");
     if !candidate.exists() {
         bail!(
-            "bundle not found at {} (agent never served? run `joi agent serve` first)",
+            "bundle not found at {} (agent never served? run `loom-daemon` first)",
             candidate.display()
         );
     }

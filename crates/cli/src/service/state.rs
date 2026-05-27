@@ -4,7 +4,7 @@
 
 //! Per-service file-system state. Pure I/O, no WS, no async — easy to
 //! unit test in isolation. The §10 layout under
-//! `~/.local/share/joi/service-host/services/<service_id>/` is owned by
+//! `~/.local/share/loom/service-host/services/<service_id>/` is owned by
 //! this module; runtime + host route through these helpers so layout
 //! changes only happen here.
 
@@ -18,19 +18,19 @@ use parking_lot::Mutex;
 
 /// Resolve the service-host data root with the standard precedence:
 ///
-/// 1. `JOI_SERVICE_HOST_DATA` env var (used by tests and ops overrides).
-/// 2. `dirs::data_local_dir()/joi/service-host` — Linux
-///    `~/.local/share/joi/service-host`, macOS
-///    `~/Library/Application Support/joi/service-host`. Matches §10.
-/// 3. `./.joi-service-host` as a last-resort relative fallback so the
+/// 1. `LOOM_SERVICE_HOST_DATA` env var (used by tests and ops overrides).
+/// 2. `dirs::data_local_dir()/loom/service-host` — Linux
+///    `~/.local/share/loom/service-host`, macOS
+///    `~/Library/Application Support/loom/service-host`. Matches §10.
+/// 3. `./.loom-service-host` as a last-resort relative fallback so the
 ///    binary still runs in a sandbox without a usable HOME.
 pub fn default_data_root() -> PathBuf {
-    if let Ok(s) = std::env::var("JOI_SERVICE_HOST_DATA") {
+    if let Ok(s) = std::env::var("LOOM_SERVICE_HOST_DATA") {
         return PathBuf::from(s);
     }
     dirs::data_local_dir()
-        .map(|p| p.join("joi").join("service-host"))
-        .unwrap_or_else(|| PathBuf::from("./.joi-service-host"))
+        .map(|p| p.join("loom").join("service-host"))
+        .unwrap_or_else(|| PathBuf::from("./.loom-service-host"))
 }
 
 /// Per-service directory: `<root>/services/<service_id>/`. Pure path
@@ -186,7 +186,7 @@ mod tests {
     use super::*;
 
     fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("joi-svc-state-{}", uuid::Uuid::new_v4().simple()))
+        std::env::temp_dir().join(format!("loom-svc-state-{}", uuid::Uuid::new_v4().simple()))
     }
 
     #[test]

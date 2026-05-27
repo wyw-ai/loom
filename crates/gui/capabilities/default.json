@@ -1,7 +1,7 @@
 {
   "$schema": "../../../apps/gui-web/node_modules/@tauri-apps/cli/schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the Joi Desktop main window.",
+  "description": "Default capabilities for the Loom Desktop main window.",
   "windows": ["main"],
   "permissions": [
     "core:default",

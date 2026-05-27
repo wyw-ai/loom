@@ -70,7 +70,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     };
 
     // In-flight status: 1 dim row above the input, only when at least one
-    // agent has an open turn in this scope. Sourced from `open_turns` so
+    // agent has an open run in this scope. Sourced from `open_turns` so
     // Esc-cancel is discoverable before the final `content.add` arrives.
     let in_flight = if let Some(scope) = app.current_scope() {
         in_flight_turns(app, &scope)
@@ -168,7 +168,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
     };
     let line = Line::from(vec![
         Span::styled(
-            " Joi ",
+            " Loom ",
             Style::default()
                 .bg(Color::Magenta)
                 .fg(Color::White)

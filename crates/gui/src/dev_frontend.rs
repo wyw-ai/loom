@@ -6,7 +6,8 @@ mod imp {
     use std::time::{Duration, Instant};
 
     const DEV_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 5173);
-    const ENV_NO_DEV_SERVER: &str = "JOI_GUI_NO_DEV_SERVER";
+    const ENV_NO_DEV_SERVER: &str = "LOOM_GUI_NO_DEV_SERVER";
+    const LEGACY_ENV_NO_DEV_SERVER: &str = "JOI_GUI_NO_DEV_SERVER";
 
     pub struct DevFrontend {
         child: Option<Child>,
@@ -14,7 +15,10 @@ mod imp {
 
     impl DevFrontend {
         pub fn start_if_needed() -> Self {
-            if env_flag(ENV_NO_DEV_SERVER) || dev_server_reachable() {
+            if env_flag(ENV_NO_DEV_SERVER)
+                || env_flag(LEGACY_ENV_NO_DEV_SERVER)
+                || dev_server_reachable()
+            {
                 return Self { child: None };
             }
 
@@ -40,7 +44,7 @@ mod imp {
                 }
             };
 
-            if wait_for_dev_server(&mut child, Duration::from_secs(10)) {
+            if wait_for_dev_server(&mut child, Duration::from_secs(60)) {
                 tracing::info!("GUI frontend dev server started");
             } else {
                 tracing::warn!("GUI frontend dev server did not become reachable before timeout");

@@ -203,7 +203,7 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "joi-bundle-tests-{name}-{}",
+            "loom-bundle-tests-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock drift")

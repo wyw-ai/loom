@@ -1,4 +1,4 @@
-//! `joi service serve` and `joi service validate` — Stage 4 entry points
+//! `loom service serve` and `loom service validate` — Stage 4 entry points
 //! for the §6 service host. The first wires `ServiceHost` to spec files
 //! on disk; the second is a one-shot validator for ops to sanity-check a
 //! spec before deploying.
@@ -21,7 +21,7 @@ use crate::service::scheduler::SchedulerPlugin;
 use crate::service::{state, ServiceHost};
 
 pub(crate) fn default_specs_dir() -> PathBuf {
-    if let Ok(s) = std::env::var("JOI_SERVICE_SPECS") {
+    if let Ok(s) = std::env::var("LOOM_SERVICE_SPECS") {
         return PathBuf::from(s);
     }
     config::service_specs_dir()
@@ -29,10 +29,10 @@ pub(crate) fn default_specs_dir() -> PathBuf {
 
 /// Load every ServiceSpec under `dir`. Accepts two layouts:
 ///
-/// * **Flat** — `<dir>/<id>.json` (legacy; used by `joi service register`
-///   when ops drop a single file under `~/.config/joi/services/`).
-/// * **Nested** — `<dir>/<id>/spec.json` (used by the workspace
-///   `data/services/` tree so each spec can ship a `bundle/` sibling).
+/// * **Flat** — `<dir>/<id>.json` (legacy; used by `loom service register`
+///   when ops drop a single file under `~/.config/loom/services/`).
+/// * **Nested** — `<dir>/<id>/spec.json` so each spec can ship a `bundle/`
+///   sibling beside the spec.
 ///
 /// Malformed files are logged and skipped — one bad spec must not block
 /// the rest of the fleet (matches `agent_serve::load_specs` behavior).
@@ -82,7 +82,7 @@ fn push_spec(path: &Path, out: &mut Vec<ServiceSpec>) {
 }
 
 /// Run the service host: load every spec under `--specs` (default
-/// `~/.config/joi/services/`), filter by `--allow-services` if given,
+/// `~/.config/loom/services/`), filter by `--allow-services` if given,
 /// then hand to [`ServiceHost::serve`]. Blocks until Ctrl-C.
 ///
 /// In S1 the host ships **no built-in plugins**, so any spec whose
@@ -124,8 +124,8 @@ pub async fn serve(
     host.serve(specs).await
 }
 
-/// `joi service reload <service_id>` — bump the per-service reload
-/// marker so a running `joi service serve` host re-reads the
+/// `loom service reload <service_id>` — bump the per-service reload
+/// marker so a running `loom service serve` host re-reads the
 /// ServiceSpec and respawns the supervised plugin instance(s) for
 /// that id. See design §7.1.
 pub fn reload(service_id: String) -> Result<()> {
@@ -143,12 +143,12 @@ pub fn reload(service_id: String) -> Result<()> {
             "reload requested  service={service_id}  epoch_ms={epoch}\n  marker={}",
             path.display()
         );
-        println!("(host will respawn on next poll cycle; if no `joi service serve` is running this is a no-op)");
+        println!("(host will respawn on next poll cycle; if no `loom service serve` is running this is a no-op)");
     }
     Ok(())
 }
 
-/// `joi service am-handler --service-id <id>` — per-message AM bridge
+/// `loom service am-handler --service-id <id>` — per-message AM bridge
 /// handler. Stage 4 wires the CLI; the orchestrator + plugin logic
 /// lives in `crate::service::am::handler` (S2).
 pub async fn am_handler(
@@ -161,7 +161,7 @@ pub async fn am_handler(
     crate::service::am::run_handler(server_url, service_id, dir, async_reply).await
 }
 
-/// `joi service validate <path>` — read a single ServiceSpec JSON file,
+/// `loom service validate <path>` — read a single ServiceSpec JSON file,
 /// run `ServiceSpec::validate()`, exit 0 on success, propagate the
 /// error otherwise. Useful in CI / pre-deploy hooks.
 pub fn validate(path: PathBuf) -> Result<()> {
@@ -178,7 +178,7 @@ pub fn validate(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// `joi service start --spec <id> --in <thread> [--params <json>] [--channel <id>]`.
+/// `loom service start --spec <id> --in <thread> [--params <json>] [--channel <id>]`.
 ///
 /// Looks up the ServiceSpec, asserts `lifecycle = thread_bound`, and
 /// writes a per-instance `request.json` under the host data root.
@@ -247,12 +247,12 @@ pub fn start(
             thread,
             path.display()
         );
-        println!("(host will start the instance on next watcher tick; no-op if no `joi service serve` is running)");
+        println!("(host will start the instance on next watcher tick; no-op if no `loom service serve` is running)");
     }
     Ok(())
 }
 
-/// `joi service stop --spec <id> --in <thread>` — remove the instance
+/// `loom service stop --spec <id> --in <thread>` — remove the instance
 /// request file. Safe to call on an instance that's already stopped.
 pub fn stop(spec_id: String, thread: String) -> Result<()> {
     let data_root = state::default_data_root();
@@ -271,7 +271,7 @@ pub fn stop(spec_id: String, thread: String) -> Result<()> {
     Ok(())
 }
 
-/// `joi service status [--spec <id>]` — list active instances. Without
+/// `loom service status [--spec <id>]` — list active instances. Without
 /// a spec filter, walks every spec dir under the host data root.
 pub fn status(spec_id: Option<String>) -> Result<()> {
     let data_root = state::default_data_root();
@@ -451,12 +451,40 @@ mod params_schema_tests {
 #[cfg(test)]
 mod service_spec_loader_tests {
     use super::load_specs;
-    use std::path::PathBuf;
+    use std::fs;
 
     #[test]
-    fn load_real_data_services_preserves_top_level_params_schema() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/services");
-        let specs = load_specs(&dir).expect("load data/services specs");
+    fn load_nested_service_fixture_preserves_top_level_params_schema() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-service-spec-loader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let spec_dir = root.join("neutral-service");
+        fs::create_dir_all(&spec_dir).expect("create spec fixture dir");
+        fs::write(
+            spec_dir.join("spec.json"),
+            r#"{
+              "id": "neutral-service",
+              "kind": "scheduler",
+              "actor": {
+                "id": "actor_service_neutral",
+                "kind": "service",
+                "displayName": "Neutral Service"
+              },
+              "paramsSchema": {
+                "type": "object",
+                "required": ["scope"]
+              }
+            }"#,
+        )
+        .expect("write spec fixture");
+
+        let specs = load_specs(&root).expect("load fixture specs");
+        fs::remove_dir_all(&root).ok();
         let spec_with_schema = specs
             .iter()
             .find(|spec| {

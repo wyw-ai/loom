@@ -25,7 +25,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/package-release.sh [options]
 
-Build and package Joi release artifacts in one command.
+Build and package Loom release artifacts in one command.
 
 Options:
   --skip-build       Package existing dist/release binaries without rebuilding.
@@ -37,7 +37,7 @@ Options:
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
   --out-dir DIR      Package output directory. Defaults to $PACKAGE_OUT_DIR or dist/packages.
   --oss-base-url URL OSS manager origin. Defaults to $OSS_BASE_URL or pre-ai.
-  --oss-group GROUP  OSS group. Defaults to joi-apps-releases-<version>-<git-sha>.
+  --oss-group GROUP  OSS group. Defaults to loom-releases-<version>-<git-sha>.
   -h, --help         Show this help.
 
 Environment:
@@ -114,14 +114,14 @@ fi
 
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GENERATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/joi-package.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/loom-package.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 sanitize_oss_group_part() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-'
 }
 
 if [[ -z "$OSS_GROUP" ]]; then
-  OSS_GROUP="joi-apps-releases-$(sanitize_oss_group_part "$VERSION")-$(sanitize_oss_group_part "$GIT_SHA")"
+  OSS_GROUP="loom-releases-$(sanitize_oss_group_part "$VERSION")-$(sanitize_oss_group_part "$GIT_SHA")"
 fi
 
 RUNTIME_TARGETS=(
@@ -166,29 +166,32 @@ checksum_cmd() {
 package_runtime_target() {
   local target="$1"
   local src_dir="$DIST_DIR/$PROFILE/$target"
-  local package_name="joi-runtime-$VERSION-$target"
+  local package_name="loom-runtime-$VERSION-$target"
   local stage_dir="$TMP_DIR/$package_name"
   local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
 
-  ensure_file "$src_dir/joi"
-  ensure_file "$src_dir/joi-server"
+  ensure_file "$src_dir/loom"
+  ensure_file "$src_dir/loom-daemon"
+  ensure_file "$src_dir/loom-server"
 
   rm -rf "$stage_dir"
   mkdir -p "$stage_dir/bin"
-  cp "$src_dir/joi" "$stage_dir/bin/joi"
-  cp "$src_dir/joi-server" "$stage_dir/bin/joi-server"
-  chmod 0755 "$stage_dir/bin/joi" "$stage_dir/bin/joi-server"
+  cp "$src_dir/loom" "$stage_dir/bin/loom"
+  cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
+  cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
+  chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
 
   cat >"$stage_dir/README.txt" <<EOF
-Joi runtime package
+Loom runtime package
 
 Version: $VERSION
 Git SHA: $GIT_SHA
 Target: $target
 
 Contents:
-- bin/joi: CLI and daemon host. Run the daemon with "joi daemon".
-- bin/joi-server: WebSocket collaboration server.
+- bin/loom: operator CLI.
+- bin/loom-daemon: machine-scoped agent and service host.
+- bin/loom-server: WebSocket collaboration server.
 EOF
 
   tar -C "$TMP_DIR" -czf "$archive" "$package_name"
@@ -202,8 +205,8 @@ package_gui_dmg() {
   fi
 
   local target="aarch64-apple-darwin"
-  local src_joi="$DIST_DIR/$PROFILE/$target/joi"
-  ensure_file "$src_joi"
+  local src_loom="$DIST_DIR/$PROFILE/$target/loom"
+  ensure_file "$src_loom"
 
   log "building GUI app bundle for $target"
   (
@@ -211,39 +214,39 @@ package_gui_dmg() {
     "$CARGO" tauri build --target "$target" --bundles app --ci
   )
 
-  local app="target/$target/release/bundle/macos/Joi Desktop.app"
+  local app="target/$target/release/bundle/macos/Loom Desktop.app"
   if [[ ! -d "$app" ]]; then
     echo "Tauri build finished but no app bundle was found at $app" >&2
     exit 1
   fi
 
-  local out="$PACKAGE_OUT_DIR/joi-gui-$VERSION-aarch64-apple-darwin.dmg"
+  local out="$PACKAGE_OUT_DIR/loom-gui-$VERSION-aarch64-apple-darwin.dmg"
   local resources_dir="$app/Contents/Resources/bin"
   mkdir -p "$resources_dir"
-  cp "$src_joi" "$resources_dir/joi"
-  chmod 0755 "$resources_dir/joi"
+  cp "$src_loom" "$resources_dir/loom"
+  chmod 0755 "$resources_dir/loom"
 
   if command -v codesign >/dev/null 2>&1; then
     codesign --force --deep --sign - "$app"
   fi
 
   local stage_dir
-  stage_dir="$(mktemp -d "/private/tmp/joi-gui-dmg.XXXXXX")"
+  stage_dir="$(mktemp -d "/private/tmp/loom-gui-dmg.XXXXXX")"
   if command -v ditto >/dev/null 2>&1; then
-    ditto "$app" "$stage_dir/Joi Desktop.app"
+    ditto "$app" "$stage_dir/Loom Desktop.app"
   else
-    cp -R "$app" "$stage_dir/Joi Desktop.app"
+    cp -R "$app" "$stage_dir/Loom Desktop.app"
   fi
   ln -s /Applications "$stage_dir/Applications"
   local dmg_dir="target/$target/release/bundle/dmg"
-  local dmg="$dmg_dir/Joi Desktop_${VERSION}_aarch64.dmg"
-  local tmp_dmg="/private/tmp/joi-gui-dmg-output-${VERSION}-$$.dmg"
+  local dmg="$dmg_dir/Loom Desktop_${VERSION}_aarch64.dmg"
+  local tmp_dmg="/private/tmp/loom-gui-dmg-output-${VERSION}-$$.dmg"
   mkdir -p "$dmg_dir"
   rm -f "$dmg" "$out" "$tmp_dmg"
   local attempt=1
   local max_attempts=5
   until hdiutil create \
-      -volname "Joi Desktop" \
+      -volname "Loom Desktop" \
       -srcfolder "$stage_dir" \
       -ov \
       -format UDRO \
@@ -298,9 +301,9 @@ portal_artifact_download_url() {
 
 write_installer() {
   local installer="$PACKAGE_OUT_DIR/install.sh"
-  local runtime_mac="joi-runtime-$VERSION-universal-apple-darwin.tar.gz"
-  local runtime_linux_x86="joi-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
-  local runtime_linux_arm="joi-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
+  local runtime_mac="loom-runtime-$VERSION-universal-apple-darwin.tar.gz"
+  local runtime_linux_x86="loom-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
+  local runtime_linux_arm="loom-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
   local sha_mac sha_linux_x86 sha_linux_arm
 
   ensure_file "$PACKAGE_OUT_DIR/$runtime_mac"
@@ -330,10 +333,10 @@ usage() {
   cat <<'USAGE'
 Usage: install.sh [options]
 
-Install Joi runtime binaries from the current release.
+Install Loom runtime binaries from the current release.
 
 Options:
-  -m, --module MODULE   Module to install: all, joi, joi-server, server.
+  -m, --module MODULE   Module to install: all, loom, loom-daemon, loom-server.
                         Can be repeated or comma-separated. Default: all.
   -t, --target TARGET   Override target package:
                         universal-apple-darwin,
@@ -347,9 +350,9 @@ Options:
 
 Examples:
   sh install.sh
-  sh install.sh --module joi
-  sh install.sh --module joi-server --bin-dir /usr/local/bin
-  sh install.sh --target x86_64-unknown-linux-musl --module joi,joi-server -y
+  sh install.sh --module loom
+  sh install.sh --module loom-server --bin-dir /usr/local/bin
+  sh install.sh --target x86_64-unknown-linux-musl --module loom,loom-daemon,loom-server -y
 USAGE
 }
 
@@ -405,7 +408,7 @@ download_file() {
   url="\$1"
   out="\$2"
   need_cmd curl
-  if [ "\${JOI_INSTALL_KEEP_PROXY:-}" = "1" ]; then
+  if [ "\${LOOM_INSTALL_KEEP_PROXY:-}" = "1" ]; then
     curl -fL --retry 3 --connect-timeout 20 -o "\$out" "\$url"
   else
     env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \\
@@ -418,9 +421,10 @@ normalize_modules() {
   modules=""
   for module in \$(printf '%s' "\$1" | tr ',' ' '); do
     case "\$module" in
-      all) modules="joi joi-server" ;;
-      joi|cli) modules="\$modules joi" ;;
-      server|joi-server) modules="\$modules joi-server" ;;
+      all) modules="loom loom-daemon loom-server" ;;
+      loom) modules="\$modules loom" ;;
+      loom-daemon) modules="\$modules loom-daemon" ;;
+      loom-server) modules="\$modules loom-server" ;;
       "") ;;
       *) die "unknown module: \$module" ;;
     esac
@@ -506,7 +510,7 @@ if [ "\$print_url" -eq 1 ]; then
   exit 0
 fi
 
-printf 'Joi %s (%s)\n' "\$VERSION" "\$GIT_SHA"
+printf 'Loom %s (%s)\n' "\$VERSION" "\$GIT_SHA"
 printf 'target: %s\n' "\$target"
 printf 'modules:%s\n' "\$modules"
 printf 'bin dir: %s\n' "\$bin_dir"
@@ -517,16 +521,16 @@ if [ "\$dry_run" -eq 1 ]; then
 fi
 
 need_cmd tar
-tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/joi-install.XXXXXX")"
+tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
 trap 'rm -rf "\$tmp_dir"' EXIT INT TERM
-archive="\$tmp_dir/joi-runtime.tar.gz"
+archive="\$tmp_dir/loom-runtime.tar.gz"
 
 download_file "\$url" "\$archive"
 actual_sha="\$(sha256_file "\$archive")"
 [ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$url"
 
 tar -xzf "\$archive" -C "\$tmp_dir"
-package_dir="\$(find "\$tmp_dir" -maxdepth 1 -type d -name "joi-runtime-*" | head -1)"
+package_dir="\$(find "\$tmp_dir" -maxdepth 1 -type d -name "loom-runtime-*" | head -1)"
 [ -n "\$package_dir" ] || die "runtime package did not extract correctly"
 
 for module in \$modules; do
@@ -599,8 +603,8 @@ PY
 
 artifact_kind() {
   case "$1" in
-    joi-runtime-*.tar.gz) printf 'runtime' ;;
-    joi-gui-*.dmg) printf 'gui' ;;
+    loom-runtime-*.tar.gz) printf 'runtime' ;;
+    loom-gui-*.dmg) printf 'gui' ;;
     install.sh) printf 'installer' ;;
     SHA256SUMS) printf 'checksums' ;;
     manifest.txt) printf 'manifest' ;;
@@ -611,8 +615,8 @@ artifact_kind() {
 artifact_label() {
   local file_name="$1"
   local label="$file_name"
-  label="${label#joi-runtime-$VERSION-}"
-  label="${label#joi-gui-$VERSION-}"
+  label="${label#loom-runtime-$VERSION-}"
+  label="${label#loom-gui-$VERSION-}"
   label="${label%.tar.gz}"
   label="${label%.dmg}"
   case "$file_name" in
@@ -643,7 +647,7 @@ payload = {
 }
 
 with open(out_path, "w", encoding="utf-8") as f:
-    f.write("window.JOI_RELEASE_DOWNLOADS = ")
+    f.write("window.LOOM_RELEASE_DOWNLOADS = ")
     json.dump(payload, f, ensure_ascii=False, indent=2)
     f.write(";\n")
 PY
@@ -764,8 +768,8 @@ PY
 }
 
 mkdir -p "$PACKAGE_OUT_DIR"
-rm -f "$PACKAGE_OUT_DIR"/joi-runtime-*.tar.gz \
-  "$PACKAGE_OUT_DIR"/joi-gui-*.dmg \
+rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
+  "$PACKAGE_OUT_DIR"/loom-gui-*.dmg \
   "$PACKAGE_OUT_DIR"/install.sh \
   "$PACKAGE_OUT_DIR"/SHA256SUMS \
   "$PACKAGE_OUT_DIR"/manifest.txt

@@ -1,16 +1,16 @@
 # Scheduler Plugin
 
-The `scheduler` plugin runs cron-driven jobs inside `joi service serve`.
+The `scheduler` plugin runs cron-driven jobs inside `loom service serve`.
 Each job ticks on a 5-field UTC schedule, fetches a body (`command` or
-`http`), and writes one Joi event into the configured scope — optionally
-with a `hands_off_to` relation so an agent picks it up.
+`http`), and writes one Loom event into the configured scope — optionally
+with a `directed_to` relation so an agent picks it up.
 
 > 状态：S3 plugin。第一个真正用 §6.2 长进程 trait 的 service。短进程
-> handler（`am`）走 `joi service am-handler`，scheduler 不走那条路。
+> handler（`am`）走 `loom service am-handler`，scheduler 不走那条路。
 
 ## 1. ServiceSpec
 
-放到 `~/.config/joi/services/<id>.json`。最小示例（一条 command job +
+放到 `~/.config/loom/services/<id>.json`。最小示例（一条 command job +
 一条 http job）：
 
 ```json
@@ -61,13 +61,13 @@ with a `hands_off_to` relation so an agent picks it up.
 校验：
 
 ```bash
-joi service validate ~/.config/joi/services/ops_watchers.json
+loom service validate ~/.config/loom/services/ops_watchers.json
 ```
 
 启动：
 
 ```bash
-joi service serve --allow-services ops_watchers
+loom service serve --allow-services ops_watchers
 ```
 
 `channelId` 在 spec 顶层不是 scheduler 必需的（每个 job 自带 scope），
@@ -91,11 +91,11 @@ joi service serve --allow-services ops_watchers
 | `scope.kind` | 是 | – | `thread` 或 `channel`。|
 | `scope.id` | 是 | – | thread id 或 channel id。|
 | `scope.channelId` | `kind=thread` 时必填 | – | scheduler 启动时会 `ensure_channel_member` 这个 channel；`kind=channel` 时省略（channel id 就是 scope id）。|
-| `targetAgent` | 否 | – | 设置后事件带 `hands_off_to -> actor:<id>`；不设置就是纯 logging。|
-| `dedupeBy` | 否 | `payload_hash` | `payload_hash` / `source_event_id` / `none`。`source_event_id` 当前与 `payload_hash` 行为相同（S4 引入 source-side id 提取后才会真正按 source id 去重，schema 留着便于平滑过渡）。|
+| `targetAgent` | 否 | – | 设置后事件带 `directed_to -> actor:<id>`；不设置就是纯 logging。|
+| `dedupeBy` | 否 | `payload_hash` | `payload_hash` / `source_message_id` / `none`。`source_message_id` 当前与 `payload_hash` 行为相同（S4 引入 source-side id 提取后才会真正按 source id 去重，schema 留着便于平滑过渡）。|
 | `cursorBy` | 否 | `none` | `none` 每 tick 都 fire；`body_hash` 把 sha256(body) 写到 `cursors/<id>.json`，下次 tick 命中相同 hash 跳过。`jq:<expr>` 在 §8.3 表里列出但当前未实现，留到后续再补。|
 | `singleInFlight` | 否 | `true` | 同 job 上一次 fire 没结束时，下一次 tick 跳过（warn 日志）。§8.5 默认值。|
-| `awaitReply` | 否 | `false` | 设为 true 时 handoff 后阻塞等 `RespondsTo`；`targetAgent` 必填。结果只用于日志，不回写。|
+| `awaitReply` | 否 | `false` | 设为 true 时 directed message 后阻塞等 `RespondsTo`；`targetAgent` 必填。结果只用于日志，不回写。|
 | `awaitTimeoutSecs` | 否 | `60` | `awaitReply=true` 时的 timeout。Doc 推荐 ≤ tick 间隔的 1/2。|
 
 ## 4. 触发链路
@@ -105,7 +105,7 @@ cron tick
   -> exec_source(command/http)
   -> sha256(body) → cursor diff（body_hash 模式）
   -> dedupe_once(key)            ← §8.4 必须先于 append
-  -> runtime.append_content / handoff
+  -> runtime.send_message / directed message
   -> cursor_save (成功后)
   -> [optional] await_responds_to
 ```
@@ -127,7 +127,7 @@ cron tick
 ## 5. 状态目录
 
 ```text
-~/.local/share/joi/service-host/services/<service_id>/
+~/.local/share/loom/service-host/services/<service_id>/
   cursors/<job_id>.json   # body_hash 模式下的上次 sha256
   dedupe.jsonl            # §8.4 append-only key 表
   logs/                   # 由 host 创建；plugin 暂不直接写
@@ -139,11 +139,11 @@ cursor / dedupe 都是 connector 私有状态，不进 server journal。删掉
 
 ## 6. 与 §9 协议路径的关系
 
-- **handoff event** 携带 `_meta.service = scheduler` + `_meta.jobId`，目标
-  agent 在自己回复里照协议补 `responds_to -> trigger_event_id`（§9.1
+- **directed message event** 携带 `_meta.service = scheduler` + `_meta.jobId`，目标
+  agent 在自己回复里照协议补 `responds_to -> trigger_source_id`（§9.1
   不变量），server 通过 §9.5 把回复反向投递到 `svc_scheduler` 的 inbox。
 - `awaitReply=true` 走的就是 §6.3 `await_responds_to` —— 当前是 polling
-  实现（`delivery/list` 每 500ms），latency 满足 watcher 类报告 job；如果
+  实现（`inbox.list` 每 500ms），latency 满足 watcher 类报告 job；如果
   你的 job 需要秒级 round-trip，等 hybrid drain-then-watch 上线（见
   `docs/service-plugin-system-design.md` §12 S1 已知限制）。
 - `singleInFlight` 是 plugin 级语义；server 不感知。多 host 进程并发跑
@@ -157,7 +157,7 @@ cursor / dedupe 都是 connector 私有状态，不进 server journal。删掉
 - **journal compact / artifact GC** —— server 内部维护任务，应该跟 server
   生命周期一起跑，不是 connector。
 - **delivery retry** —— §9.2 inbox 自带重试语义，scheduler 跑这个会和
-  server 的 receipt/record 互相干扰。
+  server 的 delivery.ack 互相干扰。
 
 ## 8. 常见 cron pattern
 
@@ -178,6 +178,6 @@ UTC 1 点 → `0 1 * * *`）。
 - 临时改成 `*/1 * * * *` + `dryRun` 风格的 source（`echo $(date)` 之类）
   验证链路。
 - `tracing` 等级开到 `debug` 看 cursor 命中 / dedupe 命中：
-  `RUST_LOG=joi_cli::service::scheduler=debug joi service serve …`。
+  `RUST_LOG=loom_cli::service::scheduler=debug loom service serve ...`。
 - 单元测试看 `crates/cli/src/service/scheduler/{cron,source,plugin,spec}.rs`
   的 `mod tests` 部分；调度真值表都在 `cron.rs` 里。

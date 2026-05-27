@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use proto::methods::{method, stream_kind, EventAppendResult, ScopeReadResult};
-use proto::types::{Event, Ref, RefKind, Relation, RelationKind, ScopeKind, ScopeRef};
+use proto::methods::{method, stream_kind, MessageListResult, MessageSendResult, ThreadListResult};
+use proto::types::{
+    AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, ScopeKind, ScopeRef,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::time::Instant;
@@ -77,11 +79,11 @@ pub struct QuestionChoice {
 #[serde(rename_all = "camelCase")]
 struct AskUserQuestionResult {
     status: String,
-    request_event_id: String,
+    request_message_id: String,
     request_id: String,
     question: ReturnedQuestion,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response_event_id: Option<String>,
+    response_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     answered_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,11 +100,11 @@ struct AskUserQuestionResult {
 #[serde(rename_all = "camelCase")]
 struct RequestApprovalResult {
     status: String,
-    request_event_id: String,
+    request_message_id: String,
     request_id: String,
     request: ReturnedApprovalRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response_event_id: Option<String>,
+    response_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approved: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,17 +165,17 @@ pub struct ApprovalArgs {
     pub reject_label: Option<String>,
 }
 
-pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result<()> {
+pub async fn run(client: Arc<Client>, _actor_id: String, args: RunArgs) -> Result<()> {
     let input = read_input(&args)?;
     let scope = resolve_scope(args.scope_id, args.is_channel, input.scope)?;
     let target_actor = first_non_empty(args.to, input.target_actor)
-        .or_else(|| std::env::var("JOI_TRIGGER_ACTOR").ok())
+        .or_else(|| std::env::var("LOOM_TRIGGER_ACTOR").ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            anyhow!("missing target actor; pass --to or run inside a daemon turn with JOI_TRIGGER_ACTOR")
+            anyhow!("missing target actor; pass --to or run inside a daemon turn with LOOM_TRIGGER_ACTOR")
         })?;
     let turn_id = first_non_empty(args.turn_id, input.turn_id)
-        .or_else(|| std::env::var("JOI_TURN_ID").ok())
+        .or_else(|| std::env::var("LOOM_RUN_ID").ok())
         .filter(|value| !value.trim().is_empty());
     let timeout_seconds = args
         .timeout_seconds
@@ -185,7 +187,7 @@ pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result
         bail!("question requires at least one choice; pass --choice id=label or provide choices in JSON");
     }
 
-    let request_id = format!("joi:question:{}", Uuid::new_v4());
+    let request_id = format!("loom:question:{}", Uuid::new_v4());
     let title = first_non_empty(args.title, input.header.or(input.title))
         .unwrap_or_else(|| "Question".into());
     let allow_freeform = input.allow_freeform || args.allow_freeform;
@@ -201,52 +203,18 @@ pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result
         payload["_meta"] = input.meta;
     }
 
-    let _: Value = client
-        .call(method::SCOPE_SUBSCRIBE, json!({ "scope": scope.clone() }))
-        .await
-        .with_context(|| {
-            format!(
-                "scope/subscribe {}:{}",
-                scope_kind_name(scope.kind),
-                scope.id
-            )
-        })?;
-
-    let relations = vec![Relation {
-        kind: RelationKind::HandsOffTo,
-        target: Ref {
-            kind: RefKind::Actor,
-            id: target_actor,
-            _meta: None,
-        },
-        _meta: None,
-    }];
-    let append: EventAppendResult = client
-        .call(
-            method::EVENT_APPEND,
-            json!({
-                "event": {
-                    "type": "action.request",
-                    "actorId": actor_id,
-                    "scope": scope,
-                    "turnId": turn_id,
-                    "payload": payload,
-                    "relations": relations,
-                }
-            }),
-        )
-        .await?;
+    let sent = append_action_request(&client, scope, turn_id, target_actor, payload).await?;
 
     let mut result = AskUserQuestionResult {
         status: "waiting".into(),
-        request_event_id: append.event.id.clone(),
+        request_message_id: sent.message.id.clone(),
         request_id: request_id.clone(),
         question: ReturnedQuestion {
             title: title.clone(),
             text: question_text.clone(),
             choices: choices.clone(),
         },
-        response_event_id: None,
+        response_message_id: None,
         answered_by: None,
         option_id: None,
         kind: None,
@@ -256,27 +224,29 @@ pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result
 
     match wait_for_response(
         &client,
-        &append.event.id,
+        &sent.message.target,
+        &sent.message.id,
         Duration::from_secs(timeout_seconds),
     )
     .await?
     {
         Some(response) => {
             result.status = "answered".into();
-            result.response_event_id = Some(response.id.clone());
-            result.answered_by = Some(response.actor_id.clone());
+            result.response_message_id = Some(response.id.clone());
+            result.answered_by = Some(response.author_actor_id.clone());
             let option_id = response
-                .payload
+                .metadata
                 .get("optionId")
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned);
             let kind = response
-                .payload
-                .get("kind")
+                .metadata
+                .get("responseKind")
+                .or_else(|| response.metadata.get("kind"))
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned);
             let text = response
-                .payload
+                .metadata
                 .get("text")
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned);
@@ -288,7 +258,7 @@ pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result
             result.kind = kind.clone();
             result.text = text.clone();
             result.answer = Some(ReturnedAnswer {
-                answered_by: response.actor_id,
+                answered_by: response.author_actor_id,
                 option_id,
                 label,
                 kind,
@@ -305,7 +275,7 @@ pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result
     } else {
         println!(
             "{}\t{}\t{}",
-            result.status, result.request_event_id, result.request_id
+            result.status, result.request_message_id, result.request_id
         );
         if let Some(option_id) = result.option_id {
             println!("option = {option_id}");
@@ -317,17 +287,21 @@ pub async fn run(client: Arc<Client>, actor_id: String, args: RunArgs) -> Result
     Ok(())
 }
 
-pub async fn run_approval(client: Arc<Client>, actor_id: String, args: ApprovalArgs) -> Result<()> {
+pub async fn run_approval(
+    client: Arc<Client>,
+    _actor_id: String,
+    args: ApprovalArgs,
+) -> Result<()> {
     let input = read_approval_input(&args)?;
     let scope = resolve_scope(args.scope_id, args.is_channel, input.scope)?;
     let target_actor = first_non_empty(args.to, input.target_actor)
-        .or_else(|| std::env::var("JOI_TRIGGER_ACTOR").ok())
+        .or_else(|| std::env::var("LOOM_TRIGGER_ACTOR").ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            anyhow!("missing target actor; pass --to or run inside a daemon turn with JOI_TRIGGER_ACTOR")
+            anyhow!("missing target actor; pass --to or run inside a daemon turn with LOOM_TRIGGER_ACTOR")
         })?;
     let turn_id = first_non_empty(args.turn_id, input.turn_id)
-        .or_else(|| std::env::var("JOI_TURN_ID").ok())
+        .or_else(|| std::env::var("LOOM_RUN_ID").ok())
         .filter(|value| !value.trim().is_empty());
     let timeout_seconds = args
         .timeout_seconds
@@ -354,7 +328,7 @@ pub async fn run_approval(client: Arc<Client>, actor_id: String, args: ApprovalA
         },
     ];
 
-    let request_id = format!("joi:approval:{}", Uuid::new_v4());
+    let request_id = format!("loom:approval:{}", Uuid::new_v4());
     let mut payload = json!({
         "requestId": request_id,
         "requestType": "approval",
@@ -367,15 +341,14 @@ pub async fn run_approval(client: Arc<Client>, actor_id: String, args: ApprovalA
         payload["_meta"] = input.meta;
     }
 
-    let append =
-        append_action_request(&client, &actor_id, scope, turn_id, target_actor, payload).await?;
+    let sent = append_action_request(&client, scope, turn_id, target_actor, payload).await?;
 
     let mut result = RequestApprovalResult {
         status: "waiting".into(),
-        request_event_id: append.event.id.clone(),
+        request_message_id: sent.message.id.clone(),
         request_id,
         request: ReturnedApprovalRequest { title, reason },
-        response_event_id: None,
+        response_message_id: None,
         approved: None,
         approved_by: None,
         option_id: None,
@@ -384,28 +357,30 @@ pub async fn run_approval(client: Arc<Client>, actor_id: String, args: ApprovalA
 
     match wait_for_response(
         &client,
-        &append.event.id,
+        &sent.message.target,
+        &sent.message.id,
         Duration::from_secs(timeout_seconds),
     )
     .await?
     {
         Some(response) => {
             let option_id = response
-                .payload
+                .metadata
                 .get("optionId")
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned);
             let kind = response
-                .payload
-                .get("kind")
+                .metadata
+                .get("responseKind")
+                .or_else(|| response.metadata.get("kind"))
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned);
             let approved =
                 option_id.as_deref() == Some("approve") || kind.as_deref() == Some("accepted");
             result.status = if approved { "approved" } else { "rejected" }.into();
-            result.response_event_id = Some(response.id);
+            result.response_message_id = Some(response.id);
             result.approved = Some(approved);
-            result.approved_by = Some(response.actor_id);
+            result.approved_by = Some(response.author_actor_id);
             result.option_id = option_id;
             result.kind = kind;
         }
@@ -419,7 +394,7 @@ pub async fn run_approval(client: Arc<Client>, actor_id: String, args: ApprovalA
     } else {
         println!(
             "{}\t{}\t{}",
-            result.status, result.request_event_id, result.request_id
+            result.status, result.request_message_id, result.request_id
         );
         if let Some(approved) = result.approved {
             println!("approved = {approved}");
@@ -488,12 +463,11 @@ fn read_approval_input(args: &ApprovalArgs) -> Result<RequestApprovalInput> {
 
 async fn append_action_request(
     client: &Arc<Client>,
-    actor_id: &str,
     scope: ScopeRef,
     turn_id: Option<String>,
     target_actor: String,
     payload: Value,
-) -> Result<EventAppendResult> {
+) -> Result<MessageSendResult> {
     let _: Value = client
         .call(method::SCOPE_SUBSCRIBE, json!({ "scope": scope.clone() }))
         .await
@@ -505,31 +479,70 @@ async fn append_action_request(
             )
         })?;
 
-    let relations = vec![Relation {
-        kind: RelationKind::HandsOffTo,
-        target: Ref {
-            kind: RefKind::Actor,
-            id: target_actor,
-            _meta: None,
-        },
-        _meta: None,
-    }];
+    let mut metadata = action_request_metadata(payload);
+    if let Some(run_id) = turn_id.filter(|value| !value.trim().is_empty()) {
+        metadata.insert("runId".into(), json!(run_id));
+    }
+    let target = message_target_for_scope(client, &scope).await?;
+    let body = action_request_body(&metadata);
     client
         .call(
-            method::EVENT_APPEND,
+            method::MESSAGE_SEND,
             json!({
-                "event": {
-                    "type": "action.request",
-                    "actorId": actor_id,
-                    "scope": scope,
-                    "turnId": turn_id,
-                    "payload": payload,
-                    "relations": relations,
-                }
+                "target": target,
+                "body": body,
+                "audience": [{ "kind": AudienceKind::Actor, "id": target_actor }],
+                "intent": MessageIntent::RequestAction,
+                "deliveryPolicy": DeliveryPolicy::WakeAgent,
+                "metadata": metadata,
             }),
         )
         .await
         .map_err(Into::into)
+}
+
+fn action_request_metadata(payload: Value) -> Meta {
+    let mut metadata = Meta::default();
+    metadata.insert("kind".into(), json!("action.request"));
+    match payload {
+        Value::Object(map) => {
+            for (key, value) in map {
+                metadata.insert(key, value);
+            }
+        }
+        other => {
+            metadata.insert("payload".into(), other);
+        }
+    }
+    metadata
+}
+
+fn action_request_body(metadata: &Meta) -> String {
+    let title = metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Question");
+    let description = metadata
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut body = format!("Action requested: {title}");
+    if !description.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(description);
+    }
+    if let Some(choices) = metadata.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            let id = choice.get("id").and_then(Value::as_str).unwrap_or("");
+            let label = choice.get("label").and_then(Value::as_str).unwrap_or("");
+            if !id.is_empty() || !label.is_empty() {
+                body.push_str(&format!("\n- {id}: {label}"));
+            }
+        }
+    }
+    body
 }
 
 fn resolve_scope(
@@ -550,17 +563,17 @@ fn resolve_scope(
     if let Some(scope) = input_scope {
         return Ok(scope);
     }
-    let id = std::env::var("JOI_SCOPE_ID")
+    let id = std::env::var("LOOM_SCOPE_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("missing scope; pass --in or run inside a daemon turn"))?;
-    let kind = match std::env::var("JOI_SCOPE_KIND")
+    let kind = match std::env::var("LOOM_SCOPE_KIND")
         .unwrap_or_else(|_| "thread".into())
         .as_str()
     {
         "channel" => ScopeKind::Channel,
         "thread" => ScopeKind::Thread,
-        other => bail!("invalid JOI_SCOPE_KIND `{other}`; expected thread or channel"),
+        other => bail!("invalid LOOM_SCOPE_KIND `{other}`; expected thread or channel"),
     };
     Ok(ScopeRef { kind, id })
 }
@@ -593,10 +606,11 @@ fn parse_choice(raw: &str) -> Result<QuestionChoice> {
 
 async fn wait_for_response(
     client: &Arc<Client>,
-    request_event_id: &str,
+    target: &str,
+    request_message_id: &str,
     timeout: Duration,
-) -> Result<Option<Event>> {
-    if let Some(response) = find_response_in_scope_read(client, request_event_id).await? {
+) -> Result<Option<Message>> {
+    if let Some(response) = find_response_in_messages(client, target, request_message_id).await? {
         return Ok(Some(response));
     }
     let deadline = Instant::now() + timeout;
@@ -610,72 +624,56 @@ async fn wait_for_response(
             Ok(None) => return Ok(None),
             Err(_) => return Ok(None),
         };
-        if let Some(event) = response_event_from_notification(notification, request_event_id) {
-            return Ok(Some(event));
-        }
-    }
-}
-
-async fn find_response_in_scope_read(
-    client: &Arc<Client>,
-    request_event_id: &str,
-) -> Result<Option<Event>> {
-    // Best-effort race closer for very fast responders. The notification path
-    // is primary; this mirrors the existing v0 "no direct event/get" pattern.
-    for scope in scopes_visible_to_client(client).await? {
-        let read: ScopeReadResult = client
-            .call(method::SCOPE_READ, json!({ "scope": scope, "limit": 200 }))
-            .await?;
-        if let Some(event) = read
-            .events
-            .into_iter()
-            .find(|event| is_response_to(event, request_event_id))
+        if let Some(message) = response_message_from_notification(notification, request_message_id)
         {
-            return Ok(Some(event));
+            return Ok(Some(message));
         }
     }
-    Ok(None)
 }
 
-async fn scopes_visible_to_client(client: &Arc<Client>) -> Result<Vec<ScopeRef>> {
-    let mut scopes = Vec::new();
-    let threads: proto::methods::ThreadListResult =
-        client.call(method::THREAD_LIST, json!({})).await?;
-    scopes.extend(threads.threads.into_iter().map(|thread| ScopeRef {
-        kind: ScopeKind::Thread,
-        id: thread.id,
-    }));
-    let channels: proto::methods::ChannelListResult =
-        client.call(method::CHANNEL_LIST, json!({})).await?;
-    scopes.extend(channels.channels.into_iter().map(|channel| ScopeRef {
-        kind: ScopeKind::Channel,
-        id: channel.id,
-    }));
-    Ok(scopes)
+async fn find_response_in_messages(
+    client: &Arc<Client>,
+    target: &str,
+    request_message_id: &str,
+) -> Result<Option<Message>> {
+    // Best-effort race closer for very fast responders. The notification path
+    // is primary; fall back to the bounded message history for this scope.
+    let res: MessageListResult = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({ "target": target, "limit": 200 }),
+        )
+        .await?;
+    Ok(res
+        .messages
+        .into_iter()
+        .find(|message| is_response_to(message, request_message_id)))
 }
 
-fn response_event_from_notification(
+fn response_message_from_notification(
     notification: proto::Notification,
-    request_event_id: &str,
-) -> Option<Event> {
+    request_message_id: &str,
+) -> Option<Message> {
     if notification.method != method::STREAM_UPDATE {
         return None;
     }
     let params = notification.params?;
-    if params.get("kind").and_then(|value| value.as_str()) != Some(stream_kind::EVENT_CREATED) {
+    if params.get("kind").and_then(|value| value.as_str()) != Some(stream_kind::MESSAGE_CREATED) {
         return None;
     }
-    let event: Event = serde_json::from_value(params.get("data")?.get("event")?.clone()).ok()?;
-    is_response_to(&event, request_event_id).then_some(event)
+    let message: Message =
+        serde_json::from_value(params.get("data")?.get("message")?.clone()).ok()?;
+    is_response_to(&message, request_message_id).then_some(message)
 }
 
-fn is_response_to(event: &Event, request_event_id: &str) -> bool {
-    event.kind == "action.response"
-        && event.relations.iter().any(|relation| {
-            matches!(relation.kind, RelationKind::RespondsTo)
-                && relation.target.kind == RefKind::Event
-                && relation.target.id == request_event_id
-        })
+fn is_response_to(message: &Message, request_message_id: &str) -> bool {
+    message.metadata.get("kind").and_then(Value::as_str) == Some("action.response")
+        && (message.parent_message_id.as_deref() == Some(request_message_id)
+            || message
+                .metadata
+                .get("requestMessageId")
+                .and_then(Value::as_str)
+                == Some(request_message_id))
 }
 
 fn first_non_empty(left: Option<String>, right: Option<String>) -> Option<String> {
@@ -687,6 +685,24 @@ fn scope_kind_name(kind: ScopeKind) -> &'static str {
     match kind {
         ScopeKind::Channel => "channel",
         ScopeKind::Thread => "thread",
+    }
+}
+
+async fn message_target_for_scope(client: &Arc<Client>, scope: &ScopeRef) -> Result<String> {
+    match scope.kind {
+        ScopeKind::Channel => Ok(format!("#{}", scope.id)),
+        ScopeKind::Thread => {
+            let res: ThreadListResult = client
+                .call(method::THREAD_LIST, json!({ "archived": false }))
+                .await
+                .context("thread/list")?;
+            let thread = res
+                .threads
+                .into_iter()
+                .find(|thread| thread.id == scope.id)
+                .ok_or_else(|| anyhow!("thread {} not found", scope.id))?;
+            Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
+        }
     }
 }
 
@@ -711,45 +727,47 @@ mod tests {
     }
 
     #[test]
-    fn response_notification_matches_responds_to_relation() {
-        let event = Event {
-            id: "evt_response".into(),
-            kind: "action.response".into(),
-            actor_id: "human_alice".into(),
+    fn response_notification_matches_parent_message() {
+        let mut metadata = Meta::default();
+        metadata.insert("kind".into(), json!("action.response"));
+        metadata.insert("optionId".into(), json!("approve"));
+        let message = Message {
+            id: "msg_response".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thr_1".into(),
             },
-            turn_id: None,
-            seq: 1,
-            occurred_at: Utc::now(),
-            payload: json!({ "optionId": "approve", "kind": "accepted" }),
-            relations: vec![Relation {
-                kind: RelationKind::RespondsTo,
-                target: Ref {
-                    kind: RefKind::Event,
-                    id: "evt_request".into(),
-                    _meta: None,
-                },
-                _meta: None,
-            }],
-            _meta: None,
+            target: "#chan:msg_root".into(),
+            author_actor_id: "human_alice".into(),
+            created_at: Utc::now(),
+            kind: proto::types::MessageKind::Human,
+            body: "approved".into(),
+            mentions: Vec::new(),
+            audience: Vec::new(),
+            intent: MessageIntent::Notify,
+            delivery_policy: DeliveryPolicy::WakeAgent,
+            parent_message_id: Some("msg_request".into()),
+            thread_root_message_id: None,
+            task_id: None,
+            attachments: Vec::new(),
+            reactions: Vec::new(),
+            metadata,
         };
         let notification = proto::Notification {
             jsonrpc: "2.0".into(),
             method: method::STREAM_UPDATE.into(),
             params: Some(json!({
-                "kind": stream_kind::EVENT_CREATED,
-                "scope": event.scope,
-                "data": { "event": event },
+                "kind": stream_kind::MESSAGE_CREATED,
+                "scope": message.scope,
+                "data": { "message": message },
             })),
         };
 
-        let matched = response_event_from_notification(notification, "evt_request").unwrap();
-        assert_eq!(matched.id, "evt_response");
+        let matched = response_message_from_notification(notification, "msg_request").unwrap();
+        assert_eq!(matched.id, "msg_response");
         assert_eq!(
             matched
-                .payload
+                .metadata
                 .get("optionId")
                 .and_then(|value| value.as_str()),
             Some("approve")

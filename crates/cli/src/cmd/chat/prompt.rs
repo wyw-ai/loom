@@ -53,9 +53,9 @@ pub enum ConfirmKind {
         display: String,
     },
     /// `@target ...` to a non-member: confirm we should `channel/invite`
-    /// them first, then send the handoff. The original message text is
+    /// them first, then send the message. The original message text is
     /// stashed here so the consumer doesn't have to re-derive it.
-    InviteThenHandoff {
+    InviteThenSend {
         channel_id: String,
         actor_id: String,
         message: String,

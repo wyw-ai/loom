@@ -58,7 +58,7 @@ impl ServiceHost {
     }
 
     /// Enable hot-reload by telling the host where the on-disk spec
-    /// files live. After this, a `joi service reload <id>` bump will
+    /// files live. After this, a `loom service reload <id>` bump will
     /// cause the host to re-read `<dir>/<id>.json`, normalize+validate,
     /// abort the running plugin task, and respawn it with the fresh
     /// spec. See design §7.1.
@@ -139,7 +139,7 @@ impl ServiceHost {
                 ServiceLifecycle::ThreadBound => {
                     // Thread-bound specs ignore `autostart` at the
                     // host level — the watcher always runs so that a
-                    // later `joi service start --in <thread>` writes
+                    // later `loom service start --in <thread>` writes
                     // a request file and is picked up. `autostart`
                     // semantics for thread-bound are reserved for a
                     // future "auto-spawn one instance per existing
@@ -342,7 +342,7 @@ async fn run_one_spec(
         Some(display.as_str())
     };
 
-    // Per §9.4 the second open_connection from a `joi service serve`
+    // Per §9.4 the second open_connection from a `loom service serve`
     // restart preempts the previous (now-dead) binding — the server's
     // `bind_actor` extends the agent preempt rule to Service kind.
     let client = Client::connect(&server_url)
@@ -438,14 +438,14 @@ async fn run_one_instance(
 ///   instance: deletes the `request.json` if still present and drops
 ///   it from `active`.
 /// * For each `active` entry whose request file has disappeared
-///   without the task finishing (`joi service stop` removed it
+///   without the task finishing (`loom service stop` removed it
 ///   externally), aborts the task and drops it.
 /// * **If `bind.auto_stop_on` contains `"thread.closed"`**: each
 ///   tick lists threads visible to the spec's service actor; any
 ///   active instance whose `instance_id` (= bound thread id) is no
 ///   longer in that list is treated as closed → reap (delete
 ///   request.json + drop the join handle), per §4.7.3.
-/// * If `joi service reload <spec.id>` bumps the reload marker, re-read
+/// * If `loom service reload <spec.id>` bumps the reload marker, re-read
 ///   the spec, abort active instance tasks, and let the next tick
 ///   respawn still-requested instances with the new spec.
 /// * On `shutdown` notification, aborts every active task and exits.
@@ -613,7 +613,7 @@ async fn supervise_instances(
         let listed_set: HashSet<String> = listed.iter().cloned().collect();
 
         // 2. Stop instances whose request files have been removed
-        //    externally (`joi service stop`).
+        //    externally (`loom service stop`).
         let to_drop: Vec<String> = active
             .keys()
             .filter(|k| !listed_set.contains(*k))
@@ -779,7 +779,7 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "joi-host-tests-{tag}-{}",
+            "loom-host-tests-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

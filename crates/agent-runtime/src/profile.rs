@@ -116,7 +116,7 @@ fn scaffold_identity_md(p: &ProfileScaffold<'_>) -> String {
             "# {display}\n\
              \n\
              - Role: <one-line role for this actor>\n\
-             - Primary responsibility: describe what you own in this Joi workspace.\n\
+             - Primary responsibility: describe what you own in this Loom workspace.\n\
              - Non-goals: do not invent access to tools or memory you cannot see.\n\
              \n\
              Edit this file freely — it is loaded on every turn as the agent identity section.\n"
@@ -126,7 +126,7 @@ fn scaffold_identity_md(p: &ProfileScaffold<'_>) -> String {
             "# {display}\n\
              \n\
              - Role: {desc}\n\
-             - Primary responsibility: handle tasks that fit this actor's strengths inside Joi.\n\
+             - Primary responsibility: handle tasks that fit this actor's strengths inside Loom.\n\
              - Non-goals: do not invent access to tools or memory you cannot see.\n\
              \n\
              Edit this file freely — it is loaded on every turn as the agent identity section.\n"
@@ -152,7 +152,7 @@ mod tests {
     use super::*;
 
     fn tmpdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("joi-profile-test-{}", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("loom-profile-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

@@ -29,7 +29,7 @@ use ratatui::Terminal;
 use crate::client::Client;
 
 /// Launch the chat TUI. `scope_id` may be empty — that's the sentinel for
-/// "user invoked `joi chat` without `--in`/`--channel`", in which case
+/// "user invoked `loom chat` without `--in`/`--channel`", in which case
 /// `events::run` auto-opens the sidebar so the operator can pick or create
 /// a channel/thread from inside the UI instead of having to quit and re-run.
 pub async fn run(

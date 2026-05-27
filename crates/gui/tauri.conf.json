@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Joi Desktop",
+  "productName": "Loom Desktop",
   "version": "0.1.0",
-  "identifier": "app.joi.desktop",
+  "identifier": "app.loom.desktop",
   "build": {
     "beforeDevCommand": {
       "script": "pnpm dev",
@@ -18,7 +18,7 @@
   "app": {
     "windows": [
       {
-        "title": "Joi Desktop",
+        "title": "Loom Desktop",
         "width": 1280,
         "height": 820,
         "minWidth": 960,
@@ -37,8 +37,8 @@
     "active": true,
     "targets": "all",
     "category": "DeveloperTool",
-    "shortDescription": "Joi multi-actor collaboration desktop client",
-    "longDescription": "Desktop client for Joi — a Discord-styled GUI over the Joi WebSocket protocol, parallel to the `joi chat` TUI.",
+    "shortDescription": "Loom multi-actor collaboration desktop client",
+    "longDescription": "Desktop client for Loom over the Loom WebSocket protocol, parallel to the `loom chat` TUI.",
     "icon": ["icons/icon.png"]
   }
 }

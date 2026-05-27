@@ -1,8 +1,6 @@
-//! Field extraction from `am listen` event JSON. Mirrors the Python
-//! reference (`examples/am-joi-channel-bridge.py`) so behaviour stays
-//! 1:1 during the S2 cutover. The Python tests-on-deployment flow
-//! produces no formal fixtures, so the test cases below encode the
-//! observed message shapes the reference handled.
+//! Field extraction from `am listen` event JSON. The legacy Python
+//! bridge is gone; these tests encode the observed message shapes it
+//! handled so the Rust handler keeps that coverage.
 
 use serde_json::Value;
 use std::collections::HashSet;

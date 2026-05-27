@@ -13,6 +13,7 @@ import type {
   PointerEvent,
   ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import {
   Bell,
@@ -68,6 +69,14 @@ import {
   type Workspace,
 } from "@/ipc/types";
 import { Badge } from "@/components/ui/badge";
+import {
+  AgentIdentityBadge,
+  type AgentIdentityBadgeProps,
+} from "@/components/agent/AgentIdentityBadge";
+import {
+  AgentProviderIcon,
+  agentProviderIconKey,
+} from "@/components/agent/AgentProviderIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -173,6 +182,11 @@ type ChannelMemberPanelItem = {
 const supportedReactionEmojis = ["👍", "👀", "✅", "🥳", "💔"];
 const avatarCount = 25;
 const agentAvatarIndexes = [1, 5, 10, 15, 20, 25] as const;
+const agentMessageBadgePopoverScale = 0.5;
+const agentMessageBadgeCompactWidth = 256;
+const agentMessageBadgeDetailWidth = 668;
+const agentMessageBadgeCompactHeight = 490;
+const agentMessageBadgeDetailHeight = 1352;
 const avatarLibraryUrls = Array.from(
   { length: avatarCount },
   (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
@@ -202,6 +216,7 @@ export function App() {
   const [connection, setConnection] = useState<ConnectionState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
+  const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [channelGroups, setChannelGroups] = useState<ChannelGroup[]>(() =>
     loadChannelGroups(channelGroupStorageKey(null)),
@@ -291,6 +306,11 @@ export function App() {
   const activeThreadTask = activeThread
     ? tasksBySourceMessageId[activeThread.rootMessageId] ?? null
     : null;
+
+  const openAgentSettings = useCallback((actorId: string) => {
+    setSettingsAgentId(actorId);
+    setView("settings");
+  }, []);
 
   const applyConfig = useCallback((next: DesktopConfig) => {
     setConfig(next);
@@ -649,15 +669,16 @@ export function App() {
         if (channel) setChannels((current) => sortChannels(upsert(current, channel)));
         return;
       }
+      case "channel.deleted": {
+        const channelId = update.data.channelId as string | undefined;
+        if (!channelId) return;
+        applyChannelDeleted(channelId);
+        return;
+      }
       case "channel.revoked": {
         const channelId = update.data.channelId as string | undefined;
         if (!channelId) return;
-        setChannels((current) => current.filter((channel) => channel.id !== channelId));
-        setThreadsByChannel((current) => {
-          const next = { ...current };
-          delete next[channelId];
-          return next;
-        });
+        applyChannelDeleted(channelId);
         return;
       }
       case "thread.created":
@@ -755,6 +776,44 @@ export function App() {
         if (actorId) void refreshInbox(actorId).catch(() => {});
         return;
       }
+    }
+  }
+
+  function applyChannelDeleted(channelId: string) {
+    const deletedThreads = threadsByChannel[channelId] ?? [];
+    const fallbackChannelId =
+      channels.find((channel) => channel.id !== channelId)?.id ?? null;
+    setChannels((current) => current.filter((channel) => channel.id !== channelId));
+    setThreadsByChannel((current) => {
+      const next = { ...current };
+      delete next[channelId];
+      return next;
+    });
+    setTasks((current) => current.filter((task) => task.channelId !== channelId));
+    setThreadStatsById((current) => {
+      const next = { ...current };
+      for (const thread of deletedThreads) delete next[thread.id];
+      return next;
+    });
+    updateChannelGroups((current) =>
+      current.map((group) => ({
+        ...group,
+        channelIds: group.channelIds.filter((id) => id !== channelId),
+      })),
+    );
+    setActiveChannelId((current) =>
+      current === channelId ? fallbackChannelId : current,
+    );
+    setActiveThreadId((current) =>
+      current && deletedThreads.some((thread) => thread.id === current)
+        ? null
+        : current,
+    );
+    if (activeChannelId === channelId) {
+      setChannelPanelTab(null);
+      setReplyTo(null);
+      setMessages([]);
+      setThreadMessages([]);
     }
   }
 
@@ -1025,6 +1084,30 @@ export function App() {
       setActiveChannelId(result.channel.id);
       setActiveThreadId(null);
       setChannelPanelTab(null);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteChannel(channel: Channel, cascade: boolean) {
+    setBusy(`channel:delete:${channel.id}`);
+    setError(null);
+    try {
+      const result = await ipc.channelDelete({
+        channelId: channel.id,
+        cascade,
+      });
+      if (result.deleted) {
+        applyChannelDeleted(channel.id);
+        const deletedThreads = result.deletedThreads ?? 0;
+        pushNotice(
+          deletedThreads > 0
+            ? `Deleted #${channel.title} and ${deletedThreads} threads`
+            : `Deleted #${channel.title}`,
+        );
+      }
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1469,6 +1552,7 @@ export function App() {
             <MessageFeed
               actors={actors}
               feedKey={target ?? "channel:none"}
+              machines={machines}
               messages={messages}
               tasksBySourceMessageId={tasksBySourceMessageId}
               channelThreads={channelThreads}
@@ -1478,6 +1562,7 @@ export function App() {
               onStartThread={startThread}
               onToggleReaction={toggleMessageReaction}
               onAnswerAction={answerAction}
+              onOpenAgentSettings={openAgentSettings}
               currentActorId={workspace?.actorId ?? null}
               busy={busy}
             />
@@ -1500,6 +1585,7 @@ export function App() {
               actors={actors}
               channels={channels}
               messages={messages}
+              machines={machines}
               threadMessages={threadMessages}
               threadStatsById={threadStatsById}
               threads={allThreads}
@@ -1517,6 +1603,7 @@ export function App() {
               onCloseThread={() => setActiveThreadId(null)}
               onSendThreadMessage={sendThreadMessage}
               onToggleReaction={toggleMessageReaction}
+              onOpenAgentSettings={openAgentSettings}
               busy={busy}
               disabled={connection !== "open" || !threadMessageTarget}
             />
@@ -1526,6 +1613,7 @@ export function App() {
             <ErrorBanner error={error} />
             <ChannelsView
               actors={actors}
+              busy={busy}
               channels={channels}
               channelGroups={channelGroups}
               threadsByChannel={threadsByChannel}
@@ -1535,6 +1623,7 @@ export function App() {
                 setActiveThreadId(null);
                 setChannelPanelTab(null);
               }}
+              onDeleteChannel={deleteChannel}
             />
           </>
         ) : view === "inbox" ? (
@@ -1594,6 +1683,7 @@ export function App() {
               agentForm={agentForm}
               setAgentForm={setAgentForm}
               machines={machines}
+              targetAgentId={settingsAgentId}
               onCheckMachines={checkMachines}
               onAddMachine={createMachine}
               onRemoveMachine={removeMachine}
@@ -1623,6 +1713,7 @@ export function App() {
             currentActorId={workspace?.actorId ?? null}
             disabled={connection !== "open" || !threadMessageTarget}
             draft={threadDraft}
+            machines={machines}
             messages={threadMessages}
             setDraft={setThreadDraft}
             task={activeThreadTask}
@@ -1632,6 +1723,7 @@ export function App() {
             onClose={() => setActiveThreadId(null)}
             onSend={sendThreadMessage}
             onToggleReaction={toggleMessageReaction}
+            onOpenAgentSettings={openAgentSettings}
           />
         ) : channelPanelTab && activeChannel ? (
           <ChannelPanel
@@ -2438,6 +2530,7 @@ function ChatHeader({
 function MessageFeed({
   actors,
   feedKey,
+  machines,
   messages,
   tasksBySourceMessageId,
   channelThreads,
@@ -2447,11 +2540,13 @@ function MessageFeed({
   onStartThread,
   onToggleReaction,
   onAnswerAction,
+  onOpenAgentSettings,
   currentActorId,
   busy,
 }: {
   actors: Record<string, Actor>;
   feedKey: string;
+  machines: MachineInfo[];
   messages: Message[];
   tasksBySourceMessageId: Record<string, Task>;
   channelThreads: Thread[];
@@ -2461,6 +2556,7 @@ function MessageFeed({
   onStartThread: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
+  onOpenAgentSettings: (actorId: string) => void;
   currentActorId: string | null;
   busy: string | null;
 }) {
@@ -2513,12 +2609,14 @@ function MessageFeed({
                   key={message.id}
                   actor={actors[message.authorActorId]}
                   actors={actors}
+                  machines={machines}
                   message={message}
                   workflowSourceIds={workflowSourceIds}
                   onReply={onReply}
                   onStartThread={onStartThread}
                   onToggleReaction={onToggleReaction}
                   onAnswerAction={onAnswerAction}
+                  onOpenAgentSettings={onOpenAgentSettings}
                   canStartThread={canUseAsThreadRoot(message)}
                   threadSummary={threadSummary}
                   threadStats={
@@ -2540,12 +2638,14 @@ function MessageFeed({
 function MessageRow({
   actor,
   actors,
+  machines,
   message,
   workflowSourceIds,
   onReply,
   onStartThread,
   onToggleReaction,
   onAnswerAction,
+  onOpenAgentSettings,
   canStartThread,
   threadSummary,
   threadStats,
@@ -2555,12 +2655,14 @@ function MessageRow({
 }: {
   actor?: Actor;
   actors: Record<string, Actor>;
+  machines: MachineInfo[];
   message: Message;
   workflowSourceIds: Set<string>;
   onReply: (message: Message) => void;
   onStartThread: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
+  onOpenAgentSettings: (actorId: string) => void;
   canStartThread: boolean;
   threadSummary: Thread | null;
   threadStats?: ThreadActivityStats;
@@ -2579,7 +2681,14 @@ function MessageRow({
     return <WorkflowEventRow actor={actor} actors={actors} message={message} />;
   }
   if (isWorkflowResultMessage(message, workflowSourceIds)) {
-    return <WorkflowResultRow actor={actor} message={message} />;
+    return (
+      <WorkflowResultRow
+        actor={actor}
+        machines={machines}
+        message={message}
+        onOpenAgentSettings={onOpenAgentSettings}
+      />
+    );
   }
   return (
     <article
@@ -2589,7 +2698,12 @@ function MessageRow({
       )}
     >
       <div className="flex items-start gap-4">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <AgentMessageAvatar
+          actor={actor}
+          fallback={message.authorActorId}
+          machines={machines}
+          onOpenAgentSettings={onOpenAgentSettings}
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
@@ -2847,15 +2961,24 @@ function WorkflowEventRow({
 
 function WorkflowResultRow({
   actor,
+  machines,
   message,
+  onOpenAgentSettings,
 }: {
   actor?: Actor;
+  machines: MachineInfo[];
   message: Message;
+  onOpenAgentSettings: (actorId: string) => void;
 }) {
   return (
     <article className="group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]">
       <div className="flex items-start gap-4">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <AgentMessageAvatar
+          actor={actor}
+          fallback={message.authorActorId}
+          machines={machines}
+          onOpenAgentSettings={onOpenAgentSettings}
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
@@ -3055,6 +3178,7 @@ function ThreadPanel({
   currentActorId,
   disabled,
   draft,
+  machines,
   messages,
   setDraft,
   task,
@@ -3064,6 +3188,7 @@ function ThreadPanel({
   onClose,
   onSend,
   onToggleReaction,
+  onOpenAgentSettings,
 }: {
   actors: Record<string, Actor>;
   channel: Channel | null;
@@ -3071,6 +3196,7 @@ function ThreadPanel({
   currentActorId: string | null;
   disabled: boolean;
   draft: string;
+  machines: MachineInfo[];
   messages: Message[];
   setDraft: (value: string) => void;
   task: Task | null;
@@ -3080,6 +3206,7 @@ function ThreadPanel({
   onClose: () => void;
   onSend: () => void;
   onToggleReaction: (message: Message, emoji: string) => void;
+  onOpenAgentSettings: (actorId: string) => void;
 }) {
   const rootMessage = thread
     ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
@@ -3161,7 +3288,9 @@ function ThreadPanel({
                   actors={actors}
                   busy={busy}
                   currentActorId={currentActorId}
+                  machines={machines}
                   message={rootMessage}
+                  onOpenAgentSettings={onOpenAgentSettings}
                   onToggleReaction={onToggleReaction}
                   root
                 />
@@ -3193,7 +3322,9 @@ function ThreadPanel({
                           actors={actors}
                           busy={busy}
                           currentActorId={currentActorId}
+                          machines={machines}
                           message={message}
+                          onOpenAgentSettings={onOpenAgentSettings}
                           onToggleReaction={onToggleReaction}
                         />
                       ))}
@@ -3221,17 +3352,21 @@ function ThreadConversationMessage({
   actor,
   actors,
   currentActorId,
+  machines,
   message,
   busy,
   root = false,
+  onOpenAgentSettings,
   onToggleReaction,
 }: {
   actor?: Actor;
   actors: Record<string, Actor>;
   currentActorId: string | null;
+  machines: MachineInfo[];
   message: Message;
   busy: string | null;
   root?: boolean;
+  onOpenAgentSettings: (actorId: string) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
 }) {
   const reactions = message.reactions ?? [];
@@ -3248,7 +3383,13 @@ function ThreadConversationMessage({
       )}
     >
       <div className="flex items-start gap-4">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <AgentMessageAvatar
+          actor={actor}
+          fallback={message.authorActorId}
+          machines={machines}
+          onOpenAgentSettings={onOpenAgentSettings}
+          preferredPlacement="left"
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">
@@ -3407,6 +3548,7 @@ function ThreadsView({
   actors,
   channels,
   messages,
+  machines,
   threadMessages,
   threadStatsById,
   threads,
@@ -3420,12 +3562,14 @@ function ThreadsView({
   onCloseThread,
   onSendThreadMessage,
   onToggleReaction,
+  onOpenAgentSettings,
   busy,
   disabled,
 }: {
   actors: Record<string, Actor>;
   channels: Channel[];
   messages: Message[];
+  machines: MachineInfo[];
   threadMessages: Message[];
   threadStatsById: Record<string, ThreadActivityStats>;
   threads: ThreadWithChannel[];
@@ -3439,6 +3583,7 @@ function ThreadsView({
   onCloseThread: () => void;
   onSendThreadMessage: () => void;
   onToggleReaction: (message: Message, emoji: string) => void;
+  onOpenAgentSettings: (actorId: string) => void;
   busy: string | null;
   disabled: boolean;
 }) {
@@ -3505,6 +3650,7 @@ function ThreadsView({
           currentActorId={currentActorId}
           disabled={disabled}
           draft={threadDraft}
+          machines={machines}
           messages={threadMessages}
           setDraft={setThreadDraft}
           task={activeThreadTask}
@@ -3514,6 +3660,7 @@ function ThreadsView({
           onClose={onCloseThread}
           onSend={onSendThreadMessage}
           onToggleReaction={onToggleReaction}
+          onOpenAgentSettings={onOpenAgentSettings}
         />
       </div>
     </section>
@@ -3588,25 +3735,35 @@ function ThreadListCard({
 
 function ChannelsView({
   actors,
+  busy,
   channels,
   channelGroups,
   threadsByChannel,
   activeChannel,
   onSelectChannel,
+  onDeleteChannel,
 }: {
   actors: Record<string, Actor>;
+  busy: string | null;
   channels: Channel[];
   channelGroups: ChannelGroup[];
   threadsByChannel: Record<string, Thread[]>;
   activeChannel: Channel | null;
   onSelectChannel: (channelId: string) => void;
+  onDeleteChannel: (channel: Channel, cascade: boolean) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
+  const [deleteTitleConfirm, setDeleteTitleConfirm] = useState("");
   const filteredChannels = channels.filter((channel) => {
     const text = `${channel.title} ${channel.topic ?? ""} ${channel.visibility}`.toLowerCase();
     return text.includes(query.trim().toLowerCase());
   });
   const sections = channelGroupSections(channelGroups, filteredChannels);
+  const closeDeleteConfirm = () => {
+    setDeleteChannelId(null);
+    setDeleteTitleConfirm("");
+  };
   return (
     <section className="flex min-h-0 flex-1 flex-col bg-white">
       <div className="flex h-[96px] shrink-0 items-center justify-between border-b border-[#e2e6ef] bg-white px-6">
@@ -3636,6 +3793,7 @@ function ChannelsView({
             <span>Type</span>
             <span>Members</span>
             <span>Activity</span>
+            <span className="text-right">Actions</span>
           </div>
           {sections.map((section) => (
             <div key={section.id}>
@@ -3645,16 +3803,40 @@ function ChannelsView({
                   <span>({section.channels.length} channels)</span>
                 </div>
               )}
-              {section.channels.map((channel) => (
-                <ChannelTableRow
-                  key={channel.id}
-                  actors={actors}
-                  channel={channel}
-                  selected={activeChannel?.id === channel.id}
-                  threads={threadsByChannel[channel.id] ?? []}
-                  onSelect={() => onSelectChannel(channel.id)}
-                />
-              ))}
+              {section.channels.map((channel) => {
+                const threads = threadsByChannel[channel.id] ?? [];
+                const deleteBusy = busy === `channel:delete:${channel.id}`;
+                return (
+                  <Fragment key={channel.id}>
+                    <ChannelTableRow
+                      actors={actors}
+                      channel={channel}
+                      deleteBusy={deleteBusy}
+                      selected={activeChannel?.id === channel.id}
+                      threads={threads}
+                      onRequestDelete={() => {
+                        setDeleteChannelId(channel.id);
+                        setDeleteTitleConfirm("");
+                      }}
+                      onSelect={() => onSelectChannel(channel.id)}
+                    />
+                    {deleteChannelId === channel.id && (
+                      <ChannelDeleteConfirm
+                        channel={channel}
+                        confirmTitle={deleteTitleConfirm}
+                        deleteBusy={deleteBusy}
+                        threads={threads}
+                        onCancel={closeDeleteConfirm}
+                        onConfirm={(cascade) => {
+                          onDeleteChannel(channel, cascade);
+                          closeDeleteConfirm();
+                        }}
+                        setConfirmTitle={setDeleteTitleConfirm}
+                      />
+                    )}
+                  </Fragment>
+                );
+              })}
             </div>
           ))}
           {filteredChannels.length === 0 && <EmptyState icon={Hash} text="No channels." />}
@@ -3667,22 +3849,33 @@ function ChannelsView({
 function ChannelTableRow({
   actors,
   channel,
+  deleteBusy,
   selected,
   threads,
+  onRequestDelete,
   onSelect,
 }: {
   actors: Record<string, Actor>;
   channel: Channel;
+  deleteBusy: boolean;
   selected: boolean;
   threads: Thread[];
+  onRequestDelete: () => void;
   onSelect: () => void;
 }) {
   const members = channel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId));
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       className={cn("channel-table-row", selected && "channel-table-row-active")}
       onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
     >
       <span className="flex min-w-0 items-center gap-3">
         <span className="channel-icon">
@@ -3709,7 +3902,82 @@ function ChannelTableRow({
         <Clock size={13} />
         {threads.length > 0 ? `${threads.length} threads` : "No threads"}
       </span>
-    </button>
+      <span className="flex justify-end">
+        <button
+          type="button"
+          title={`Delete #${channel.title}`}
+          disabled={deleteBusy}
+          className="composer-icon h-8 min-w-8 text-red-500 hover:text-red-600"
+          onKeyDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onRequestDelete();
+          }}
+        >
+          {deleteBusy ? <Loader2 className="animate-spin" size={14} /> : <Trash2 size={14} />}
+        </button>
+      </span>
+    </div>
+  );
+}
+
+function ChannelDeleteConfirm({
+  channel,
+  confirmTitle,
+  deleteBusy,
+  threads,
+  onCancel,
+  onConfirm,
+  setConfirmTitle,
+}: {
+  channel: Channel;
+  confirmTitle: string;
+  deleteBusy: boolean;
+  threads: Thread[];
+  onCancel: () => void;
+  onConfirm: (cascade: boolean) => void;
+  setConfirmTitle: (value: string) => void;
+}) {
+  const cascade = threads.length > 0;
+  const titleMatches = confirmTitle.trim() === channel.title;
+  return (
+    <div className="my-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900">
+      <div className="flex items-start gap-3">
+        <Trash2 className="mt-0.5 shrink-0 text-red-500" size={16} />
+        <div className="min-w-0 flex-1">
+          <div className="font-bold">Delete #{channel.title}?</div>
+          <div className="mt-1 text-xs font-medium text-red-700">
+            {cascade
+              ? `This will delete the channel and ${threads.length} thread${threads.length === 1 ? "" : "s"}.`
+              : "This channel has no threads and will be removed."}
+          </div>
+          {cascade && (
+            <Input
+              autoFocus
+              value={confirmTitle}
+              onChange={(event) => setConfirmTitle(event.target.value)}
+              placeholder={`Type ${channel.title} to confirm`}
+              className="mt-3 h-9 rounded-lg border-red-200 bg-white text-sm text-red-900 shadow-none placeholder:text-red-300"
+            />
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button type="button" variant="outline" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            disabled={deleteBusy || (cascade && !titleMatches)}
+            className="bg-red-600 text-white hover:bg-red-700"
+            onClick={() => onConfirm(cascade)}
+          >
+            {deleteBusy ? <Loader2 className="animate-spin" size={13} /> : <Trash2 size={13} />}
+            Delete
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -4073,6 +4341,7 @@ function SettingsView({
   agentForm,
   setAgentForm,
   machines,
+  targetAgentId,
   onCheckMachines,
   onAddMachine,
   onRemoveMachine,
@@ -4087,6 +4356,7 @@ function SettingsView({
   agentForm: AgentFormState;
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
+  targetAgentId: string | null;
   onCheckMachines: () => void;
   onAddMachine: () => void;
   onRemoveMachine: (machineId: string) => void;
@@ -4097,7 +4367,7 @@ function SettingsView({
 }) {
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [hostComposerOpen, setHostComposerOpen] = useState(false);
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
   const memberEntries = agentMemberEntries(machines);
   const selectedMemberEntry =
     selectedAgentId === null
@@ -4131,6 +4401,14 @@ function SettingsView({
       setSelectedAgentId(null);
     }
   }, [memberEntries, selectedAgentId]);
+
+  useEffect(() => {
+    if (!targetAgentId) return;
+    const entry = findAgentMemberEntry(machines, targetAgentId);
+    setSelectedAgentId(targetAgentId);
+    setHostComposerOpen(false);
+    if (entry) setSelectedMachineId(entry.machine.id);
+  }, [machines, targetAgentId]);
 
   function selectMachine(machine: MachineInfo) {
     setSelectedMachineId(machine.id);
@@ -5011,8 +5289,10 @@ function HostDetailSection({
 }
 
 function ProviderBadge({ provider }: { provider: MachineAgentProviderInfo }) {
+  const iconKey = agentProviderIconKey(provider.id, provider.name);
   return (
-    <Badge variant="outline">
+    <Badge variant="outline" className="gap-1.5">
+      {iconKey && <AgentProviderIcon iconKey={iconKey} className="h-3.5 w-3.5" />}
       {provider.name}
       {provider.actorCount > 0 ? ` (${provider.actorCount})` : ""}
     </Badge>
@@ -5782,6 +6062,190 @@ function ActorAvatar({
   );
 }
 
+function AgentMessageAvatar({
+  actor,
+  fallback,
+  machines,
+  onOpenAgentSettings,
+  preferredPlacement = "right",
+  small,
+}: {
+  actor?: Actor;
+  fallback: string;
+  machines: MachineInfo[];
+  onOpenAgentSettings: (actorId: string) => void;
+  preferredPlacement?: "left" | "right";
+  small?: boolean;
+}) {
+  const actorId = actor?.id ?? fallback;
+  const entry = findAgentMemberEntry(machines, actorId);
+  const avatarActor = actor ?? entry?.agent.spec.actor;
+  const [open, setOpen] = useState(false);
+  const [badgeExpanded, setBadgeExpanded] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
+  const anchorRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current === null) return;
+    window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+
+  const updatePopoverPosition = useCallback((expanded = badgeExpanded) => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    const margin = 16;
+    const gap = 12;
+    const fallbackWidth =
+      (expanded ? agentMessageBadgeDetailWidth : agentMessageBadgeCompactWidth) *
+      agentMessageBadgePopoverScale;
+    const fallbackHeight =
+      (expanded ? agentMessageBadgeDetailHeight : agentMessageBadgeCompactHeight) *
+      agentMessageBadgePopoverScale;
+    const content = popoverRef.current?.firstElementChild;
+    const contentRect = content?.getBoundingClientRect();
+    const visualWidth =
+      contentRect && contentRect.width > 0
+        ? Math.min(contentRect.width, window.innerWidth - margin * 2)
+        : Math.min(fallbackWidth, window.innerWidth - margin * 2);
+    const visualHeight =
+      contentRect && contentRect.height > 0 ? contentRect.height : fallbackHeight;
+    const maxVisualHeight = Math.max(120, window.innerHeight - margin * 2);
+    const clampedVisualHeight = Math.min(visualHeight, maxVisualHeight);
+    let left =
+      preferredPlacement === "left"
+        ? rect.left - visualWidth - gap
+        : rect.right + gap;
+
+    if (left + visualWidth > window.innerWidth - margin) {
+      left = rect.left - visualWidth - gap;
+    }
+    if (left < margin) {
+      left = Math.min(window.innerWidth - margin - visualWidth, rect.right + gap);
+    }
+    if (left < margin) left = margin;
+
+    const maxTop = Math.max(margin, window.innerHeight - margin - clampedVisualHeight);
+    const top = Math.max(margin, Math.min(rect.top - 12, maxTop));
+    const availableVisualHeight = Math.max(120, window.innerHeight - top - margin);
+    setPopoverStyle({
+      left,
+      top,
+      "--agent-message-avatar-popover-max-height": `${availableVisualHeight / agentMessageBadgePopoverScale}px`,
+    } as CSSProperties);
+  }, [badgeExpanded, preferredPlacement]);
+
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    if (!open) setBadgeExpanded(false);
+    updatePopoverPosition(false);
+    setOpen(true);
+  }, [clearCloseTimer, open, updatePopoverPosition]);
+
+  const scheduleClose = useCallback(() => {
+    clearCloseTimer();
+    closeTimerRef.current = window.setTimeout(() => setOpen(false), 180);
+  }, [clearCloseTimer]);
+
+  useEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    const reposition = () => updatePopoverPosition();
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open, updatePopoverPosition]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    const popover = popoverRef.current;
+    if (!popover || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => updatePopoverPosition());
+    observer.observe(popover);
+    if (popover.firstElementChild) observer.observe(popover.firstElementChild);
+    return () => observer.disconnect();
+  }, [badgeExpanded, open, updatePopoverPosition]);
+
+  useEffect(() => {
+    if (!open) setBadgeExpanded(false);
+  }, [open]);
+
+  useEffect(() => () => clearCloseTimer(), [clearCloseTimer]);
+
+  if (!entry || avatarActor?.kind !== "agent") {
+    return <ActorAvatar actor={actor} fallback={fallback} small={small} />;
+  }
+
+  const badgeProps = agentIdentityBadgeProps(entry);
+  const entryActorId = entry.agent.spec.actor.id;
+  const display = displayName(avatarActor);
+
+  function openSettings() {
+    setOpen(false);
+    onOpenAgentSettings(entryActorId);
+  }
+
+  const scaledPopoverStyle = {
+    ...popoverStyle,
+    "--agent-message-avatar-popover-scale": agentMessageBadgePopoverScale,
+  } as CSSProperties;
+
+  const popover =
+    open && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            ref={popoverRef}
+            className="agent-message-avatar-popover"
+            style={scaledPopoverStyle}
+            onFocus={openPopover}
+            onMouseEnter={openPopover}
+            onMouseLeave={scheduleClose}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setOpen(false);
+            }}
+          >
+            <AgentIdentityBadge
+              {...badgeProps}
+              onAvatarClick={openSettings}
+              onExpandedChange={setBadgeExpanded}
+            />
+          </div>,
+          document.body,
+        )
+      : null;
+
+  return (
+    <>
+      <span className="agent-message-avatar">
+        <button
+          ref={anchorRef}
+          type="button"
+          className="agent-message-avatar__button"
+          title={`Open ${display} agent settings`}
+          aria-label={`Open ${display} agent settings`}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onClick={openSettings}
+          onFocus={openPopover}
+          onBlur={scheduleClose}
+          onMouseEnter={openPopover}
+          onMouseLeave={scheduleClose}
+        >
+          <ActorAvatar actor={avatarActor} fallback={fallback} small={small} />
+        </button>
+      </span>
+      {popover}
+    </>
+  );
+}
+
 function AvatarStack({
   actors,
   max,
@@ -6103,6 +6567,80 @@ function agentSettingsDraft(
     autostart: Boolean(agent.spec.autostart),
     avatarUrl: agentAvatarValue(agent),
   };
+}
+
+function agentIdentityBadgeProps(entry: AgentMemberEntry): AgentIdentityBadgeProps {
+  const provider = providerForAgent(entry.machine, entry.agent);
+  const providerName = provider?.name || provider?.id || "AI Runtime";
+  const iconKey = agentProviderIconKey(provider?.id, providerName);
+  return {
+    avatarUrl: agentAvatarValue(entry.agent),
+    agentName: agentDisplayName(entry.agent),
+    providerName,
+    providerMark: providerMark(providerName),
+    providerIcon: iconKey ? <AgentProviderIcon iconKey={iconKey} /> : undefined,
+    modelName: agentModelLabel(entry.agent, provider),
+    usedTokensLabel: agentContextUsedLabel(entry.agent),
+    remainingLabel: agentContextRemainingLabel(entry.agent),
+    online: isOnlinePresenceStatus(entry.agent.status, entry.agent),
+  };
+}
+
+function agentModelLabel(
+  agent: MachineInfo["agents"][number],
+  provider?: MachineAgentProviderInfo,
+) {
+  const model = agentModelValue(agent);
+  const modelChoices = [
+    ...(provider?.modelChoices ?? []),
+    ...(agent.spec.models?.choices ?? []),
+  ];
+  return modelChoices.find((choice) => choice.id === model)?.label || model || "Default model";
+}
+
+function providerMark(providerName: string) {
+  if (/anthropic|claude/i.test(providerName)) return "AI";
+  const words = providerName.match(/[A-Za-z0-9]+/g) ?? [];
+  if (words.length >= 2) {
+    const first = words[0]?.[0] ?? "";
+    const second = words[1]?.[0] ?? "";
+    return `${first}${second}`.toUpperCase() || "AI";
+  }
+  return providerName.trim().slice(0, 2).toUpperCase() || "AI";
+}
+
+function agentContextUsedLabel(agent: MachineInfo["agents"][number]) {
+  const meta = agent.spec._meta;
+  const explicit = metadataString(meta, ["contextUsedLabel", "usedTokensLabel"]);
+  if (explicit) return explicit;
+  const used = metadataNumber(meta, ["contextUsedTokens", "usedTokens"]);
+  const total = metadataNumber(meta, ["contextWindowTokens", "totalTokens", "maxTokens"]);
+  if (typeof used === "number" && typeof total === "number" && total > 0) {
+    return `${compactTokenCount(used)} / ${compactTokenCount(total)} tokens`;
+  }
+  return "112.0K / 128.0K tokens";
+}
+
+function agentContextRemainingLabel(agent: MachineInfo["agents"][number]) {
+  const meta = agent.spec._meta;
+  const explicit = metadataString(meta, ["contextRemainingLabel", "remainingLabel"]);
+  if (explicit) return explicit;
+  const remainingPercent = metadataNumber(meta, ["contextRemainingPercent", "remainingPercent"]);
+  if (typeof remainingPercent === "number") {
+    const normalized = remainingPercent <= 1 ? remainingPercent * 100 : remainingPercent;
+    return `${Math.max(0, Math.round(normalized))}%`;
+  }
+  const used = metadataNumber(meta, ["contextUsedTokens", "usedTokens"]);
+  const total = metadataNumber(meta, ["contextWindowTokens", "totalTokens", "maxTokens"]);
+  if (typeof used === "number" && typeof total === "number" && total > 0) {
+    return `${Math.max(0, Math.round(((total - used) / total) * 100))}%`;
+  }
+  return "13%";
+}
+
+function compactTokenCount(value: number) {
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
+  return `${Math.round(value)}`;
 }
 
 function actorAvatarUrl(actor: Actor | undefined, fallback: string) {

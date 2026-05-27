@@ -673,12 +673,12 @@
   }
 
   .channel-table {
-    min-width: 760px;
+    min-width: 840px;
   }
 
   .channel-table-head {
     display: grid;
-    grid-template-columns: minmax(260px, 1.5fr) 96px 136px 136px;
+    grid-template-columns: minmax(260px, 1.5fr) 96px 136px 136px 72px;
     align-items: center;
     gap: 18px;
     padding: 0 8px 10px;
@@ -710,7 +710,7 @@
     display: grid;
     min-height: 48px;
     width: 100%;
-    grid-template-columns: minmax(260px, 1.5fr) 96px 136px 136px;
+    grid-template-columns: minmax(260px, 1.5fr) 96px 136px 136px 72px;
     align-items: center;
     gap: 18px;
     border-bottom: 1px solid #e7eaf2;

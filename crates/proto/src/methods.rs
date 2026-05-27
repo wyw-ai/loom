@@ -2981,6 +2981,7 @@ pub mod stream_kind {
     /// all connections; private channels go to the creator only.
     pub const CHANNEL_CREATED: &str = "channel.created";
     pub const CHANNEL_UPDATED: &str = "channel.updated";
+    pub const CHANNEL_DELETED: &str = "channel.deleted";
     pub const RUN_UPDATED: &str = "run.updated";
     pub const MESSAGE_CREATED: &str = "message.created";
     pub const MESSAGE_UPDATED: &str = "message.updated";

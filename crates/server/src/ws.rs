@@ -368,6 +368,47 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
+    if let StoreEvent::ChannelDeleted {
+        channel_id,
+        visibility,
+        members,
+    } = &ev
+    {
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel_id.clone(),
+        };
+        let payload = json!({
+            "kind": sk::CHANNEL_DELETED,
+            "scope": scope,
+            "data": { "channelId": channel_id },
+        });
+        match visibility {
+            ChannelVisibility::Public => {
+                state
+                    .subscriptions
+                    .broadcast_to_all(method::STREAM_UPDATE, payload);
+                tracing::debug!(
+                    channel = %channel_id,
+                    "channel.deleted broadcast to all",
+                );
+            }
+            ChannelVisibility::Private => {
+                for actor_id in members {
+                    let delivered =
+                        send_actor_inbox(state, actor_id, method::STREAM_UPDATE, payload.clone());
+                    tracing::debug!(
+                        channel = %channel_id,
+                        actor = %actor_id,
+                        delivered,
+                        "channel.deleted actor-inbox push (private)",
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::MessageCreated(m) => (sk::MESSAGE_CREATED, json!({ "message": m })),
@@ -390,8 +431,9 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         }
         StoreEvent::ChannelGranted { .. }
         | StoreEvent::ChannelRevoked { .. }
-        | StoreEvent::ChannelCreated(_) => {
-            unreachable!("channel grant/revoke/created handled above")
+        | StoreEvent::ChannelCreated(_)
+        | StoreEvent::ChannelDeleted { .. } => {
+            unreachable!("channel grant/revoke/create/delete handled above")
         }
     };
     let Some(scope) = scope else {

@@ -1,66 +1,70 @@
 import type { Config } from "tailwindcss";
 
-// Keep the palette in sync with docs/gui-desktop-design.md §4.1. Tokens live
-// as CSS variables (see src/design/tokens.css) so the same values serve
-// inline styles, Tailwind, and any third-party component that wants them.
 const config: Config = {
   darkMode: "class",
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        servers: "var(--bg-servers)",
-        sidebar: "var(--bg-sidebar)",
-        main: "var(--bg-main)",
-        elevated: "var(--bg-elevated)",
-        hover: "var(--bg-hover)",
-        active: "var(--bg-active)",
-        mention: "var(--bg-mention)",
-        border: "var(--border)",
-        primary: "var(--text-primary)",
-        secondary: "var(--text-secondary)",
-        muted: "var(--text-muted)",
-        accent: "var(--accent)",
-        "accent-hover": "var(--accent-hover)",
-        "accent-contrast": "var(--accent-contrast)",
-        success: "var(--success)",
-        warning: "var(--warning)",
-        danger: "var(--danger)",
-        "role-human": "var(--role-human)",
-        "role-agent": "var(--role-agent)",
-        "role-service": "var(--role-service)",
-        "brutal-yellow": "var(--brutal-yellow)",
-        "brutal-pink": "var(--brutal-pink)",
-        "brutal-cyan": "var(--brutal-cyan)",
-        "brutal-lime": "var(--brutal-lime)",
-        "brutal-orange": "var(--brutal-orange)",
-        "brutal-lavender": "var(--brutal-lavender)",
-        "brutal-cream": "var(--brutal-cream)",
+        border: "hsl(var(--border))",
+        input: "hsl(var(--input))",
+        ring: "hsl(var(--ring))",
+        background: "hsl(var(--background))",
+        foreground: "hsl(var(--foreground))",
+        primary: {
+          DEFAULT: "hsl(var(--primary))",
+          foreground: "hsl(var(--primary-foreground))",
+        },
+        secondary: {
+          DEFAULT: "hsl(var(--secondary))",
+          foreground: "hsl(var(--secondary-foreground))",
+        },
+        destructive: {
+          DEFAULT: "hsl(var(--destructive))",
+          foreground: "hsl(var(--destructive-foreground))",
+        },
+        muted: {
+          DEFAULT: "hsl(var(--muted))",
+          foreground: "hsl(var(--muted-foreground))",
+        },
+        accent: {
+          DEFAULT: "hsl(var(--accent))",
+          foreground: "hsl(var(--accent-foreground))",
+        },
+        popover: {
+          DEFAULT: "hsl(var(--popover))",
+          foreground: "hsl(var(--popover-foreground))",
+        },
+        card: {
+          DEFAULT: "hsl(var(--card))",
+          foreground: "hsl(var(--card-foreground))",
+        },
+      },
+      borderRadius: {
+        lg: "var(--radius)",
+        md: "calc(var(--radius) - 2px)",
+        sm: "calc(var(--radius) - 4px)",
       },
       fontFamily: {
-        ui: [
-          "IBM Plex Mono",
-          "JetBrains Mono",
-          "SF Mono",
-          "Menlo",
-          "Consolas",
-          "monospace",
-        ],
-        display: [
-          "IBM Plex Mono",
-          "JetBrains Mono",
-          "SF Mono",
-          "Menlo",
-          "Consolas",
-          "monospace",
+        sans: [
+          "Inter",
+          "ui-sans-serif",
+          "system-ui",
+          "-apple-system",
+          "BlinkMacSystemFont",
+          "Segoe UI",
+          "sans-serif",
         ],
         mono: [
           "JetBrains Mono",
-          "SF Mono",
-          "Menlo",
+          "SFMono-Regular",
           "Consolas",
+          "Liberation Mono",
           "monospace",
         ],
+      },
+      boxShadow: {
+        soft: "0 18px 42px rgb(38 45 65 / 0.16)",
       },
     },
   },

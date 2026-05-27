@@ -1,11 +1,11 @@
 [package]
-name = "joi-server"
+name = "loom-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "joi-server"
+name = "loom-server"
 path = "src/main.rs"
 
 [dependencies]
@@ -25,3 +25,5 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
+rusqlite = { workspace = true }
+dirs = { workspace = true }

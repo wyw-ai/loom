@@ -1,6 +1,6 @@
-# Joi Desktop GUI 设计文档
+# Loom Desktop GUI 设计文档
 
-> 为 human actor 提供的本地桌面 GUI 客户端，替代/并行于 `joi chat` TUI。
+> 为 human actor 提供的本地桌面 GUI 客户端，替代/并行于 `loom chat` TUI。
 > 交互与视觉语言参考 Discord；协议语义严格遵循 v0（[open-multi-actor-collaboration-protocol-v0.md](protocol/open-multi-actor-collaboration-protocol-v0.md)）。
 > 本文档是 GUI 工作的权威入口，后端 Rust 代码与前端 React 代码都以此为规范。
 
@@ -9,15 +9,15 @@
 ### 目标
 
 1. 为人类 actor 提供一个持续驻留、桌面原生的工作台（mac / linux），取代 TUI 的长连接窗口。
-2. **完全等价**地覆盖 TUI 当前所有交互：channel/thread 浏览、发送、流式接收、@handoff、`/slash`、reply target、cancel turn、action.request 审批、announcement 面板、channel 邀请/撤销、跨 scope 的 action.request inbox。
+2. **完全等价**地覆盖 TUI 当前所有交互：channel/thread 浏览、发送、流式接收、@mention、`/slash`、reply target、cancel run、action.request 审批、announcement 面板、channel 邀请/撤销、跨 scope 的 action.request inbox。
 3. 视觉与交互向 Discord 的「服务器栏 · 频道栏 · 主内容 · 成员栏」四栏范式看齐，便于新用户零学习成本。
-4. 不引入任何新的 WS 方法。GUI 仍是协议客户端，不托管 `joi-server`，
-   也不启动 `joi daemon`；machine/daemon 由用户在目标机器上自行配置和启动。
+4. 不引入任何新的 WS 方法。GUI 仍是协议客户端，不托管 `loom-server`，
+   也不启动 `loom daemon`；machine/daemon 由用户在目标机器上自行配置和启动。
 
 ### 非目标
 
 - 不做帐号/身份认证（v0 仍免认证；actor_id 由本地配置决定）。
-- 不做多服务器并行连接（首版只连 `config.server_url` 指定的一个 joi-server）。
+- 不做多服务器并行连接（首版只连 `config.server_url` 指定的一个 loom-server）。
 - 不做消息/文件的跨设备同步——服务器本身就是 single source of truth。
 - **不**字面拷贝 Discord 的 CSS / 位图资源（版权与法律风险）。我们复刻的是**设计语言**：三/四栏骨架、深色配色比例、消息组、reactions、@mention picker、slash palette、bell inbox、context menu。
 
@@ -27,7 +27,7 @@
 
 ```mermaid
 flowchart LR
-    subgraph Desktop["本机桌面进程：joi-gui"]
+    subgraph Desktop["本机桌面进程：loom-gui"]
         Web["React WebView<br/>apps/gui-web"]
         IPC["Tauri IPC<br/>crates/gui/src/ipc.rs"]
         Client["GUI Client<br/>crates/gui/src/ws.rs"]
@@ -36,18 +36,18 @@ flowchart LR
         Web -- "invoke / listen" --> IPC
         IPC --> Client
         Client --> Forward
-        Forward -- "joi://stream / joi://connection" --> Web
+        Forward -- "loom://stream / loom://connection" --> Web
     end
 
     subgraph MachineHost["需要运行 agent/service 的机器"]
-        Daemon["joi daemon<br/>user configured / user started"]
+        Daemon["loom daemon<br/>user configured / user started"]
         Agent["local agent workers"]
         Service["optional service host"]
         Daemon --> Agent
         Daemon --> Service
     end
 
-    Server["joi-server<br/>configured workspace.server_url<br/>can be local / intranet / remote"]
+    Server["loom-server<br/>configured workspace.server_url<br/>can be local / intranet / remote"]
 
     Client -- "direct WS JSON-RPC<br/>workspace.server_url" --> Server
     Daemon -- "WS JSON-RPC proxy / actor connections" --> Server
@@ -55,8 +55,8 @@ flowchart LR
     Service -- "WS JSON-RPC service connection" --> Server
 ```
 
-这条边界必须保持稳定：GUI 可以为了 `cargo run -p joi-gui` 的开发体验补起 Vite dev
-server；但 `joi-server` 和 `joi daemon` 都是用户显式管理的外部进程。GUI 启动不
+这条边界必须保持稳定：GUI 可以为了 `cargo run -p loom-gui` 的开发体验补起 Vite dev
+server；但 `loom-server` 和 `loom daemon` 都是用户显式管理的外部进程。GUI 启动不
 依赖它们已经在线，也不负责拉起它们；用户在 GUI 里选择 workspace 后，才按
 `server_url` 尝试连接对应服务端。
 
@@ -72,7 +72,7 @@ server；但 `joi-server` 和 `joi daemon` 都是用户显式管理的外部进�
 
 ```
 crates/
-  gui/                          # 新增：Tauri 后端 crate，名 "joi-gui"
+  gui/                          # 新增：Tauri 后端 crate，名 "loom-gui"
     Cargo.toml
     build.rs                    # tauri-build
     tauri.conf.json
@@ -149,14 +149,14 @@ Discord 的四栏结构直接可用：
 | Inbox（铃铛） | 跨 scope 待办 `action.request` 数量徽标；断线时 disabled |
 | Settings | 本地配置 |
 
-启动时**不自动连**：如果有历史 workspace 就展示它们在栏里、主区展示 Landing；如果没有就直接渲染空态让用户走 Add。配置在 `~/.config/joi-apps/desktop.toml`（多 profile 的 toml 数组），首次启动会尝试从 TUI 的 `cli.toml` 迁移成 "Local" workspace。
+启动时**不自动连**：如果有历史 workspace 就展示它们在栏里、主区展示 Landing；如果没有就直接渲染空态让用户走 Add。配置在 `~/.config/loom-apps/desktop.toml`（多 profile 的 toml 数组），首次启动会尝试从 TUI 的 `cli.toml` 迁移成 "Local" workspace。
 
 ### 3.2 Channels & Threads 栏（240px）
 
 一栏里分区展示，参考 Discord 的「频道列表 + 活跃线程」：
 
 ```
-JOI WORKSPACE                 ⚙
+LOOM WORKSPACE                 ⚙
 ────────────────────────────
 ▸ CHANNELS
    # design           🟢      ← 当前频道高亮
@@ -173,7 +173,7 @@ JOI WORKSPACE                 ⚙
   - 在 channel 上：Rename / Delete / Invite... / Members / Leave（如果自己是成员）
   - 在 thread 上：Rename / Delete / Copy id
 - **增删**：右上角小 `+` 按钮触发 modal；创建 thread 时先在 channel
-  公共区写入 root event，再以该 `rootEventId` 调用 `thread/create`。不能从
+  公共区写入 root message，再以该 `rootMessageId` 调用 `thread/create`。不能从
   thread 内 event 继续创建子 thread。
 
 ### 3.3 Main 区（flex）
@@ -185,14 +185,14 @@ JOI WORKSPACE                 ⚙
 3. **Message list**：
    - 按时间升序；相邻同 actor 且间隔 < 5 分钟的 bubble 合并成「消息组」（仅首条显示头像 + 名字 + 时间）。
    - 气泡类型（直接映射 `history::BubbleKind`）：
-     - `Stream`：正常 `content.add` 消息；同 actor 同 turn 的连续内容可合并。
-     - `Static`：handoff、action.response 之类。
+     - `Stream`：正常 chat 消息；同 actor 同 run 的连续内容可合并。
+     - `Static`：action.response、status update 之类。
      - `ActionRequest`：黄色左 border + 标题 + 选项按钮；首次到达吹气（pulse）一次。
      - `System`：灰色斜体、居中。
    - 每条气泡 hover 显示工具条：`Reply` · `Copy` · `Copy id` · 对 `ActionRequest` 显示各 choice 按钮。
-   - **Reply quote line**：有 `reply_to_event_id` 时头部挂一条 `↩ @target: preview…`（TUI history.rs 已有同款概念）。
-   - **Handoff line**：有 `handoff_target` 时用 `handoff -> @target: …` 样式，右侧小 badge 显示目标 agent 状态（从 `actor/list` 过滤 agent）。
-4. **Streaming status bar**（position: sticky; bottom）：展示当前 scope 内所有 open turn（`open_turns_in_scope`）。点击 ✕ 触发 `turn/close(status=cancelled)`。
+   - **Reply quote line**：有 `reply_to_source_id` 时头部挂一条 `↩ @target: preview…`（TUI history.rs 已有同款概念）。
+   - **Audience line**：有 direct audience 时用 `to @target: …` 样式，右侧小 badge 显示目标 agent 状态（从 `actor/list` 过滤 agent）。
+4. **Streaming status bar**（position: sticky; bottom）：展示当前 scope 内所有 open run（`open_runs_in_scope`）。点击 ✕ 触发 run cancel message。
 5. **Prompt**（固定底部，参考 Discord 输入框）：
    - 多行可伸缩 textarea，`Enter` 发送，`Shift+Enter` 换行。
    - **Reply chip**：`reply_target` 非空时顶出一行 `Replying to @x: preview…  [✕]`。
@@ -227,7 +227,7 @@ Inbox                                                       [Mark all read]
 - 各 scope 的 history 里未响应的 `action.request`（`History::pending_action_requests`）。
 - 跨 scope 的 `action.request` 通过 actor-inbox push 进来时写入 `inbox.store`（events.rs:462 `apply_cross_scope_action_request` 的 GUI 等价）。
 
-「Approve / Reject」按钮直接调 `event/append(kind='action.response', payload={optionId, kind}, relations=[RespondsTo(request_event_id)])`，和 TUI `do_action_response` 完全一致（events.rs:2171）。
+「Approve / Reject」按钮直接调 `message.send` 写入 `metadata.kind='action.response'`，并把 `parentMessageId` 指向原 action.request message，和 TUI `do_action_response` 完全一致。
 
 ## 4. 设计 Token
 
@@ -293,7 +293,7 @@ Inbox                                                       [Mark all read]
 | `AnnouncementBanner` | 顶部 pin 面板（折叠） | `chat/announcement.rs` |
 | `MessageList` | 虚拟滚动的 bubble 列 | `chat/history.rs` + `chat/ui.rs` |
 | `Bubble.Stream` / `Static` / `ActionRequest` / `System` | 四种 bubble 渲染器 | `BubbleKind` |
-| `InFlightStatusBar` | 当前 scope open turns + cancel | `ui.rs` in-flight 区 |
+| `InFlightStatusBar` | 当前 scope open runs + cancel | `ui.rs` in-flight 区 |
 | `Prompt` | textarea + chip + placeholder | `chat/prompt.rs` |
 | `SlashPalette` | `/` 触发的浮层菜单 | `app::slash_menu` |
 | `MentionPalette` | `@` 触发的浮层菜单 | `app::at_menu` |
@@ -338,15 +338,15 @@ Inbox                                                       [Mark all read]
 
 ```ts
 type Bubble = {
-  id: string                // trailing_event_id | synthetic
+  id: string                // trailing_source_id | synthetic
   actorId: string
-  turnId?: string
+  runId?: string
   kind: 'stream' | 'static' | 'actionRequest' | 'system'
   text: string
   ts: ISOString
-  replyToEventId?: string
+  replyToSourceId?: string
   delivery: 'na' | 'pending' | 'delivered'
-  handoffTarget?: string
+  audienceTarget?: string
   // action.request 专用：
   requestType?: string
   choices?: { id: string; label: string }[]
@@ -358,27 +358,27 @@ type Bubble = {
     bubbles: Bubble[]
     announcement?: { text, actorId, ts }
     pendingActionIds: Set<string>       // 本 scope 内未 ack 的 action.request id
-    openTurns: Record<turnId, { actorId, openedAt }>
+    openRuns: Record<runId, { actorId, openedAt }>
     autoFollow: boolean
     scrollToBottom: number               // 触发器
   }>
 }
 ```
 
-所有写入逻辑严格对齐 `history::push_event` switch：
-- `content.add` 且 `HandsOffTo` 且无 `RepliesTo` → 推 handoff bubble。
-- `content.add` 其它 → append stream（同 actor 同 turn 合并）。
-- `action.request` → `ActionRequest` bubble + `pendingActionIds += id`。
-- `action.response` → 从 relations[RespondsTo] 取 request id，`pendingActionIds.delete(id)`，可选 push static。
-- `announcement.set` / `.clear` → 改 `announcement`。
-- `turn.close` 且 `status=cancelled` → push system 行。
+所有写入逻辑严格对齐 `history::push_message` switch：
+- 普通 chat message → append stream（同 actor 同 run 合并）。
+- 有 direct audience 的 message → append stream，并显示 audience target。
+- `metadata.kind=action.request` → `ActionRequest` bubble + `pendingActionIds += id`。
+- `metadata.kind=action.response` → 从 `parentMessageId` 取 request id，`pendingActionIds.delete(id)`，可选 push static。
+- `metadata.kind=announcement.set` / `.clear` → 改 `announcement`。
+- run cancel/status message → push system 行。
 
 ### 6.4 `inbox` store
 
 ```ts
 {
   items: Array<{
-    requestEventId: string
+    requestMessageId: string
     scope: ScopeRef
     title: string
     description: string
@@ -390,7 +390,7 @@ type Bubble = {
 ```
 
 来源：
-- 跨 scope push（`event.created` kind=action.request + HandsOffTo me && scope ≠ currentScope）→ 追加。
+- 跨 scope push（`message.created` 且 `metadata.kind=action.request` + audience 包含当前 actor && scope ≠ currentScope）→ 追加。
 - 本 scope 解决时若 item 来自 inbox 需移除。
 
 ### 6.5 `ui` store
@@ -402,7 +402,7 @@ type Bubble = {
   modal: null | { type: 'createChannel'|'renameThread'|... , props }
   toast?: { level, message, id }
   draft: Record<scopeKey, string>          // 对应 TUI DraftInput 的持久化
-  replyTarget: Record<scopeKey, { eventId, preview } | null>
+  replyTarget: Record<scopeKey, { messageId, preview } | null>
   theme: 'dark' | 'light'
 }
 ```
@@ -428,9 +428,9 @@ type Bubble = {
 | `channel_update` / `channel_delete` / `channel_invite` / `channel_revoke` | | 对应 RPC |
 | `channel_members` | `{ channelId }` | |
 | `thread_list` / `thread_create` / `thread_update` / `thread_delete` | | |
-| `scope_subscribe` / `scope_unsubscribe` / `scope_read` | `{ scope, limit?, beforeEventId? }` | |
-| `event_append` | `{ event: EventAppendInput }` | 通用：message send、handoff、action.response 都走这个 |
-| `turn_close` | `{ turnId, status }` | cancel |
+| `scope_subscribe` / `scope_unsubscribe` | `{ scope }` | |
+| `message_list` / `message_send` / `message_read` | `{ target, limit?, beforeMessageId? }` | 通用消息读写、action.response、announcement 都走 message |
+| `run_cancel` | `{ runId }` | cancel |
 | `actor_list` / `agent_list` | | 启动时引导 + @mention palette |
 | `artifact_publish` | `{ ingress, createdBy, scope }` | 粘贴附件 |
 
@@ -440,29 +440,29 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 
 | event name | payload |
 | --- | --- |
-| `joi://stream` | `{ kind: string, scope, data }`（原 `stream/update` 镜像） |
-| `joi://trace` | `TurnTraceUpdate`（agent 行）—— GUI 首版不展示，但埋好 |
-| `joi://connection` | `{ state: 'open'|'closed'|'error', detail? }` |
+| `loom://stream` | `{ kind: string, scope, data }`（原 `stream/update` 镜像） |
+| `loom://trace` | `RunFrame`（agent 行）—— GUI 首版不展示，但埋好 |
+| `loom://connection` | `{ state: 'open'|'closed'|'error', detail? }` |
 
 前端在 `ipc/bridge.ts` 注册 listener，分发到对应 store。
 
 ### 7.3 重连
 
 - 断线 → 指数退避（1s, 2s, 5s, 10s, 30s 封顶）自动重连。
-- 重连成功后重放：`initialize` → `connection/open` → 所有 `subscribedScopes` 重订阅 → 对当前 scope 做 `scope/read` 增量回补（`beforeEventId` 取本地最老那条）。
+- 重连成功后重放：`initialize` → `connection/open` → 所有 `subscribedScopes` 重订阅 → 对当前 target 做 `message.list` 增量回补（`beforeMessageId` 取本地最老那条）。
 - UI：`DisconnectedOverlay` 半透明覆盖 main 区，大字 "Reconnecting…" + 重试按钮。
 
-## 8. 事件 ↔ UI 更新映射表
+## 8. Message/Run ↔ UI 更新映射表
 
 | 协议入口 | 处理 | UI 可视结果 |
 | --- | --- | --- |
-| `stream/update{event.created, content.add}` | messages.append / mergeStream | 气泡出现或拼接 |
-| `stream/update{event.created, action.request}` 本 scope | messages.append ActionRequest + inbox-in-scope | 黄框气泡、铃铛响、桌面通知 |
-| `stream/update{event.created, action.request}` 跨 scope | inbox.add + toast | Servers 铃铛徽标 +1、顶部 toast |
-| `stream/update{event.created, action.response}` | messages.resolveAction | 原 ActionRequest 气泡上打勾、按钮禁用 |
-| `stream/update{event.created, announcement.set/clear}` | messages.setAnnouncement | AnnouncementBanner 出现/消失 |
-| `stream/update{turn.opened}` | openTurns[id] = ... | 状态条显示 "agent X typing…" |
-| `stream/update{turn.closed}` | openTurns delete; 流式 bubble 结束 | 光标消失、状态条移除 |
+| `stream/update{message.created, chat}` | messages.append / mergeStream | 气泡出现或拼接 |
+| `stream/update{message.created, action.request}` 本 scope | messages.append ActionRequest + inbox-in-scope | 黄框气泡、铃铛响、桌面通知 |
+| `stream/update{message.created, action.request}` 跨 scope | inbox.add + toast | Servers 铃铛徽标 +1、顶部 toast |
+| `stream/update{message.created, action.response}` | messages.resolveAction | 原 ActionRequest 气泡上打勾、按钮禁用 |
+| `stream/update{message.created, announcement.set/clear}` | messages.setAnnouncement | AnnouncementBanner 出现/消失 |
+| `stream/update{run.opened}` | openRuns[id] = ... | 状态条显示 "agent X running…" |
+| `stream/update{run.closed}` | openRuns delete; 流式 bubble 结束 | 光标消失、状态条移除 |
 | `stream/update{channel.invited}` | channels.addOrPatch + toast "you were added to #x" | Sidebar 出现新 channel |
 | `stream/update{channel.revoked}` | channels.remove + 当前 scope 若在其中则回 Home | Sidebar 该 channel 消失 |
 | `stream/update{thread.created}` | threadsByChannel[ch].append | Sidebar 展开 channel 时可见 |
@@ -495,14 +495,14 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 
 | `/cmd` | GUI 行为 |
 | --- | --- |
-| `/handoff [@agent] [msg]` | 带 message → 直接发 `content.add` + HandsOffTo；不带 → 打开 Handoff picker |
+| `/to [@agent] [msg]` | 带 message → 直接发 `message.send` + actor audience；不带 → 打开 actor picker |
 | `/reply` | 打开 Reply picker（历史中可回复的气泡） |
 | `/action` | 打开本 scope 的 pending action picker |
 | `/agents` | 在 main 区弹出 agents 列表（`actor/list` 过滤 agent） |
-| `/cancel [@agent]` | 取消本 scope 的 open turn（多选时弹 picker） |
+| `/cancel [@agent]` | 取消本 scope 的 open run（多选时弹 picker） |
 | `/invite` | 打开 Invite actor modal |
 | `/members` | 打开 MembersRail（若已开则滚到顶） |
-| `/announce <text>` / `/announce clear` | `event/append` announcement.set / .clear |
+| `/announce <text>` / `/announce clear` | `message.send` announcement.set / .clear |
 | `/quit` | 关闭窗口（= ⌘Q） |
 
 除了 `/quit` 其它**和 TUI 字面一致**——允许用户把 TUI 肌肉记忆直接搬到 GUI。
@@ -514,16 +514,16 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 ### M1 · 脚手架（下一步落地）
 
 交付物：
-- `crates/gui` Tauri backend crate：能启动空白窗口、完成 `connect` 命令、前端能收到 `joi://connection` event。
+- `crates/gui` Tauri backend crate：能启动空白窗口、完成 `connect` 命令、前端能收到 `loom://connection` event。
 - `apps/gui-web` React 骨架：Discord-like 四栏空壳、读 mock 数据；验证设计 token。
 - `make gui-dev` / `make gui-release` 可跑通。
 
 ### M2 · 核心聊天闭环（本轮目标收口）
 
 - Sidebar：列 channels、点击切 scope、基本 thread 列表。
-- Main：`scope/read` 冷启 + open turn 状态 + 发送。
+- Main：`message.list` 冷启 + open run 状态 + 发送。
 - Bell：本 scope action.request 弹黄框 + cross-scope 写 inbox。
-- Prompt：textarea + slash/at palette 基础项（`/handoff`、`@agent`）。
+- Prompt：textarea + slash/at palette 基础项（`/to`、`@agent`）。
 
 ### M3 · 完整覆盖 TUI
 
@@ -531,7 +531,7 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 - ✅ channel CRUD（create / rename / delete / invite / thread create/rename/delete）走通用 Modal + 右键 ContextMenu。
 - ✅ members pane（自动按 channel 拉 `channel/members`）。
 - ✅ announcement banner + `/announce <text>` / `/announce clear` 写入路径。
-- ✅ cancel turn（`/cancel` 或状态条 ✕，自动选唯一 / 多条时弹 picker）。
+- ✅ cancel run（`/cancel` 或状态条 ✕，自动选唯一 / 多条时弹 picker）。
 - ✅ `/reply` · `/action` · `/invite` · `/members` · `/agents` · `/quit` 真实动作。
 - ✅ 断线 overlay（`DisconnectedOverlay`）+ 手动 Retry。
 - ✅ `⌘K` quick switcher 骨架（`ModalHost` 的 quickSwitch 模式已实现，尚未绑全局快捷键）。
@@ -549,13 +549,13 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
 - 粘贴大块文本自动 artifact 选择器。
 - 拖放文件上传 artifact（`artifact/publish` InlineText → binary 时需先扩协议，暂缓）。
 - 浅色主题。
-- agent trace 可视化（`turn/trace.update`）。
+- agent trace 可视化（`run.append` / run frames）。
 
 ## 12. 与 TUI 的共存策略
 
-- TUI 和 GUI 走同一个 joi-server、可同时连，服务器 actor-inbox 会把 directed event（handoff、invite 等）给**所有** bound connection。但 action.response 只能有一条——先响应的先生效。
-- 配置文件共享 `~/.config/joi-apps/cli.toml`。GUI 修改 actor_id 会写回这里，TUI 下次启动读到新值。
-- 文档里保留 `joi chat` 作为「轻量 / ssh 远程 / 服务器旁运维」入口；GUI 作为日常工作台入口。
+- TUI 和 GUI 走同一个 loom-server、可同时连，服务器 actor-inbox 会把 directed message（mention、DM、invite 等）给**所有** bound connection。但 action.response 只能有一条——先响应的先生效。
+- 配置文件共享 `~/.config/loom-apps/cli.toml`。GUI 修改 actor_id 会写回这里，TUI 下次启动读到新值。
+- 文档里保留 `loom chat` 作为「轻量 / ssh 远程 / 服务器旁运维」入口；GUI 作为日常工作台入口。
 
 ## 13. 合规与版权说明
 
@@ -564,4 +564,4 @@ Rust 侧跑一个 `forward` task 把 WS `Notification` 映射成 Tauri event：
   - 颜色全部自选（§4.1）。
   - 字体用 Inter（OFL）+ JetBrains Mono（OFL）。
   - 图标用 [Lucide](https://lucide.dev)（ISC License）。
-- 产品名：`Joi Desktop`（与 TUI 的 `joi` 区分）。
+- 产品名：`Loom Desktop`（与 TUI 的 `loom` 区分）。

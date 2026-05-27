@@ -1,32 +1,25 @@
-mod client;
-mod cmd;
-mod config;
-mod daemon_ipc;
-mod render;
-mod service;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-
-use crate::client::Client;
-use crate::render::OutputMode;
+use loom_cli::client::Client;
+use loom_cli::render::OutputMode;
+use loom_cli::{cmd, config, daemon_ipc, render};
 
 #[derive(Parser, Debug)]
-#[command(name = "joi", about = "Joi multi-actor collaboration CLI")]
+#[command(name = "loom", about = "Loom multi-actor collaboration CLI")]
 struct Args {
     /// Override the configured server URL (defaults to ws://127.0.0.1:7878/rpc).
-    #[arg(long, global = true, env = "JOI_SERVER")]
+    #[arg(long, global = true, env = "LOOM_SERVER")]
     server: Option<String>,
     /// Override the configured local actor id.
-    #[arg(long = "as", global = true, env = "JOI_ACTOR")]
+    #[arg(long = "as", global = true, env = "LOOM_ACTOR")]
     actor: Option<String>,
     /// Override the configured local display name.
-    #[arg(long = "display", global = true, env = "JOI_DISPLAY")]
+    #[arg(long = "display", global = true, env = "LOOM_DISPLAY")]
     display: Option<String>,
     /// Emit machine-readable JSON instead of human-friendly text.
-    #[arg(long, global = true, env = "JOI_JSON")]
+    #[arg(long, global = true, env = "LOOM_JSON")]
     json: bool,
 
     #[command(subcommand)]
@@ -47,43 +40,17 @@ enum Cmd {
         #[command(subcommand)]
         sub: ThreadCmd,
     },
-    /// Send a content.add event into a thread or channel.
-    Say {
-        text: String,
-        #[arg(long)]
-        r#in: String,
-        /// Treat --in as a channel id instead of a thread id.
-        #[arg(long)]
-        channel: bool,
-        #[arg(long)]
-        reply: Option<String>,
-    },
-    /// Hand off the turn to an actor in a thread or channel.
-    Handoff {
-        /// Target actor id; omit to pick from a list of registered agents/humans.
-        agent: Option<String>,
-        /// Internal thread/channel scope id. Prefer --target when you have a channel/root event target.
-        #[arg(long)]
-        r#in: Option<String>,
-        /// Treat --in as a channel id instead of a thread id.
-        #[arg(long)]
-        channel: bool,
-        /// Canonical destination target: #<channel_id> or #<channel_id>:<root_event_id>.
-        #[arg(long)]
-        target: Option<String>,
-        /// Prompt prefix to place at the very beginning of the receiver's
-        /// final provider prompt for this handoff only.
-        #[arg(long = "handoff-prefix")]
-        handoff_prefix: Option<String>,
-        #[arg(long, short = 'm', default_value = "")]
-        message: String,
-    },
-    /// Message commands using the canonical #channel/#channel:root-event/dm:actor grammar.
+    /// Message commands using the canonical #channel/#channel:root-message/dm:@actor grammar.
     Message {
         #[command(subcommand)]
         sub: MessageCmd,
     },
-    /// Respond to an action.request event.
+    /// List and acknowledge this actor's deterministic attention inbox.
+    Inbox {
+        #[command(subcommand)]
+        sub: InboxCmd,
+    },
+    /// Respond to an action.request message.
     Action {
         #[command(subcommand)]
         sub: ActionCmd,
@@ -93,21 +60,36 @@ enum Cmd {
         #[command(subcommand)]
         sub: TaskCmd,
     },
+    /// Record an agent execution run.
+    Run {
+        #[command(subcommand)]
+        sub: RunCmd,
+    },
+    /// Coordinate explicit multi-actor work with baton/revision checks.
+    Coordination {
+        #[command(subcommand)]
+        sub: CoordinationCmd,
+    },
+    /// Publish and activate immutable agent config versions.
+    AgentConfig {
+        #[command(subcommand)]
+        sub: AgentConfigCmd,
+    },
     /// Ask the triggering human to choose or provide input, then return the answer to this process.
     AskUserQuestion {
         /// Max seconds to wait for action.response.
         #[arg(long = "timeout-seconds")]
         timeout_seconds: Option<u64>,
-        /// Scope id. Defaults to JOI_SCOPE_ID inside daemon-managed agent turns.
+        /// Scope id. Defaults to LOOM_SCOPE_ID inside daemon-managed agent turns.
         #[arg(long)]
         r#in: Option<String>,
         /// Treat --in as a channel id instead of a thread id.
         #[arg(long)]
         channel: bool,
-        /// Actor id that should answer. Defaults to JOI_TRIGGER_ACTOR inside daemon turns.
+        /// Actor id that should answer. Defaults to LOOM_TRIGGER_ACTOR inside daemon turns.
         #[arg(long)]
         to: Option<String>,
-        /// Turn id to associate with the action.request. Defaults to JOI_TURN_ID.
+        /// Run id to associate with the action.request. Defaults to LOOM_RUN_ID.
         #[arg(long = "turn-id")]
         turn_id: Option<String>,
         /// Short title shown in clients. JSON stdin may also provide header/title.
@@ -128,16 +110,16 @@ enum Cmd {
         /// Max seconds to wait for action.response.
         #[arg(long = "timeout-seconds")]
         timeout_seconds: Option<u64>,
-        /// Scope id. Defaults to JOI_SCOPE_ID inside daemon-managed agent turns.
+        /// Scope id. Defaults to LOOM_SCOPE_ID inside daemon-managed agent turns.
         #[arg(long)]
         r#in: Option<String>,
         /// Treat --in as a channel id instead of a thread id.
         #[arg(long)]
         channel: bool,
-        /// Actor id that should approve. Defaults to JOI_TRIGGER_ACTOR inside daemon turns.
+        /// Actor id that should approve. Defaults to LOOM_TRIGGER_ACTOR inside daemon turns.
         #[arg(long)]
         to: Option<String>,
-        /// Turn id to associate with the action.request. Defaults to JOI_TURN_ID.
+        /// Run id to associate with the action.request. Defaults to LOOM_RUN_ID.
         #[arg(long = "turn-id")]
         turn_id: Option<String>,
         /// Short title shown in clients. JSON stdin may also provide title.
@@ -153,20 +135,20 @@ enum Cmd {
         #[arg(long = "reject-label")]
         reject_label: Option<String>,
     },
-    /// Inspect daemon-configured agents. Runtime hosting is done by `joi daemon`.
+    /// Inspect daemon-configured agents. Runtime hosting is done by `loom-daemon`.
     Agent {
         #[command(subcommand)]
         sub: AgentCmd,
-    },
-    /// Read events / history from a scope (thread by default; pass --channel for a channel scope).
-    Event {
-        #[command(subcommand)]
-        sub: EventCmd,
     },
     /// Inspect actors known to the server.
     Actor {
         #[command(subcommand)]
         sub: ActorCmd,
+    },
+    /// Manage channel-scoped actor groups used by @group mentions.
+    Group {
+        #[command(subcommand)]
+        sub: GroupCmd,
     },
     /// Publish, fetch, or read artifacts.
     Artifact {
@@ -200,7 +182,7 @@ enum Cmd {
         #[command(subcommand)]
         sub: MemoryCmd,
     },
-    /// Run joi as a stdio MCP server. Typically not invoked by humans —
+    /// Run loom as a stdio MCP server. Typically not invoked by humans —
     /// the runtime auto-injects this as a `session/new.mcpServers` entry
     /// when an agent's spec opts into `memory.delivery.mcp`.
     Mcp {
@@ -225,55 +207,18 @@ enum Cmd {
         #[command(subcommand)]
         sub: WorkspaceCmd,
     },
-    /// Run the machine-scoped daemon: auto-detect supported local agent CLIs
-    /// and host agents configured on the selected machine.
-    Daemon {
-        /// Machine id from the desktop machine config. Defaults to the active
-        /// workspace's first machine.
-        #[arg(long = "machine-id", env = "JOI_MACHINE_ID")]
-        machine_id: Option<String>,
-        /// Override the daemon data root. Defaults to the machine data root.
-        #[arg(long = "data-root", env = "JOI_AGENT_DATA_ROOT")]
-        data_root: Option<PathBuf>,
-        /// Comma-separated actor ids to load. Empty/omitted = load every
-        /// agent configured on the machine.
-        #[arg(long = "allow-actors", value_delimiter = ',')]
-        allow_actors: Vec<String>,
-        /// Print auto-detected local providers and exit.
-        #[arg(long = "list-providers")]
-        list_providers: bool,
-        /// Override the directory of ServiceSpec JSON files loaded by the
-        /// daemon. Defaults to `~/.config/joi/services/` or
-        /// `$JOI_SERVICE_SPECS`.
-        #[arg(long = "services")]
-        services: Option<PathBuf>,
-        /// Comma-separated service ids to load through the daemon. Empty or
-        /// omitted means load every ServiceSpec under --services.
-        #[arg(long = "allow-services", value_delimiter = ',')]
-        allow_services: Vec<String>,
-        /// Do not start the service host from this daemon.
-        #[arg(long = "no-services")]
-        no_services: bool,
-        /// Unix socket used by local `joi` CLI clients to reach this daemon.
-        #[arg(long = "socket", env = "JOI_DAEMON_SOCKET")]
-        socket: Option<PathBuf>,
-        /// Do not expose the local daemon IPC socket. Useful for tests where
-        /// agents connect to the server directly.
-        #[arg(long = "no-ipc")]
-        no_ipc: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
 enum SpecCmd {
     /// Apply the lesson-plan attached to the action.request that was
-    /// accepted by the given `action.response` event. See
+    /// accepted by the given `action.response` message. See
     /// `crates/cli/src/cmd/spec_apply.rs` for the frontmatter contract.
     Apply {
-        /// Event id of the `action.response` (kind = accepted) that
+        /// Message id of the `action.response` (responseKind = accepted) that
         /// approved the lesson-plan.
         #[arg(long = "action")]
-        action_event_id: String,
+        action_message_id: String,
         /// Don't write spec/bundle files or bump the reload epoch.
         /// Prints the planned changes and exits.
         #[arg(long)]
@@ -345,9 +290,9 @@ struct WsTarget {
     /// Thread id. Required for thread-shared workspaces.
     #[arg(long = "in")]
     thread: Option<String>,
-    /// Actor id (defaults to JOI_ACTOR / current actor). Use --actor to
+    /// Actor id (defaults to LOOM_ACTOR / current actor). Use --actor to
     /// explicitly target a per-actor workspace.
-    #[arg(long, env = "JOI_ACTOR")]
+    #[arg(long, env = "LOOM_ACTOR")]
     actor: Option<String>,
     /// Target the channel-shared area (`channels/<cid>/shared/`).
     #[arg(long, conflicts_with_all = ["thread_shared", "actor_ws"])]
@@ -403,7 +348,7 @@ enum ServiceCmd {
     /// §12 phases S2/S3).
     Serve {
         /// Override the directory of ServiceSpec JSON files. Defaults
-        /// to `~/.config/joi/services/` (or `$JOI_SERVICE_SPECS`).
+        /// to `~/.config/loom/services/` (or `$LOOM_SERVICE_SPECS`).
         #[arg(long)]
         specs: Option<PathBuf>,
         /// Comma-separated spec ids to load. Empty/omitted = load every
@@ -415,22 +360,22 @@ enum ServiceCmd {
     /// non-zero with the parsing/validation error otherwise.
     Validate { path: PathBuf },
     /// Per-message AM bridge handler. Spawned by `am listen --script
-    /// "joi service am-handler --service-id <id>"` once per DingTalk
-    /// message. Replaces `examples/am-joi-channel-bridge.py`.
+    /// "loom service am-handler --service-id <id>"` once per DingTalk
+    /// message. Replaces the removed Python bridge.
     AmHandler {
-        /// ServiceSpec id under --specs (defaults to ~/.config/joi/services/).
+        /// ServiceSpec id under --specs (defaults to ~/.config/loom/services/).
         #[arg(long = "service-id")]
         service_id: String,
         /// Override the specs directory.
         #[arg(long)]
         specs: Option<PathBuf>,
         /// Internal: spawned by ourselves in async_send mode. Carries
-        /// the JSON payload `{sourceEvent, triggerId, scopeKind, scopeId}`.
+        /// the JSON payload `{sourcePayload, triggerId, scopeKind, scopeId}`.
         #[arg(long = "async-reply", hide = true)]
         async_reply: Option<String>,
     },
     /// Bump the reload-epoch marker for `service_id` so a running
-    /// `joi service serve` host re-reads the ServiceSpec and respawns
+    /// `loom service serve` host re-reads the ServiceSpec and respawns
     /// the supervised plugin instance(s). See design §7.1.
     Reload { service_id: String },
     /// Inspect ServiceSpec JSON files on disk (no server contact).
@@ -439,7 +384,7 @@ enum ServiceCmd {
         sub: ServiceSpecCmd,
     },
     /// Start a `lifecycle = thread_bound` instance by writing a
-    /// per-instance `request.json`. A running `joi service serve`
+    /// per-instance `request.json`. A running `loom service serve`
     /// host watches the spec's `instances/` directory and dispatches
     /// the plugin task on observation. See design §4.7.3.
     Start {
@@ -459,7 +404,7 @@ enum ServiceCmd {
         #[arg(long = "params")]
         params: Option<String>,
         /// Override the specs directory (used to look up the spec for
-        /// validation). Defaults to `~/.config/joi/services/`.
+        /// validation). Defaults to `~/.config/loom/services/`.
         #[arg(long)]
         specs: Option<PathBuf>,
     },
@@ -498,8 +443,8 @@ enum McpCmd {
     /// (`memory.query` / `memory.append` / `memory.get`).
     Memory {
         /// Actor id used as `actorId` on newly-appended records. Usually
-        /// supplied via the env (`JOI_ACTOR`) but explicit takes precedence.
-        #[arg(long = "actor-id", env = "JOI_ACTOR")]
+        /// supplied via the env (`LOOM_ACTOR`) but explicit takes precedence.
+        #[arg(long = "actor-id", env = "LOOM_ACTOR")]
         actor_id: String,
         /// Path to `{agent.profile}` — the runtime expands `{agent.profile}`
         /// before spawn, so specs should hand over a fully-resolved path.
@@ -513,14 +458,14 @@ enum McpCmd {
     /// Expose pinned-announcement tools (`announcement.set` /
     /// `announcement.clear`) so an agent can publish a recap to the
     /// right-side panel of any chat scope it has write access to. Connects
-    /// back to the running joi-server over WebSocket and proxies each tool
-    /// call to one `event/append`.
+    /// back to the running loom-server over WebSocket and proxies each tool
+    /// call to one `message.send`.
     Announcement {
-        #[arg(long = "actor-id", env = "JOI_ACTOR")]
+        #[arg(long = "actor-id", env = "LOOM_ACTOR")]
         actor_id: String,
-        /// joi-server WebSocket URL. Falls back to `JOI_SERVER`; the
+        /// loom-server WebSocket URL. Falls back to `LOOM_SERVER`; the
         /// runtime hands this over explicitly when spawning the MCP child.
-        #[arg(long = "server", env = "JOI_SERVER")]
+        #[arg(long = "server", env = "LOOM_SERVER")]
         server: String,
     },
 }
@@ -548,8 +493,8 @@ enum MemoryCmd {
         summary: String,
         #[arg(long = "source-channel")]
         source_channel: String,
-        #[arg(long = "source-event")]
-        source_event: Option<String>,
+        #[arg(long = "source-message")]
+        source_message: Option<String>,
         #[arg(long, default_value = "pending")]
         status: String,
         #[arg(long = "type", default_value = "note")]
@@ -578,8 +523,8 @@ enum MemoryCmd {
         status: String,
         #[arg(long)]
         reason: Option<String>,
-        #[arg(long = "source-event")]
-        source_event: Option<String>,
+        #[arg(long = "source-message")]
+        source_message: Option<String>,
         #[arg(long = "profile-dir")]
         profile_dir: Option<PathBuf>,
     },
@@ -589,7 +534,7 @@ enum MemoryCmd {
 enum ChannelCmd {
     /// Create a new channel. Channels created via this CLI are private by
     /// default — the caller is the sole initial member; invite others
-    /// with `joi channel invite`.
+    /// with `loom channel invite`.
     Create {
         #[arg(long)]
         title: String,
@@ -616,9 +561,9 @@ enum ThreadCmd {
     Create {
         #[arg(long)]
         channel: String,
-        /// Channel-scope event that anchors the thread.
-        #[arg(long = "root-event")]
-        root_event: String,
+        /// Channel-scope message that anchors the thread.
+        #[arg(long = "root-message")]
+        root_message: String,
         #[arg(long, default_value = "Untitled")]
         title: String,
         /// Record this thread under `resident_threads.<role>` in the
@@ -654,6 +599,14 @@ enum ThreadCmd {
     /// thread (`bind.auto_stop_on=["thread.closed"]`, §4.7.3) reap
     /// their instances on the next watcher tick.
     Delete { thread_id: String },
+    /// Follow a thread so replies enter this actor's inbox.
+    Follow {
+        thread_id: String,
+        #[arg(long)]
+        muted: bool,
+    },
+    /// Stop following a thread.
+    Unfollow { thread_id: String },
     /// Bootstrap an *existing* thread from a clone-manifest (or explicit
     /// mounts) artifact. Used when an already-open thread (e.g. a
     /// bug-fix loop's bugfix thread) needs target/reference repo
@@ -676,85 +629,11 @@ enum ThreadCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum EventCmd {
-    /// Read one event by id, with the same ACL as its containing scope.
-    Get { event_id: String },
-    /// List events in a thread (default) or channel scope.
-    List {
-        /// Scope id (thread id by default; pass --channel to read a channel scope).
-        #[arg(long)]
-        r#in: String,
-        /// Read a channel scope instead of a thread scope.
-        #[arg(long)]
-        channel: bool,
-        #[arg(long, default_value_t = 50)]
-        limit: u32,
-        /// Cursor: only return events older than this event id.
-        #[arg(long)]
-        before: Option<String>,
-    },
-    /// Alias for `event list` — kept for parity with the design doc and
-    /// for the migrated services that prefer the `query` verb.
-    Query {
-        #[arg(long)]
-        r#in: String,
-        #[arg(long)]
-        channel: bool,
-        #[arg(long, default_value_t = 50)]
-        limit: u32,
-        #[arg(long)]
-        before: Option<String>,
-    },
-    /// Append an arbitrary event to a scope. Use --reply / --handoff /
-    /// --artifact-link to attach the corresponding relations; use --text
-    /// / --file / --stdin to provide the payload body. `joi say` /
-    /// `joi handoff` remain as ergonomic shortcuts for content.add.
-    Append {
-        /// Scope id (thread id by default; pass --channel to write into a channel scope).
-        #[arg(long)]
-        r#in: String,
-        /// Treat --in as a channel id instead of a thread id.
-        #[arg(long)]
-        channel: bool,
-        /// Event type discriminator (e.g. content.add, status.update).
-        #[arg(long = "type", default_value = "content.add")]
-        event_type: String,
-        /// payload.contentType. Defaults to text/markdown to match
-        /// content.add's convention; ignored if no body is supplied.
-        #[arg(long = "content-type", default_value = "text/markdown")]
-        content_type: String,
-        /// Event body as inline text.
-        #[arg(long)]
-        text: Option<String>,
-        /// Event body read from this file.
-        #[arg(long)]
-        file: Option<PathBuf>,
-        /// Event body read from stdin.
-        #[arg(long)]
-        stdin: bool,
-        /// Add a `replies_to` relation pointing at this event id.
-        #[arg(long = "reply")]
-        reply: Option<String>,
-        /// Add a `hands_off_to` relation pointing at this actor id.
-        #[arg(long = "handoff")]
-        handoff: Option<String>,
-        /// Prompt prefix to place at the very beginning of the handoff
-        /// receiver's final provider prompt for this event only.
-        #[arg(long = "handoff-prefix")]
-        handoff_prefix: Option<String>,
-        /// Add one or more `attaches_artifact` relations targeting an artifact
-        /// (`art_…` or `artifact://…`). May be repeated.
-        #[arg(long = "artifact-link")]
-        artifact_link: Vec<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum TaskCmd {
-    /// Create a task anchored to a top-level channel event.
+    /// Create a task anchored to a top-level channel message.
     Create {
-        #[arg(long = "source-event")]
-        source_event: String,
+        #[arg(long = "source-message")]
+        source_message: String,
         #[arg(long)]
         title: Option<String>,
         #[arg(long, default_value = "")]
@@ -763,8 +642,8 @@ enum TaskCmd {
         owner: Option<String>,
         #[arg(long)]
         status: Option<String>,
-        #[arg(long = "parent-source-event")]
-        parent_source_event: Option<String>,
+        #[arg(long = "parent-source-message")]
+        parent_source_message: Option<String>,
         #[arg(long = "parent-task")]
         parent_task: Option<String>,
         #[arg(long = "practice-contract-epoch")]
@@ -774,8 +653,8 @@ enum TaskCmd {
     List {
         #[arg(long)]
         channel: Option<String>,
-        #[arg(long = "source-event")]
-        source_event: Option<String>,
+        #[arg(long = "source-message")]
+        source_message: Option<String>,
         #[arg(long)]
         owner: Option<String>,
         #[arg(long = "status", value_delimiter = ',')]
@@ -794,6 +673,35 @@ enum TaskCmd {
         result: Option<String>,
         #[arg(long = "artifact-id")]
         artifact_ids: Vec<String>,
+    },
+    /// Claim a task for this actor or an explicit actor. Pass either a task id
+    /// or --source-message to atomically create/claim the message-anchored task.
+    Claim {
+        task_id: Option<String>,
+        #[arg(long = "source-message")]
+        source_message: Option<String>,
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Mark a task done.
+    Complete {
+        task_id: String,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long = "artifact-id")]
+        artifact_ids: Vec<String>,
+    },
+    /// Reopen a task, optionally assigning a new owner.
+    Reopen {
+        task_id: String,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Cancel a task.
+    Cancel {
+        task_id: String,
+        #[arg(long)]
+        result: Option<String>,
     },
     /// Create an assignment and hand it off in the task's canonical thread.
     Assign {
@@ -854,8 +762,8 @@ enum TaskAssignmentCmd {
         assignment_id: String,
         #[arg(long)]
         status: Option<String>,
-        #[arg(long = "result-event")]
-        result_event: Option<String>,
+        #[arg(long = "result-message")]
+        result_message: Option<String>,
         #[arg(long)]
         result: Option<String>,
         #[arg(long = "result-envelope-json")]
@@ -897,8 +805,8 @@ enum TaskRefCmd {
         confidence: String,
         #[arg(long, default_value = "active")]
         status: String,
-        #[arg(long = "source-event")]
-        source_event: Option<String>,
+        #[arg(long = "source-message")]
+        source_message: Option<String>,
         #[arg(long = "fields-json")]
         fields_json: Option<String>,
     },
@@ -1094,16 +1002,29 @@ enum TaskWorkspaceLeaseCmd {
 
 #[derive(Subcommand, Debug)]
 enum MessageCmd {
-    /// Send a message to #channel, #channel:root-event, or dm:actor.
+    /// Send a message to #channel, #channel:root-message, or dm:@actor.
     Send {
+        /// Destination target, for example #chan_123, #chan_123:msg_456, or dm:@actor_id.
         #[arg(long)]
-        target: String,
+        target: Option<String>,
+        /// Direct-message recipient. Equivalent to --target dm:@<actor>.
+        #[arg(long, conflicts_with = "target")]
+        to: Option<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Message intent: chat, ask, request_action, assign_task, status_update, review, notify.
+        #[arg(long)]
+        intent: Option<String>,
+        /// Delivery policy: notify_only, wake_agent, route_by_intent, silent.
+        #[arg(long = "delivery-policy")]
+        delivery_policy: Option<String>,
+        /// Only send if this is still the latest message in the target scope.
+        #[arg(long = "if-latest")]
+        if_latest: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
-    /// Read messages from #channel, #channel:root-event, or dm:actor.
+    /// Read messages from #channel, #channel:root-message, or dm:@actor.
     Read {
         #[arg(long)]
         target: String,
@@ -1111,13 +1032,6 @@ enum MessageCmd {
         limit: u32,
         #[arg(long)]
         before: Option<String>,
-    },
-    /// Drain this actor's pending directed inbox.
-    Check {
-        #[arg(long, default_value_t = 50)]
-        limit: u32,
-        #[arg(long = "no-ack")]
-        no_ack: bool,
     },
     /// Search visible message text.
     Search {
@@ -1127,6 +1041,137 @@ enum MessageCmd {
         target: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InboxCmd {
+    /// List this actor's pending directed deliveries and ack them unless --no-ack is set.
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long = "no-ack")]
+        no_ack: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RunCmd {
+    /// Open a run for the current actor in a channel or thread scope.
+    Open {
+        #[arg(long)]
+        target: String,
+        #[arg(long = "delivery-id")]
+        delivery_id: Option<String>,
+        #[arg(long = "start-reason")]
+        start_reason: Option<String>,
+        #[arg(long = "agent-config-version-id")]
+        agent_config_version_id: String,
+    },
+    /// Append private execution progress to a run.
+    Append {
+        run_id: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long = "frame-kind", default_value = "log")]
+        frame_kind: String,
+        #[arg(long = "payload-json")]
+        payload_json: Option<String>,
+    },
+    /// Mark the current run as intentionally producing no visible reply.
+    Ignore {
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Close a run with a terminal status.
+    Close {
+        run_id: String,
+        #[arg(long, default_value = "completed")]
+        status: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CoordinationCmd {
+    /// Propose a coordination session.
+    Propose {
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = "sequential")]
+        mode: String,
+        #[arg(long = "decision-rule", default_value = "owner_decides")]
+        decision_rule: String,
+        #[arg(long = "participant")]
+        participants: Vec<String>,
+        #[arg(long = "plan-json")]
+        plan_json: Option<String>,
+    },
+    /// Commit a proposed session and deliver the first baton/slots.
+    Commit { session_id: String },
+    /// Ack or reject a proposed session.
+    Respond {
+        session_id: String,
+        #[arg(long, conflicts_with = "reject")]
+        accept: bool,
+        #[arg(long, conflicts_with = "accept")]
+        reject: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Submit a coordination step.
+    Step {
+        session_id: String,
+        #[arg(long = "base-revision")]
+        base_revision: u64,
+        #[arg(long = "step-type", default_value = "work")]
+        step_type: String,
+        #[arg(long = "output-json")]
+        output_json: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Skip the current baton.
+    Skip {
+        session_id: String,
+        #[arg(long = "base-revision")]
+        base_revision: u64,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Reassign one participant/baton holder.
+    Reassign {
+        session_id: String,
+        #[arg(long = "from")]
+        from_actor_id: String,
+        #[arg(long = "to")]
+        to_actor_id: String,
+        #[arg(long = "base-revision")]
+        base_revision: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentConfigCmd {
+    /// Publish an immutable config version for an actor.
+    Publish {
+        actor_id: String,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        adapter: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long = "tools-json")]
+        tools_json: Option<String>,
+    },
+    /// Activate a config version for an actor.
+    Activate {
+        actor_id: String,
+        version_id: String,
     },
 }
 
@@ -1149,6 +1194,31 @@ enum ActorCmd {
     },
     /// Delete an actor row from the server registry.
     Delete { actor_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCmd {
+    /// Create a channel-scoped mention group.
+    Create {
+        #[arg(long)]
+        channel: String,
+        name: String,
+        #[arg(long)]
+        display: Option<String>,
+        #[arg(long = "member")]
+        members: Vec<String>,
+        #[arg(long = "wake-agents")]
+        wake_agents: bool,
+    },
+    /// List groups visible to this actor.
+    List {
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Add one actor to a group.
+    AddMember { group_id: String, actor_id: String },
+    /// Remove one actor from a group.
+    RemoveMember { group_id: String, actor_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1268,12 +1338,12 @@ enum ReminderCmd {
 #[derive(Subcommand, Debug)]
 enum ActionCmd {
     Accept {
-        event_id: String,
+        message_id: String,
         #[arg(long, default_value = "allow")]
         option: String,
     },
     Decline {
-        event_id: String,
+        message_id: String,
         #[arg(long, default_value = "deny")]
         option: String,
     },
@@ -1284,11 +1354,11 @@ enum AgentCmd {
     /// List agents configured for daemon-managed machines.
     List,
     /// Bump the reload-epoch marker for `actor_id` so a running
-    /// `joi agent serve` host re-reads the AgentSpec + bundle and
+    /// `loom agent serve` host re-reads the AgentSpec + bundle and
     /// respawns the worker. See design §7.1.
     Reload { actor_id: String },
     /// Run as the v1 external agent client: load every AgentSpec under
-    /// --specs (defaults to ~/.config/joi/agents) and supervise each agent
+    /// --specs (defaults to ~/.config/loom/agents) and supervise each agent
     /// over its own server connection.
     Serve {
         /// Override the directory of AgentSpec JSON files.
@@ -1369,7 +1439,7 @@ async fn main() -> Result<()> {
                 actor,
                 summary,
                 source_channel,
-                source_event,
+                source_message,
                 status,
                 record_type,
                 confidence,
@@ -1381,7 +1451,7 @@ async fn main() -> Result<()> {
                 profile_dir.clone(),
                 summary.clone(),
                 source_channel.clone(),
-                source_event.clone(),
+                source_message.clone(),
                 status.clone(),
                 record_type.clone(),
                 confidence.clone(),
@@ -1404,7 +1474,7 @@ async fn main() -> Result<()> {
                 memory_id,
                 status,
                 reason,
-                source_event,
+                source_message,
                 profile_dir,
             } => cmd::memory::update(
                 actor.clone(),
@@ -1412,7 +1482,7 @@ async fn main() -> Result<()> {
                 memory_id.clone(),
                 status.clone(),
                 reason.clone(),
-                source_event.clone(),
+                source_message.clone(),
                 args.json,
             ),
         };
@@ -1442,7 +1512,7 @@ async fn main() -> Result<()> {
 
     // `agent serve` opens its own per-agent connections and never acts as the
     // local human actor. Keep it as a compatibility path for repo-bundled
-    // AgentSpec actors while `joi daemon` hosts machine-configured agents.
+    // AgentSpec actors while `loom-daemon` hosts machine-configured agents.
     if let Cmd::Agent {
         sub: AgentCmd::Serve {
             specs,
@@ -1453,7 +1523,7 @@ async fn main() -> Result<()> {
         return cmd::agent_serve::run(specs, cfg.server_url, allow_actors).await;
     }
 
-    // `joi agent` local inspection commands should work without opening an
+    // `loom agent` local inspection commands should work without opening an
     // unused human connection.
     if let Cmd::Agent { sub } = args.cmd {
         match sub {
@@ -1489,33 +1559,6 @@ async fn main() -> Result<()> {
         return cmd::service::serve(specs, cfg.server_url, allow_services).await;
     }
 
-    if let Cmd::Daemon {
-        machine_id,
-        data_root,
-        allow_actors,
-        list_providers,
-        services,
-        allow_services,
-        no_services,
-        socket,
-        no_ipc,
-    } = args.cmd
-    {
-        return cmd::daemon::run(
-            machine_id,
-            data_root,
-            allow_actors,
-            list_providers,
-            services,
-            allow_services,
-            no_services,
-            socket,
-            no_ipc,
-            cfg.server_url,
-        )
-        .await;
-    }
-
     // `service validate` is offline — no server contact needed.
     if let Cmd::Service {
         sub: ServiceCmd::Validate { path },
@@ -1525,7 +1568,7 @@ async fn main() -> Result<()> {
     }
 
     // `service reload` is local-only — it bumps an on-disk marker that
-    // the supervising `joi service serve` host polls. No server contact.
+    // the supervising `loom service serve` host polls. No server contact.
     if let Cmd::Service {
         sub: ServiceCmd::Reload { service_id },
     } = &args.cmd
@@ -1552,7 +1595,7 @@ async fn main() -> Result<()> {
     // `agent spec` / `agent bundle` / `service spec` are local-only —
     // they read AgentSpec/ServiceSpec JSON files and bundle directories
     // off the operator's disk. Short-circuit before the websocket dance
-    // so they work even when no joi-server is running.
+    // so they work even when no loom-server is running.
     if let Cmd::Service {
         sub: ServiceCmd::Spec { sub },
     } = args.cmd
@@ -1565,7 +1608,7 @@ async fn main() -> Result<()> {
 
     // `service start/stop/status` are local-only file-IO commands —
     // they read/write/list per-instance `request.json` files under the
-    // host data root. The running `joi service serve` host is the
+    // host data root. The running `loom service serve` host is the
     // observer; these commands themselves never touch the server.
     if let Cmd::Service {
         sub:
@@ -1644,7 +1687,7 @@ async fn main() -> Result<()> {
         };
     }
 
-    // `mcp memory` never talks to the joi server — it's spawned by the ACP
+    // `mcp memory` never talks to the loom server — it's spawned by the ACP
     // runtime as a stdio MCP child. Short-circuit before opening a websocket
     // so we don't wait on an online server that the agent doesn't need.
     if let Cmd::Mcp {
@@ -1697,7 +1740,7 @@ async fn main() -> Result<()> {
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create {
                 channel,
-                root_event,
+                root_message,
                 title,
                 resident_as,
                 bootstrap_artifact,
@@ -1705,7 +1748,7 @@ async fn main() -> Result<()> {
                 cmd::thread::create(
                     client,
                     channel,
-                    root_event,
+                    root_message,
                     title,
                     resident_as,
                     bootstrap_artifact,
@@ -1725,86 +1768,83 @@ async fn main() -> Result<()> {
                 cmd::thread::list(client, Some(channel), true).await?
             }
             ThreadCmd::Delete { thread_id } => cmd::thread::delete(client, thread_id).await?,
+            ThreadCmd::Follow { thread_id, muted } => {
+                cmd::thread::follow(client, thread_id, muted).await?
+            }
+            ThreadCmd::Unfollow { thread_id } => cmd::thread::unfollow(client, thread_id).await?,
             ThreadCmd::Bootstrap {
                 thread_id,
                 channel,
                 bootstrap_artifact,
             } => cmd::thread::bootstrap(client, channel, thread_id, bootstrap_artifact).await?,
         },
-        Cmd::Say {
-            text,
-            r#in,
-            channel,
-            reply,
-        } => cmd::say::run(client, cfg.actor_id, r#in, channel, text, reply).await?,
-        Cmd::Handoff {
-            agent,
-            r#in,
-            channel,
-            target,
-            handoff_prefix,
-            message,
-        } => {
-            cmd::handoff::run(
-                client,
-                cfg.actor_id,
-                agent,
-                r#in,
-                channel,
-                target,
-                handoff_prefix,
-                message,
-            )
-            .await?
-        }
         Cmd::Message { sub } => match sub {
             MessageCmd::Send {
                 target,
+                to,
                 text,
+                intent,
+                delivery_policy,
+                if_latest,
                 attachment_ids,
-            } => cmd::message::send(client, cfg.actor_id, target, text, attachment_ids).await?,
+            } => {
+                cmd::message::send(
+                    client,
+                    cfg.actor_id,
+                    target,
+                    to,
+                    text,
+                    intent,
+                    delivery_policy,
+                    if_latest,
+                    attachment_ids,
+                )
+                .await?
+            }
             MessageCmd::Read {
                 target,
                 limit,
                 before,
             } => cmd::message::read(client, cfg.actor_id, target, limit, before).await?,
-            MessageCmd::Check { limit, no_ack } => {
-                cmd::message::check(client, cfg.actor_id, limit, !no_ack).await?
-            }
             MessageCmd::Search {
                 query,
                 target,
                 limit,
             } => cmd::message::search(client, cfg.actor_id, query, target, limit).await?,
         },
-        Cmd::Action { sub } => match sub {
-            ActionCmd::Accept { event_id, option } => {
-                cmd::action::respond(client, cfg.actor_id, event_id, option, true).await?
+        Cmd::Inbox { sub } => match sub {
+            InboxCmd::List { limit, no_ack } => {
+                cmd::message::inbox_list(client, cfg.actor_id, limit, !no_ack).await?
             }
-            ActionCmd::Decline { event_id, option } => {
-                cmd::action::respond(client, cfg.actor_id, event_id, option, false).await?
+        },
+        Cmd::Action { sub } => match sub {
+            ActionCmd::Accept { message_id, option } => {
+                cmd::action::respond(client, cfg.actor_id, message_id, option, true).await?
+            }
+            ActionCmd::Decline { message_id, option } => {
+                cmd::action::respond(client, cfg.actor_id, message_id, option, false).await?
             }
         },
         Cmd::Task { sub } => match sub {
             TaskCmd::Create {
-                source_event,
+                source_message,
                 title,
                 description,
                 owner,
                 status,
-                parent_source_event,
+                parent_source_message,
                 parent_task,
                 practice_contract_epoch,
             } => {
                 cmd::task::create(
                     client,
                     cfg.actor_id,
-                    source_event,
+                    source_message,
                     title,
                     description,
                     owner,
                     status,
-                    parent_source_event,
+                    parent_source_message,
                     parent_task,
                     practice_contract_epoch,
                 )
@@ -1812,10 +1852,10 @@ async fn main() -> Result<()> {
             }
             TaskCmd::List {
                 channel,
-                source_event,
+                source_message,
                 owner,
                 statuses,
-            } => cmd::task::list(client, channel, source_event, owner, statuses).await?,
+            } => cmd::task::list(client, channel, source_message, owner, statuses).await?,
             TaskCmd::Show { task_id } => cmd::task::show(client, task_id).await?,
             TaskCmd::Update {
                 task_id,
@@ -1824,6 +1864,20 @@ async fn main() -> Result<()> {
                 result,
                 artifact_ids,
             } => cmd::task::update(client, task_id, status, owner, result, artifact_ids).await?,
+            TaskCmd::Claim {
+                task_id,
+                source_message,
+                actor,
+            } => cmd::task::claim(client, task_id, source_message, actor).await?,
+            TaskCmd::Complete {
+                task_id,
+                result,
+                artifact_ids,
+            } => cmd::task::complete(client, task_id, result, artifact_ids).await?,
+            TaskCmd::Reopen { task_id, owner } => cmd::task::reopen(client, task_id, owner).await?,
+            TaskCmd::Cancel { task_id, result } => {
+                cmd::task::cancel(client, task_id, result).await?
+            }
             TaskCmd::Assign {
                 task_id,
                 to,
@@ -1855,7 +1909,7 @@ async fn main() -> Result<()> {
                     normalized,
                     confidence,
                     status,
-                    source_event,
+                    source_message,
                     fields_json,
                 } => {
                     cmd::task::ref_attach(
@@ -1867,7 +1921,7 @@ async fn main() -> Result<()> {
                         normalized,
                         confidence,
                         status,
-                        source_event,
+                        source_message,
                         fields_json,
                     )
                     .await?
@@ -2012,7 +2066,7 @@ async fn main() -> Result<()> {
                 TaskAssignmentCmd::Update {
                     assignment_id,
                     status,
-                    result_event,
+                    result_message,
                     result,
                     result_envelope_json,
                     result_artifact_ids,
@@ -2023,7 +2077,7 @@ async fn main() -> Result<()> {
                         client,
                         assignment_id,
                         status,
-                        result_event,
+                        result_message,
                         result,
                         result_envelope_json,
                         result_artifact_ids,
@@ -2096,12 +2150,123 @@ async fn main() -> Result<()> {
                 },
             },
         },
+        Cmd::Run { sub } => match sub {
+            RunCmd::Open {
+                target,
+                delivery_id,
+                start_reason,
+                agent_config_version_id,
+            } => {
+                cmd::run::open(
+                    client,
+                    cfg.actor_id,
+                    target,
+                    delivery_id,
+                    start_reason,
+                    agent_config_version_id,
+                )
+                .await?
+            }
+            RunCmd::Append {
+                run_id,
+                status,
+                frame_kind,
+                payload_json,
+            } => cmd::run::append(client, run_id, status, frame_kind, payload_json).await?,
+            RunCmd::Ignore { run_id, reason } => cmd::run::ignore(client, run_id, reason).await?,
+            RunCmd::Close { run_id, status } => cmd::run::close(client, run_id, status).await?,
+        },
+        Cmd::Coordination { sub } => match sub {
+            CoordinationCmd::Propose {
+                target,
+                mode,
+                decision_rule,
+                participants,
+                plan_json,
+            } => {
+                cmd::coordination::propose(
+                    client,
+                    target,
+                    mode,
+                    decision_rule,
+                    participants,
+                    plan_json,
+                )
+                .await?
+            }
+            CoordinationCmd::Commit { session_id } => {
+                cmd::coordination::commit(client, session_id).await?
+            }
+            CoordinationCmd::Respond {
+                session_id,
+                accept,
+                reject,
+                reason,
+            } => cmd::coordination::respond(client, session_id, accept || !reject, reason).await?,
+            CoordinationCmd::Step {
+                session_id,
+                base_revision,
+                step_type,
+                output_json,
+                message,
+            } => {
+                cmd::coordination::step(
+                    client,
+                    session_id,
+                    base_revision,
+                    step_type,
+                    output_json,
+                    message,
+                )
+                .await?
+            }
+            CoordinationCmd::Skip {
+                session_id,
+                base_revision,
+                reason,
+            } => cmd::coordination::skip(client, session_id, base_revision, reason).await?,
+            CoordinationCmd::Reassign {
+                session_id,
+                from_actor_id,
+                to_actor_id,
+                base_revision,
+            } => {
+                cmd::coordination::reassign(
+                    client,
+                    session_id,
+                    from_actor_id,
+                    to_actor_id,
+                    base_revision,
+                )
+                .await?
+            }
+        },
+        Cmd::AgentConfig { sub } => match sub {
+            AgentConfigCmd::Publish {
+                actor_id,
+                version,
+                model,
+                adapter,
+                prompt,
+                tools_json,
+            } => {
+                cmd::agent_config::publish(
+                    client, actor_id, version, model, adapter, prompt, tools_json,
+                )
+                .await?
+            }
+            AgentConfigCmd::Activate {
+                actor_id,
+                version_id,
+            } => cmd::agent_config::activate(client, actor_id, version_id).await?,
+        },
         Cmd::Spec { sub } => match sub {
             SpecCmd::Apply {
-                action_event_id,
+                action_message_id,
                 dry_run,
             } => {
-                cmd::spec_apply::run(client, cfg.actor_id.clone(), action_event_id, dry_run).await?
+                cmd::spec_apply::run(client, cfg.actor_id.clone(), action_message_id, dry_run)
+                    .await?
             }
         },
         Cmd::AskUserQuestion {
@@ -2163,53 +2328,6 @@ async fn main() -> Result<()> {
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
-        Cmd::Event { sub } => match sub {
-            EventCmd::Get { event_id } => cmd::event::get(client, event_id).await?,
-            EventCmd::List {
-                r#in,
-                channel,
-                limit,
-                before,
-            } => cmd::event::list(client, r#in, channel, limit, before).await?,
-            EventCmd::Query {
-                r#in,
-                channel,
-                limit,
-                before,
-            } => cmd::event::list(client, r#in, channel, limit, before).await?,
-            EventCmd::Append {
-                r#in,
-                channel,
-                event_type,
-                content_type,
-                text,
-                file,
-                stdin,
-                reply,
-                handoff,
-                handoff_prefix,
-                artifact_link,
-            } => {
-                cmd::event::append(
-                    client,
-                    cmd::event::AppendArgs {
-                        actor_id: cfg.actor_id,
-                        scope_id: r#in,
-                        is_channel: channel,
-                        event_type,
-                        content_type,
-                        text,
-                        file,
-                        stdin,
-                        reply_to: reply,
-                        handoff_to: handoff,
-                        handoff_prefix,
-                        artifact_links: artifact_link,
-                    },
-                )
-                .await?
-            }
-        },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,
             ActorCmd::Upsert {
@@ -2219,6 +2337,22 @@ async fn main() -> Result<()> {
                 capabilities_json,
             } => cmd::actor::upsert(client, actor_id, kind, display, capabilities_json).await?,
             ActorCmd::Delete { actor_id } => cmd::actor::delete(client, actor_id).await?,
+        },
+        Cmd::Group { sub } => match sub {
+            GroupCmd::Create {
+                channel,
+                name,
+                display,
+                members,
+                wake_agents,
+            } => cmd::group::create(client, channel, name, display, members, wake_agents).await?,
+            GroupCmd::List { channel } => cmd::group::list(client, channel).await?,
+            GroupCmd::AddMember { group_id, actor_id } => {
+                cmd::group::add_member(client, group_id, actor_id).await?
+            }
+            GroupCmd::RemoveMember { group_id, actor_id } => {
+                cmd::group::remove_member(client, group_id, actor_id).await?
+            }
         },
         Cmd::Artifact { sub } => match sub {
             ArtifactCmd::Publish {
@@ -2315,7 +2449,6 @@ async fn main() -> Result<()> {
         }
         Cmd::Service { .. } => unreachable!("handled before client setup"),
         Cmd::Workspace { .. } => unreachable!("handled before client setup"),
-        Cmd::Daemon { .. } => unreachable!("handled before client setup"),
     }
     Ok(())
 }
@@ -2372,4 +2505,325 @@ fn init_tracing() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_send_accepts_direct_recipient_and_delivery_options() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "message",
+            "send",
+            "--to",
+            "actor_reviewer",
+            "--intent",
+            "request_action",
+            "--delivery-policy",
+            "wake_agent",
+            "--if-latest",
+            "msg_latest",
+            "--text",
+            "please review",
+        ])
+        .expect("parse message send");
+
+        match args.cmd {
+            Cmd::Message {
+                sub:
+                    MessageCmd::Send {
+                        target,
+                        to,
+                        intent,
+                        delivery_policy,
+                        if_latest,
+                        text,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(to.as_deref(), Some("actor_reviewer"));
+                assert_eq!(intent.as_deref(), Some("request_action"));
+                assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
+                assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(text.as_deref(), Some("please review"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_claim_accepts_source_message_guard() {
+        let args = Args::try_parse_from([
+            "loom",
+            "task",
+            "claim",
+            "--source-message",
+            "msg_root",
+            "--actor",
+            "actor_worker",
+        ])
+        .expect("parse task claim");
+
+        match args.cmd {
+            Cmd::Task {
+                sub:
+                    TaskCmd::Claim {
+                        task_id,
+                        source_message,
+                        actor,
+                    },
+            } => {
+                assert_eq!(task_id, None);
+                assert_eq!(source_message.as_deref(), Some("msg_root"));
+                assert_eq!(actor.as_deref(), Some("actor_worker"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbox_list_is_the_directed_inbox_surface() {
+        let args = Args::try_parse_from(["loom", "inbox", "list", "--no-ack", "--limit", "7"])
+            .expect("parse inbox list");
+
+        match args.cmd {
+            Cmd::Inbox {
+                sub: InboxCmd::List { limit, no_ack },
+            } => {
+                assert_eq!(limit, 7);
+                assert!(no_ack);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_create_accepts_members_and_wake_policy() {
+        let args = Args::try_parse_from([
+            "loom",
+            "group",
+            "create",
+            "--channel",
+            "chan_123",
+            "reviewers",
+            "--member",
+            "actor_alice",
+            "--member",
+            "actor_agent_reviewer",
+            "--wake-agents",
+        ])
+        .expect("parse group create");
+
+        match args.cmd {
+            Cmd::Group {
+                sub:
+                    GroupCmd::Create {
+                        channel,
+                        name,
+                        members,
+                        wake_agents,
+                        ..
+                    },
+            } => {
+                assert_eq!(channel, "chan_123");
+                assert_eq!(name, "reviewers");
+                assert_eq!(members, vec!["actor_alice", "actor_agent_reviewer"]);
+                assert!(wake_agents);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_follow_and_task_shortcuts_parse() {
+        let follow = Args::try_parse_from(["loom", "thread", "follow", "thread_123", "--muted"])
+            .expect("parse thread follow");
+        match follow.cmd {
+            Cmd::Thread {
+                sub: ThreadCmd::Follow { thread_id, muted },
+            } => {
+                assert_eq!(thread_id, "thread_123");
+                assert!(muted);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let complete = Args::try_parse_from([
+            "loom",
+            "task",
+            "complete",
+            "task_123",
+            "--result",
+            "done",
+            "--artifact-id",
+            "art_1",
+        ])
+        .expect("parse task complete");
+        match complete.cmd {
+            Cmd::Task {
+                sub:
+                    TaskCmd::Complete {
+                        task_id,
+                        result,
+                        artifact_ids,
+                    },
+            } => {
+                assert_eq!(task_id, "task_123");
+                assert_eq!(result.as_deref(), Some("done"));
+                assert_eq!(artifact_ids, vec!["art_1"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_open_accepts_explicit_local_start() {
+        let args = Args::try_parse_from([
+            "loom",
+            "run",
+            "open",
+            "--target",
+            "#chan_123",
+            "--start-reason",
+            "manual",
+            "--agent-config-version-id",
+            "cfg_v1",
+        ])
+        .expect("parse run open");
+
+        match args.cmd {
+            Cmd::Run {
+                sub:
+                    RunCmd::Open {
+                        target,
+                        start_reason,
+                        agent_config_version_id,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, "#chan_123");
+                assert_eq!(start_reason.as_deref(), Some("manual"));
+                assert_eq!(agent_config_version_id, "cfg_v1");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_ignore_accepts_optional_run_and_reason() {
+        let args = Args::try_parse_from([
+            "loom",
+            "run",
+            "ignore",
+            "--run-id",
+            "run_123",
+            "--reason",
+            "not directed at me",
+        ])
+        .expect("parse run ignore");
+
+        match args.cmd {
+            Cmd::Run {
+                sub: RunCmd::Ignore { run_id, reason },
+            } => {
+                assert_eq!(run_id.as_deref(), Some("run_123"));
+                assert_eq!(reason.as_deref(), Some("not directed at me"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordination_propose_accepts_participants_and_plan() {
+        let args = Args::try_parse_from([
+            "loom",
+            "coordination",
+            "propose",
+            "--target",
+            "#chan_123",
+            "--mode",
+            "sequential",
+            "--participant",
+            "actor_a",
+            "--participant",
+            "actor_b",
+            "--plan-json",
+            r#"{"goal":"count"}"#,
+        ])
+        .expect("parse coordination propose");
+
+        match args.cmd {
+            Cmd::Coordination {
+                sub:
+                    CoordinationCmd::Propose {
+                        target,
+                        mode,
+                        participants,
+                        plan_json,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, "#chan_123");
+                assert_eq!(mode, "sequential");
+                assert_eq!(participants, vec!["actor_a", "actor_b"]);
+                assert_eq!(plan_json.as_deref(), Some(r#"{"goal":"count"}"#));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_config_publish_accepts_version_metadata() {
+        let args = Args::try_parse_from([
+            "loom",
+            "agent-config",
+            "publish",
+            "actor_agent_bot",
+            "--version",
+            "v1",
+            "--model",
+            "noop",
+            "--tools-json",
+            "[]",
+        ])
+        .expect("parse agent-config publish");
+
+        match args.cmd {
+            Cmd::AgentConfig {
+                sub:
+                    AgentConfigCmd::Publish {
+                        actor_id,
+                        version,
+                        model,
+                        tools_json,
+                        ..
+                    },
+            } => {
+                assert_eq!(actor_id, "actor_agent_bot");
+                assert_eq!(version.as_deref(), Some("v1"));
+                assert_eq!(model.as_deref(), Some("noop"));
+                assert_eq!(tools_json.as_deref(), Some("[]"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retired_event_say_and_daemon_commands_are_not_public_cli() {
+        let cases: &[&[&str]] = &[
+            &["loom", "event", "list", "--in", "thread_1"],
+            &["loom", "say", "--in", "thread_1", "hello"],
+            &["loom", "daemon", "--list-providers"],
+        ];
+        for argv in cases {
+            assert!(
+                Args::try_parse_from(*argv).is_err(),
+                "legacy command parsed unexpectedly: {argv:?}"
+            );
+        }
+    }
 }

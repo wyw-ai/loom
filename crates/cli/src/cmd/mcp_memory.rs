@@ -1,6 +1,6 @@
-//! `joi mcp memory` — stdio MCP server exposing per-actor memory as tools.
+//! `loom mcp memory` — stdio MCP server exposing per-actor memory as tools.
 //!
-//! The same `joi` binary runs as an MCP server when spawned with this
+//! The same `loom` binary runs as an MCP server when spawned with this
 //! subcommand. The ACP runtime injects it into `session/new.mcpServers`
 //! whenever the spec has `memory.delivery.mcp = true`, giving the agent
 //! first-class tools:
@@ -27,7 +27,7 @@ use agent_runtime::memory::{
 };
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "joi-memory";
+const SERVER_NAME: &str = "loom-memory";
 
 pub fn run(actor_id: String, profile_dir: PathBuf, shard_by: Option<String>) -> Result<()> {
     let root_path = resolve_memory_root(&profile_dir);
@@ -402,7 +402,7 @@ mod tests {
     use super::*;
 
     fn tmpdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("joi-mcp-memory-{}", Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("loom-mcp-memory-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

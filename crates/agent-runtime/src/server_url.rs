@@ -10,7 +10,7 @@ pub fn local_agent_child_server_url(server_url: &str) -> String {
 }
 
 fn child_server_url(server_url: &str, assume_local: bool) -> String {
-    if let Ok(explicit) = std::env::var("JOI_AGENT_SERVER") {
+    if let Ok(explicit) = std::env::var("LOOM_AGENT_SERVER") {
         if !explicit.trim().is_empty() {
             return explicit;
         }

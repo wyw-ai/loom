@@ -1,25 +1,25 @@
-// Public S2 surface; first user is `joi service am-handler` (added in
+// Public S2 surface; first user is `loom service am-handler` (added in
 // S2-5). Silence dead-code warnings until then so Stage-by-stage
 // commits stay clean.
 #![allow(dead_code)]
 
 //! `am` plugin entry point. S2 ships AM as a short-lived CLI handler
-//! (`joi service am-handler --service-id <id>`) that replaces the
-//! Python reference at `examples/am-joi-channel-bridge.py`. Each
+//! (`loom service am-handler --service-id <id>`) that replaces the
+//! removed Python bridge. Each
 //! `am listen --script` invocation spawns one handler, which:
 //!
 //! 1. Reads the message JSON from stdin.
 //! 2. Loads the `ServiceSpec` for `<id>` and parses `spec.config` as
 //!    [`AmConfig`].
-//! 3. Connects to joi-server as the service actor, writes a handoff
-//!    event into the resolved scope, optionally awaits the agent reply,
+//! 3. Connects to loom-server as the service actor, writes a directed
+//!    message into the resolved scope, optionally awaits the agent reply,
 //!    and either prints a callback JSON to stdout or invokes `am`.
 //!
 //! No long-lived plugin process in S2 — see the design doc §12 S2 entry
 //! and the AM-shape architectural decision (`A` in the S2 dialog). The
 //! `ServiceRuntime` substrate from S1 is used per-invocation; thread
 //! map / dedupe live in files under
-//! `~/.local/share/joi/service-host/services/<id>/`.
+//! `~/.local/share/loom/service-host/services/<id>/`.
 
 pub mod extract;
 pub mod handler;
@@ -53,7 +53,7 @@ pub struct AmConfig {
     /// only — the handler doesn't subscribe; it's documentation for the
     /// `am listen --topic` flag operators wire up themselves.
     pub topic: String,
-    /// Where to write each handoff event (§7.2).
+    /// Where to write each directed message (§7.2).
     pub scope: ScopeMode,
     /// Fixed thread id used by `scope = "thread"` (and as override
     /// when `scope = "auto_thread"` and `threadId` is set, matching
@@ -61,7 +61,7 @@ pub struct AmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// Whether to wait for the agent reply at all. When `false`, the
-    /// handler exits after the handoff and emits an empty `{}` to the
+    /// handler exits after the directed message and emits an empty `{}` to the
     /// listener.
     pub reply: bool,
     /// Which §7.4 reply path to take when `reply = true`.

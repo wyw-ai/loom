@@ -1,9 +1,9 @@
 {
-  "name": "joi-apps-pages",
+  "name": "loom-apps-pages",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Joi Apps static portal",
+  "description": "Loom Apps static portal",
   "scripts": {
     "build": "bash build.sh"
   }

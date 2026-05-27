@@ -16,8 +16,6 @@ pub enum TargetMode {
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
     pub scope: ScopeRef,
-    pub direct_actor: Option<String>,
-    pub thread_root_event_id: Option<String>,
 }
 
 pub async fn resolve_target(
@@ -39,7 +37,7 @@ pub async fn resolve_target(
     }
 
     bail!(
-        "unsupported target `{}` (use #<channel_id>, #<channel_id>:<root_event_id>, or dm:<actor_id>)",
+        "unsupported target `{}` (use #<channel_id>, #<channel_id>:<root_message_id>, or dm:<actor_id>)",
         target
     )
 }
@@ -50,8 +48,6 @@ fn scope(kind: ScopeKind, id: &str) -> ResolvedTarget {
             kind,
             id: id.to_string(),
         },
-        direct_actor: None,
-        thread_root_event_id: None,
     }
 }
 
@@ -64,12 +60,12 @@ async fn resolve_hash_target(
     if raw.is_empty() {
         bail!("invalid target `#` (use #<channel_id>)");
     }
-    let Some((channel_id, root_event_id)) = raw.split_once(':') else {
+    let Some((channel_id, root_message_id)) = raw.split_once(':') else {
         return Ok(scope(ScopeKind::Channel, raw));
     };
-    if channel_id.is_empty() || root_event_id.is_empty() || root_event_id.contains(':') {
+    if channel_id.is_empty() || root_message_id.is_empty() || root_message_id.contains(':') {
         bail!(
-            "invalid thread target `#{}` (use #<channel_id>:<root_event_id>)",
+            "invalid thread target `#{}` (use #<channel_id>:<root_message_id>)",
             raw
         );
     }
@@ -79,27 +75,25 @@ async fn resolve_hash_target(
     if let Some(thread) = existing
         .threads
         .into_iter()
-        .find(|t| t.root_event_id == root_event_id)
+        .find(|t| t.root_message_id == root_message_id)
     {
         return Ok(ResolvedTarget {
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: thread.id,
             },
-            direct_actor: None,
-            thread_root_event_id: Some(root_event_id.to_string()),
         });
     }
     if mode == TargetMode::Read {
-        bail!("thread `#{channel_id}:{root_event_id}` does not exist");
+        bail!("thread `#{channel_id}:{root_message_id}` does not exist");
     }
     let created: ThreadCreateResult = client
         .call(
             method::THREAD_CREATE,
             json!({
                 "channelId": channel_id,
-                "title": format!("thread {root_event_id}"),
-                "rootEventId": root_event_id,
+                "title": format!("thread {root_message_id}"),
+                "rootMessageId": root_message_id,
             }),
         )
         .await?;
@@ -108,8 +102,6 @@ async fn resolve_hash_target(
             kind: ScopeKind::Thread,
             id: created.thread.id,
         },
-        direct_actor: None,
-        thread_root_event_id: Some(root_event_id.to_string()),
     })
 }
 
@@ -129,8 +121,6 @@ async fn resolve_dm_target(
             kind: ScopeKind::Channel,
             id: channel.id,
         },
-        direct_actor: Some(actor_id),
-        thread_root_event_id: None,
     })
 }
 

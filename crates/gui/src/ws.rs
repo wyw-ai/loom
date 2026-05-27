@@ -1,7 +1,7 @@
-//! Thin WebSocket JSON-RPC client for the Joi server.
+//! Thin WebSocket JSON-RPC client for the Loom server.
 //!
 //! Mirrors `crates/cli/src/client.rs` — the two will be merged into a shared
-//! `joi-client` crate in a follow-up; for this scaffold we duplicate the file
+//! `loom-client` crate in a follow-up; for this scaffold we duplicate the file
 //! verbatim so the GUI can land without disturbing the TUI's call sites.
 
 use std::collections::HashMap;
@@ -117,7 +117,7 @@ impl Client {
                     "protocolVersion": proto::PROTOCOL_VERSION,
                     "clientInfo": {
                         "name": client_name,
-                        "title": "Joi Desktop",
+                        "title": "Loom Desktop",
                         "version": client_version,
                     },
                 })),

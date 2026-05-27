@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use crate::client::Client;
 use crate::render;
 
-/// `joi thread create --root-event <event_id> [--resident-as <role>] [--bootstrap-artifact <uri>]`.
+/// `loom thread create --root-message <message_id> [--resident-as <role>] [--bootstrap-artifact <uri>]`.
 ///
 /// After the server creates the thread, the CLI writes two channel-local
 /// metadata files when the optional flags are passed (see design §4.7.1
@@ -16,7 +16,7 @@ use crate::render;
 ///
 /// * `--resident-as` records `resident_threads.<role> = <tid>` in the
 ///   channel-shared `scope.json` so a router can address the thread by
-///   role without scraping events.
+///   role without scraping messages.
 /// * `--bootstrap-artifact` reads the artifact, derives a `mounts` array
 ///   (either taken verbatim or generated from a `repos[]` clone-manifest
 ///   shape) and writes it to the thread-shared `scope.json`. Per-actor
@@ -25,7 +25,7 @@ use crate::render;
 pub async fn create(
     client: Arc<Client>,
     channel_id: String,
-    root_event_id: String,
+    root_message_id: String,
     title: String,
     resident_as: Option<String>,
     bootstrap_artifact: Option<String>,
@@ -33,7 +33,7 @@ pub async fn create(
     let res: ThreadCreateResult = client
         .call(
             method::THREAD_CREATE,
-            json!({ "channelId": channel_id, "rootEventId": root_event_id, "title": title }),
+            json!({ "channelId": channel_id, "rootMessageId": root_message_id, "title": title }),
         )
         .await?;
     let thread_id = res.thread.id.clone();
@@ -111,7 +111,7 @@ pub async fn list(client: Arc<Client>, channel_id: Option<String>, archived: boo
     Ok(())
 }
 
-/// `joi thread archive <thread_id>` / `joi thread unarchive <thread_id>`.
+/// `loom thread archive <thread_id>` / `loom thread unarchive <thread_id>`.
 pub async fn archive(client: Arc<Client>, thread_id: String, archived: bool) -> Result<()> {
     let res: ThreadArchiveResult = client
         .call(
@@ -129,7 +129,7 @@ pub async fn archive(client: Arc<Client>, thread_id: String, archived: bool) -> 
     Ok(())
 }
 
-/// `joi thread delete <thread_id>`.
+/// `loom thread delete <thread_id>`.
 ///
 /// Calls `thread/delete` on the server, which removes the thread plus
 /// its scope skills. Thread-bound services watching that thread (per
@@ -151,7 +151,45 @@ pub async fn delete(client: Arc<Client>, thread_id: String) -> Result<()> {
     Ok(())
 }
 
-/// `joi thread bootstrap --in <thread_id> --channel <chan> --bootstrap-artifact <uri>`.
+pub async fn follow(client: Arc<Client>, thread_id: String, muted: bool) -> Result<()> {
+    let res: ThreadFollowResult = client
+        .call(
+            method::THREAD_FOLLOW,
+            json!({ "threadId": thread_id, "muted": muted }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.presence.muted {
+        println!(
+            "followed thread {} (muted)",
+            res.presence.thread_id.unwrap_or_default()
+        );
+    } else {
+        println!(
+            "followed thread {}",
+            res.presence.thread_id.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+pub async fn unfollow(client: Arc<Client>, thread_id: String) -> Result<()> {
+    let res: ThreadUnfollowResult = client
+        .call(method::THREAD_UNFOLLOW, json!({ "threadId": thread_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "unfollowed thread {}",
+            res.presence.thread_id.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// `loom thread bootstrap --in <thread_id> --channel <chan> --bootstrap-artifact <uri>`.
 ///
 /// Bootstrap an *existing* thread from a clone-manifest / mounts artifact.
 /// Used when a thread already exists (e.g. a bug-fix loop reuses its bugfix
@@ -165,7 +203,7 @@ pub async fn delete(client: Arc<Client>, thread_id: String) -> Result<()> {
 /// 3. Writes `scope.json.mounts` on the thread-shared scope.
 ///
 /// Per-actor `agent serve` instances pick up the new mounts on the next
-/// ensure_scope (i.e. next handoff into the thread).
+/// ensure_scope (i.e. next directed message into the thread).
 pub async fn bootstrap(
     client: Arc<Client>,
     channel_id: String,
@@ -197,16 +235,14 @@ pub async fn bootstrap(
 }
 
 fn data_root() -> PathBuf {
-    for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
-        if let Some(v) = std::env::var_os(key) {
-            if !v.is_empty() {
-                return PathBuf::from(v);
-            }
+    if let Some(v) = std::env::var_os("LOOM_AGENT_DATA_ROOT") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
         }
     }
-    dirs::home_dir()
-        .map(|d| d.join(".agentx"))
-        .unwrap_or_else(|| PathBuf::from(".agentx"))
+    dirs::data_dir()
+        .map(|d| d.join("loom").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
 }
 
 fn channel_shared_scope_json(data_root: &Path, channel_id: &str) -> PathBuf {
@@ -214,7 +250,7 @@ fn channel_shared_scope_json(data_root: &Path, channel_id: &str) -> PathBuf {
         .join("channels")
         .join(channel_id)
         .join("shared")
-        .join(".joi")
+        .join(".loom")
         .join("state")
         .join("scope.json")
 }
@@ -226,7 +262,7 @@ fn thread_shared_scope_json(data_root: &Path, channel_id: &str, thread_id: &str)
         .join("threads")
         .join(thread_id)
         .join("shared")
-        .join(".joi")
+        .join(".loom")
         .join("state")
         .join("scope.json")
 }
@@ -390,7 +426,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             let mut p = std::env::temp_dir();
             p.push(format!(
-                "joi-thread-tests-{tag}-{}",
+                "loom-thread-tests-{tag}-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("clock drift")
@@ -423,15 +459,15 @@ mod tests {
 
     #[test]
     fn parse_mounts_from_clone_manifest() {
-        let body = r#"{"repos":[{"repo_id":"aone/joi-apps"},{"repo_id":"aone/other","to":"repos/custom","readonly":true}]}"#;
+        let body = r#"{"repos":[{"repo_id":"aone/loom-apps"},{"repo_id":"aone/other","to":"repos/custom","readonly":true}]}"#;
         let mounts = parse_bootstrap_mounts(body).expect("parse");
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0]["name"], "target-repo:aone/joi-apps");
+        assert_eq!(mounts[0]["name"], "target-repo:aone/loom-apps");
         assert_eq!(
             mounts[0]["from"],
-            "service://repo-cache/cache/aone%2Fjoi-apps"
+            "service://repo-cache/cache/aone%2Floom-apps"
         );
-        assert_eq!(mounts[0]["to"], "repos/joi-apps");
+        assert_eq!(mounts[0]["to"], "repos/loom-apps");
         assert_eq!(mounts[0]["readonly"], false);
         assert_eq!(mounts[1]["to"], "repos/custom");
         assert_eq!(mounts[1]["readonly"], true);

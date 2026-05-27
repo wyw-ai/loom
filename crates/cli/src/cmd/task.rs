@@ -16,12 +16,12 @@ use crate::render;
 pub async fn create(
     client: Arc<Client>,
     actor_id: String,
-    source_event_id: String,
+    source_message_id: String,
     title: Option<String>,
     description: String,
     owner: Option<String>,
     status: Option<String>,
-    parent_source_event: Option<String>,
+    parent_source_message: Option<String>,
     parent_task: Option<String>,
     practice_contract_epoch: Option<String>,
 ) -> Result<()> {
@@ -30,13 +30,13 @@ pub async fn create(
         .call(
             method::TASK_CREATE,
             json!({
-                "sourceEventId": source_event_id,
+                "sourceMessageId": source_message_id,
                 "title": title,
                 "description": description,
                 "requesterActorId": actor_id,
                 "ownerActorId": owner,
                 "status": status,
-                "parentSourceEventId": parent_source_event,
+                "parentSourceMessageId": parent_source_message,
                 "parentTaskId": parent_task,
                 "practiceContractEpoch": practice_contract_epoch,
             }),
@@ -56,7 +56,7 @@ pub async fn create(
 pub async fn list(
     client: Arc<Client>,
     channel_id: Option<String>,
-    source_event_id: Option<String>,
+    source_message_id: Option<String>,
     owner: Option<String>,
     statuses: Vec<String>,
 ) -> Result<()> {
@@ -69,7 +69,7 @@ pub async fn list(
             method::TASK_LIST,
             json!({
                 "channelId": channel_id,
-                "sourceEventId": source_event_id,
+                "sourceMessageId": source_message_id,
                 "ownerActorId": owner,
                 "statuses": statuses,
             }),
@@ -106,7 +106,7 @@ pub async fn show(client: Arc<Client>, task_id: String) -> Result<()> {
         println!("title       {}", task.title);
         println!("status      {:?}", task.status);
         println!("channel     {}", task.channel_id);
-        println!("source      {}", task.source_event_id);
+        println!("source      {}", task.source_message_id);
         println!("thread      {}", task.canonical_thread_id);
         println!("requester   {}", task.requester_actor_id);
         println!(
@@ -171,6 +171,83 @@ pub async fn update(
     Ok(())
 }
 
+pub async fn claim(
+    client: Arc<Client>,
+    task_id: Option<String>,
+    source_message: Option<String>,
+    actor: Option<String>,
+) -> Result<()> {
+    if task_id.is_some() == source_message.is_some() {
+        bail!("pass exactly one of <task_id> or --source-message");
+    }
+    let res: TaskUpdateResult = client
+        .call(
+            method::TASK_CLAIM,
+            json!({
+                "taskId": task_id,
+                "sourceMessageId": source_message,
+                "actorId": actor,
+            }),
+        )
+        .await?;
+    print_task_update(res);
+    Ok(())
+}
+
+pub async fn complete(
+    client: Arc<Client>,
+    task_id: String,
+    result: Option<String>,
+    artifact_ids: Vec<String>,
+) -> Result<()> {
+    let artifact_ids = expand_cli_values(artifact_ids);
+    let res: TaskUpdateResult = client
+        .call(
+            method::TASK_COMPLETE,
+            json!({
+                "taskId": task_id,
+                "resultSummary": result,
+                "artifactIds": artifact_ids,
+            }),
+        )
+        .await?;
+    print_task_update(res);
+    Ok(())
+}
+
+pub async fn reopen(client: Arc<Client>, task_id: String, owner: Option<String>) -> Result<()> {
+    let res: TaskUpdateResult = client
+        .call(
+            method::TASK_REOPEN,
+            json!({ "taskId": task_id, "ownerActorId": owner }),
+        )
+        .await?;
+    print_task_update(res);
+    Ok(())
+}
+
+pub async fn cancel(client: Arc<Client>, task_id: String, result: Option<String>) -> Result<()> {
+    let res: TaskUpdateResult = client
+        .call(
+            method::TASK_CANCEL,
+            json!({ "taskId": task_id, "resultSummary": result }),
+        )
+        .await?;
+    print_task_update(res);
+    Ok(())
+}
+
+fn print_task_update(res: TaskUpdateResult) {
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "task #{} {} ({:?})",
+            res.task.number, res.task.id, res.task.status
+        );
+    }
+}
+
 pub async fn assign(
     client: Arc<Client>,
     actor_id: String,
@@ -202,8 +279,8 @@ pub async fn assign(
         render::print_json(&res);
     } else {
         println!(
-            "assignment {} -> {} (event {})",
-            res.assignment.id, res.assignment.to_actor_id, res.event.id
+            "assignment {} -> {} (message {})",
+            res.assignment.id, res.assignment.to_actor_id, res.message.id
         );
     }
     Ok(())
@@ -213,7 +290,7 @@ pub async fn assignment_update(
     client: Arc<Client>,
     assignment_id: String,
     status: Option<String>,
-    result_event: Option<String>,
+    result_message: Option<String>,
     result: Option<String>,
     result_envelope_json: Option<String>,
     result_artifact_ids: Vec<String>,
@@ -246,7 +323,7 @@ pub async fn assignment_update(
             json!({
                 "assignmentId": assignment_id,
                 "status": status,
-                "resultEventId": result_event,
+                "resultMessageId": result_message,
                 "resultSummary": result,
                 "resultEnvelope": result_envelope,
                 "resultArtifactIds": result_artifact_ids,
@@ -288,7 +365,7 @@ pub async fn ref_attach(
     normalized: String,
     confidence: String,
     status: String,
-    source_event: Option<String>,
+    source_message: Option<String>,
     fields_json: Option<String>,
 ) -> Result<()> {
     let fields = json_value_opt(fields_json)?.unwrap_or_else(|| json!({}));
@@ -305,7 +382,7 @@ pub async fn ref_attach(
                 "normalized": normalized,
                 "confidence": confidence,
                 "status": status,
-                "sourceEventId": source_event,
+                "sourceMessageId": source_message,
                 "fields": fields,
             }),
         )

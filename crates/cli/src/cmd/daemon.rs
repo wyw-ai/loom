@@ -1,4 +1,4 @@
-//! `joi daemon` — machine-scoped agent host.
+//! `loom-daemon` — machine-scoped agent host.
 //!
 //! The daemon is the machine-scoped agent host: it reads the desktop machine
 //! config, auto-detects supported local agent CLIs, synthesizes runtime
@@ -64,7 +64,7 @@ pub async fn run(
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
-    std::env::set_var("JOI_AGENT_DATA_ROOT", &data_root);
+    std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
     let mut inventory_revision = 1u64;
     let mut inventory_fingerprint = machine_inventory_fingerprint(&machine, &data_root, &providers);
@@ -92,13 +92,13 @@ pub async fn run(
         let proxy_handle = daemon_ipc::start_proxy(socket_path.clone(), server_url.clone()).await?;
         std::env::set_var(daemon_ipc::ENV_DAEMON_SOCKET, &socket_path);
         if let Err(err) = daemon_ipc::write_discovery(&socket_path, &server_url) {
-            eprintln!("joi daemon: warning: failed to write daemon discovery: {err:#}");
+            eprintln!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
         }
         (Some(socket_path), Some(proxy_handle))
     };
 
     if no_services {
-        eprintln!("joi daemon: service host disabled by --no-services");
+        eprintln!("loom-daemon: service host disabled by --no-services");
     } else {
         spawn_service_host(services_dir, server_url.clone(), allow_services);
     }
@@ -109,18 +109,18 @@ pub async fn run(
     let mut warned_missing = HashSet::new();
 
     eprintln!(
-        "joi daemon: machine={} providers={} data={} reload={}s",
+        "loom-daemon: machine={} providers={} data={} reload={}s",
         machine.id,
         providers.len(),
         data_root.display(),
         CONFIG_RELOAD_INTERVAL.as_secs()
     );
     if let Some(socket_path) = socket_path.as_ref() {
-        eprintln!("joi daemon: socket={}", socket_path.display());
+        eprintln!("loom-daemon: socket={}", socket_path.display());
     } else {
-        eprintln!("joi daemon: socket disabled");
+        eprintln!("loom-daemon: socket disabled");
     }
-    eprintln!("joi daemon: ready (ctrl-c to stop)");
+    eprintln!("loom-daemon: ready (ctrl-c to stop)");
 
     loop {
         match refresh_machine_runtime(
@@ -136,14 +136,14 @@ pub async fn run(
             &mut warned_missing,
         ) {
             Ok(()) => {}
-            Err(e) => eprintln!("joi daemon: reload failed: {e:#}"),
+            Err(e) => eprintln!("loom-daemon: reload failed: {e:#}"),
         }
 
         tokio::select! {
             _ = shutdown_signal() => break,
             maybe_command = machine_command_rx.recv() => {
                 let Some(command) = maybe_command else {
-                    eprintln!("joi daemon: machine command channel closed");
+                    eprintln!("loom-daemon: machine command channel closed");
                     continue;
                 };
                 let result = handle_machine_command(
@@ -179,7 +179,7 @@ pub async fn run(
         }
     }
 
-    eprintln!("\njoi daemon: shutting down");
+    eprintln!("\nloom-daemon: shutting down");
     if let Some(proxy_handle) = proxy_handle {
         proxy_handle.abort();
     }
@@ -286,7 +286,7 @@ fn load_machine_specs(
     let restored_context = if was_missing {
         if warned_missing.insert(format!("machine:{selected_machine_id}")) {
             eprintln!(
-                "joi daemon: selected machine {selected_machine_id} is missing from desktop.toml; restoring live runtime snapshot"
+                "loom-daemon: selected machine {selected_machine_id} is missing from desktop.toml; restoring live runtime snapshot"
             );
         }
         restore_selected_machine_context(&mut cfg, selected_machine, server_url, true)
@@ -402,7 +402,7 @@ fn spawn_service_host(
 ) {
     tokio::spawn(async move {
         if let Err(e) = service::serve(services_dir, server_url, allow_services).await {
-            eprintln!("joi daemon: service host exited with error: {e:#}");
+            eprintln!("loom-daemon: service host exited with error: {e:#}");
         }
     });
 }
@@ -601,6 +601,9 @@ fn apply_machine_command(
             if let Some(value) = command.get("autostart").and_then(Value::as_bool) {
                 agent.autostart = value;
             }
+            if let Some(value) = optional_trimmed_str(command, "avatarUrl") {
+                agent.avatar_url = value;
+            }
             let updated = agent.clone();
             save_desktop_config(&cfg)?;
             *selected_machine = cfg.machines[machine_index].clone();
@@ -730,6 +733,12 @@ fn agent_config_from_command(command: &Value, machine_id: &str) -> Result<Machin
             .get("autostart")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        avatar_url: command
+            .get("avatarUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
     })
 }
 
@@ -816,7 +825,7 @@ fn warn_missing_providers_once(
                 continue;
             }
             eprintln!(
-                "joi daemon: skipping {} because provider `{}` is not available on PATH",
+                "loom-daemon: skipping {} because provider `{}` is not available on PATH",
                 definition.actor_id, definition.provider_id
             );
         }
@@ -901,6 +910,8 @@ struct MachineAgentConfig {
     reasoning_effort: String,
     #[serde(default)]
     autostart: bool,
+    #[serde(default)]
+    avatar_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1146,7 +1157,9 @@ async fn select_machine_for_daemon(
         }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("joi daemon: warning: failed to recover machine config from server: {err:#}");
+            eprintln!(
+                "loom-daemon: warning: failed to recover machine config from server: {err:#}"
+            );
         }
     }
 
@@ -1354,6 +1367,12 @@ fn active_account_actor_id(cfg: &DesktopConfig) -> Option<&str> {
         .as_ref()
         .map(|account| account.actor_id.trim())
         .filter(|actor_id| !actor_id.is_empty())
+        .or_else(|| {
+            active_workspace_id(cfg)
+                .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+                .map(|workspace| workspace.actor_id.trim())
+                .filter(|actor_id| !actor_id.is_empty())
+        })
 }
 
 fn active_workspace_can_be_recovered(cfg: &DesktopConfig) -> bool {
@@ -1559,6 +1578,7 @@ fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
         model: non_empty(agent.model.trim()),
         reasoning_effort: non_empty(agent.reasoning_effort.trim()),
         autostart: agent.autostart,
+        avatar_url: non_empty(agent.avatar_url.trim()),
     }
 }
 
@@ -1660,6 +1680,7 @@ mod tests {
             model: String::new(),
             reasoning_effort: String::new(),
             autostart: true,
+            avatar_url: String::new(),
         }
     }
 
@@ -1737,6 +1758,7 @@ mod tests {
             model: Some("gpt-5.5".into()),
             reasoning_effort: Some("xhigh".into()),
             autostart: false,
+            avatar_url: None,
         };
         let mut specs = provider_specs_from_agent_definitions(&[provider], &[definition])
             .into_iter()
@@ -1785,12 +1807,12 @@ mod tests {
         let cfg = cfg_with_owner("actor_human_1", Vec::new());
 
         let machine =
-            synthesize_requested_machine(&cfg, "machine_remote", Path::new("/tmp/joi-remote"));
+            synthesize_requested_machine(&cfg, "machine_remote", Path::new("/tmp/loom-remote"));
 
         assert_eq!(machine.id, "machine_remote");
         assert_eq!(machine.workspace_id.as_deref(), Some("ws_main"));
         assert_eq!(machine.owner_actor_id.as_deref(), Some("actor_human_1"));
-        assert_eq!(machine.data_root, "/tmp/joi-remote");
+        assert_eq!(machine.data_root, "/tmp/loom-remote");
     }
 
     #[test]
@@ -1855,6 +1877,7 @@ mod tests {
                 model: String::new(),
                 reasoning_effort: String::new(),
                 autostart: true,
+                avatar_url: String::new(),
             }],
         };
         let mut cfg = DesktopConfig {
@@ -1944,7 +1967,7 @@ mod tests {
             owner_actor_id: Some("actor_human_1".into()),
             name: "Remote".into(),
             kind: default_machine_kind(),
-            data_root: "/tmp/joi-remote".into(),
+            data_root: "/tmp/loom-remote".into(),
             agents: Vec::new(),
         };
 
@@ -1979,7 +2002,7 @@ mod tests {
             owner_actor_id: Some("actor_human_88084".into()),
             name: "Remote".into(),
             kind: default_machine_kind(),
-            data_root: "/tmp/joi-remote".into(),
+            data_root: "/tmp/loom-remote".into(),
             agents: Vec::new(),
         };
         let data_root = PathBuf::from("/tmp/default/actor_human_88084/local_computer");

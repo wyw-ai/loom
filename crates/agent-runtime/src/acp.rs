@@ -1,6 +1,6 @@
 //! Minimal ACP (Agent Client Protocol) stdio adapter.
 //!
-//! Lifted and slimmed from joi/src-tauri/src/agents/acp.rs — only the wire
+//! Lifted and slimmed from loom/src-tauri/src/agents/acp.rs — only the wire
 //! handling we need:
 //!   initialize → optional authenticate → (lazy per-scope session/new) →
 //!   session/prompt loop, inbound session/update streams (text + tool_call),
@@ -37,7 +37,7 @@ use crate::usage::{extract_token_usage, normalized_usage};
 
 const SHELL_ENV_CAPTURE_TIMEOUT: Duration = Duration::from_secs(8);
 const TERMINAL_AUTH_TIMEOUT: Duration = Duration::from_secs(120);
-const SESSION_MODEL_CONFIG_ID: &str = "joi:acp:session-model";
+const SESSION_MODEL_CONFIG_ID: &str = "loom:acp:session-model";
 
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
@@ -47,7 +47,7 @@ pub struct AcpConfig {
     pub process_cwd: PathBuf,
     pub auth_method: Option<String>,
     /// Passed verbatim as `mcpServers` in every `session/new`. Callers
-    /// synthesize this (e.g. from `memory.delivery.mcp = true` + the joi
+    /// synthesize this (e.g. from `memory.delivery.mcp = true` + the loom
     /// binary path). An empty vec reproduces the pre-envelope behavior of
     /// always sending `mcpServers: []`.
     #[allow(dead_code)]
@@ -182,7 +182,7 @@ impl AcpAdapter {
                 (scope_for_prompt.clone(), session_id.clone()),
             );
             eprintln!(
-                "[joi:acp] session/prompt sent id={} session={} scope={} (in_flight={})",
+                "[loom:acp] session/prompt sent id={} session={} scope={} (in_flight={})",
                 request_id,
                 session_id,
                 scope_for_prompt.id,
@@ -292,7 +292,7 @@ impl AcpAdapter {
             Ok(session) => session,
             Err(err) if requested_model.is_some() => {
                 eprintln!(
-                    "[joi:acp] session/new with saved model failed while listing models; \
+                    "[loom:acp] session/new with saved model failed while listing models; \
                      retrying without model: {err}"
                 );
                 self.ensure_session(scope, prompt.cwd, None).await?
@@ -379,7 +379,7 @@ impl AcpAdapter {
             });
             shared.write_message(&response)?;
             eprintln!(
-                "[joi:acp] -> permission response id={} option={}",
+                "[loom:acp] -> permission response id={} option={}",
                 response
                     .get("id")
                     .and_then(request_id_key)
@@ -538,7 +538,7 @@ fn start_blocking(
         match capture_login_shell_env(&process_cwd, SHELL_ENV_CAPTURE_TIMEOUT) {
             Ok(env) => {
                 eprintln!(
-                    "[joi:acp] captured {} env vars from login shell for ACP child",
+                    "[loom:acp] captured {} env vars from login shell for ACP child",
                     env.len()
                 );
                 if let Some(path) = env.get("PATH") {
@@ -547,7 +547,7 @@ fn start_blocking(
                 process_env.extend(env);
             }
             Err(err) => {
-                eprintln!("[joi:acp] login shell env capture skipped: {err}");
+                eprintln!("[loom:acp] login shell env capture skipped: {err}");
             }
         }
     }
@@ -593,8 +593,8 @@ fn start_blocking(
         json!({
             "protocolVersion": 1,
             "clientInfo": {
-                "name": "joi-server",
-                "title": "Joi Server",
+                "name": "loom-server",
+                "title": "Loom Server",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "clientCapabilities": {
@@ -675,7 +675,7 @@ fn request_new_session_with_auth_retry(
                 *attempted = true;
             }
             eprintln!(
-                "[joi:acp] session/new requires authentication; trying auth method `{}`",
+                "[loom:acp] session/new requires authentication; trying auth method `{}`",
                 method.id
             );
             if method.terminal_auth.is_some() {
@@ -688,7 +688,7 @@ fn request_new_session_with_auth_retry(
                     Ok(value) => return Ok(value),
                     Err(retry_err) if is_auth_required_error(&retry_err) => {
                         eprintln!(
-                            "[joi:acp] terminal auth completed but session/new still requires \
+                            "[loom:acp] terminal auth completed but session/new still requires \
                              authentication; trying ACP authenticate `{}`",
                             method.id
                         );
@@ -961,7 +961,7 @@ fn run_terminal_auth(shared: &AcpShared, method: &AcpAuthMethod) -> Result<(), S
         .as_ref()
         .ok_or_else(|| format!("auth method `{}` does not provide terminal auth", method.id))?;
     eprintln!(
-        "[joi:acp] running terminal auth command `{}`{}",
+        "[loom:acp] running terminal auth command `{}`{}",
         format_terminal_auth_command(terminal),
         terminal
             .label
@@ -1029,7 +1029,7 @@ fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Erro
 }
 
 fn should_capture_shell_env() -> bool {
-    match std::env::var("JOI_ACP_SHELL_ENV") {
+    match std::env::var("LOOM_ACP_SHELL_ENV") {
         Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
@@ -1046,8 +1046,8 @@ fn capture_login_shell_env(
     let shell = std::env::var_os("SHELL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-    let start = format!("__JOI_ACP_ENV_START_{}__", Uuid::new_v4().simple());
-    let end = format!("__JOI_ACP_ENV_END_{}__", Uuid::new_v4().simple());
+    let start = format!("__LOOM_ACP_ENV_START_{}__", Uuid::new_v4().simple());
+    let end = format!("__LOOM_ACP_ENV_END_{}__", Uuid::new_v4().simple());
     let cwd = cwd.to_string_lossy();
     let command = format!(
         "cd {}; printf '{}\\n'; env -0; printf '\\n{}\\n'",
@@ -1265,7 +1265,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, shared: Arc<AcpShared>) {
             if trimmed.is_empty() {
                 continue;
             }
-            eprintln!("[joi:acp] <- {}", truncate_for_log(trimmed, 400));
+            eprintln!("[loom:acp] <- {}", truncate_for_log(trimmed, 400));
             let message: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(err) => {
@@ -1315,7 +1315,7 @@ fn spawn_stderr_drain(stderr: ChildStderr) {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if !line.trim().is_empty() {
-                eprintln!("[joi:acp] {}", line);
+                eprintln!("[loom:acp] {}", line);
             }
         }
     });
@@ -1328,7 +1328,7 @@ fn handle_incoming_message(shared: &Arc<AcpShared>, message: Value) {
         .map(|v| v.to_string());
     let id = message.get("id").cloned();
     eprintln!(
-        "[joi:acp] dispatch method={:?} id={:?}",
+        "[loom:acp] dispatch method={:?} id={:?}",
         method.as_deref(),
         id.as_ref().and_then(request_id_key)
     );
@@ -1391,7 +1391,7 @@ fn handle_agent_request(shared: &Arc<AcpShared>, method: &str, id: Value, messag
                 "id": id,
                 "error": {
                     "code": -32601,
-                    "message": format!("joi-server does not implement `{}`", unsupported),
+                    "message": format!("loom-server does not implement `{}`", unsupported),
                 }
             }));
         }
@@ -1475,7 +1475,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
     };
     if let Some(((scope, session_id), remaining)) = popped {
         eprintln!(
-            "[joi:acp] session/prompt response id={} scope={} (in_flight remaining={})",
+            "[loom:acp] session/prompt response id={} scope={} (in_flight remaining={})",
             id_key, scope.id, remaining
         );
         if let Some(error) = message.get("error") {
@@ -1512,7 +1512,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         return;
     }
     eprintln!(
-        "[joi:acp] response id={} matched no waiter and no in-flight prompt (orphan)",
+        "[loom:acp] response id={} matched no waiter and no in-flight prompt (orphan)",
         id_key
     );
 }
@@ -1615,11 +1615,11 @@ mod tests {
     #[test]
     fn parse_env_output_ignores_shell_noise_and_reads_nul_records() {
         let stdout =
-            b"hello from shell\n__START__\nHOME=/Users/joi\0PATH=/opt/bin:/usr/bin\0\n__END__\n";
+            b"hello from shell\n__START__\nHOME=/Users/loom\0PATH=/opt/bin:/usr/bin\0\n__END__\n";
 
         let env = parse_env_output(stdout, "__START__", "__END__").expect("parse env");
 
-        assert_eq!(env.get("HOME").map(String::as_str), Some("/Users/joi"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/Users/loom"));
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some("/opt/bin:/usr/bin")
@@ -1628,7 +1628,7 @@ mod tests {
 
     #[test]
     fn parse_env_output_rejects_missing_markers() {
-        let err = parse_env_output(b"HOME=/Users/joi\0", "__START__", "__END__")
+        let err = parse_env_output(b"HOME=/Users/loom\0", "__START__", "__END__")
             .expect_err("must reject missing markers");
 
         assert!(err.contains("start marker"));

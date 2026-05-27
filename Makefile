@@ -1,4 +1,4 @@
-# joi-apps multi-target build
+# loom multi-target build
 #
 # Usage:
 #   make help                # show all targets
@@ -25,8 +25,8 @@ LINUX_BUILDER  ?= $(CARGO)
 VERSION := $(shell awk -F\" '/^version/ {print $$2; exit}' Cargo.toml 2>/dev/null || echo 0.0.0)
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-PKG_FLAGS := -p joi-cli -p joi-server
-BINS      := joi joi-server
+PKG_FLAGS := -p loom-cli -p loom-server
+BINS      := loom loom-daemon loom-server
 
 TRIPLE_MAC_ARM   := aarch64-apple-darwin
 TRIPLE_MAC_X86   := x86_64-apple-darwin
@@ -45,7 +45,7 @@ ALL_TRIPLES := \
 
 .PHONY: help
 help:
-	@echo "joi-apps build (version=$(VERSION) sha=$(GIT_SHA))"
+	@echo "loom build (version=$(VERSION) sha=$(GIT_SHA))"
 	@echo ""
 	@echo "Native (host triple):"
 	@echo "  build                       cargo build (debug)"
@@ -103,14 +103,16 @@ define define-target
 $(1)-debug:
 	$(3) build --target $(2) $(PKG_FLAGS)
 	@mkdir -p $(DIST_DIR)/debug/$(2)
-	cp target/$(2)/debug/joi        $(DIST_DIR)/debug/$(2)/joi
-	cp target/$(2)/debug/joi-server $(DIST_DIR)/debug/$(2)/joi-server
+	cp target/$(2)/debug/loom        $(DIST_DIR)/debug/$(2)/loom
+	cp target/$(2)/debug/loom-daemon $(DIST_DIR)/debug/$(2)/loom-daemon
+	cp target/$(2)/debug/loom-server $(DIST_DIR)/debug/$(2)/loom-server
 
 $(1)-release:
 	$(3) build --release --target $(2) $(PKG_FLAGS)
 	@mkdir -p $(DIST_DIR)/release/$(2)
-	cp target/$(2)/release/joi        $(DIST_DIR)/release/$(2)/joi
-	cp target/$(2)/release/joi-server $(DIST_DIR)/release/$(2)/joi-server
+	cp target/$(2)/release/loom        $(DIST_DIR)/release/$(2)/loom
+	cp target/$(2)/release/loom-daemon $(DIST_DIR)/release/$(2)/loom-daemon
+	cp target/$(2)/release/loom-server $(DIST_DIR)/release/$(2)/loom-server
 
 endef
 
@@ -126,21 +128,27 @@ UNIVERSAL_DIR := universal-apple-darwin
 .PHONY: mac-universal-debug mac-universal-release
 mac-universal-debug: mac-arm-debug mac-x86-debug
 	@mkdir -p $(DIST_DIR)/debug/$(UNIVERSAL_DIR)
-	$(LIPO) -create -output $(DIST_DIR)/debug/$(UNIVERSAL_DIR)/joi \
-	  $(DIST_DIR)/debug/$(TRIPLE_MAC_ARM)/joi \
-	  $(DIST_DIR)/debug/$(TRIPLE_MAC_X86)/joi
-	$(LIPO) -create -output $(DIST_DIR)/debug/$(UNIVERSAL_DIR)/joi-server \
-	  $(DIST_DIR)/debug/$(TRIPLE_MAC_ARM)/joi-server \
-	  $(DIST_DIR)/debug/$(TRIPLE_MAC_X86)/joi-server
+	$(LIPO) -create -output $(DIST_DIR)/debug/$(UNIVERSAL_DIR)/loom \
+	  $(DIST_DIR)/debug/$(TRIPLE_MAC_ARM)/loom \
+	  $(DIST_DIR)/debug/$(TRIPLE_MAC_X86)/loom
+	$(LIPO) -create -output $(DIST_DIR)/debug/$(UNIVERSAL_DIR)/loom-daemon \
+	  $(DIST_DIR)/debug/$(TRIPLE_MAC_ARM)/loom-daemon \
+	  $(DIST_DIR)/debug/$(TRIPLE_MAC_X86)/loom-daemon
+	$(LIPO) -create -output $(DIST_DIR)/debug/$(UNIVERSAL_DIR)/loom-server \
+	  $(DIST_DIR)/debug/$(TRIPLE_MAC_ARM)/loom-server \
+	  $(DIST_DIR)/debug/$(TRIPLE_MAC_X86)/loom-server
 
 mac-universal-release: mac-arm-release mac-x86-release
 	@mkdir -p $(DIST_DIR)/release/$(UNIVERSAL_DIR)
-	$(LIPO) -create -output $(DIST_DIR)/release/$(UNIVERSAL_DIR)/joi \
-	  $(DIST_DIR)/release/$(TRIPLE_MAC_ARM)/joi \
-	  $(DIST_DIR)/release/$(TRIPLE_MAC_X86)/joi
-	$(LIPO) -create -output $(DIST_DIR)/release/$(UNIVERSAL_DIR)/joi-server \
-	  $(DIST_DIR)/release/$(TRIPLE_MAC_ARM)/joi-server \
-	  $(DIST_DIR)/release/$(TRIPLE_MAC_X86)/joi-server
+	$(LIPO) -create -output $(DIST_DIR)/release/$(UNIVERSAL_DIR)/loom \
+	  $(DIST_DIR)/release/$(TRIPLE_MAC_ARM)/loom \
+	  $(DIST_DIR)/release/$(TRIPLE_MAC_X86)/loom
+	$(LIPO) -create -output $(DIST_DIR)/release/$(UNIVERSAL_DIR)/loom-daemon \
+	  $(DIST_DIR)/release/$(TRIPLE_MAC_ARM)/loom-daemon \
+	  $(DIST_DIR)/release/$(TRIPLE_MAC_X86)/loom-daemon
+	$(LIPO) -create -output $(DIST_DIR)/release/$(UNIVERSAL_DIR)/loom-server \
+	  $(DIST_DIR)/release/$(TRIPLE_MAC_ARM)/loom-server \
+	  $(DIST_DIR)/release/$(TRIPLE_MAC_X86)/loom-server
 
 # ---- Bulk ----------------------------------------------------------------
 
@@ -192,7 +200,7 @@ distclean: clean
 #   make gui-dev       # launches vite dev server + tauri window
 #   make gui-release   # builds a signed/unsigned bundle into crates/gui/target/
 #
-# The joi-gui crate is excluded from workspace default-members, so normal
+# The GUI crate is excluded from workspace default-members, so normal
 # `cargo build` doesn't pay its compile cost. Invoke through these targets
 # or directly with `cargo tauri dev|build` from crates/gui/.
 

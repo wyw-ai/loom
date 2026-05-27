@@ -1,0 +1,131 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "loom-daemon", about = "Loom machine-scoped agent host")]
+struct Args {
+    /// Override the configured server URL (defaults to ws://127.0.0.1:7878/rpc).
+    #[arg(long, env = "LOOM_SERVER")]
+    server: Option<String>,
+    /// Machine id from the desktop machine config. Defaults to the active
+    /// workspace's first machine.
+    #[arg(long = "machine-id", env = "LOOM_MACHINE_ID")]
+    machine_id: Option<String>,
+    /// Override the daemon data root. Defaults to the machine data root.
+    #[arg(long = "data-root", env = "LOOM_AGENT_DATA_ROOT")]
+    data_root: Option<PathBuf>,
+    /// Comma-separated actor ids to load. Empty/omitted = load every
+    /// agent configured on the machine.
+    #[arg(long = "allow-actors", value_delimiter = ',')]
+    allow_actors: Vec<String>,
+    /// Print auto-detected local providers and exit.
+    #[arg(long = "list-providers")]
+    list_providers: bool,
+    /// Override the directory of ServiceSpec JSON files loaded by the
+    /// daemon. Defaults to `~/.config/loom/services/` or
+    /// `$LOOM_SERVICE_SPECS`.
+    #[arg(long = "services")]
+    services: Option<PathBuf>,
+    /// Comma-separated service ids to load through the daemon. Empty or
+    /// omitted means load every ServiceSpec under --services.
+    #[arg(long = "allow-services", value_delimiter = ',')]
+    allow_services: Vec<String>,
+    /// Do not start the service host from this daemon.
+    #[arg(long = "no-services")]
+    no_services: bool,
+    /// Unix socket used by local `loom` CLI clients to reach this daemon.
+    #[arg(long = "socket", env = "LOOM_DAEMON_SOCKET")]
+    socket: Option<PathBuf>,
+    /// Do not expose the local daemon IPC socket. Useful for tests where
+    /// agents connect to the server directly.
+    #[arg(long = "no-ipc")]
+    no_ipc: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    let args = Args::parse();
+    let cfg = loom_cli::config::resolve(args.server.clone(), None, None)?;
+    loom_cli::cmd::daemon::run(
+        args.machine_id,
+        args.data_root,
+        args.allow_actors,
+        args.list_providers,
+        args.services,
+        args.allow_services,
+        args.no_services,
+        args.socket,
+        args.no_ipc,
+        cfg.server_url,
+    )
+    .await
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_accepts_runtime_host_options() {
+        let args = Args::try_parse_from([
+            "loom-daemon",
+            "--server",
+            "ws://127.0.0.1:9/rpc",
+            "--machine-id",
+            "machine_a",
+            "--data-root",
+            "/tmp/loom-daemon-test",
+            "--allow-actors",
+            "actor_a,actor_b",
+            "--services",
+            "/tmp/loom-services",
+            "--allow-services",
+            "svc_a,svc_b",
+            "--no-services",
+            "--socket",
+            "/tmp/loom.sock",
+            "--no-ipc",
+        ])
+        .expect("parse loom-daemon options");
+
+        assert_eq!(args.server.as_deref(), Some("ws://127.0.0.1:9/rpc"));
+        assert_eq!(args.machine_id.as_deref(), Some("machine_a"));
+        assert_eq!(
+            args.data_root.as_deref(),
+            Some(std::path::Path::new("/tmp/loom-daemon-test"))
+        );
+        assert_eq!(args.allow_actors, ["actor_a", "actor_b"]);
+        assert_eq!(
+            args.services.as_deref(),
+            Some(std::path::Path::new("/tmp/loom-services"))
+        );
+        assert_eq!(args.allow_services, ["svc_a", "svc_b"]);
+        assert!(args.no_services);
+        assert_eq!(
+            args.socket.as_deref(),
+            Some(std::path::Path::new("/tmp/loom.sock"))
+        );
+        assert!(args.no_ipc);
+    }
+
+    #[test]
+    fn daemon_exposes_provider_inventory_probe() {
+        let args = Args::try_parse_from(["loom-daemon", "--list-providers"])
+            .expect("parse list-providers");
+
+        assert!(args.list_providers);
+    }
+}

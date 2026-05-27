@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use reqwest::header::{ACCEPT, USER_AGENT};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -14,90 +15,157 @@ use uuid::Uuid;
 
 use crate::config::{normalize_human_account, HumanAccount};
 
-const BUC_BASE_URL: &str = "https://login.alibaba-inc.com";
-const BUC_CLIENT_ID: &str = "aone-cli";
-const BUC_AUTH_PATH: &str = "/oauth2/auth.htm";
-const BUC_TOKEN_PATH: &str = "/rpc/oauth2/access_token.json";
-const BUC_USER_INFO_PATH: &str = "/rpc/oauth2/user_info.json";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const USER_AGENT_VALUE: &str = "loom-desktop";
 
-pub async fn login_buc() -> Result<HumanAccount> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthProvider {
+    Google,
+    GitHub,
+}
+
+impl OAuthProvider {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "google" => Ok(Self::Google),
+            "github" => Ok(Self::GitHub),
+            other => bail!("unsupported account provider: {other}"),
+        }
+    }
+
+    fn display(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::GitHub => "GitHub",
+        }
+    }
+
+    fn auth_url(self) -> &'static str {
+        match self {
+            Self::Google => "https://accounts.google.com/o/oauth2/v2/auth",
+            Self::GitHub => "https://github.com/login/oauth/authorize",
+        }
+    }
+
+    fn token_url(self) -> &'static str {
+        match self {
+            Self::Google => "https://oauth2.googleapis.com/token",
+            Self::GitHub => "https://github.com/login/oauth/access_token",
+        }
+    }
+
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Google => "openid email profile",
+            Self::GitHub => "read:user user:email",
+        }
+    }
+
+    fn client_id(self) -> Result<String> {
+        let env_name = match self {
+            Self::Google => "LOOM_GOOGLE_CLIENT_ID",
+            Self::GitHub => "LOOM_GITHUB_CLIENT_ID",
+        };
+        std::env::var(env_name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{env_name} is required for {} login", self.display()))
+    }
+
+    fn client_secret(self) -> Option<String> {
+        let env_name = match self {
+            Self::Google => "LOOM_GOOGLE_CLIENT_SECRET",
+            Self::GitHub => "LOOM_GITHUB_CLIENT_SECRET",
+        };
+        std::env::var(env_name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+pub async fn login_oauth(provider: &str) -> Result<HumanAccount> {
+    let provider = OAuthProvider::parse(provider)?;
+    let client_id = provider.client_id()?;
+    let client_secret = provider.client_secret();
     let pkce = Pkce::new();
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
-        .context("starting BUC callback listener")?;
+        .with_context(|| format!("starting {} callback listener", provider.display()))?;
     let redirect_uri = format!(
         "http://127.0.0.1:{}/callback",
         listener.local_addr()?.port()
     );
-    let base_url = buc_base_url();
-    let auth_url = authorization_url(&base_url, &redirect_uri, &pkce)?;
+    let auth_url = authorization_url(provider, &client_id, &redirect_uri, &pkce)?;
 
     open_browser(auth_url.as_str()).with_context(|| {
         format!(
-            "opening browser for BUC login failed; visit this URL manually: {}",
+            "opening browser for {} login failed; visit this URL manually: {}",
+            provider.display(),
             auth_url.as_str()
         )
     })?;
 
-    let code = wait_for_callback(listener, &pkce.state).await?;
+    let code = wait_for_callback(listener, &pkce.state, provider).await?;
     let client = HttpClient::builder().timeout(HTTP_TIMEOUT).build()?;
     let token = exchange_token(
         &client,
-        &base_url,
+        provider,
+        &client_id,
+        client_secret.as_deref(),
         &code,
         &pkce.code_verifier,
         &redirect_uri,
     )
     .await?;
-    let user = get_user_info(&client, &base_url, &token.access_token).await?;
-    user.into_account()
+    provider_account(&client, provider, &token.access_token).await
 }
 
-fn buc_base_url() -> String {
-    std::env::var("JOI_BUC_BASE_URL")
-        .or_else(|_| std::env::var("A1_BUC_BASE_URL"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            let trimmed = value.trim().trim_end_matches('/').to_string();
-            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                trimmed
-            } else {
-                format!("http://{trimmed}")
-            }
-        })
-        .unwrap_or_else(|| BUC_BASE_URL.into())
-}
-
-fn authorization_url(base_url: &str, redirect_uri: &str, pkce: &Pkce) -> Result<Url> {
-    // Reuse the a1-cli BUC OAuth app so users approve the same internal app.
-    let mut url = Url::parse(&format!("{base_url}{BUC_AUTH_PATH}"))?;
+fn authorization_url(
+    provider: OAuthProvider,
+    client_id: &str,
+    redirect_uri: &str,
+    pkce: &Pkce,
+) -> Result<Url> {
+    let mut url = Url::parse(provider.auth_url())?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", BUC_CLIENT_ID)
+        .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", "profile")
+        .append_pair("scope", provider.scope())
         .append_pair("state", &pkce.state)
         .append_pair("code_challenge", &pkce.code_challenge)
         .append_pair("code_challenge_method", "S256");
     Ok(url)
 }
 
-async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
+async fn wait_for_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    provider: OAuthProvider,
+) -> Result<String> {
     let (mut stream, _) = timeout(CALLBACK_TIMEOUT, listener.accept())
         .await
-        .map_err(|_| anyhow!("timed out waiting for BUC authorization callback"))??;
+        .map_err(|_| {
+            anyhow!(
+                "timed out waiting for {} authorization callback",
+                provider.display()
+            )
+        })??;
 
-    let request = read_http_request(&mut stream).await?;
+    let request = read_http_request(&mut stream, provider).await?;
     let result = parse_callback_request(&request, expected_state);
     match &result {
         Ok(_) => {
             write_http_response(
                 &mut stream,
                 "200 OK",
-                "BUC login complete. You can return to Joi.",
+                &format!(
+                    "{} login complete. You can return to Loom.",
+                    provider.display()
+                ),
             )
             .await?;
         }
@@ -105,7 +173,7 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
             write_http_response(
                 &mut stream,
                 "400 Bad Request",
-                &format!("BUC login failed: {err}"),
+                &format!("{} login failed: {err}", provider.display()),
             )
             .await?;
         }
@@ -114,13 +182,13 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
     result
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
+async fn read_http_request(stream: &mut TcpStream, provider: OAuthProvider) -> Result<String> {
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0_u8; 1024];
     loop {
         let n = timeout(Duration::from_secs(10), stream.read(&mut chunk))
             .await
-            .map_err(|_| anyhow!("timed out reading BUC callback request"))??;
+            .map_err(|_| anyhow!("timed out reading {} callback request", provider.display()))??;
         if n == 0 {
             break;
         }
@@ -129,7 +197,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
             break;
         }
     }
-    String::from_utf8(buf).context("BUC callback request was not UTF-8")
+    String::from_utf8(buf).context("OAuth callback request was not UTF-8")
 }
 
 fn parse_callback_request(request: &str, expected_state: &str) -> Result<String> {
@@ -177,7 +245,7 @@ fn parse_callback_request(request: &str, expected_state: &str) -> Result<String>
 
 async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
     let html = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Joi Login</title><body>{body}</body>"
+        "<!doctype html><meta charset=\"utf-8\"><title>Loom Login</title><body>{body}</body>"
     );
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -191,37 +259,130 @@ async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -
 
 async fn exchange_token(
     client: &HttpClient,
-    base_url: &str,
+    provider: OAuthProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
 ) -> Result<TokenResponse> {
-    let body = client
-        .post(format!("{base_url}{BUC_TOKEN_PATH}"))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("client_id", BUC_CLIENT_ID),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", code_verifier),
-        ])
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret));
+    }
+
+    let response = client
+        .post(provider.token_url())
+        .header(ACCEPT, "application/json")
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .form(&form)
         .send()
         .await
-        .context("BUC token exchange request failed")?;
-    decode_buc_response(body, "BUC token exchange").await
+        .with_context(|| format!("{} token exchange request failed", provider.display()))?;
+    decode_json_response(response, &format!("{} token exchange", provider.display())).await
 }
 
-async fn get_user_info(client: &HttpClient, base_url: &str, access_token: &str) -> Result<BucUser> {
-    let body = client
-        .post(format!("{base_url}{BUC_USER_INFO_PATH}"))
-        .form(&[("access_token", access_token)])
+async fn provider_account(
+    client: &HttpClient,
+    provider: OAuthProvider,
+    access_token: &str,
+) -> Result<HumanAccount> {
+    match provider {
+        OAuthProvider::Google => google_account(client, access_token).await,
+        OAuthProvider::GitHub => github_account(client, access_token).await,
+    }
+}
+
+async fn google_account(client: &HttpClient, access_token: &str) -> Result<HumanAccount> {
+    let response = client
+        .get("https://openidconnect.googleapis.com/v1/userinfo")
+        .bearer_auth(access_token)
+        .header(ACCEPT, "application/json")
         .send()
         .await
-        .context("BUC user info request failed")?;
-    decode_buc_response(body, "BUC user info").await
+        .context("Google user info request failed")?
+        .error_for_status()
+        .context("Google user info returned an error")?;
+    let user: GoogleUser = response.json().await.context("parsing Google user info")?;
+
+    if user.sub.trim().is_empty() {
+        bail!("Google user info did not include subject");
+    }
+    let nickname = user
+        .email
+        .as_deref()
+        .and_then(|email| email.split('@').next())
+        .unwrap_or("")
+        .to_string();
+    Ok(normalize_human_account(HumanAccount {
+        provider: "google".into(),
+        staff_id: user.sub,
+        nickname,
+        real_name: user.name.unwrap_or_default(),
+        email: user.email.unwrap_or_default(),
+        actor_id: String::new(),
+        avatar_url: user.picture.unwrap_or_default(),
+    }))
 }
 
-async fn decode_buc_response<T: for<'de> Deserialize<'de>>(
+async fn github_account(client: &HttpClient, access_token: &str) -> Result<HumanAccount> {
+    let response = client
+        .get("https://api.github.com/user")
+        .bearer_auth(access_token)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .send()
+        .await
+        .context("GitHub user info request failed")?
+        .error_for_status()
+        .context("GitHub user info returned an error")?;
+    let user: GitHubUser = response.json().await.context("parsing GitHub user info")?;
+
+    let email = match user.email.filter(|email| !email.trim().is_empty()) {
+        Some(email) => email,
+        None => github_primary_email(client, access_token)
+            .await
+            .unwrap_or_default(),
+    };
+    Ok(normalize_human_account(HumanAccount {
+        provider: "github".into(),
+        staff_id: user.id.to_string(),
+        nickname: user.login,
+        real_name: user.name.unwrap_or_default(),
+        email,
+        actor_id: String::new(),
+        avatar_url: user.avatar_url.unwrap_or_default(),
+    }))
+}
+
+async fn github_primary_email(client: &HttpClient, access_token: &str) -> Result<String> {
+    let response = client
+        .get("https://api.github.com/user/emails")
+        .bearer_auth(access_token)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .send()
+        .await
+        .context("GitHub emails request failed")?
+        .error_for_status()
+        .context("GitHub emails returned an error")?;
+    let emails: Vec<GitHubEmail> = response.json().await.context("parsing GitHub emails")?;
+    emails
+        .iter()
+        .find(|email| email.primary && email.verified)
+        .or_else(|| emails.iter().find(|email| email.verified))
+        .map(|email| email.email.clone())
+        .filter(|email| !email.trim().is_empty())
+        .ok_or_else(|| anyhow!("GitHub account did not expose a verified email"))
+}
+
+async fn decode_json_response<T: for<'de> Deserialize<'de>>(
     response: reqwest::Response,
     label: &str,
 ) -> Result<T> {
@@ -322,33 +483,33 @@ struct TokenResponse {
 }
 
 #[derive(Deserialize)]
-struct BucUser {
-    #[serde(default, alias = "empId", alias = "employeeId")]
-    emp_id: String,
-    #[serde(default, alias = "realName")]
-    name: String,
-    #[serde(default, alias = "nickName")]
-    nickname: String,
+struct GoogleUser {
+    sub: String,
     #[serde(default)]
-    email: String,
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    picture: Option<String>,
 }
 
-impl BucUser {
-    fn into_account(self) -> Result<HumanAccount> {
-        let staff_id = self.emp_id.trim();
-        if staff_id.is_empty() {
-            bail!("BUC user info did not include employee id");
-        }
-        Ok(normalize_human_account(HumanAccount {
-            provider: "buc".into(),
-            staff_id: staff_id.into(),
-            nickname: self.nickname,
-            real_name: self.name,
-            email: self.email,
-            actor_id: String::new(),
-            avatar_url: String::new(),
-        }))
-    }
+#[derive(Deserialize)]
+struct GitHubUser {
+    id: u64,
+    login: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubEmail {
+    email: String,
+    primary: bool,
+    verified: bool,
 }
 
 #[cfg(test)]
@@ -371,18 +532,15 @@ mod tests {
     }
 
     #[test]
-    fn buc_user_account_uses_only_profile_fields() {
-        let user = BucUser {
-            emp_id: "12345".into(),
-            name: "Bo Jun".into(),
-            nickname: "bojun".into(),
-            email: "bojun@example.com".into(),
-        };
-        let account = user.into_account().unwrap();
-        assert_eq!(account.provider, "buc");
-        assert_eq!(account.staff_id, "12345");
-        assert_eq!(account.nickname, "bojun");
-        assert_eq!(account.real_name, "Bo Jun");
-        assert_eq!(account.email, "bojun@example.com");
+    fn parses_supported_providers() {
+        assert_eq!(
+            OAuthProvider::parse("google").unwrap(),
+            OAuthProvider::Google
+        );
+        assert_eq!(
+            OAuthProvider::parse("GitHub").unwrap(),
+            OAuthProvider::GitHub
+        );
+        assert!(OAuthProvider::parse("internal").is_err());
     }
 }

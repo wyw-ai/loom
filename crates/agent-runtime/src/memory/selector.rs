@@ -146,7 +146,7 @@ mod tests {
     use proto::methods::{MemoryDeliverySpec, MemoryQuerySpec, MemorySpec, MemoryStoreSpec};
 
     fn tmpdir() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("joi-selector-test-{}", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("loom-selector-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

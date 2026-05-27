@@ -40,7 +40,7 @@ pub struct ServiceContext {
     /// without a source path). Plugins that resolve `{spec.dir}` /
     /// `{bundle.dir}` placeholders look at the parent of this path.
     pub spec_path: Option<std::path::PathBuf>,
-    /// Substrate for talking to joi-server. See [`ServiceRuntime`].
+    /// Substrate for talking to loom-server. See [`ServiceRuntime`].
     pub runtime: Arc<ServiceRuntime>,
     /// Cancellation signal from the host. Plugins observe it to exit
     /// cleanly on shutdown.

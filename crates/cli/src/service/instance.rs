@@ -8,9 +8,9 @@
 //! <data_root>/services/<service_id>/instances/<instance_id>/request.json
 //! ```
 //!
-//! `joi service start --spec <id> --in <thread> --params {...}` is the
-//! supported writer; `joi service stop --spec <id> --in <thread>`
-//! removes the file. The running `joi service serve` host watches each
+//! `loom service start --spec <id> --in <thread> --params {...}` is the
+//! supported writer; `loom service stop --spec <id> --in <thread>`
+//! removes the file. The running `loom service serve` host watches each
 //! spec's `instances/` directory and on-create dispatches a per-instance
 //! plugin task; on-delete it tears the task down.
 //!
@@ -60,7 +60,7 @@ pub struct InstanceScope {
     /// Thread id (for `kind = "thread"`).
     pub id: String,
     /// Parent channel of the thread, when known. Optional because some
-    /// callers (e.g., `joi service start --in <thread>` without a
+    /// callers (e.g., `loom service start --in <thread>` without a
     /// `--channel` flag) defer the lookup to the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
@@ -144,7 +144,7 @@ mod tests {
     fn temp() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "joi-instance-tests-{}",
+            "loom-instance-tests-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

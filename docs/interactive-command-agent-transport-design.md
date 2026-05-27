@@ -1,20 +1,20 @@
 # Interactive Command Agent Transport 设计
 
-> 目标：为 Claude / Copilot 这类可用 CLI session id 恢复、但不一定以进程退出作为单轮结束信号的 agent，新增一个 Joi 托管的 `interactive_command` transport。
+> 目标：为 Claude / Copilot 这类可用 CLI session id 恢复、但不一定以进程退出作为单轮结束信号的 agent，新增一个 Loom 托管的 `interactive_command` transport。
 
 ## 1. 背景
 
-Joi 当前的 agent runtime 主要有两类 transport：
+Loom 当前的 agent runtime 主要有两类 transport：
 
 | Transport | 进程形态 | 单轮结束信号 | Session 归属 |
 | --- | --- | --- | --- |
 | `acp_stdio` | 长驻 ACP 子进程 | ACP 协议事件，例如 `session/update` / stop reason | ACP session |
-| `command` | 每个 prompt 启一个子进程 | 子进程退出 | Joi 记录 `(actor, scope) -> provider session_id` |
+| `command` | 每个 prompt 启一个子进程 | 子进程退出 | Loom 记录 `(actor, scope) -> provider session_id` |
 
 这两类都依赖一个明确的结束边界：
 
-- ACP 由协议告诉 Joi 何时完成。
-- `command` 由进程退出告诉 Joi 何时完成。
+- ACP 由协议告诉 Loom 何时完成。
+- `command` 由进程退出告诉 Loom 何时完成。
 
 但 Claude / Copilot 的某些 CLI 用法更像：
 
@@ -29,7 +29,7 @@ claude "<prompt>" --resume <session_id>
 copilot "<prompt>" --resume <session_id>
 ```
 
-这类命令可以接收 prompt 和 session id，但进程可能进入交互式状态，或者输出中没有机器可读的“完成”帧。Joi 需要自己定义：
+这类命令可以接收 prompt 和 session id，但进程可能进入交互式状态，或者输出中没有机器可读的“完成”帧。Loom 需要自己定义：
 
 1. 何时创建 provider session。
 2. 何时 resume provider session。
@@ -43,7 +43,7 @@ copilot "<prompt>" --resume <session_id>
 
 ### 2.1 Scope 是 session 边界
 
-Joi 的协作作用域只有两种：
+Loom 的协作作用域只有两种：
 
 ```text
 ScopeRef =
@@ -53,8 +53,8 @@ ScopeRef =
 
 这里的 `thread:<thread_id>` / `channel:<channel_id>` 是 runtime 内部 session
 边界，不是 agent-facing message target。CLI target 的 canonical 形式是
-`#<channel_id>` 或 `#<channel_id>:<root_event_id>`；thread 由 channel 公共区
-的一条 root event 锚定，不能嵌套。
+`#<channel_id>` 或 `#<channel_id>:<root_message_id>`；thread 由 channel 公共区
+的一条 root message 锚定，不能嵌套。
 
 `interactive_command` 的 provider session 生命周期直接跟随 `ScopeRef`：
 
@@ -72,18 +72,18 @@ ScopeRef =
 
 ### 2.2 Server 不托管 agent 进程
 
-`joi-server` 继续只做 message hub：
+`loom-server` 继续只做 message hub：
 
 - actor connection
 - scope subscribe
 - event / turn / trace / artifact store
 - fanout
 
-agent 进程仍由 `joi agent serve` 托管。`interactive_command` 只是在 agent runtime 里新增一种 adapter。
+agent 进程仍由 `loom agent serve` 托管。`interactive_command` 只是在 agent runtime 里新增一种 adapter。
 
 ### 2.3 Scope skills 是 workspace 能力，不是 provider session 状态
 
-为了兼容 classroom / 多 agent 场景，Joi server 可以把 channel 成员 actor 的已发布 bundle 投影到 scope 级 `skills/` 目录：
+为了兼容 classroom / 多 agent 场景，Loom server 可以把 channel 成员 actor 的已发布 bundle 投影到 scope 级 `skills/` 目录：
 
 ```text
 data/workspaces/channel/{channel_id}/skills/{actor_id} -> data/agents/{actor_id}/bundle source
@@ -92,13 +92,13 @@ data/workspaces/thread/{thread_id}/skills/{actor_id}  -> data/agents/{actor_id}/
 
 当前实现采用 file-backed 方案：server 读取 `data/agents/{actor_id}/bundle-release.json` 的 `source` 字段作为 symlink target。这个数据源被隔离在 actor skill source 解析层，未来可以扩展为 agent serve 通过 RPC 上报的 registry-backed 方案，而不需要重写 scope projection 规则。
 
-`joi agent serve` 在创建 scope workspace 时会把对应 scope skills 桥接进 agent 当前工作目录：
+`loom agent serve` 在创建 scope workspace 时会把对应 scope skills 桥接进 agent 当前工作目录：
 
 ```text
 {agent workspace}/skills -> {scope workspaces root}/{scope.kind}/{scope.id}/skills
 ```
 
-默认 `{scope workspaces root}` 是 `JOI_AGENT_DATA_ROOT/workspaces`。当 `joi-server --data-dir` 和 `JOI_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `JOI_SCOPE_WORKSPACES_ROOT` 显式指向 server 的 `data/workspaces`。这保证 `interactive_command` provider 从 `cwd` 看见的是当前 scope 的 skills，而 provider session record 仍按 `(actor, scope)` 独立管理。
+默认 `{scope workspaces root}` 是 `LOOM_AGENT_DATA_ROOT/workspaces`。当 `loom-server --data-dir` 和 `LOOM_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `LOOM_SCOPE_WORKSPACES_ROOT` 显式指向 server 的 `data/workspaces`。这保证 `interactive_command` provider 从 `cwd` 看见的是当前 scope 的 skills，而 provider session record 仍按 `(actor, scope)` 独立管理。
 
 ### 2.4 完成信号必须显式
 
@@ -108,7 +108,7 @@ data/workspaces/thread/{thread_id}/skills/{actor_id}  -> data/agents/{actor_id}/
 
 ```text
 When your final user-visible answer is complete, output this exact marker on a line by itself:
-__JOI_DONE__
+__LOOM_DONE__
 Do not output anything after the marker.
 ```
 
@@ -116,7 +116,7 @@ adapter 看到 sentinel 后：
 
 1. 认为本轮完成。
 2. 从最终用户可见输出中移除 sentinel。
-3. flush 文本为 `content.add`。
+3. flush 文本为 `message`。
 4. emit `AdapterEvent::Finished`。
 5. 按 kill policy 结束子进程。
 
@@ -125,28 +125,28 @@ adapter 看到 sentinel 后：
 ```text
 Human / GUI / TUI
       │
-      │ event/append(content.add + hands_off_to)
+      │ message.send(message + directed_to)
       ▼
 ┌─────────────────────┐
-│ joi-server          │
+│ loom-server          │
 │ - journal/store     │
 │ - delivery/fanout   │
-│ - turn/trace        │
+│ - run frames        │
 └──────────┬──────────┘
            │ actor inbox / scope update
            ▼
 ┌──────────────────────────────────────────────┐
-│ joi agent serve                              │
+│ loom agent serve                              │
 │                                              │
 │  Worker(actor_claude)                        │
-│    ├─ resolve Joi scope                      │
+│    ├─ resolve Loom scope                      │
 │    ├─ resolve/create provider session id     │
-│    ├─ compose Joi prompt envelope            │
+│    ├─ compose Loom prompt envelope            │
 │    ├─ append completion contract             │
 │    └─ InteractiveCommandAdapter              │
 │         ├─ spawn claude/copilot              │
 │         ├─ read output                       │
-│         ├─ detect __JOI_DONE__               │
+│         ├─ detect __LOOM_DONE__               │
 │         ├─ strip/normalize output            │
 │         └─ kill child according to policy    │
 └──────────────────────────────────────────────┘
@@ -172,7 +172,7 @@ Human / GUI / TUI
     "model": "claude-sonnet-4.6",
 
     "session": {
-      "idStrategy": "joi_uuid_per_scope",
+      "idStrategy": "loom_uuid_per_scope",
       "newArgs": ["{prompt}", "--session-id", "{session_id}"],
       "resumeArgs": ["{prompt}", "--resume", "{session_id}"],
       "onMissing": "create",
@@ -181,10 +181,10 @@ Human / GUI / TUI
     },
 
     "prompt": {
-      "template": "{joi_envelope}",
+      "template": "{loom_envelope}",
       "completionContract": {
-        "sentinel": "__JOI_DONE__",
-        "instruction": "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it."
+        "sentinel": "__LOOM_DONE__",
+        "instruction": "When your final user-visible answer is complete, output __LOOM_DONE__ on a line by itself. Do not output anything after it."
       }
     },
 
@@ -233,7 +233,7 @@ Human / GUI / TUI
     "command": "copilot",
     "model": "gpt-5.5",
     "session": {
-      "idStrategy": "joi_uuid_per_scope",
+      "idStrategy": "loom_uuid_per_scope",
       "newArgs": ["{prompt}", "--resume", "{session_id}"],
       "resumeArgs": ["{prompt}", "--resume", "{session_id}"],
       "onMissing": "create",
@@ -242,7 +242,7 @@ Human / GUI / TUI
     },
     "completion": {
       "detect": "sentinel",
-      "sentinel": "__JOI_DONE__",
+      "sentinel": "__LOOM_DONE__",
       "stripSentinel": true,
       "maxTurnMs": 900000
     },
@@ -258,7 +258,7 @@ Copilot 的首次创建语义需要用真实 CLI 验证。如果 `copilot --resu
 
 ### 4.3 Model 参数
 
-`interactive_command` 允许在 transport 或现有 Joi model selection 中解析出一个 active model。规则建议保持简单：
+`interactive_command` 允许在 transport 或现有 Loom model selection 中解析出一个 active model。规则建议保持简单：
 
 - 如果 active model 为空，不给 provider CLI 增加任何 model 参数。
 - 如果 active model 非空，adapter 在解析完 `newArgs` / `resumeArgs` 后追加一个 argv token：`--model=<model>`。
@@ -316,11 +316,11 @@ session_key =
 
 | 场景 | 行为 |
 | --- | --- |
-| actor 第一次在 thread 中被 handoff | 创建 provider session |
-| actor 再次在同一个 thread 中被 handoff | resume 同一个 provider session |
-| actor 在另一个 thread 中被 handoff | 创建另一个 provider session |
-| actor 在 channel 公共区被 handoff | 创建/恢复该 channel scope 的 provider session |
-| 同一个 thread 中 handoff 给另一个 actor | 使用另一个 provider session |
+| actor 第一次在 thread 中被 directed message | 创建 provider session |
+| actor 再次在同一个 thread 中被 directed message | resume 同一个 provider session |
+| actor 在另一个 thread 中被 directed message | 创建另一个 provider session |
+| actor 在 channel 公共区被 directed message | 创建/恢复该 channel scope 的 provider session |
+| 同一个 thread 中 directed message 给另一个 actor | 使用另一个 provider session |
 | command/model/settings/prompt contract 变化 | 新建 provider session |
 | resume 失败 | 默认 fail，不自动重跑 |
 | 用户显式 reset | 删除映射，下次新建 |
@@ -351,7 +351,7 @@ session_key =
     "command": "sha256:...",
     "model": "claude-sonnet-4.6",
     "settings": "sha256:...",
-    "promptContract": "joi-done-v1"
+    "promptContract": "loom-done-v1"
   },
   "state": "active"
 }
@@ -376,9 +376,9 @@ session signature 至少包含：
 
 ## 6. Prompt composition
 
-### 6.1 现有 Joi envelope
+### 6.1 现有 Loom envelope
 
-`joi agent serve` 当前会为 agent 组合：
+`loom agent serve` 当前会为 agent 组合：
 
 - identity
 - soul
@@ -404,14 +404,14 @@ Bootstrap memory:
 Relevant memory:
 ...
 
-=== joi bootstrap ===
-You are an agent driven by `joi agent serve`.
+=== loom bootstrap ===
+You are an agent driven by `loom agent serve`.
 current scope = thread:thread_123
 ...
 
-=== Joi interactive command completion contract ===
+=== Loom interactive command completion contract ===
 When your final user-visible answer is complete, output this exact marker on a line by itself:
-__JOI_DONE__
+__LOOM_DONE__
 Do not output anything after the marker.
 
 === User message ===
@@ -440,7 +440,7 @@ You are replying in a task thread. Maintain continuity for this thread.
 默认：
 
 ```text
-sentinel = "__JOI_DONE__"
+sentinel = "__LOOM_DONE__"
 ```
 
 完成条件：
@@ -458,7 +458,7 @@ sentinel = "__JOI_DONE__"
 | --- | --- | --- | --- |
 | Agent reply done | agent 已经输出完整的用户可见回答 | provider CLI 输出 sentinel | adapter 停止收集正文，准备 flush |
 | Adapter turn done | adapter 已经完成输出归一化、session 记录、kill policy | `InteractiveCommandAdapter` | emit `AdapterEvent::Finished` |
-| Joi turn done | Joi 已经把最终内容和 turn close 写回 server | `joi agent serve` translator | thread/channel timeline 可见最终结果 |
+| Loom turn done | Loom 已经把最终内容和 turn close 写回 server | `loom agent serve` translator | thread/channel timeline 可见最终结果 |
 
 首版的 DoD 采用 **sentinel success** 作为唯一正常成功完成条件：
 
@@ -474,7 +474,7 @@ normal success =
 
 以下情况不算 successful Done：
 
-| 情况 | Adapter 结果 | Joi turn 结果 |
+| 情况 | Adapter 结果 | Loom turn 结果 |
 | --- | --- | --- |
 | 进程退出但没有 sentinel | failed，summary 说明 missing sentinel / exited early | turn failed |
 | 达到 `maxTurnMs` | failed，summary 说明 timeout | turn failed |
@@ -483,7 +483,7 @@ normal success =
 | resume 失败 | failed，不自动重跑 | turn failed |
 | kill policy fallback 仍未结束进程 | failed，summary 说明 kill failed，并记录 pid | turn failed |
 
-这个约定避免把“进程退出”误判为成功。对 interactive CLI 来说，进程退出只能说明 provider 结束了，不代表它按 Joi 协议完成了回答。正常成功必须看到 sentinel。
+这个约定避免把“进程退出”误判为成功。对 interactive CLI 来说，进程退出只能说明 provider 结束了，不代表它按 Loom 协议完成了回答。正常成功必须看到 sentinel。
 
 ### 7.3 Timeout fallback
 
@@ -594,7 +594,7 @@ Claude settings 是 actor 级配置，而不是 scope 级上下文。建议放�
 | mode | 行为 | 用途 |
 | --- | --- | --- |
 | `global` | 不传 `--settings` | 使用用户全局 Claude 配置 |
-| `actor_profile` | 传 `--settings {agent.profile}/claude/settings.json` | 每个 Joi actor 独立配置 |
+| `actor_profile` | 传 `--settings {agent.profile}/claude/settings.json` | 每个 Loom actor 独立配置 |
 | `custom` | 传 `--settings <resolved path>` | 用户完全自定义 |
 
 ### 10.2 示例
@@ -674,7 +674,7 @@ send_prompt(AdapterPrompt)
 6. 应用 `kill.onComplete`；如果进程已退出则跳过。
 7. emit `AdapterEvent::Finished { success: true, summary: "" }`。
 
-如果第 5 或第 6 步失败，adapter 不应假装成功。它应 emit error/trace，并以 `Finished { success: false }` 收口，避免 Joi timeline 显示“成功完成”但 session 状态不可用或进程泄漏。
+如果第 5 或第 6 步失败，adapter 不应假装成功。它应 emit error/trace，并以 `Finished { success: false }` 收口，避免 Loom timeline 显示“成功完成”但 session 状态不可用或进程泄漏。
 
 ### 11.3 Cancel
 
@@ -695,13 +695,13 @@ send_prompt(AdapterPrompt)
 
 session records 是 provider session 映射，不属于进程生命周期临时状态。
 
-## 12. 与 `joi agent serve` 的集成
+## 12. 与 `loom agent serve` 的集成
 
-`joi agent serve` 当前负责：
+`loom agent serve` 当前负责：
 
 - 读取 agent specs。
 - 每个 agent 一条 WS connection。
-- 监听 handoff。
+- 监听 directed message。
 - 打开 turn。
 - 构造 `AdapterPrompt`。
 - 调用 adapter。
@@ -711,7 +711,7 @@ session records 是 provider session 映射，不属于进程生命周期临时�
 
 1. `build_adapter` 支持 `transport.kind == "interactive_command"`。
 2. 传入 actor profile、scope workspace、scope env、template vars、selected model。
-3. 保留 same-scope FIFO：同一个 scope 的多个 handoff 排队，前一轮完成后再执行下一轮。
+3. 保留 same-scope FIFO：同一个 scope 的多个 directed message 排队，前一轮完成后再执行下一轮。
 4. channel scope 和 thread scope 在 session record key 中必须不同。
 
 ## 13. 用户操作建议
@@ -722,10 +722,10 @@ session records 是 provider session 映射，不属于进程生命周期临时�
 
 | 命令 | 作用 |
 | --- | --- |
-| `joi agent session list <actor>` | 查看 actor 的 provider session 映射 |
-| `joi agent session reset <actor> --in <scope>` | 删除某 actor 在某 scope 的映射，下次新建 |
-| `joi agent session bind <actor> --in <scope> --session-id <id>` | 高级：绑定已有外部 provider session |
-| `joi handoff <actor> --new-session --in <scope>` | 本次 handoff 前 reset 并新建 |
+| `loom agent session list <actor>` | 查看 actor 的 provider session 映射 |
+| `loom agent session reset <actor> --in <scope>` | 删除某 actor 在某 scope 的映射，下次新建 |
+| `loom agent session bind <actor> --in <scope> --session-id <id>` | 高级：绑定已有外部 provider session |
+| `loom directed message <actor> --new-session --in <scope>` | 本次 directed message 前 reset 并新建 |
 
 如果不做这些 CLI，仍可以先通过删除 session record 文件实现手动 reset。
 
@@ -739,7 +739,7 @@ session records 是 provider session 映射，不属于进程生命周期临时�
 
 ### 14.2 Session lifecycle
 
-- 同 actor + 同 thread：第二次 handoff resume。
+- 同 actor + 同 thread：第二次 directed message resume。
 - 同 actor + 不同 thread：不同 session id。
 - 同 actor + channel common area：独立 session id。
 - 不同 actor + 同 thread：不同 session id。
@@ -747,7 +747,7 @@ session records 是 provider session 映射，不属于进程生命周期临时�
 
 ### 14.3 Prompt / completion
 
-- 默认注入 `__JOI_DONE__` contract。
+- 默认注入 `__LOOM_DONE__` contract。
 - 自定义 sentinel 生效。
 - sentinel 输出触发 completion。
 - final answer 不包含 sentinel。
@@ -795,6 +795,6 @@ session records 是 provider session 映射，不属于进程生命周期临时�
 4. 实现 sentinel completion 和 maxTurnMs。
 5. 实现 kill policy。
 6. 接入 Claude settings policy。
-7. 接入 `joi agent serve`。
+7. 接入 `loom agent serve`。
 8. 增加 Claude / Copilot 示例。
 9. 根据真实 CLI 验证决定是否补 PTY。

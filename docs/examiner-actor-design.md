@@ -44,7 +44,7 @@ human -> actor_router -> actor_discovery -> actor_delivery -> actor_router
 
 | 角色 | 当前职责 | 问题 |
 | --- | --- | --- |
-| `actor_router` | human 入口、分类、thread 复用、handoff、终态汇报 | 不写代码、不深度审查；适合做状态机，不适合判质量 |
+| `actor_router` | human 入口、分类、thread 复用、directed message、终态汇报 | 不写代码、不深度审查；适合做状态机，不适合判质量 |
 | `actor_discovery` | 需求分析、五件套、delivery thread 创建、workspace provision | 是出题人，又承担部分 MR 复核，存在自我确认倾向 |
 | `actor_delivery` | 实现、测试、发 MR、处理 CI/comment、feedback 收口 | 写作业的人，不能做最终判题；但仍应保留具体执行权 |
 | `actor_a1_bug_triage` | feedback 分类、归一化、队列分类 | 只做分流，不应介入交付质量审查 |
@@ -96,7 +96,7 @@ blocker = 证据明确 + 影响核心目标/架构安全/可验证性/可合并�
 
 ### 3.4 router 管升级，mr-watcher 管 MR 常规推进
 
-审查员不得直接 handoff `actor_discovery` 或 `actor_delivery`。MR 常规审查出口是：
+审查员不得直接 directed message `actor_discovery` 或 `actor_delivery`。MR 常规审查出口是：
 
 ```text
 actor_examiner -> MR [examiner-result] comment -> mr-watcher -> actor_delivery
@@ -131,7 +131,7 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 
 允许动作：
 
-- 读 Joi thread、artifact、workspace。
+- 读 Loom thread、artifact、workspace。
 - 读代码、MR diff、CI 日志、review comment、部署日志。
 - 运行只读或验证命令。
 - 发布审查 artifact。
@@ -143,7 +143,7 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 - 修改业务代码。
 - 重写 discovery 五件套。
 - 创建 delivery thread。
-- 直接 handoff discovery/delivery。
+- 直接 directed message discovery/delivery。
 - 在没有证据时阻塞任务。
 - 把个人偏好当 blocker。
 - 直接 merge MR。
@@ -155,7 +155,7 @@ discovery -> examiner -> discovery -> examiner -> delivery -> examiner -> delive
 触发：discovery 完成 `task-goal.json`、`definition-of-done.json`、`clone-manifest.json`
 并发出 `[discovery-ready]` 之后、启动 delivery 之前。
 
-触发方式：router 收到 discovery 的 `[discovery-ready]` 后，在同一 thread handoff
+触发方式：router 收到 discovery 的 `[discovery-ready]` 后，在同一 thread directed message
 `actor_examiner gate=spec_review`。不再新增独立 `spec-review-watcher` service。
 
 审查问题：
@@ -173,7 +173,7 @@ human/terminal 裁决，不能启动 delivery。
 
 ### 5.2 `mr_review`
 
-触发：delivery handoff router 并带 `[mr-opened v1]`，或 delivery 修复完 review/CI 后
+触发：delivery directed message router 并带 `[mr-opened v1]`，或 delivery 修复完 review/CI 后
 请求复审。
 
 审查问题：
@@ -283,8 +283,8 @@ human gate。
 | --- | --- | --- |
 | `pass` | 五件套可交付 | 不打扰 delivery |
 | `advisory` | 有建议但不影响主线 | 可转给 delivery 或记录 |
-| `needs_revision` | DoD/scope/目标需修订 | handoff discovery 修订，并通知 delivery 暂停关键改动 |
-| `rescope` | 仓库或责任域错误 | handoff discovery 重做五件套，必要时新建 delivery |
+| `needs_revision` | DoD/scope/目标需修订 | directed message discovery 修订，并通知 delivery 暂停关键改动 |
+| `rescope` | 仓库或责任域错误 | directed message discovery 重做五件套，必要时新建 delivery |
 | `reject` | 不该做或缺陷不成立 | 进入 `terminal_review` 或 human gate |
 | `human_decision` | 需要人决策 | channel 摘要并请求 human |
 
@@ -293,18 +293,18 @@ human gate。
 | verdict | 含义 | router 动作 |
 | --- | --- | --- |
 | `quality_pass` | 代码质量、DoD 和 Code 平台硬 gate 均通过 | 常规路径不接收；由 MR 评论被 mr-watcher 扫描后进入 CI/reviewer/merge gate |
-| `needs_changes` | 需要 delivery 修改 | 常规路径不接收；由 MR 评论被 mr-watcher 扫描后 handoff delivery |
-| `blocked` | 缺权限、环境、依赖或外部系统 | 普通阻塞走 MR 评论 + mr-watcher；需要 human/状态机升级才 handoff router |
-| `design_review_needed` | 不是局部实现问题 | handoff examiner 进入 `design_review` |
+| `needs_changes` | 需要 delivery 修改 | 常规路径不接收；由 MR 评论被 mr-watcher 扫描后 directed message delivery |
+| `blocked` | 缺权限、环境、依赖或外部系统 | 普通阻塞走 MR 评论 + mr-watcher；需要 human/状态机升级才 directed message router |
+| `design_review_needed` | 不是局部实现问题 | directed message examiner 进入 `design_review` |
 | `reject` | MR 不应继续 | 进入 `terminal_review` |
 
 ### 6.3 `design_review` verdict
 
 | verdict | 含义 | router 动作 |
 | --- | --- | --- |
-| `keep_plan` | 原设计正确，delivery 继续修 | handoff delivery |
-| `revise_dod` | DoD 要改 | handoff discovery 修订 |
-| `rescope` | 责任仓库/范围要改 | handoff discovery 重做 |
+| `keep_plan` | 原设计正确，delivery 继续修 | directed message delivery |
+| `revise_dod` | DoD 要改 | directed message discovery 修订 |
+| `rescope` | 责任仓库/范围要改 | directed message discovery 重做 |
 | `withdraw_mr` | 当前 MR 应撤回 | 进入 `terminal_review` |
 | `human_decision` | 需要 human/API owner | 请求 human |
 
@@ -312,11 +312,11 @@ human gate。
 
 | verdict | 含义 | 执行策略 |
 | --- | --- | --- |
-| `auto_close_mr` | 可自动关闭 MR | router handoff delivery 执行 close |
+| `auto_close_mr` | 可自动关闭 MR | router directed message delivery 执行 close |
 | `need_human_close_mr` | 关闭 MR 需要 human 确认 | router 请求 human |
-| `auto_feedback_nonfixed` | 可自动把 feedback 收为非 Fixed | router handoff delivery/loop 执行 |
+| `auto_feedback_nonfixed` | 可自动把 feedback 收为非 Fixed | router directed message delivery/loop 执行 |
 | `need_human_feedback_terminal` | feedback 终态需要 human 确认 | router 请求 human |
-| `rescope_not_close` | 问题真实但 scope 错，不能关闭 | handoff discovery 重做 |
+| `rescope_not_close` | 问题真实但 scope 错，不能关闭 | directed message discovery 重做 |
 | `no_terminal_action` | 证据不足，不终止 | 回到 delivery/discovery |
 
 ## 7. 通过、废弃、feedback 状态策略
@@ -407,11 +407,11 @@ MR 对应 feedback 标 Fixed。
 
 - 具体回评和状态更新仍由 delivery 或 `a1-bug-fix-loop` 执行。
 - loop 是 queue ledger owner，负责 `fix_status`、`closed_at`、`archived_at` 等队列字段。
-- delivery 可作为 Aone workitem 的实际写入者，写入后 handoff router；loop 读取终态后推进下一条。
+- delivery 可作为 Aone workitem 的实际写入者，写入后 directed message router；loop 读取终态后推进下一条。
 
-## 8. Handoff 防循环规则
+## 8. Directed Message 防循环规则
 
-1. examiner 不直接 handoff discovery/delivery；`mr_review` 常规 verdict 只发 artifact + MR `[examiner-result]` 评论。
+1. examiner 不直接 directed message discovery/delivery；`mr_review` 常规 verdict 只发 artifact + MR `[examiner-result]` 评论。
 2. service 只触发 examiner，不触发 discovery/delivery。
 3. mr-watcher 是 MR 常规推进入口；router 是升级状态机 owner。
 4. 每个 gate 有最大轮次：
@@ -478,7 +478,7 @@ MR 对应 feedback 标 Fixed。
 
 - 处理 examiner `needs_changes`。
 - 执行 `[examiner-close-approved]`。
-- 当发现题目问题时 handoff router，请求 examiner `design_review`。
+- 当发现题目问题时 directed message router，请求 examiner `design_review`。
 
 迁出：
 
@@ -536,13 +536,13 @@ actor_discovery [discovery-ready]
 ### Phase 1：只读审查
 
 - 新增 `actor_examiner` spec/profile。
-- router 在 MR opened 后 handoff examiner `mr_review`。
+- router 在 MR opened 后 directed message examiner `mr_review`。
 - router 在 `[discovery-ready]` 后触发 `spec_review`。
 - examiner 只输出 artifact 和 MR 评论，不 approve、不 close、不改 feedback。
 
 ### Phase 2：替换 discovery MR 复核
 
-- router 的“delivery 报 MR 后 handoff discovery 复核”改成 handoff examiner。
+- router 的“delivery 报 MR 后 directed message discovery 复核”改成 directed message examiner。
 - discovery 只在 `rescope` / `revise_dod` 时被 router 唤醒。
 - delivery Step 6 从 `review-result.v1` 迁到 `examiner-review-result.v1`。
 
@@ -561,7 +561,7 @@ actor_discovery [discovery-ready]
 
 方案可行，原因：
 
-- Joi 已有 actor/profile/service/artifact/handoff 元语，不需要改协议。
+- Loom 已有 actor/profile/service/artifact/directed message 元语，不需要改协议。
 - 当前缺口主要是角色职责，不是 runtime 能力。
 - 一个 actor 多 gate 可以避免多审查员通信复杂度。
 - router 保持唯一状态机，可以控制循环。

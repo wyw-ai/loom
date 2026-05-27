@@ -34,17 +34,17 @@
 | 上下文 | child 自己在内存里维护 | **外包给底层 CLI 的 `--resume <session_id>`** |
 | 流式输出 | 原生 `session/update` 帧流 | 取决于 CLI 是否支持 stream output（`text` 模式没流，`stream-json` 模式有） |
 | 工具调用可见度 | 高（`tool_call` / `tool_call_update` 帧） | 取决于 stream 格式；`text` 模式完全不可见 |
-| Permission request | 原生 `session/request_permission` | v0 不支持（command 子进程不便往 joi 反向请求权限） |
+| Permission request | 原生 `session/request_permission` | v0 不支持（command 子进程不便往 loom 反向请求权限） |
 | 启动开销 | 一次启动，复用 | 每条 prompt 都冷启动一次 LLM client |
 
 ### 1.3 设计原则
 
-1. **不在 joi 内重新发明上下文管理**。LLM CLI 自己已经把 session 持久化做得很好
-   （`~/.claude/sessions/`、`~/.codex/sessions/` 等），joi 只簿记
+1. **不在 loom 内重新发明上下文管理**。LLM CLI 自己已经把 session 持久化做得很好
+   （`~/.claude/sessions/`、`~/.codex/sessions/` 等），loom 只簿记
    `(actor, scope) → session_id` 这个最小映射。
 2. **schema 必须能描述任意一次性 CLI**。即便用户写一个 echo 脚本也能跑通。
-3. **保真度由 CLI 自己决定**。joi 提供 `output_format` 旋钮让用户告诉 adapter
-   "我跑的这个 CLI 输出长什么样"，joi 按格式解析；解析不到的细节就当没有，不强
+3. **保真度由 CLI 自己决定**。loom 提供 `output_format` 旋钮让用户告诉 adapter
+   "我跑的这个 CLI 输出长什么样"，loom 按格式解析；解析不到的细节就当没有，不强
    行造数据。
 
 ---
@@ -103,7 +103,7 @@ pub enum PromptVia {
     Args,
     /// prompt 写到子进程 stdin，进程读完关闭。
     Stdin,
-    /// prompt 写到 env var JOI_PROMPT。
+    /// prompt 写到 env var LOOM_PROMPT。
     Env,
 }
 
@@ -189,12 +189,12 @@ bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示
 
 字段说明：
 
-- **`scope`**：joi 协议里的 scope（channel 或 thread）。一个 thread 的对话历史
+- **`scope`**：loom 协议里的 scope（channel 或 thread）。一个 thread 的对话历史
   对应底层 CLI 的一个 session。
 - **`session_id`**：从底层 CLI 启动输出里抓出来的那串 ID（`first_run_capture`
-  规则解出）。joi 不解释它，仅作为 `--resume` 的入参。
+  规则解出）。loom 不解释它，仅作为 `--resume` 的入参。
 - **`command_signature`**：`command` + `args` 模板（替换前）的哈希。如果用户改了
-  spec 里的 command，joi 应该作废旧映射并按 first-run 重跑——避免把"用 model A
+  spec 里的 command，loom 应该作废旧映射并按 first-run 重跑——避免把"用 model A
   起的 session" 喂给"现在配置成 model B 的 CLI"。
 
 ### 3.2 失效处理
@@ -205,7 +205,7 @@ bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示
 1. Adapter 捕获子进程非零退出 + stderr 包含 `"session not found"` 之类信号；
 2. 删除对应 `<scope_id>.json`；
 3. 回退按"first run"重跑一次（不带 `--resume`），重新抓 session_id；
-4. 如果二次仍然失败，发 `AdapterEvent::Error`，joi 端写 `error` trace 帧。
+4. 如果二次仍然失败，发 `AdapterEvent::Error`，loom 端写 `error` trace 帧。
 
 > **失效信号清单**（adapter 里硬编码或 spec 配置）：
 > - 退出码非 0
@@ -226,7 +226,7 @@ bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示
 
 ## 4. `first_run_capture` DSL
 
-第一次调用（spec 里没记 session_id 时）跑完之后，joi 需要把底层 CLI 给出的
+第一次调用（spec 里没记 session_id 时）跑完之后，loom 需要把底层 CLI 给出的
 session_id 抓回来。规则形态有三种：
 
 ### 4.1 `stdout_json:<jq-style-path>`
@@ -275,7 +275,7 @@ spec 里配置，由 runtime 固定设为当前 channel 下该 actor 的 workspa
 | 变量 | 来源 |
 | --- | --- |
 | `{actor.id}` | 当前 actor id |
-| `{scope.id}` | 当前 scope id（trigger event 的 scope） |
+| `{scope.id}` | 当前 scope id（trigger message 的 scope） |
 | `{scope.kind}` | `"thread"` 或 `"channel"` |
 | `{agent.workspace}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>/workspace` |
 | `{agent.profile}` | `~/.agentx/agents/<actor-id>/profile`（per-actor 持久化状态：identity / memory / MCP 配置等） |
@@ -309,11 +309,11 @@ spec 里配置，由 runtime 固定设为当前 channel 下该 actor 的 workspa
 | --- | --- | --- |
 | `args` | `command` + `args` + `prompt` | `command` + `resume_args`（其中 `{prompt}` 展开为实际文本） |
 | `stdin` | `command` + `args`，prompt 写 stdin | `command` + `resume_args`（无 `{prompt}`），prompt 写 stdin |
-| `env` | `command` + `args`，env `JOI_PROMPT=<text>` | `command` + `resume_args`，env `JOI_PROMPT=<text>` |
+| `env` | `command` + `args`，env `LOOM_PROMPT=<text>` | `command` + `resume_args`，env `LOOM_PROMPT=<text>` |
 
 ### 5.2 空 prompt 的处理
 
-不应该出现"hand-off 事件没带文本"的情况——`joi daemon` 的
+不应该出现"directed-message 事件没带文本"的情况——`loom-daemon` 的
 `render_prompt` 会用 fallback（`text` → `message` → 整个 payload JSON）保证非空。
 但 adapter 要做防御性检查：
 
@@ -323,7 +323,7 @@ spec 里配置，由 runtime 固定设为当前 channel 下该 actor 的 workspa
 ### 5.3 不支持 resume 的 CLI
 
 `session.first_run_capture` 与 `session.resume_args` 都不填时，每次调用都按 first
-run 跑——也就是每次都是"裸 prompt，无上下文"。这等价于"无记忆 agent"。joi 仍然
+run 跑——也就是每次都是"裸 prompt，无上下文"。这等价于"无记忆 agent"。loom 仍然
 会按 thread 维护 turn / event 历史，但 CLI 自己看不到上一轮。
 
 ---
@@ -361,7 +361,7 @@ Anthropic Claude Code `--output-format stream-json` 输出长这样（每行一�
 | `type=system, subtype=init` | （不发；`session_id` 由 `first_run_capture: stdout_json:.session_id` 抓走） |
 | `type=assistant, content[].type=text` | `Text { content, is_partial: true }`（每帧一次） |
 | `type=assistant, content[].type=tool_use` | `ToolUse { tool_name=name, input }` |
-| `type=user, content[].type=tool_result` | （不发；joi 不需要看到 tool 结果，那是 CLI 内部的事） |
+| `type=user, content[].type=tool_result` | （不发；loom 不需要看到 tool 结果，那是 CLI 内部的事） |
 | `type=result, subtype=success` | 流末尾再补 `Text { is_partial: false }`（空字符串）触发 flush；然后 `Finished { success: true, summary: total_cost_usd }` |
 | `type=result, subtype=error_*` | `Finished { success: false, summary: error_message }` |
 
@@ -372,7 +372,7 @@ stream-json 没有显式 flush，所以约定"`type=result` 之前所有的 text
 ### 6.3 `copilot_json`
 
 GitHub Copilot CLI `--output-format json --stream off` 输出 JSONL session
-events。joi 只把根 agent 的最后一条 `assistant.message.data.content` 当成最终
+events。loom 只把根 agent 的最后一条 `assistant.message.data.content` 当成最终
 回答发给用户；`tool.*`、`assistant.reasoning*`、带 `agentId` 的 sub-agent 事件
 都保留在子进程 stdout 日志里，不转换成用户可见消息。
 
@@ -420,7 +420,7 @@ E2 阶段实现时再根据实际 codex 输出 fix schema。
 
 不论 `output_format` 取何值，stderr 始终：
 
-- 行式追加到该 agent 的 log（`~/.local/share/joi/agents/<actor>/logs/run.log`）；
+- 行式追加到该 agent 的 log（`~/.local/share/loom/agents/<actor>/logs/run.log`）；
 - 不进 `AdapterEvent` 流；
 - 用户直接查看 daemon data root 下的 agent log 文件。
 
@@ -465,7 +465,7 @@ session_id。
 
 ### 7.2 第一次调用
 
-人在 thread `thr_abc` 里发 `content.add` + `hands_off_to=actor_claude_cmd`。
+人在 thread `thr_abc` 里发 `message` + `directed_to=actor_claude_cmd`。
 
 Agent client 查 `~/.agentx/sessions/actor_claude_cmd/thr_abc.json`：
 **不存在**。
@@ -473,7 +473,7 @@ Agent client 查 `~/.agentx/sessions/actor_claude_cmd/thr_abc.json`：
 走 first run 路径：
 
 ```bash
-cd ~/.local/share/joi/agents/actor_claude_cmd/workspace
+cd ~/.local/share/loom/agents/actor_claude_cmd/workspace
 claude -p --output-format stream-json --verbose "<prompt 文本>"
 ```
 
@@ -490,17 +490,17 @@ claude -p --output-format stream-json --verbose "<prompt 文本>"
 }
 ```
 
-stream-json 翻译为 `AdapterEvent`，joi 端 turn 跑完写若干 trace 帧 + 一条
-`content.add` + `turn.close`。
+stream-json 翻译为 `AdapterEvent`，loom 端 turn 跑完写若干 trace 帧 + 一条
+`message` + `turn.close`。
 
 ### 7.3 同一 thread 的第二条 prompt
 
-人再发一条 hand-off。Agent client 查文件：**存在**。
+人再发一条 directed-message。Agent client 查文件：**存在**。
 
 走 resume 路径：
 
 ```bash
-cd ~/.local/share/joi/agents/actor_claude_cmd/workspace
+cd ~/.local/share/loom/agents/actor_claude_cmd/workspace
 claude --resume 01J6Q0R5K3HZ2A1XW8Y9P7T6FE -p --output-format stream-json --verbose "<新 prompt>"
 ```
 
@@ -533,7 +533,7 @@ set -euo pipefail
 
 prompt="$1"
 echo "{\"type\":\"text\",\"text\":\"You said: $prompt\"}"
-echo "{\"type\":\"text\",\"text\":\" (in scope $JOI_SCOPE_ID)\"}"
+echo "{\"type\":\"text\",\"text\":\" (in scope $LOOM_SCOPE_ID)\"}"
 echo "{\"type\":\"done\",\"ok\":true}"
 ```
 
@@ -574,17 +574,17 @@ echo "{\"type\":\"done\",\"ok\":true}"
 ### 8.3 注入给脚本的 env vars
 
 Runtime 会为 command 子进程补齐以下默认环境变量。spec 里的同名 `env` 值优先；
-`JOI_SERVER` 默认会尽量改写为 loopback 地址，避免本机 agent sandbox 不能访问网卡
-IP。也可以用 `JOI_AGENT_SERVER` 显式覆盖。
+`LOOM_SERVER` 默认会尽量改写为 loopback 地址，避免本机 agent sandbox 不能访问网卡
+IP。也可以用 `LOOM_AGENT_SERVER` 显式覆盖。
 
 | 环境变量 | 值 |
 | --- | --- |
-| `JOI_SERVER` | 子进程 shell out 回 joi 时使用的 WS URL |
-| `JOI_ACTOR` | 当前 agent 的 actor id |
-| `JOI_SCOPE_ID` | 当前 turn 的 thread/channel scope id |
-| `JOI_SCOPE_KIND` | 当前 turn 的 scope kind：`thread` 或 `channel` |
-| `JOI_AGENT_PROFILE` | per-actor profile 目录 |
-| `JOI_AGENT_BUNDLE_DIR` | 当前 bundle 目录 |
+| `LOOM_SERVER` | 子进程 shell out 回 loom 时使用的 WS URL |
+| `LOOM_ACTOR` | 当前 agent 的 actor id |
+| `LOOM_SCOPE_ID` | 当前 turn 的 thread/channel scope id |
+| `LOOM_SCOPE_KIND` | 当前 turn 的 scope kind：`thread` 或 `channel` |
+| `LOOM_AGENT_PROFILE` | per-actor profile 目录 |
+| `LOOM_AGENT_BUNDLE_DIR` | 当前 bundle 目录 |
 | `AGENTX_CHANNEL_ID` | 当前 channel id |
 | `AGENTX_CHANNEL_ROOT` | 当前 channel 根目录 |
 | `AGENTX_CHANNEL_SHARED` | 当前 channel shared 目录 |
@@ -592,16 +592,16 @@ IP。也可以用 `JOI_AGENT_SERVER` 显式覆盖。
 | `AGENTX_AGENT_ROOT` | 当前 channel 下该 agent 的私有根目录 |
 | `AGENTX_AGENT_WORKSPACE` | 当前 channel 下该 agent 的默认 workspace |
 | `AGENTX_AGENT_LOGS` | 当前 channel 下该 agent 的日志目录 |
-| `PATH` | 继承 `joi daemon` 进程的 PATH |
+| `PATH` | 继承 `loom-daemon` 进程的 PATH |
 
-### 8.4 脚本里 shell out 回 joi
+### 8.4 脚本里 shell out 回 loom
 
-因为 `JOI_SERVER` / `JOI_ACTOR` / `PATH` 都齐了，脚本可以直接：
+因为 `LOOM_SERVER` / `LOOM_ACTOR` / `PATH` 都齐了，脚本可以直接：
 
 ```bash
-joi --json event list --in "$JOI_SCOPE_ID" --limit 20
-joi --json event list --in "$JOI_SCOPE_ID" --channel --limit 20
-joi --json artifact publish --name plan.md --text "$plan_body"
+loom --json message read --in "$LOOM_SCOPE_ID" --limit 20
+loom --json message read --in "$LOOM_SCOPE_ID" --channel --limit 20
+loom --json artifact publish --name plan.md --text "$plan_body"
 ```
 
 形成 "command agent 通过 cli 反向读写 server" 的闭环。这是 command transport 的
@@ -634,28 +634,28 @@ provider 的 prompt cache）。
 
 ### 9.3 Permission request 不可表达
 
-ACP 有 `session/request_permission` → joi `action.request` 的反向通道。Command
+ACP 有 `session/request_permission` → loom `action.request` 的反向通道。Command
 子进程没法在 prompt 跑到一半暂停回头问人。
 
 v0 决定：command transport 不发 `AdapterEvent::ActionRequest`，整个 turn 是"prompt
 进、结果出"的同步往返。如果某个 command CLI 真的需要权限审批，应该让它的开发者
 做成 ACP transport。
 
-agent 主动需要人参与时不走 adapter permission 通道，而是 shell out 到 Joi 的
-human-interaction 工具：`joi ask-user-question` 用于选择/补信息，
-`joi request-approval` 用于批准/拒绝。命令自己 append `action.request`，阻塞
+agent 主动需要人参与时不走 adapter permission 通道，而是 shell out 到 Loom 的
+human-interaction 工具：`loom ask-user-question` 用于选择/补信息，
+`loom request-approval` 用于批准/拒绝。命令自己 append `action.request`，阻塞
 等待 `action.response`，然后把结果返回给当前 agent 进程；daemon worker 只广播
-这条响应，不把 `joi:question:*` / `joi:approval:*` 回传给 adapter。
+这条响应，不把 `loom:question:*` / `loom:approval:*` 回传给 adapter。
 
-### 9.4 Session id 不是 joi 的概念
+### 9.4 Session id 不是 loom 的概念
 
-joi 不在 protocol 层面承认 session_id 的存在——它纯粹是 command transport 内部
+loom 不在 protocol 层面承认 session_id 的存在——它纯粹是 command transport 内部
 状态。其他 transport（ACP、未来的 MCP）有自己的 session 抽象，但都不会泄漏到
 event/turn 模型里。
 
 ### 9.5 命令外部修改
 
-CLI 升级、用户 `rm -rf ~/.claude/`、底层 session schema 变更，都会让 joi 簿记的
+CLI 升级、用户 `rm -rf ~/.claude/`、底层 session schema 变更，都会让 loom 簿记的
 session_id 突然作废。adapter 必须能优雅降级（§3.2 失效处理）。
 
 ### 9.6 命令注入

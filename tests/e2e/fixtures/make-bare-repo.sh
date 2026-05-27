@@ -19,11 +19,11 @@ git init --bare -b main "$DEST" >/dev/null
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 git -C "$WORK" init -b main >/dev/null
-git -C "$WORK" config user.email e2e@joi.local
+git -C "$WORK" config user.email e2e@loom.local
 git -C "$WORK" config user.name "e2e"
 mkdir -p "$WORK/openspec/changes"
 cat > "$WORK/README.md" <<EOF
-# joi-e2e seed
+# loom-e2e seed
 Synthetic repo used by scripts/e2e/. Not for production.
 EOF
 cat > "$WORK/openspec/AGENTS.md" <<EOF

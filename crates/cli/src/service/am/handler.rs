@@ -1,20 +1,20 @@
-// `joi service am-handler` orchestrator. First user is the CLI
+// `loom service am-handler` orchestrator. First user is the CLI
 // subcommand wired in `crate::cmd::service`; some helpers are exported
 // for tests but not yet used outside this module.
 #![allow(dead_code)]
 
 //! Per-invocation orchestrator for the AM bridge. One process per
 //! `am listen --script` callback. Reads the message JSON from stdin,
-//! resolves scope, writes a `hands_off_to` event, optionally waits for
+//! resolves scope, writes a directed message, optionally waits for
 //! the agent reply, and either prints a DingTalk callback JSON to
 //! stdout or sends via `am`.
 //!
 //! Two entry shapes:
 //!
-//! * `run_normal` — the default: stdin → handoff → reply (callback /
+//! * `run_normal` — the default: stdin → directed message → reply (callback /
 //!   send / async_send dispatch).
 //! * `run_async_reply` — invoked by ourselves when async_send mode
-//!   spawned a detached child. Skips the handoff (already done in the
+//!   spawned a detached child. Skips the directed send (already done in the
 //!   parent) and only waits-then-sends.
 
 use std::fs;
@@ -227,19 +227,11 @@ async fn resolve_scope(
                 return Ok((ScopeKind::Thread, entry.thread_id.clone()));
             }
             let title = scope::thread_title(event, &key);
-            let root_event_id = runtime
-                .append_content(
-                    ScopeRef {
-                        kind: ScopeKind::Channel,
-                        id: channel_id.into(),
-                    },
-                    title.clone(),
-                    vec![],
-                    None,
-                )
+            let root_message_id = runtime
+                .append_channel_message(channel_id, title.clone())
                 .await?;
             let thread = runtime
-                .create_thread(channel_id, &root_event_id, &title)
+                .create_thread(channel_id, &root_message_id, &title)
                 .await?;
             chan_map.insert(
                 key,
@@ -253,7 +245,7 @@ async fn resolve_scope(
             tracing::info!(
                 thread_id = %thread.id,
                 channel = %channel_id,
-                "am-joi: auto-created thread",
+                "am-loom: auto-created thread",
             );
             Ok((ScopeKind::Thread, thread.id))
         }
@@ -266,32 +258,30 @@ async fn wait_for_answer(
     timeout_secs: u64,
 ) -> Result<String> {
     let timeout = Duration::from_secs(timeout_secs);
-    let events = runtime.await_responds_to(trigger_id, timeout).await?;
-    for event in events {
-        if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Ok(trimmed.to_string());
-            }
+    let messages = runtime.await_message_replies(trigger_id, timeout).await?;
+    for message in messages {
+        let trimmed = message.body.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
         }
     }
     bail!("timed out waiting for response to {trigger_id}")
 }
 
-/// async_send parent path: spawn a detached `joi service am-handler
+/// async_send parent path: spawn a detached `loom service am-handler
 /// --service-id <id> --async-reply <payload>` child that will wait for
 /// the agent reply and send via `am`. Parent prints the pending
 /// callback and exits.
 fn spawn_async_reply(
     service_id: &str,
-    source_event: &Value,
+    source_payload: &Value,
     trigger_id: &str,
     scope_kind: &str,
     scope_id: &str,
     am_cfg: &AmConfig,
 ) -> Result<()> {
     let payload = json!({
-        "sourceEvent": source_event,
+        "sourcePayload": source_payload,
         "triggerId": trigger_id,
         "scopeKind": scope_kind,
         "scopeId": scope_id,
@@ -320,12 +310,6 @@ pub async fn run_handler(
     let am_cfg = parse_am_config(&spec)?;
 
     let data_root = state::default_data_root();
-    let state_path = state::state_dir(&data_root, &service_id);
-    // One-shot legacy import (idempotent on subsequent runs).
-    let _ = scope::migrate_legacy(
-        &scope::thread_map_path(&state_path),
-        &scope::legacy_thread_map_path(),
-    );
 
     if let Some(payload) = async_reply {
         return run_async_reply(server_url, spec, am_cfg, &data_root, &payload).await;
@@ -367,7 +351,7 @@ async fn run_normal(
     let target_agent = spec
         .target_agent
         .clone()
-        .ok_or_else(|| anyhow!("AM plugin requires spec.targetAgent for handoff"))?;
+        .ok_or_else(|| anyhow!("AM plugin requires spec.targetAgent for directed message"))?;
 
     if am_cfg.auto_invite {
         let _ = runtime.ensure_channel_member(&channel_id).await;
@@ -382,7 +366,7 @@ async fn run_normal(
         let raw_text = event.get("_raw").and_then(|v| v.as_str()).unwrap_or("");
         let user_text = extract::extract_text(&event, raw_text);
         if user_text.is_empty() {
-            tracing::warn!("am-joi: skipping empty message");
+            tracing::warn!("am-loom: skipping empty message");
             continue;
         }
 
@@ -391,7 +375,7 @@ async fn run_normal(
         let body = format_question(&event, &user_text);
         let meta = build_meta(&event);
         let trigger_id = runtime
-            .handoff(
+            .send_directed_message(
                 &target_agent,
                 ScopeRef {
                     kind: scope_kind,
@@ -401,7 +385,7 @@ async fn run_normal(
                 Some(meta),
             )
             .await?;
-        tracing::info!(%trigger_id, scope = %scope_id, "am-joi: handoff written");
+        tracing::info!(%trigger_id, scope = %scope_id, "am-loom: directed message written");
 
         if !am_cfg.reply {
             continue;
@@ -450,7 +434,7 @@ async fn run_normal(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AsyncPayload {
-    source_event: Value,
+    source_payload: Value,
     trigger_id: String,
     /// `"channel"` or `"thread"`. Currently unused on the receive side
     /// (await_responds_to filters by trigger_id only) but kept in the
@@ -489,7 +473,7 @@ async fn run_async_reply(
     let runtime = ServiceRuntime::start(spec.id.clone(), actor_id, client, data_root)?;
 
     let answer = wait_for_answer(&runtime, &payload.trigger_id, am_cfg.reply_timeout_secs).await?;
-    reply::send_via_am(&am_cfg.am_send_config(), &payload.source_event, &answer)?;
+    reply::send_via_am(&am_cfg.am_send_config(), &payload.source_payload, &answer)?;
     Ok(())
 }
 
@@ -649,7 +633,7 @@ mod tests {
     #[test]
     fn load_spec_finds_by_filename() {
         let dir =
-            std::env::temp_dir().join(format!("joi-am-handler-{}", uuid::Uuid::new_v4().simple()));
+            std::env::temp_dir().join(format!("loom-am-handler-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("am1.json");
         std::fs::write(
@@ -664,7 +648,7 @@ mod tests {
     #[test]
     fn load_spec_rejects_id_filename_mismatch() {
         let dir =
-            std::env::temp_dir().join(format!("joi-am-handler-{}", uuid::Uuid::new_v4().simple()));
+            std::env::temp_dir().join(format!("loom-am-handler-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("renamed.json");
         std::fs::write(

@@ -1,4 +1,4 @@
-//! `joi workspace` — read/write/list files inside a scope workspace.
+//! `loom workspace` — read/write/list files inside a scope workspace.
 //!
 //! Mirrors the layout that `crate::cmd::agent_serve` provisions:
 //!
@@ -8,7 +8,7 @@
 //!   (the thread variant is provisioned by Phase 1 changes to agent_serve.)
 //!
 //! These commands are pure local filesystem operations — they do not
-//! contact the joi-server. They exist so skill processes (running under a
+//! contact the loom-server. They exist so skill processes (running under a
 //! served agent) and operators can read/write workspace files without
 //! re-implementing the path-resolution dance.
 
@@ -22,7 +22,7 @@ use crate::render;
 #[derive(Debug, Clone, Copy)]
 pub enum WsKind {
     /// Per-actor workspace under `channels/<cid>/agents/<aid>/workspace/`.
-    /// Requires both --channel/--in *and* --actor (or env JOI_ACTOR).
+    /// Requires both --channel/--in *and* --actor (or env LOOM_ACTOR).
     Actor,
     /// Shared channel area under `channels/<cid>/shared/`.
     Channel,
@@ -47,7 +47,7 @@ impl WsRef {
                 let actor = self
                     .actor_id
                     .as_deref()
-                    .ok_or_else(|| anyhow!("actor workspace requires --actor or JOI_ACTOR"))?;
+                    .ok_or_else(|| anyhow!("actor workspace requires --actor or LOOM_ACTOR"))?;
                 channel_root.join("agents").join(actor).join("workspace")
             }
             WsKind::Channel => channel_root.join("shared"),
@@ -64,16 +64,14 @@ impl WsRef {
 }
 
 fn data_root() -> PathBuf {
-    for key in ["JOI_AGENT_DATA_ROOT", "AGENTHUB_HOME", "AGENTX_HOME"] {
-        if let Some(v) = std::env::var_os(key) {
-            if !v.is_empty() {
-                return PathBuf::from(v);
-            }
+    if let Some(v) = std::env::var_os("LOOM_AGENT_DATA_ROOT") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
         }
     }
-    dirs::home_dir()
-        .map(|d| d.join(".agentx"))
-        .unwrap_or_else(|| PathBuf::from(".agentx"))
+    dirs::data_dir()
+        .map(|d| d.join("loom").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
 }
 
 fn sanitize_relative(rel: &str) -> Result<PathBuf> {

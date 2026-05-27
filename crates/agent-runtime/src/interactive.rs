@@ -1,7 +1,7 @@
 //! Interactive command transport.
 //!
 //! This adapter is for provider CLIs that accept prompt + session id arguments
-//! but do not use process exit as the turn completion boundary. Joi owns the
+//! but do not use process exit as the turn completion boundary. Loom owns the
 //! provider session id per `(actor, scope)` and uses an explicit completion
 //! sentinel to decide when a turn is done.
 
@@ -169,7 +169,7 @@ impl Adapter for InteractiveCommandAdapter {
         slot.lock().cancel_requested = false;
         // Detach the provider turn onto a blocking worker. send_prompt must
         // return promptly so the agent worker's notification loop stays
-        // free to process turn/close, action responses, and handoffs to
+        // free to process turn/close, action responses, and directed messages to
         // other scopes while a (potentially long) interactive turn runs.
         // Completion is driven entirely through AdapterEvent (Finished /
         // Error), and run_prompt always emits a Finished event in both
@@ -411,31 +411,10 @@ fn run_prompt_inner(
             summary = "timeout waiting for interactive command sentinel".into();
             break;
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("failed to poll child: {e}"))?
-        {
-            summary = if found_done {
-                String::new()
-            } else if status.success() {
-                "process exited before completion sentinel".into()
-            } else {
-                format!(
-                    "process exited before completion sentinel with code {}",
-                    status.code().unwrap_or(-1)
-                )
-            };
-            break;
-        }
         match stdout_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
-                let chunk = if cfg.spec.output.strip_ansi {
-                    strip_ansi(&chunk)
-                } else {
-                    chunk
-                };
-                collected.push_str(&chunk);
-                if contains_sentinel_line(&collected, &sentinel) {
+                if append_stdout_chunk(&mut collected, chunk, cfg.spec.output.strip_ansi, &sentinel)
+                {
                     final_text = text_before_sentinel(&collected, &sentinel);
                     if cfg.spec.completion.strip_sentinel {
                         final_text = final_text.trim_end().to_string();
@@ -453,6 +432,32 @@ fn run_prompt_inner(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to poll child: {e}"))?
+        {
+            drain_exited_stdout(
+                &stdout_rx,
+                &mut collected,
+                cfg.spec.output.strip_ansi,
+                &sentinel,
+                &mut final_text,
+                cfg.spec.completion.strip_sentinel,
+                &mut found_done,
+            );
+            if found_done {
+                summary = String::new();
+                success = true;
+            } else if status.success() {
+                summary = "process exited before completion sentinel".into();
+            } else {
+                summary = format!(
+                    "process exited before completion sentinel with code {}",
+                    status.code().unwrap_or(-1)
+                );
+            }
+            break;
         }
     }
 
@@ -475,6 +480,49 @@ fn run_prompt_inner(
         command_signature,
         usage,
     })
+}
+
+fn append_stdout_chunk(
+    collected: &mut String,
+    chunk: String,
+    strip_output_ansi: bool,
+    sentinel: &str,
+) -> bool {
+    let chunk = if strip_output_ansi {
+        strip_ansi(&chunk)
+    } else {
+        chunk
+    };
+    collected.push_str(&chunk);
+    contains_sentinel_line(collected, sentinel)
+}
+
+fn drain_exited_stdout(
+    stdout_rx: &std::sync::mpsc::Receiver<String>,
+    collected: &mut String,
+    strip_output_ansi: bool,
+    sentinel: &str,
+    final_text: &mut String,
+    strip_sentinel: bool,
+    found_done: &mut bool,
+) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match stdout_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(chunk) => {
+                if append_stdout_chunk(collected, chunk, strip_output_ansi, sentinel) {
+                    *found_done = true;
+                    *final_text = text_before_sentinel(collected, sentinel);
+                    if strip_sentinel {
+                        *final_text = final_text.trim_end().to_string();
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 fn spawn_child(
@@ -511,7 +559,7 @@ fn build_interactive_prompt(
     cfg.spec
         .prompt
         .template
-        .replace("{joi_envelope}", &with_contract)
+        .replace("{loom_envelope}", &with_contract)
         .replace("{user_message}", &prompt.content)
         .replace("{session_id}", session_id)
 }
@@ -523,9 +571,9 @@ fn completion_contract(cfg: &InteractiveCommandConfig) -> String {
         .prompt
         .completion_contract
         .instruction
-        .replace("__JOI_DONE__", sentinel);
+        .replace("__LOOM_DONE__", sentinel);
     format!(
-        "=== Joi interactive command completion contract ===\n{instruction}\nCompletion sentinel: {sentinel}"
+        "=== Loom interactive command completion contract ===\n{instruction}\nCompletion sentinel: {sentinel}"
     )
 }
 
@@ -705,7 +753,7 @@ fn expanded_env(
         env.entry(k.clone()).or_insert_with(|| v.clone());
     }
     if let Some(model) = active_model(cfg, request) {
-        env.entry("JOI_AGENT_MODEL".into()).or_insert(model);
+        env.entry("LOOM_AGENT_MODEL".into()).or_insert(model);
     }
     env
 }
@@ -916,7 +964,7 @@ mod tests {
 
     #[test]
     fn session_path_distinguishes_thread_and_channel() {
-        let cfg = cfg(std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4())));
+        let cfg = cfg(std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4())));
         let thread = session_path(&cfg, &scope(ScopeKind::Thread, "abc"));
         let channel = session_path(&cfg, &scope(ScopeKind::Channel, "abc"));
         assert_ne!(thread, channel);
@@ -926,7 +974,7 @@ mod tests {
 
     #[test]
     fn argv_appends_model_when_configured() {
-        let mut cfg = cfg(std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4())));
+        let mut cfg = cfg(std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4())));
         cfg.model = Some("claude-sonnet".into());
         let req = prompt(scope(ScopeKind::Thread, "t"), "hello");
         let mut argv = expand_argv(&cfg.spec.session.new_args, &cfg, &req, Some("sid"), "hello");
@@ -939,7 +987,7 @@ mod tests {
 
     #[test]
     fn argv_uses_configured_model_args_when_present() {
-        let mut cfg = cfg(std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4())));
+        let mut cfg = cfg(std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4())));
         cfg.model = Some("claude-sonnet".into());
         cfg.model_args = vec!["--model".into(), "{model}".into()];
         let req = prompt(scope(ScopeKind::Thread, "t"), "hello");
@@ -953,7 +1001,7 @@ mod tests {
 
     #[test]
     fn argv_omits_model_when_missing() {
-        let cfg = cfg(std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4())));
+        let cfg = cfg(std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4())));
         let req = prompt(scope(ScopeKind::Thread, "t"), "hello");
         let mut argv = expand_argv(&cfg.spec.session.new_args, &cfg, &req, Some("sid"), "hello");
         append_provider_args(&cfg, &req, &mut argv).unwrap();
@@ -962,13 +1010,13 @@ mod tests {
 
     #[test]
     fn prompt_injects_completion_contract_before_user_message() {
-        let cfg = cfg(std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4())));
+        let cfg = cfg(std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4())));
         let req = prompt(
             scope(ScopeKind::Thread, "t"),
             "context\n\n=== User message ===\nhello",
         );
         let built = build_interactive_prompt(&cfg, &req, "sid");
-        assert!(built.contains("=== Joi interactive command completion contract ==="));
+        assert!(built.contains("=== Loom interactive command completion contract ==="));
         assert!(
             built.find("completion contract").unwrap()
                 < built.find("=== User message ===").unwrap()
@@ -997,7 +1045,7 @@ mod tests {
 
     #[test]
     fn save_session_updates_last_used_on_resume() {
-        let root = std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
         let cfg = cfg(root.clone());
         let scope = scope(ScopeKind::Thread, "thr");
 
@@ -1015,7 +1063,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_done_requires_sentinel_and_saves_session() {
-        let root = std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
         let mut cfg = cfg(root.clone());
         cfg.command = "sh".into();
         cfg.spec.session.new_args = vec!["-c".into(), "printf 'hello\\n__DONE__\\n'".into()];
@@ -1052,7 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_exit_without_sentinel_is_failed_done() {
-        let root = std::env::temp_dir().join(format!("joi-it-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
         let mut cfg = cfg(root.clone());
         cfg.command = "sh".into();
         cfg.spec.session.new_args = vec!["-c".into(), "printf 'hello\\n'".into()];

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui"]
-# joi-gui pulls a sizable native dep tree (Tauri + system webkit on macOS, webkit2gtk
+# GUI crate pulls a sizable native dep tree (Tauri + system webkit on macOS, webkit2gtk
 # on Linux). Keep it out of the default `cargo build` the CI uses by excluding it
 # from `default-members`; developers opt in via `make gui-dev` / `cargo tauri dev`.
 default-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"]
@@ -45,6 +45,7 @@ which = "6"
 async-trait = "0.1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

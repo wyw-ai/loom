@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::types::*;
 
-// ---- method names (canonical, slash-form) ----
+// ---- method names ----
 
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
@@ -12,7 +12,6 @@ pub mod method {
     pub const CONNECTION_LIST: &str = "connection/list";
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
-    pub const SCOPE_READ: &str = "scope/read";
     pub const CHANNEL_CREATE: &str = "channel/create";
     pub const CHANNEL_LIST: &str = "channel/list";
     pub const CHANNEL_UPDATE: &str = "channel/update";
@@ -25,10 +24,17 @@ pub mod method {
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_ARCHIVE: &str = "thread/archive";
     pub const THREAD_DELETE: &str = "thread/delete";
-    pub const TASK_CREATE: &str = "task/create";
-    pub const TASK_GET: &str = "task/get";
-    pub const TASK_LIST: &str = "task/list";
-    pub const TASK_UPDATE: &str = "task/update";
+    pub const THREAD_FOLLOW: &str = "thread.follow";
+    pub const THREAD_UNFOLLOW: &str = "thread.unfollow";
+    pub const TASK_CREATE: &str = "task.create";
+    pub const TASK_GET: &str = "task.get";
+    pub const TASK_LIST: &str = "task.list";
+    pub const TASK_UPDATE: &str = "task.update";
+    pub const TASK_CLAIM: &str = "task.claim";
+    pub const TASK_ASSIGN: &str = "task.assign";
+    pub const TASK_COMPLETE: &str = "task.complete";
+    pub const TASK_REOPEN: &str = "task.reopen";
+    pub const TASK_CANCEL: &str = "task.cancel";
     pub const TASK_REF_ATTACH: &str = "task/ref.attach";
     pub const TASK_REF_FIND: &str = "task/ref.find";
     pub const TASK_REF_LIST: &str = "task/ref.list";
@@ -49,18 +55,26 @@ pub mod method {
     pub const TASK_WORKSPACE_LEASE_ACQUIRE: &str = "task/workspace.lease.acquire";
     pub const TASK_WORKSPACE_LEASE_RELEASE: &str = "task/workspace.lease.release";
     pub const TASK_WORKSPACE_LEASE_LIST: &str = "task/workspace.lease.list";
-    pub const TURN_OPEN: &str = "turn/open";
-    pub const TURN_CLOSE: &str = "turn/close";
-    pub const TURN_TRACE_READ: &str = "turn/trace.read";
-    pub const TURN_TRACE_UPDATE: &str = "turn/trace.update";
-    pub const TURN_TRACE_APPEND: &str = "turn/trace.append";
-    pub const EVENT_GET: &str = "event/get";
-    pub const EVENT_APPEND: &str = "event/append";
-    pub const MESSAGE_SEARCH: &str = "message/search";
+    pub const RUN_OPEN: &str = "run.open";
+    pub const RUN_APPEND: &str = "run.append";
+    pub const RUN_CLOSE: &str = "run.close";
+    pub const RUN_CANCEL: &str = "run.cancel";
+    pub const COORDINATION_PROPOSE: &str = "coordination.propose";
+    pub const COORDINATION_COMMIT: &str = "coordination.commit";
+    pub const COORDINATION_RESPOND: &str = "coordination.respond";
+    pub const COORDINATION_STEP: &str = "coordination.step";
+    pub const COORDINATION_SKIP: &str = "coordination.skip";
+    pub const COORDINATION_REASSIGN: &str = "coordination.reassign";
+    pub const AGENT_CONFIG_PUBLISH: &str = "agent_config.publish";
+    pub const AGENT_CONFIG_ACTIVATE: &str = "agent_config.activate";
+    pub const MESSAGE_SEND: &str = "message.send";
+    pub const MESSAGE_LIST: &str = "message.list";
+    pub const MESSAGE_READ: &str = "message.read";
+    pub const MESSAGE_REACTION_TOGGLE: &str = "message.reaction.toggle";
+    pub const MESSAGE_SEARCH: &str = "message.search";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
     pub const ARTIFACT_READ: &str = "artifact/read";
-    pub const RECEIPT_RECORD: &str = "receipt/record";
     pub const REMINDER_SCHEDULE: &str = "reminder/schedule";
     pub const REMINDER_LIST: &str = "reminder/list";
     pub const REMINDER_CANCEL: &str = "reminder/cancel";
@@ -69,7 +83,8 @@ pub mod method {
     /// §9.2 Durable actor inbox. Caller (must be bound to `actorId`) lists
     /// deliveries pending against its inbox, with cursor pagination so a
     /// host can resume after restart without losing directed events.
-    pub const DELIVERY_LIST: &str = "delivery/list";
+    pub const INBOX_LIST: &str = "inbox.list";
+    pub const DELIVERY_ACK: &str = "delivery.ack";
     /// Compatibility create-and-wait wrapper around the durable command API.
     pub const MACHINE_COMMAND: &str = "machine/command";
     pub const MACHINE_COMMAND_CREATE: &str = "machine/command.create";
@@ -81,6 +96,10 @@ pub mod method {
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
     pub const ACTOR_DELETE: &str = "actor/delete";
+    pub const ACTOR_GROUP_CREATE: &str = "actor.group.create";
+    pub const ACTOR_GROUP_LIST: &str = "actor.group.list";
+    pub const ACTOR_GROUP_ADD_MEMBER: &str = "actor.group.add_member";
+    pub const ACTOR_GROUP_REMOVE_MEMBER: &str = "actor.group.remove_member";
 
     // outbound notification
     pub const STREAM_UPDATE: &str = "stream/update";
@@ -204,39 +223,8 @@ pub struct ScopeUnsubscribeResult {
     pub unsubscribed: bool,
 }
 
-// ---- scope/read ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScopeReadParams {
-    pub scope: ScopeRef,
-    #[serde(default = "default_limit")]
-    pub limit: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_event_id: Option<String>,
-}
-
 fn default_limit() -> u32 {
     50
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScopeReadResult {
-    pub events: Vec<Event>,
-    pub page_info: PageInfo,
-}
-
-// ---- event/get ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventGetParams {
-    pub event_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventGetResult {
-    pub event: Event,
 }
 
 // ---- channel/create ----
@@ -245,6 +233,8 @@ pub struct EventGetResult {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelCreateParams {
     pub title: String,
+    #[serde(default)]
+    pub topic: String,
     /// When provided, the new channel is created `Private` and the creator
     /// is its sole initial member. When omitted, the channel is created
     /// `Public`.
@@ -308,6 +298,8 @@ pub struct ChannelMembersResult {
 pub struct ChannelUpdateParams {
     pub channel_id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +335,7 @@ pub struct ChannelDeleteResult {
 pub struct ThreadCreateParams {
     pub channel_id: String,
     pub title: String,
-    pub root_event_id: String,
+    pub root_message_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,13 +399,39 @@ pub struct ThreadDeleteResult {
     pub deleted: bool,
 }
 
+// ---- thread.follow / thread.unfollow ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadFollowParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadFollowResult {
+    pub presence: ActorPresence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnfollowParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadUnfollowResult {
+    pub presence: ActorPresence,
+}
+
 // ---- task/create / get / list / update ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskCreateParams {
-    /// Top-level channel event that should own the task metadata.
-    pub source_event_id: String,
+    /// Top-level channel message that should own the task metadata.
+    pub source_message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default)]
@@ -425,7 +443,7 @@ pub struct TaskCreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_source_event_id: Option<String>,
+    pub parent_source_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,7 +482,7 @@ pub struct TaskListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_event_id: Option<String>,
+    pub source_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_actor_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -497,6 +515,50 @@ pub struct TaskUpdateResult {
     pub task: Task,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClaimParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAssignParams {
+    pub task_id: String,
+    pub owner_actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCompleteParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskReopenParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCancelParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+}
+
 // ---- task refs / artifacts / facts / projections ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,7 +580,7 @@ pub struct TaskRefAttachParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_event_id: Option<String>,
+    pub source_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -756,8 +818,8 @@ pub struct TaskAssignmentCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskAssignmentCreateResult {
     pub assignment: TaskAssignment,
-    /// Handoff event written to the task's canonical thread.
-    pub event: Event,
+    /// Directed wake message written to the task's canonical thread.
+    pub message: Message,
     pub task: Task,
 }
 
@@ -768,7 +830,7 @@ pub struct TaskAssignmentUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskAssignmentStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_event_id: Option<String>,
+    pub result_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -907,61 +969,6 @@ pub struct WorkspaceLeaseListResult {
     pub leases: Vec<WorkspaceLease>,
 }
 
-// ---- turn/open / close ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnOpenParams {
-    pub actor_id: String,
-    pub scope: ScopeRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_event_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnOpenResult {
-    pub turn: Turn,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnCloseParams {
-    pub turn_id: String,
-    #[serde(default = "default_close_status")]
-    pub status: TurnStatus,
-}
-
-fn default_close_status() -> TurnStatus {
-    TurnStatus::Closed
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnCloseResult {
-    pub turn: Turn,
-}
-
-// ---- turn/trace.read ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnTraceReadParams {
-    pub turn_id: String,
-    #[serde(default = "default_trace_limit")]
-    pub limit: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_seq: Option<u64>,
-}
-
-fn default_trace_limit() -> u32 {
-    100
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnTraceReadResult {
-    pub frames: Vec<crate::types::trace::TraceFrame>,
-    pub page_info: PageInfo,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,73 +1041,330 @@ mod tests {
     }
 }
 
-// ---- turn/trace.append (external client → server) ----
-
-/// Append a turn-private trace frame from an external agent client. v0 wrote
-/// trace frames directly through the in-server runtime; v1 lets `joi agent
-/// serve` push them via this RPC instead. Server fans the new frame out as a
-/// `turn/trace.update` notification to the turn owner just like the embedded
-/// path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnTraceAppendParams {
-    pub turn_id: String,
-    pub kind: crate::types::trace::TraceKind,
-    #[serde(default)]
-    pub payload: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnTraceAppendResult {
-    pub frame: crate::types::trace::TraceFrame,
-}
-
-// ---- turn/trace.update notification ----
+// ---- run.* ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TurnTraceUpdate {
-    pub turn_id: String,
-    pub frame: crate::types::trace::TraceFrame,
-}
-
-// ---- event/append ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventAppendInput {
-    #[serde(rename = "type")]
-    pub kind: String,
+pub struct RunOpenParams {
     pub actor_id: String,
     pub scope: ScopeRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
+    pub delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_reason: Option<String>,
+    pub agent_config_version_id: String,
+    #[serde(default)]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunOpenResult {
+    pub run: Run,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAppendParams {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<RunStatus>,
+    #[serde(default = "default_run_frame_kind")]
+    pub frame_kind: String,
     #[serde(default)]
     pub payload: Value,
+}
+
+fn default_run_frame_kind() -> String {
+    "log".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunAppendResult {
+    pub run: Run,
+    pub frame: RunFrame,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunCloseParams {
+    pub run_id: String,
+    #[serde(default = "default_run_close_status")]
+    pub status: RunStatus,
+}
+
+fn default_run_close_status() -> RunStatus {
+    RunStatus::Completed
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunCloseResult {
+    pub run: Run,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunCancelParams {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunCancelResult {
+    pub run: Run,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_message: Option<Message>,
+}
+
+// ---- coordination.* ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationProposeParams {
+    pub target: String,
+    pub mode: CoordinationMode,
+    #[serde(default = "default_coordination_decision_rule")]
+    pub decision_rule: CoordinationDecisionRule,
     #[serde(default)]
-    pub relations: Vec<Relation>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
-    pub _meta: Option<Meta>,
+    pub participants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_message_id: Option<String>,
+    #[serde(default)]
+    pub plan: Value,
+    #[serde(default)]
+    pub metadata: Meta,
+}
+
+fn default_coordination_decision_rule() -> CoordinationDecisionRule {
+    CoordinationDecisionRule::OwnerDecides
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventAppendParams {
-    pub event: EventAppendInput,
+pub struct CoordinationProposeResult {
+    pub session: CoordinationSession,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventAppendResult {
-    pub event: Event,
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationCommitParams {
+    pub session_id: String,
 }
 
-// ---- message/search ----
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationCommitResult {
+    pub session: CoordinationSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationRespondParams {
+    pub session_id: String,
+    pub accept: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationRespondResult {
+    pub session: CoordinationSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationStepParams {
+    pub session_id: String,
+    pub base_revision: u64,
+    #[serde(default = "default_coordination_step_type")]
+    pub step_type: CoordinationStepType,
+    #[serde(default)]
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_body: Option<String>,
+}
+
+fn default_coordination_step_type() -> CoordinationStepType {
+    CoordinationStepType::Work
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationStepResult {
+    pub session: CoordinationSession,
+    pub step: CoordinationStep,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationSkipParams {
+    pub session_id: String,
+    pub base_revision: u64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationSkipResult {
+    pub session: CoordinationSession,
+    pub step: CoordinationStep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationReassignParams {
+    pub session_id: String,
+    pub from_actor_id: String,
+    pub to_actor_id: String,
+    pub base_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationReassignResult {
+    pub session: CoordinationSession,
+    pub step: CoordinationStep,
+}
+
+// ---- agent_config.* ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigPublishParams {
+    pub actor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
+    pub tools: Value,
+    #[serde(default)]
+    pub capability_tags: Vec<String>,
+    #[serde(default)]
+    pub attention_policy: Value,
+    #[serde(default)]
+    pub context_policy: Value,
+    #[serde(default)]
+    pub reply_policy: Value,
+    #[serde(default)]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigPublishResult {
+    pub version: AgentConfigVersion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigActivateParams {
+    pub actor_id: String,
+    pub version_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigActivateResult {
+    pub activation: AgentConfigActivation,
+    pub version: AgentConfigVersion,
+}
+
+// ---- message.* ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSendParams {
+    pub target: String,
+    pub body: String,
+    #[serde(default)]
+    pub mentions: Vec<MessageMention>,
+    #[serde(default)]
+    pub audience: Vec<AudienceRef>,
+    #[serde(default = "default_message_send_intent")]
+    pub intent: MessageIntent,
+    #[serde(default = "default_message_send_delivery_policy")]
+    pub delivery_policy: DeliveryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_message_id: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Optional optimistic-send guard. When present, the server appends only
+    /// if the resolved target scope's latest message id is exactly this value.
+    /// Agents use it for send-time rebase: read latest, adjust content, then
+    /// send with this base id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_latest_message_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Meta,
+}
+
+fn default_message_send_intent() -> MessageIntent {
+    MessageIntent::Chat
+}
+
+fn default_message_send_delivery_policy() -> DeliveryPolicy {
+    DeliveryPolicy::NotifyOnly
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSendResult {
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageListParams {
+    pub target: String,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageListResult {
+    pub messages: Vec<Message>,
+    pub page_info: PageInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReadParams {
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReadResult {
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionToggleParams {
+    pub message_id: String,
+    pub emoji: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReactionToggleResult {
+    pub message: Message,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageSearchParams {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<ScopeRef>,
+    pub target: Option<String>,
     #[serde(default = "default_search_limit")]
     pub limit: u32,
 }
@@ -1111,7 +1375,7 @@ fn default_search_limit() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSearchResult {
-    pub events: Vec<Event>,
+    pub messages: Vec<Message>,
 }
 
 // ---- artifact/publish / get / read ----
@@ -1289,29 +1553,13 @@ pub struct ReminderUpdateResult {
     pub reminder: Reminder,
 }
 
-// ---- receipt/record ----
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReceiptRecordParams {
-    pub event_id: String,
-    pub actor_id: String,
-    pub kind: ReceiptKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReceiptRecordResult {
-    pub receipt: Receipt,
-}
-
-// ---- delivery/list (§9.2 durable actor inbox) ----
+// ---- inbox.list (§9.2 durable actor inbox) ----
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct DeliveryListParams {
+pub struct InboxListParams {
     /// Caller must be bound to this actor (via `connection/open`); cross-actor
-    /// inbox reads are refused. Mirrors the `actorId`-scoped contract that
-    /// `service-plugin-system-design.md` §9.2 calls out.
+    /// inbox reads are refused.
     pub actor_id: String,
     /// Optional state filter. `None` = all states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1327,23 +1575,32 @@ pub struct DeliveryListParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeliveryListEntry {
+pub struct InboxListEntry {
     pub delivery: Delivery,
-    /// Inline event payload so plugins don't need a follow-up `scope/read`.
-    /// `None` only when the event row has been compacted away (defensive —
-    /// the current store keeps events forever).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event: Option<Event>,
+    pub message: Option<Message>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct DeliveryListResult {
-    pub deliveries: Vec<DeliveryListEntry>,
-    /// Opaque cursor for the next page. Absent when the result set was
-    /// fully drained.
+pub struct InboxListResult {
+    pub deliveries: Vec<InboxListEntry>,
+    /// Opaque cursor for the next page. Absent when the result set was fully
+    /// drained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryAckParams {
+    pub actor_id: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryAckResult {
+    pub delivery: Delivery,
 }
 
 // ---- machine command durable lifecycle ----
@@ -1515,6 +1772,50 @@ pub struct ActorDeleteResult {
     pub deleted: bool,
 }
 
+// ---- actor.group.* ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorGroupCreateParams {
+    pub channel_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub member_actor_ids: Vec<String>,
+    #[serde(default)]
+    pub wake_agents: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorGroupCreateResult {
+    pub group: ActorGroup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorGroupListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorGroupListResult {
+    pub groups: Vec<ActorGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorGroupMemberParams {
+    pub group_id: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorGroupMemberResult {
+    pub group: ActorGroup,
+}
+
 // ---- agent/* ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1532,7 +1833,7 @@ pub struct AgentTransport {
 
     // ---- command / interactive command transport only ----
     /// Optional default model for transports that expose a CLI-level model flag.
-    /// `joi daemon` may override this with the actor's selected runtime model.
+    /// `loom-daemon` may override this with the actor's selected runtime model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Argv template appended when a command-style transport has an active
@@ -1556,7 +1857,7 @@ pub struct AgentTransport {
     #[serde(default, rename = "promptVia")]
     pub prompt_via: PromptVia,
     /// Optional hard timeout for one command-transport turn. When exceeded the
-    /// daemon cancels the subprocess and fails the turn so later handoffs can
+    /// daemon cancels the subprocess and fails the turn so later triggers can
     /// drain instead of being stranded behind a hung CLI.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
@@ -1656,7 +1957,7 @@ impl Default for InteractiveSessionSpec {
 #[serde(rename_all = "snake_case")]
 pub enum InteractiveSessionIdStrategy {
     #[default]
-    JoiUuidPerScope,
+    LoomUuidPerScope,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1699,7 +2000,7 @@ impl Default for InteractivePromptSpec {
 }
 
 fn default_interactive_prompt_template() -> String {
-    "{joi_envelope}".into()
+    "{loom_envelope}".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1721,11 +2022,11 @@ impl Default for InteractiveCompletionContractSpec {
 }
 
 fn default_interactive_sentinel() -> String {
-    "__JOI_DONE__".into()
+    "__LOOM_DONE__".into()
 }
 
 fn default_interactive_instruction() -> String {
-    "When your final user-visible answer is complete, output __JOI_DONE__ on a line by itself. Do not output anything after it.".into()
+    "When your final user-visible answer is complete, output __LOOM_DONE__ on a line by itself. Do not output anything after it.".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1909,7 +2210,7 @@ pub enum PromptVia {
     Args,
     /// Write prompt to subprocess stdin, then close stdin.
     Stdin,
-    /// Inject prompt as the env var `JOI_PROMPT`.
+    /// Inject prompt as the env var `LOOM_PROMPT`.
     Env,
 }
 
@@ -1919,8 +2220,8 @@ pub struct AgentSpec {
     pub transport: AgentTransport,
     #[serde(default)]
     pub autostart: bool,
-    /// Optional model menu for this actor. Joi treats these as runtime-level
-    /// model ids: `joi daemon` can surface them through `/models` and
+    /// Optional model menu for this actor. Loom treats these as runtime-level
+    /// model ids: `loom-daemon` can surface them through `/models` and
     /// pass the selected id to transports that support model selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<AgentModelSpec>,
@@ -1942,19 +2243,18 @@ pub struct AgentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemorySpec>,
     /// Optional opt-in for the pinned-announcement MCP. When present and
-    /// `mcp = true`, the runtime auto-injects a `joi-announcement` stdio
+    /// `mcp = true`, the runtime auto-injects a `loom-announcement` stdio
     /// server into the ACP session, giving the agent two tools:
     /// `announcement.set` and `announcement.clear` to publish a recap to
     /// the right-side panel of any chat client subscribed to the scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announcement: Option<AnnouncementSpec>,
-    /// Optional callee-described handoff metadata (design §5.0). Lets the
-    /// agent declare a slash-command prefix that the runtime auto-injects
-    /// into trigger event content when *anyone* hands off to it, so
-    /// callers don't have to know about skill-activation conventions like
+    /// Optional trigger metadata. Lets the agent declare a slash-command
+    /// prefix that the runtime auto-injects into triggered message content,
+    /// so callers don't have to know about skill-activation conventions like
     /// `/delivery` or `/discovery`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handoff: Option<HandoffSpec>,
+    pub trigger: Option<TriggerSpec>,
     /// Optional per-actor prompt template (design §5). Wraps the trigger
     /// event content with `everyTurnPrefix`, `firstTurnPrefix` (first
     /// turn per scope only), and `everyTurnSuffix` lines, with template
@@ -1968,24 +2268,24 @@ pub struct AgentSpec {
     pub prompt_template: Option<PromptTemplateSpec>,
 }
 
-/// Callee-described handoff metadata. See `AgentSpec.handoff`.
+/// Callee-described trigger metadata. See `AgentSpec.trigger`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HandoffSpec {
-    /// Text prepended to the trigger event content (the user message side
+pub struct TriggerSpec {
+    /// Text prepended to the trigger message content (the user message side
     /// of the prompt). Typically a slash command like `"/delivery\n"` so
     /// the underlying provider activates the right skill.
     #[serde(default)]
     pub trigger_prompt_prefix: String,
     /// Whether the prefix applies on the first turn of a scope only or
-    /// on every handoff. Default: `every-turn`.
+    /// on every trigger. Default: `every-turn`.
     #[serde(default)]
-    pub apply_on: HandoffApplyOn,
+    pub apply_on: TriggerPrefixApplyOn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum HandoffApplyOn {
+pub enum TriggerPrefixApplyOn {
     FirstTurn,
     #[default]
     EveryTurn,
@@ -2075,7 +2375,7 @@ impl AgentProviderSpec {
                     identity: merge_identity(defaults.identity.as_ref(), actor.identity),
                     memory: actor.memory.or_else(|| defaults.memory.clone()),
                     announcement: actor.announcement.or_else(|| defaults.announcement.clone()),
-                    handoff: None,
+                    trigger: None,
                     prompt_template: None,
                 }
             })
@@ -2208,7 +2508,7 @@ pub struct AgentModelChoice {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnnouncementSpec {
-    /// When true, the ACP `session/new` call synthesizes a `joi-announcement`
+    /// When true, the ACP `session/new` call synthesizes a `loom-announcement`
     /// stdio MCP server. Default false — opt-in.
     #[serde(default)]
     pub mcp: bool,
@@ -2434,7 +2734,7 @@ pub struct MemoryDeliverySpec {
     /// false — opt-in.
     #[serde(default)]
     pub prompt: bool,
-    /// When true, the ACP `session/new` call synthesizes a `joi-memory`
+    /// When true, the ACP `session/new` call synthesizes a `loom-memory`
     /// stdio MCP server so the agent can `memory.query` / `memory.append` /
     /// `memory.get` on demand. Default false — opt-in.
     #[serde(default)]
@@ -2462,10 +2762,10 @@ fn default_disabled_mode() -> String {
     "disabled".into()
 }
 
-// ---- service spec (parallel to AgentSpec; runs under `joi service serve`) ----
+// ---- service spec (parallel to AgentSpec; runs under `loom-daemon`) ----
 
 /// On-disk spec for a service actor (kind = Service). Mirrors `AgentSpec`
-/// for the host process: `joi service serve` loads `*.json` from a specs
+/// for the host process: `loom-daemon` loads `*.json` from a specs
 /// directory, instantiates the named plugin (`kind`), and binds it to a
 /// long-lived service actor connection. See
 /// `docs/service-plugin-system-design.md` §6.1.
@@ -2473,8 +2773,8 @@ fn default_disabled_mode() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceSpec {
     /// Unique within a specs directory. Used for state-dir naming
-    /// (`~/.local/share/joi/service-host/services/<id>/`) and for the
-    /// `--allow-services` filter on `joi service serve`. Distinct from
+    /// (`~/.local/share/loom/service-host/services/<id>/`) and for the
+    /// `--allow-services` filter on `loom-daemon`. Distinct from
     /// `actor.id` because one actor may be reachable from multiple specs
     /// (e.g., a default and a test variant).
     pub id: String,
@@ -2489,7 +2789,7 @@ pub struct ServiceSpec {
     /// process can mount multiple actor kinds and the spec is the only
     /// signal of intent.
     pub actor: Actor,
-    /// Start this service automatically when `joi service serve` boots.
+    /// Start this service automatically when `loom-daemon` boots.
     /// Default true — services exist to run continuously, the override is
     /// for staged rollout / debugging.
     #[serde(default = "default_true")]
@@ -2499,9 +2799,8 @@ pub struct ServiceSpec {
     /// `auto_thread` mode in §7.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
-    /// Default handoff target. When set, plugin-emitted events typically
-    /// carry `hands_off_to -> actor:<targetAgent>` unless the plugin
-    /// overrides per-event. Plugins are not forced to honor this.
+    /// Default directed-message target for service output. Plugins are not
+    /// forced to honor this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent: Option<String>,
     /// Lifecycle of this service. `channel_singleton` (default) means
@@ -2516,7 +2815,7 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<ServiceBind>,
     /// Optional JSON-Schema fragment describing `--params` accepted at
-    /// `joi service start --in <thread> --params {...}`. The CLI validates
+    /// `loom service start --in <thread> --params {...}`. The CLI validates
     /// start params against the shallow subset it supports.
     #[serde(
         default,
@@ -2681,12 +2980,12 @@ pub mod stream_kind {
     /// Broadcast when a new channel is created. Public channels go to
     /// all connections; private channels go to the creator only.
     pub const CHANNEL_CREATED: &str = "channel.created";
-    pub const TURN_OPENED: &str = "turn.opened";
-    pub const TURN_CLOSED: &str = "turn.closed";
-    pub const EVENT_CREATED: &str = "event.created";
+    pub const CHANNEL_UPDATED: &str = "channel.updated";
+    pub const RUN_UPDATED: &str = "run.updated";
+    pub const MESSAGE_CREATED: &str = "message.created";
+    pub const MESSAGE_UPDATED: &str = "message.updated";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     pub const DELIVERY_UPDATED: &str = "delivery.updated";
-    pub const RECEIPT_RECORDED: &str = "receipt.recorded";
     /// Direct-to-actor notification: the recipient was added to a channel
     /// and is now allowed to read/subscribe/append. Carries the full
     /// `Channel` so the receiving client can patch its sidebar cache

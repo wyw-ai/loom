@@ -37,11 +37,11 @@ pub struct JobSpec {
     pub schedule: String,
     /// Where the body comes from each tick.
     pub source: Source,
-    /// Where to write the resulting Joi event.
+    /// Where to write the resulting Loom event.
     pub scope: ScopeBinding,
-    /// Optional handoff target. When set, emitted events carry
-    /// `hands_off_to -> actor:<targetAgent>`. When unset, the event is
-    /// pure logging (still appended, no agent invocation).
+    /// Optional directed message target. When set, emitted output is sent
+    /// with `audience=actor:<targetAgent>` and `deliveryPolicy=wake_agent`.
+    /// When unset, the output is pure logging (still appended, no agent invocation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent: Option<String>,
     /// Dedupe strategy. Default `payload_hash` per §8.4.
@@ -54,7 +54,7 @@ pub struct JobSpec {
     /// watcher jobs should never have two ticks in flight.
     #[serde(default = "default_true")]
     pub single_in_flight: bool,
-    /// Wait for `RespondsTo` after handoff (§8.5 awaited mode). Off by
+    /// Wait for a message reply after directed send (§8.5 awaited mode). Off by
     /// default — fire-and-forget is the common case.
     #[serde(default)]
     pub await_reply: bool,
@@ -73,7 +73,7 @@ pub struct JobSpec {
     pub emit: Option<EmitConfig>,
 }
 
-/// How the scheduler turns one fire's stdout into Joi events.
+/// How the scheduler turns one fire's stdout into Loom events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmitConfig {
@@ -173,12 +173,12 @@ pub enum DedupeBy {
     /// `service:<sid>:job:<jid>:fire:<fire_time>:hash:<body_hash>`
     #[default]
     PayloadHash,
-    /// `service:<sid>:job:<jid>:source_event:<source_id>` — only
+    /// `service:<sid>:job:<jid>:source_payload:<source_id>` — only
     /// meaningful for sources that expose a stable id (HTTP responses
     /// the operator parses out, etc). Plugin currently treats this as
-    /// `payload_hash` until S4 adds source-event extraction; left in
+    /// `payload_hash` until S4 adds source-message extraction; left in
     /// the schema so specs don't need to change later.
-    SourceEventId,
+    SourceMessageId,
     /// Skip dedupe entirely. The cron expression itself becomes the
     /// rate limiter; suitable for "fire every N min" notifiers.
     None,

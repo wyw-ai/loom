@@ -2,6 +2,11 @@
 //!
 //! Layout: `~/.loom-apps/desktop.toml`
 //!
+//! Daemon runtime configs are written separately below
+//! `~/.loom-apps/d/<workspace>/<owner-short>/<machine>/desktop.toml`.
+//! The GUI can track multiple server profiles in one desktop config, while a
+//! daemon should see only the workspace/machine it is launched for.
+//!
 //! ```toml
 //! active = "default"
 //!
@@ -34,6 +39,7 @@ use std::path::{Path, PathBuf};
 use agent_runtime::discovery::AgentProviderOverride;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const ENV_CONFIG_DIR: &str = "LOOM_CONFIG_DIR";
@@ -132,6 +138,25 @@ pub fn config_dir() -> PathBuf {
 
 pub fn desktop_config_path() -> PathBuf {
     config_dir().join("desktop.toml")
+}
+
+pub fn daemon_config_dir_for_machine(machine: &MachineConfig) -> PathBuf {
+    let workspace_key = machine
+        .workspace_id
+        .as_deref()
+        .map(|value| short_config_key(value, 16))
+        .unwrap_or_else(|| "unassigned".into());
+    let owner_key = machine
+        .owner_actor_id
+        .as_deref()
+        .map(|value| short_config_key(value, 16))
+        .unwrap_or_else(|| "unowned".into());
+    let machine_key = short_config_key(&machine.id, 24);
+    config_dir()
+        .join("d")
+        .join(workspace_key)
+        .join(owner_key)
+        .join(machine_key)
 }
 
 fn legacy_cli_config_path() -> PathBuf {
@@ -727,6 +752,22 @@ fn safe_config_key(value: &str) -> String {
     }
 }
 
+fn short_config_key(value: &str, max_prefix_len: usize) -> String {
+    let key = safe_config_key(value);
+    if key.len() <= max_prefix_len {
+        return key;
+    }
+    format!("{}_{}", &key[..max_prefix_len], short_hash(value))
+}
+
+fn short_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn first_non_empty<'a, const N: usize>(values: [&'a str; N]) -> &'a str {
     values
         .into_iter()
@@ -904,6 +945,25 @@ id = "default"
             machine.data_root,
             "~/.agentx/machines/ws_local/actor_human_github_12345/local"
         );
+    }
+
+    #[test]
+    fn daemon_config_dir_is_scoped_and_short_enough_for_unix_socket() {
+        let machine = MachineConfig {
+            workspace_id: Some("ws_2ca56331".into()),
+            owner_actor_id: Some("actor_human_local_ws_2ca56331".into()),
+            id: "machine_c3a89b06".into(),
+            name: "CanfengMac".into(),
+            kind: "local".into(),
+            data_root: "~/.agentx".into(),
+            providers: Vec::new(),
+            agents: Vec::new(),
+        };
+
+        let dir = daemon_config_dir_for_machine(&machine);
+        let path = dir.join("daemon").join("daemon.sock");
+        assert!(path.display().to_string().len() < 104);
+        assert!(dir.ends_with("d/ws_2ca56331/actor_human_loca_120ccc37/machine_c3a89b06"));
     }
 
     #[test]

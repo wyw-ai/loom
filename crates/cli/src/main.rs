@@ -542,6 +542,13 @@ enum ChannelCmd {
     /// List channels visible to this caller (public channels + private
     /// channels the caller is a member of).
     List,
+    /// Delete a channel. Refuses when child threads exist unless --cascade is set.
+    Delete {
+        channel_id: String,
+        /// Also delete child threads before removing the channel.
+        #[arg(long)]
+        cascade: bool,
+    },
     /// Add an actor to a channel's member set.
     Invite {
         channel_id: String,
@@ -1727,6 +1734,10 @@ async fn main() -> Result<()> {
                 cmd::channel::create(client, cfg.actor_id.clone(), title).await?
             }
             ChannelCmd::List => cmd::channel::list(client).await?,
+            ChannelCmd::Delete {
+                channel_id,
+                cascade,
+            } => cmd::channel::delete(client, channel_id, cascade).await?,
             ChannelCmd::Invite {
                 channel_id,
                 actor_id,
@@ -2596,6 +2607,26 @@ mod tests {
             } => {
                 assert_eq!(limit, 7);
                 assert!(no_ack);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_delete_accepts_cascade_flag() {
+        let args = Args::try_parse_from(["loom", "channel", "delete", "chan_123", "--cascade"])
+            .expect("parse channel delete");
+
+        match args.cmd {
+            Cmd::Channel {
+                sub:
+                    ChannelCmd::Delete {
+                        channel_id,
+                        cascade,
+                    },
+            } => {
+                assert_eq!(channel_id, "chan_123");
+                assert!(cascade);
             }
             other => panic!("unexpected command: {other:?}"),
         }

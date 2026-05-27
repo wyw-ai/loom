@@ -10,6 +10,7 @@ import type {
   ComponentType,
   CSSProperties,
   FormEvent,
+  MouseEvent,
   PointerEvent,
   ReactNode,
 } from "react";
@@ -117,6 +118,11 @@ type ChannelPointerDrag = {
   startY: number;
   pointerId: number;
   dragging: boolean;
+};
+type ChannelContextMenu = {
+  channelId: string;
+  x: number;
+  y: number;
 };
 type PanelResizeKind = "sidebar" | "detail";
 type PanelSizes = {
@@ -1091,13 +1097,33 @@ export function App() {
     }
   }
 
-  async function deleteChannel(channel: Channel, cascade: boolean) {
+  async function renameChannel(channel: Channel, rawTitle: string) {
+    const title = rawTitle.trim();
+    if (!title || title === channel.title) return;
+    setBusy(`channel:rename:${channel.id}`);
+    setError(null);
+    try {
+      const result = await ipc.channelUpdate({
+        channelId: channel.id,
+        title,
+        topic: channel.topic,
+      });
+      setChannels((current) => sortChannels(upsert(current, result.channel)));
+      pushNotice(`Renamed #${channel.title} to #${result.channel.title}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteChannel(channel: Channel) {
     setBusy(`channel:delete:${channel.id}`);
     setError(null);
     try {
       const result = await ipc.channelDelete({
         channelId: channel.id,
-        cascade,
+        cascade: true,
       });
       if (result.deleted) {
         applyChannelDeleted(channel.id);
@@ -1506,6 +1532,7 @@ export function App() {
           onAddChannelGroup={addChannelGroup}
           onMoveChannelToGroup={moveChannelToGroup}
           onDeleteChannel={deleteChannel}
+          onRenameChannel={renameChannel}
           onRemoveChannelGroup={removeChannelGroup}
           onRenameChannelGroup={renameChannelGroup}
           onSelectChannel={(id) => {
@@ -1918,6 +1945,7 @@ function Sidebar({
   onAddChannelGroup,
   onMoveChannelToGroup,
   onDeleteChannel,
+  onRenameChannel,
   onRemoveChannelGroup,
   onRenameChannelGroup,
   onSelectChannel,
@@ -1936,7 +1964,8 @@ function Sidebar({
   onAddChannel: (title: string) => void;
   onAddChannelGroup: (title: string) => void;
   onMoveChannelToGroup: (channelId: string, groupId: string) => void;
-  onDeleteChannel: (channel: Channel, cascade: boolean) => void;
+  onDeleteChannel: (channel: Channel) => void;
+  onRenameChannel: (channel: Channel, title: string) => void;
   onRemoveChannelGroup: (groupId: string) => void;
   onRenameChannelGroup: (groupId: string, title: string) => void;
   onSelectChannel: (channelId: string) => void;
@@ -1949,14 +1978,21 @@ function Sidebar({
   const [editingSectionId, setEditingSectionId] = useState<string | null>(null);
   const [sectionTitleDraft, setSectionTitleDraft] = useState("");
   const [deleteSectionId, setDeleteSectionId] = useState<string | null>(null);
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const [channelTitleDraft, setChannelTitleDraft] = useState("");
   const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
   const [deleteTitleConfirm, setDeleteTitleConfirm] = useState("");
+  const [channelContextMenu, setChannelContextMenu] =
+    useState<ChannelContextMenu | null>(null);
   const [draggingChannelId, setDraggingChannelId] = useState<string | null>(null);
   const [dragOverSectionId, setDragOverSectionId] = useState<string | null>(null);
   const dragSessionRef = useRef<ChannelPointerDrag | null>(null);
   const dragListenerCleanupRef = useRef<(() => void) | null>(null);
   const suppressChannelClickRef = useRef<string | null>(null);
   const sections = channelGroupSections(channelGroups, channels);
+  const contextMenuChannel = channelContextMenu
+    ? channels.find((channel) => channel.id === channelContextMenu.channelId) ?? null
+    : null;
   const navItems = [
     { id: "chat" as const, label: "Home", icon: Home },
     { id: "channels" as const, label: "All Channels", icon: Hash },
@@ -1974,6 +2010,11 @@ function Sidebar({
   const closeDeleteChannelConfirm = () => {
     setDeleteChannelId(null);
     setDeleteTitleConfirm("");
+  };
+
+  const closeRenameChannel = () => {
+    setEditingChannelId(null);
+    setChannelTitleDraft("");
   };
 
   const handleOpenCreate = (kind: "channel" | "section") => {
@@ -1999,6 +2040,8 @@ function Sidebar({
     setSectionTitleDraft(section.title);
     setDeleteSectionId(null);
     closeDeleteChannelConfirm();
+    closeRenameChannel();
+    setChannelContextMenu(null);
   };
 
   const submitRenameSection = (
@@ -2027,8 +2070,52 @@ function Sidebar({
     setDeleteSectionId(null);
     setEditingSectionId(null);
     setSectionTitleDraft("");
+    closeRenameChannel();
+    setChannelContextMenu(null);
     setDeleteChannelId(channelId);
     setDeleteTitleConfirm("");
+  };
+
+  const startRenameChannel = (channel: Channel) => {
+    closeCreateMenu();
+    closeDeleteChannelConfirm();
+    setChannelContextMenu(null);
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setEditingChannelId(channel.id);
+    setChannelTitleDraft(channel.title);
+  };
+
+  const submitRenameChannel = (
+    event: FormEvent<HTMLFormElement>,
+    channel: Channel,
+  ) => {
+    event.preventDefault();
+    const title = channelTitleDraft.trim();
+    if (!title) return;
+    onRenameChannel(channel, title);
+    closeRenameChannel();
+  };
+
+  const openChannelContextMenu = (
+    event: MouseEvent<HTMLElement>,
+    channel: Channel,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelChannelDrag();
+    closeCreateMenu();
+    closeDeleteChannelConfirm();
+    closeRenameChannel();
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setChannelContextMenu({
+      channelId: channel.id,
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 184)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 96)),
+    });
   };
 
   const sectionIdAtPoint = (x: number, y: number) => {
@@ -2176,6 +2263,22 @@ function Sidebar({
       () => event.stopPropagation(),
     );
   };
+
+  useEffect(() => {
+    if (!channelContextMenu) return;
+    const close = () => setChannelContextMenu(null);
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [channelContextMenu]);
 
   useEffect(() => () => cleanupChannelDragListeners(), []);
   return (
@@ -2404,6 +2507,7 @@ function Sidebar({
                       const selected = channel.id === activeChannelId && !activeThreadId;
                       const threads = threadsByChannel[channel.id] ?? [];
                       const deleteBusy = busy === `channel:delete:${channel.id}`;
+                      const renameBusy = busy === `channel:rename:${channel.id}`;
                       return (
                         <div
                           key={channel.id}
@@ -2423,6 +2527,9 @@ function Sidebar({
                               onPointerMove={updateChannelDrag}
                               onPointerUp={finishChannelDrag}
                               onPointerCancel={cancelChannelDrag}
+                              onContextMenu={(event) =>
+                                openChannelContextMenu(event, channel)
+                              }
                               onClick={() => {
                                 if (suppressChannelClickRef.current === channel.id) {
                                   suppressChannelClickRef.current = null;
@@ -2430,6 +2537,7 @@ function Sidebar({
                                 }
                                 closeCreateMenu();
                                 closeDeleteChannelConfirm();
+                                closeRenameChannel();
                                 onSelectChannel(channel.id);
                               }}
                             >
@@ -2452,35 +2560,51 @@ function Sidebar({
                                 {threads.length}
                               </Badge>
                             </button>
-                            <button
-                              type="button"
-                              title={`Delete #${channel.title}`}
-                              disabled={deleteBusy}
-                              className={cn(
-                                "composer-icon h-7 min-w-7 text-red-500 opacity-0 hover:text-red-600 group-hover/channel:opacity-100",
-                                (selected || deleteChannelId === channel.id) && "opacity-100",
-                              )}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                requestDeleteChannel(channel.id);
-                              }}
-                            >
-                              {deleteBusy ? (
-                                <Loader2 className="animate-spin" size={13} />
-                              ) : (
-                                <Trash2 size={13} />
-                              )}
-                            </button>
                           </div>
+                          {editingChannelId === channel.id && (
+                            <form
+                              className="channel-section-editor"
+                              onSubmit={(event) => submitRenameChannel(event, channel)}
+                            >
+                              <Input
+                                autoFocus
+                                value={channelTitleDraft}
+                                onChange={(event) =>
+                                  setChannelTitleDraft(event.target.value)
+                                }
+                                placeholder="Channel name"
+                                className="h-8 rounded-lg border-[#dfe3ec] bg-white text-xs shadow-none"
+                              />
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={renameBusy}
+                                onClick={closeRenameChannel}
+                              >
+                                Cancel
+                              </Button>
+                              <Button
+                                type="submit"
+                                size="sm"
+                                disabled={!channelTitleDraft.trim() || renameBusy}
+                              >
+                                {renameBusy ? (
+                                  <Loader2 className="animate-spin" size={13} />
+                                ) : (
+                                  "Save"
+                                )}
+                              </Button>
+                            </form>
+                          )}
                           {deleteChannelId === channel.id && (
                             <ChannelDeleteConfirm
                               channel={channel}
                               confirmTitle={deleteTitleConfirm}
                               deleteBusy={deleteBusy}
-                              threads={threads}
                               onCancel={closeDeleteChannelConfirm}
-                              onConfirm={(cascade) => {
-                                onDeleteChannel(channel, cascade);
+                              onConfirm={() => {
+                                onDeleteChannel(channel);
                                 closeDeleteChannelConfirm();
                               }}
                               setConfirmTitle={setDeleteTitleConfirm}
@@ -2498,6 +2622,7 @@ function Sidebar({
                                   onClick={() => {
                                     closeCreateMenu();
                                     closeDeleteChannelConfirm();
+                                    closeRenameChannel();
                                     onSelectThread(thread);
                                   }}
                                 >
@@ -2517,6 +2642,34 @@ function Sidebar({
           ))}
         </div>
       </div>
+      {channelContextMenu &&
+        contextMenuChannel &&
+        createPortal(
+          <div
+            className="fixed z-50 w-44 rounded-lg border border-[#dfe3ec] bg-white p-1 text-sm shadow-soft"
+            style={{ left: channelContextMenu.x, top: channelContextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+              onClick={() => startRenameChannel(contextMenuChannel)}
+            >
+              <Pencil size={14} />
+              Rename
+            </button>
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-red-600 hover:bg-red-50"
+              onClick={() => requestDeleteChannel(contextMenuChannel.id)}
+            >
+              <Trash2 size={14} />
+              Delete
+            </button>
+          </div>,
+          document.body,
+        )}
     </aside>
   );
 }
@@ -3810,7 +3963,7 @@ function ChannelsView({
   threadsByChannel: Record<string, Thread[]>;
   activeChannel: Channel | null;
   onSelectChannel: (channelId: string) => void;
-  onDeleteChannel: (channel: Channel, cascade: boolean) => void;
+  onDeleteChannel: (channel: Channel) => void;
 }) {
   const [query, setQuery] = useState("");
   const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
@@ -3885,10 +4038,9 @@ function ChannelsView({
                         channel={channel}
                         confirmTitle={deleteTitleConfirm}
                         deleteBusy={deleteBusy}
-                        threads={threads}
                         onCancel={closeDeleteConfirm}
-                        onConfirm={(cascade) => {
-                          onDeleteChannel(channel, cascade);
+                        onConfirm={() => {
+                          onDeleteChannel(channel);
                           closeDeleteConfirm();
                         }}
                         setConfirmTitle={setDeleteTitleConfirm}
@@ -3985,7 +4137,6 @@ function ChannelDeleteConfirm({
   channel,
   confirmTitle,
   deleteBusy,
-  threads,
   onCancel,
   onConfirm,
   setConfirmTitle,
@@ -3993,12 +4144,10 @@ function ChannelDeleteConfirm({
   channel: Channel;
   confirmTitle: string;
   deleteBusy: boolean;
-  threads: Thread[];
   onCancel: () => void;
-  onConfirm: (cascade: boolean) => void;
+  onConfirm: () => void;
   setConfirmTitle: (value: string) => void;
 }) {
-  const cascade = threads.length > 0;
   const titleMatches = confirmTitle.trim() === channel.title;
   return (
     <div className="my-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900">
@@ -4007,19 +4156,15 @@ function ChannelDeleteConfirm({
         <div className="min-w-0 flex-1">
           <div className="font-bold">Delete #{channel.title}?</div>
           <div className="mt-1 text-xs font-medium text-red-700">
-            {cascade
-              ? `This will delete the channel and ${threads.length} thread${threads.length === 1 ? "" : "s"}.`
-              : "This channel has no threads and will be removed."}
+            This will delete the channel and all threads in this channel.
           </div>
-          {cascade && (
-            <Input
-              autoFocus
-              value={confirmTitle}
-              onChange={(event) => setConfirmTitle(event.target.value)}
-              placeholder={`Type ${channel.title} to confirm`}
-              className="mt-3 h-9 rounded-lg border-red-200 bg-white text-sm text-red-900 shadow-none placeholder:text-red-300"
-            />
-          )}
+          <Input
+            autoFocus
+            value={confirmTitle}
+            onChange={(event) => setConfirmTitle(event.target.value)}
+            placeholder={`Type ${channel.title} to confirm`}
+            className="mt-3 h-9 rounded-lg border-red-200 bg-white text-sm text-red-900 shadow-none placeholder:text-red-300"
+          />
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <Button type="button" variant="outline" size="sm" onClick={onCancel}>
@@ -4028,9 +4173,9 @@ function ChannelDeleteConfirm({
           <Button
             type="button"
             size="sm"
-            disabled={deleteBusy || (cascade && !titleMatches)}
+            disabled={deleteBusy || !titleMatches}
             className="bg-red-600 text-white hover:bg-red-700"
-            onClick={() => onConfirm(cascade)}
+            onClick={onConfirm}
           >
             {deleteBusy ? <Loader2 className="animate-spin" size={13} /> : <Trash2 size={13} />}
             Delete

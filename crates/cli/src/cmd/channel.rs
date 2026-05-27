@@ -37,6 +37,30 @@ pub async fn list(client: Arc<Client>) -> Result<()> {
     Ok(())
 }
 
+pub async fn delete(client: Arc<Client>, channel_id: String, cascade: bool) -> Result<()> {
+    let res: ChannelDeleteResult = client
+        .call(
+            method::CHANNEL_DELETE,
+            json!({ "channelId": channel_id, "cascade": cascade }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.deleted {
+        if res.deleted_threads > 0 {
+            println!(
+                "deleted channel (cascade: {} thread(s))",
+                res.deleted_threads
+            );
+        } else {
+            println!("deleted channel");
+        }
+    } else {
+        println!("channel not deleted");
+    }
+    Ok(())
+}
+
 pub async fn invite(client: Arc<Client>, channel_id: String, actor_id: String) -> Result<()> {
     let res: ChannelInviteResult = client
         .call(

@@ -1493,6 +1493,7 @@ export function App() {
         <Sidebar
           view={view}
           setView={setView}
+          busy={busy}
           channels={channels}
           channelGroups={channelGroups}
           connection={connection}
@@ -1504,6 +1505,7 @@ export function App() {
           }}
           onAddChannelGroup={addChannelGroup}
           onMoveChannelToGroup={moveChannelToGroup}
+          onDeleteChannel={deleteChannel}
           onRemoveChannelGroup={removeChannelGroup}
           onRenameChannelGroup={renameChannelGroup}
           onSelectChannel={(id) => {
@@ -1905,6 +1907,7 @@ function ResizeHandle({
 function Sidebar({
   view,
   setView,
+  busy,
   channels,
   channelGroups,
   connection,
@@ -1914,6 +1917,7 @@ function Sidebar({
   onAddChannel,
   onAddChannelGroup,
   onMoveChannelToGroup,
+  onDeleteChannel,
   onRemoveChannelGroup,
   onRenameChannelGroup,
   onSelectChannel,
@@ -1922,6 +1926,7 @@ function Sidebar({
 }: {
   view: View;
   setView: (view: View) => void;
+  busy: string | null;
   channels: Channel[];
   channelGroups: ChannelGroup[];
   connection: ConnectionState;
@@ -1931,6 +1936,7 @@ function Sidebar({
   onAddChannel: (title: string) => void;
   onAddChannelGroup: (title: string) => void;
   onMoveChannelToGroup: (channelId: string, groupId: string) => void;
+  onDeleteChannel: (channel: Channel, cascade: boolean) => void;
   onRemoveChannelGroup: (groupId: string) => void;
   onRenameChannelGroup: (groupId: string, title: string) => void;
   onSelectChannel: (channelId: string) => void;
@@ -1943,6 +1949,8 @@ function Sidebar({
   const [editingSectionId, setEditingSectionId] = useState<string | null>(null);
   const [sectionTitleDraft, setSectionTitleDraft] = useState("");
   const [deleteSectionId, setDeleteSectionId] = useState<string | null>(null);
+  const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
+  const [deleteTitleConfirm, setDeleteTitleConfirm] = useState("");
   const [draggingChannelId, setDraggingChannelId] = useState<string | null>(null);
   const [dragOverSectionId, setDragOverSectionId] = useState<string | null>(null);
   const dragSessionRef = useRef<ChannelPointerDrag | null>(null);
@@ -1961,6 +1969,11 @@ function Sidebar({
     setCreateMenuOpen(false);
     setCreateKind(null);
     setCreateTitle("");
+  };
+
+  const closeDeleteChannelConfirm = () => {
+    setDeleteChannelId(null);
+    setDeleteTitleConfirm("");
   };
 
   const handleOpenCreate = (kind: "channel" | "section") => {
@@ -1985,6 +1998,7 @@ function Sidebar({
     setEditingSectionId(section.id);
     setSectionTitleDraft(section.title);
     setDeleteSectionId(null);
+    closeDeleteChannelConfirm();
   };
 
   const submitRenameSection = (
@@ -2006,6 +2020,15 @@ function Sidebar({
       setSectionTitleDraft("");
     }
     setDeleteSectionId(null);
+  };
+
+  const requestDeleteChannel = (channelId: string) => {
+    closeCreateMenu();
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setDeleteChannelId(channelId);
+    setDeleteTitleConfirm("");
   };
 
   const sectionIdAtPoint = (x: number, y: number) => {
@@ -2315,6 +2338,7 @@ function Sidebar({
                           setDeleteSectionId(section.id);
                           setEditingSectionId(null);
                           setSectionTitleDraft("");
+                          closeDeleteChannelConfirm();
                         }}
                       >
                         <Trash2 size={12} />
@@ -2379,6 +2403,7 @@ function Sidebar({
                     section.channels.map((channel) => {
                       const selected = channel.id === activeChannelId && !activeThreadId;
                       const threads = threadsByChannel[channel.id] ?? [];
+                      const deleteBusy = busy === `channel:delete:${channel.id}`;
                       return (
                         <div
                           key={channel.id}
@@ -2404,6 +2429,7 @@ function Sidebar({
                                   return;
                                 }
                                 closeCreateMenu();
+                                closeDeleteChannelConfirm();
                                 onSelectChannel(channel.id);
                               }}
                             >
@@ -2426,7 +2452,40 @@ function Sidebar({
                                 {threads.length}
                               </Badge>
                             </button>
+                            <button
+                              type="button"
+                              title={`Delete #${channel.title}`}
+                              disabled={deleteBusy}
+                              className={cn(
+                                "composer-icon h-7 min-w-7 text-red-500 opacity-0 hover:text-red-600 group-hover/channel:opacity-100",
+                                (selected || deleteChannelId === channel.id) && "opacity-100",
+                              )}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                requestDeleteChannel(channel.id);
+                              }}
+                            >
+                              {deleteBusy ? (
+                                <Loader2 className="animate-spin" size={13} />
+                              ) : (
+                                <Trash2 size={13} />
+                              )}
+                            </button>
                           </div>
+                          {deleteChannelId === channel.id && (
+                            <ChannelDeleteConfirm
+                              channel={channel}
+                              confirmTitle={deleteTitleConfirm}
+                              deleteBusy={deleteBusy}
+                              threads={threads}
+                              onCancel={closeDeleteChannelConfirm}
+                              onConfirm={(cascade) => {
+                                onDeleteChannel(channel, cascade);
+                                closeDeleteChannelConfirm();
+                              }}
+                              setConfirmTitle={setDeleteTitleConfirm}
+                            />
+                          )}
                           {channel.id === activeChannelId && threads.length > 0 && (
                             <div className="ml-4 mt-1 space-y-1 border-l border-[#e1e5ef] pl-2">
                               {threads.map((thread) => (
@@ -2438,6 +2497,7 @@ function Sidebar({
                                   )}
                                   onClick={() => {
                                     closeCreateMenu();
+                                    closeDeleteChannelConfirm();
                                     onSelectThread(thread);
                                   }}
                                 >

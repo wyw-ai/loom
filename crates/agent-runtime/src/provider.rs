@@ -63,6 +63,8 @@ pub struct ProviderRuntimePlan {
     pub output_format: CommandOutputFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder: Option<ProviderDecoderSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "stderr")]
+    pub stderr_decoder: Option<ProviderDecoderSpec>,
     #[serde(default)]
     pub prompt_via: PromptVia,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +91,7 @@ impl ProviderRuntimePlan {
             session: self.session,
             output_format: Some(self.output_format),
             decoder: self.decoder,
+            stderr_decoder: self.stderr_decoder,
             prompt_via: self.prompt_via,
             prompt: self.prompt,
             stdin: self.stdin,
@@ -260,6 +263,9 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
         }
         validate_mode_command(manifest, mode_name, mode)?;
         validate_decoder_spec(manifest, mode_name, "stdout", &mode.stdout)?;
+        if let Some(stderr) = mode.stderr.as_ref() {
+            validate_decoder_spec(manifest, mode_name, "stderr", stderr)?;
+        }
         validate_prompt_references(manifest, mode_name, mode)?;
     }
     Ok(())
@@ -655,6 +661,7 @@ fn apply_mode_patch(base_mode: &mut Value, patch_mode: &Value) -> Result<(), Str
         "command",
         "stdin",
         "stdout",
+        "stderr",
         "session",
         "timeoutMs",
         "idleTimeoutMs",
@@ -852,19 +859,27 @@ fn validate_session_spec(
     if matches!(
         session.id_source,
         Some(ProviderSessionIdSource::ProviderCapture)
-    ) && mode
-        .stdout
-        .capture
-        .as_ref()
-        .and_then(|capture| capture.session.as_ref())
-        .is_none()
+    ) && decoder_session_capture(mode).is_none()
     {
         return Err(format!(
-            "provider `{}` mode `{mode_name}` uses provider_capture but stdout.capture.session is missing",
+            "provider `{}` mode `{mode_name}` uses provider_capture but stdout/stderr capture.session is missing",
             manifest.id
         ));
     }
     Ok(())
+}
+
+fn decoder_session_capture(mode: &ProviderModeSpec) -> Option<&ProviderJsonlTextReducerSpec> {
+    mode.stdout
+        .capture
+        .as_ref()
+        .and_then(|capture| capture.session.as_ref())
+        .or_else(|| {
+            mode.stderr
+                .as_ref()
+                .and_then(|stderr| stderr.capture.as_ref())
+                .and_then(|capture| capture.session.as_ref())
+        })
 }
 
 fn validate_decoder_spec(
@@ -1556,6 +1571,7 @@ fn runtime_plan_from_manifest(
         }),
         output_format: output_format(&mode.stdout)?,
         decoder: Some(mode.stdout.clone()),
+        stderr_decoder: mode.stderr.clone(),
         prompt_via: PromptVia::Args,
         prompt: mode.prompt.clone(),
         stdin,
@@ -1733,6 +1749,7 @@ fn mode(
             reduce: None,
             capture: None,
         },
+        stderr: None,
         session,
         timeout_ms: None,
         idle_timeout_ms: None,
@@ -2655,7 +2672,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_capture_requires_stdout_capture_session() {
+    fn provider_capture_requires_decoder_capture_session() {
         let manifest = manifest(
             "missing_capture",
             "Missing Capture",
@@ -2682,7 +2699,41 @@ mod tests {
         );
 
         let err = validate_manifest(&manifest).expect_err("missing capture should fail");
-        assert!(err.contains("stdout.capture.session is missing"), "{err}");
+        assert!(
+            err.contains("stdout/stderr capture.session is missing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn provider_capture_allows_stderr_capture_session() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            full_prompt(),
+            "text",
+            Some(ProviderSessionSpec {
+                id_source: Some(ProviderSessionIdSource::ProviderCapture),
+                resume_args: vec![lit("--resume"), lit("{session.id}"), lit("{prompt.full}")],
+                scope: Some("actor_scope".into()),
+            }),
+        );
+        provider_mode.stderr = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(session_capture("$.session_id")),
+        });
+        let manifest = manifest(
+            "stderr_capture",
+            "Stderr Capture",
+            &["stderr-capture"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        validate_manifest(&manifest).expect("stderr capture should satisfy provider_capture");
     }
 
     #[test]

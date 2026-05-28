@@ -223,7 +223,7 @@ export function App() {
   const [threadDraft, setThreadDraft] = useState("");
   const [workspaceForm, setWorkspaceForm] = useState({
     name: "Local",
-    serverUrl: "ws://127.0.0.1:7878/rpc",
+    serverUrl: "ws://127.0.0.1:18888/rpc",
   });
   const [agentForm, setAgentForm] = useState<AgentFormState>({
     machineId: "",
@@ -802,7 +802,7 @@ export function App() {
       });
       applyConfig(next);
       await loadMachines();
-      setWorkspaceForm({ name: "Local", serverUrl: "ws://127.0.0.1:7878/rpc" });
+      setWorkspaceForm({ name: "Local", serverUrl: "ws://127.0.0.1:18888/rpc" });
       pushNotice(`Space ${workspaceForm.name.trim()} added`);
     } catch (err) {
       setError(errorText(err));
@@ -3854,7 +3854,7 @@ function SpacesView({
                 onChange={(event) =>
                   setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
                 }
-                placeholder="ws://127.0.0.1:7878/rpc"
+                placeholder="ws://127.0.0.1:18888/rpc"
               />
               <Button
                 type="submit"

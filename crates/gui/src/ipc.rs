@@ -1640,8 +1640,13 @@ fn server_machine_info_from_actor(
         "configured"
     };
     let config_dir = PathBuf::from(&meta.config_dir);
-    let (serve_command, setup_script) =
-        daemon_start_commands(&data_root, Some(&config_dir), server_url, &machine_id);
+    let (serve_command, setup_script) = daemon_start_commands(
+        &data_root,
+        Some(&config_dir),
+        server_url,
+        &machine_id,
+        &name,
+    );
 
     let can_command = remote_machine_belongs_to_active_owner(&meta, cfg)
         && meta
@@ -1733,7 +1738,7 @@ fn active_server_url(cfg: &DesktopConfig) -> &str {
     config::active_workspace_id(cfg)
         .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
         .map(|workspace| workspace.server_url.as_str())
-        .unwrap_or("ws://127.0.0.1:7878/rpc")
+        .unwrap_or("ws://127.0.0.1:18888/rpc")
 }
 
 async fn apply_connection_status(result: &mut MachineListResult, client: Option<Arc<Client>>) {
@@ -1930,6 +1935,7 @@ fn daemon_start_commands(
     config_dir: Option<&Path>,
     server_url: &str,
     machine_id: &str,
+    machine_name: &str,
 ) -> (String, String) {
     let data_root_arg = shell_path_arg(data_root);
     let config_dir_arg = config_dir.map(shell_path_arg);
@@ -1938,20 +1944,22 @@ fn daemon_start_commands(
         .unwrap_or_else(|| "loom-daemon".into());
     let serve_command = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
         format!(
-            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {}",
+            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
             config_dir_arg,
             data_root_arg,
             daemon_bin,
             shell_arg(server_url),
             shell_arg(machine_id),
+            shell_arg(machine_name),
         )
     } else {
         format!(
-            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {}",
+            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
             data_root_arg,
             daemon_bin,
             shell_arg(server_url),
             shell_arg(machine_id),
+            shell_arg(machine_name),
         )
     };
     let mkdir_args = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
@@ -1964,13 +1972,14 @@ fn daemon_start_commands(
         .map(|config_dir_arg| format!("export LOOM_CONFIG_DIR={config_dir_arg}\n"))
         .unwrap_or_default();
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {}\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {} --machine-name {}\n",
         mkdir_args,
         config_export,
         shell_path_arg(data_root),
         daemon_bin,
         shell_arg(server_url),
         shell_arg(machine_id),
+        shell_arg(machine_name),
     );
     (serve_command, setup_script)
 }
@@ -2205,20 +2214,21 @@ mod tests {
         let (serve_command, setup_script) = daemon_start_commands(
             Path::new("/tmp/loom data"),
             Some(Path::new("/tmp/loom config")),
-            "ws://127.0.0.1:7878/rpc",
+            "ws://127.0.0.1:18888/rpc",
             "machine_test",
+            "CanfengMac",
         );
 
-        assert!(
-            serve_command.contains("--server ws://127.0.0.1:7878/rpc --machine-id machine_test")
-        );
+        assert!(serve_command.contains(
+            "--server ws://127.0.0.1:18888/rpc --machine-id machine_test --machine-name CanfengMac"
+        ));
         assert!(serve_command.starts_with("LOOM_CONFIG_DIR="));
         assert!(serve_command.contains("LOOM_AGENT_DATA_ROOT="));
         assert!(!serve_command.contains(" daemon --machine-id "));
         assert!(setup_script.contains("export LOOM_CONFIG_DIR="));
         assert!(setup_script.contains("LOOM_DAEMON_BIN"));
         assert!(setup_script.contains(
-            "exec \"$LOOM_DAEMON_BIN\" --server ws://127.0.0.1:7878/rpc --machine-id machine_test"
+            "exec \"$LOOM_DAEMON_BIN\" --server ws://127.0.0.1:18888/rpc --machine-id machine_test --machine-name CanfengMac"
         ));
         assert!(!setup_script.contains(" daemon --machine-id "));
     }
@@ -2232,7 +2242,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
@@ -2271,7 +2281,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: "actor_human_88084".into(),
                 display_name: "actor_human_88084".into(),
             }],
@@ -2347,7 +2357,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
@@ -2527,7 +2537,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],

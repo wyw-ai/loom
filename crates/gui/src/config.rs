@@ -6,9 +6,9 @@
 //! server profiles, and the active server. Machines and agents are discovered
 //! from the connected server inventory instead of treated as local truth.
 //!
-//! Daemon runtime configs may still use the same TOML shape in scoped config
-//! dirs below `~/.loom-apps/d/<workspace>/<owner-short>/<machine>/desktop.toml`.
-//! Those files belong to daemon startup, not GUI host discovery.
+//! Daemon runtime config is deliberately separate. A daemon reads its own
+//! `daemon.toml` from `LOOM_CONFIG_DIR`; this GUI file does not own daemon
+//! machine identity, providers, agents, profile, memory, or runtime state.
 //!
 //! ```toml
 //! active = "default"
@@ -25,7 +25,7 @@
 //! [[workspaces]]
 //! id = "default"
 //! name = "Local"
-//! server_url = "ws://127.0.0.1:7878/rpc"
+//! server_url = "ws://127.0.0.1:18888/rpc"
 //! actor_id = "actor_human_<staff_id>"
 //! display_name = "bojun"
 //! ```
@@ -557,7 +557,7 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
             changed = true;
         }
         if workspace.server_url.trim().is_empty() {
-            workspace.server_url = "ws://127.0.0.1:7878/rpc".into();
+            workspace.server_url = "ws://127.0.0.1:18888/rpc".into();
             changed = true;
         }
         if workspace.actor_id.trim().is_empty() {
@@ -678,7 +678,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: "actor_human_old".into(),
                 display_name: "old".into(),
             }],
@@ -706,7 +706,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: "actor_human_github_12345".into(),
                 display_name: "octocat".into(),
             }],
@@ -738,7 +738,7 @@ mod tests {
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: String::new(),
                 display_name: String::new(),
             }],
@@ -768,7 +768,7 @@ id = "default"
         let mut cfg = cfg;
         assert!(repair_workspace_fields(&mut cfg));
         assert_eq!(cfg.workspaces[0].name, "Local");
-        assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
+        assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:18888/rpc");
         assert_eq!(cfg.workspaces[0].actor_id, "actor_human_local_default");
         assert_eq!(cfg.workspaces[0].display_name, "actor_human_local_default");
     }
@@ -804,7 +804,7 @@ id = "default"
             workspaces: vec![Workspace {
                 id: "default".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: "actor_human_github_12345".into(),
                 display_name: "octocat".into(),
             }],
@@ -842,7 +842,7 @@ id = "default"
             workspaces: vec![Workspace {
                 id: "ws_abbb0e0b".into(),
                 name: "Local".into(),
-                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                server_url: "ws://127.0.0.1:18888/rpc".into(),
                 actor_id: "actor_human_local_ws_abbb0e0b".into(),
                 display_name: "boyd".into(),
             }],

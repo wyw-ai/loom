@@ -371,15 +371,21 @@ fn run_prompt(
         None
     };
 
-    let (argv, is_first_run) = match (resume_session_id.as_deref(), cfg.resume_args.as_ref()) {
-        (Some(sid), Some(template)) => {
-            let argv = if cfg.resume_arg_specs.is_empty() {
-                expand_argv(template, &cfg, &prompt, Some(sid), &content)
-            } else {
-                expand_arg_specs(&cfg.resume_arg_specs, &cfg, &prompt, Some(sid), &content)
-            };
-            (argv, false)
-        }
+    let (argv, is_first_run) = match resume_session_id.as_deref() {
+        Some(sid) if !cfg.resume_arg_specs.is_empty() => (
+            expand_arg_specs(&cfg.resume_arg_specs, &cfg, &prompt, Some(sid), &content),
+            false,
+        ),
+        Some(sid) if cfg.resume_args.is_some() => (
+            expand_argv(
+                cfg.resume_args.as_deref().unwrap_or_default(),
+                &cfg,
+                &prompt,
+                Some(sid),
+                &content,
+            ),
+            false,
+        ),
         _ => (
             expand_first_run_argv(&cfg, &prompt, first_run_session_id.as_deref(), &content),
             true,
@@ -2835,6 +2841,38 @@ mod tests {
 
         let saved = load_session(&cfg, &scope()).expect("saved session");
         assert_eq!(saved.session_id, "sid_decoder");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_prompt_resumes_with_arg_specs_without_legacy_resume_args() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec!["-c".into(), "printf '%s\\n' first-run".into()];
+        cfg.resume_args = None;
+        cfg.resume_arg_specs = vec![
+            ProviderArgSpec::Literal("-c".into()),
+            ProviderArgSpec::Literal("printf '%s\\n' \"$1\"".into()),
+            ProviderArgSpec::Literal("resume".into()),
+            ProviderArgSpec::Literal("{session_id}".into()),
+        ];
+        let request = prompt("ignored");
+        let signature = command_signature_for_prompt(&cfg, &request);
+        save_session(&cfg, &request.scope, "sid_arg_specs", &signature).expect("save session");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), request, tx, slot).expect("run prompt");
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Text { content, .. } = event {
+                texts.push(content);
+            }
+        }
+        assert_eq!(texts, vec!["sid_arg_specs\n"]);
         std::fs::remove_dir_all(root).ok();
     }
 

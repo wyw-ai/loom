@@ -1161,7 +1161,7 @@ fn validate_json_path_segment(path: &str, segment: &str) -> Result<(), String> {
             return Err(format!("unterminated json path index in `{path}`"));
         };
         let index = &rest[1..close];
-        if index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit()) {
+        if index != "*" && (index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit())) {
             return Err(format!("unsupported json path index `{index}` in `{path}`"));
         }
         rest = &rest[close + 1..];
@@ -2801,6 +2801,36 @@ mod tests {
 
         let err = validate_manifest(&manifest).expect_err("bad reducer should fail");
         assert!(err.contains("unsupported reducer mode `last`"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_allows_decoder_wildcard_path() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            full_prompt(),
+            "text",
+            None,
+        );
+        provider_mode.stdout.format = "jsonl".into();
+        provider_mode.stdout.name = None;
+        provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "concat".into(),
+                path: "$.items[*].text".into(),
+                when: None,
+                fallback: None,
+            }),
+        });
+        let manifest = manifest(
+            "wildcard_decoder",
+            "Wildcard Decoder",
+            &["wildcard-decoder"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        validate_manifest(&manifest).expect("wildcard decoder path should pass");
     }
 
     #[test]

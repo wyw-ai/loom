@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use proto::methods::{
     AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
     CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderConditionalArgSpec,
-    ProviderDecoderCaptureSpec, ProviderDecoderEmitSpec, ProviderDecoderSpec, ProviderDetectSpec,
-    ProviderJsonConditionSpec, ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec,
-    ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec, ProviderPromptSpec,
-    ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
+    ProviderDecoderCaptureSpec, ProviderDecoderEmitSpec, ProviderDecoderEventSpec,
+    ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
+    ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
+    ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -505,10 +505,16 @@ fn is_prompt_part_placeholder(key: &str) -> bool {
 
 fn preset_parts(preset: &str) -> Result<Vec<&'static str>, String> {
     match preset {
-        "loom_system" => Ok(vec!["actor_context", "bootstrap_memory", "scope_bootstrap"]),
+        "loom_system" => Ok(vec![
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+        ]),
         "loom_turn" => Ok(vec!["turn_memory", "runtime_context", "user_message"]),
         "loom_full" => Ok(vec![
             "actor_context",
+            "agent_instructions",
             "bootstrap_memory",
             "scope_bootstrap",
             "turn_memory",
@@ -1508,6 +1514,7 @@ fn is_known_prompt_part(key: &str) -> bool {
         key,
         "trigger_prefix"
             | "actor_context"
+            | "agent_instructions"
             | "bootstrap_memory"
             | "scope_bootstrap"
             | "turn_memory"
@@ -1874,6 +1881,41 @@ fn copilot_jsonl_decoder() -> ProviderDecoderSpec {
     }
 }
 
+fn opencode_jsonl_decoder() -> ProviderDecoderSpec {
+    ProviderDecoderSpec {
+        format: "jsonl".into(),
+        name: None,
+        events: vec![
+            ProviderDecoderEventSpec {
+                when: Some(json_condition_equals("$.type", "tool_use")),
+                emit: ProviderDecoderEmitSpec {
+                    emit_type: "tool_use".into(),
+                    tool_name: Some("$.part.tool".into()),
+                    input: Some("$.part.state.input".into()),
+                    ..Default::default()
+                },
+            },
+            ProviderDecoderEventSpec {
+                when: Some(json_condition_equals("$.type", "error")),
+                emit: ProviderDecoderEmitSpec {
+                    emit_type: "error".into(),
+                    message: Some("$.error.data.message".into()),
+                    ..Default::default()
+                },
+            },
+        ],
+        reduce: Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.part.text".into(),
+                when: Some(json_condition_equals("$.type", "text")),
+                fallback: None,
+            }),
+        }),
+        capture: Some(session_capture("$.sessionID")),
+    }
+}
+
 fn session_capture(path: &str) -> ProviderDecoderCaptureSpec {
     ProviderDecoderCaptureSpec {
         session: Some(ProviderJsonlTextReducerSpec {
@@ -2192,9 +2234,11 @@ fn codex_manifest() -> ProviderManifest {
 }
 
 fn opencode_manifest() -> ProviderManifest {
-    let args = vec![
+    let first_args = vec![
         lit("run"),
         lit("--dangerously-skip-permissions"),
+        lit("--format"),
+        lit("json"),
         when("model", vec![lit("--model"), lit("{model}")]),
         when(
             "reasoningEffort",
@@ -2202,7 +2246,32 @@ fn opencode_manifest() -> ProviderManifest {
         ),
         lit("{prompt.full}"),
     ];
-    let mut mode = mode("{bin}", args, full_prompt(), "text", None);
+    let resume_args = vec![
+        lit("run"),
+        lit("--dangerously-skip-permissions"),
+        lit("--format"),
+        lit("json"),
+        lit("--session"),
+        lit("{session.id}"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("--variant"), lit("{reasoningEffort}")],
+        ),
+        lit("{prompt.full}"),
+    ];
+    let mut mode = mode(
+        "{bin}",
+        first_args,
+        full_prompt(),
+        "text",
+        Some(ProviderSessionSpec {
+            id_source: Some(ProviderSessionIdSource::ProviderCapture),
+            resume_args,
+            scope: Some("actor_scope".into()),
+        }),
+    );
+    mode.stdout = opencode_jsonl_decoder();
     mode.env.insert(
         "XDG_DATA_HOME".into(),
         "{agent.profile}/opencode/data".into(),
@@ -2221,18 +2290,16 @@ fn opencode_manifest() -> ProviderManifest {
         &["opencode"],
         BTreeMap::from([("print".into(), mode)]),
         &[
-            ("openai/gpt-5.5", "OpenAI GPT-5.5"),
-            ("openai/gpt-5.4", "OpenAI GPT-5.4"),
-            ("openai/gpt-5.4-mini", "OpenAI GPT-5.4 Mini"),
-            ("openai/gpt-5.3-codex", "OpenAI GPT-5.3 Codex"),
-            ("openai/gpt-5.3-codex-spark", "OpenAI GPT-5.3 Codex Spark"),
-            ("openai/gpt-5.2", "OpenAI GPT-5.2"),
             ("opencode/big-pickle", "OpenCode Big Pickle"),
             (
                 "opencode/deepseek-v4-flash-free",
                 "OpenCode DeepSeek V4 Flash Free",
             ),
-            ("opencode/minimax-m2.5-free", "OpenCode MiniMax M2.5 Free"),
+            ("opencode/mimo-v2.5-free", "OpenCode Mimo V2.5 Free"),
+            (
+                "opencode/nemotron-3-super-free",
+                "OpenCode Nemotron 3 Super Free",
+            ),
         ],
     )
 }
@@ -3168,6 +3235,59 @@ mod tests {
     }
 
     #[test]
+    fn builtin_opencode_declares_json_session_capture_and_resume() {
+        let dir = temp_dir("opencode-path");
+        make_executable(&dir.join("opencode"));
+        let registry = ProviderRegistry::load(&temp_dir("opencode-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "opencode")
+            .expect("opencode");
+        let provider_ref = AgentProviderRef {
+            id: "opencode".into(),
+            mode: Some("print".into()),
+            model: Some("opencode/big-pickle".into()),
+            reasoning_effort: None,
+        };
+        let plan = runtime_plan_from_manifest(
+            &provider.manifest,
+            "print",
+            provider.manifest.modes.get("print").unwrap(),
+            Path::new(&provider.command),
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        assert_eq!(plan.provider_id, "opencode");
+        assert!(plan.args.contains(&"--format".into()));
+        assert!(plan.args.contains(&"json".into()));
+        assert!(plan.args.contains(&"{prompt.full}".into()));
+        assert_eq!(
+            plan.session.as_ref().and_then(|session| session.id_source),
+            Some(CommandSessionIdSource::ProviderCapture)
+        );
+        assert!(plan
+            .session
+            .as_ref()
+            .and_then(|session| session.resume_args.as_ref())
+            .is_some_and(|args| args.contains(&"--session".into())
+                && args.contains(&"{session_id}".into())
+                && args.contains(&"{prompt.full}".into())));
+        assert_eq!(
+            plan.decoder.as_ref().map(|decoder| decoder.format.as_str()),
+            Some("jsonl")
+        );
+        assert!(plan
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some_and(|session| session.path == "$.sessionID"));
+    }
+
+    #[test]
     fn provider_runtime_plan_resolves_before_adapter_transport() {
         let dir = temp_dir("runtime-plan-path");
         make_executable(&dir.join("qodercli"));
@@ -3322,7 +3442,7 @@ mod tests {
 
     #[test]
     fn builtin_provider_capture_sessions_are_declared_on_stdout_decoder() {
-        for provider_id in ["qoder", "codex"] {
+        for provider_id in ["qoder", "codex", "opencode"] {
             let manifest = builtin_provider_manifests()
                 .into_iter()
                 .find(|manifest| manifest.id == provider_id)

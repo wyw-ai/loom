@@ -231,6 +231,7 @@ export interface MachineAgentProviderInfo {
 
 export interface AgentSpec {
   actor: Actor;
+  instructions?: string | null;
   providerRef: AgentProviderRef;
   models?: AgentModelSpec | null;
   autostart?: boolean | null;

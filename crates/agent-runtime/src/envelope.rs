@@ -34,6 +34,9 @@ pub struct EnvelopeInput<'a> {
     /// Runtime actor context resolved by Loom itself. This is protocol
     /// metadata (actor id/display name) and should be injected every prompt.
     pub actor_context: &'a str,
+    /// Static per-agent instructions from AgentSpec. This belongs with the
+    /// system-side prompt parts, not the per-turn user message.
+    pub agent_instructions: &'a str,
     pub bootstrap_memory: &'a str,
     pub turn_memory: &'a str,
     /// Dynamic runtime facts for this turn, such as the local wall clock used
@@ -55,6 +58,11 @@ pub fn compose_prompt(input: &EnvelopeInput<'_>) -> (String, Vec<PromptSection>)
         &mut sections,
         "actor_context",
         input.actor_context.trim().to_string(),
+    );
+    push_nonempty(
+        &mut sections,
+        "agent_instructions",
+        input.agent_instructions.trim().to_string(),
     );
     push_nonempty(
         &mut sections,
@@ -117,6 +125,8 @@ pub struct BuildContext<'a> {
     /// Loom-resolved actor identity section. Stable for this actor, so callers
     /// should keep volatile facts out of it for better prompt-cache reuse.
     pub actor_context: &'a str,
+    /// Static agent instructions resolved from AgentSpec.
+    pub agent_instructions: &'a str,
     /// Absolute path to this actor's profile dir. Memory roots are resolved
     /// under this when relative.
     pub profile_dir: &'a Path,
@@ -163,6 +173,7 @@ pub fn build_envelope(cx: &BuildContext<'_>) -> (String, Vec<PromptSection>) {
 
     compose_prompt(&EnvelopeInput {
         actor_context: cx.actor_context,
+        agent_instructions: cx.agent_instructions,
         bootstrap_memory: &bootstrap_rendered,
         turn_memory: &turn_rendered,
         runtime_context: cx.runtime_context,
@@ -215,6 +226,7 @@ mod tests {
         let (body, sections) = compose_prompt(&EnvelopeInput {
             actor_context:
                 "=== System: Loom actor identity ===\nYou are Coder (@actor_agent_coder).",
+            agent_instructions: "=== System: Agent instructions ===\nHost concise games.",
             bootstrap_memory: "Bootstrap memory:\n- [fact / high] a",
             turn_memory: "Relevant memory:\n- [note / medium] b",
             runtime_context: "",
@@ -226,6 +238,7 @@ mod tests {
             names,
             vec![
                 "actor_context",
+                "agent_instructions",
                 "bootstrap_memory",
                 "scope_bootstrap",
                 "turn_memory",
@@ -233,6 +246,7 @@ mod tests {
             ]
         );
         assert!(body.find("Loom actor identity").unwrap() < body.find("Bootstrap memory").unwrap());
+        assert!(body.find("Agent instructions").unwrap() < body.find("Bootstrap memory").unwrap());
         assert!(
             body.find("Bootstrap memory").unwrap() < body.find("=== User message ===").unwrap()
         );

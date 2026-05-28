@@ -133,6 +133,10 @@ Provider stdout 默认仍然只进入 run trace。Provider 结果是否成为 GU
 另一个隐式 `modelArgs` 分支里。过渡期可以把现有 `transport.modelArgs` 编译进
 manifest，但新 manifest 应以 argv 模板为准。
 
+本地 Provider 可以通过 `extends` 继承内置 Provider，再用同一套 patch 语义覆盖
+mode。这样 `MachineConfig.providers[]` 这种 command/args/env 局部覆盖不需要继续
+作为独立配置面存在。
+
 `detect.candidates` 是最小检测方式。内置 Provider 还应在测试里固定一组 help/version
 样本，防止 CLI 升级后参数名变化但 manifest 仍然静默通过。自定义 Provider 可以先只
 写 `candidates`；后续再扩展可选的 `versionCommand`、`helpCommand`、
@@ -750,8 +754,190 @@ run trace 和可选 auto-publish pipeline。
 }
 ```
 
-daemon 在启动时把 `providerRef` resolve 成具体 runtime plan。手写 spec 作者仍然
-可以覆盖 command args、env、parser、timeout、session 规则。
+daemon 在启动时把 `providerRef` resolve 成具体 runtime plan。手写 spec 作者可以使用
+受控的 `modeOverride` 覆盖少量运行参数；完整 raw `transport` 只作为 legacy escape
+hatch 保留。
+
+## 与 AgentSpec / `spec.json` 的边界
+
+现有 Loom 已经有 agent 自己的 `spec.json`，通常位于 `<agents>/<actor_id>/spec.json`
+或 legacy flat `<agents>/<actor_id>.json`。这个文件描述的是一个具体 agent actor；
+Provider manifest 描述的是一类 CLI/runtime 如何接入 Loom。两者不能继续混在一起。
+
+职责边界：
+
+```text
+ProviderManifest
+  描述“怎么启动和解析某类 Provider”
+  例如 Claude Code / Codex / Qoder / Copilot 的 detect、command、args/env/stdin、
+  prompt parts 映射、stdout/stderr parser、session 策略、provider 级模型菜单。
+
+AgentSpec / spec.json
+  描述“这个 agent 是谁、带什么个性和状态”
+  例如 actor id/displayName、autostart、identity/soul、memory、bundle、announcement、
+  trigger、promptTemplate、actor 选中的 model/reasoningEffort，以及 providerRef。
+```
+
+容易重复的字段和归属建议：
+
+| 字段 | 归属 | 说明 |
+| --- | --- | --- |
+| `command` / `args` / `env` / `stdin` | ProviderManifest | 默认不应该出现在每个 agent 的 `spec.json` 里。 |
+| stdout/stderr parser | ProviderManifest | 解析方式是 Provider 能力，不是 actor 个性。 |
+| session 策略 | ProviderManifest | `loom_uuid`、`provider_capture`、resumeArgs 都是 Provider 接入规则。 |
+| model choices | ProviderManifest 为主，AgentSpec 可收窄/覆盖 | Provider 给 UI 默认菜单；agent 可以指定默认 model 或限制 choices。 |
+| selected model / reasoning effort | AgentSpec 或运行时选择 | 这是具体 agent 的偏好，Provider 只定义如何映射到 argv/env。 |
+| prompt parts 如何进 system/user/full | ProviderManifest | 这是 Provider 接入形态。 |
+| promptTemplate / trigger_prefix | AgentSpec | 这是具体 agent 的触发语义和任务包装。 |
+| identity / soul / memory / bundle | AgentSpec | 这是 actor 的人格、记忆和附带资源。 |
+| autostart / avatar / displayName | AgentSpec | 这是 actor 生命周期和 UI 信息。 |
+
+因此新设计下，`spec.json` 的推荐形态是引用 provider，而不是复制 transport：
+
+```json
+{
+  "actor": {
+    "id": "actor_agent_reviewer",
+    "kind": "agent",
+    "displayName": "Reviewer"
+  },
+  "providerRef": {
+    "id": "claude",
+    "mode": "print",
+    "model": "sonnet",
+    "reasoningEffort": "high"
+  },
+  "autostart": true,
+  "identity": {
+    "files": {
+      "identity": "identity.md",
+      "soul": "soul.md"
+    }
+  },
+  "memory": {
+    "delivery": {
+      "prompt": true
+    }
+  }
+}
+```
+
+向后兼容上，现有 `AgentSpec.transport` 仍然可以保留为高级逃生口：
+
+- 如果 `spec.json` 只有 `providerRef`，daemon 从 ProviderManifest resolve 出完整
+  runtime plan。
+- 如果 `spec.json` 同时写了 `providerRef` 和局部 override，只允许覆盖明确列出的
+  安全字段，例如 timeout、env 追加、model 默认值；不建议覆盖 parser。
+- 如果 `spec.json` 写了完整 raw `transport`，按 legacy 行为运行，但 GUI 应标记为
+  advanced/custom transport，避免配置者误以为它会随 ProviderManifest 自动升级。
+
+现有 `AgentProviderSpec` 实际上同时包含 provider transport、defaults 和 `actors[]`，
+会把“Provider 接入规则”和“具体 actor 配置”绑在一个文件里。新模型应把它拆成：
+
+```text
+ProviderManifest       -> provider catalog / runtime adapter
+AgentSpec(spec.json)   -> actor instance, references providerRef
+```
+
+过渡期可以继续把旧 `AgentProviderSpec` 展开成多个 `AgentSpec`，但展开结果应尽快转成
+`providerRef`，不要在每个 actor 上复制同一份 `transport`。
+
+## 统一最终配置模型
+
+最终应收敛成三类 source of truth：
+
+```text
+{loom.configDir}/providers/<provider_id>.json
+  ProviderManifest。描述 Provider 接入规则，shared by many agents。
+
+{loom.configDir}/agents/<actor_id>/spec.json
+  AgentSpec。描述具体 agent actor，引用 providerRef。
+
+{loom.dataRoot}/runtime/...
+  Runtime state。保存进程状态、session id、最近 run、临时缓存等，不进入配置。
+```
+
+`desktop.toml` / machine config 应只保存 workspace、server、machine、dataRoot 等宿主
+信息。GUI 创建或编辑 agent 时，最终应该写 `agents/<actor_id>/spec.json`，而不是只在
+`desktop.toml` 里维护一份 `machines[].agents[]`。过渡期可以保留
+`MachineAgentConfig`，但它应该被视为 legacy 简化视图，并能无损迁移成 AgentSpec。
+
+统一后的职责：
+
+| 当前位置 | 问题 | 最终归宿 |
+| --- | --- | --- |
+| `AgentProviderSpec.provider + transport + actors[]` | provider 接入规则和多个 actor 混在一起 | 拆成 ProviderManifest + 多个 AgentSpec |
+| `AgentSpec.transport` | 每个 agent 复制 command/args/parser/session | 改为 `providerRef`；raw transport 只做 legacy escape hatch |
+| `MachineConfig.providers[]` / `AgentProviderOverride` | 在 machine config 里局部覆盖 provider command/args/env | 改为本地 ProviderManifest，必要时用 `extends` 或 custom provider id |
+| `MachineConfig.agents[]` / `MachineAgentConfig` | GUI agent 信息和 AgentSpec 重复 | GUI 直接读写 AgentSpec，machine config 只保留宿主信息 |
+| `AgentDefinition` | MachineAgentConfig 到 AgentSpec 的中间展开结构 | 迁移后删除或只作为 legacy importer |
+| runtime session id | 容易被误写入 spec | 写入 runtime state，由 session 策略生成或 capture |
+
+### 高级手写配置
+
+高级手写配置不应该再复制完整 ProviderManifest。它应该使用同一套 mode 子 schema 的
+**局部覆盖**，挂在 `providerRef.modeOverride` 下：
+
+```json
+{
+  "actor": {
+    "id": "actor_agent_reviewer",
+    "kind": "agent",
+    "displayName": "Reviewer"
+  },
+  "providerRef": {
+    "id": "claude",
+    "mode": "print",
+    "model": "sonnet",
+    "reasoningEffort": "high",
+    "modeOverride": {
+      "timeoutMs": 900000,
+      "env": {
+        "merge": {
+          "EXTRA_FLAG": "1"
+        }
+      },
+      "args": {
+        "append": ["--max-budget-usd", "5"]
+      }
+    }
+  }
+}
+```
+
+`modeOverride` 使用 Provider mode 的字段名，但语义是 patch，不是完整定义：
+
+| override 字段 | 合并规则 |
+| --- | --- |
+| `timeoutMs` / `idleTimeoutMs` | 标量覆盖 |
+| `env.merge` | 合并到 provider env；同名 key 覆盖 |
+| `env.unset` | 从 provider env 删除指定 key |
+| `args.append` / `args.prepend` | 在 provider args 前后追加；适合安全小改动 |
+| `args.replace` | 整体替换 args；需要 GUI 标成 advanced |
+| `prompt.outputs` | 按 output name 替换或新增；不影响未提到的输出 |
+| `stdin` | 覆盖 stdin 模板 |
+| `stdout` / `stderr` parser | 整体替换；默认不建议普通 GUI 暴露 |
+| `session` | 整体替换；只给手写高级 spec |
+
+这样配置者可以复用 ProviderManifest 的启动/解析能力，只覆盖确实属于这个 agent 的差异。
+如果一个覆盖会被多个 agent 复用，应该提取成新的 ProviderManifest，例如：
+
+```json
+{
+  "id": "claude_bare",
+  "extends": "claude",
+  "modes": {
+    "print": {
+      "args": {
+        "append": ["--bare"]
+      }
+    }
+  }
+}
+```
+
+规则是：**共享的运行适配差异进 ProviderManifest；单个 actor 的身份、记忆、触发和少量
+运行偏好进 AgentSpec；短期进程状态进 runtime state。**
 
 ## 安全与校验
 
@@ -849,6 +1035,12 @@ loom provider doctor <provider_id>
    provider 是 built-in 还是 local。
 10. 增加 `loom provider validate/add/list/show/remove/doctor`，方便调试和管理
     自定义 Provider。
+11. 将 `MachineConfig.agents[]` 迁移成 `{loom.configDir}/agents/<actor_id>/spec.json`；
+    GUI 创建/编辑 agent 改为读写 AgentSpec。
+12. 将 `MachineConfig.providers[]` / `AgentProviderOverride` 迁移成本地 ProviderManifest
+    或 `extends` provider；machine config 不再保存 command/args/env override。
+13. 保留 `AgentSpec.transport` 和旧 `AgentProviderSpec` loader 作为 legacy importer，
+    但新写入一律使用 `providerRef` + 可选 `modeOverride`。
 
 ## 待定问题
 

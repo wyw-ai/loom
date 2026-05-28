@@ -16,7 +16,7 @@ use proto::methods::{
     CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderDecoderSpec,
     ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
     ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
-    ProviderPromptSpec, ProviderSessionIdSource, ProviderSessionSpec,
+    ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -285,8 +285,9 @@ fn render_prompt_output(
         }
     }
 
+    let render_title = output.render_title.unwrap_or_default();
     let mut rendered = if let Some(template) = output.template.as_ref() {
-        render_prompt_template(template, &part_map)
+        render_prompt_template(template, &part_map, render_title)
     } else {
         let include = if !output.include.is_empty() {
             output.include.clone()
@@ -305,7 +306,8 @@ fn render_prompt_output(
             join_parts(
                 include
                     .iter()
-                    .filter_map(|key| part_map.get(key.as_str()).map(|part| part.content.as_str())),
+                    .filter_map(|key| part_map.get(key.as_str()))
+                    .map(|part| render_prompt_part(part, render_title)),
                 join,
             )
         }
@@ -319,7 +321,29 @@ fn render_prompt_output(
     Ok(rendered)
 }
 
-fn render_prompt_template(template: &str, parts: &BTreeMap<&str, &PromptPart>) -> String {
+fn render_prompt_part(part: &PromptPart, render_title: ProviderRenderTitle) -> String {
+    match render_title {
+        ProviderRenderTitle::Always => {
+            let title = part.title.trim();
+            if title.is_empty() {
+                return part.content.clone();
+            }
+            let heading = format!("=== {title} ===");
+            if part.content.trim_start().starts_with(&heading) {
+                part.content.clone()
+            } else {
+                format!("{heading}\n{}", part.content)
+            }
+        }
+        ProviderRenderTitle::Never | ProviderRenderTitle::Auto => part.content.clone(),
+    }
+}
+
+fn render_prompt_template(
+    template: &str,
+    parts: &BTreeMap<&str, &PromptPart>,
+    render_title: ProviderRenderTitle,
+) -> String {
     let mut out = String::new();
     let mut rest = template;
     while let Some(start) = rest.find('{') {
@@ -332,7 +356,7 @@ fn render_prompt_template(template: &str, parts: &BTreeMap<&str, &PromptPart>) -
         let key = &after_open[..end];
         if is_prompt_part_placeholder(key) {
             if let Some(part) = parts.get(key) {
-                out.push_str(&part.content);
+                out.push_str(&render_prompt_part(part, render_title));
             }
         } else {
             out.push('{');
@@ -368,7 +392,7 @@ fn preset_parts(preset: &str) -> Result<Vec<&'static str>, String> {
     }
 }
 
-fn join_parts<'a>(parts: impl IntoIterator<Item = &'a str>, join: &str) -> String {
+fn join_parts(parts: impl IntoIterator<Item = String>, join: &str) -> String {
     parts
         .into_iter()
         .filter(|part| !part.trim().is_empty())
@@ -677,16 +701,288 @@ fn validate_prompt_references(
     outputs.insert("full".into());
     outputs.insert("system".into());
     outputs.insert("user".into());
+    validate_prompt_outputs(manifest, mode_name, mode.prompt.as_ref())?;
+    validate_template_variables(manifest, mode_name, mode, &outputs)?;
     let references = prompt_references_in_mode(mode);
-    for name in references {
-        if !outputs.contains(&name) {
+    for name in &references {
+        if !outputs.contains(name) {
             return Err(format!(
                 "provider `{}` mode `{mode_name}` references unknown prompt output `{name}`",
                 manifest.id
             ));
         }
     }
+    if mode.transport == "command" {
+        if !mode_has_prompt_reference(mode, false) {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` must pass one prompt output through args, env, or stdin",
+                manifest.id
+            ));
+        }
+        if mode
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.resume_args.is_empty())
+            && !mode_has_prompt_reference(mode, true)
+        {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` session resumeArgs must pass one prompt output",
+                manifest.id
+            ));
+        }
+    }
     Ok(())
+}
+
+fn validate_prompt_outputs(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    prompt: Option<&ProviderPromptSpec>,
+) -> Result<(), String> {
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+    for (output_name, output) in &prompt.outputs {
+        if let Some(preset) = output.preset.as_deref() {
+            preset_parts(preset).map_err(|err| {
+                format!(
+                    "provider `{}` mode `{mode_name}` prompt output `{output_name}`: {err}",
+                    manifest.id
+                )
+            })?;
+        }
+        for key in output.include.iter().chain(output.required.iter()) {
+            if key == "full" {
+                continue;
+            }
+            if !is_known_prompt_part(key) {
+                return Err(format!(
+                    "provider `{}` mode `{mode_name}` prompt output `{output_name}` references unknown prompt part `{key}`",
+                    manifest.id
+                ));
+            }
+        }
+        if let Some(template) = output.template.as_deref() {
+            for key in prompt_part_placeholders(template) {
+                if !is_known_prompt_part(&key) {
+                    return Err(format!(
+                        "provider `{}` mode `{mode_name}` prompt output `{output_name}` references unknown prompt part `{key}`",
+                        manifest.id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_template_variables(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    mode: &ProviderModeSpec,
+    outputs: &HashSet<String>,
+) -> Result<(), String> {
+    for (where_, value) in mode_templates(mode, false) {
+        for name in template_placeholders(value) {
+            validate_template_variable(manifest, mode_name, where_, &name, outputs)?;
+        }
+    }
+    if let Some(session) = mode.session.as_ref() {
+        for arg in &session.resume_args {
+            for (where_, value) in arg_templates(arg, "session.resumeArgs") {
+                for name in template_placeholders(value) {
+                    validate_template_variable(manifest, mode_name, where_, &name, outputs)?;
+                }
+            }
+        }
+    }
+    validate_condition_names(manifest, mode_name, &mode.args)?;
+    if let Some(session) = mode.session.as_ref() {
+        validate_condition_names(manifest, mode_name, &session.resume_args)?;
+    }
+    Ok(())
+}
+
+fn validate_template_variable(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    name: &str,
+    outputs: &HashSet<String>,
+) -> Result<(), String> {
+    if let Some(output) = name.strip_prefix("prompt.") {
+        if outputs.contains(output) {
+            return Ok(());
+        }
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` {where_} references unknown prompt output `{output}`",
+            manifest.id
+        ));
+    }
+    if is_supported_runtime_template_var(name) {
+        return Ok(());
+    }
+    Err(format!(
+        "provider `{}` mode `{mode_name}` {where_} references unknown template variable `{name}`",
+        manifest.id
+    ))
+}
+
+fn validate_condition_names(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    args: &[ProviderArgSpec],
+) -> Result<(), String> {
+    for arg in args {
+        match arg {
+            ProviderArgSpec::Literal(_) => {}
+            ProviderArgSpec::Conditional { when, args } => {
+                let when = when.trim();
+                if !matches!(when, "model" | "reasoningEffort" | "reasoning_effort") {
+                    return Err(format!(
+                        "provider `{}` mode `{mode_name}` uses unsupported args condition `{when}`",
+                        manifest.id
+                    ));
+                }
+                validate_condition_names(manifest, mode_name, args)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mode_has_prompt_reference(mode: &ProviderModeSpec, resume: bool) -> bool {
+    mode_templates(mode, resume)
+        .any(|(_, value)| template_placeholders(value).any(|name| is_prompt_delivery_var(&name)))
+}
+
+fn mode_templates<'a>(
+    mode: &'a ProviderModeSpec,
+    resume: bool,
+) -> impl Iterator<Item = (&'static str, &'a str)> + 'a {
+    let command = std::iter::once(("command", mode.command.as_str()));
+    let args: Box<dyn Iterator<Item = (&'static str, &'a str)> + 'a> = if resume {
+        Box::new(
+            mode.session
+                .as_ref()
+                .into_iter()
+                .flat_map(|session| session.resume_args.iter())
+                .flat_map(|arg| arg_templates(arg, "session.resumeArgs")),
+        )
+    } else {
+        Box::new(mode.args.iter().flat_map(|arg| arg_templates(arg, "args")))
+    };
+    let env = mode.env.values().map(|value| ("env", value.as_str()));
+    let stdin = mode
+        .stdin
+        .as_deref()
+        .map(|value| ("stdin", value))
+        .into_iter();
+    command.chain(args).chain(env).chain(stdin)
+}
+
+fn arg_templates<'a>(
+    arg: &'a ProviderArgSpec,
+    where_: &'static str,
+) -> Box<dyn Iterator<Item = (&'static str, &'a str)> + 'a> {
+    match arg {
+        ProviderArgSpec::Literal(value) => Box::new(std::iter::once((where_, value.as_str()))),
+        ProviderArgSpec::Conditional { args, .. } => {
+            Box::new(args.iter().flat_map(move |arg| arg_templates(arg, where_)))
+        }
+    }
+}
+
+fn template_placeholders(value: &str) -> impl Iterator<Item = String> + '_ {
+    let mut rest = value;
+    std::iter::from_fn(move || loop {
+        let start = rest.find('{')?;
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('}') else {
+            rest = "";
+            return None;
+        };
+        let key = &after_open[..end];
+        rest = &after_open[end + 1..];
+        if is_template_placeholder(key) {
+            return Some(key.to_string());
+        }
+    })
+}
+
+fn prompt_part_placeholders(value: &str) -> impl Iterator<Item = String> + '_ {
+    template_placeholders(value).filter(|key| is_prompt_part_placeholder(key))
+}
+
+fn is_template_placeholder(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn is_prompt_delivery_var(name: &str) -> bool {
+    name == "prompt" || name == "loom_envelope" || name.starts_with("prompt.")
+}
+
+fn is_supported_runtime_template_var(name: &str) -> bool {
+    matches!(
+        name,
+        "bin"
+            | "model"
+            | "reasoningEffort"
+            | "session.id"
+            | "session_id"
+            | "prompt"
+            | "loom_envelope"
+            | "actor.id"
+            | "scope.id"
+            | "scope.kind"
+            | "loom.configDir"
+            | "loom.server"
+            | "loom.actor"
+            | "loom.scope.id"
+            | "loom.scope.kind"
+            | "loom.run.id"
+            | "loom.trigger.id"
+            | "loom.trigger.actor"
+            | "paths.cwd"
+            | "workspace.dir"
+            | "agent.root"
+            | "agent.profile"
+            | "agent.workspace"
+            | "agent.logs"
+            | "agent.skills"
+            | "agent.bundle_root"
+            | "agent.bundle"
+            | "agent.skillBody"
+            | "scope.skills"
+            | "channel.id"
+            | "channel.root"
+            | "channel.shared"
+            | "channel.sharedArtifacts"
+            | "thread.id"
+            | "trigger.id"
+            | "trigger.actor_id"
+            | "reply.target"
+            | "prompt.activeSkill"
+    ) || name.starts_with("vars.")
+}
+
+fn is_known_prompt_part(key: &str) -> bool {
+    matches!(
+        key,
+        "trigger_prefix"
+            | "actor_context"
+            | "bootstrap_memory"
+            | "scope_bootstrap"
+            | "turn_memory"
+            | "runtime_context"
+            | "latest_message"
+            | "assignment_context"
+            | "turn_input"
+            | "user_message"
+    )
 }
 
 fn prompt_references_in_mode(mode: &ProviderModeSpec) -> HashSet<String> {
@@ -1545,6 +1841,154 @@ mod tests {
             outputs.get("system").map(String::as_str),
             Some("actor context\n\n{json:keep}")
         );
+    }
+
+    #[test]
+    fn render_title_controls_prompt_part_headings() {
+        let parts = vec![PromptPart {
+            key: "actor_context".into(),
+            title: "System: Loom actor context".into(),
+            content: "You are @demo.".into(),
+            role_hint: crate::adapter::PromptRoleHint::System,
+        }];
+        let outputs = render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                outputs: BTreeMap::from([
+                    (
+                        "with_title".into(),
+                        ProviderPromptOutputSpec {
+                            include: vec!["actor_context".into()],
+                            render_title: Some(ProviderRenderTitle::Always),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "raw".into(),
+                        ProviderPromptOutputSpec {
+                            include: vec!["actor_context".into()],
+                            render_title: Some(ProviderRenderTitle::Never),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            }),
+            &parts,
+            "full prompt",
+        )
+        .expect("outputs");
+
+        assert_eq!(
+            outputs.get("with_title").map(String::as_str),
+            Some("=== System: Loom actor context ===\nYou are @demo.")
+        );
+        assert_eq!(
+            outputs.get("raw").map(String::as_str),
+            Some("You are @demo.")
+        );
+    }
+
+    #[test]
+    fn render_title_always_does_not_duplicate_existing_heading() {
+        let parts = vec![PromptPart {
+            key: "actor_context".into(),
+            title: "System: Loom actor context".into(),
+            content: "=== System: Loom actor context ===\nYou are @demo.".into(),
+            role_hint: crate::adapter::PromptRoleHint::System,
+        }];
+        let outputs = render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                outputs: BTreeMap::from([(
+                    "system".into(),
+                    ProviderPromptOutputSpec {
+                        template: Some("{actor_context}".into()),
+                        render_title: Some(ProviderRenderTitle::Always),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &parts,
+            "full prompt",
+        )
+        .expect("outputs");
+
+        assert_eq!(
+            outputs.get("system").map(String::as_str),
+            Some("=== System: Loom actor context ===\nYou are @demo.")
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_command_mode_without_prompt_delivery() {
+        let manifest = manifest(
+            "no_prompt",
+            "No Prompt",
+            &["no-prompt"],
+            BTreeMap::from([(
+                "print".into(),
+                mode("{bin}", vec![lit("run")], full_prompt(), "text", None),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("missing prompt should fail");
+        assert!(err.contains("must pass one prompt output"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unknown_template_variable() {
+        let manifest = manifest(
+            "bad_var",
+            "Bad Var",
+            &["bad-var"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}"), lit("{unknown.var}")],
+                    full_prompt(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("unknown variable should fail");
+        assert!(
+            err.contains("unknown template variable `unknown.var`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unknown_prompt_part_reference() {
+        let manifest = manifest(
+            "bad_part",
+            "Bad Part",
+            &["bad-part"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    ProviderPromptSpec {
+                        outputs: BTreeMap::from([(
+                            "full".into(),
+                            ProviderPromptOutputSpec {
+                                include: vec!["actor_context".into(), "identity".into()],
+                                ..Default::default()
+                            },
+                        )]),
+                    },
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("unknown part should fail");
+        assert!(err.contains("unknown prompt part `identity`"), "{err}");
     }
 
     #[test]

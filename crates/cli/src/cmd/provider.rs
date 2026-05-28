@@ -20,30 +20,40 @@ pub fn validate(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn add(path: PathBuf) -> Result<()> {
+pub fn add(path: PathBuf, replace: bool) -> Result<()> {
     let (manifest, raw) = read_and_resolve_manifest_file(&path)?;
     let registry = ProviderRegistry::load(&config::config_dir()).map_err(|err| anyhow!(err))?;
-    if registry.get(&manifest.id).is_some() {
-        return Err(anyhow!(
-            "provider `{}` already exists; use a new id and extends for local variants",
-            manifest.id
-        ));
-    }
     let dir = providers_dir(&config::config_dir());
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create provider dir {}", dir.display()))?;
     let target = dir.join(format!("{}.json", manifest.id));
+    let target_exists = target.exists();
+    if registry.get(&manifest.id).is_some() && !(replace && target_exists) {
+        return Err(anyhow!(
+            "provider `{}` already exists; use --replace only for existing local provider manifests, or use a new id with extends for local variants",
+            manifest.id
+        ));
+    }
+    if target_exists && !replace {
+        return Err(anyhow!(
+            "local provider `{}` already exists at {}; pass --replace to overwrite",
+            manifest.id,
+            target.display()
+        ));
+    }
     let text = serde_json::to_string_pretty(&raw).context("serialize provider manifest")?;
     std::fs::write(&target, text)
         .with_context(|| format!("write provider manifest {}", target.display()))?;
     if render::is_json() {
         render::print_json(&json!({
             "ok": true,
+            "replaced": target_exists,
             "path": target.display().to_string(),
             "provider": provider_summary(&manifest, false, None),
         }));
     } else {
-        println!("added provider {} -> {}", manifest.id, target.display());
+        let verb = if target_exists { "replaced" } else { "added" };
+        println!("{verb} provider {} -> {}", manifest.id, target.display());
     }
     Ok(())
 }

@@ -2452,14 +2452,6 @@ pub struct AgentSpec {
     /// template variables / env injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<AgentBundleSpec>,
-    /// Legacy per-actor persona configuration. New providerRef-based specs
-    /// should not set this; use actor metadata and prompt parts instead. When
-    /// present, the runtime
-    /// loads the referenced markdown files from `{agent.profile}` and injects
-    /// them as labeled prompt sections on **every** turn. Absent means "no
-    /// persona injection" and preserves pre-persona behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<IdentitySpec>,
     /// Optional per-actor memory configuration. Defines where records live
     /// under `{agent.profile}/memory/`, how they are selected each turn, and
     /// how they reach the agent (prompt section and/or MCP bridge).
@@ -2643,64 +2635,6 @@ pub enum BundleInstallMode {
     #[default]
     Copy,
     Symlink,
-}
-
-// ---- legacy profile identity ----
-
-/// Legacy persona config: which markdown files under `{agent.profile}` carry
-/// old role/style text. New providerRef-based agents should use actor metadata
-/// plus prompt parts instead of setting this field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentitySpec {
-    #[serde(default)]
-    pub files: IdentityFiles,
-    /// Optional short role description used when scaffolding a missing
-    /// identity file. Existing files are never overwritten.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Optional first-run file contents for `identity.md` / `soul.md`.
-    /// Existing files still win, so operators can edit profiles safely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scaffold: Option<IdentityScaffoldSpec>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityScaffoldSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub soul: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityFiles {
-    /// Markdown path relative to `{agent.profile}` (or absolute). Default
-    /// `identity.md`.
-    #[serde(default = "default_identity_file")]
-    pub identity: String,
-    /// Markdown path relative to `{agent.profile}` (or absolute). Default
-    /// `soul.md`.
-    #[serde(default = "default_soul_file")]
-    pub soul: String,
-}
-
-impl Default for IdentityFiles {
-    fn default() -> Self {
-        Self {
-            identity: default_identity_file(),
-            soul: default_soul_file(),
-        }
-    }
-}
-
-fn default_identity_file() -> String {
-    "identity.md".into()
-}
-fn default_soul_file() -> String {
-    "soul.md".into()
 }
 
 // ---- memory ----

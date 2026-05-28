@@ -729,21 +729,7 @@ impl AgentPaths {
         std::fs::create_dir_all(&self.profile)?;
         std::fs::create_dir_all(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
-        if spec.identity.is_some() || spec.memory.is_some() {
-            let identity = spec.identity.as_ref();
-            let identity_file = identity
-                .map(|s| s.files.identity.as_str())
-                .unwrap_or("identity.md");
-            let soul_file = identity.map(|s| s.files.soul.as_str()).unwrap_or("soul.md");
-            let description = identity
-                .and_then(|s| s.description.as_deref())
-                .unwrap_or("");
-            let identity_seed = identity
-                .and_then(|s| s.scaffold.as_ref())
-                .and_then(|s| s.identity.as_deref());
-            let soul_seed = identity
-                .and_then(|s| s.scaffold.as_ref())
-                .and_then(|s| s.soul.as_deref());
+        if spec.memory.is_some() {
             let memory_root = spec
                 .memory
                 .as_ref()
@@ -752,14 +738,7 @@ impl AgentPaths {
             if let Err(e) =
                 agent_runtime::ensure_profile_scaffold(&agent_runtime::ProfileScaffold {
                     profile_dir: &self.profile,
-                    actor_id,
-                    display_name: &spec.actor.display_name,
-                    description,
-                    identity_file,
-                    soul_file,
                     memory_root,
-                    identity_seed,
-                    soul_seed,
                 })
             {
                 tracing::warn!(actor = %actor_id, %e, "failed to scaffold profile");
@@ -3677,10 +3656,9 @@ async fn compose_envelope_prompt(
         &user_text,
     );
 
-    let identity_spec = state.spec.identity.as_ref();
     let memory_spec = state.spec.memory.as_ref();
 
-    if identity_spec.is_none() && memory_spec.is_none() {
+    if memory_spec.is_none() {
         let mut sections = vec![agent_runtime::PromptSection {
             name: "actor_context",
             content: actor_context.clone(),
@@ -3716,7 +3694,6 @@ async fn compose_envelope_prompt(
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             actor_context: &actor_context,
             profile_dir: &state.profile_dir,
-            identity_spec,
             memory_spec,
             channel_id: channel_id.as_deref(),
             thread_context: &conversation_context,
@@ -3937,9 +3914,7 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
         title: prompt_section_title(section.name).to_string(),
         content: section.content.clone(),
         role_hint: match section.name {
-            "actor_context" | "identity" | "soul" | "bootstrap_memory" | "scope_bootstrap" => {
-                PromptRoleHint::System
-            }
+            "actor_context" | "bootstrap_memory" | "scope_bootstrap" => PromptRoleHint::System,
             _ => PromptRoleHint::User,
         },
     }
@@ -3948,8 +3923,6 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
 fn prompt_section_title(name: &str) -> &str {
     match name {
         "actor_context" => "System: Loom actor context",
-        "identity" => "System: Legacy profile identity",
-        "soul" => "System: Legacy profile soul",
         "bootstrap_memory" => "System: Bootstrap memory",
         "turn_memory" => "Context: Turn memory",
         "runtime_context" => "Context: Runtime context",
@@ -3981,8 +3954,6 @@ fn prompt_stats(text: &str) -> PromptStats {
 fn prompt_section_label(name: &str) -> &str {
     match name {
         "actor_context" => "Actor Context",
-        "identity" => "Legacy Identity",
-        "soul" => "Legacy Soul",
         "bootstrap_memory" => "Bootstrap Memory",
         "turn_memory" => "Turn Memory",
         "runtime_context" => "Runtime Context",
@@ -4897,7 +4868,6 @@ mod tests {
             autostart: false,
             models: None,
             bundle,
-            identity: None,
             memory: None,
             announcement: None,
             trigger: None,

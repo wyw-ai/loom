@@ -1369,35 +1369,64 @@ fn extract_decoder_final_text(
     decoder: Option<&ProviderDecoderSpec>,
     stdout: &str,
 ) -> Option<String> {
+    let decoder = decoder?;
     let reducer = decoder
-        .and_then(|decoder| decoder.reduce.as_ref())
+        .reduce
+        .as_ref()
         .and_then(|reduce| reduce.final_text.as_ref())?;
-    reduce_jsonl_text_with_fallback(stdout, reducer)
+    reduce_text_with_fallback(decoder.format.as_str(), stdout, reducer)
 }
 
 fn capture_decoder_session_id(
     decoder: Option<&ProviderDecoderSpec>,
     stdout: &str,
 ) -> Option<String> {
+    let decoder = decoder?;
     let reducer = decoder
-        .and_then(|decoder| decoder.capture.as_ref())
+        .capture
+        .as_ref()
         .and_then(|capture| capture.session.as_ref())?;
-    reduce_jsonl_text_with_fallback(stdout, reducer)
+    reduce_text_with_fallback(decoder.format.as_str(), stdout, reducer)
 }
 
-fn reduce_jsonl_text_with_fallback(
+fn reduce_text_with_fallback(
+    format: &str,
     stdout: &str,
     reducer: &ProviderJsonlTextReducerSpec,
 ) -> Option<String> {
-    reduce_jsonl_text(stdout, reducer).or_else(|| {
+    reduce_text(format, stdout, reducer).or_else(|| {
         reducer
             .fallback
             .as_deref()
-            .and_then(|fallback| reduce_jsonl_text_with_fallback(stdout, fallback))
+            .and_then(|fallback| reduce_text_with_fallback(format, stdout, fallback))
     })
 }
 
+fn reduce_text(
+    format: &str,
+    stdout: &str,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Option<String> {
+    if format.trim() == "json" {
+        let root = serde_json::from_str::<Value>(stdout).ok()?;
+        return reduce_json_values(std::iter::once(root), reducer);
+    }
+    reduce_jsonl_text(stdout, reducer)
+}
+
 fn reduce_jsonl_text(stdout: &str, reducer: &ProviderJsonlTextReducerSpec) -> Option<String> {
+    reduce_json_values(
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
+        reducer,
+    )
+}
+
+fn reduce_json_values(
+    values: impl IntoIterator<Item = Value>,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Option<String> {
     let mode = reducer.mode.trim();
     let path = reducer.path.trim();
     if path.is_empty() {
@@ -1405,11 +1434,7 @@ fn reduce_jsonl_text(stdout: &str, reducer: &ProviderJsonlTextReducerSpec) -> Op
     }
     let mut last: Option<String> = None;
     let mut concat = String::new();
-    for line in stdout.lines() {
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for v in values {
         if !reducer
             .when
             .as_ref()
@@ -2085,7 +2110,7 @@ fn _arc_keepalive(_: Arc<CommandAdapter>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::methods::ProviderDecoderEventSpec;
+    use proto::methods::{ProviderDecoderEventSpec, ProviderJsonlReduceSpec};
     use proto::types::ScopeKind;
 
     fn cfg() -> CommandConfig {
@@ -2616,8 +2641,64 @@ mod tests {
         let stdout = r#"{"items":[{"text":"hello "},{"text":"world"}]}"#;
 
         assert_eq!(
-            reduce_jsonl_text_with_fallback(stdout, &reducer),
+            reduce_text_with_fallback("jsonl", stdout, &reducer),
             Some("hello world".into())
+        );
+    }
+
+    #[test]
+    fn provider_json_decoder_reads_pretty_json_final_text() {
+        let decoder = ProviderDecoderSpec {
+            format: "json".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: Some(ProviderJsonlReduceSpec {
+                final_text: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.result.message".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+            capture: None,
+        };
+        let stdout = r#"{
+  "result": {
+    "message": "JSON answer"
+  }
+}"#;
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&decoder), stdout),
+            Some("JSON answer".into())
+        );
+    }
+
+    #[test]
+    fn provider_json_decoder_captures_session_from_pretty_json() {
+        let decoder = ProviderDecoderSpec {
+            format: "json".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.meta.session_id".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+        };
+        let stdout = r#"{
+  "meta": {
+    "session_id": "sid_json"
+  }
+}"#;
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&decoder), stdout),
+            Some("sid_json".into())
         );
     }
 

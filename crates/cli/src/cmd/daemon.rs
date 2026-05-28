@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{
-    apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
-    AgentDefinition, AgentProviderOverride, DetectedAgentProvider,
+    detect_agent_cli_providers, provider_specs_from_agent_definitions, AgentDefinition,
+    DetectedAgentProvider,
 };
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{method, AgentModelSpec, AgentProviderRef, AgentSpec, AgentTransport};
@@ -56,7 +56,7 @@ pub async fn run(
         &server_url,
     )
     .await?;
-    let providers = apply_provider_overrides(detected_providers, &machine.providers);
+    let providers = detected_providers;
     let migrated_legacy_agents =
         migrate_legacy_machine_agents_to_specs(&mut cfg, &machine.id, &providers)?;
     if repaired_desktop_config || restored_machine_config || migrated_legacy_agents {
@@ -320,10 +320,7 @@ fn load_machine_specs(
     };
     let (machine_index, restored) =
         ensure_selected_machine_config(&mut cfg, selected_machine_id, selected_machine)?;
-    let providers = apply_provider_overrides(
-        detect_agent_cli_providers(),
-        &cfg.machines[machine_index].providers,
-    );
+    let providers = detect_agent_cli_providers();
     let migrated_legacy_agents =
         migrate_legacy_machine_agents_at_index_to_specs(&mut cfg, machine_index, &providers)?;
     if repaired || restored_context || restored || migrated_legacy_agents {
@@ -911,10 +908,7 @@ fn apply_machine_command(
 
     match op {
         "agent.create" => {
-            let providers = apply_provider_overrides(
-                detect_agent_cli_providers(),
-                &cfg.machines[machine_index].providers,
-            );
+            let providers = detect_agent_cli_providers();
             let spec = agent_spec_from_command(command, selected_machine_id, &providers)?;
             if cfg.machines[machine_index]
                 .agents
@@ -944,10 +938,7 @@ fn apply_machine_command(
         }
         "agent.update" => {
             let actor_id = required_str(command, "actorId")?;
-            let providers = apply_provider_overrides(
-                detect_agent_cli_providers(),
-                &cfg.machines[machine_index].providers,
-            );
+            let providers = detect_agent_cli_providers();
             if let Some(spec) = load_config_agent_spec(actor_id)? {
                 let spec = update_agent_spec_from_command(spec, command, &providers)?;
                 let path = write_config_agent_spec(&spec)?;
@@ -1184,8 +1175,6 @@ struct MachineConfig {
     kind: String,
     #[serde(default)]
     data_root: String,
-    #[serde(default)]
-    providers: Vec<AgentProviderOverride>,
     #[serde(default)]
     agents: Vec<MachineAgentConfig>,
 }
@@ -1507,7 +1496,6 @@ fn select_machine(cfg: &DesktopConfig, requested: Option<&str>) -> Result<Machin
                 name: "Local Machine".into(),
                 kind: default_machine_kind(),
                 data_root: default_agent_data_root_expr(),
-                providers: Vec::new(),
                 agents: Vec::new(),
             })
         })
@@ -1565,7 +1553,6 @@ async fn recover_machine_from_server_inventory(
             name: inventory.name,
             kind: inventory.kind,
             data_root: home_path_expr(Path::new(&inventory.data_root)),
-            providers: Vec::new(),
             agents: Vec::new(),
         }));
     }
@@ -1610,7 +1597,6 @@ fn synthesize_requested_machine(
             .unwrap_or_else(|| "Local Machine".into()),
         kind: default_machine_kind(),
         data_root: home_path_expr(data_root),
-        providers: Vec::new(),
         agents: Vec::new(),
     }
 }
@@ -1849,10 +1835,6 @@ fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineC
         machine.data_root = fallback.data_root.clone();
         changed = true;
     }
-    if machine.providers.is_empty() && !fallback.providers.is_empty() {
-        machine.providers = fallback.providers.clone();
-        changed = true;
-    }
     changed
 }
 
@@ -1960,7 +1942,6 @@ mod tests {
             name: id.into(),
             kind: default_machine_kind(),
             data_root: String::new(),
-            providers: Vec::new(),
             agents: Vec::new(),
         }
     }
@@ -2275,7 +2256,6 @@ mod tests {
             name: "Remote".into(),
             kind: default_machine_kind(),
             data_root: "~/.agentx/machines/ws_remote/actor_human_368136/local".into(),
-            providers: Vec::new(),
             agents: vec![MachineAgentConfig {
                 provider_id: "claude".into(),
                 actor_id: "actor_agent_claude_1".into(),
@@ -2333,7 +2313,6 @@ mod tests {
             name: "Server A Machine".into(),
             kind: default_machine_kind(),
             data_root: "~/.agentx/machines/ws_server_a/actor_human_368136/local".into(),
-            providers: Vec::new(),
             agents: Vec::new(),
         };
         let mut cfg = DesktopConfig {

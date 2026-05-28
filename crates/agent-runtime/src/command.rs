@@ -34,8 +34,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use proto::methods::{
-    CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderDecoderSpec,
-    ProviderJsonConditionSpec, ProviderJsonlTextReducerSpec, ProviderPromptSpec,
+    CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderDecoderEmitSpec,
+    ProviderDecoderSpec, ProviderJsonConditionSpec, ProviderJsonlTextReducerSpec,
+    ProviderPromptSpec,
 };
 use proto::types::ScopeRef;
 use serde_json::Value;
@@ -568,6 +569,7 @@ fn spawn_and_collect(
 
     let mut collected_stdout = String::new();
     let mut emitted_text = false;
+    let mut emitted_finish = false;
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
@@ -584,7 +586,9 @@ fn spawn_and_collect(
     loop {
         while let Ok(line) = stdout_rx.try_recv() {
             last_stdout_at = Instant::now();
-            emitted_text |= collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+            let events = collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+            emitted_text |= events.emitted_text;
+            emitted_finish |= events.emitted_finish;
         }
 
         if let Some(status) = child
@@ -636,8 +640,9 @@ fn spawn_and_collect(
         match stdout_rx.recv_timeout(wait_for) {
             Ok(line) => {
                 last_stdout_at = Instant::now();
-                emitted_text |=
-                    collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+                let events = collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+                emitted_text |= events.emitted_text;
+                emitted_finish |= events.emitted_finish;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -654,7 +659,9 @@ fn spawn_and_collect(
     };
     let _ = stdout_handle.join();
     for line in stdout_rx.try_iter() {
-        emitted_text |= collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+        let events = collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+        emitted_text |= events.emitted_text;
+        emitted_finish |= events.emitted_finish;
     }
     let collected_stderr = stderr_handle.join().unwrap_or_default();
     let exit_code = exit.code().unwrap_or(-1);
@@ -743,12 +750,14 @@ fn spawn_and_collect(
     }
     let usage = extract_token_usage_from_text(&collected_stdout)
         .or_else(|| extract_token_usage_from_text(&collected_stderr));
-    let _ = sender.send(AdapterEvent::Finished {
-        scope: Some(prompt.scope.clone()),
-        success,
-        summary,
-        usage,
-    });
+    if !emitted_finish || !success {
+        let _ = sender.send(AdapterEvent::Finished {
+            scope: Some(prompt.scope.clone()),
+            success,
+            summary,
+            usage,
+        });
+    }
 
     Ok(SpawnOutcome {
         exit_code,
@@ -771,20 +780,28 @@ fn collect_stdout_line(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     line: &str,
     collected_stdout: &mut String,
-) -> bool {
+) -> OutputLineEvents {
     collected_stdout.push_str(line);
     let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(events) =
+        translate_decoder_event_line(cfg.decoder.as_ref(), parsed_line, &prompt.scope, sender)
+    {
+        return events;
+    }
     match cfg.output_format {
-        CommandOutputFormat::NdjsonLines => {
-            translate_ndjson_line(parsed_line, &prompt.scope, sender)
-        }
-        CommandOutputFormat::ClaudeStreamJson => {
-            translate_claude_stream_line(parsed_line, &prompt.scope, sender)
-        }
-        CommandOutputFormat::CodexStreamJson => {
-            translate_codex_event_line(parsed_line, &prompt.scope, sender)
-        }
-        CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => false,
+        CommandOutputFormat::NdjsonLines => OutputLineEvents {
+            emitted_text: translate_ndjson_line(parsed_line, &prompt.scope, sender),
+            emitted_finish: false,
+        },
+        CommandOutputFormat::ClaudeStreamJson => OutputLineEvents {
+            emitted_text: translate_claude_stream_line(parsed_line, &prompt.scope, sender),
+            emitted_finish: false,
+        },
+        CommandOutputFormat::CodexStreamJson => OutputLineEvents {
+            emitted_text: translate_codex_event_line(parsed_line, &prompt.scope, sender),
+            emitted_finish: false,
+        },
+        CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => OutputLineEvents::default(),
     }
 }
 
@@ -800,6 +817,150 @@ fn truncate_for_summary(s: &str) -> String {
 }
 
 // ---------------- output_format translators ----------------
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputLineEvents {
+    emitted_text: bool,
+    emitted_finish: bool,
+}
+
+fn translate_decoder_event_line(
+    decoder: Option<&ProviderDecoderSpec>,
+    line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> Option<OutputLineEvents> {
+    let decoder = decoder?;
+    if decoder.events.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    let mut events = OutputLineEvents::default();
+    for event in &decoder.events {
+        if !event
+            .when
+            .as_ref()
+            .map(|condition| json_condition_matches(&v, condition))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let emitted = emit_decoder_event(&event.emit, &v, scope, sender);
+        events.emitted_text |= emitted.emitted_text;
+        events.emitted_finish |= emitted.emitted_finish;
+    }
+    Some(events)
+}
+
+fn emit_decoder_event(
+    emit: &ProviderDecoderEmitSpec,
+    root: &Value,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    match emit.emit_type.as_str() {
+        "text" => {
+            let Some(content) = emit
+                .text
+                .as_deref()
+                .and_then(|template| decoder_template_value(root, template))
+            else {
+                return OutputLineEvents::default();
+            };
+            let _ = sender.send(AdapterEvent::Text {
+                scope: Some(scope.clone()),
+                content,
+                is_partial: emit.partial.unwrap_or(true),
+            });
+            OutputLineEvents {
+                emitted_text: true,
+                emitted_finish: false,
+            }
+        }
+        "tool_use" | "toolUse" | "tool" => {
+            let tool_name = emit
+                .tool_name
+                .as_deref()
+                .and_then(|template| decoder_template_value(root, template))
+                .unwrap_or_default();
+            let input = emit
+                .input
+                .as_deref()
+                .and_then(|template| decoder_template_json_value(root, template))
+                .unwrap_or(Value::Null);
+            let _ = sender.send(AdapterEvent::ToolUse {
+                scope: Some(scope.clone()),
+                tool_name,
+                input,
+            });
+            OutputLineEvents::default()
+        }
+        "status" => {
+            if let Some(status) = emit
+                .status
+                .as_deref()
+                .or(emit.text.as_deref())
+                .and_then(|template| decoder_template_value(root, template))
+            {
+                let _ = sender.send(AdapterEvent::StatusChange {
+                    scope: Some(scope.clone()),
+                    status,
+                });
+            }
+            OutputLineEvents::default()
+        }
+        "error" => {
+            let message = emit
+                .message
+                .as_deref()
+                .or(emit.text.as_deref())
+                .and_then(|template| decoder_template_value(root, template))
+                .unwrap_or_else(|| "provider error frame".into());
+            let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
+                message,
+            });
+            OutputLineEvents::default()
+        }
+        "finish" | "finished" => {
+            let summary = emit
+                .summary
+                .as_deref()
+                .or(emit.message.as_deref())
+                .and_then(|template| decoder_template_value(root, template))
+                .unwrap_or_default();
+            let _ = sender.send(AdapterEvent::Finished {
+                scope: Some(scope.clone()),
+                success: emit.success.unwrap_or(true),
+                summary,
+                usage: None,
+            });
+            OutputLineEvents {
+                emitted_text: false,
+                emitted_finish: true,
+            }
+        }
+        _ => OutputLineEvents::default(),
+    }
+}
+
+fn decoder_template_value(root: &Value, template: &str) -> Option<String> {
+    if template.starts_with('$') || template.starts_with('.') {
+        json_path_lookup(root, template)
+    } else {
+        Some(template.to_string())
+    }
+}
+
+fn decoder_template_json_value(root: &Value, template: &str) -> Option<Value> {
+    if template.starts_with('$') || template.starts_with('.') {
+        json_path_lookup_value(root, template).cloned()
+    } else {
+        serde_json::from_str(template)
+            .ok()
+            .or_else(|| Some(Value::String(template.to_string())))
+    }
+}
 
 fn translate_ndjson_line(
     line: &str,
@@ -1698,6 +1859,7 @@ fn _arc_keepalive(_: Arc<CommandAdapter>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::methods::ProviderDecoderEventSpec;
     use proto::types::ScopeKind;
 
     fn cfg() -> CommandConfig {
@@ -1836,6 +1998,161 @@ mod tests {
     fn json_path_missing_returns_none() {
         let v: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
         assert!(json_path_lookup(&v, ".b").is_none());
+    }
+
+    #[test]
+    fn provider_jsonl_events_emit_text_status_tool_error_and_finish() {
+        let decoder = ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: vec![
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("text".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "text".into(),
+                        text: Some("$.text".into()),
+                        partial: Some(false),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("status".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "status".into(),
+                        status: Some("$.status".into()),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("tool".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "tool_use".into(),
+                        tool_name: Some("$.name".into()),
+                        input: Some("$.input".into()),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("error".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "error".into(),
+                        message: Some("$.message".into()),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("done".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "finish".into(),
+                        success: Some(true),
+                        summary: Some("$.summary".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+            reduce: None,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let scope = scope();
+
+        let text = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"text","text":"hello"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("text events");
+        let status = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"status","status":"working"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("status events");
+        let tool = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"tool","name":"shell","input":{"cmd":"ls"}}"#,
+            &scope,
+            &tx,
+        )
+        .expect("tool events");
+        let error = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"error","message":"bad"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("error events");
+        let finish = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"done","summary":"ok"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("finish events");
+
+        assert!(text.emitted_text);
+        assert!(!status.emitted_text && !tool.emitted_text && !error.emitted_text);
+        assert!(finish.emitted_finish);
+
+        let mut rx = rx;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            &events[0],
+            AdapterEvent::Text {
+                content,
+                is_partial: false,
+                ..
+            } if content == "hello"
+        ));
+        assert!(matches!(
+            &events[1],
+            AdapterEvent::StatusChange { status, .. } if status == "working"
+        ));
+        assert!(matches!(
+            &events[2],
+            AdapterEvent::ToolUse {
+                tool_name,
+                input,
+                ..
+            } if tool_name == "shell" && input.pointer("/cmd").and_then(Value::as_str) == Some("ls")
+        ));
+        assert!(matches!(
+            &events[3],
+            AdapterEvent::Error { message, .. } if message == "bad"
+        ));
+        assert!(matches!(
+            &events[4],
+            AdapterEvent::Finished {
+                success: true,
+                summary,
+                ..
+            } if summary == "ok"
+        ));
     }
 
     #[test]

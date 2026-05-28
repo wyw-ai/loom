@@ -9,7 +9,7 @@ use loom_cli::{cmd, config, daemon_ipc, render};
 #[derive(Parser, Debug)]
 #[command(name = "loom", about = "Loom multi-actor collaboration CLI")]
 struct Args {
-    /// Override the configured server URL (defaults to ws://127.0.0.1:18888/rpc).
+    /// Override the configured server URL (defaults to ws://127.0.0.1:7878/rpc).
     #[arg(long, global = true, env = "LOOM_SERVER")]
     server: Option<String>,
     /// Override the configured local actor id.

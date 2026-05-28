@@ -3784,12 +3784,14 @@ fn apply_trigger_prefix_to_prompt(
     let Some(prefix) = trigger_prefix.or_else(|| trigger_prefix_for_turn(spec, first_turn)) else {
         return prompt;
     };
-    if prompt.content.starts_with(prefix)
-        || prompt
-            .parts
-            .iter()
-            .any(|part| part.key == "user_message" && part.content.starts_with(prefix))
-    {
+    let has_user_message_part = prompt.parts.iter().any(|part| part.key == "user_message");
+    let already_prefixed = prompt
+        .parts
+        .iter()
+        .any(|part| part.key == "user_message" && part.content.starts_with(prefix))
+        || (!has_user_message_part && prompt.content.starts_with(prefix));
+    if already_prefixed {
+        ensure_trigger_prefix_prompt_part(&mut prompt, prefix);
         return prompt;
     }
 
@@ -3809,6 +3811,7 @@ fn apply_trigger_prefix_to_prompt(
         prompt.content = format!("{prefix}{}", prompt.content);
     }
     prompt.stats = prompt_stats(&prompt.content);
+    ensure_trigger_prefix_prompt_part(&mut prompt, prefix);
 
     let stats = prompt_stats(prefix);
     prompt.breakdown.sections.insert(
@@ -3824,6 +3827,26 @@ fn apply_trigger_prefix_to_prompt(
     );
     recalculate_prompt_breakdown_percentages(&mut prompt.breakdown.sections);
     prompt
+}
+
+fn ensure_trigger_prefix_prompt_part(prompt: &mut PromptTelemetry, prefix: &str) {
+    if prefix.trim().is_empty() || prompt.parts.iter().any(|part| part.key == "trigger_prefix") {
+        return;
+    }
+    let index = prompt
+        .parts
+        .iter()
+        .position(|part| part.key == "user_message")
+        .unwrap_or(prompt.parts.len());
+    prompt.parts.insert(
+        index,
+        PromptPart {
+            key: "trigger_prefix".to_string(),
+            title: prompt_section_title("trigger_prefix").to_string(),
+            content: prefix.to_string(),
+            role_hint: PromptRoleHint::User,
+        },
+    );
 }
 
 fn trigger_prompt_prefix_from_trigger(trigger: &AgentTrigger) -> Option<&str> {
@@ -3993,6 +4016,7 @@ fn prompt_section_title(name: &str) -> &str {
         "turn_memory" => "Context: Turn memory",
         "runtime_context" => "Context: Runtime context",
         "scope_bootstrap" => "System: Loom multi-actor context",
+        "trigger_prefix" => "Trigger prefix",
         "latest_message" => "Latest Loom message",
         "assignment_context" => "Loom assignment context",
         "turn_input" => "Turn input",
@@ -4027,6 +4051,10 @@ fn prompt_section_label(name: &str) -> &str {
         "turn_memory" => "Turn Memory",
         "runtime_context" => "Runtime Context",
         "scope_bootstrap" => "Scope Bootstrap",
+        "trigger_prefix" => "Trigger Prefix",
+        "latest_message" => "Latest Message",
+        "assignment_context" => "Assignment Context",
+        "turn_input" => "Turn Input",
         "user_message" => "Latest Message",
         other => other,
     }
@@ -4944,7 +4972,8 @@ async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Res
 mod tests {
     use super::*;
     use proto::methods::{
-        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentProviderRef, TriggerSpec,
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentProviderRef,
+        ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
@@ -6005,6 +6034,13 @@ mod tests {
 
         assert!(prompt.content.starts_with("/router\n=== User message ==="));
         assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
+        let keys = prompt
+            .parts
+            .iter()
+            .map(|part| part.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["trigger_prefix", "user_message"]);
+        assert_eq!(prompt.parts[0].content, "/router\n");
     }
 
     #[test]
@@ -6027,6 +6063,60 @@ mod tests {
             .starts_with("/review [loom]\n=== User message ==="));
         assert!(!prompt.content.starts_with("/router\n"));
         assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
+        assert_eq!(
+            prompt
+                .parts
+                .iter()
+                .find(|part| part.key == "trigger_prefix")
+                .map(|part| part.content.as_str()),
+            Some("/review [loom]\n")
+        );
+    }
+
+    #[test]
+    fn trigger_prefix_part_can_be_composed_by_provider_prompt_outputs() {
+        let mut spec = sample_spec(None);
+        spec.trigger = Some(TriggerSpec {
+            trigger_prompt_prefix: "/router\n".into(),
+            apply_on: TriggerPrefixApplyOn::EveryTurn,
+        });
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "=== User message ===\nignored".into(),
+        }];
+        let prompt = apply_trigger_prefix_to_prompt(
+            &spec,
+            prompt_telemetry(sections[0].content.clone(), &sections),
+            false,
+            None,
+        );
+        let mut prompt = prompt;
+        let trigger_prompt = TriggerPromptText {
+            latest_message: "latest".into(),
+            assignment_context: String::new(),
+            turn_input: "latest".into(),
+        };
+        add_turn_input_prompt_parts(&mut prompt, &trigger_prompt, &trigger_prompt.turn_input);
+
+        let outputs = agent_runtime::provider::render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                outputs: BTreeMap::from([(
+                    "custom_user".into(),
+                    ProviderPromptOutputSpec {
+                        template: Some("{trigger_prefix}{turn_input}".into()),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &prompt.parts,
+            &prompt.content,
+        )
+        .expect("render provider prompt outputs");
+
+        assert_eq!(
+            outputs.get("custom_user").map(String::as_str),
+            Some("/router\nlatest")
+        );
     }
 
     #[test]

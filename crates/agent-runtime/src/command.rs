@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use crate::provider::ProviderRuntimeEvent;
 use crate::usage::extract_token_usage_from_text;
 
 #[cfg(unix)]
@@ -939,25 +940,6 @@ fn truncate_for_summary(s: &str) -> String {
 struct OutputLineEvents {
     emitted_text: bool,
     emitted_finish: bool,
-}
-
-#[derive(Debug, Clone)]
-enum ProviderRuntimeEvent {
-    Text { content: String, is_partial: bool },
-    ToolUse { tool_name: String, input: Value },
-    Status { status: String },
-    Error { message: String },
-    Finished { success: bool, summary: String },
-    Session { session_id: String },
-}
-
-impl ProviderRuntimeEvent {
-    fn into_session_id(self) -> Option<String> {
-        match self {
-            ProviderRuntimeEvent::Session { session_id } => Some(session_id),
-            _ => None,
-        }
-    }
 }
 
 fn emit_provider_runtime_events(

@@ -18,7 +18,7 @@ impl Default for Config {
     fn default() -> Self {
         let suffix = Uuid::new_v4().simple().to_string()[..8].to_string();
         Self {
-            server_url: "ws://127.0.0.1:18888/rpc".into(),
+            server_url: "ws://127.0.0.1:7878/rpc".into(),
             actor_id: format!("actor_human_{}", suffix),
             display_name: whoami_or("you"),
         }

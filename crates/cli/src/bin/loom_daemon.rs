@@ -6,7 +6,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "loom-daemon", about = "Loom machine-scoped agent host")]
 struct Args {
-    /// Override the configured server URL (defaults to ws://127.0.0.1:18888/rpc).
+    /// Override the configured server URL (defaults to ws://127.0.0.1:7878/rpc).
     #[arg(long, env = "LOOM_SERVER")]
     server: Option<String>,
     /// Machine id from the desktop machine config. Defaults to the active

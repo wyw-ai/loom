@@ -1058,7 +1058,7 @@ fn resolve_daemon_server_url(cfg: &mut DaemonConfig, server_url: Option<&str>) -
     let selected = server_url
         .and_then(trimmed_non_empty)
         .or_else(|| trimmed_non_empty(&cfg.server_url))
-        .unwrap_or("ws://127.0.0.1:18888/rpc")
+        .unwrap_or("ws://127.0.0.1:7878/rpc")
         .to_string();
     let changed = cfg.server_url != selected;
     if changed {
@@ -1325,7 +1325,7 @@ mod tests {
     #[test]
     fn daemon_config_roundtrip_preserves_single_machine_only() {
         let cfg = DaemonConfig {
-            server_url: "ws://127.0.0.1:18888/rpc".into(),
+            server_url: "ws://127.0.0.1:7878/rpc".into(),
             machine: Some(MachineConfig {
                 workspace_id: Some("ws_main".into()),
                 owner_actor_id: Some("actor_human_88084".into()),
@@ -1337,7 +1337,7 @@ mod tests {
         };
 
         let text = toml::to_string_pretty(&cfg).expect("serialize daemon config");
-        assert!(text.contains("serverUrl = \"ws://127.0.0.1:18888/rpc\""));
+        assert!(text.contains("serverUrl = \"ws://127.0.0.1:7878/rpc\""));
         assert!(text.contains("[machine]"));
         assert!(text.contains("name = \"CanfengMac\""));
         assert!(!text.contains("[[workspaces]]"));
@@ -1352,16 +1352,17 @@ mod tests {
 
     #[test]
     fn resolve_daemon_server_url_uses_arg_before_config() {
+        let custom_url = "ws://custom.test/rpc";
         let mut cfg = DaemonConfig {
-            server_url: "ws://old/rpc".into(),
+            server_url: "ws://127.0.0.1:7878/rpc".into(),
             machine: None,
         };
 
-        let (server_url, changed) = resolve_daemon_server_url(&mut cfg, Some("ws://new/rpc"));
+        let (server_url, changed) = resolve_daemon_server_url(&mut cfg, Some(custom_url));
 
         assert!(changed);
-        assert_eq!(server_url, "ws://new/rpc");
-        assert_eq!(cfg.server_url, "ws://new/rpc");
+        assert_eq!(server_url, custom_url);
+        assert_eq!(cfg.server_url, custom_url);
     }
 
     #[test]
@@ -1513,7 +1514,7 @@ mod tests {
     fn ensure_selected_machine_restores_cached_machine() {
         let selected = machine("machine_remote", Some("actor_human_1"));
         let mut cfg = DaemonConfig {
-            server_url: "ws://127.0.0.1:18888/rpc".into(),
+            server_url: "ws://127.0.0.1:7878/rpc".into(),
             machine: Some(machine("machine_default", Some("actor_human_1"))),
         };
 
@@ -1531,7 +1532,7 @@ mod tests {
     fn ensure_selected_machine_uses_existing_id_without_active_owner_check() {
         let selected = machine("machine_remote", Some("actor_human_1"));
         let mut cfg = DaemonConfig {
-            server_url: "ws://127.0.0.1:18888/rpc".into(),
+            server_url: "ws://127.0.0.1:7878/rpc".into(),
             machine: Some(machine("machine_remote", Some("actor_human_1"))),
         };
 

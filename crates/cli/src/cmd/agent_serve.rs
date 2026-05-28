@@ -1329,6 +1329,7 @@ fn test_command_transport() -> AgentTransport {
         kind: "command".into(),
         command: "echo".into(),
         args: Vec::new(),
+        arg_specs: Vec::new(),
         env: std::collections::BTreeMap::new(),
         auth_method: None,
         model: None,
@@ -5799,6 +5800,7 @@ mod tests {
             id_source: None,
             first_run_capture: Some("stdout_json:.session_id".into()),
             resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
+            resume_arg_specs: Vec::new(),
         });
         assert!(!command_transport_without_resume(&resumable));
 

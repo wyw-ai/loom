@@ -1825,6 +1825,11 @@ pub struct AgentTransport {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Provider-manifest argv template preserving conditional arg fragments.
+    /// When present, command runtime expands this instead of the legacy
+    /// string-only `args` + `modelArgs` bridge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "argSpecs")]
+    pub arg_specs: Vec<ProviderArgSpec>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1900,6 +1905,7 @@ impl Default for AgentTransport {
             kind: String::new(),
             command: String::new(),
             args: Vec::new(),
+            arg_specs: Vec::new(),
             env: std::collections::BTreeMap::new(),
             auth_method: None,
             model: None,
@@ -1923,6 +1929,7 @@ impl AgentTransport {
         self.kind.is_empty()
             && self.command.is_empty()
             && self.args.is_empty()
+            && self.arg_specs.is_empty()
             && self.env.is_empty()
             && self.auth_method.is_none()
             && self.model.is_none()
@@ -1959,6 +1966,15 @@ pub struct CommandSession {
     /// `{prompt}`. `None` means resume is not supported (each call is a first run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_args: Option<Vec<String>>,
+    /// Provider-manifest resume argv template preserving conditional arg
+    /// fragments. When present, command runtime expands this instead of
+    /// string-only `resumeArgs`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "resumeArgSpecs"
+    )]
+    pub resume_arg_specs: Vec<ProviderArgSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

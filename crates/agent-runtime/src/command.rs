@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use proto::methods::{
-    CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderDecoderEmitSpec,
-    ProviderDecoderSpec, ProviderJsonConditionSpec, ProviderJsonlTextReducerSpec,
-    ProviderPromptSpec,
+    CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderArgSpec,
+    ProviderDecoderEmitSpec, ProviderDecoderSpec, ProviderJsonConditionSpec,
+    ProviderJsonlTextReducerSpec, ProviderPromptSpec,
 };
 use proto::types::ScopeRef;
 use serde_json::Value;
@@ -67,6 +67,8 @@ pub struct CommandConfig {
     pub command: String,
     /// First-run argv (template — `{prompt}` may appear when `prompt_via=args`).
     pub args: Vec<String>,
+    /// Provider-manifest argv template preserving conditional fragments.
+    pub arg_specs: Vec<ProviderArgSpec>,
     pub env: BTreeMap<String, String>,
     /// Argv template appended when the prompt selects a model. `{model}` is
     /// expanded only after a non-empty selected model exists.
@@ -74,6 +76,7 @@ pub struct CommandConfig {
     pub session_id_source: Option<CommandSessionIdSource>,
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
+    pub resume_arg_specs: Vec<ProviderArgSpec>,
     pub output_format: CommandOutputFormat,
     pub decoder: Option<ProviderDecoderSpec>,
     pub prompt_via: PromptVia,
@@ -86,8 +89,9 @@ pub struct CommandConfig {
     pub timeout_ms: Option<u64>,
     /// Optional per-turn stdout idle timeout in milliseconds.
     pub idle_timeout_ms: Option<u64>,
-    /// Hash of `command` + `args` template (pre-expansion) — when the spec
-    /// changes the saved sessions are invalidated.
+    /// Hash of provider command/session templates before per-turn runtime
+    /// values are expanded. When the spec changes, saved sessions are
+    /// invalidated.
     pub command_signature: String,
 }
 
@@ -102,25 +106,52 @@ impl CommandConfig {
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(command.as_bytes());
-        for a in &args {
-            hasher.update(b"\x00");
-            hasher.update(a.as_bytes());
+        if spec.arg_specs.is_empty() {
+            for a in &args {
+                hasher.update(b"\x00arg\x00");
+                hasher.update(a.as_bytes());
+            }
+        } else {
+            hasher.update(b"\x00arg_specs\x00");
+            if let Ok(json) = serde_json::to_vec(&spec.arg_specs) {
+                hasher.update(json);
+            }
         }
         for a in &spec.model_args {
             hasher.update(b"\x00model_arg\x00");
             hasher.update(a.as_bytes());
         }
-        let command_signature = format!("sha256:{}", hex::encode(hasher.finalize()));
         let session = spec.session.clone();
+        if let Some(session) = session.as_ref() {
+            if session.resume_arg_specs.is_empty() {
+                if let Some(args) = session.resume_args.as_ref() {
+                    for a in args {
+                        hasher.update(b"\x00resume_arg\x00");
+                        hasher.update(a.as_bytes());
+                    }
+                }
+            } else {
+                hasher.update(b"\x00resume_arg_specs\x00");
+                if let Ok(json) = serde_json::to_vec(&session.resume_arg_specs) {
+                    hasher.update(json);
+                }
+            }
+        }
+        let command_signature = format!("sha256:{}", hex::encode(hasher.finalize()));
         Self {
             actor_id,
             command,
             args,
+            arg_specs: spec.arg_specs.clone(),
             env,
             model_args: spec.model_args.clone(),
             session_id_source: session.as_ref().and_then(|s| s.id_source),
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
+            resume_arg_specs: session
+                .as_ref()
+                .map(|s| s.resume_arg_specs.clone())
+                .unwrap_or_default(),
             output_format: spec.output_format.unwrap_or_default(),
             decoder: spec.decoder.clone(),
             prompt_via: spec.prompt_via,
@@ -341,10 +372,14 @@ fn run_prompt(
     };
 
     let (argv, is_first_run) = match (resume_session_id.as_deref(), cfg.resume_args.as_ref()) {
-        (Some(sid), Some(template)) => (
-            expand_argv(template, &cfg, &prompt, Some(sid), &content),
-            false,
-        ),
+        (Some(sid), Some(template)) => {
+            let argv = if cfg.resume_arg_specs.is_empty() {
+                expand_argv(template, &cfg, &prompt, Some(sid), &content)
+            } else {
+                expand_arg_specs(&cfg.resume_arg_specs, &cfg, &prompt, Some(sid), &content)
+            };
+            (argv, false)
+        }
         _ => (
             expand_first_run_argv(&cfg, &prompt, first_run_session_id.as_deref(), &content),
             true,
@@ -1545,13 +1580,30 @@ fn save_session(
 }
 
 fn command_signature_for_prompt(cfg: &CommandConfig, request: &AdapterPrompt) -> String {
-    let Some(model) = request.model.as_ref().filter(|m| !m.trim().is_empty()) else {
+    let model = request
+        .model
+        .as_ref()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty());
+    let reasoning_effort = request
+        .template_vars
+        .get("reasoningEffort")
+        .or_else(|| request.template_vars.get("reasoning_effort"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if model.is_none() && reasoning_effort.is_none() {
         return cfg.command_signature.clone();
     };
     let mut hasher = Sha256::new();
     hasher.update(cfg.command_signature.as_bytes());
-    hasher.update(b"\x00model\x00");
-    hasher.update(model.trim().as_bytes());
+    if let Some(model) = model {
+        hasher.update(b"\x00model\x00");
+        hasher.update(model.as_bytes());
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        hasher.update(b"\x00reasoning_effort\x00");
+        hasher.update(reasoning_effort.as_bytes());
+    }
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
@@ -1684,6 +1736,9 @@ fn expand_first_run_argv(
     session_id: Option<&str>,
     prompt: &str,
 ) -> Vec<String> {
+    if !cfg.arg_specs.is_empty() {
+        return expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
+    }
     let mut argv: Vec<String> = cfg
         .args
         .iter()
@@ -1718,6 +1773,58 @@ fn expand_first_run_argv(
         }
     }
     argv
+}
+
+fn expand_arg_specs(
+    specs: &[ProviderArgSpec],
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    append_arg_specs(&mut out, specs, cfg, request, session_id, prompt);
+    out
+}
+
+fn append_arg_specs(
+    out: &mut Vec<String>,
+    specs: &[ProviderArgSpec],
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) {
+    for spec in specs {
+        match spec {
+            ProviderArgSpec::Literal(value) => {
+                out.push(expand_template(value, cfg, request, session_id, prompt));
+            }
+            ProviderArgSpec::Conditional { when, args } => {
+                if arg_condition_matches(when, request) {
+                    append_arg_specs(out, args, cfg, request, session_id, prompt);
+                }
+            }
+        }
+    }
+}
+
+fn arg_condition_matches(when: &str, request: &AdapterPrompt) -> bool {
+    let when = when.trim();
+    if when == "model" {
+        return active_model(request).is_some();
+    }
+    if matches!(when, "reasoningEffort" | "reasoning_effort") {
+        return request
+            .template_vars
+            .get("reasoningEffort")
+            .or_else(|| request.template_vars.get("reasoning_effort"))
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    request
+        .template_vars
+        .get(when)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn expand_argv(
@@ -1888,11 +1995,13 @@ mod tests {
             actor_id: "actor_demo".into(),
             command: "echo".into(),
             args: vec!["-n".into()],
+            arg_specs: Vec::new(),
             env: BTreeMap::new(),
             model_args: Vec::new(),
             session_id_source: None,
             first_run_capture: None,
             resume_args: None,
+            resume_arg_specs: Vec::new(),
             output_format: CommandOutputFormat::Text,
             decoder: None,
             prompt_via: PromptVia::Args,
@@ -1948,6 +2057,19 @@ mod tests {
 
         assert_ne!(model_a, cfg.command_signature);
         assert_ne!(model_a, model_b);
+
+        request.model = None;
+        request
+            .template_vars
+            .insert("reasoningEffort".into(), "high".into());
+        let high = command_signature_for_prompt(&cfg, &request);
+        request
+            .template_vars
+            .insert("reasoningEffort".into(), "low".into());
+        let low = command_signature_for_prompt(&cfg, &request);
+
+        assert_ne!(high, cfg.command_signature);
+        assert_ne!(high, low);
     }
 
     #[test]
@@ -2000,6 +2122,75 @@ mod tests {
         let argv = expand_first_run_argv(&cfg, &prompt("hello"), None, "hello");
 
         assert_eq!(argv, vec!["-n".to_string(), "hello".to_string()]);
+    }
+
+    #[test]
+    fn provider_arg_specs_expand_conditionals_in_manifest_order() {
+        let mut cfg = cfg();
+        cfg.args = vec!["legacy".into()];
+        cfg.model_args = vec!["--legacy-model".into(), "{model}".into()];
+        cfg.arg_specs = vec![
+            ProviderArgSpec::Literal("run".into()),
+            ProviderArgSpec::Conditional {
+                when: "model".into(),
+                args: vec![
+                    ProviderArgSpec::Literal("--model".into()),
+                    ProviderArgSpec::Literal("{model}".into()),
+                ],
+            },
+            ProviderArgSpec::Conditional {
+                when: "reasoningEffort".into(),
+                args: vec![
+                    ProviderArgSpec::Literal("--effort".into()),
+                    ProviderArgSpec::Literal("{reasoningEffort}".into()),
+                ],
+            },
+            ProviderArgSpec::Literal("{prompt.full}".into()),
+        ];
+        let mut request = prompt("fallback prompt");
+        request.model = Some("model_a".into());
+        request
+            .template_vars
+            .insert("reasoningEffort".into(), "high".into());
+        request
+            .outputs
+            .insert("full".into(), "rendered full prompt".into());
+
+        let argv = expand_first_run_argv(&cfg, &request, None, "fallback prompt");
+
+        assert_eq!(
+            argv,
+            vec![
+                "run".to_string(),
+                "--model".to_string(),
+                "model_a".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "rendered full prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_arg_specs_omit_false_conditionals_without_implicit_prompt_append() {
+        let mut cfg = cfg();
+        cfg.arg_specs = vec![
+            ProviderArgSpec::Literal("run".into()),
+            ProviderArgSpec::Conditional {
+                when: "model".into(),
+                args: vec![
+                    ProviderArgSpec::Literal("--model".into()),
+                    ProviderArgSpec::Literal("{model}".into()),
+                ],
+            },
+            ProviderArgSpec::Literal("{prompt.full}".into()),
+        ];
+        let mut request = prompt("fallback prompt");
+        request.outputs.insert("full".into(), "full".into());
+
+        let argv = expand_first_run_argv(&cfg, &request, None, "fallback prompt");
+
+        assert_eq!(argv, vec!["run".to_string(), "full".to_string()]);
     }
 
     #[test]

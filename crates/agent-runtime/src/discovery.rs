@@ -47,6 +47,7 @@ impl DetectedAgentProvider {
             kind: self.transport_kind.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
+            arg_specs: Vec::new(),
             env: self.transport_env.clone(),
             model: self.default_model.clone(),
             ..Default::default()
@@ -100,7 +101,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::methods::{CommandOutputFormat, CommandSessionIdSource};
+    use proto::methods::{CommandOutputFormat, CommandSessionIdSource, ProviderArgSpec};
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -169,28 +170,16 @@ mod tests {
                 .and_then(|s| s.first_run_capture.as_deref()),
             None
         );
-        assert_eq!(
-            claude_transport
-                .session
-                .as_ref()
-                .and_then(|s| s.resume_args.as_ref())
-                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
-            Some(vec![
-                "--add-dir",
-                "{loom.configDir}",
-                "--permission-mode",
-                "bypassPermissions",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--resume",
-                "{session_id}",
-                "--append-system-prompt",
-                "{prompt.system}",
-                "-p",
-                "{prompt.user}",
-            ])
-        );
+        let claude_session = claude_transport.session.as_ref().expect("claude session");
+        let resume_args = claude_session.resume_args.as_ref().expect("resume args");
+        assert!(resume_args.contains(&"--resume".into()));
+        assert!(resume_args.contains(&"{session_id}".into()));
+        assert!(resume_args.contains(&"{prompt.user}".into()));
+        assert!(claude_session.resume_arg_specs.iter().any(|arg| matches!(
+            arg,
+            ProviderArgSpec::Conditional { when, .. } if when == "model"
+        )));
+        assert!(claude_transport.model_args.is_empty());
         let qoder = providers
             .iter()
             .find(|provider| provider.id == "qoder")

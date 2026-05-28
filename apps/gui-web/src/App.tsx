@@ -4854,8 +4854,6 @@ function AgentMemberDetail({
           <HostInfoRow label="Host">{machine.name}</HostInfoRow>
           <HostInfoRow label="Actor ID" mono>{actor.id}</HostInfoRow>
           <HostInfoRow label="Profile Path" mono>{agent.profilePath || "Not set"}</HostInfoRow>
-          <HostInfoRow label="Identity Path" mono>{agent.identityPath || "Not set"}</HostInfoRow>
-          <HostInfoRow label="Soul Path" mono>{agent.soulPath || "Not set"}</HostInfoRow>
         </div>
       </HostDetailSection>
 
@@ -5974,16 +5972,16 @@ function agentDisplayName(agent: MachineInfo["agents"][number]) {
 }
 
 function agentModelValue(agent: MachineInfo["agents"][number]) {
-  return agent.spec.model ?? agent.spec.models?.default ?? "";
+  return agent.spec.providerRef.model ?? agent.spec.models?.default ?? "";
 }
 
 function agentDescriptionValue(agent: MachineInfo["agents"][number]) {
-  return agent.spec.identity?.description ?? "";
+  const value = agent.spec.actor._meta?.description;
+  return typeof value === "string" ? value : "";
 }
 
 function agentReasoningEffort(agent: MachineInfo["agents"][number]) {
-  const value = agent.spec.actor._meta?.reasoningEffort;
-  return typeof value === "string" ? value : "";
+  return agent.spec.providerRef.reasoningEffort ?? "";
 }
 
 function agentAvatarValue(agent: MachineInfo["agents"][number]) {
@@ -5997,6 +5995,10 @@ function providerForAgent(
 ) {
   const preferred = machine.providers.find((provider) => provider.id === preferredProviderId);
   if (preferred) return preferred;
+  const providerRef = machine.providers.find(
+    (provider) => provider.id === agent.spec.providerRef.id,
+  );
+  if (providerRef) return providerRef;
   const model = agentModelValue(agent);
   return (
     machine.providers.find(

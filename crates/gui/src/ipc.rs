@@ -21,8 +21,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config::{
-    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount, MachineConfig,
-    Workspace,
+    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount, Workspace,
 };
 use crate::forward;
 use crate::state::AppState;
@@ -191,8 +190,6 @@ pub struct WorkspaceIdArgs {
 pub async fn workspace_remove(args: WorkspaceIdArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
     cfg.workspaces.retain(|w| w.id != args.id);
-    cfg.machines
-        .retain(|machine| machine.workspace_id.as_deref() != Some(args.id.as_str()));
     if cfg.active.as_deref() == Some(args.id.as_str()) {
         cfg.active = cfg.workspaces.first().map(|w| w.id.clone());
     }
@@ -1147,66 +1144,14 @@ pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MachineCreateArgs {
-    pub name: String,
-    #[serde(default)]
-    pub data_root: String,
-}
+pub struct MachineCreateArgs {}
 
 #[tauri::command]
 pub async fn machine_create(
-    state: State<'_, AppState>,
-    args: MachineCreateArgs,
+    _state: State<'_, AppState>,
+    _args: MachineCreateArgs,
 ) -> Result<MachineListResult, String> {
-    let name = args.name.trim();
-    if name.is_empty() {
-        return Err("machine name is required".into());
-    }
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let owner_actor_id = config::active_owner_actor_id(&cfg);
-    let workspace_dir = workspace_id
-        .as_deref()
-        .map(slugify)
-        .unwrap_or_else(|| "unassigned".into());
-    let machine_id = config::generate_machine_id();
-    let dir_slug = format!(
-        "{}_{}",
-        slugify(name),
-        machine_id.trim_start_matches("machine_")
-    );
-    let data_root_key = owner_actor_id
-        .as_deref()
-        .map(|owner| format!("{}/{}", slugify(owner), dir_slug))
-        .unwrap_or_else(|| dir_slug.clone());
-    let (data_root_expr, data_root) = machine_path_input(
-        args.data_root.trim(),
-        config::machine_data_root_expr(&workspace_dir, &data_root_key),
-    )
-    .map_err(stringify)?;
-    std::fs::create_dir_all(&data_root)
-        .map_err(|e| format!("create data root {}: {e}", data_root.display()))?;
-
-    cfg.machines.push(MachineConfig {
-        workspace_id,
-        owner_actor_id,
-        id: machine_id,
-        name: name.to_string(),
-        kind: "local".into(),
-        data_root: data_root_expr,
-    });
-    config::save(&cfg).map_err(stringify)?;
-    machines_from_config(&cfg, state.try_client().await).await
-}
-
-fn machine_path_input(input: &str, default_expr: String) -> anyhow::Result<(String, PathBuf)> {
-    let raw = if input.is_empty() {
-        default_expr
-    } else {
-        input.to_string()
-    };
-    let path = normalize_local_path(config::expand_home(&raw))?;
-    Ok((config::home_path_expr(&path), path))
+    Err("hosts are daemon-owned; start loom-daemon and let it publish inventory to the connected server".into())
 }
 
 #[derive(Deserialize)]
@@ -1217,48 +1162,13 @@ pub struct MachineRemoveArgs {
 
 #[tauri::command]
 pub async fn machine_remove(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     args: MachineRemoveArgs,
 ) -> Result<MachineListResult, String> {
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let active_machine_count = cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
-        .count();
-    if active_machine_count <= 1 {
-        return Err("last machine cannot be removed".into());
-    }
-    let before = cfg.machines.len();
-    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
-    let actor_ids = cfg
-        .machines
-        .iter()
-        .find(|machine| {
-            machine.id == args.machine_id
-                && config::machine_belongs_to_workspace_and_owner(
-                    machine,
-                    active_workspace_id.as_deref(),
-                    active_owner_actor_id.as_deref(),
-                )
-        })
-        .map(actor_ids_for_machine)
-        .unwrap_or_default();
-    cfg.machines.retain(|machine| {
-        machine.id != args.machine_id
-            || !config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    });
-    if cfg.machines.len() == before {
-        return Err(format!("unknown machine id: {}", args.machine_id));
-    }
-    config::save(&cfg).map_err(stringify)?;
-    delete_actors_from_server(state.try_client().await, &actor_ids).await;
-    machines_from_config(&cfg, state.try_client().await).await
+    Err(format!(
+        "host `{}` is daemon-owned; stop or reconfigure the daemon instead of deleting it from GUI local state",
+        args.machine_id
+    ))
 }
 #[tauri::command]
 pub async fn machine_agent_create(
@@ -1369,10 +1279,6 @@ async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[Str
     }
 }
 
-fn actor_ids_for_machine(machine: &MachineConfig) -> Vec<String> {
-    vec![machine_connection_actor_id(machine)]
-}
-
 fn stringify(e: anyhow::Error) -> String {
     deep_stringify(e)
 }
@@ -1453,9 +1359,7 @@ async fn merge_server_machine_inventory(
 
 fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, machine: MachineInfo) {
     if let Some(existing) = machines.iter_mut().find(|m| m.id == machine.id) {
-        if existing.source == "local_config"
-            || machine.inventory_revision >= existing.inventory_revision
-        {
+        if machine.inventory_revision >= existing.inventory_revision {
             *existing = machine;
         }
     } else {
@@ -1857,10 +1761,6 @@ fn agent_profile_path(data_root: &Path, spec: &AgentSpec) -> PathBuf {
         .join("profile")
 }
 
-fn machine_connection_actor_id(machine: &MachineConfig) -> String {
-    format!("actor_service_{}", machine.id)
-}
-
 fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path)
@@ -2146,17 +2046,6 @@ mod tests {
         })
     }
 
-    fn test_machine(id: &str, owner_actor_id: Option<&str>) -> MachineConfig {
-        MachineConfig {
-            workspace_id: Some("default".into()),
-            owner_actor_id: owner_actor_id.map(ToString::to_string),
-            id: id.into(),
-            name: id.into(),
-            kind: "local".into(),
-            data_root: "~/.agentx".into(),
-        }
-    }
-
     #[test]
     fn generated_actor_id_uses_machine_stem_for_short_ascii_name_fragments() {
         let id = actor_id_from_input("", "G仔", "machine_macbook_01").expect("actor id");
@@ -2235,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_list_filter_ignores_local_machine_agents() {
+    fn actor_list_filter_ignores_agents_without_daemon_inventory() {
         let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
@@ -2247,10 +2136,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![
-                test_machine("mine", Some(account.actor_id.as_str())),
-                test_machine("other", Some("actor_human_other")),
-            ],
         };
         let value = json!({
             "actors": [
@@ -2286,7 +2171,6 @@ mod tests {
                 actor_id: "actor_human_88084".into(),
                 display_name: "actor_human_88084".into(),
             }],
-            machines: Vec::new(),
         };
         let value = json!({
             "actors": [
@@ -2362,7 +2246,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_remote",
@@ -2450,7 +2333,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_remote",
@@ -2496,7 +2378,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_other",
@@ -2530,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn server_machine_inventory_replaces_local_stub_with_same_id() {
+    fn server_machine_inventory_replaces_older_snapshot_with_same_id() {
         let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
@@ -2542,7 +2423,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_remote",
@@ -2588,12 +2468,11 @@ mod tests {
         });
         let server_machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
             .expect("server machine");
-        let mut local_stub = server_machine.clone();
-        local_stub.source = "local_config".into();
-        local_stub.inventory_revision = 0;
-        local_stub.agents.clear();
-        local_stub.agent_count = 0;
-        let mut machines = vec![local_stub];
+        let mut older_snapshot = server_machine.clone();
+        older_snapshot.inventory_revision = 0;
+        older_snapshot.agents.clear();
+        older_snapshot.agent_count = 0;
+        let mut machines = vec![older_snapshot];
 
         upsert_server_machine_info(&mut machines, server_machine);
 
@@ -2613,7 +2492,6 @@ mod tests {
             active: Some("default".into()),
             account: Some(account.clone()),
             workspaces: vec![],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_abbb0e0b_actor_human_local_ws_abbb0e0b",

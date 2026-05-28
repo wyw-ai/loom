@@ -2576,6 +2576,34 @@ mod tests {
     }
 
     #[test]
+    fn template_expands_provider_runtime_aliases_from_request_vars() {
+        let cfg = cfg();
+        let mut request = prompt("hello");
+        request
+            .template_vars
+            .insert("loom.server".into(), "ws://server/rpc".into());
+        request
+            .template_vars
+            .insert("loom.run.id".into(), "run_1".into());
+        request
+            .template_vars
+            .insert("loom.trigger.actor".into(), "actor_human".into());
+        request
+            .template_vars
+            .insert("paths.cwd".into(), "/tmp/workspace".into());
+
+        let out = expand_template(
+            "{loom.server}|{loom.run.id}|{loom.trigger.actor}|{paths.cwd}",
+            &cfg,
+            &request,
+            None,
+            "",
+        );
+
+        assert_eq!(out, "ws://server/rpc|run_1|actor_human|/tmp/workspace");
+    }
+
+    #[test]
     fn expanded_env_keeps_spec_values_and_adds_request_defaults() {
         let mut cfg = cfg();
         cfg.env.insert("LOOM_SERVER".into(), "ws://spec".into());

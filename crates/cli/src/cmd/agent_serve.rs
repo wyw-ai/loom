@@ -2970,8 +2970,8 @@ async fn dispatch_trigger(
                 }),
             )
             .await?;
-        let user_text = render_trigger_prompt(client, state, &trigger).await;
-        let prompt = compose_envelope_prompt(client, state, &trigger, &user_text).await;
+        let turn_input = render_trigger_prompt(client, state, &trigger).await;
+        let prompt = compose_envelope_prompt(client, state, &trigger, &turn_input).await;
         let no_reply_file =
             no_reply_file_for_turn(client, state, trigger.scope(), &run_res.run.id).await;
         let active = ActiveTurn {
@@ -3052,10 +3052,32 @@ async fn build_adapter_prompt(
         .paths
         .template_vars(&state.actor_id, &channel_id, scope);
     extend_prompt_template_vars(&mut template_vars, state, trigger);
+    template_vars.insert("loom.actor".into(), state.actor_id.clone());
+    template_vars.insert("loom.scope.id".into(), scope.id.clone());
+    template_vars.insert(
+        "loom.scope.kind".into(),
+        scope_kind_name(scope.kind).to_string(),
+    );
+    template_vars.insert("loom.server".into(), state.agent_server_url.clone());
     template_vars.insert(
         "loom.configDir".into(),
         config::config_dir().display().to_string(),
     );
+    template_vars.insert(
+        "paths.cwd".into(),
+        scope_paths.workspace.display().to_string(),
+    );
+    if let Some(model) = state.current_model() {
+        template_vars.insert("model".into(), model);
+    }
+    if let Some(reasoning_effort) = state.spec.provider_ref.reasoning_effort.as_deref() {
+        template_vars.insert("reasoningEffort".into(), reasoning_effort.to_string());
+    }
+    if let Some(active) = active {
+        template_vars.insert("loom.run.id".into(), active.run_id.clone());
+        template_vars.insert("loom.trigger.id".into(), active.trigger_source_id.clone());
+        template_vars.insert("loom.trigger.actor".into(), active.trigger_actor.clone());
+    }
     let outputs = agent_runtime::provider::render_prompt_outputs(
         state.transport.prompt.as_ref(),
         &prompt.parts,
@@ -3132,23 +3154,34 @@ fn render_prompt(trigger: &AgentTrigger) -> String {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TriggerPromptText {
+    latest_message: String,
+    assignment_context: String,
+    turn_input: String,
+}
+
 async fn render_trigger_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     trigger: &AgentTrigger,
-) -> String {
+) -> TriggerPromptText {
     let actor_names = actor_display_map_for_prompt(client, state).await;
-    let mut prompt = render_trigger_prompt_with_names(
+    let latest_message = render_trigger_prompt_with_names(
         &state.actor_id,
         &state.spec.actor.display_name,
         trigger,
         &actor_names,
     );
-    if let Some(context) = assignment_context_for_prompt(client, trigger).await {
-        prompt.push_str("\n\n");
-        prompt.push_str(&context);
+    let assignment_context = assignment_context_for_prompt(client, trigger)
+        .await
+        .unwrap_or_default();
+    let turn_input = join_prompt_sections([latest_message.clone(), assignment_context.clone()]);
+    TriggerPromptText {
+        latest_message,
+        assignment_context,
+        turn_input,
     }
-    prompt
 }
 
 async fn recent_conversation_context(
@@ -3632,7 +3665,7 @@ async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     trigger: &AgentTrigger,
-    user_text: &str,
+    trigger_prompt: &TriggerPromptText,
 ) -> PromptTelemetry {
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
@@ -3650,11 +3683,11 @@ async fn compose_envelope_prompt(
         .as_deref()
         .map(|channel_id| prompt_template_vars(state, trigger, channel_id))
         .unwrap_or_else(|| minimal_prompt_template_vars(state, trigger));
-    let user_text = apply_prompt_template(
+    let turn_input = apply_prompt_template(
         state.spec.prompt_template.as_ref(),
         &template_vars,
         first_turn,
-        &user_text,
+        &trigger_prompt.turn_input,
     );
 
     let memory_spec = state.spec.memory.as_ref();
@@ -3676,19 +3709,21 @@ async fn compose_envelope_prompt(
         });
         sections.push(agent_runtime::PromptSection {
             name: "user_message",
-            content: format!("=== User message ===\n{user_text}"),
+            content: format!("=== User message ===\n{turn_input}"),
         });
         let content = sections
             .iter()
             .map(|section| section.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        return apply_trigger_prefix_to_prompt(
+        let mut prompt = apply_trigger_prefix_to_prompt(
             &state.spec,
             prompt_telemetry(content, &sections),
             first_turn,
             trigger_prompt_prefix_from_trigger(trigger),
         );
+        add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
+        return prompt;
     }
 
     let (prompt, sections) =
@@ -3699,15 +3734,43 @@ async fn compose_envelope_prompt(
             channel_id: channel_id.as_deref(),
             thread_context: &conversation_context,
             runtime_context: &runtime_context,
-            user_message: &user_text,
+            user_message: &turn_input,
             scope_bootstrap: &scope_bootstrap,
         });
-    apply_trigger_prefix_to_prompt(
+    let mut prompt = apply_trigger_prefix_to_prompt(
         &state.spec,
         prompt_telemetry(prompt, &sections),
         first_turn,
         trigger_prompt_prefix_from_trigger(trigger),
-    )
+    );
+    add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
+    prompt
+}
+
+fn add_turn_input_prompt_parts(
+    prompt: &mut PromptTelemetry,
+    trigger_prompt: &TriggerPromptText,
+    turn_input: &str,
+) {
+    push_extra_prompt_part(prompt, "latest_message", &trigger_prompt.latest_message);
+    push_extra_prompt_part(
+        prompt,
+        "assignment_context",
+        &trigger_prompt.assignment_context,
+    );
+    push_extra_prompt_part(prompt, "turn_input", turn_input);
+}
+
+fn push_extra_prompt_part(prompt: &mut PromptTelemetry, key: &'static str, content: &str) {
+    if content.trim().is_empty() || prompt.parts.iter().any(|part| part.key == key) {
+        return;
+    }
+    prompt.parts.push(PromptPart {
+        key: key.to_string(),
+        title: prompt_section_title(key).to_string(),
+        content: content.to_string(),
+        role_hint: PromptRoleHint::User,
+    });
 }
 
 fn apply_trigger_prefix_to_prompt(
@@ -3928,6 +3991,9 @@ fn prompt_section_title(name: &str) -> &str {
         "turn_memory" => "Context: Turn memory",
         "runtime_context" => "Context: Runtime context",
         "scope_bootstrap" => "System: Loom multi-actor context",
+        "latest_message" => "Latest Loom message",
+        "assignment_context" => "Loom assignment context",
+        "turn_input" => "Turn input",
         "user_message" => "User message",
         other => other,
     }
@@ -5811,6 +5877,37 @@ mod tests {
         let later = apply_prompt_template(Some(&template), &vars, false, "hi");
         assert!(!later.contains("# Router skill"));
         assert!(later.contains("hi"));
+    }
+
+    #[test]
+    fn turn_input_parts_are_available_without_changing_full_prompt() {
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "=== User message ===\nlatest\n\nassignment".into(),
+        }];
+        let mut prompt = prompt_telemetry(sections[0].content.clone(), &sections);
+        let original = prompt.content.clone();
+        let trigger_prompt = TriggerPromptText {
+            latest_message: "latest".into(),
+            assignment_context: "assignment".into(),
+            turn_input: "latest\n\nassignment".into(),
+        };
+
+        add_turn_input_prompt_parts(&mut prompt, &trigger_prompt, &trigger_prompt.turn_input);
+
+        assert_eq!(prompt.content, original);
+        assert!(prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "latest_message" && part.content == "latest"));
+        assert!(prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "assignment_context" && part.content == "assignment"));
+        assert!(prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "turn_input" && part.content == "latest\n\nassignment"));
     }
 
     #[test]

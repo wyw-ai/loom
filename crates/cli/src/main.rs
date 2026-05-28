@@ -1418,7 +1418,12 @@ enum ProviderCmd {
     /// Validate a provider manifest JSON file.
     Validate { path: PathBuf },
     /// Add a provider manifest into the current LOOM_CONFIG_DIR.
-    Add { path: PathBuf },
+    Add {
+        path: PathBuf,
+        /// Overwrite an existing local provider manifest with the same id.
+        #[arg(long)]
+        replace: bool,
+    },
     /// List built-in and locally installed providers.
     List,
     /// Show one resolved provider manifest.
@@ -1569,7 +1574,7 @@ async fn main() -> Result<()> {
     if let Cmd::Provider { sub } = args.cmd {
         match sub {
             ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
-            ProviderCmd::Add { path } => cmd::provider::add(path)?,
+            ProviderCmd::Add { path, replace } => cmd::provider::add(path, replace)?,
             ProviderCmd::List => cmd::provider::list()?,
             ProviderCmd::Show { provider_id } => cmd::provider::show(provider_id)?,
             ProviderCmd::Remove { provider_id } => cmd::provider::remove(provider_id)?,
@@ -2841,6 +2846,22 @@ mod tests {
                 assert_eq!(version.as_deref(), Some("v1"));
                 assert_eq!(model.as_deref(), Some("noop"));
                 assert_eq!(tools_json.as_deref(), Some("[]"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_add_accepts_replace_flag() {
+        let args = Args::try_parse_from(["loom", "provider", "add", "demo.json", "--replace"])
+            .expect("parse provider add --replace");
+
+        match args.cmd {
+            Cmd::Provider {
+                sub: ProviderCmd::Add { path, replace },
+            } => {
+                assert_eq!(path, PathBuf::from("demo.json"));
+                assert!(replace);
             }
             other => panic!("unexpected command: {other:?}"),
         }

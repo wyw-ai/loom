@@ -1862,6 +1862,11 @@ pub struct AgentTransport {
     /// manifest-driven reducers such as JSONL finalText extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder: Option<ProviderDecoderSpec>,
+    /// Optional stderr provider decoder retained after ProviderManifest
+    /// resolution. This lets provider-owned stderr protocols emit trace events
+    /// or capture sessions without overloading stdout semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "stderr")]
+    pub stderr_decoder: Option<ProviderDecoderSpec>,
     /// How the prompt text is delivered to the subprocess. Defaults to `args`
     /// (appended after `args` as the final argv token).
     #[serde(default, rename = "promptVia")]
@@ -1913,6 +1918,7 @@ impl Default for AgentTransport {
             session: None,
             output_format: None,
             decoder: None,
+            stderr_decoder: None,
             prompt_via: PromptVia::default(),
             prompt: None,
             stdin: None,
@@ -1937,6 +1943,7 @@ impl AgentTransport {
             && self.session.is_none()
             && self.output_format.is_none()
             && self.decoder.is_none()
+            && self.stderr_decoder.is_none()
             && self.prompt_via == PromptVia::default()
             && self.prompt.is_none()
             && self.stdin.is_none()
@@ -2034,6 +2041,8 @@ pub struct ProviderModeSpec {
     pub prompt: Option<ProviderPromptSpec>,
     #[serde(default)]
     pub stdout: ProviderDecoderSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<ProviderDecoderSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ProviderSessionSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]

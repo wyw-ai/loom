@@ -80,6 +80,7 @@ pub struct CommandConfig {
     pub resume_arg_specs: Vec<ProviderArgSpec>,
     pub output_format: CommandOutputFormat,
     pub decoder: Option<ProviderDecoderSpec>,
+    pub stderr_decoder: Option<ProviderDecoderSpec>,
     pub prompt_via: PromptVia,
     pub prompt: Option<ProviderPromptSpec>,
     pub stdin_template: Option<String>,
@@ -166,6 +167,7 @@ impl CommandConfig {
                 .unwrap_or_default(),
             output_format: spec.output_format.unwrap_or_default(),
             decoder: spec.decoder.clone(),
+            stderr_decoder: spec.stderr_decoder.clone(),
             prompt_via: spec.prompt_via,
             prompt: spec.prompt.clone(),
             stdin_template: spec.stdin.clone(),
@@ -479,8 +481,7 @@ fn run_prompt(
             if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
             }
-        } else if let Some(sid) = capture_decoder_session_id(cfg.decoder.as_ref(), &outcome.stdout)
-        {
+        } else if let Some(sid) = capture_configured_decoder_session_id(&cfg, &outcome) {
             if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to save decoder-captured command session");
             }
@@ -721,6 +722,14 @@ fn spawn_and_collect(
         emitted_finish |= events.emitted_finish;
     }
     let collected_stderr = stderr_handle.join().unwrap_or_default();
+    let stderr_events = collect_decoder_buffer(
+        cfg.stderr_decoder.as_ref(),
+        &collected_stderr,
+        &prompt.scope,
+        sender,
+    );
+    emitted_text |= stderr_events.emitted_text;
+    emitted_finish |= stderr_events.emitted_finish;
     let exit_code = exit.code().unwrap_or(-1);
     // Snapshot + clear the cancel flag now that the child is reaped, before
     // building the Finished summary below.
@@ -757,7 +766,9 @@ fn spawn_and_collect(
         format!("exited with code {exit_code}")
     };
 
-    if let Some(content) = extract_decoder_final_text(cfg.decoder.as_ref(), &collected_stdout) {
+    if let Some(content) =
+        extract_configured_decoder_final_text(cfg, &collected_stdout, &collected_stderr)
+    {
         let _ = sender.send(AdapterEvent::Text {
             scope: Some(prompt.scope.clone()),
             content,
@@ -860,6 +871,22 @@ fn collect_stdout_line(
         },
         CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => OutputLineEvents::default(),
     }
+}
+
+fn collect_decoder_buffer(
+    decoder: Option<&ProviderDecoderSpec>,
+    text: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    let mut events = OutputLineEvents::default();
+    for line in text.lines() {
+        if let Some(emitted) = translate_decoder_event_line(decoder, line, scope, sender) {
+            events.emitted_text |= emitted.emitted_text;
+            events.emitted_finish |= emitted.emitted_finish;
+        }
+    }
+    events
 }
 
 fn truncate_for_summary(s: &str) -> String {
@@ -1377,6 +1404,15 @@ fn extract_decoder_final_text(
     reduce_text_with_fallback(decoder.format.as_str(), stdout, reducer)
 }
 
+fn extract_configured_decoder_final_text(
+    cfg: &CommandConfig,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    extract_decoder_final_text(cfg.decoder.as_ref(), stdout)
+        .or_else(|| extract_decoder_final_text(cfg.stderr_decoder.as_ref(), stderr))
+}
+
 fn capture_decoder_session_id(
     decoder: Option<&ProviderDecoderSpec>,
     stdout: &str,
@@ -1387,6 +1423,14 @@ fn capture_decoder_session_id(
         .as_ref()
         .and_then(|capture| capture.session.as_ref())?;
     reduce_text_with_fallback(decoder.format.as_str(), stdout, reducer)
+}
+
+fn capture_configured_decoder_session_id(
+    cfg: &CommandConfig,
+    outcome: &SpawnOutcome,
+) -> Option<String> {
+    capture_decoder_session_id(cfg.decoder.as_ref(), &outcome.stdout)
+        .or_else(|| capture_decoder_session_id(cfg.stderr_decoder.as_ref(), &outcome.stderr))
 }
 
 fn reduce_text_with_fallback(
@@ -2128,6 +2172,7 @@ mod tests {
             resume_arg_specs: Vec::new(),
             output_format: CommandOutputFormat::Text,
             decoder: None,
+            stderr_decoder: None,
             prompt_via: PromptVia::Args,
             prompt: None,
             stdin_template: None,
@@ -3068,6 +3113,83 @@ mod tests {
         let saved = load_session(&cfg, &scope()).expect("saved session");
         assert_eq!(saved.session_id, "sid_decoder");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_prompt_saves_stderr_decoder_captured_provider_session() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sid_stderr\"}' >&2".into(),
+        ];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.session_id_source = Some(CommandSessionIdSource::ProviderCapture);
+        cfg.resume_args = Some(vec![
+            "--resume".into(),
+            "{session_id}".into(),
+            "{prompt}".into(),
+        ]);
+        cfg.stderr_decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), prompt("ignored"), tx, slot).expect("run prompt");
+
+        let saved = load_session(&cfg, &scope()).expect("saved session");
+        assert_eq!(saved.session_id, "sid_stderr");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stderr_decoder_final_text_is_emitted() {
+        let mut cfg = cfg();
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"text\":\"from stderr\"}' >&2".into(),
+        ];
+        cfg.stderr_decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: Some(ProviderJsonlReduceSpec {
+                final_text: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.text".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+            capture: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot).expect("spawn sh");
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Text { content, .. } = event {
+                texts.push(content);
+            }
+        }
+        assert_eq!(texts, vec!["from stderr"]);
     }
 
     #[test]

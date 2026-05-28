@@ -287,6 +287,7 @@ fn provider_mode_detail(
         "stdin": mode.stdin,
         "prompt": mode.prompt,
         "stdout": mode.stdout,
+        "stderr": mode.stderr,
         "session": mode.session,
         "timeoutMs": mode.timeout_ms,
         "idleTimeoutMs": mode.idle_timeout_ms,
@@ -380,6 +381,9 @@ fn print_provider_detail(detail: &Value) {
             }
             println!("prompt    = {}", compact_json(&mode["prompt"]));
             println!("stdout    = {}", compact_json(&mode["stdout"]));
+            if !mode["stderr"].is_null() {
+                println!("stderr    = {}", compact_json(&mode["stderr"]));
+            }
             println!("session   = {}", compact_json(&mode["session"]));
             if !mode["runtimePlan"].is_null() {
                 println!("runtime   = {}", compact_json(&mode["runtimePlan"]));

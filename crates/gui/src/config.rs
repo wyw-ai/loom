@@ -39,7 +39,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use agent_runtime::discovery::AgentProviderOverride;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -92,28 +91,6 @@ pub struct MachineConfig {
     #[serde(default = "default_machine_kind")]
     pub kind: String,
     pub data_root: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<AgentProviderOverride>,
-    #[serde(default)]
-    pub agents: Vec<MachineAgentConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineAgentConfig {
-    pub provider_id: String,
-    pub actor_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub reasoning_effort: String,
-    #[serde(default)]
-    pub autostart: bool,
-    #[serde(default)]
-    pub avatar_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -406,8 +383,6 @@ fn default_machine_for_workspace(
         name: "Local Machine".into(),
         kind: default_machine_kind(),
         data_root: machine_data_root_expr(&workspace_key, &data_key),
-        providers: Vec::new(),
-        agents: Vec::new(),
     }
 }
 
@@ -517,14 +492,6 @@ fn cleanup_machine_configs(cfg: &mut DesktopConfig) -> bool {
             }
         }
 
-        let before_agents = machine.agents.len();
-        machine
-            .agents
-            .retain(|agent| is_supported_agent_actor_id(&agent.actor_id));
-        if machine.agents.len() != before_agents {
-            changed = true;
-        }
-
         if merge_machine_config(&mut cleaned, machine) {
             changed = true;
         }
@@ -557,15 +524,6 @@ fn is_legacy_owner_scoped_machine_id(machine_id: &str) -> bool {
     machine_id.starts_with("machine_") && machine_id.contains("_actor_human_")
 }
 
-fn is_supported_agent_actor_id(actor_id: &str) -> bool {
-    let trimmed = actor_id.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 64
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
-}
-
 fn merge_machine_config(machines: &mut Vec<MachineConfig>, machine: MachineConfig) -> bool {
     let Some(existing) = machines.iter_mut().find(|existing| {
         existing.workspace_id == machine.workspace_id
@@ -585,24 +543,6 @@ fn merge_machine_config(machines: &mut Vec<MachineConfig>, machine: MachineConfi
     if existing.data_root.trim().is_empty() || existing.data_root == default_agent_data_root_expr()
     {
         existing.data_root = machine.data_root;
-    }
-    for provider in machine.providers {
-        if !existing
-            .providers
-            .iter()
-            .any(|existing_provider| existing_provider.id == provider.id)
-        {
-            existing.providers.push(provider);
-        }
-    }
-    for agent in machine.agents {
-        if !existing
-            .agents
-            .iter()
-            .any(|existing_agent| existing_agent.actor_id == agent.actor_id)
-        {
-            existing.agents.push(agent);
-        }
     }
     true
 }
@@ -886,8 +826,6 @@ id = "default"
             name: "CanfengMac".into(),
             kind: "local".into(),
             data_root: "~/.agentx".into(),
-            providers: Vec::new(),
-            agents: Vec::new(),
         };
 
         let dir = daemon_config_dir_for_machine(&machine);
@@ -916,8 +854,6 @@ id = "default"
                     name: "Local Machine".into(),
                     kind: "local".into(),
                     data_root: "~/.agentx".into(),
-                    providers: Vec::new(),
-                    agents: Vec::new(),
                 },
                 MachineConfig {
                     workspace_id: Some("ws_abbb0e0b".into()),
@@ -927,19 +863,6 @@ id = "default"
                     kind: "local".into(),
                     data_root: "~/.agentx/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local"
                         .into(),
-                    providers: Vec::new(),
-                    agents: vec![MachineAgentConfig {
-                        provider_id: "codex".into(),
-                        actor_id:
-                            "actor_agent_machine_abbb0e0b_actor_human_local_ws_abbb0e0b_45b7a479"
-                                .into(),
-                        name: "legacy".into(),
-                        description: String::new(),
-                        model: String::new(),
-                        reasoning_effort: String::new(),
-                        autostart: false,
-                        avatar_url: String::new(),
-                    }],
                 },
             ],
         };
@@ -953,6 +876,5 @@ id = "default"
             cfg.machines[0].owner_actor_id.as_deref(),
             Some("actor_human_local_ws_abbb0e0b")
         );
-        assert!(cfg.machines[0].agents.is_empty());
     }
 }

@@ -471,16 +471,16 @@ client 管理的 actor 之一。
   上线。
 - **E3c**（`feat(cli): loom agent serve external runtime client`）：新增
   [`crates/cli/src/cmd/agent_serve.rs`](../crates/cli/src/cmd/agent_serve.rs)
-  实现 `loom agent serve [--specs <dir>]`：扫 `~/.config/loom/agents/`，把 provider
-  spec 展开成 actor；每个 actor 起一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
+  实现 `loom agent serve [--specs <dir>]`：扫 `~/.config/loom/agents/` 的
+  per-actor AgentSpec；每个 actor 起一条 WS、用 `connection/open(actor_id, kind=agent)` 上线，监听通知、把
   message delivery 翻译成 `run.open` + `send_prompt` + 流式 run frame + `run.close`。
 
 ### Phase E4：清理 server ✅ 已合
 
 - 删除 `crates/server/src/runtime/`，server 不再依赖 `agent-runtime`。
-- 删除 server 侧 `agent/*` runtime RPC；provider spec 安装/注册/删除改为 CLI 本地写
-  `~/.config/loom/agents/`。
-- 后续可把 `AgentProviderSpec` / `AgentSpec` / `AgentTransport` 从 `methods.rs` 移到独立 mod，进一步
+- 删除 server 侧 `agent/*` runtime RPC；AgentSpec / ProviderManifest 的安装、注册、删除
+  改为 CLI/daemon 本地写 `{LOOM_CONFIG_DIR}/agents/` 与 `{LOOM_CONFIG_DIR}/providers/`。
+- 后续可把 `AgentSpec` / `AgentTransport` 从 `methods.rs` 移到独立 mod，进一步
   表明它们不属于 server runtime 协议。
 
 每个 phase 都满足"可灰度"：E1/E2 没有协议变更；E3 让 server 同时能跑两种部署模
@@ -538,7 +538,7 @@ client 管理的 actor 之一。
 | `AcpAdapter` 实现 | [crates/agent-runtime/src/acp.rs](../crates/agent-runtime/src/acp.rs) | ACP stdio transport |
 | `CommandAdapter` 实现 | [crates/agent-runtime/src/command.rs](../crates/agent-runtime/src/command.rs) | 一次性 CLI transport |
 | `action.response` 路由 | [crates/cli/src/cmd/agent_serve.rs](../crates/cli/src/cmd/agent_serve.rs) | agent client 调 `adapter.respond_action` |
-| `AgentProviderSpec` / `AgentTransport` schema | [crates/proto/src/methods.rs](../crates/proto/src/methods.rs) | provider spec 展开成 per-actor runtime spec；`cwd` 由 runtime 统一按 channel 计算 |
+| `AgentSpec` / `AgentTransport` schema | [crates/proto/src/methods.rs](../crates/proto/src/methods.rs) | AgentSpec 只引用 providerRef；AgentTransport 是 provider resolve 后的 runtime plan |
 | 现有 spec 范例 | [agents/opencode.json](../agents/opencode.json) | E3 阶段迁到 `~/.config/loom/agents/` |
 | Marketplace 编目 | [assets/marketplace.json](../assets/marketplace.json) | 编目格式不变；`loom agent install` 改由 cli 写本地文件 |
 | `connection/open` handler | [crates/server/src/handlers/mod.rs:98-135](../crates/server/src/handlers/mod.rs#L98-L135) | 不变；agent client 用同一接口上线每个被管理的 actor |

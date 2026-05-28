@@ -1,8 +1,8 @@
 //! Daemon agent worker internals.
 //!
-//! `loom-daemon` synthesizes `AgentSpec`s from the desktop machine config and
-//! uses this module to open a dedicated WebSocket per agent, then supervise
-//! that one agent through the shared `agent-runtime` adapter trait.
+//! `loom-daemon` loads daemon-local `AgentSpec`s and uses this module to open a
+//! dedicated WebSocket per agent, then supervise that one agent through the
+//! shared `agent-runtime` adapter trait.
 //!
 //! Architecture:
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
@@ -24,9 +24,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, BundleInstallMode, InboxListResult, MessageListResult,
-    MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    AgentModelChoice, AgentSpec, AgentTransport, BundleInstallMode, InboxListResult,
+    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
+    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -1213,6 +1213,9 @@ struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
     spec: AgentSpec,
+    /// Runtime-only provider resolution. This is intentionally separate from
+    /// AgentSpec so providerRef resolution does not rewrite on-disk spec data.
+    transport: AgentTransport,
     /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
     /// here so prompt-envelope code can read legacy profile fields and memory without
     /// threading `paths` through every call.
@@ -1341,6 +1344,28 @@ struct ModelStateFile {
     model: String,
 }
 
+#[cfg(test)]
+fn test_command_transport() -> AgentTransport {
+    AgentTransport {
+        kind: "command".into(),
+        command: "echo".into(),
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        auth_method: None,
+        model: None,
+        model_args: Vec::new(),
+        session: None,
+        output_format: None,
+        prompt_via: proto::methods::PromptVia::default(),
+        prompt: None,
+        stdin: None,
+        timeout_ms: None,
+        idle_timeout_ms: None,
+        interactive: None,
+        provider: None,
+    }
+}
+
 impl WorkerState {
     #[cfg(test)]
     fn new(
@@ -1350,9 +1375,29 @@ impl WorkerState {
         paths: AgentPaths,
         agent_server_url: String,
     ) -> Self {
+        Self::new_with_transport(
+            actor_id,
+            spec,
+            test_command_transport(),
+            profile_dir,
+            paths,
+            agent_server_url,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_transport(
+        actor_id: String,
+        spec: AgentSpec,
+        transport: AgentTransport,
+        profile_dir: PathBuf,
+        paths: AgentPaths,
+        agent_server_url: String,
+    ) -> Self {
         Self::new_with_agent_config_version(
             actor_id,
             spec,
+            transport,
             profile_dir,
             paths,
             agent_server_url,
@@ -1363,13 +1408,14 @@ impl WorkerState {
     fn new_with_agent_config_version(
         actor_id: String,
         spec: AgentSpec,
+        transport: AgentTransport,
         profile_dir: PathBuf,
         paths: AgentPaths,
         agent_server_url: String,
         agent_config_version_id: String,
     ) -> Self {
         let selected_model = load_model_state(&profile_dir)
-            .filter(|model| persisted_model_is_allowed(&spec, model))
+            .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
         let mut actor_display_cache = HashMap::new();
         if !spec.actor.display_name.trim().is_empty() {
@@ -1378,6 +1424,7 @@ impl WorkerState {
         Self {
             actor_id,
             spec,
+            transport,
             profile_dir,
             paths,
             agent_server_url,
@@ -1693,12 +1740,12 @@ fn model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
         .any(|choice| choice.id == model)
 }
 
-fn persisted_model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
+fn persisted_model_is_allowed(spec: &AgentSpec, transport: &AgentTransport, model: &str) -> bool {
     let model = model.trim();
     if model.is_empty() {
         return false;
     }
-    if transport_supports_runtime_model_options(spec) {
+    if transport_supports_runtime_model_options(transport) {
         return true;
     }
     let choices = model_choices_for_spec(spec);
@@ -1708,8 +1755,8 @@ fn persisted_model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
     choices.iter().any(|choice| choice.id == model)
 }
 
-fn transport_supports_runtime_model_options(spec: &AgentSpec) -> bool {
-    spec.transport.kind == "acp_stdio"
+fn transport_supports_runtime_model_options(transport: &AgentTransport) -> bool {
+    transport.kind == "acp_stdio"
 }
 
 fn model_choices_for_spec(spec: &AgentSpec) -> Vec<AgentModelChoice> {
@@ -1755,13 +1802,9 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
     }
 }
 
-async fn run_agent_worker(
-    mut spec: AgentSpec,
-    server_url: String,
-    data_root: PathBuf,
-) -> Result<()> {
-    agent_runtime::discovery::resolve_provider_ref_in_spec(&mut spec)
-        .map_err(|e| anyhow!("resolve providerRef for {}: {e}", spec.actor.id))?;
+async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
+    let transport = resolve_transport_for_spec(&spec)
+        .map_err(|e| anyhow!("resolve transport for {}: {e}", spec.actor.id))?;
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -1791,7 +1834,8 @@ async fn run_agent_worker(
     client
         .open_connection_as(&actor_id, actor_kind, Some(&display_name))
         .await?;
-    let agent_config_version_id = publish_runtime_agent_config(&client, &actor_id, &spec).await?;
+    let agent_config_version_id =
+        publish_runtime_agent_config(&client, &actor_id, &spec, &transport).await?;
     eprintln!(
         "[{actor_id}] connected to {server_url} as {:?}",
         spec.actor.kind
@@ -1807,13 +1851,14 @@ async fn run_agent_worker(
     let state = Arc::new(WorkerState::new_with_agent_config_version(
         actor_id.clone(),
         spec.clone(),
+        transport.clone(),
         paths.profile.clone(),
         paths.clone(),
         agent_server_url.clone(),
         agent_config_version_id,
     ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
-    let adapter = build_adapter(&spec, &paths, &bundle_paths, &agent_server_url)?;
+    let adapter = build_adapter(&spec, &transport, &paths, &bundle_paths, &agent_server_url)?;
 
     // Translator: AdapterEvent → server RPC. Drains until adapter drops the
     // sender (worker exit) — at which point the loop falls out and the task
@@ -1836,10 +1881,17 @@ async fn run_agent_worker(
     result
 }
 
+fn resolve_transport_for_spec(spec: &AgentSpec) -> Result<AgentTransport> {
+    agent_runtime::provider::default_registry()
+        .and_then(|registry| registry.resolve_transport(&spec.provider_ref))
+        .map_err(|e| anyhow!(e))
+}
+
 async fn publish_runtime_agent_config(
     client: &Client,
     actor_id: &str,
     spec: &AgentSpec,
+    transport: &AgentTransport,
 ) -> Result<String> {
     let spec_json = serde_json::to_value(spec).context("serialize agent spec")?;
     let spec_bytes = serde_json::to_vec(spec).context("serialize agent spec for hash")?;
@@ -1855,7 +1907,7 @@ async fn publish_runtime_agent_config(
         .context("serialize prompt template")?
         .unwrap_or_default();
     let model = default_model_for_spec(spec)
-        .or_else(|| spec.transport.model.clone())
+        .or_else(|| transport.model.clone())
         .unwrap_or_default();
     let capabilities = spec
         .actor
@@ -1879,7 +1931,7 @@ async fn publish_runtime_agent_config(
                 "version": version,
                 "prompt": prompt,
                 "model": model,
-                "adapter": spec.transport.kind,
+                "adapter": transport.kind,
                 "tools": spec_json,
                 "capabilityTags": capabilities,
                 "metadata": {
@@ -1905,17 +1957,17 @@ async fn publish_runtime_agent_config(
 
 fn build_adapter(
     spec: &AgentSpec,
+    transport: &AgentTransport,
     paths: &AgentPaths,
     bundle_paths: &BundlePaths,
     server_url: &str,
 ) -> Result<Arc<dyn Adapter>> {
-    let mut process_env: BTreeMap<String, String> = spec
-        .transport
+    let mut process_env: BTreeMap<String, String> = transport
         .env
         .iter()
         .map(|(k, v)| (k.clone(), paths.expand(v, Some(bundle_paths))))
         .collect();
-    let mut command_env = spec.transport.env.clone();
+    let mut command_env = transport.env.clone();
     let loom_binary = current_loom_binary();
     inject_loom_cli_env(&mut process_env, loom_binary.as_deref());
     inject_loom_cli_env(&mut command_env, loom_binary.as_deref());
@@ -1974,14 +2026,13 @@ fn build_adapter(
     }
     insert_static_local_time_env(&mut process_env);
     insert_static_local_time_env(&mut command_env);
-    let process_args: Vec<String> = spec
-        .transport
+    let process_args: Vec<String> = transport
         .args
         .iter()
         .map(|a| paths.expand(a, Some(bundle_paths)))
         .collect();
 
-    match spec.transport.kind.as_str() {
+    match transport.kind.as_str() {
         "acp_stdio" => {
             let mcp_servers = agent_runtime::build_mcp_servers(
                 loom_binary.as_deref(),
@@ -1992,11 +2043,11 @@ fn build_adapter(
                 Some(server_url),
             );
             let cfg = AcpConfig {
-                command: spec.transport.command.clone(),
+                command: transport.command.clone(),
                 args: process_args,
                 env: process_env,
                 process_cwd: paths.root.clone(),
-                auth_method: spec.transport.auth_method.clone(),
+                auth_method: transport.auth_method.clone(),
                 mcp_servers,
             };
             Ok(Arc::new(AcpAdapter::new(cfg)))
@@ -2004,30 +2055,30 @@ fn build_adapter(
         "command" => {
             let cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
-                spec.transport.command.clone(),
-                spec.transport.args.clone(),
+                transport.command.clone(),
+                transport.args.clone(),
                 command_env,
-                &spec.transport,
+                transport,
                 paths.sessions.clone(),
             );
             Ok(Arc::new(CommandAdapter::new(cfg)))
         }
         "interactive_command" => {
-            let interactive = spec.transport.interactive.clone().unwrap_or_default();
+            let interactive = transport.interactive.clone().unwrap_or_default();
             let model = spec
-                .transport
-                .model
-                .clone()
-                .or_else(|| spec.models.as_ref().and_then(|m| m.default.clone()));
+                .models
+                .as_ref()
+                .and_then(|m| m.default.clone())
+                .or_else(|| transport.model.clone());
             let cfg = InteractiveCommandConfig::new(
                 spec.actor.id.clone(),
-                spec.transport.command.clone(),
-                &spec.transport.args,
+                transport.command.clone(),
+                &transport.args,
                 command_env,
                 model,
-                spec.transport.model_args.clone(),
+                transport.model_args.clone(),
                 interactive,
-                spec.transport.provider.clone(),
+                transport.provider.clone(),
                 paths.sessions.clone(),
                 paths.profile.clone(),
             );
@@ -3026,7 +3077,7 @@ async fn build_adapter_prompt(
         config::config_dir().display().to_string(),
     );
     let outputs = agent_runtime::provider::render_prompt_outputs(
-        state.spec.transport.prompt.as_ref(),
+        state.transport.prompt.as_ref(),
         &prompt.parts,
         &prompt.content,
     )
@@ -3609,7 +3660,7 @@ async fn compose_envelope_prompt(
     let conversation_context = recent_conversation_context(client, state, trigger).await;
     let runtime_context =
         join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
-    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.spec) {
+    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.transport) {
         seed_manifest(&state.actor_id, scope)
     } else {
         String::new()
@@ -3941,11 +3992,11 @@ fn prompt_section_label(name: &str) -> &str {
     }
 }
 
-fn command_transport_without_resume(spec: &AgentSpec) -> bool {
-    if spec.transport.kind != "command" {
+fn command_transport_without_resume(transport: &AgentTransport) -> bool {
+    if transport.kind != "command" {
         return false;
     }
-    match spec.transport.session.as_ref() {
+    match transport.session.as_ref() {
         Some(session) => session.first_run_capture.is_none() || session.resume_args.is_none(),
         None => true,
     }
@@ -4824,7 +4875,7 @@ async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Res
 mod tests {
     use super::*;
     use proto::methods::{
-        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, TriggerSpec,
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentProviderRef, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
@@ -4837,24 +4888,11 @@ mod tests {
                 capabilities: None,
                 _meta: None,
             },
-            provider_ref: None,
-            transport: AgentTransport {
-                kind: "command".into(),
-                command: "echo".into(),
-                args: Vec::new(),
-                env: std::collections::BTreeMap::new(),
-                auth_method: None,
+            provider_ref: AgentProviderRef {
+                id: "test".into(),
+                mode: Some("print".into()),
                 model: None,
-                model_args: Vec::new(),
-                session: None,
-                output_format: None,
-                prompt_via: proto::methods::PromptVia::default(),
-                prompt: None,
-                stdin: None,
-                timeout_ms: None,
-                idle_timeout_ms: None,
-                interactive: None,
-                provider: None,
+                reasoning_effort: None,
             },
             autostart: false,
             models: None,
@@ -5716,19 +5754,19 @@ mod tests {
 
     #[test]
     fn command_transport_without_resume_tracks_session_capability() {
-        let no_session = sample_spec(None);
+        let no_session = test_command_transport();
         assert!(command_transport_without_resume(&no_session));
 
-        let mut resumable = sample_spec(None);
-        resumable.transport.session = Some(proto::methods::CommandSession {
+        let mut resumable = test_command_transport();
+        resumable.session = Some(proto::methods::CommandSession {
             id_source: None,
             first_run_capture: Some("stdout_json:.session_id".into()),
             resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
         });
         assert!(!command_transport_without_resume(&resumable));
 
-        let mut acp = sample_spec(None);
-        acp.transport.kind = "acp_stdio".into();
+        let mut acp = test_command_transport();
+        acp.kind = "acp_stdio".into();
         assert!(!command_transport_without_resume(&acp));
     }
 
@@ -6102,7 +6140,8 @@ mod tests {
         std::fs::create_dir_all(&paths.profile).expect("create profile");
         persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
         let mut spec = sample_spec(None);
-        spec.transport.kind = "acp_stdio".into();
+        let mut transport = test_command_transport();
+        transport.kind = "acp_stdio".into();
         spec.models = Some(AgentModelSpec {
             default: Some("spec_default".into()),
             choices: vec![AgentModelChoice {
@@ -6112,9 +6151,10 @@ mod tests {
             }],
         });
 
-        let state = WorkerState::new(
+        let state = WorkerState::new_with_transport(
             "actor_demo".into(),
             spec,
+            transport,
             paths.profile.clone(),
             paths,
             "ws://127.0.0.1:0".into(),

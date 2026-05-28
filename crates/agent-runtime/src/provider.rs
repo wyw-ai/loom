@@ -278,45 +278,15 @@ pub fn render_prompt_outputs(
 ) -> Result<BTreeMap<String, String>, String> {
     let mut outputs = BTreeMap::new();
     let default = default_prompt_outputs();
-    let prompt_spec = spec.unwrap_or(&default);
-    if prompt_spec.outputs.is_empty() {
-        outputs.insert("full".into(), full_prompt.to_string());
-    } else {
-        for (name, output) in &prompt_spec.outputs {
-            outputs.insert(
-                name.clone(),
-                render_prompt_output(output, parts, full_prompt)?,
-            );
+    let prompt_spec = spec
+        .filter(|spec| !spec.outputs.is_empty())
+        .unwrap_or(&default);
+    for (name, output) in &prompt_spec.outputs {
+        let mut rendered = render_prompt_output(output, parts, full_prompt)?;
+        if name == "full" && rendered.trim().is_empty() && !full_prompt.trim().is_empty() {
+            rendered = full_prompt.to_string();
         }
-    }
-    outputs
-        .entry("full".into())
-        .or_insert_with(|| full_prompt.to_string());
-    if !outputs.contains_key("system") {
-        outputs.insert(
-            "system".into(),
-            render_prompt_output(
-                &ProviderPromptOutputSpec {
-                    preset: Some("loom_system".into()),
-                    ..Default::default()
-                },
-                parts,
-                full_prompt,
-            )?,
-        );
-    }
-    if !outputs.contains_key("user") {
-        outputs.insert(
-            "user".into(),
-            render_prompt_output(
-                &ProviderPromptOutputSpec {
-                    preset: Some("loom_turn".into()),
-                    ..Default::default()
-                },
-                parts,
-                full_prompt,
-            )?,
-        );
+        outputs.insert(name.clone(), rendered);
     }
     Ok(outputs)
 }
@@ -759,14 +729,7 @@ fn validate_prompt_references(
     mode_name: &str,
     mode: &ProviderModeSpec,
 ) -> Result<(), String> {
-    let mut outputs = mode
-        .prompt
-        .as_ref()
-        .map(|prompt| prompt.outputs.keys().cloned().collect::<HashSet<_>>())
-        .unwrap_or_default();
-    outputs.insert("full".into());
-    outputs.insert("system".into());
-    outputs.insert("user".into());
+    let outputs = prompt_output_names(mode.prompt.as_ref());
     validate_prompt_outputs(manifest, mode_name, mode.prompt.as_ref())?;
     validate_template_variables(manifest, mode_name, mode, &outputs)?;
     let references = prompt_references_in_mode(mode);
@@ -799,6 +762,13 @@ fn validate_prompt_references(
         validate_session_capture(manifest, mode_name, mode)?;
     }
     Ok(())
+}
+
+fn prompt_output_names(prompt: Option<&ProviderPromptSpec>) -> HashSet<String> {
+    prompt
+        .filter(|prompt| !prompt.outputs.is_empty())
+        .map(|prompt| prompt.outputs.keys().cloned().collect())
+        .unwrap_or_else(|| HashSet::from(["full".into()]))
 }
 
 fn validate_session_capture(
@@ -1886,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_spec_still_renders_default_system_and_user_outputs() {
+    fn empty_prompt_spec_renders_only_default_full_output() {
         let parts = vec![
             prompt_part("actor_context", "actor context"),
             prompt_part("runtime_context", "runtime context"),
@@ -1896,15 +1866,38 @@ mod tests {
             render_prompt_outputs(Some(&ProviderPromptSpec::default()), &parts, "full prompt")
                 .expect("outputs");
 
-        assert_eq!(outputs.get("full").map(String::as_str), Some("full prompt"));
+        assert_eq!(
+            outputs.get("full").map(String::as_str),
+            Some("actor context\n\nruntime context\n\nuser message")
+        );
+        assert!(!outputs.contains_key("system"));
+        assert!(!outputs.contains_key("user"));
+    }
+
+    #[test]
+    fn declared_prompt_outputs_do_not_create_implicit_full_system_or_user() {
+        let parts = vec![prompt_part("actor_context", "actor context")];
+        let outputs = render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                outputs: BTreeMap::from([(
+                    "system".into(),
+                    ProviderPromptOutputSpec {
+                        include: vec!["actor_context".into()],
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &parts,
+            "full prompt",
+        )
+        .expect("outputs");
+
         assert_eq!(
             outputs.get("system").map(String::as_str),
             Some("actor context")
         );
-        assert_eq!(
-            outputs.get("user").map(String::as_str),
-            Some("runtime context\n\nuser message")
-        );
+        assert!(!outputs.contains_key("full"));
+        assert!(!outputs.contains_key("user"));
     }
 
     #[test]
@@ -2044,6 +2037,32 @@ mod tests {
         let err = validate_manifest(&manifest).expect_err("unknown variable should fail");
         assert!(
             err.contains("unknown template variable `unknown.var`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_undeclared_prompt_output_reference() {
+        let manifest = manifest(
+            "bad_prompt_output",
+            "Bad Prompt Output",
+            &["bad-prompt-output"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("--system"), lit("{prompt.system}")],
+                    ProviderPromptSpec::default(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("unknown prompt output should fail");
+        assert!(
+            err.contains("references unknown prompt output `system`"),
             "{err}"
         );
     }

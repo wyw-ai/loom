@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use proto::methods::{
     AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
     CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderDecoderCaptureSpec,
-    ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
-    ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
-    ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
+    ProviderDecoderEmitSpec, ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec,
+    ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec,
+    ProviderPromptOutputSpec, ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource,
+    ProviderSessionSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -258,6 +259,7 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
             ));
         }
         validate_mode_command(manifest, mode_name, mode)?;
+        validate_decoder_spec(manifest, mode_name, "stdout", &mode.stdout)?;
         validate_prompt_references(manifest, mode_name, mode)?;
     }
     Ok(())
@@ -863,6 +865,315 @@ fn validate_session_spec(
         ));
     }
     Ok(())
+}
+
+fn validate_decoder_spec(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    stream: &str,
+    decoder: &ProviderDecoderSpec,
+) -> Result<(), String> {
+    output_format(decoder).map_err(|err| {
+        format!(
+            "provider `{}` mode `{mode_name}` {stream} decoder: {err}",
+            manifest.id
+        )
+    })?;
+    for (idx, event) in decoder.events.iter().enumerate() {
+        if let Some(condition) = event.when.as_ref() {
+            validate_json_condition(
+                manifest,
+                mode_name,
+                &format!("{stream}.events[{idx}].when"),
+                condition,
+            )?;
+        }
+        validate_decoder_emit(
+            manifest,
+            mode_name,
+            &format!("{stream}.events[{idx}].emit"),
+            &event.emit,
+        )?;
+    }
+    if let Some(reduce) = decoder.reduce.as_ref() {
+        if let Some(final_text) = reduce.final_text.as_ref() {
+            validate_jsonl_text_reducer(
+                manifest,
+                mode_name,
+                &format!("{stream}.reduce.finalText"),
+                final_text,
+            )?;
+        }
+    }
+    if let Some(capture) = decoder.capture.as_ref() {
+        if let Some(session) = capture.session.as_ref() {
+            validate_jsonl_text_reducer(
+                manifest,
+                mode_name,
+                &format!("{stream}.capture.session"),
+                session,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoder_emit(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    emit: &ProviderDecoderEmitSpec,
+) -> Result<(), String> {
+    let emit_type = emit.emit_type.trim();
+    match emit_type {
+        "text" => {
+            require_decoder_template(manifest, mode_name, where_, "text", emit.text.as_deref())?;
+            validate_optional_decoder_template(manifest, mode_name, where_, "text", &emit.text)?;
+        }
+        "tool_use" | "toolUse" | "tool" => {
+            require_decoder_template(
+                manifest,
+                mode_name,
+                where_,
+                "toolName",
+                emit.tool_name.as_deref(),
+            )?;
+            validate_optional_decoder_template(
+                manifest,
+                mode_name,
+                where_,
+                "toolName",
+                &emit.tool_name,
+            )?;
+            validate_optional_decoder_template(manifest, mode_name, where_, "input", &emit.input)?;
+        }
+        "status" => {
+            if emit.status.as_ref().or(emit.text.as_ref()).is_none() {
+                return Err(format!(
+                    "provider `{}` mode `{mode_name}` {where_} status event requires `status` or `text`",
+                    manifest.id
+                ));
+            }
+            validate_optional_decoder_template(
+                manifest,
+                mode_name,
+                where_,
+                "status",
+                &emit.status,
+            )?;
+            validate_optional_decoder_template(manifest, mode_name, where_, "text", &emit.text)?;
+        }
+        "error" => {
+            if emit.message.as_ref().or(emit.text.as_ref()).is_none() {
+                return Err(format!(
+                    "provider `{}` mode `{mode_name}` {where_} error event requires `message` or `text`",
+                    manifest.id
+                ));
+            }
+            validate_optional_decoder_template(
+                manifest,
+                mode_name,
+                where_,
+                "message",
+                &emit.message,
+            )?;
+            validate_optional_decoder_template(manifest, mode_name, where_, "text", &emit.text)?;
+        }
+        "finish" | "finished" => {
+            validate_optional_decoder_template(
+                manifest,
+                mode_name,
+                where_,
+                "summary",
+                &emit.summary,
+            )?;
+            validate_optional_decoder_template(
+                manifest,
+                mode_name,
+                where_,
+                "message",
+                &emit.message,
+            )?;
+        }
+        "" => {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` {where_} type is required",
+                manifest.id
+            ));
+        }
+        other => {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` {where_} uses unsupported event type `{other}`",
+                manifest.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_decoder_template(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    field: &str,
+    value: Option<&str>,
+) -> Result<(), String> {
+    if value.is_some_and(|value| !value.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(format!(
+        "provider `{}` mode `{mode_name}` {where_} {field} is required",
+        manifest.id
+    ))
+}
+
+fn validate_optional_decoder_template(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    field: &str,
+    value: &Option<String>,
+) -> Result<(), String> {
+    let Some(value) = value.as_deref() else {
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.starts_with('$') || value.starts_with('.') {
+        validate_json_path_syntax(value).map_err(|err| {
+            format!(
+                "provider `{}` mode `{mode_name}` {where_}.{field}: {err}",
+                manifest.id
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_jsonl_text_reducer(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Result<(), String> {
+    let mode = reducer.mode.trim();
+    if !matches!(
+        mode,
+        "lastNonEmpty"
+            | "last_non_empty"
+            | "firstNonEmpty"
+            | "first_non_empty"
+            | "concat"
+            | "joinText"
+            | "join_text"
+    ) {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` {where_} uses unsupported reducer mode `{mode}`",
+            manifest.id
+        ));
+    }
+    validate_json_path_syntax(&reducer.path).map_err(|err| {
+        format!(
+            "provider `{}` mode `{mode_name}` {where_}.path: {err}",
+            manifest.id
+        )
+    })?;
+    if let Some(condition) = reducer.when.as_ref() {
+        validate_json_condition(manifest, mode_name, &format!("{where_}.when"), condition)?;
+    }
+    if let Some(fallback) = reducer.fallback.as_deref() {
+        validate_jsonl_text_reducer(manifest, mode_name, &format!("{where_}.fallback"), fallback)?;
+    }
+    Ok(())
+}
+
+fn validate_json_condition(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    condition: &ProviderJsonConditionSpec,
+) -> Result<(), String> {
+    if let Some(path) = condition.path.as_deref() {
+        validate_json_path_syntax(path).map_err(|err| {
+            format!(
+                "provider `{}` mode `{mode_name}` {where_}.path: {err}",
+                manifest.id
+            )
+        })?;
+    }
+    for (idx, item) in condition.all.iter().enumerate() {
+        validate_json_condition(manifest, mode_name, &format!("{where_}.all[{idx}]"), item)?;
+    }
+    for (idx, item) in condition.any.iter().enumerate() {
+        validate_json_condition(manifest, mode_name, &format!("{where_}.any[{idx}]"), item)?;
+    }
+    if let Some(item) = condition.not.as_deref() {
+        validate_json_condition(manifest, mode_name, &format!("{where_}.not"), item)?;
+    }
+    Ok(())
+}
+
+fn validate_json_path_syntax(path: &str) -> Result<(), String> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err("json path is required".into());
+    }
+    let path = raw
+        .strip_prefix("$.")
+        .or_else(|| raw.strip_prefix('.'))
+        .unwrap_or(raw);
+    if path.is_empty() || path == "$" {
+        return Err(format!("unsupported json path `{raw}`"));
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return Err(format!("unsupported empty json path segment in `{raw}`"));
+        }
+        validate_json_path_segment(raw, segment)?;
+    }
+    Ok(())
+}
+
+fn validate_json_path_segment(path: &str, segment: &str) -> Result<(), String> {
+    let mut rest = segment;
+    if let Some(open) = rest.find('[') {
+        let key = &rest[..open];
+        if !key.is_empty() && !valid_json_path_key(key) {
+            return Err(format!(
+                "unsupported json path segment `{segment}` in `{path}`"
+            ));
+        }
+        rest = &rest[open..];
+    } else {
+        if !valid_json_path_key(rest) {
+            return Err(format!(
+                "unsupported json path segment `{segment}` in `{path}`"
+            ));
+        }
+        return Ok(());
+    }
+    while !rest.is_empty() {
+        if !rest.starts_with('[') {
+            return Err(format!(
+                "unsupported json path segment `{segment}` in `{path}`"
+            ));
+        }
+        let Some(close) = rest.find(']') else {
+            return Err(format!("unterminated json path index in `{path}`"));
+        };
+        let index = &rest[1..close];
+        if index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(format!("unsupported json path index `{index}` in `{path}`"));
+        }
+        rest = &rest[close + 1..];
+    }
+    Ok(())
+}
+
+fn valid_json_path_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
 fn validate_prompt_outputs(
@@ -1900,6 +2211,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::methods::ProviderDecoderEventSpec;
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -2404,6 +2716,91 @@ mod tests {
             err.contains("unsupported session scope `workspace`"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unknown_decoder_format() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            full_prompt(),
+            "text",
+            None,
+        );
+        provider_mode.stdout.format = "xml".into();
+        provider_mode.stdout.name = None;
+        let manifest = manifest(
+            "bad_decoder_format",
+            "Bad Decoder Format",
+            &["bad-decoder-format"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("bad decoder should fail");
+        assert!(err.contains("unknown decoder format `xml`"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unknown_decoder_event_type() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            full_prompt(),
+            "text",
+            None,
+        );
+        provider_mode.stdout.format = "jsonl".into();
+        provider_mode.stdout.name = None;
+        provider_mode.stdout.events = vec![ProviderDecoderEventSpec {
+            when: None,
+            emit: ProviderDecoderEmitSpec {
+                emit_type: "metric".into(),
+                text: Some("$.value".into()),
+                ..Default::default()
+            },
+        }];
+        let manifest = manifest(
+            "bad_decoder_event",
+            "Bad Decoder Event",
+            &["bad-decoder-event"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("bad event should fail");
+        assert!(err.contains("unsupported event type `metric`"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_bad_decoder_reducer() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            full_prompt(),
+            "text",
+            None,
+        );
+        provider_mode.stdout.format = "jsonl".into();
+        provider_mode.stdout.name = None;
+        provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "last".into(),
+                path: "$.data.content".into(),
+                when: Some(json_condition_equals("$.type", "assistant.message")),
+                fallback: None,
+            }),
+        });
+        let manifest = manifest(
+            "bad_decoder_reducer",
+            "Bad Decoder Reducer",
+            &["bad-decoder-reducer"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("bad reducer should fail");
+        assert!(err.contains("unsupported reducer mode `last`"), "{err}");
     }
 
     #[test]

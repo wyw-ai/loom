@@ -2587,6 +2587,11 @@ pub enum PromptVia {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
+    /// Static instructions for this agent actor. Loom injects these as a
+    /// system-side prompt part so providers with a native system prompt can
+    /// keep this content stable across turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Provider-catalog based runtime selection. The host resolves this into a
     /// runtime transport plan before starting the worker.
     #[serde(rename = "providerRef")]

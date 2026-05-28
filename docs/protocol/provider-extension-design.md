@@ -12,7 +12,7 @@ Provider manifest 时忽略 Loom 原有能力。
 | 原有功能/边界 | 影响 | 设计结论 |
 | --- | --- | --- |
 | agent 启动与 provider discovery | 从 `provider id -> Rust hardcode` 改成 `ProviderManifest -> ProviderRuntimePlan` | 行为应由内置 manifest 复刻，启动入口不再按 provider id 分支。 |
-| AgentSpec | 不再保存完整 `transport`，也不由 GUI/server 生成最终文件 | AgentSpec 由目标 daemon 写入，只保存 actor id/displayName、metadata、trigger/promptTemplate、memory policy、providerRef 和选中的 model/reasoning。 |
+| AgentSpec | 不再保存完整 `transport`，也不由 GUI/server 生成最终文件 | AgentSpec 由目标 daemon 写入，只保存 actor id/displayName、静态 instructions、metadata、trigger/promptTemplate、memory policy、providerRef 和选中的 model/reasoning。 |
 | daemon machine 配置 | 只保存 daemon 自己上线和运行所需的宿主信息 | daemon 拥有本机 provider registry、AgentSpec、profile/memory 与运行状态；GUI/server 不直接写 daemon 私有配置。 |
 | GUI 本地 machine/agent 配置 | 删除运行时意义 | GUI 只保存人类客户端偏好和 server 连接选择；agent/provider 列表来自 server 上的 daemon inventory，修改必须变成 machine command。 |
 | machine-level provider override | 收敛为 daemon-local ProviderManifest variant | 如果某台 host 需要特殊 command/args/env，用该 daemon 的 `{loom.configDir}/providers/<id>.json` + `extends` 表达。 |
@@ -191,8 +191,9 @@ mode 选择应该由 AgentSpec 或 Provider 默认值显式决定。GUI 请求�
 Loom prompt composer 应输出结构化 parts，而不是只输出一个字符串。建议最小集合：
 
 ```text
-trigger_prefix      AgentSpec triggerPromptPrefix
 actor_context       Loom 注入的 actor id/displayName 和当前 actor 上下文
+agent_instructions  AgentSpec 的静态 instructions，属于 system-side prompt part
+trigger_prefix      AgentSpec triggerPromptPrefix
 bootstrap_memory    长期/启动 memory
 scope_bootstrap     Loom CLI、协作规则、当前 scope 等首轮规则
 turn_memory         本 turn 选中的 memory
@@ -204,7 +205,8 @@ user_message        turn 侧输入，等价于 trigger_prefix + turn_input
 ```
 
 新模型不把历史 `identity.md` / `soul.md` 当作 agent 的标准字段或 Provider 输入。
-agent 的描述、展示名、头像等信息属于 `actor._meta`；长期上下文属于 memory。旧
+agent 的静态行为说明属于 `AgentSpec.instructions`，展示名、头像、UI 描述等信息属于
+`actor._meta`；长期上下文属于 memory。旧
 identity/soul 文件如需保留，只能由显式迁移工具转换成新的 metadata 或 memory，runtime
 不再把它们作为默认 prompt part 读取。
 
@@ -250,7 +252,7 @@ Provider manifest 可以把这些 parts 组合成任意命名 prompt 输出。�
 建议内置 preset：
 
 ```text
-loom_system  actor_context + bootstrap_memory + scope_bootstrap
+loom_system  actor_context + agent_instructions + bootstrap_memory + scope_bootstrap
 loom_turn    turn_memory + runtime_context + user_message，承载每轮动态上下文、
              trigger_prefix 和 prompt_template 行为
 loom_full    loom_system + loom_turn，等价于当前单字符串 envelope 的语义
@@ -567,7 +569,7 @@ Claude Code          2.1.92
 Qoder CLI            1.0.6
 GitHub Copilot CLI   1.0.54
 Codex CLI            0.134.0
-OpenCode             当前未安装，安装后再补调研
+OpenCode             1.15.11
 ```
 
 ### Claude Code
@@ -742,10 +744,73 @@ id 时发出 `ProviderRuntimeEvent::Session`。
 
 ### OpenCode
 
-OpenCode 当前本机未安装，不能把接入方式写成已验证事实。当前只记录假设：
-`opencode run --dangerously-skip-permissions {prompt.full}`，输出按 `text` 处理。
-安装后需要补齐 CLI help、模型参数、权限参数、是否支持 JSON/JSONL 输出、是否支持
-system prompt 和 session resume，再更新内置 manifest。
+OpenCode 的非交互入口是 `opencode run [message..]`。当前 CLI help 显示它支持
+`--format default|json`、`--session`、`--continue`、`--model`、`--variant`、
+`--agent` 和 `--dangerously-skip-permissions`。没有看到等价于
+`--system-prompt` / `--append-system-prompt` 的 run 参数，因此第一版应使用
+`{prompt.full}`，让 Loom system、agent instructions、runtime context 和 turn message
+按 prompt parts 组合后作为 message 传入。
+
+OpenCode session 直接按 `provider_capture + --session` 接入：首轮从 JSON 输出捕获
+Provider 生成的 `sessionID`，后续 turn 用 `--session {session.id}`。为了让每个 Loom
+agent 的运行期状态彼此隔离，manifest 应设置 `XDG_DATA_HOME`、`XDG_STATE_HOME` 和
+`XDG_CACHE_HOME` 到 `{agent.profile}/opencode/...`。`opencode debug paths` 显示
+config 仍默认来自用户级 `~/.config/opencode`；这部分暂时保留给 OpenCode 凭据和全局
+配置，不写入 AgentSpec。本机 `opencode models` 当前返回
+`opencode/big-pickle`、`opencode/deepseek-v4-flash-free`、`opencode/mimo-v2.5-free`
+和 `opencode/nemotron-3-super-free`；内置 manifest 不应默认写不存在的 OpenAI
+模型 id。
+
+建议 print mode：
+
+```json
+{
+  "prompt": {
+    "outputs": {
+      "full": { "preset": "loom_full" }
+    }
+  },
+  "env": {
+    "XDG_DATA_HOME": "{agent.profile}/opencode/data",
+    "XDG_STATE_HOME": "{agent.profile}/opencode/state",
+    "XDG_CACHE_HOME": "{agent.profile}/opencode/cache"
+  },
+  "args": [
+    "run",
+    "--dangerously-skip-permissions",
+    "--format", "json",
+    { "when": "model", "args": ["--model", "{model}"] },
+    { "when": "reasoningEffort", "args": ["--variant", "{reasoningEffort}"] },
+    "{prompt.full}"
+  ],
+  "stdout": {
+    "format": "jsonl",
+    "reduce": {
+      "finalText": {
+        "mode": "lastNonEmpty",
+        "path": "$.part.text",
+        "when": { "path": "$.type", "equals": "text" }
+      }
+    },
+    "capture": {
+      "session": { "mode": "lastNonEmpty", "path": "$.sessionID" }
+    }
+  },
+  "session": {
+    "idSource": "provider_capture",
+    "scope": "actor_scope",
+    "resumeArgs": [
+      "run",
+      "--dangerously-skip-permissions",
+      "--format", "json",
+      "--session", "{session.id}",
+      { "when": "model", "args": ["--model", "{model}"] },
+      { "when": "reasoningEffort", "args": ["--variant", "{reasoningEffort}"] },
+      "{prompt.full}"
+    ]
+  }
+}
+```
 
 ## Runtime 架构
 
@@ -779,8 +844,8 @@ transport。
 
 ## AgentSpec 方向
 
-AgentSpec 不复制 transport。GUI 请求创建 agent 时只提交 actor metadata、providerRef、
-model 等声明；真正写入由目标 daemon 完成：
+AgentSpec 不复制 transport。GUI 请求创建 agent 时只提交 actor metadata、instructions、
+providerRef、model 等声明；真正写入由目标 daemon 完成：
 
 ```json
 {
@@ -788,6 +853,7 @@ model 等声明；真正写入由目标 daemon 完成：
     "id": "actor_joi",
     "displayName": "Joi"
   },
+  "instructions": "Reply concisely and report completed work.",
   "providerRef": {
     "id": "claude",
     "mode": "print",
@@ -834,6 +900,7 @@ AgentSpec / spec.json
 | model choices | ProviderManifest | Provider 给 UI 默认菜单；agent 只记录选中的 model。 |
 | selected model / reasoning effort | AgentSpec 或运行时选择 | 这是具体 agent 的偏好，Provider 只定义如何映射到 argv/env。 |
 | prompt parts 如何进 system/user/full | ProviderManifest | 这是 Provider 接入形态。 |
+| instructions | AgentSpec | 这是具体 agent 的静态行为说明，进入 `agent_instructions` prompt part，并由 ProviderManifest 决定是否落到 system prompt。 |
 | promptTemplate / trigger_prefix | AgentSpec | 这是具体 agent 的触发语义和任务包装。 |
 | metadata / description | AgentSpec | 这是 actor 的 UI 与调度元信息，不参与 Provider 启动规则。 |
 | memory policy | AgentSpec | 这是具体 agent 是否注入 memory 的策略；memory 内容和索引属于 daemon profile/dataRoot。 |
@@ -851,6 +918,7 @@ AgentSpec / spec.json
       "description": "Reviews code changes"
     }
   },
+  "instructions": "Reviews code changes and replies with concise findings.",
   "providerRef": {
     "id": "claude",
     "mode": "print",
@@ -1019,8 +1087,8 @@ Provider variant，用 `extends` 继承已有 Provider，再覆盖 mode：
 }
 ```
 
-规则是：**运行适配差异进 ProviderManifest；单个 actor 的 metadata、记忆策略、触发和
-模型偏好进 AgentSpec；短期进程状态进 runtime state。**
+规则是：**运行适配差异进 ProviderManifest；单个 actor 的 instructions、metadata、
+记忆策略、触发和模型偏好进 AgentSpec；短期进程状态进 runtime state。**
 
 ## 安全与校验
 
@@ -1156,7 +1224,8 @@ GUI/server 只消费 daemon inventory。
 
 ## 待定问题
 
-- OpenCode 安装后需要补齐 CLI help 和输出样本，再确认是否继续 text parser。
+- OpenCode 已按当前 CLI help 接入 JSON 输出和 `provider_capture` session；仍需要在
+  后续真实运行样本中确认 JSON 事件字段是否稳定，尤其是 `sessionID` 和最终文本路径。
 - 复杂 Provider 是否需要 JavaScript/WASM parser hook，还是小型 JSONPath/regex DSL
   足够？
 - models 应该静态写在 manifest、通过 provider command 动态发现，还是两者都支持并

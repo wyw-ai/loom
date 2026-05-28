@@ -427,6 +427,13 @@ fn agent_spec_from_command(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let instructions = command
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| description.clone());
     let model = command
         .get("model")
         .and_then(Value::as_str)
@@ -472,6 +479,7 @@ fn agent_spec_from_command(
             capabilities: None,
             _meta: Some(meta),
         },
+        instructions,
         provider_ref: AgentProviderRef {
             id: provider.id.clone(),
             mode: Some("print".into()),
@@ -522,9 +530,18 @@ fn update_agent_spec_from_command(
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         if description.trim().is_empty() {
             meta.remove("description");
+            spec.instructions = None;
         } else {
             meta.insert("description".into(), json!(description));
+            spec.instructions = Some(description);
         }
+    }
+    if let Some(instructions) = optional_trimmed_str(command, "instructions") {
+        spec.instructions = if instructions.trim().is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
     }
     if let Some(model) = optional_trimmed_str(command, "model") {
         let model = if model.trim().is_empty() {
@@ -1400,6 +1417,7 @@ mod tests {
                     ("reasoningEffort".into(), json!("xhigh")),
                 ])),
             },
+            instructions: None,
             provider_ref: AgentProviderRef {
                 id: "codex".into(),
                 mode: Some("print".into()),
@@ -1458,6 +1476,7 @@ mod tests {
 
         assert_eq!(spec.provider_ref.id.as_str(), "claude");
         assert_eq!(spec.provider_ref.model.as_deref(), Some("opus"));
+        assert_eq!(spec.instructions.as_deref(), Some("Writes concise updates"));
         let value = serde_json::to_value(&spec).expect("json");
         assert!(value.get("providerRef").is_some());
         assert!(value.get("transport").is_none());
@@ -1474,6 +1493,7 @@ mod tests {
                 capabilities: None,
                 _meta: Some(BTreeMap::from([("providerId".into(), json!("codex"))])),
             },
+            instructions: None,
             provider_ref: AgentProviderRef {
                 id: "codex".into(),
                 mode: Some("print".into()),

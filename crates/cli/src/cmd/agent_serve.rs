@@ -1337,6 +1337,7 @@ fn test_command_transport() -> AgentTransport {
         session: None,
         output_format: None,
         decoder: None,
+        stderr_decoder: None,
         prompt_via: proto::methods::PromptVia::default(),
         prompt: None,
         stdin: None,
@@ -4055,14 +4056,19 @@ fn command_transport_can_resume(transport: &AgentTransport) -> bool {
     }
     match session.id_source {
         Some(CommandSessionIdSource::LoomUuid) => true,
-        Some(CommandSessionIdSource::ProviderCapture) => transport
-            .decoder
-            .as_ref()
-            .and_then(|decoder| decoder.capture.as_ref())
-            .and_then(|capture| capture.session.as_ref())
-            .is_some(),
+        Some(CommandSessionIdSource::ProviderCapture) => {
+            decoder_has_session_capture(transport.decoder.as_ref())
+                || decoder_has_session_capture(transport.stderr_decoder.as_ref())
+        }
         None => session.first_run_capture.is_some(),
     }
+}
+
+fn decoder_has_session_capture(decoder: Option<&proto::methods::ProviderDecoderSpec>) -> bool {
+    decoder
+        .and_then(|decoder| decoder.capture.as_ref())
+        .and_then(|capture| capture.session.as_ref())
+        .is_some()
 }
 
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
@@ -5861,6 +5867,10 @@ mod tests {
             ..Default::default()
         });
         assert!(!command_transport_without_resume(&decoder_capture));
+
+        let mut stderr_decoder_capture = decoder_capture.clone();
+        stderr_decoder_capture.stderr_decoder = stderr_decoder_capture.decoder.take();
+        assert!(!command_transport_without_resume(&stderr_decoder_capture));
 
         let mut turn_scoped = loom_uuid.clone();
         turn_scoped.session.as_mut().unwrap().scope = Some("turn".into());

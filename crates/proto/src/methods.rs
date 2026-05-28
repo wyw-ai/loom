@@ -1958,6 +1958,10 @@ pub struct CommandSession {
     /// means Loom generates and stores a stable UUID for the actor/scope.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "idSource")]
     pub id_source: Option<CommandSessionIdSource>,
+    /// Session reuse boundary. Defaults to `actor_scope`, matching the legacy
+    /// command transport behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// DSL: `stdout_json:<jq-style-path>`, `stderr_regex:<re>`, `file:<path>`.
     /// `None` means this CLI does not expose a resumable session.
     #[serde(default, skip_serializing_if = "Option::is_none")]

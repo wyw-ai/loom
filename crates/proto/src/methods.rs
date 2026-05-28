@@ -1005,7 +1005,7 @@ mod tests {
             r#"{
                 "kind": "interactive_command",
                 "command": "claude",
-                "model": "claude-sonnet-4.6",
+                "model": "claude-sonnet-4-6",
                 "modelArgs": ["--model", "{model}"],
                 "interactive": {
                     "session": {
@@ -1021,7 +1021,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(transport.kind, "interactive_command");
-        assert_eq!(transport.model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(transport.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(transport.model_args, vec!["--model", "{model}"]);
         let interactive = transport.interactive.unwrap();
         assert_eq!(interactive.session.new_args.len(), 3);
@@ -1587,6 +1587,8 @@ pub struct InboxListEntry {
     pub delivery: Delivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Event>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1894,8 +1896,9 @@ pub struct AgentTransport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSession {
-    /// DSL: `stdout_json:<jq-style-path>`, `stderr_regex:<re>`, `file:<path>`.
-    /// `None` means this CLI does not expose a resumable session.
+    /// DSL: `stdout_json:<jq-style-path>`, `stdout_json_any:<path>|<path>`,
+    /// `stderr_regex:<re>`, `file:<path>`. `None` means this CLI does not
+    /// expose a resumable session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_run_capture: Option<String>,
     /// Argv template substituted with `{session_id}` and (when `prompt_via=args`)
@@ -2204,8 +2207,10 @@ pub enum CommandOutputFormat {
     ClaudeStreamJson,
     /// GitHub Copilot CLI `--output-format json` JSONL session events.
     CopilotJson,
-    /// OpenAI codex CLI `--output-format stream-json` framing (placeholder).
+    /// OpenAI codex CLI `--json` event stream.
     CodexStreamJson,
+    /// OpenCode `run --format json` raw JSON events.
+    OpencodeJson,
     /// Generic line-delimited JSON (each line carries `{"type": "...", ...}`).
     NdjsonLines,
 }
@@ -2993,6 +2998,7 @@ pub mod stream_kind {
     pub const RUN_UPDATED: &str = "run.updated";
     pub const MESSAGE_CREATED: &str = "message.created";
     pub const MESSAGE_UPDATED: &str = "message.updated";
+    pub const EVENT_CREATED: &str = "event.created";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     pub const DELIVERY_UPDATED: &str = "delivery.updated";
     /// Direct-to-actor notification: the recipient was added to a channel

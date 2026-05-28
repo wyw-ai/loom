@@ -10,12 +10,12 @@
 //!
 //! E2 scope (initial implementation):
 //!   * `output_format`: `Text`, `NdjsonLines`, `ClaudeStreamJson`,
-//!     `CopilotJson`. CodexStreamJson is wired through but its translation
-//!     table is a placeholder per the doc.
+//!     `CopilotJson`, `CodexStreamJson`, `OpencodeJson`.
 //!   * `prompt_via`: `Args`, `Stdin`, `Env`.
-//!   * `first_run_capture`: `stdout_json:<path>`, `file:<path>`. The
-//!     `stderr_regex:` form is recognised but returns an unimplemented error so
-//!     it is obvious in logs (rather than silently swallowed).
+//!   * `first_run_capture`: `stdout_json:<path>`,
+//!     `stdout_json_any:<path>|<path>`, `file:<path>`. The `stderr_regex:` form
+//!     is recognised but returns an unimplemented error so it is obvious in logs
+//!     (rather than silently swallowed).
 //!   * Session bookkeeping: written to disk, read back on next prompt; signature
 //!     mismatch invalidates and forces a first-run path.
 //!
@@ -25,7 +25,7 @@
 //! `AdapterEvent`s synchronously.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -44,6 +44,11 @@ use crate::usage::extract_token_usage_from_text;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+enum ProcessOutput {
+    Stdout(String),
+    Stderr(String),
+}
 
 /// Per-scope handle to an in-flight subprocess. The PID is set after spawn
 /// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
@@ -480,9 +485,10 @@ fn spawn_and_collect(
     let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
     let stderr = child.stderr.take().ok_or("failed to open child stderr")?;
 
-    // Stream stdout on a helper thread so the foreground loop can enforce a
-    // hard timeout even if the child is silent or never closes stdout.
-    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<String>();
+    // Stream child output on helper threads so the foreground loop can enforce
+    // timeouts and surface provider errors even if the process never exits.
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<ProcessOutput>();
+    let stdout_tx = output_tx.clone();
     let stdout_handle = std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
@@ -491,22 +497,31 @@ fn spawn_and_collect(
             match reader.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let _ = stdout_tx.send(line.clone());
+                    let _ = stdout_tx.send(ProcessOutput::Stdout(line.clone()));
                 }
                 Err(_) => break,
             }
         }
     });
-    // Collect stderr on a thread purely so it doesn't fill its pipe and
-    // deadlock the child.
+    let stderr_tx = output_tx.clone();
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr);
-        let _ = r.read_to_string(&mut buf);
-        buf
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = stderr_tx.send(ProcessOutput::Stderr(line.clone()));
+                }
+                Err(_) => break,
+            }
+        }
     });
+    drop(output_tx);
 
     let mut collected_stdout = String::new();
+    let mut collected_stderr = String::new();
     let mut emitted_text = false;
     let deadline = cfg
         .timeout_ms
@@ -516,15 +531,33 @@ fn spawn_and_collect(
         .idle_timeout_ms
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis);
-    let mut last_stdout_at = Instant::now();
+    let mut last_output_at = Instant::now();
     let mut exit: Option<ExitStatus> = None;
     let mut timed_out = false;
     let mut idle_timed_out = false;
+    let mut early_runtime_error: Option<String> = None;
 
     loop {
-        while let Ok(line) = stdout_rx.try_recv() {
-            last_stdout_at = Instant::now();
-            emitted_text |= collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+        while let Ok(output) = output_rx.try_recv() {
+            last_output_at = Instant::now();
+            match output {
+                ProcessOutput::Stdout(line) => {
+                    emitted_text |=
+                        collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+                }
+                ProcessOutput::Stderr(line) => {
+                    collected_stderr.push_str(&line);
+                    if early_runtime_error.is_none() {
+                        early_runtime_error = extract_runtime_error_from_text(&line);
+                    }
+                }
+            }
+        }
+        if early_runtime_error.is_some() {
+            if force_kill_child(child.id()).is_err() {
+                let _ = child.kill();
+            }
+            break;
         }
 
         if let Some(status) = child
@@ -550,7 +583,7 @@ fn spawn_and_collect(
         }
 
         if let Some(idle_timeout) = idle_timeout {
-            if last_stdout_at.elapsed() >= idle_timeout {
+            if last_output_at.elapsed() >= idle_timeout {
                 idle_timed_out = true;
                 if force_kill_child(child.id()).is_err() {
                     let _ = child.kill();
@@ -568,16 +601,32 @@ fn spawn_and_collect(
             .into_iter()
             .chain(idle_timeout.map(|idle_timeout| {
                 idle_timeout
-                    .saturating_sub(last_stdout_at.elapsed())
+                    .saturating_sub(last_output_at.elapsed())
                     .min(Duration::from_millis(50))
             }))
             .min()
             .unwrap_or_else(|| Duration::from_millis(50));
-        match stdout_rx.recv_timeout(wait_for) {
-            Ok(line) => {
-                last_stdout_at = Instant::now();
-                emitted_text |=
-                    collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+        match output_rx.recv_timeout(wait_for) {
+            Ok(output) => {
+                last_output_at = Instant::now();
+                match output {
+                    ProcessOutput::Stdout(line) => {
+                        emitted_text |=
+                            collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+                    }
+                    ProcessOutput::Stderr(line) => {
+                        collected_stderr.push_str(&line);
+                        if early_runtime_error.is_none() {
+                            early_runtime_error = extract_runtime_error_from_text(&line);
+                        }
+                    }
+                }
+                if early_runtime_error.is_some() {
+                    if force_kill_child(child.id()).is_err() {
+                        let _ = child.kill();
+                    }
+                    break;
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -593,10 +642,16 @@ fn spawn_and_collect(
             .map_err(|e| format!("failed to wait on child: {e}"))?,
     };
     let _ = stdout_handle.join();
-    for line in stdout_rx.try_iter() {
-        emitted_text |= collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+    let _ = stderr_handle.join();
+    for output in output_rx.try_iter() {
+        match output {
+            ProcessOutput::Stdout(line) => {
+                emitted_text |=
+                    collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
+            }
+            ProcessOutput::Stderr(line) => collected_stderr.push_str(&line),
+        }
     }
-    let collected_stderr = stderr_handle.join().unwrap_or_default();
     let exit_code = exit.code().unwrap_or(-1);
     // Snapshot + clear the cancel flag now that the child is reaped, before
     // building the Finished summary below.
@@ -613,6 +668,13 @@ fn spawn_and_collect(
     // + Finished here. The Text format never pushed anything, so we emit the
     // whole stdout as a single Text and then Finished.
     let success = exit_code == 0 && !was_cancelled && !timed_out && !idle_timed_out;
+    let runtime_error = if success {
+        None
+    } else {
+        early_runtime_error
+            .or_else(|| extract_runtime_error_from_text(&collected_stdout))
+            .or_else(|| extract_runtime_error_from_text(&collected_stderr))
+    };
     let summary = if was_cancelled {
         "cancelled".into()
     } else if timed_out {
@@ -627,6 +689,8 @@ fn spawn_and_collect(
         }
     } else if success {
         String::new()
+    } else if let Some(message) = runtime_error {
+        message
     } else if !collected_stderr.is_empty() {
         truncate_for_summary(&collected_stderr)
     } else {
@@ -645,6 +709,15 @@ fn spawn_and_collect(
         }
         CommandOutputFormat::CopilotJson => {
             if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
+                let _ = sender.send(AdapterEvent::Text {
+                    scope: Some(prompt.scope.clone()),
+                    content,
+                    is_partial: false,
+                });
+            }
+        }
+        CommandOutputFormat::OpencodeJson => {
+            if let Some(content) = extract_opencode_json_final_text(&collected_stdout) {
                 let _ = sender.send(AdapterEvent::Text {
                     scope: Some(prompt.scope.clone()),
                     content,
@@ -716,7 +789,9 @@ fn collect_stdout_line(
         CommandOutputFormat::CodexStreamJson => {
             translate_codex_event_line(parsed_line, &prompt.scope, sender)
         }
-        CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => false,
+        CommandOutputFormat::Text
+        | CommandOutputFormat::CopilotJson
+        | CommandOutputFormat::OpencodeJson => false,
     }
 }
 
@@ -729,6 +804,247 @@ fn truncate_for_summary(s: &str) -> String {
         t.push('…');
         t
     }
+}
+
+fn extract_runtime_error_from_text(text: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            if let Some(value) = extract_embedded_error_json(trimmed) {
+                if let Some(message) = runtime_error_from_json(&value).and_then(non_blank) {
+                    found = Some(truncate_for_summary(&message));
+                }
+            }
+            continue;
+        };
+        if let Some(message) = runtime_error_from_json(&value).and_then(non_blank) {
+            found = Some(truncate_for_summary(&message));
+        }
+    }
+    found
+}
+
+fn runtime_error_from_json(value: &Value) -> Option<String> {
+    let embedded_error = json_string_at_paths(
+        value,
+        &["/data/errorMessage", "/errorMessage", "/error/errorMessage"],
+    );
+    let message = string_at_paths(
+        value,
+        &[
+            "/error/message",
+            "/error/data/error/message",
+            "/error/data/message",
+            "/error/error/message",
+            "/properties/error/message",
+            "/data/error/message",
+            "/data/message",
+            "/message/content/0/text",
+            "/message",
+            "/result",
+            "/details",
+        ],
+    )
+    .or_else(|| {
+        embedded_error
+            .as_ref()
+            .and_then(|error| string_at_paths(error, &["/error/message", "/message", "/details"]))
+    })
+    .or_else(|| string_at_paths(value, &["/data/errorMessage", "/errorMessage"]))
+    .or_else(|| response_body_error_message(value))?;
+
+    let status = string_or_number_at_paths(
+        value,
+        &[
+            "/statusCode",
+            "/status",
+            "/properties/statusCode",
+            "/properties/status",
+            "/data/statusCode",
+            "/data/status",
+            "/api_error_status",
+            "/error/statusCode",
+            "/error/status",
+            "/error/api_error_status",
+        ],
+    )
+    .or_else(|| {
+        embedded_error.as_ref().and_then(|error| {
+            string_or_number_at_paths(
+                error,
+                &[
+                    "/statusCode",
+                    "/status",
+                    "/error/statusCode",
+                    "/error/status",
+                ],
+            )
+        })
+    })
+    .or_else(|| response_body_error_status(value));
+    let code = string_at_paths(
+        value,
+        &[
+            "/error/type",
+            "/error/code",
+            "/properties/error/type",
+            "/properties/error/code",
+            "/data/errorCode",
+            "/data/code",
+            "/code",
+            "/error",
+        ],
+    )
+    .or_else(|| {
+        embedded_error.as_ref().and_then(|error| {
+            string_at_paths(
+                error,
+                &[
+                    "/error/type",
+                    "/error/code",
+                    "/error/name",
+                    "/code",
+                    "/name",
+                ],
+            )
+        })
+    })
+    .or_else(|| response_body_error_code(value))
+    .or_else(|| string_at_paths(value, &["/error/name", "/properties/error/name", "/name"]));
+    let retry_after = string_or_number_at_paths(
+        value,
+        &[
+            "/responseHeaders/retry-after",
+            "/responseHeaders/Retry-After",
+            "/error/responseHeaders/retry-after",
+            "/error/responseHeaders/Retry-After",
+            "/properties/responseHeaders/retry-after",
+            "/properties/responseHeaders/Retry-After",
+            "/headers/retry-after",
+            "/headers/Retry-After",
+        ],
+    );
+
+    let mut prefix = Vec::new();
+    if let Some(status) = status.filter(|status| !message.contains(status)) {
+        prefix.push(status);
+    }
+    if let Some(code) = code.filter(|code| !message.contains(code)) {
+        prefix.push(code);
+    }
+    let mut rendered = if prefix.is_empty() {
+        message
+    } else {
+        format!("{}: {message}", prefix.join(" "))
+    };
+    if let Some(retry_after) = retry_after {
+        rendered.push_str(&format!(" (retry-after: {retry_after}s)"));
+    }
+    Some(rendered)
+}
+
+fn response_body_error_message(value: &Value) -> Option<String> {
+    let parsed = response_body_json(value)?;
+    string_at_paths(
+        &parsed,
+        &["/error/message", "/message", "/error/details", "/details"],
+    )
+}
+
+fn response_body_error_status(value: &Value) -> Option<String> {
+    let parsed = response_body_json(value)?;
+    string_or_number_at_paths(
+        &parsed,
+        &[
+            "/statusCode",
+            "/status",
+            "/error/statusCode",
+            "/error/status",
+        ],
+    )
+}
+
+fn response_body_error_code(value: &Value) -> Option<String> {
+    let parsed = response_body_json(value)?;
+    string_at_paths(
+        &parsed,
+        &[
+            "/error/type",
+            "/error/code",
+            "/error/name",
+            "/code",
+            "/name",
+        ],
+    )
+    .or_else(|| {
+        let kind = parsed.get("type").and_then(Value::as_str)?;
+        (kind != "error").then(|| kind.to_string())
+    })
+}
+
+fn response_body_json(value: &Value) -> Option<Value> {
+    let body = string_at_paths(
+        value,
+        &[
+            "/responseBody",
+            "/error/responseBody",
+            "/properties/responseBody",
+            "/data/responseBody",
+        ],
+    )?;
+    serde_json::from_str::<Value>(&body).ok()
+}
+
+fn json_string_at_paths(value: &Value, paths: &[&str]) -> Option<Value> {
+    paths.iter().find_map(|path| {
+        let raw = value.pointer(path).and_then(Value::as_str)?.trim();
+        if !raw.starts_with('{') {
+            return None;
+        }
+        serde_json::from_str::<Value>(raw).ok()
+    })
+}
+
+fn extract_embedded_error_json(line: &str) -> Option<Value> {
+    let start = line.find("error=")?;
+    let after_marker = &line[start + "error=".len()..];
+    let brace_offset = after_marker.find('{')?;
+    let json_text = balanced_json_object_prefix(&after_marker[brace_offset..])?;
+    serde_json::from_str::<Value>(json_text).ok()
+}
+
+fn balanced_json_object_prefix(input: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&input[..=idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ---------------- output_format translators ----------------
@@ -1079,6 +1395,117 @@ fn extract_copilot_json_final_text(stdout: &str) -> Option<String> {
     final_text.or_else(|| non_blank(streamed_text))
 }
 
+fn extract_opencode_json_final_text(stdout: &str) -> Option<String> {
+    let mut final_text: Option<String> = None;
+    let mut part_texts: Vec<(String, String)> = Vec::new();
+    let mut streamed_text = String::new();
+
+    for line in stdout.lines() {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "message.updated" => {
+                let info = v.pointer("/properties/info").or_else(|| v.get("info"));
+                if let Some(info) = info {
+                    if !opencode_message_role_allows_assistant(info) {
+                        continue;
+                    }
+                    if let Some(text) = opencode_message_text(info).and_then(non_blank) {
+                        final_text = Some(text);
+                    }
+                }
+            }
+            "message.part.updated" | "message.part.delta" => {
+                let part = v.pointer("/properties/part").or_else(|| v.get("part"));
+                if let Some(part) = part {
+                    if let Some(delta) = string_at_paths(part, &["/delta", "/textDelta"]) {
+                        streamed_text.push_str(&delta);
+                    } else if let Some(text) = opencode_part_text(part).and_then(non_blank) {
+                        let id = string_at_paths(part, &["/id", "/partID", "/partId"])
+                            .unwrap_or_else(|| format!("part_{}", part_texts.len()));
+                        upsert_part_text(&mut part_texts, id, text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    final_text
+        .or_else(|| {
+            let joined = part_texts
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+                .join("");
+            non_blank(joined)
+        })
+        .or_else(|| non_blank(streamed_text))
+}
+
+fn opencode_message_role_allows_assistant(info: &Value) -> bool {
+    let Some(role) = info.get("role").and_then(Value::as_str) else {
+        return true;
+    };
+    role == "assistant"
+}
+
+fn opencode_message_text(info: &Value) -> Option<String> {
+    string_at_paths(info, &["/text", "/content", "/message"])
+        .or_else(|| info.get("parts").and_then(opencode_parts_text))
+        .or_else(|| info.get("content").and_then(opencode_content_text))
+}
+
+fn opencode_parts_text(value: &Value) -> Option<String> {
+    let parts = value.as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        if let Some(text) = opencode_part_text(part) {
+            out.push_str(&text);
+        }
+    }
+    non_blank(out)
+}
+
+fn opencode_part_text(part: &Value) -> Option<String> {
+    let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+    if !part_type.is_empty()
+        && !matches!(
+            part_type,
+            "text" | "markdown" | "content" | "assistant_message"
+        )
+    {
+        return None;
+    }
+    string_at_paths(part, &["/text", "/content", "/message"])
+        .or_else(|| part.get("content").and_then(opencode_content_text))
+}
+
+fn opencode_content_text(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    let arr = value.as_array()?;
+    let mut out = String::new();
+    for item in arr {
+        if let Some(text) = opencode_part_text(item) {
+            out.push_str(&text);
+        }
+    }
+    non_blank(out)
+}
+
+fn upsert_part_text(parts: &mut Vec<(String, String)>, id: String, text: String) {
+    if let Some((_, existing)) = parts.iter_mut().find(|(existing_id, _)| *existing_id == id) {
+        *existing = text;
+        return;
+    }
+    parts.push((id, text));
+}
+
 fn copilot_message_phase_is_hidden(v: &Value) -> bool {
     let Some(phase) = v.pointer("/data/phase").and_then(Value::as_str) else {
         return false;
@@ -1093,6 +1520,18 @@ fn string_at_paths(v: &Value, paths: &[&str]) -> Option<String> {
     paths
         .iter()
         .find_map(|path| v.pointer(path).and_then(Value::as_str).map(str::to_string))
+}
+
+fn string_or_number_at_paths(v: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        v.pointer(path).and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_i64().map(|n| n.to_string()))
+                .or_else(|| value.as_u64().map(|n| n.to_string()))
+        })
+    })
 }
 
 fn non_blank(s: String) -> Option<String> {
@@ -1196,6 +1635,14 @@ fn capture_session_id(
     if let Some(path) = rule.strip_prefix("stdout_json:") {
         return Ok(extract_json_path(&outcome.stdout, path));
     }
+    if let Some(paths) = rule.strip_prefix("stdout_json_any:") {
+        let paths = paths
+            .split('|')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        return Ok(extract_json_path_any(&outcome.stdout, &paths));
+    }
     if let Some(_re) = rule.strip_prefix("stderr_regex:") {
         return Err("stderr_regex first_run_capture not yet implemented".into());
     }
@@ -1226,6 +1673,23 @@ fn extract_json_path(stdout: &str, path: &str) -> Option<String> {
             if let Some(s) = json_path_lookup(&v, path) {
                 // Per the doc: "find the last line that matches" — keep
                 // overwriting so the loop ends with the most recent value.
+                found = Some(s);
+            }
+        }
+    }
+    found
+}
+
+fn extract_json_path_any(stdout: &str, paths: &[&str]) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<Value>(stdout) {
+        if let Some(s) = paths.iter().find_map(|path| json_path_lookup(&v, path)) {
+            return Some(s);
+        }
+    }
+    let mut found: Option<String> = None;
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if let Some(s) = paths.iter().find_map(|path| json_path_lookup(&v, path)) {
                 found = Some(s);
             }
         }
@@ -1572,6 +2036,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_session_id_any_path_picks_last_matching_line() {
+        let stdout = "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"copilot_sid\"}}\n\
+                      {\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"opencode_sid\"}}\n";
+        assert_eq!(
+            extract_json_path_any(stdout, &[".data.sessionId", ".properties.sessionID"]),
+            Some("opencode_sid".into())
+        );
+    }
+
+    #[test]
     fn copilot_json_final_text_picks_last_root_assistant_message() {
         let stdout = r#"{"type":"assistant.message","data":{"messageId":"m1","content":"I will inspect it.","toolRequests":[{"name":"shell"}]}}
 {"type":"tool.completed","data":{"toolCallId":"t1","content":"done"}}
@@ -1618,6 +2092,223 @@ mod tests {
             extract_copilot_json_final_text(stdout),
             Some("hello world".into())
         );
+    }
+
+    #[test]
+    fn opencode_json_final_text_picks_message_updated_parts() {
+        let stdout = r#"{"type":"message.updated","properties":{"info":{"sessionID":"s1","role":"user","parts":[{"type":"text","text":"Question"}]}}}
+{"type":"message.updated","properties":{"info":{"sessionID":"s1","role":"assistant","parts":[{"type":"text","text":"Final"},{"type":"text","text":" answer\n"}]}}}
+"#;
+
+        assert_eq!(
+            extract_opencode_json_final_text(stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn opencode_json_final_text_falls_back_to_latest_part_updates() {
+        let stdout = r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","type":"text","text":"draft"}}}
+{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","type":"text","text":"Final"}}}
+{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p2","type":"text","text":" answer\n"}}}
+"#;
+
+        assert_eq!(
+            extract_opencode_json_final_text(stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn runtime_error_from_response_body_includes_actionable_details() {
+        let stdout = serde_json::json!({
+            "statusCode": 429,
+            "responseHeaders": { "retry-after": "59140" },
+            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 59140s"));
+    }
+
+    #[test]
+    fn runtime_error_from_embedded_log_error_includes_actionable_details() {
+        let error = serde_json::json!({
+            "error": {
+                "name": "AI_APICallError",
+                "statusCode": 429,
+                "responseHeaders": { "retry-after": "57108" },
+                "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+            }
+        });
+        let stderr = format!("ERROR service=llm error={error} stream error\n");
+
+        let summary = extract_runtime_error_from_text(&stderr).expect("runtime error summary");
+
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 57108s"));
+    }
+
+    #[test]
+    fn runtime_error_from_claude_result_includes_model_error_details() {
+        let stdout = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "api_error_status": 404,
+            "result": "There's an issue with the selected model (claude-sonnet-4.6). It may not exist or you may not have access to it.",
+            "error": "model_not_found"
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("404"));
+        assert!(summary.contains("model_not_found"));
+        assert!(summary.contains("selected model"));
+    }
+
+    #[test]
+    fn runtime_error_from_copilot_session_error_includes_quota_details() {
+        let stdout = serde_json::json!({
+            "type": "session.error",
+            "data": {
+                "errorType": "quota",
+                "errorCode": "quota_exceeded",
+                "message": "You have no quota (Request ID: req_123)",
+                "statusCode": 402
+            }
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("402"));
+        assert!(summary.contains("quota_exceeded"));
+        assert!(summary.contains("You have no quota"));
+    }
+
+    #[test]
+    fn runtime_error_from_copilot_model_failure_parses_error_message_json() {
+        let stdout = serde_json::json!({
+            "type": "model.call_failure",
+            "data": {
+                "model": "gpt-5.5",
+                "statusCode": 402,
+                "errorMessage": "{\"message\":\"You have no quota\",\"code\":\"quota_exceeded\"}"
+            }
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("402"));
+        assert!(summary.contains("quota_exceeded"));
+        assert!(summary.contains("You have no quota"));
+        assert!(!summary.contains("{\"message\""));
+    }
+
+    #[test]
+    fn failed_command_summary_prefers_runtime_error_over_raw_json() {
+        let error_line = serde_json::json!({
+            "statusCode": 429,
+            "responseHeaders": { "retry-after": "59140" },
+            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+        })
+        .to_string();
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "printf '%s\n' \"$ERROR_JSON\"; exit 1".into()];
+        cfg.env.insert("ERROR_JSON".into(), error_line);
+        cfg.output_format = CommandOutputFormat::OpencodeJson;
+        cfg.prompt_via = PromptVia::Stdin;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert_ne!(outcome.exit_code, 0);
+        let mut summary = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success,
+                summary: value,
+                ..
+            } = event
+            {
+                assert!(!success);
+                summary = Some(value);
+                break;
+            }
+        }
+        let summary = summary.expect("missing Finished event");
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 59140s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_runtime_error_terminates_hung_command_without_idle_timeout() {
+        let error_line = serde_json::json!({
+            "error": {
+                "name": "AI_APICallError",
+                "statusCode": 429,
+                "responseHeaders": { "retry-after": "57108" },
+                "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+            }
+        })
+        .to_string();
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf 'ERROR service=llm error=%s stream error\n' \"$ERROR_JSON\" >&2; exec sleep 30"
+                .into(),
+        ];
+        cfg.env.insert("ERROR_JSON".into(), error_line);
+        cfg.output_format = CommandOutputFormat::OpencodeJson;
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.idle_timeout_ms = Some(5_000);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let started = std::time::Instant::now();
+        let outcome =
+            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "runtime error should terminate before idle timeout"
+        );
+        assert_ne!(outcome.exit_code, 0);
+        let mut summary = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success,
+                summary: value,
+                ..
+            } = event
+            {
+                assert!(!success);
+                summary = Some(value);
+                break;
+            }
+        }
+        let summary = summary.expect("missing Finished event");
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 57108s"));
     }
 
     #[test]

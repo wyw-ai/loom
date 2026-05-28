@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{
-    apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
-    AgentDefinition, AgentProviderOverride, DetectedAgentProvider,
+    apply_provider_overrides, detect_agent_cli_providers, normalize_model_id_for_provider,
+    provider_specs_from_agent_definitions, AgentDefinition, AgentProviderOverride,
+    DetectedAgentProvider,
 };
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{method, AgentSpec};
@@ -593,8 +594,9 @@ fn apply_machine_command(
                 }
             }
             if let Some(value) = optional_trimmed_str(command, "model") {
-                agent.model = value;
+                agent.model = normalize_model_id_for_provider(&agent.provider_id, &value);
             }
+            agent.model = normalize_model_id_for_provider(&agent.provider_id, &agent.model);
             if let Some(value) = optional_trimmed_str(command, "reasoningEffort") {
                 agent.reasoning_effort = value;
             }
@@ -707,8 +709,13 @@ fn agent_config_from_command(command: &Value, machine_id: &str) -> Result<Machin
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("actor_agent_{}_{}", slugify(&name), machine_id));
+    let provider_id = required_str(command, "providerId")?.to_string();
+    let model = command
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     Ok(MachineAgentConfig {
-        provider_id: required_str(command, "providerId")?.to_string(),
+        provider_id: provider_id.clone(),
         actor_id,
         name,
         description: command
@@ -717,12 +724,7 @@ fn agent_config_from_command(command: &Value, machine_id: &str) -> Result<Machin
             .unwrap_or_default()
             .trim()
             .to_string(),
-        model: command
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
+        model: normalize_model_id_for_provider(&provider_id, model),
         reasoning_effort: command
             .get("reasoningEffort")
             .and_then(Value::as_str)
@@ -1051,6 +1053,15 @@ fn repair_desktop_config_for_daemon(cfg: &mut DesktopConfig, server_url: &str) -
                 changed = true;
             } else if !workspace.actor_id.trim().is_empty() {
                 workspace.display_name = workspace.actor_id.clone();
+                changed = true;
+            }
+        }
+    }
+    for machine in &mut cfg.machines {
+        for agent in &mut machine.agents {
+            let normalized = normalize_model_id_for_provider(&agent.provider_id, &agent.model);
+            if normalized != agent.model {
+                agent.model = normalized;
                 changed = true;
             }
         }
@@ -1575,7 +1586,10 @@ fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
         actor_id: agent.actor_id.clone(),
         display_name: agent.name.clone(),
         description: non_empty(agent.description.trim()),
-        model: non_empty(agent.model.trim()),
+        model: non_empty(&normalize_model_id_for_provider(
+            &agent.provider_id,
+            &agent.model,
+        )),
         reasoning_effort: non_empty(agent.reasoning_effort.trim()),
         autostart: agent.autostart,
         avatar_url: non_empty(agent.avatar_url.trim()),
@@ -1736,6 +1750,46 @@ mod tests {
         ));
         assert_eq!(cfg.workspaces[0].name, "Local");
         assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
+    }
+
+    #[test]
+    fn repair_desktop_config_normalizes_legacy_claude_model_ids() {
+        let mut cfg = DesktopConfig {
+            active: Some("ws_main".into()),
+            account: None,
+            workspaces: vec![WorkspaceConfig {
+                id: "ws_main".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: String::new(),
+                display_name: String::new(),
+            }],
+            machines: vec![MachineConfig {
+                workspace_id: Some("ws_main".into()),
+                owner_actor_id: None,
+                id: "machine_main".into(),
+                name: "local".into(),
+                kind: default_machine_kind(),
+                data_root: String::new(),
+                providers: Vec::new(),
+                agents: vec![MachineAgentConfig {
+                    provider_id: "claude".into(),
+                    actor_id: "actor_agent_claude".into(),
+                    name: "Claude".into(),
+                    description: String::new(),
+                    model: "claude-opus-4.7".into(),
+                    reasoning_effort: String::new(),
+                    autostart: true,
+                    avatar_url: String::new(),
+                }],
+            }],
+        };
+
+        assert!(repair_desktop_config_for_daemon(
+            &mut cfg,
+            "ws://127.0.0.1:7878/rpc"
+        ));
+        assert_eq!(cfg.machines[0].agents[0].model, "claude-opus-4-7");
     }
 
     #[test]

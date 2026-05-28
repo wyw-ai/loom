@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::state::AppState;
-use crate::store::StoreError;
+use crate::store::{Store, StoreError};
 
 pub type HandlerResult = Result<Value, ErrorObject>;
 
@@ -2048,6 +2048,9 @@ fn message_read(state: &AppState, connection_id: &str, params: Option<Value>) ->
         .store
         .check_scope_access(&message.scope, &actor_id)
         .map_err(map_store_err)?;
+    if !Store::message_visible_to_actor(&message, &actor_id) {
+        return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "message"));
+    }
     ok(MessageReadResult { message })
 }
 
@@ -2264,7 +2267,11 @@ fn inbox_list(state: &AppState, connection_id: &str, params: Option<Value>) -> H
     let entries = rows
         .into_iter()
         .map(|delivery| InboxListEntry {
-            message: state.store.get_message(&delivery.source_id),
+            message: state
+                .store
+                .get_message(&delivery.source_id)
+                .filter(|message| Store::message_visible_to_actor(message, &p.actor_id)),
+            event: state.store.get_event(&delivery.source_id),
             delivery,
         })
         .collect();
@@ -5125,6 +5132,64 @@ mod tests {
         let message = entry.message.as_ref().expect("inline message payload");
         assert_eq!(message.id, message_id);
         assert!(res.next_cursor.is_none(), "single page");
+    }
+
+    #[tokio::test]
+    async fn inbox_list_returns_pending_event_payload_for_caller_inbox() {
+        let state = fresh_state("auto");
+        let ch = state.store.create_channel("c".into(), None).expect("ch");
+        state
+            .store
+            .grant_channel(&ch.id, "svc_writer")
+            .expect("g w");
+        state
+            .store
+            .grant_channel(&ch.id, "actor_target")
+            .expect("g t");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: ch.id.clone(),
+        };
+        let event = state
+            .store
+            .append_event(
+                "reminder.fire".into(),
+                "svc_writer".into(),
+                scope,
+                None,
+                json!({"title": "wake up"}),
+                vec![Relation {
+                    kind: RelationKind::DirectedTo,
+                    target: Ref {
+                        kind: RefKind::Actor,
+                        id: "actor_target".into(),
+                        _meta: None,
+                    },
+                    _meta: None,
+                }],
+                None,
+            )
+            .expect("append event");
+        open_conn(&state, "conn_t", "actor_target").await;
+
+        let value = dispatch(
+            &state,
+            "conn_t",
+            method::INBOX_LIST,
+            Some(json!({ "actorId": "actor_target", "state": "pending" })),
+        )
+        .await
+        .expect("inbox.list ok");
+        let res: InboxListResult = serde_json::from_value(value).expect("decode");
+
+        assert_eq!(res.deliveries.len(), 1);
+        let entry = &res.deliveries[0];
+        assert_eq!(entry.delivery.source_id, event.id);
+        assert!(entry.message.is_none());
+        assert_eq!(
+            entry.event.as_ref().map(|event| event.kind.as_str()),
+            Some("reminder.fire")
+        );
     }
 
     #[tokio::test]

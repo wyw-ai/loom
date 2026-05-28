@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use agent_runtime::provider::{providers_dir, validate_manifest, ProviderRegistry};
+use agent_runtime::provider::{providers_dir, ProviderRegistry};
 use anyhow::{anyhow, Context, Result};
 use proto::methods::ProviderManifest;
 use serde_json::json;
@@ -8,8 +8,7 @@ use serde_json::json;
 use crate::{config, render};
 
 pub fn validate(path: PathBuf) -> Result<()> {
-    let manifest = read_manifest(&path)?;
-    validate_manifest(&manifest).map_err(|err| anyhow!(err))?;
+    let manifest = resolve_manifest_file(&path)?;
     if render::is_json() {
         render::print_json(&json!({
             "ok": true,
@@ -22,13 +21,19 @@ pub fn validate(path: PathBuf) -> Result<()> {
 }
 
 pub fn add(path: PathBuf) -> Result<()> {
-    let manifest = read_manifest(&path)?;
-    validate_manifest(&manifest).map_err(|err| anyhow!(err))?;
+    let (manifest, raw) = read_and_resolve_manifest_file(&path)?;
+    let registry = ProviderRegistry::load(&config::config_dir()).map_err(|err| anyhow!(err))?;
+    if registry.get(&manifest.id).is_some() {
+        return Err(anyhow!(
+            "provider `{}` already exists; use a new id and extends for local variants",
+            manifest.id
+        ));
+    }
     let dir = providers_dir(&config::config_dir());
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create provider dir {}", dir.display()))?;
     let target = dir.join(format!("{}.json", manifest.id));
-    let text = serde_json::to_string_pretty(&manifest).context("serialize provider manifest")?;
+    let text = serde_json::to_string_pretty(&raw).context("serialize provider manifest")?;
     std::fs::write(&target, text)
         .with_context(|| format!("write provider manifest {}", target.display()))?;
     if render::is_json() {
@@ -120,7 +125,6 @@ pub fn doctor(provider_id: String) -> Result<()> {
     let manifest = registry
         .get(&provider_id)
         .ok_or_else(|| anyhow!("provider `{provider_id}` not found"))?;
-    validate_manifest(manifest).map_err(|err| anyhow!(err))?;
     let detected = registry
         .detect_with_path(std::env::var_os("PATH").unwrap_or_default())
         .map_err(|err| anyhow!(err))?
@@ -150,10 +154,19 @@ pub fn doctor(provider_id: String) -> Result<()> {
     Ok(())
 }
 
-fn read_manifest(path: &PathBuf) -> Result<ProviderManifest> {
+fn read_and_resolve_manifest_file(path: &Path) -> Result<(ProviderManifest, serde_json::Value)> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("parse provider manifest {}", path.display()))
+    let raw = serde_json::from_str::<serde_json::Value>(&text)
+        .with_context(|| format!("parse provider manifest {}", path.display()))?;
+    let registry = ProviderRegistry::load(&config::config_dir()).map_err(|err| anyhow!(err))?;
+    let manifest = registry
+        .resolve_manifest_value(raw.clone())
+        .map_err(|err| anyhow!(err))?;
+    Ok((manifest, raw))
+}
+
+fn resolve_manifest_file(path: &Path) -> Result<ProviderManifest> {
+    read_and_resolve_manifest_file(path).map(|(manifest, _)| manifest)
 }
 
 fn provider_summary(

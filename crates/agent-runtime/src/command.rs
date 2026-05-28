@@ -1153,21 +1153,24 @@ fn translate_ndjson_line(
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> bool {
+    let events = decode_ndjson_line_events(line);
+    emit_provider_runtime_events(events, scope, sender).emitted_text
+}
+
+fn decode_ndjson_line_events(line: &str) -> Vec<ProviderRuntimeEvent> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let mut emitted_text = false;
+    let mut events = Vec::new();
     match kind {
         "text" => {
             if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(scope.clone()),
+                events.push(ProviderRuntimeEvent::Text {
                     content: t.to_string(),
                     is_partial: true,
                 });
-                emitted_text = true;
             }
         }
         "tool" => {
@@ -1177,16 +1180,14 @@ fn translate_ndjson_line(
                 .unwrap_or("")
                 .to_string();
             let input = v.get("input").cloned().unwrap_or(Value::Null);
-            let _ = sender.send(AdapterEvent::ToolUse {
-                scope: Some(scope.clone()),
+            events.push(ProviderRuntimeEvent::ToolUse {
                 tool_name: name,
                 input,
             });
         }
         "status" => {
             if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
-                let _ = sender.send(AdapterEvent::StatusChange {
-                    scope: Some(scope.clone()),
+                events.push(ProviderRuntimeEvent::Status {
                     status: s.to_string(),
                 });
             }
@@ -1197,16 +1198,13 @@ fn translate_ndjson_line(
                 .and_then(|x| x.as_str())
                 .unwrap_or("ndjson error frame")
                 .to_string();
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: msg,
-            });
+            events.push(ProviderRuntimeEvent::Error { message: msg });
         }
         // "done" and unknown kinds: caller handles the final flush + Finished
         // outside the per-line loop, so nothing to do here.
         _ => {}
     }
-    emitted_text
+    events
 }
 
 fn translate_claude_stream_line(
@@ -1214,12 +1212,17 @@ fn translate_claude_stream_line(
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> bool {
+    let events = decode_claude_stream_line_events(line);
+    emit_provider_runtime_events(events, scope, sender).emitted_text
+}
+
+fn decode_claude_stream_line_events(line: &str) -> Vec<ProviderRuntimeEvent> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     let outer = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let mut emitted_text = false;
+    let mut events = Vec::new();
     match outer {
         "assistant" => {
             let blocks = v
@@ -1232,12 +1235,10 @@ fn translate_claude_stream_line(
                 match kind {
                     "text" => {
                         if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
-                            let _ = sender.send(AdapterEvent::Text {
-                                scope: Some(scope.clone()),
+                            events.push(ProviderRuntimeEvent::Text {
                                 content: t.to_string(),
                                 is_partial: false,
                             });
-                            emitted_text = true;
                         }
                     }
                     "tool_use" => {
@@ -1247,8 +1248,7 @@ fn translate_claude_stream_line(
                             .unwrap_or("")
                             .to_string();
                         let input = b.get("input").cloned().unwrap_or(Value::Null);
-                        let _ = sender.send(AdapterEvent::ToolUse {
-                            scope: Some(scope.clone()),
+                        events.push(ProviderRuntimeEvent::ToolUse {
                             tool_name: name,
                             input,
                         });
@@ -1262,7 +1262,7 @@ fn translate_claude_stream_line(
         "user" | "system" | "result" => {}
         _ => {}
     }
-    emitted_text
+    events
 }
 
 fn translate_codex_event_line(
@@ -1270,11 +1270,16 @@ fn translate_codex_event_line(
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> bool {
+    let events = decode_codex_event_line_events(line);
+    emit_provider_runtime_events(events, scope, sender).emitted_text
+}
+
+fn decode_codex_event_line_events(line: &str) -> Vec<ProviderRuntimeEvent> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
-    let mut emitted_text = false;
+    let mut events = Vec::new();
     if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
         match t {
             "task_complete" | "task.completed" => {
@@ -1289,22 +1294,18 @@ fn translate_codex_event_line(
                 .or_else(|| codex_content_text(v.get("last_agent_message")?))
                 .and_then(non_blank)
                 {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
+                    events.push(ProviderRuntimeEvent::Text {
                         content: text,
                         is_partial: false,
                     });
-                    emitted_text = true;
                 }
             }
             "agent_message" | "agent.message" => {
                 if let Some(text) = codex_message_event_text(&v).and_then(non_blank) {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
+                    events.push(ProviderRuntimeEvent::Text {
                         content: text,
                         is_partial: false,
                     });
-                    emitted_text = true;
                 }
             }
             "item_completed" | "item.completed" | "raw_response_item" | "raw.response_item" => {
@@ -1313,12 +1314,10 @@ fn translate_codex_event_line(
                     .and_then(codex_response_item_text)
                     .and_then(non_blank)
                 {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
+                    events.push(ProviderRuntimeEvent::Text {
                         content: text,
                         is_partial: false,
                     });
-                    emitted_text = true;
                 }
             }
             "tool_call" => {
@@ -1328,8 +1327,7 @@ fn translate_codex_event_line(
                     .unwrap_or("")
                     .to_string();
                 let input = v.get("arguments").cloned().unwrap_or(Value::Null);
-                let _ = sender.send(AdapterEvent::ToolUse {
-                    scope: Some(scope.clone()),
+                events.push(ProviderRuntimeEvent::ToolUse {
                     tool_name: name,
                     input,
                 });
@@ -1338,15 +1336,12 @@ fn translate_codex_event_line(
                 let message =
                     string_at_paths(&v, &["/message", "/error/message", "/error", "/details"])
                         .unwrap_or_else(|| "codex stream error".into());
-                let _ = sender.send(AdapterEvent::Error {
-                    scope: Some(scope.clone()),
-                    message,
-                });
+                events.push(ProviderRuntimeEvent::Error { message });
             }
             _ => {}
         }
     }
-    emitted_text
+    events
 }
 
 fn extract_codex_json_final_text(stdout: &str) -> Option<String> {
@@ -2712,6 +2707,39 @@ mod tests {
         assert!(matches!(
             rx.try_recv().expect("adapter event"),
             AdapterEvent::Text { content, is_partial: false, .. } if content == "runtime event"
+        ));
+    }
+
+    #[test]
+    fn builtin_claude_decoder_produces_runtime_events_before_adapter_mapping() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"},{"type":"tool_use","name":"shell","input":{"cmd":"pwd"}}]}}"#;
+
+        let events = decode_claude_stream_line_events(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::Text {
+                content,
+                is_partial: false,
+            } if content == "hello"
+        ));
+        assert!(matches!(
+            &events[1],
+            ProviderRuntimeEvent::ToolUse { tool_name, input }
+                if tool_name == "shell" && input.pointer("/cmd").and_then(Value::as_str) == Some("pwd")
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitted = emit_provider_runtime_events(events, &scope(), &tx);
+        assert!(emitted.emitted_text);
+        assert!(matches!(
+            rx.try_recv().expect("text event"),
+            AdapterEvent::Text { content, is_partial: false, .. } if content == "hello"
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("tool event"),
+            AdapterEvent::ToolUse { tool_name, input, .. }
+                if tool_name == "shell" && input.pointer("/cmd").and_then(Value::as_str) == Some("pwd")
         ));
     }
 

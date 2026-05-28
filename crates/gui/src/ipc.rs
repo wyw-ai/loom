@@ -1086,8 +1086,6 @@ pub struct MachineAgentInfo {
     #[serde(flatten)]
     pub info: AgentInfo,
     pub profile_path: String,
-    pub identity_path: String,
-    pub soul_path: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1145,94 +1143,6 @@ pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
             .map_err(|e| format!("create directory {}: {e}", path.display()))?;
     }
     open_path_with_system(&path).map_err(stringify)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProfileFileReadArgs {
-    pub machine_id: String,
-    pub actor_id: String,
-    pub file: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProfileFileWriteArgs {
-    pub machine_id: String,
-    pub actor_id: String,
-    pub file: String,
-    pub text: String,
-    #[serde(default)]
-    pub base_sha256: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProfileFileResult {
-    pub path: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-}
-
-#[tauri::command]
-pub async fn agent_profile_file_read(
-    state: State<'_, AppState>,
-    args: AgentProfileFileReadArgs,
-) -> Result<AgentProfileFileResult, String> {
-    let cfg = config::load_or_init().map_err(stringify)?;
-    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
-        .await
-        .is_some()
-    {
-        let output = run_remote_machine_command(
-            &state,
-            &cfg,
-            &args.machine_id,
-            json!({
-                "op": "agent.profile.read",
-                "actorId": args.actor_id,
-                "file": args.file,
-            }),
-        )
-        .await?;
-        return profile_file_result_from_output(output);
-    }
-    Err(format!(
-        "machine `{}` is not present in daemon inventory; start the daemon before reading agent profile files",
-        args.machine_id
-    ))
-}
-
-#[tauri::command]
-pub async fn agent_profile_file_write(
-    state: State<'_, AppState>,
-    args: AgentProfileFileWriteArgs,
-) -> Result<AgentProfileFileResult, String> {
-    let cfg = config::load_or_init().map_err(stringify)?;
-    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
-        .await
-        .is_some()
-    {
-        let output = run_remote_machine_command(
-            &state,
-            &cfg,
-            &args.machine_id,
-            json!({
-                "op": "agent.profile.write",
-                "actorId": args.actor_id,
-                "file": args.file,
-                "text": args.text,
-                "baseSha256": args.base_sha256,
-            }),
-        )
-        .await?;
-        return profile_file_result_from_output(output);
-    }
-    Err(format!(
-        "machine `{}` is not present in daemon inventory; start the daemon before writing agent profile files",
-        args.machine_id
-    ))
 }
 
 #[derive(Deserialize)]
@@ -1674,26 +1584,8 @@ async fn run_remote_machine_command(
 fn is_mutating_machine_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "agent.create" | "agent.update" | "agent.remove" | "agent.profile.write"
+        "agent.create" | "agent.update" | "agent.remove" | "provider.add" | "provider.remove"
     )
-}
-
-fn profile_file_result_from_output(output: Value) -> Result<AgentProfileFileResult, String> {
-    let path = output
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "remote profile result missing path".to_string())?
-        .to_string();
-    let text = output
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "remote profile result missing text".to_string())?
-        .to_string();
-    let sha256 = output
-        .get("sha256")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    Ok(AgentProfileFileResult { path, text, sha256 })
 }
 
 fn server_machine_info_from_actor(
@@ -1728,7 +1620,7 @@ fn server_machine_info_from_actor(
     let agents: Vec<MachineAgentInfo> = agent_specs
         .into_iter()
         .map(|spec| {
-            let paths = agent_profile_paths(&data_root, &spec);
+            let profile_path = agent_profile_path(&data_root, &spec);
             MachineAgentInfo {
                 info: AgentInfo {
                     spec,
@@ -1736,9 +1628,7 @@ fn server_machine_info_from_actor(
                     pid: None,
                     session_id: None,
                 },
-                profile_path: paths.profile.display().to_string(),
-                identity_path: paths.identity.display().to_string(),
-                soul_path: paths.soul.display().to_string(),
+                profile_path: profile_path.display().to_string(),
             }
         })
         .collect();
@@ -1955,41 +1845,11 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
     value
 }
 
-struct AgentProfilePaths {
-    profile: PathBuf,
-    identity: PathBuf,
-    soul: PathBuf,
-}
-
-fn agent_profile_paths(data_root: &Path, spec: &AgentSpec) -> AgentProfilePaths {
-    let profile = data_root
+fn agent_profile_path(data_root: &Path, spec: &AgentSpec) -> PathBuf {
+    data_root
         .join("agents")
         .join(&spec.actor.id)
-        .join("profile");
-    let identity_file = spec
-        .identity
-        .as_ref()
-        .map(|identity| identity.files.identity.as_str())
-        .unwrap_or("identity.md");
-    let soul_file = spec
-        .identity
-        .as_ref()
-        .map(|identity| identity.files.soul.as_str())
-        .unwrap_or("soul.md");
-    AgentProfilePaths {
-        identity: resolve_profile_path(&profile, identity_file),
-        soul: resolve_profile_path(&profile, soul_file),
-        profile,
-    }
-}
-
-fn resolve_profile_path(profile: &Path, value: &str) -> PathBuf {
-    let path = Path::new(value);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        profile.join(path)
-    }
+        .join("profile")
 }
 
 fn machine_connection_actor_id(machine: &MachineConfig) -> String {

@@ -2795,7 +2795,7 @@ fn is_machine_actor(state: &AppState, actor_id: &str) -> bool {
 fn is_mutating_machine_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "agent.create" | "agent.update" | "agent.remove" | "agent.profile.write"
+        "agent.create" | "agent.update" | "agent.remove" | "provider.add" | "provider.remove"
     )
 }
 

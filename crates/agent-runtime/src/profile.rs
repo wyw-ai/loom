@@ -1,65 +1,21 @@
-//! Scaffolding for `{agent.profile}/identity.md` + `soul.md` + `memory/`.
+//! Scaffolding for `{agent.profile}/memory/`.
 //!
-//! Called on every agent spawn. Files that already exist are preserved
-//! verbatim — we only write templates when the file is missing, so user
-//! edits are never clobbered. The `memory/records/` dir is just `mkdir -p`.
+//! Called on every agent spawn when memory is enabled. Existing files are
+//! preserved; the scaffold only ensures the memory records directory and its
+//! marker file exist.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Parameters for scaffolding. Paths are joined against `profile_dir`; if a
-/// caller passes an absolute path for `identity_file` / `soul_file` we treat
-/// it as-is (matches the spec's relative-or-absolute semantics).
 #[derive(Debug)]
 pub struct ProfileScaffold<'a> {
     pub profile_dir: &'a Path,
-    pub actor_id: &'a str,
-    pub display_name: &'a str,
-    /// Marketplace description or empty string. Drives the "Role:" line of
-    /// the scaffolded identity template. Purely cosmetic.
-    pub description: &'a str,
-    /// Relative-or-absolute path for identity.md. Use spec default
-    /// (`identity.md`) if unset.
-    pub identity_file: &'a str,
-    /// Relative-or-absolute path for soul.md.
-    pub soul_file: &'a str,
     /// Relative-or-absolute path for memory records dir.
     pub memory_root: &'a str,
-    /// Optional first-run identity file contents. Existing files are preserved.
-    pub identity_seed: Option<&'a str>,
-    /// Optional first-run soul file contents. Existing files are preserved.
-    pub soul_seed: Option<&'a str>,
 }
 
-/// Ensure the profile-dir layout exists, writing templates only where
-/// files are absent. Returns any IO error on the first failure — callers
-/// should warn-and-continue (a failed scaffold is not fatal to the spawn).
 pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
     std::fs::create_dir_all(params.profile_dir)?;
-
-    let identity_path = resolve_relative(params.profile_dir, params.identity_file);
-    if !identity_path.exists() {
-        if let Some(parent) = identity_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = params
-            .identity_seed
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| scaffold_identity_md(params));
-        std::fs::write(&identity_path, content)?;
-    }
-
-    let soul_path = resolve_relative(params.profile_dir, params.soul_file);
-    if !soul_path.exists() {
-        if let Some(parent) = soul_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = params
-            .soul_seed
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| scaffold_soul_md(params));
-        std::fs::write(&soul_path, content)?;
-    }
 
     let memory_root = resolve_relative(params.profile_dir, params.memory_root);
     std::fs::create_dir_all(&memory_root)?;
@@ -88,13 +44,6 @@ pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
     Ok(())
 }
 
-/// Read an identity/soul markdown file. Returns empty string if the file
-/// doesn't exist — callers use that to skip the prompt section.
-pub fn read_markdown_file(profile_dir: &Path, rel: &str) -> String {
-    let path = resolve_relative(profile_dir, rel);
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
 fn resolve_relative(profile_dir: &Path, rel: &str) -> PathBuf {
     let p = Path::new(rel);
     if p.is_absolute() {
@@ -102,49 +51,6 @@ fn resolve_relative(profile_dir: &Path, rel: &str) -> PathBuf {
     } else {
         profile_dir.join(p)
     }
-}
-
-fn scaffold_identity_md(p: &ProfileScaffold<'_>) -> String {
-    let display = if p.display_name.trim().is_empty() {
-        p.actor_id
-    } else {
-        p.display_name
-    };
-    let desc = p.description.trim();
-    if desc.is_empty() {
-        format!(
-            "# {display}\n\
-             \n\
-             - Role: <one-line role for this actor>\n\
-             - Primary responsibility: describe what you own in this Loom workspace.\n\
-             - Non-goals: do not invent access to tools or memory you cannot see.\n\
-             \n\
-             Edit this file freely — it is loaded on every turn as the agent identity section.\n"
-        )
-    } else {
-        format!(
-            "# {display}\n\
-             \n\
-             - Role: {desc}\n\
-             - Primary responsibility: handle tasks that fit this actor's strengths inside Loom.\n\
-             - Non-goals: do not invent access to tools or memory you cannot see.\n\
-             \n\
-             Edit this file freely — it is loaded on every turn as the agent identity section.\n"
-        )
-    }
-}
-
-fn scaffold_soul_md(_p: &ProfileScaffold<'_>) -> String {
-    "# Operating Style\n\
-     \n\
-     - Prefer precise, technical communication.\n\
-     - Surface risks and tradeoffs early.\n\
-     - Use platform memory and conversation tools when available instead of guessing.\n\
-     - Separate assumptions from observed facts.\n\
-     - Keep collaboration explicit when handing work to another actor.\n\
-     \n\
-     Edit this file freely — it is loaded on every turn as the agent soul section.\n"
-        .into()
 }
 
 #[cfg(test)]
@@ -157,91 +63,45 @@ mod tests {
         p
     }
 
-    fn params<'a>(dir: &'a Path, desc: &'a str) -> ProfileScaffold<'a> {
+    fn params<'a>(dir: &'a Path) -> ProfileScaffold<'a> {
         ProfileScaffold {
             profile_dir: dir,
-            actor_id: "actor_test",
-            display_name: "Test",
-            description: desc,
-            identity_file: "identity.md",
-            soul_file: "soul.md",
             memory_root: "./memory/records",
-            identity_seed: None,
-            soul_seed: None,
         }
     }
 
     #[test]
-    fn creates_all_files_on_first_run() {
+    fn creates_memory_layout_on_first_run() {
         let dir = tmpdir();
-        ensure_profile_scaffold(&params(&dir, "Coding assistant")).unwrap();
-        assert!(dir.join("identity.md").exists());
-        assert!(dir.join("soul.md").exists());
+        ensure_profile_scaffold(&params(&dir)).unwrap();
         assert!(dir.join("memory/records").is_dir());
         assert!(dir.join("memory/meta.json").exists());
-        let id = std::fs::read_to_string(dir.join("identity.md")).unwrap();
-        assert!(id.contains("Coding assistant"));
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn preserves_user_edited_identity() {
+    fn preserves_existing_meta_file() {
         let dir = tmpdir();
-        ensure_profile_scaffold(&params(&dir, "desc")).unwrap();
-        std::fs::write(dir.join("identity.md"), "# user override\n\ncustom content").unwrap();
-        ensure_profile_scaffold(&params(&dir, "desc")).unwrap();
-        let id = std::fs::read_to_string(dir.join("identity.md")).unwrap();
-        assert!(id.contains("user override"));
-        assert!(id.contains("custom content"));
+        std::fs::create_dir_all(dir.join("memory")).unwrap();
+        std::fs::write(dir.join("memory/meta.json"), "{\"custom\":true}").unwrap();
+        ensure_profile_scaffold(&params(&dir)).unwrap();
+        let meta = std::fs::read_to_string(dir.join("memory/meta.json")).unwrap();
+        assert_eq!(meta, "{\"custom\":true}");
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn absolute_paths_are_respected() {
+    fn absolute_memory_root_is_respected() {
         let dir = tmpdir();
-        let alt = tmpdir().join("custom-identity.md");
+        let alt = tmpdir().join("custom-memory");
         let p = ProfileScaffold {
             profile_dir: &dir,
-            actor_id: "a",
-            display_name: "A",
-            description: "",
-            identity_file: alt.to_str().unwrap(),
-            soul_file: "soul.md",
-            memory_root: "./memory/records",
-            identity_seed: None,
-            soul_seed: None,
+            memory_root: alt.to_str().unwrap(),
         };
         ensure_profile_scaffold(&p).unwrap();
-        assert!(alt.exists());
-        assert!(!dir.join("identity.md").exists());
+        assert!(alt.is_dir());
+        assert!(!dir.join("memory/records").exists());
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn uses_seed_content_only_on_first_run() {
-        let dir = tmpdir();
-        let p = ProfileScaffold {
-            profile_dir: &dir,
-            actor_id: "a",
-            display_name: "A",
-            description: "",
-            identity_file: "identity.md",
-            soul_file: "soul.md",
-            memory_root: "./memory/records",
-            identity_seed: Some("# Architect\n\nOwn system design."),
-            soul_seed: Some("# Style\n\nBe direct."),
-        };
-        ensure_profile_scaffold(&p).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("identity.md")).unwrap(),
-            "# Architect\n\nOwn system design."
-        );
-        std::fs::write(dir.join("identity.md"), "# edited").unwrap();
-        ensure_profile_scaffold(&p).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("identity.md")).unwrap(),
-            "# edited"
-        );
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(alt).ok();
     }
 }

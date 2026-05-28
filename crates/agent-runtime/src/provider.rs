@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use proto::methods::{
     AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
     CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderDecoderSpec,
-    ProviderDetectSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
+    ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
+    ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
     ProviderPromptSpec, ProviderSessionIdSource, ProviderSessionSpec,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::adapter::PromptPart;
 
@@ -791,6 +792,7 @@ fn transport_from_manifest(
             },
         }),
         output_format: Some(output_format(&mode.stdout)?),
+        decoder: Some(mode.stdout.clone()),
         prompt_via: PromptVia::Args,
         prompt: mode.prompt.clone(),
         stdin: mode.stdin.clone(),
@@ -969,10 +971,66 @@ fn mode(
         stdout: ProviderDecoderSpec {
             format: "builtin".into(),
             name: Some(stdout_name.into()),
+            reduce: None,
         },
         session,
         timeout_ms: None,
         idle_timeout_ms: None,
+    }
+}
+
+fn copilot_jsonl_decoder() -> ProviderDecoderSpec {
+    ProviderDecoderSpec {
+        format: "jsonl".into(),
+        name: None,
+        reduce: Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.data.content".into(),
+                when: Some(ProviderJsonConditionSpec {
+                    all: vec![
+                        json_condition_equals("$.type", "assistant.message"),
+                        json_condition_absent_or_null("$.agentId"),
+                        json_condition_absent_or_null("$.data.parentToolCallId"),
+                        ProviderJsonConditionSpec {
+                            path: Some("$.data.phase".into()),
+                            not_in: Some(vec![json!("thinking"), json!("reasoning")]),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                fallback: Some(Box::new(ProviderJsonlTextReducerSpec {
+                    mode: "concat".into(),
+                    path: "$.data.deltaContent".into(),
+                    when: Some(ProviderJsonConditionSpec {
+                        all: vec![
+                            json_condition_equals("$.type", "assistant.message_delta"),
+                            json_condition_absent_or_null("$.agentId"),
+                            json_condition_absent_or_null("$.data.parentToolCallId"),
+                        ],
+                        ..Default::default()
+                    }),
+                    fallback: None,
+                })),
+            }),
+        }),
+    }
+}
+
+fn json_condition_equals(path: &str, value: &str) -> ProviderJsonConditionSpec {
+    ProviderJsonConditionSpec {
+        path: Some(path.into()),
+        equals: Some(json!(value)),
+        ..Default::default()
+    }
+}
+
+fn json_condition_absent_or_null(path: &str) -> ProviderJsonConditionSpec {
+    ProviderJsonConditionSpec {
+        path: Some(path.into()),
+        absent_or_null: Some(true),
+        ..Default::default()
     }
 }
 
@@ -1177,16 +1235,17 @@ fn copilot_manifest() -> ProviderManifest {
         "copilot",
         "GitHub Copilot CLI",
         &["copilot", "copilotcli"],
-        BTreeMap::from([(
-            "print".into(),
-            mode(
+        BTreeMap::from([("print".into(), {
+            let mut mode = mode(
                 "{bin}",
                 args,
                 full_prompt(),
                 "copilot_jsonl_final_text",
                 Some(session),
-            ),
-        )]),
+            );
+            mode.stdout = copilot_jsonl_decoder();
+            mode
+        })]),
         &[
             ("gpt-5.5", "GPT-5.5"),
             ("gpt-5.4", "GPT-5.4"),

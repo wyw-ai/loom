@@ -33,7 +33,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use proto::methods::{CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderPromptSpec};
+use proto::methods::{
+    CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderDecoderSpec,
+    ProviderJsonConditionSpec, ProviderJsonlTextReducerSpec, ProviderPromptSpec,
+};
 use proto::types::ScopeRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -72,6 +75,7 @@ pub struct CommandConfig {
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
     pub output_format: CommandOutputFormat,
+    pub decoder: Option<ProviderDecoderSpec>,
     pub prompt_via: PromptVia,
     pub prompt: Option<ProviderPromptSpec>,
     pub stdin_template: Option<String>,
@@ -118,6 +122,7 @@ impl CommandConfig {
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
             output_format: spec.output_format.unwrap_or_default(),
+            decoder: spec.decoder.clone(),
             prompt_via: spec.prompt_via,
             prompt: spec.prompt.clone(),
             stdin_template: spec.stdin.clone(),
@@ -688,44 +693,52 @@ fn spawn_and_collect(
         format!("exited with code {exit_code}")
     };
 
-    match cfg.output_format {
-        CommandOutputFormat::Text => {
-            if !collected_stdout.is_empty() {
+    if let Some(content) = extract_decoder_final_text(cfg.decoder.as_ref(), &collected_stdout) {
+        let _ = sender.send(AdapterEvent::Text {
+            scope: Some(prompt.scope.clone()),
+            content,
+            is_partial: false,
+        });
+    } else {
+        match cfg.output_format {
+            CommandOutputFormat::Text => {
+                if !collected_stdout.is_empty() {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content: collected_stdout.clone(),
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::CopilotJson => {
+                if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content,
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::CodexStreamJson if !emitted_text => {
+                if let Some(content) = extract_codex_json_final_text(&collected_stdout) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content,
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::CodexStreamJson => {}
+            _ => {
+                // Force a buffer flush downstream by emitting an empty
+                // is_partial=false Text frame; the runtime's `take_text_buffer`
+                // will turn whatever was accumulated into a single content.add.
                 let _ = sender.send(AdapterEvent::Text {
                     scope: Some(prompt.scope.clone()),
-                    content: collected_stdout.clone(),
+                    content: String::new(),
                     is_partial: false,
                 });
             }
-        }
-        CommandOutputFormat::CopilotJson => {
-            if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(prompt.scope.clone()),
-                    content,
-                    is_partial: false,
-                });
-            }
-        }
-        CommandOutputFormat::CodexStreamJson if !emitted_text => {
-            if let Some(content) = extract_codex_json_final_text(&collected_stdout) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(prompt.scope.clone()),
-                    content,
-                    is_partial: false,
-                });
-            }
-        }
-        CommandOutputFormat::CodexStreamJson => {}
-        _ => {
-            // Force a buffer flush downstream by emitting an empty
-            // is_partial=false Text frame; the runtime's `take_text_buffer`
-            // will turn whatever was accumulated into a single content.add.
-            let _ = sender.send(AdapterEvent::Text {
-                scope: Some(prompt.scope.clone()),
-                content: String::new(),
-                is_partial: false,
-            });
         }
     }
     let usage = extract_token_usage_from_text(&collected_stdout)
@@ -1134,6 +1147,142 @@ fn extract_copilot_json_final_text(stdout: &str) -> Option<String> {
     final_text.or_else(|| non_blank(streamed_text))
 }
 
+fn extract_decoder_final_text(
+    decoder: Option<&ProviderDecoderSpec>,
+    stdout: &str,
+) -> Option<String> {
+    let reducer = decoder
+        .and_then(|decoder| decoder.reduce.as_ref())
+        .and_then(|reduce| reduce.final_text.as_ref())?;
+    reduce_jsonl_text(stdout, reducer).or_else(|| {
+        reducer
+            .fallback
+            .as_deref()
+            .and_then(|fallback| reduce_jsonl_text(stdout, fallback))
+    })
+}
+
+fn reduce_jsonl_text(stdout: &str, reducer: &ProviderJsonlTextReducerSpec) -> Option<String> {
+    let mode = reducer.mode.trim();
+    let path = reducer.path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let mut last: Option<String> = None;
+    let mut concat = String::new();
+    for line in stdout.lines() {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !reducer
+            .when
+            .as_ref()
+            .map(|condition| json_condition_matches(&v, condition))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(text) = json_path_lookup(&v, path) else {
+            continue;
+        };
+        match mode {
+            "firstNonEmpty" | "first_non_empty" => {
+                if let Some(text) = non_blank(text) {
+                    return Some(text);
+                }
+            }
+            "concat" | "joinText" | "join_text" => concat.push_str(&text),
+            _ => {
+                if let Some(text) = non_blank(text) {
+                    last = Some(text);
+                }
+            }
+        }
+    }
+    match mode {
+        "concat" | "joinText" | "join_text" => non_blank(concat),
+        _ => last,
+    }
+}
+
+fn json_condition_matches(root: &Value, condition: &ProviderJsonConditionSpec) -> bool {
+    if !condition
+        .all
+        .iter()
+        .all(|item| json_condition_matches(root, item))
+    {
+        return false;
+    }
+    if !condition.any.is_empty()
+        && !condition
+            .any
+            .iter()
+            .any(|item| json_condition_matches(root, item))
+    {
+        return false;
+    }
+    if condition
+        .not
+        .as_deref()
+        .is_some_and(|item| json_condition_matches(root, item))
+    {
+        return false;
+    }
+    let actual = condition
+        .path
+        .as_deref()
+        .and_then(|path| json_path_lookup_value(root, path));
+    if let Some(expected) = condition.exists {
+        if actual.is_some() != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = condition.absent_or_null {
+        let absent_or_null = actual.is_none_or(Value::is_null);
+        if absent_or_null != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = condition.not_empty {
+        let not_empty = actual.is_some_and(value_not_empty);
+        if not_empty != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = condition.equals.as_ref() {
+        if actual != Some(expected) {
+            return false;
+        }
+    }
+    if let Some(unexpected) = condition.not_equals.as_ref() {
+        if actual == Some(unexpected) {
+            return false;
+        }
+    }
+    if let Some(values) = condition.in_values.as_ref() {
+        if !actual.is_some_and(|actual| values.iter().any(|value| value == actual)) {
+            return false;
+        }
+    }
+    if let Some(values) = condition.not_in.as_ref() {
+        if actual.is_some_and(|actual| values.iter().any(|value| value == actual)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn value_not_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        _ => true,
+    }
+}
+
 fn copilot_message_phase_is_hidden(v: &Value) -> bool {
     let Some(phase) = v.pointer("/data/phase").and_then(Value::as_str) else {
         return false;
@@ -1297,6 +1446,15 @@ fn extract_json_path(stdout: &str, path: &str) -> Option<String> {
 /// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`. No filters,
 /// pipes, or functions.
 fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
+    let cur = json_path_lookup_value(root, path)?;
+    match cur {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn json_path_lookup_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let path = path
         .strip_prefix("$.")
         .or_else(|| path.strip_prefix('.'))
@@ -1315,11 +1473,7 @@ fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
             cur = cur.get(idx)?;
         }
     }
-    match cur {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
+    Some(cur)
 }
 
 fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
@@ -1557,6 +1711,7 @@ mod tests {
             first_run_capture: None,
             resume_args: None,
             output_format: CommandOutputFormat::Text,
+            decoder: None,
             prompt_via: PromptVia::Args,
             prompt: None,
             stdin_template: None,
@@ -1738,6 +1893,41 @@ mod tests {
 
         assert_eq!(
             extract_copilot_json_final_text(stdout),
+            Some("hello world".into())
+        );
+    }
+
+    #[test]
+    fn provider_jsonl_reducer_matches_copilot_final_text_rules() {
+        let decoder = crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "copilot")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("copilot decoder");
+        let stdout = r#"{"agentId":"sub_1","type":"assistant.message","data":{"messageId":"m1","content":"Sub-agent detail"}}
+{"type":"assistant.message","data":{"messageId":"m2","phase":"thinking","content":"Private reasoning"}}
+{"type":"assistant.message","data":{"messageId":"m3","content":"Root answer"}}
+"#;
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&decoder), stdout),
+            Some("Root answer".into())
+        );
+    }
+
+    #[test]
+    fn provider_jsonl_reducer_uses_fallback_delta_text() {
+        let decoder = crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "copilot")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("copilot decoder");
+        let stdout = r#"{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"hello"}}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":" world"}}
+"#;
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&decoder), stdout),
             Some("hello world".into())
         );
     }

@@ -1852,6 +1852,11 @@ pub struct AgentTransport {
         rename = "outputFormat"
     )]
     pub output_format: Option<CommandOutputFormat>,
+    /// Full provider decoder spec retained after ProviderManifest resolution.
+    /// `outputFormat` is the legacy adapter selector; decoder carries
+    /// manifest-driven reducers such as JSONL finalText extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder: Option<ProviderDecoderSpec>,
     /// How the prompt text is delivered to the subprocess. Defaults to `args`
     /// (appended after `args` as the final argv token).
     #[serde(default, rename = "promptVia")]
@@ -1901,6 +1906,7 @@ impl Default for AgentTransport {
             model_args: Vec::new(),
             session: None,
             output_format: None,
+            decoder: None,
             prompt_via: PromptVia::default(),
             prompt: None,
             stdin: None,
@@ -1923,6 +1929,7 @@ impl AgentTransport {
             && self.model_args.is_empty()
             && self.session.is_none()
             && self.output_format.is_none()
+            && self.decoder.is_none()
             && self.prompt_via == PromptVia::default()
             && self.prompt.is_none()
             && self.stdin.is_none()
@@ -2088,10 +2095,63 @@ pub struct ProviderDecoderSpec {
     pub format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce: Option<ProviderJsonlReduceSpec>,
 }
 
 fn default_provider_decoder_format() -> String {
     "text".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderJsonlReduceSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "finalText")]
+    pub final_text: Option<ProviderJsonlTextReducerSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderJsonlTextReducerSpec {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<ProviderJsonConditionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<ProviderJsonlTextReducerSpec>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderJsonConditionSpec {
+    #[serde(default)]
+    pub all: Vec<ProviderJsonConditionSpec>,
+    #[serde(default)]
+    pub any: Vec<ProviderJsonConditionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not: Option<Box<ProviderJsonConditionSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "notEquals")]
+    pub not_equals: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "absentOrNull"
+    )]
+    pub absent_or_null: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "notEmpty")]
+    pub not_empty: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "in")]
+    pub in_values: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "notIn")]
+    pub not_in: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

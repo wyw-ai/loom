@@ -1335,6 +1335,7 @@ fn test_command_transport() -> AgentTransport {
         model_args: Vec::new(),
         session: None,
         output_format: None,
+        decoder: None,
         prompt_via: proto::methods::PromptVia::default(),
         prompt: None,
         stdin: None,

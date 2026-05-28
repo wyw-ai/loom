@@ -11,6 +11,8 @@ use std::path::Path;
 use proto::methods::{AgentModelChoice, AgentProviderRef, AgentTransport};
 use serde::{Deserialize, Serialize};
 
+use crate::provider::{ProviderRegistry, ProviderRuntimePlan};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectedAgentProvider {
@@ -22,7 +24,7 @@ pub struct DetectedAgentProvider {
     #[serde(default, skip)]
     pub transport_env: BTreeMap<String, String>,
     #[serde(default, skip)]
-    pub transport: AgentTransport,
+    pub runtime_plan: Option<ProviderRuntimePlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(default)]
@@ -38,18 +40,17 @@ pub fn detect_agent_cli_providers() -> Vec<DetectedAgentProvider> {
 
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
-        let mut transport = self.transport.clone();
-        if transport.command.trim().is_empty() {
-            transport.command = self.command.clone();
+        if let Some(plan) = self.runtime_plan.clone() {
+            return plan.into_transport();
         }
-        if transport.args.is_empty() {
-            transport.args = self.args.clone();
+        AgentTransport {
+            kind: self.transport_kind.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            env: self.transport_env.clone(),
+            model: self.default_model.clone(),
+            ..Default::default()
         }
-        transport.env.extend(self.transport_env.clone());
-        if transport.model.is_none() {
-            transport.model = self.default_model.clone();
-        }
-        transport
     }
 }
 
@@ -57,6 +58,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
     path: OsString,
     config_dir: &Path,
 ) -> Vec<DetectedAgentProvider> {
+    let registry = ProviderRegistry::load(config_dir).ok();
     crate::provider::detect_agent_cli_providers_with_config_dir_and_path(config_dir, path)
         .unwrap_or_default()
         .into_iter()
@@ -70,23 +72,16 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
             let default_model = provider.default_model;
             let model_choices = provider.model_choices;
             let manifest_id = provider.manifest.id;
-            let transport = crate::provider::ProviderRegistry::load(config_dir)
-                .and_then(|registry| {
-                    registry.resolve_transport(&AgentProviderRef {
+            let runtime_plan = registry.as_ref().and_then(|registry| {
+                registry
+                    .resolve_runtime_plan(&AgentProviderRef {
                         id: manifest_id,
                         mode: Some("print".into()),
                         model: default_model.clone(),
                         reasoning_effort: None,
                     })
-                })
-                .unwrap_or_else(|_| AgentTransport {
-                    kind: transport_kind.clone(),
-                    command: command.clone(),
-                    args: args.clone(),
-                    env: env.clone(),
-                    model: default_model.clone(),
-                    ..Default::default()
-                });
+                    .ok()
+            });
             DetectedAgentProvider {
                 id,
                 display_name,
@@ -94,7 +89,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
                 transport_kind,
                 args,
                 transport_env: env,
-                transport,
+                runtime_plan,
                 default_model,
                 model_choices,
             }
@@ -201,9 +196,18 @@ mod tests {
             .find(|provider| provider.id == "qoder")
             .expect("qoder provider");
         assert!(qoder.args.contains(&"--append-system-prompt".into()));
+        let qoder_plan = qoder.runtime_plan.as_ref().expect("qoder runtime plan");
+        assert_eq!(qoder_plan.provider_id, "qoder");
+        assert_eq!(qoder_plan.mode, "print");
+        assert_eq!(qoder_plan.transport_kind, "command");
         assert_eq!(
             qoder.transport().output_format,
             Some(CommandOutputFormat::ClaudeStreamJson)
+        );
+        let serialized = serde_json::to_value(qoder).expect("serialize provider");
+        assert!(
+            serialized.get("runtimePlan").is_none(),
+            "daemon inventory should publish provider summary, not runtime plan internals"
         );
         let copilot = providers
             .iter()

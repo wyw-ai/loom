@@ -955,6 +955,8 @@ mod tests {
         AdapterPrompt {
             scope,
             content: content.into(),
+            parts: Vec::new(),
+            outputs: BTreeMap::from([("full".into(), content.into())]),
             model: None,
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),

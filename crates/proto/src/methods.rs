@@ -1996,7 +1996,7 @@ pub enum CommandSessionIdSource {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderManifest {
     #[serde(default = "default_provider_schema_version")]
     pub schema_version: u32,
@@ -2018,14 +2018,14 @@ fn default_provider_schema_version() -> u32 {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDetectSpec {
     #[serde(default)]
     pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderModeSpec {
     #[serde(default = "default_provider_transport")]
     pub transport: String,
@@ -2059,15 +2059,37 @@ fn default_provider_transport() -> String {
     "command".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ProviderArgSpec {
     Literal(String),
-    Conditional {
-        when: String,
-        #[serde(default)]
-        args: Vec<ProviderArgSpec>,
-    },
+    Conditional(ProviderConditionalArgSpec),
+}
+
+impl<'de> Deserialize<'de> for ProviderArgSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(value) => Ok(Self::Literal(value)),
+            serde_json::Value::Object(_) => ProviderConditionalArgSpec::deserialize(value)
+                .map(Self::Conditional)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "provider arg must be a string or conditional object",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConditionalArgSpec {
+    pub when: String,
+    #[serde(default)]
+    pub args: Vec<ProviderArgSpec>,
 }
 
 impl Default for ProviderArgSpec {
@@ -2077,14 +2099,14 @@ impl Default for ProviderArgSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderPromptSpec {
     #[serde(default)]
     pub outputs: std::collections::BTreeMap<String, ProviderPromptOutputSpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderPromptOutputSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
@@ -2118,7 +2140,7 @@ pub enum ProviderRenderTitle {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDecoderSpec {
     #[serde(default = "default_provider_decoder_format")]
     pub format: String,
@@ -2137,7 +2159,7 @@ fn default_provider_decoder_format() -> String {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDecoderEventSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<ProviderJsonConditionSpec>,
@@ -2146,14 +2168,14 @@ pub struct ProviderDecoderEventSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDecoderCaptureSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ProviderJsonlTextReducerSpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDecoderEmitSpec {
     #[serde(default, rename = "type")]
     pub emit_type: String,
@@ -2176,14 +2198,14 @@ pub struct ProviderDecoderEmitSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderJsonlReduceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "finalText")]
     pub final_text: Option<ProviderJsonlTextReducerSpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderJsonlTextReducerSpec {
     #[serde(default)]
     pub mode: String,
@@ -2196,7 +2218,7 @@ pub struct ProviderJsonlTextReducerSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderJsonConditionSpec {
     #[serde(default)]
     pub all: Vec<ProviderJsonConditionSpec>,

@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 
 use proto::methods::{
     AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
-    CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderDecoderCaptureSpec,
-    ProviderDecoderEmitSpec, ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec,
-    ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec,
-    ProviderPromptOutputSpec, ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource,
-    ProviderSessionSpec,
+    CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderConditionalArgSpec,
+    ProviderDecoderCaptureSpec, ProviderDecoderEmitSpec, ProviderDecoderSpec, ProviderDetectSpec,
+    ProviderJsonConditionSpec, ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec,
+    ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec, ProviderPromptSpec,
+    ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -617,23 +617,36 @@ fn merge_manifest_value(mut base: Value, patch: Value) -> Result<Value, String> 
         .as_object()
         .ok_or_else(|| "provider manifest patch must be an object".to_string())?;
 
+    reject_unknown_keys(
+        patch_obj,
+        &[
+            "schemaVersion",
+            "id",
+            "extends",
+            "displayName",
+            "detect",
+            "modes",
+            "models",
+        ],
+        "provider manifest patch",
+    )?;
+
     for key in ["schemaVersion", "id", "extends", "displayName", "models"] {
         if let Some(value) = patch_obj.get(key) {
-            if key != "displayName" || value.as_str().is_some_and(|s| !s.trim().is_empty()) {
-                base_obj.insert(key.to_string(), value.clone());
-            }
+            base_obj.insert(key.to_string(), value.clone());
         }
     }
-    if let Some(detect) = patch_obj.get("detect").and_then(Value::as_object) {
-        if detect
-            .get("candidates")
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-        {
-            base_obj.insert("detect".into(), Value::Object(detect.clone()));
-        }
+    if let Some(detect_value) = patch_obj.get("detect") {
+        let detect = detect_value
+            .as_object()
+            .ok_or_else(|| "detect patch must be an object".to_string())?;
+        reject_unknown_keys(detect, &["candidates"], "detect patch")?;
+        base_obj.insert("detect".into(), Value::Object(detect.clone()));
     }
-    if let Some(patch_modes) = patch_obj.get("modes").and_then(Value::as_object) {
+    if let Some(modes_value) = patch_obj.get("modes") {
+        let patch_modes = modes_value
+            .as_object()
+            .ok_or_else(|| "modes patch must be an object".to_string())?;
         let base_modes = base_obj
             .entry("modes")
             .or_insert_with(|| Value::Object(Map::new()))
@@ -657,6 +670,24 @@ fn apply_mode_patch(base_mode: &mut Value, patch_mode: &Value) -> Result<(), Str
     let patch = patch_mode
         .as_object()
         .ok_or_else(|| "provider mode patch must be an object".to_string())?;
+
+    reject_unknown_keys(
+        patch,
+        &[
+            "transport",
+            "command",
+            "args",
+            "env",
+            "stdin",
+            "prompt",
+            "stdout",
+            "stderr",
+            "session",
+            "timeoutMs",
+            "idleTimeoutMs",
+        ],
+        "provider mode patch",
+    )?;
 
     for key in [
         "transport",
@@ -686,12 +717,12 @@ fn apply_mode_patch(base_mode: &mut Value, patch_mode: &Value) -> Result<(), Str
 
 fn apply_args_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), String> {
     if patch.is_array() {
-        base.insert("args".into(), patch.clone());
-        return Ok(());
+        return Err("args patch must be an object; use args.replace to replace args".into());
     }
     let Some(obj) = patch.as_object() else {
         return Err("args patch must be an array or object".into());
     };
+    reject_unknown_keys(obj, &["replace", "prepend", "append"], "args patch")?;
     if let Some(replace) = obj.get("replace") {
         ensure_array_field(replace, "args.replace")?;
         base.insert("args".into(), replace.clone());
@@ -729,9 +760,13 @@ fn apply_env_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), S
         .ok_or_else(|| "env patch must be an object".to_string())?;
     let is_patch = obj.contains_key("merge") || obj.contains_key("unset");
     if !is_patch {
-        base.insert("env".into(), patch.clone());
-        return Ok(());
+        return if obj.is_empty() {
+            Ok(())
+        } else {
+            Err("env patch must use merge and/or unset".into())
+        };
     }
+    reject_unknown_keys(obj, &["merge", "unset"], "env patch")?;
     let mut env = base
         .get("env")
         .and_then(Value::as_object)
@@ -765,9 +800,13 @@ fn apply_prompt_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<()
         .as_object()
         .ok_or_else(|| "prompt patch must be an object".to_string())?;
     let Some(outputs_patch) = obj.get("outputs") else {
-        base.insert("prompt".into(), patch.clone());
-        return Ok(());
+        return if obj.is_empty() {
+            Ok(())
+        } else {
+            Err("prompt patch must use outputs".into())
+        };
     };
+    reject_unknown_keys(obj, &["outputs"], "prompt patch")?;
     let prompt = base
         .entry("prompt")
         .or_insert_with(|| Value::Object(Map::new()))
@@ -783,6 +822,19 @@ fn apply_prompt_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<()
         .ok_or_else(|| "prompt.outputs must be an object".to_string())?
     {
         outputs.insert(name.clone(), output.clone());
+    }
+    Ok(())
+}
+
+fn reject_unknown_keys(
+    obj: &Map<String, Value>,
+    allowed: &[&str],
+    where_: &str,
+) -> Result<(), String> {
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{where_} contains unknown field `{key}`"));
+        }
     }
     Ok(())
 }
@@ -1295,15 +1347,15 @@ fn validate_condition_names(
     for arg in args {
         match arg {
             ProviderArgSpec::Literal(_) => {}
-            ProviderArgSpec::Conditional { when, args } => {
-                let when = when.trim();
+            ProviderArgSpec::Conditional(spec) => {
+                let when = spec.when.trim();
                 if !matches!(when, "model" | "reasoningEffort" | "reasoning_effort") {
                     return Err(format!(
                         "provider `{}` mode `{mode_name}` uses unsupported args condition `{when}`",
                         manifest.id
                     ));
                 }
-                validate_condition_names(manifest, mode_name, args)?;
+                validate_condition_names(manifest, mode_name, &spec.args)?;
             }
         }
     }
@@ -1346,9 +1398,11 @@ fn arg_templates<'a>(
 ) -> Box<dyn Iterator<Item = (&'static str, &'a str)> + 'a> {
     match arg {
         ProviderArgSpec::Literal(value) => Box::new(std::iter::once((where_, value.as_str()))),
-        ProviderArgSpec::Conditional { args, .. } => {
-            Box::new(args.iter().flat_map(move |arg| arg_templates(arg, where_)))
-        }
+        ProviderArgSpec::Conditional(spec) => Box::new(
+            spec.args
+                .iter()
+                .flat_map(move |arg| arg_templates(arg, where_)),
+        ),
     }
 }
 
@@ -1466,8 +1520,8 @@ fn prompt_references_in_mode(mode: &ProviderModeSpec) -> HashSet<String> {
 fn collect_prompt_refs_from_arg(arg: &ProviderArgSpec, refs: &mut HashSet<String>) {
     match arg {
         ProviderArgSpec::Literal(value) => collect_prompt_refs(value, refs),
-        ProviderArgSpec::Conditional { args, .. } => {
-            for arg in args {
+        ProviderArgSpec::Conditional(spec) => {
+            for arg in &spec.args {
                 collect_prompt_refs_from_arg(arg, refs);
             }
         }
@@ -1591,10 +1645,12 @@ fn expand_static_arg_specs(specs: &[ProviderArgSpec], bin: &Path) -> Vec<Provide
             ProviderArgSpec::Literal(value) => {
                 ProviderArgSpec::Literal(expand_static_template(value, bin))
             }
-            ProviderArgSpec::Conditional { when, args } => ProviderArgSpec::Conditional {
-                when: when.clone(),
-                args: expand_static_arg_specs(args, bin),
-            },
+            ProviderArgSpec::Conditional(spec) => {
+                ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
+                    when: spec.when.clone(),
+                    args: expand_static_arg_specs(&spec.args, bin),
+                })
+            }
         })
         .collect()
 }
@@ -1607,7 +1663,7 @@ fn append_literals(specs: &[ProviderArgSpec], out: &mut Vec<String>) {
     for spec in specs {
         match spec {
             ProviderArgSpec::Literal(value) => out.push(value.clone()),
-            ProviderArgSpec::Conditional { args, .. } => append_literals(args, out),
+            ProviderArgSpec::Conditional(spec) => append_literals(&spec.args, out),
         }
     }
 }
@@ -1831,10 +1887,10 @@ fn lit(value: &str) -> ProviderArgSpec {
 }
 
 fn when(when: &str, args: Vec<ProviderArgSpec>) -> ProviderArgSpec {
-    ProviderArgSpec::Conditional {
+    ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
         when: when.into(),
         args,
-    }
+    })
 }
 
 fn manifest(
@@ -2265,6 +2321,22 @@ mod tests {
         }
     }
 
+    fn provider_manifest_parse_error(text: &str) -> String {
+        serde_json::from_str::<ProviderManifest>(text)
+            .expect_err("provider manifest should fail schema parsing")
+            .to_string()
+    }
+
+    fn provider_registry_load_error(name: &str, text: &str) -> String {
+        let config = temp_dir(name);
+        let providers = providers_dir(&config);
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::write(providers.join("provider.json"), text).expect("write provider");
+        ProviderRegistry::load(&config)
+            .expect_err("provider registry should reject manifest")
+            .to_string()
+    }
+
     #[test]
     fn base_prompt_keeps_dynamic_turn_context_out_of_system_output() {
         let parts = vec![
@@ -2677,6 +2749,126 @@ mod tests {
     }
 
     #[test]
+    fn provider_manifest_schema_rejects_unknown_top_level_field() {
+        let err = provider_manifest_parse_error(
+            r#"{
+              "schemaVersion": 1,
+              "id": "unknown_top_level",
+              "displayName": "Unknown Top Level",
+              "detect": { "candidates": ["unknown-top-level"] },
+              "owner": "daemon",
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "args": ["{prompt.full}"],
+                  "stdout": { "format": "text" }
+                }
+              }
+            }"#,
+        );
+        assert!(err.contains("unknown field `owner`"), "{err}");
+    }
+
+    #[test]
+    fn provider_manifest_schema_rejects_unknown_mode_field() {
+        let err = provider_manifest_parse_error(
+            r#"{
+              "schemaVersion": 1,
+              "id": "unknown_mode",
+              "detect": { "candidates": ["unknown-mode"] },
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "argz": ["{prompt.full}"],
+                  "args": ["{prompt.full}"],
+                  "stdout": { "format": "text" }
+                }
+              }
+            }"#,
+        );
+        assert!(err.contains("unknown field `argz`"), "{err}");
+    }
+
+    #[test]
+    fn provider_manifest_schema_rejects_unknown_conditional_arg_field() {
+        let err = provider_manifest_parse_error(
+            r#"{
+              "schemaVersion": 1,
+              "id": "unknown_conditional_arg",
+              "detect": { "candidates": ["unknown-conditional-arg"] },
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "args": [
+                    { "when": "model", "argz": ["--model"], "args": ["--model", "{model}"] },
+                    "{prompt.full}"
+                  ],
+                  "stdout": { "format": "text" }
+                }
+              }
+            }"#,
+        );
+        assert!(err.contains("unknown field `argz`"), "{err}");
+    }
+
+    #[test]
+    fn provider_manifest_schema_rejects_unknown_prompt_output_field() {
+        let err = provider_manifest_parse_error(
+            r#"{
+              "schemaVersion": 1,
+              "id": "unknown_prompt_output",
+              "detect": { "candidates": ["unknown-prompt-output"] },
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "prompt": {
+                    "outputs": {
+                      "full": { "template": "{user_message}", "joim": "\n\n" }
+                    }
+                  },
+                  "args": ["{prompt.full}"],
+                  "stdout": { "format": "text" }
+                }
+              }
+            }"#,
+        );
+        assert!(err.contains("unknown field `joim`"), "{err}");
+    }
+
+    #[test]
+    fn provider_manifest_schema_rejects_unknown_decoder_event_field() {
+        let err = provider_manifest_parse_error(
+            r#"{
+              "schemaVersion": 1,
+              "id": "unknown_decoder_event",
+              "detect": { "candidates": ["unknown-decoder-event"] },
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "args": ["{prompt.full}"],
+                  "stdout": {
+                    "format": "jsonl",
+                    "events": [
+                      {
+                        "when": { "path": "$.type", "equals": "message" },
+                        "emit": { "type": "text", "text": "$.text" },
+                        "extra": true
+                      }
+                    ]
+                  }
+                }
+              }
+            }"#,
+        );
+        assert!(err.contains("unknown field `extra`"), "{err}");
+    }
+
+    #[test]
     fn provider_capture_requires_decoder_capture_session() {
         let manifest = manifest(
             "missing_capture",
@@ -2993,7 +3185,7 @@ mod tests {
         );
         assert!(plan.arg_specs.iter().any(|arg| matches!(
             arg,
-            ProviderArgSpec::Conditional { when, .. } if when == "model"
+            ProviderArgSpec::Conditional(spec) if spec.when == "model"
         )));
         assert!(plan
             .decoder
@@ -3081,8 +3273,8 @@ mod tests {
         assert_eq!(plan.stdin.as_deref(), Some(expected_stdin.as_str()));
         assert!(plan.arg_specs.iter().any(|arg| matches!(
             arg,
-            ProviderArgSpec::Conditional { args, .. }
-                if args.iter().any(|item| matches!(item, ProviderArgSpec::Literal(value) if value == &bin_text))
+            ProviderArgSpec::Conditional(spec)
+                if spec.args.iter().any(|item| matches!(item, ProviderArgSpec::Literal(value) if value == &bin_text))
         )));
         let session = plan.session.as_ref().expect("session");
         assert!(
@@ -3209,6 +3401,131 @@ mod tests {
             mode.stdout.name.as_deref(),
             Some("codex_stream_json"),
             "patch must preserve base parser"
+        );
+    }
+
+    #[test]
+    fn extended_provider_patch_rejects_unknown_fields_before_merge() {
+        let top_level_err = provider_registry_load_error(
+            "extends-unknown-top-level",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_unknown_top",
+              "extends": "codex",
+              "detcet": { "candidates": ["codex"] }
+            }"#,
+        );
+        assert!(
+            top_level_err.contains("provider manifest patch contains unknown field `detcet`"),
+            "{top_level_err}"
+        );
+
+        let mode_err = provider_registry_load_error(
+            "extends-unknown-mode",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_unknown_mode",
+              "extends": "codex",
+              "modes": { "print": { "argz": ["--bad"] } }
+            }"#,
+        );
+        assert!(
+            mode_err.contains("provider mode patch contains unknown field `argz`"),
+            "{mode_err}"
+        );
+
+        let args_err = provider_registry_load_error(
+            "extends-unknown-args",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_unknown_args",
+              "extends": "codex",
+              "modes": { "print": { "args": { "appned": ["--bad"] } } }
+            }"#,
+        );
+        assert!(
+            args_err.contains("args patch contains unknown field `appned`"),
+            "{args_err}"
+        );
+
+        let prompt_err = provider_registry_load_error(
+            "extends-unknown-prompt",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_unknown_prompt",
+              "extends": "codex",
+              "modes": {
+                "print": {
+                  "prompt": {
+                    "outputs": { "diagnostic": { "template": "{actor_context}" } },
+                    "join": "\n\n"
+                  }
+                }
+              }
+            }"#,
+        );
+        assert!(
+            prompt_err.contains("prompt patch contains unknown field `join`"),
+            "{prompt_err}"
+        );
+
+        let env_err = provider_registry_load_error(
+            "extends-unknown-env",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_unknown_env",
+              "extends": "codex",
+              "modes": { "print": { "env": { "merge": {}, "drop": ["X"] } } }
+            }"#,
+        );
+        assert!(
+            env_err.contains("env patch contains unknown field `drop`"),
+            "{env_err}"
+        );
+    }
+
+    #[test]
+    fn extended_provider_patch_requires_explicit_patch_shapes_for_existing_modes() {
+        let args_err = provider_registry_load_error(
+            "extends-args-shorthand",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_args_shorthand",
+              "extends": "codex",
+              "modes": { "print": { "args": ["--bad"] } }
+            }"#,
+        );
+        assert!(
+            args_err.contains("args patch must be an object; use args.replace"),
+            "{args_err}"
+        );
+
+        let env_err = provider_registry_load_error(
+            "extends-env-shorthand",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_env_shorthand",
+              "extends": "codex",
+              "modes": { "print": { "env": { "EXTRA_FLAG": "1" } } }
+            }"#,
+        );
+        assert!(
+            env_err.contains("env patch must use merge and/or unset"),
+            "{env_err}"
+        );
+
+        let prompt_err = provider_registry_load_error(
+            "extends-prompt-shorthand",
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_prompt_shorthand",
+              "extends": "codex",
+              "modes": { "print": { "prompt": { "outputsWrong": {} } } }
+            }"#,
+        );
+        assert!(
+            prompt_err.contains("prompt patch must use outputs"),
+            "{prompt_err}"
         );
     }
 

@@ -177,7 +177,7 @@ mod tests {
         assert!(resume_args.contains(&"{prompt.user}".into()));
         assert!(claude_session.resume_arg_specs.iter().any(|arg| matches!(
             arg,
-            ProviderArgSpec::Conditional { when, .. } if when == "model"
+            ProviderArgSpec::Conditional(spec) if spec.when == "model"
         )));
         assert!(claude_transport.model_args.is_empty());
         let qoder = providers

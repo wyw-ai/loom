@@ -2099,6 +2099,8 @@ pub struct ProviderDecoderSpec {
     pub events: Vec<ProviderDecoderEventSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduce: Option<ProviderJsonlReduceSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<ProviderDecoderCaptureSpec>,
 }
 
 fn default_provider_decoder_format() -> String {
@@ -2112,6 +2114,13 @@ pub struct ProviderDecoderEventSpec {
     pub when: Option<ProviderJsonConditionSpec>,
     #[serde(default)]
     pub emit: ProviderDecoderEmitSpec,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDecoderCaptureSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ProviderJsonlTextReducerSpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2189,12 +2198,10 @@ pub struct ProviderJsonConditionSpec {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderSessionSpec {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "idSource")]
     pub id_source: Option<ProviderSessionIdSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capture: Option<String>,
     #[serde(default)]
     pub resume_args: Vec<ProviderArgSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

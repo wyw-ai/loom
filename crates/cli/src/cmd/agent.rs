@@ -12,6 +12,21 @@ use serde::Deserialize;
 use crate::{config, render};
 
 pub fn list() -> Result<()> {
+    let specs_dir = default_specs_dir();
+    let mut seen = HashSet::new();
+    let mut agents = load_specs_at(&specs_dir)?
+        .into_iter()
+        .map(|spec| {
+            seen.insert(spec.actor.id.clone());
+            AgentInfo {
+                spec,
+                status: "registered".into(),
+                pid: None,
+                session_id: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
     let cfg = load_desktop_config().unwrap_or_default();
     let detected_providers = detect_agent_cli_providers();
     let provider_overrides = cfg
@@ -37,16 +52,19 @@ pub fn list() -> Result<()> {
                 .map(machine_agent_definition)
         })
         .collect::<Vec<_>>();
-    let agents = provider_specs_from_agent_definitions(&providers, &definitions)
-        .into_iter()
-        .flat_map(|provider| provider.into_agent_specs())
-        .map(|spec| AgentInfo {
-            spec,
-            status: "registered".into(),
-            pid: None,
-            session_id: None,
-        })
-        .collect::<Vec<_>>();
+    agents.extend(
+        provider_specs_from_agent_definitions(&providers, &definitions)
+            .into_iter()
+            .flat_map(|provider| provider.into_agent_specs())
+            .filter(|spec| seen.insert(spec.actor.id.clone()))
+            .map(|spec| AgentInfo {
+                spec,
+                status: "registered".into(),
+                pid: None,
+                session_id: None,
+            }),
+    );
+    agents.sort_by(|a, b| a.spec.actor.id.cmp(&b.spec.actor.id));
     let res = AgentListResult { agents };
     if render::is_json() {
         render::print_json(&res);
@@ -57,9 +75,15 @@ pub fn list() -> Result<()> {
         return Ok(());
     }
     for a in res.agents {
+        let provider = a
+            .spec
+            .provider_ref
+            .as_ref()
+            .map(|provider_ref| provider_ref.id.as_str())
+            .unwrap_or("-");
         println!(
-            "{}\t{}\tstatus={}\tcommand={}",
-            a.spec.actor.id, a.spec.actor.display_name, a.status, a.spec.transport.command,
+            "{}\t{}\tstatus={}\tprovider={}",
+            a.spec.actor.id, a.spec.actor.display_name, a.status, provider,
         );
     }
     Ok(())
@@ -196,9 +220,7 @@ pub(crate) fn default_specs_dir() -> PathBuf {
             return PathBuf::from(s);
         }
     }
-    dirs::config_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents"))
+    config::config_dir().join("agents")
 }
 
 pub(crate) fn load_specs_at(dir: &Path) -> Result<Vec<AgentSpec>> {

@@ -140,6 +140,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentCmd,
     },
+    /// Manage provider manifests used to launch agent CLIs.
+    Provider {
+        #[command(subcommand)]
+        sub: ProviderCmd,
+    },
     /// Inspect actors known to the server.
     Actor {
         #[command(subcommand)]
@@ -1408,6 +1413,22 @@ enum AgentBundleCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ProviderCmd {
+    /// Validate a provider manifest JSON file.
+    Validate { path: PathBuf },
+    /// Add a provider manifest into the current LOOM_CONFIG_DIR.
+    Add { path: PathBuf },
+    /// List built-in and locally installed providers.
+    List,
+    /// Show one resolved provider manifest.
+    Show { provider_id: String },
+    /// Remove a locally installed provider manifest.
+    Remove { provider_id: String },
+    /// Validate and check local command detection for one provider.
+    Doctor { provider_id: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -1541,6 +1562,18 @@ async fn main() -> Result<()> {
                     list,
                 } => cmd::spec::bundle_get(actor_id, file, list)?,
             },
+        }
+        return Ok(());
+    }
+
+    if let Cmd::Provider { sub } = args.cmd {
+        match sub {
+            ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
+            ProviderCmd::Add { path } => cmd::provider::add(path)?,
+            ProviderCmd::List => cmd::provider::list()?,
+            ProviderCmd::Show { provider_id } => cmd::provider::show(provider_id)?,
+            ProviderCmd::Remove { provider_id } => cmd::provider::remove(provider_id)?,
+            ProviderCmd::Doctor { provider_id } => cmd::provider::doctor(provider_id)?,
         }
         return Ok(());
     }
@@ -2326,6 +2359,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
+        Cmd::Provider { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Actor { sub } => match sub {

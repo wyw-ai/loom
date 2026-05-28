@@ -7,16 +7,14 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use proto::methods::{
     AgentActorDefaults, AgentActorSpec, AgentModelChoice, AgentModelSpec, AgentProviderInfo,
-    AgentProviderRef, AgentProviderSpec, AgentSpec, AgentTransport, CommandOutputFormat,
-    CommandSession, CommandSessionIdSource, IdentityFiles, IdentityScaffoldSpec, IdentitySpec,
-    PromptVia,
+    AgentProviderRef, AgentProviderSpec, AgentSpec, AgentTransport,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +26,8 @@ pub struct DetectedAgentProvider {
     pub args: Vec<String>,
     #[serde(default, skip)]
     pub transport_env: BTreeMap<String, String>,
+    #[serde(default, skip)]
+    pub transport: AgentTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(default)]
@@ -58,50 +58,10 @@ pub struct AgentDefinition {
     pub avatar_url: Option<String>,
 }
 
-struct ProviderDef {
-    id: &'static str,
-    display_name: &'static str,
-    candidates: &'static [&'static str],
-    args: &'static [&'static str],
-}
-
-const PROVIDER_DEFS: &[ProviderDef] = &[
-    ProviderDef {
-        id: "claude",
-        display_name: "Claude Code",
-        candidates: &["claude"],
-        args: &["-p"],
-    },
-    ProviderDef {
-        id: "qoder",
-        display_name: "Qoder CLI",
-        candidates: &["qodercli"],
-        args: &["-p"],
-    },
-    ProviderDef {
-        id: "copilot",
-        display_name: "GitHub Copilot CLI",
-        candidates: &["copilot", "copilotcli"],
-        args: &["-p"],
-    },
-    ProviderDef {
-        id: "codex",
-        display_name: "Codex CLI",
-        candidates: &["codex", "codexcli"],
-        args: &["exec", "--skip-git-repo-check"],
-    },
-    ProviderDef {
-        id: "opencode",
-        display_name: "OpenCode",
-        candidates: &["opencode"],
-        args: &["run"],
-    },
-];
-
 pub fn detect_agent_cli_providers() -> Vec<DetectedAgentProvider> {
     detect_agent_cli_providers_in_path_with_config_dir(
         std::env::var_os("PATH").unwrap_or_default(),
-        &loom_config_dir(),
+        &crate::provider::loom_config_dir(),
     )
 }
 
@@ -142,9 +102,11 @@ pub fn apply_provider_overrides(
             .filter(|command| !command.is_empty())
         {
             provider.command = command.to_string();
+            provider.transport.command = command.to_string();
         }
         if let Some(args) = &override_config.args {
             provider.args = args.clone();
+            provider.transport.args = args.clone();
         }
         provider.transport_env.extend(
             override_config
@@ -152,6 +114,7 @@ pub fn apply_provider_overrides(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
+        provider.transport.env.extend(override_config.env.clone());
     }
     providers
 }
@@ -160,108 +123,24 @@ pub fn resolve_provider_ref_in_spec(spec: &mut AgentSpec) -> Result<(), String> 
     let Some(provider_ref) = spec.provider_ref.clone() else {
         return Ok(());
     };
-    let mode = provider_ref.mode.as_deref().unwrap_or("print");
-    if mode != "print" && mode != "command" {
-        return Err(format!(
-            "providerRef for {} requested unsupported mode `{mode}`",
-            spec.actor.id
-        ));
-    }
-    let provider = detect_agent_cli_providers()
-        .into_iter()
-        .find(|provider| provider.id == provider_ref.id)
-        .ok_or_else(|| {
-            format!(
-                "provider `{}` referenced by {} was not detected on PATH",
-                provider_ref.id, spec.actor.id
-            )
-        })?;
-    let mut transport = provider.transport();
-    if provider_ref
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .is_none()
-    {
-        transport.model = None;
-    }
-    apply_provider_ref_options(&mut transport, &provider_ref);
-    spec.transport = transport;
+    spec.transport = crate::provider::default_registry()?.resolve_transport(&provider_ref)?;
     Ok(())
-}
-
-fn apply_provider_ref_options(transport: &mut AgentTransport, provider_ref: &AgentProviderRef) {
-    if let Some(model) = provider_ref
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    {
-        transport.model = Some(model.to_string());
-    }
-    if let Some(reasoning_effort) = provider_ref
-        .reasoning_effort
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        match provider_ref.id.as_str() {
-            "opencode" => {
-                transport.args.push("--variant".into());
-                transport.args.push(reasoning_effort.to_string());
-            }
-            "qoder" => {
-                transport.args.push("--reasoning-effort".into());
-                transport.args.push(reasoning_effort.to_string());
-            }
-            "copilot" => {
-                transport.args.push("--effort".into());
-                transport.args.push(reasoning_effort.to_string());
-            }
-            _ => {}
-        }
-    }
 }
 
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
-        let mut env = self.transport_env.clone();
-        if self.id == "codex" {
-            // Codex runs model-generated shell commands inside its own
-            // sandbox. The Loom daemon socket is outside the actor workspace
-            // and macOS Seatbelt denies AF_UNIX access there, so have `loom`
-            // CLI calls use LOOM_SERVER directly.
-            env.entry("LOOM_NO_DAEMON".into())
-                .or_insert_with(|| "1".into());
+        let mut transport = self.transport.clone();
+        if transport.command.trim().is_empty() {
+            transport.command = self.command.clone();
         }
-        if self.id == "opencode" {
-            // OpenCode keeps a SQLite store under XDG_DATA_HOME. Use an
-            // actor-local store so a user's interactive opencode process does
-            // not lock the daemon-run provider.
-            env.entry("XDG_DATA_HOME".into())
-                .or_insert_with(|| "{agent.profile}/opencode/data".into());
-            env.entry("XDG_STATE_HOME".into())
-                .or_insert_with(|| "{agent.profile}/opencode/state".into());
-            env.entry("XDG_CACHE_HOME".into())
-                .or_insert_with(|| "{agent.profile}/opencode/cache".into());
+        if transport.args.is_empty() {
+            transport.args = self.args.clone();
         }
-        AgentTransport {
-            kind: self.transport_kind.clone(),
-            command: self.command.clone(),
-            args: self.args.clone(),
-            env,
-            auth_method: None,
-            model: self.default_model.clone(),
-            model_args: model_args_for_provider(&self.id),
-            session: command_session_for_provider(&self.id, &self.args),
-            output_format: Some(command_output_format_for_provider(&self.id)),
-            prompt_via: PromptVia::Args,
-            timeout_ms: None,
-            idle_timeout_ms: None,
-            interactive: None,
-            provider: None,
+        transport.env.extend(self.transport_env.clone());
+        if transport.model.is_none() {
+            transport.model = self.default_model.clone();
         }
+        transport
     }
 
     pub fn to_provider_spec(&self, actors: Vec<AgentActorSpec>) -> AgentProviderSpec {
@@ -312,6 +191,14 @@ fn actor_spec_from_definition(
     {
         meta.insert("avatarUrl".into(), json!(avatar_url));
     }
+    if let Some(description) = definition
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        meta.insert("description".into(), json!(description));
+    }
 
     AgentActorSpec {
         id: definition.actor_id.clone(),
@@ -323,17 +210,7 @@ fn actor_spec_from_definition(
         model: definition.model.clone(),
         models: None,
         bundle: None,
-        identity: Some(IdentitySpec {
-            files: IdentityFiles::default(),
-            description: definition.description.clone(),
-            scaffold: definition
-                .description
-                .as_ref()
-                .map(|description| IdentityScaffoldSpec {
-                    identity: Some(description.clone()),
-                    soul: None,
-                }),
-        }),
+        identity: None,
         memory: None,
         announcement: None,
     }
@@ -343,32 +220,49 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
     path: OsString,
     config_dir: &Path,
 ) -> Vec<DetectedAgentProvider> {
-    PROVIDER_DEFS
-        .iter()
-        .filter_map(|def| {
-            let command = find_command_in_path(def.candidates, &path)?;
-            let (default_model, model_choices) = model_choices_for_provider(def.id);
-            Some(DetectedAgentProvider {
-                id: def.id.into(),
-                display_name: def.display_name.into(),
-                command: command.display().to_string(),
-                transport_kind: "command".into(),
-                args: provider_args(def, config_dir),
-                transport_env: BTreeMap::new(),
+    crate::provider::detect_agent_cli_providers_with_config_dir_and_path(config_dir, path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|provider| {
+            let id = provider.id;
+            let display_name = provider.display_name;
+            let command = provider.command;
+            let transport_kind = provider.transport_kind;
+            let args = provider.args;
+            let env = provider.env;
+            let default_model = provider.default_model;
+            let model_choices = provider.model_choices;
+            let manifest_id = provider.manifest.id;
+            let transport = crate::provider::ProviderRegistry::load(config_dir)
+                .and_then(|registry| {
+                    registry.resolve_transport(&AgentProviderRef {
+                        id: manifest_id,
+                        mode: Some("print".into()),
+                        model: default_model.clone(),
+                        reasoning_effort: None,
+                    })
+                })
+                .unwrap_or_else(|_| AgentTransport {
+                    kind: transport_kind.clone(),
+                    command: command.clone(),
+                    args: args.clone(),
+                    env: env.clone(),
+                    model: default_model.clone(),
+                    ..Default::default()
+                });
+            DetectedAgentProvider {
+                id,
+                display_name,
+                command,
+                transport_kind,
+                args,
+                transport_env: env,
+                transport,
                 default_model,
                 model_choices,
-            })
+            }
         })
         .collect()
-}
-
-fn model_args_for_provider(provider_id: &str) -> Vec<String> {
-    match provider_id {
-        "claude" | "qoder" | "copilot" | "codex" | "opencode" => {
-            vec!["--model".into(), "{model}".into()]
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn model_spec(default: Option<&str>, choices: &[AgentModelChoice]) -> Option<AgentModelSpec> {
@@ -381,363 +275,11 @@ fn model_spec(default: Option<&str>, choices: &[AgentModelChoice]) -> Option<Age
     })
 }
 
-fn model_choices_for_provider(provider_id: &str) -> (Option<String>, Vec<AgentModelChoice>) {
-    match provider_id {
-        "codex" => model_choices_from_codex_cache(),
-        "qoder" => model_choices_from_qoder_registry(),
-        "copilot" => static_model_choices(COPILOT_MODELS),
-        "claude" => static_model_choices(CLAUDE_MODELS),
-        "opencode" => static_model_choices(OPENCODE_MODELS),
-        _ => (None, Vec::new()),
-    }
-}
-
-const CLAUDE_MODELS: &[(&str, &str)] = &[
-    ("sonnet", "Sonnet"),
-    ("opus", "Opus"),
-    ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
-    ("claude-opus-4.7", "Claude Opus 4.7"),
-    ("claude-haiku-4.5", "Claude Haiku 4.5"),
-];
-
-const COPILOT_MODELS: &[(&str, &str)] = &[
-    ("gpt-5.5", "GPT-5.5"),
-    ("gpt-5.4", "GPT-5.4"),
-    ("gpt-5.3-codex", "GPT-5.3 Codex"),
-    ("gpt-5.2-codex", "GPT-5.2 Codex"),
-    ("gpt-5.2", "GPT-5.2"),
-    ("gpt-5.1", "GPT-5.1"),
-    ("gpt-5.4-mini", "GPT-5.4 Mini"),
-    ("gpt-5-mini", "GPT-5 Mini"),
-    ("gpt-4.1", "GPT-4.1"),
-    ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
-    ("claude-sonnet-4.5", "Claude Sonnet 4.5"),
-    ("claude-haiku-4.5", "Claude Haiku 4.5"),
-    ("claude-opus-4.7", "Claude Opus 4.7"),
-    ("claude-opus-4.6", "Claude Opus 4.6"),
-    ("claude-opus-4.6-fast", "Claude Opus 4.6 Fast"),
-    ("claude-opus-4.5", "Claude Opus 4.5"),
-    ("claude-sonnet-4", "Claude Sonnet 4"),
-];
-
-const OPENCODE_MODELS: &[(&str, &str)] = &[
-    ("openai/gpt-5.5", "OpenAI GPT-5.5"),
-    ("openai/gpt-5.4", "OpenAI GPT-5.4"),
-    ("openai/gpt-5.4-mini", "OpenAI GPT-5.4 Mini"),
-    ("openai/gpt-5.3-codex", "OpenAI GPT-5.3 Codex"),
-    ("openai/gpt-5.3-codex-spark", "OpenAI GPT-5.3 Codex Spark"),
-    ("openai/gpt-5.2", "OpenAI GPT-5.2"),
-    ("opencode/big-pickle", "OpenCode Big Pickle"),
-    (
-        "opencode/deepseek-v4-flash-free",
-        "OpenCode DeepSeek V4 Flash Free",
-    ),
-    ("opencode/minimax-m2.5-free", "OpenCode MiniMax M2.5 Free"),
-];
-
-fn static_model_choices(models: &[(&str, &str)]) -> (Option<String>, Vec<AgentModelChoice>) {
-    let choices = models
-        .iter()
-        .map(|(id, label)| model_choice(id, label))
-        .collect::<Vec<_>>();
-    (models.first().map(|(id, _)| (*id).to_string()), choices)
-}
-
-fn model_choices_from_codex_cache() -> (Option<String>, Vec<AgentModelChoice>) {
-    let Some(path) = home_relative_path(".codex/models_cache.json") else {
-        return static_model_choices(CODEX_MODELS);
-    };
-    let Some(root) = read_json_file(&path) else {
-        return static_model_choices(CODEX_MODELS);
-    };
-    let choices = root
-        .get("models")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|model| string_field(model, "visibility") == Some("list"))
-        .filter_map(|model| {
-            let id = string_field(model, "slug")?.trim();
-            if id.is_empty() {
-                return None;
-            }
-            let label = string_field(model, "display_name")
-                .filter(|label| !label.trim().is_empty())
-                .unwrap_or(id);
-            Some(model_choice(id, label))
-        })
-        .collect::<Vec<_>>();
-    if choices.is_empty() {
-        return static_model_choices(CODEX_MODELS);
-    }
-    (choices.first().map(|choice| choice.id.clone()), choices)
-}
-
-const CODEX_MODELS: &[(&str, &str)] = &[
-    ("gpt-5.5", "GPT-5.5"),
-    ("gpt-5.4", "GPT-5.4"),
-    ("gpt-5.4-mini", "GPT-5.4 Mini"),
-    ("gpt-5.3-codex", "GPT-5.3 Codex"),
-    ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
-    ("gpt-5.2", "GPT-5.2"),
-];
-
-fn model_choices_from_qoder_registry() -> (Option<String>, Vec<AgentModelChoice>) {
-    let Some(path) = home_relative_path(".qoder/.auth/models") else {
-        return static_model_choices(QODER_MODELS);
-    };
-    let Some(root) = read_json_file(&path) else {
-        return static_model_choices(QODER_MODELS);
-    };
-    let choices = root
-        .get("assistant")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|model| model.get("enable").and_then(Value::as_bool).unwrap_or(true))
-        .filter_map(|model| {
-            let id = string_field(model, "key")?.trim();
-            if id.is_empty() {
-                return None;
-            }
-            let label = string_field(model, "display_name")
-                .filter(|label| !label.trim().is_empty())
-                .unwrap_or(id);
-            Some(model_choice(id, label))
-        })
-        .collect::<Vec<_>>();
-    if choices.is_empty() {
-        return static_model_choices(QODER_MODELS);
-    }
-    let default = root
-        .get("assistant")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|model| model.get("is_default").and_then(Value::as_bool) == Some(true))
-        .and_then(|model| string_field(model, "key"))
-        .map(ToOwned::to_owned)
-        .or_else(|| choices.first().map(|choice| choice.id.clone()));
-    (default, choices)
-}
-
-const QODER_MODELS: &[(&str, &str)] = &[
-    ("auto", "Auto"),
-    ("ultimate", "Ultimate"),
-    ("performance", "Performance"),
-    ("efficient", "Efficient"),
-    ("lite", "Lite"),
-];
-
-fn model_choice(id: &str, label: &str) -> AgentModelChoice {
-    AgentModelChoice {
-        id: id.to_string(),
-        label: label.to_string(),
-        description: None,
-    }
-}
-
-fn read_json_file(path: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str)
-}
-
-fn home_relative_path(path: &str) -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(path))
-}
-
-fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
-    let loom_config_dir = absolute_path(config_dir);
-    let mut args = Vec::new();
-    match def.id {
-        "claude" => {
-            append_add_dir_arg(&mut args, &loom_config_dir);
-            args.push("--permission-mode".into());
-            args.push("bypassPermissions".into());
-            args.push("--output-format".into());
-            args.push("stream-json".into());
-            args.push("--verbose".into());
-            args.push("--session-id".into());
-            args.push("{session_id}".into());
-            args.extend(def.args.iter().map(|arg| (*arg).to_string()));
-        }
-        "qoder" => {
-            append_add_dir_arg(&mut args, &loom_config_dir);
-            args.push("--yolo".into());
-            args.push("--output-format".into());
-            args.push("stream-json".into());
-            args.extend(def.args.iter().map(|arg| (*arg).to_string()));
-        }
-        "copilot" => {
-            append_add_dir_arg(&mut args, &loom_config_dir);
-            args.push("--yolo".into());
-            args.push("--output-format".into());
-            args.push("json".into());
-            args.push("--stream".into());
-            args.push("off".into());
-            args.extend(def.args.iter().map(|arg| (*arg).to_string()));
-        }
-        "codex" => {
-            args.extend(def.args.iter().map(|arg| (*arg).to_string()));
-            args.push("--json".into());
-            args.push("--sandbox".into());
-            args.push("danger-full-access".into());
-            args.push("-c".into());
-            args.push("sandbox_workspace_write.network_access=true".into());
-            append_add_dir_arg(&mut args, &loom_config_dir);
-        }
-        "opencode" => {
-            args.extend(def.args.iter().map(|arg| (*arg).to_string()));
-            args.push("--dangerously-skip-permissions".into());
-        }
-        _ => args.extend(def.args.iter().map(|arg| (*arg).to_string())),
-    }
-    args
-}
-
-fn command_output_format_for_provider(provider_id: &str) -> CommandOutputFormat {
-    match provider_id {
-        "claude" | "qoder" => CommandOutputFormat::ClaudeStreamJson,
-        "copilot" => CommandOutputFormat::CopilotJson,
-        "codex" => CommandOutputFormat::CodexStreamJson,
-        _ => CommandOutputFormat::Text,
-    }
-}
-
-fn command_session_for_provider(
-    provider_id: &str,
-    first_run_args: &[String],
-) -> Option<CommandSession> {
-    match provider_id {
-        "claude" => Some(CommandSession {
-            id_source: Some(CommandSessionIdSource::LoomUuid),
-            first_run_capture: None,
-            resume_args: Some(claude_resume_args(first_run_args)),
-        }),
-        _ => None,
-    }
-}
-
-fn claude_resume_args(first_run_args: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(first_run_args.len());
-    let mut i = 0;
-    while i < first_run_args.len() {
-        if first_run_args[i] == "--session-id"
-            && first_run_args
-                .get(i + 1)
-                .is_some_and(|arg| arg == "{session_id}")
-        {
-            args.push("--resume".into());
-            args.push("{session_id}".into());
-            i += 2;
-            continue;
-        }
-        args.push(first_run_args[i].clone());
-        i += 1;
-    }
-    args
-}
-
-fn append_add_dir_arg(args: &mut Vec<String>, dir: &Path) {
-    args.push("--add-dir".into());
-    args.push(dir.display().to_string());
-}
-
-fn loom_config_dir() -> PathBuf {
-    if let Some(value) = std::env::var_os("LOOM_CONFIG_DIR").filter(|value| !value.is_empty()) {
-        return PathBuf::from(value);
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home).join(".loom");
-    }
-    PathBuf::from(".loom")
-}
-
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(path)
-}
-
-fn find_command_in_path(candidates: &[&str], path: &OsString) -> Option<PathBuf> {
-    let mut path_dirs = std::env::split_paths(path).collect::<Vec<_>>();
-    path_dirs.extend(fallback_command_dirs());
-    path_dirs.sort();
-    path_dirs.dedup();
-    for candidate in candidates {
-        let candidate_path = Path::new(candidate);
-        if candidate_path.components().count() > 1 && is_executable(candidate_path) {
-            return Some(candidate_path.to_path_buf());
-        }
-        for dir in &path_dirs {
-            let path = dir.join(candidate);
-            if is_executable(&path) {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-fn fallback_command_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/opt/local/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-    ];
-    if let Some(home) = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-    {
-        dirs.push(home.join(".local").join("bin"));
-        dirs.push(home.join(".cargo").join("bin"));
-        dirs.push(home.join(".bun").join("bin"));
-        let nvm_node_root = home.join(".nvm").join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(nvm_node_root) {
-            dirs.extend(
-                entries
-                    .flatten()
-                    .map(|entry| entry.path().join("bin"))
-                    .filter(|path| path.is_dir()),
-            );
-        }
-    }
-    dirs
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::methods::{CommandOutputFormat, CommandSessionIdSource};
+    use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -781,26 +323,14 @@ mod tests {
             &config_dir,
         );
         let ids = providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
-        let config_dir_arg = config_dir.display().to_string();
-        let add_dir = vec!["--add-dir", config_dir_arg.as_str()];
-
-        assert_eq!(ids, vec!["claude", "qoder", "copilot", "codex", "opencode"]);
+        assert_eq!(ids, vec!["claude", "codex", "copilot", "opencode", "qoder"]);
         let claude = providers
             .iter()
             .find(|provider| provider.id == "claude")
             .expect("claude provider");
-        let mut expected = add_dir.clone();
-        expected.extend([
-            "--permission-mode",
-            "bypassPermissions",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--session-id",
-            "{session_id}",
-        ]);
-        expected.push("-p");
-        assert_eq!(claude.args, expected);
+        assert!(claude.args.contains(&"--append-system-prompt".into()));
+        assert!(claude.args.contains(&"{prompt.system}".into()));
+        assert!(claude.args.contains(&"{prompt.user}".into()));
         let claude_transport = claude.transport();
         assert_eq!(
             claude_transport.output_format,
@@ -825,7 +355,7 @@ mod tests {
                 .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
             Some(vec![
                 "--add-dir",
-                config_dir_arg.as_str(),
+                "{loom.configDir}",
                 "--permission-mode",
                 "bypassPermissions",
                 "--output-format",
@@ -833,19 +363,17 @@ mod tests {
                 "--verbose",
                 "--resume",
                 "{session_id}",
+                "--append-system-prompt",
+                "{prompt.system}",
                 "-p",
+                "{prompt.user}",
             ])
         );
         let qoder = providers
             .iter()
             .find(|provider| provider.id == "qoder")
             .expect("qoder provider");
-        let mut expected = add_dir.clone();
-        expected.push("--yolo");
-        expected.push("--output-format");
-        expected.push("stream-json");
-        expected.push("-p");
-        assert_eq!(qoder.args, expected);
+        assert!(qoder.args.contains(&"--append-system-prompt".into()));
         assert_eq!(
             qoder.transport().output_format,
             Some(CommandOutputFormat::ClaudeStreamJson)
@@ -854,14 +382,8 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "copilot")
             .expect("copilot provider");
-        let mut expected = add_dir.clone();
-        expected.push("--yolo");
-        expected.push("--output-format");
-        expected.push("json");
-        expected.push("--stream");
-        expected.push("off");
-        expected.push("-p");
-        assert_eq!(copilot.args, expected);
+        assert!(copilot.args.contains(&"--resume".into()));
+        assert!(copilot.args.contains(&"{prompt.full}".into()));
         assert_eq!(
             copilot.transport().output_format,
             Some(CommandOutputFormat::CopilotJson)
@@ -870,17 +392,7 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "codex")
             .expect("codex provider");
-        let mut expected = vec![
-            "exec",
-            "--skip-git-repo-check",
-            "--json",
-            "--sandbox",
-            "danger-full-access",
-            "-c",
-            "sandbox_workspace_write.network_access=true",
-        ];
-        expected.extend(add_dir);
-        assert_eq!(codex.args, expected);
+        assert!(codex.args.contains(&"{prompt.full}".into()));
         assert_eq!(
             codex.transport().output_format,
             Some(CommandOutputFormat::CodexStreamJson)
@@ -897,7 +409,7 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "opencode")
             .expect("opencode provider");
-        assert_eq!(opencode.args, vec!["run", "--dangerously-skip-permissions"]);
+        assert!(opencode.args.contains(&"{prompt.full}".into()));
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
     }
@@ -920,6 +432,22 @@ mod tests {
                 "/tmp/loom-config".into(),
             ],
             transport_env: BTreeMap::new(),
+            transport: AgentTransport {
+                kind: "command".into(),
+                command: "/bin/codex".into(),
+                args: vec![
+                    "exec".into(),
+                    "--skip-git-repo-check".into(),
+                    "--sandbox".into(),
+                    "danger-full-access".into(),
+                    "-c".into(),
+                    "sandbox_workspace_write.network_access=true".into(),
+                    "--add-dir".into(),
+                    "/tmp/loom-config".into(),
+                ],
+                env: BTreeMap::from([("LOOM_NO_DAEMON".into(), "1".into())]),
+                ..Default::default()
+            },
             default_model: None,
             model_choices: Vec::new(),
         };
@@ -972,6 +500,7 @@ mod tests {
             transport_kind: "command".into(),
             args: vec!["exec".into(), "--skip-git-repo-check".into()],
             transport_env: BTreeMap::new(),
+            transport: AgentTransport::default(),
             default_model: None,
             model_choices: Vec::new(),
         }];
@@ -998,10 +527,6 @@ mod tests {
         assert_eq!(
             transport.env.get("HTTPS_PROXY").map(String::as_str),
             Some("http://127.0.0.1:7890")
-        );
-        assert_eq!(
-            transport.env.get("LOOM_NO_DAEMON").map(String::as_str),
-            Some("1")
         );
     }
 }

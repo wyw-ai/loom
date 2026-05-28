@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use proto::methods::{CommandOutputFormat, CommandSessionIdSource, PromptVia};
+use proto::methods::{CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderPromptSpec};
 use proto::types::ScopeRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -73,6 +73,8 @@ pub struct CommandConfig {
     pub resume_args: Option<Vec<String>>,
     pub output_format: CommandOutputFormat,
     pub prompt_via: PromptVia,
+    pub prompt: Option<ProviderPromptSpec>,
+    pub stdin_template: Option<String>,
     /// Where to keep `<actor>/<scope_id>.json` session bookkeeping files. The
     /// adapter creates subdirs lazily on first write.
     pub sessions_dir: PathBuf,
@@ -117,6 +119,8 @@ impl CommandConfig {
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
             output_format: spec.output_format.unwrap_or_default(),
             prompt_via: spec.prompt_via,
+            prompt: spec.prompt.clone(),
+            stdin_template: spec.stdin.clone(),
             sessions_dir,
             timeout_ms: spec.timeout_ms,
             idle_timeout_ms: spec.idle_timeout_ms,
@@ -342,7 +346,10 @@ fn run_prompt(
         ),
     };
 
-    let result = spawn_and_collect(&cfg, &prompt, &argv, &sender, &slot);
+    let active_session_id = resume_session_id
+        .as_deref()
+        .or(first_run_session_id.as_deref());
+    let result = spawn_and_collect(&cfg, &prompt, &argv, active_session_id, &sender, &slot);
     let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
@@ -375,7 +382,14 @@ fn run_prompt(
         };
         let first_run_argv =
             expand_first_run_argv(&cfg, &prompt, retry_session_id.as_deref(), &content);
-        outcome = match spawn_and_collect(&cfg, &prompt, &first_run_argv, &sender, &slot) {
+        outcome = match spawn_and_collect(
+            &cfg,
+            &prompt,
+            &first_run_argv,
+            retry_session_id.as_deref(),
+            &sender,
+            &slot,
+        ) {
             Ok(o) => o,
             Err(e) => {
                 let _ = sender.send(AdapterEvent::Error {
@@ -458,6 +472,7 @@ fn spawn_and_collect(
     cfg: &CommandConfig,
     prompt: &AdapterPrompt,
     argv: &[String],
+    session_id: Option<&str>,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     slot: &Arc<Mutex<InFlight>>,
 ) -> Result<SpawnOutcome, String> {
@@ -469,7 +484,7 @@ fn spawn_and_collect(
         )
     })?;
     let mut cmd = Command::new(&cfg.command);
-    let stdin = if matches!(cfg.prompt_via, PromptVia::Stdin) {
+    let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -502,10 +517,15 @@ fn spawn_and_collect(
         }
     }
 
-    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+    if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         if let Some(mut stdin) = child.stdin.take() {
+            let stdin_body = cfg
+                .stdin_template
+                .as_ref()
+                .map(|template| expand_template(template, cfg, prompt, session_id, &prompt.content))
+                .unwrap_or_else(|| prompt.content.clone());
             stdin
-                .write_all(prompt.content.as_bytes())
+                .write_all(stdin_body.as_bytes())
                 .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
         }
     }
@@ -1231,6 +1251,12 @@ fn capture_session_id(
     if let Some(path) = rule.strip_prefix("stdout_json:") {
         return Ok(extract_json_path(&outcome.stdout, path));
     }
+    if let Some(path) = rule
+        .strip_prefix("stdout_jsonl:last(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Ok(extract_json_path(&outcome.stdout, path));
+    }
     if let Some(_re) = rule.strip_prefix("stderr_regex:") {
         return Err("stderr_regex first_run_capture not yet implemented".into());
     }
@@ -1271,7 +1297,10 @@ fn extract_json_path(stdout: &str, path: &str) -> Option<String> {
 /// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`. No filters,
 /// pipes, or functions.
 fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
-    let path = path.strip_prefix('.').unwrap_or(path);
+    let path = path
+        .strip_prefix("$.")
+        .or_else(|| path.strip_prefix('.'))
+        .unwrap_or(path);
     let mut cur = root;
     for raw in path.split('.') {
         if raw.is_empty() {
@@ -1324,8 +1353,14 @@ fn expand_first_run_argv(
         .iter()
         .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
+    if let Some(pos) = prompt_ref_insert_pos(&cfg.args, &argv) {
+        let mut model_args = Vec::new();
+        append_model_args(&mut model_args, cfg, request, session_id, prompt);
+        argv.splice(pos..pos, model_args);
+        return argv;
+    }
     if matches!(cfg.prompt_via, PromptVia::Args) {
-        let already = cfg.args.iter().any(|a| a.contains("{prompt}"));
+        let already = cfg.args.iter().any(|a| contains_prompt_ref(a));
         if !already {
             if let Some(pos) = prompt_flag_without_value(&argv) {
                 let mut model_args = Vec::new();
@@ -1340,7 +1375,8 @@ fn expand_first_run_argv(
     append_model_args(&mut argv, cfg, request, session_id, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
         // Only append when the template didn't already place {prompt} itself.
-        let already = argv.iter().any(|a| a == prompt);
+        let already =
+            cfg.args.iter().any(|a| contains_prompt_ref(a)) || argv.iter().any(|a| a == prompt);
         if !already {
             argv.push(prompt.to_string());
         }
@@ -1359,8 +1395,14 @@ fn expand_argv(
         .iter()
         .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
+    if let Some(pos) = prompt_ref_insert_pos(template, &argv) {
+        let mut model_args = Vec::new();
+        append_model_args(&mut model_args, cfg, request, session_id, prompt);
+        argv.splice(pos..pos, model_args);
+        return argv;
+    }
     if matches!(cfg.prompt_via, PromptVia::Args) {
-        let already = template.iter().any(|a| a.contains("{prompt}"));
+        let already = template.iter().any(|a| contains_prompt_ref(a));
         if !already {
             if let Some(pos) = prompt_flag_without_value(&argv) {
                 let mut model_args = Vec::new();
@@ -1374,7 +1416,7 @@ fn expand_argv(
     }
     append_model_args(&mut argv, cfg, request, session_id, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
-        let already = template.iter().any(|a| a.contains("{prompt}"));
+        let already = template.iter().any(|a| contains_prompt_ref(a));
         if !already {
             argv.push(prompt.to_string());
         }
@@ -1386,6 +1428,24 @@ fn prompt_flag_without_value(argv: &[String]) -> Option<usize> {
     argv.iter()
         .rposition(|arg| matches!(arg.as_str(), "-p" | "--prompt"))
         .filter(|pos| *pos + 1 == argv.len())
+}
+
+fn contains_prompt_ref(input: &str) -> bool {
+    input.contains("{prompt") || input.contains("{loom_envelope}")
+}
+
+fn prompt_ref_insert_pos(template: &[String], argv: &[String]) -> Option<usize> {
+    let pos = template.iter().position(|arg| contains_prompt_ref(arg))?;
+    if pos > 0
+        && matches!(
+            argv[pos - 1].as_str(),
+            "-p" | "--prompt" | "--append-system-prompt" | "--system-prompt"
+        )
+    {
+        Some(pos - 1)
+    } else {
+        Some(pos)
+    }
 }
 
 fn expand_template(
@@ -1404,9 +1464,30 @@ fn expand_template(
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{model}", active_model(request).as_deref().unwrap_or(""))
-        .replace("{prompt}", prompt);
+        .replace("{prompt}", prompt)
+        .replace(
+            "{prompt.full}",
+            request
+                .outputs
+                .get("full")
+                .map(String::as_str)
+                .unwrap_or(prompt),
+        )
+        .replace(
+            "{loom_envelope}",
+            request
+                .outputs
+                .get("full")
+                .map(String::as_str)
+                .unwrap_or(prompt),
+        );
     if let Some(sid) = session_id {
-        out = out.replace("{session_id}", sid);
+        out = out
+            .replace("{session_id}", sid)
+            .replace("{session.id}", sid);
+    }
+    for (name, value) in &request.outputs {
+        out = out.replace(&format!("{{prompt.{name}}}"), value);
     }
     for (key, value) in &request.template_vars {
         out = out.replace(&format!("{{{key}}}"), value);
@@ -1477,6 +1558,8 @@ mod tests {
             resume_args: None,
             output_format: CommandOutputFormat::Text,
             prompt_via: PromptVia::Args,
+            prompt: None,
+            stdin_template: None,
             sessions_dir: PathBuf::from("/tmp/loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
@@ -1502,6 +1585,8 @@ mod tests {
         AdapterPrompt {
             scope: scope(),
             content: content.into(),
+            parts: Vec::new(),
+            outputs: BTreeMap::from([("full".into(), content.into())]),
             model: None,
             cwd: PathBuf::from("/tmp"),
             env: BTreeMap::new(),
@@ -1778,8 +1863,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(InFlight::default()));
 
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert_eq!(outcome.exit_code, 0);
         let mut messages = Vec::new();
@@ -1839,8 +1924,8 @@ mod tests {
         cfg.prompt_via = PromptVia::Args;
         let (tx, _rx) = mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(InFlight::default()));
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert_eq!(outcome.stdout.trim(), "stdin-closed");
     }
@@ -1857,8 +1942,8 @@ mod tests {
         let slot = Arc::new(Mutex::new(InFlight::default()));
 
         let started = std::time::Instant::now();
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -1888,13 +1973,13 @@ mod tests {
         cfg.command = "sh".into();
         cfg.args = vec!["-c".into(), "echo started; sleep 30".into()];
         cfg.prompt_via = PromptVia::Stdin;
-        cfg.idle_timeout_ms = Some(100);
+        cfg.idle_timeout_ms = Some(500);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(InFlight::default()));
 
         let started = std::time::Instant::now();
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -1910,7 +1995,7 @@ mod tests {
             } = event
             {
                 assert!(!success);
-                assert_eq!(summary, "idle timed out after 100ms");
+                assert_eq!(summary, "idle timed out after 500ms");
                 got_idle_timeout = true;
                 break;
             }

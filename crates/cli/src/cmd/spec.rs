@@ -52,7 +52,7 @@ pub fn agent_list() -> Result<()> {
                 serde_json::json!({
                     "actor_id": s.actor.id,
                     "display_name": s.actor.display_name,
-                    "transport": s.transport.command,
+                    "provider": s.provider_ref.as_ref().map(|provider| provider.id.as_str()),
                 })
             })
             .collect();
@@ -68,9 +68,14 @@ pub fn agent_list() -> Result<()> {
     }
     println!("DIR: {}", super::agent::default_specs_dir().display());
     for s in specs {
+        let provider = s
+            .provider_ref
+            .as_ref()
+            .map(|provider_ref| provider_ref.id.as_str())
+            .unwrap_or("-");
         println!(
-            "{}\t{}\ttransport={}",
-            s.actor.id, s.actor.display_name, s.transport.command,
+            "{}\t{}\tprovider={}",
+            s.actor.id, s.actor.display_name, provider,
         );
     }
     Ok(())

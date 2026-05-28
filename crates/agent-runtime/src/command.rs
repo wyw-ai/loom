@@ -481,7 +481,9 @@ fn run_prompt(
             if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
             }
-        } else if let Some(sid) = capture_configured_decoder_session_id(&cfg, &outcome) {
+        } else if let Some(sid) = capture_configured_decoder_session_event(&cfg, &outcome)
+            .and_then(ProviderRuntimeEvent::into_session_id)
+        {
             if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to save decoder-captured command session");
             }
@@ -766,14 +768,10 @@ fn spawn_and_collect(
         format!("exited with code {exit_code}")
     };
 
-    if let Some(content) =
-        extract_configured_decoder_final_text(cfg, &collected_stdout, &collected_stderr)
+    if let Some(event) =
+        configured_decoder_final_text_event(cfg, &collected_stdout, &collected_stderr)
     {
-        let _ = sender.send(AdapterEvent::Text {
-            scope: Some(prompt.scope.clone()),
-            content,
-            is_partial: false,
-        });
+        let _ = emit_provider_runtime_event(event, &prompt.scope, sender);
     } else {
         match cfg.output_format {
             CommandOutputFormat::Text => {
@@ -943,6 +941,97 @@ struct OutputLineEvents {
     emitted_finish: bool,
 }
 
+#[derive(Debug, Clone)]
+enum ProviderRuntimeEvent {
+    Text { content: String, is_partial: bool },
+    ToolUse { tool_name: String, input: Value },
+    Status { status: String },
+    Error { message: String },
+    Finished { success: bool, summary: String },
+    Session { session_id: String },
+}
+
+impl ProviderRuntimeEvent {
+    fn into_session_id(self) -> Option<String> {
+        match self {
+            ProviderRuntimeEvent::Session { session_id } => Some(session_id),
+            _ => None,
+        }
+    }
+}
+
+fn emit_provider_runtime_events(
+    events: impl IntoIterator<Item = ProviderRuntimeEvent>,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    let mut emitted = OutputLineEvents::default();
+    for event in events {
+        let next = emit_provider_runtime_event(event, scope, sender);
+        emitted.emitted_text |= next.emitted_text;
+        emitted.emitted_finish |= next.emitted_finish;
+    }
+    emitted
+}
+
+fn emit_provider_runtime_event(
+    event: ProviderRuntimeEvent,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    match event {
+        ProviderRuntimeEvent::Text {
+            content,
+            is_partial,
+        } => {
+            let _ = sender.send(AdapterEvent::Text {
+                scope: Some(scope.clone()),
+                content,
+                is_partial,
+            });
+            OutputLineEvents {
+                emitted_text: true,
+                emitted_finish: false,
+            }
+        }
+        ProviderRuntimeEvent::ToolUse { tool_name, input } => {
+            let _ = sender.send(AdapterEvent::ToolUse {
+                scope: Some(scope.clone()),
+                tool_name,
+                input,
+            });
+            OutputLineEvents::default()
+        }
+        ProviderRuntimeEvent::Status { status } => {
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(scope.clone()),
+                status,
+            });
+            OutputLineEvents::default()
+        }
+        ProviderRuntimeEvent::Error { message } => {
+            let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
+                message,
+            });
+            OutputLineEvents::default()
+        }
+        ProviderRuntimeEvent::Finished { success, summary } => {
+            let _ = sender.send(AdapterEvent::Finished {
+                scope: Some(scope.clone()),
+                success,
+                summary,
+                usage: None,
+            });
+            OutputLineEvents {
+                emitted_text: false,
+                emitted_finish: true,
+            }
+        }
+        ProviderRuntimeEvent::Session { .. } => OutputLineEvents::default(),
+    }
+}
+
 fn translate_decoder_event_line(
     decoder: Option<&ProviderDecoderSpec>,
     line: &str,
@@ -953,8 +1042,19 @@ fn translate_decoder_event_line(
     if decoder.events.is_empty() {
         return None;
     }
+    let events = decode_decoder_event_line(decoder, line)?;
+    Some(emit_provider_runtime_events(events, scope, sender))
+}
+
+fn decode_decoder_event_line(
+    decoder: &ProviderDecoderSpec,
+    line: &str,
+) -> Option<Vec<ProviderRuntimeEvent>> {
+    if decoder.events.is_empty() {
+        return None;
+    }
     let v: Value = serde_json::from_str(line).ok()?;
-    let mut events = OutputLineEvents::default();
+    let mut decoded = Vec::new();
     for event in &decoder.events {
         if !event
             .when
@@ -964,37 +1064,27 @@ fn translate_decoder_event_line(
         {
             continue;
         }
-        let emitted = emit_decoder_event(&event.emit, &v, scope, sender);
-        events.emitted_text |= emitted.emitted_text;
-        events.emitted_finish |= emitted.emitted_finish;
+        if let Some(event) = decode_decoder_emit(&event.emit, &v) {
+            decoded.push(event);
+        }
     }
-    Some(events)
+    Some(decoded)
 }
 
-fn emit_decoder_event(
+fn decode_decoder_emit(
     emit: &ProviderDecoderEmitSpec,
     root: &Value,
-    scope: &ScopeRef,
-    sender: &mpsc::UnboundedSender<AdapterEvent>,
-) -> OutputLineEvents {
+) -> Option<ProviderRuntimeEvent> {
     match emit.emit_type.as_str() {
         "text" => {
-            let Some(content) = emit
+            let content = emit
                 .text
                 .as_deref()
-                .and_then(|template| decoder_template_value(root, template))
-            else {
-                return OutputLineEvents::default();
-            };
-            let _ = sender.send(AdapterEvent::Text {
-                scope: Some(scope.clone()),
+                .and_then(|template| decoder_template_value(root, template))?;
+            Some(ProviderRuntimeEvent::Text {
                 content,
                 is_partial: emit.partial.unwrap_or(true),
-            });
-            OutputLineEvents {
-                emitted_text: true,
-                emitted_finish: false,
-            }
+            })
         }
         "tool_use" | "toolUse" | "tool" => {
             let tool_name = emit
@@ -1007,27 +1097,14 @@ fn emit_decoder_event(
                 .as_deref()
                 .and_then(|template| decoder_template_json_value(root, template))
                 .unwrap_or(Value::Null);
-            let _ = sender.send(AdapterEvent::ToolUse {
-                scope: Some(scope.clone()),
-                tool_name,
-                input,
-            });
-            OutputLineEvents::default()
+            Some(ProviderRuntimeEvent::ToolUse { tool_name, input })
         }
-        "status" => {
-            if let Some(status) = emit
-                .status
-                .as_deref()
-                .or(emit.text.as_deref())
-                .and_then(|template| decoder_template_value(root, template))
-            {
-                let _ = sender.send(AdapterEvent::StatusChange {
-                    scope: Some(scope.clone()),
-                    status,
-                });
-            }
-            OutputLineEvents::default()
-        }
+        "status" => emit
+            .status
+            .as_deref()
+            .or(emit.text.as_deref())
+            .and_then(|template| decoder_template_value(root, template))
+            .map(|status| ProviderRuntimeEvent::Status { status }),
         "error" => {
             let message = emit
                 .message
@@ -1035,11 +1112,7 @@ fn emit_decoder_event(
                 .or(emit.text.as_deref())
                 .and_then(|template| decoder_template_value(root, template))
                 .unwrap_or_else(|| "provider error frame".into());
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message,
-            });
-            OutputLineEvents::default()
+            Some(ProviderRuntimeEvent::Error { message })
         }
         "finish" | "finished" => {
             let summary = emit
@@ -1048,18 +1121,12 @@ fn emit_decoder_event(
                 .or(emit.message.as_deref())
                 .and_then(|template| decoder_template_value(root, template))
                 .unwrap_or_default();
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
+            Some(ProviderRuntimeEvent::Finished {
                 success: emit.success.unwrap_or(true),
                 summary,
-                usage: None,
-            });
-            OutputLineEvents {
-                emitted_text: false,
-                emitted_finish: true,
-            }
+            })
         }
-        _ => OutputLineEvents::default(),
+        _ => None,
     }
 }
 
@@ -1448,6 +1515,19 @@ fn extract_configured_decoder_final_text(
         .or_else(|| extract_decoder_final_text(cfg.stderr_decoder.as_ref(), stderr))
 }
 
+fn configured_decoder_final_text_event(
+    cfg: &CommandConfig,
+    stdout: &str,
+    stderr: &str,
+) -> Option<ProviderRuntimeEvent> {
+    extract_configured_decoder_final_text(cfg, stdout, stderr).map(|content| {
+        ProviderRuntimeEvent::Text {
+            content,
+            is_partial: false,
+        }
+    })
+}
+
 fn capture_decoder_session_id(
     decoder: Option<&ProviderDecoderSpec>,
     stdout: &str,
@@ -1466,6 +1546,14 @@ fn capture_configured_decoder_session_id(
 ) -> Option<String> {
     capture_decoder_session_id(cfg.decoder.as_ref(), &outcome.stdout)
         .or_else(|| capture_decoder_session_id(cfg.stderr_decoder.as_ref(), &outcome.stderr))
+}
+
+fn capture_configured_decoder_session_event(
+    cfg: &CommandConfig,
+    outcome: &SpawnOutcome,
+) -> Option<ProviderRuntimeEvent> {
+    capture_configured_decoder_session_id(cfg, outcome)
+        .map(|session_id| ProviderRuntimeEvent::Session { session_id })
 }
 
 fn reduce_text_with_fallback(
@@ -2581,6 +2669,49 @@ mod tests {
                 summary,
                 ..
             } if summary == "ok"
+        ));
+    }
+
+    #[test]
+    fn provider_decoder_line_decodes_runtime_event_before_adapter_mapping() {
+        let decoder = ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: vec![ProviderDecoderEventSpec {
+                when: Some(ProviderJsonConditionSpec {
+                    path: Some("$.type".into()),
+                    equals: Some(Value::String("text".into())),
+                    ..Default::default()
+                }),
+                emit: ProviderDecoderEmitSpec {
+                    emit_type: "text".into(),
+                    text: Some("$.text".into()),
+                    partial: Some(false),
+                    ..Default::default()
+                },
+            }],
+            reduce: None,
+            capture: None,
+        };
+
+        let events =
+            decode_decoder_event_line(&decoder, r#"{"type":"text","text":"runtime event"}"#)
+                .expect("runtime events");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::Text {
+                content,
+                is_partial: false,
+            } if content == "runtime event"
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitted = emit_provider_runtime_events(events, &scope(), &tx);
+        assert!(emitted.emitted_text);
+        assert!(matches!(
+            rx.try_recv().expect("adapter event"),
+            AdapterEvent::Text { content, is_partial: false, .. } if content == "runtime event"
         ));
     }
 

@@ -1879,6 +1879,27 @@ pub struct AgentTransport {
     pub provider: Option<InteractiveProviderSpec>,
 }
 
+impl Default for AgentTransport {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            auth_method: None,
+            model: None,
+            model_args: Vec::new(),
+            session: None,
+            output_format: None,
+            prompt_via: PromptVia::default(),
+            timeout_ms: None,
+            idle_timeout_ms: None,
+            interactive: None,
+            provider: None,
+        }
+    }
+}
+
 /// Bookkeeping rules for `transport.kind = "command"`. Both fields together let
 /// the adapter resume an existing session (`first_run_capture` extracts a
 /// session id from the very first invocation; `resume_args` is the argv
@@ -1886,6 +1907,10 @@ pub struct AgentTransport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSession {
+    /// How Loom obtains the session id before launching a command. `loom_uuid`
+    /// means Loom generates and stores a stable UUID for the actor/scope.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idSource")]
+    pub id_source: Option<CommandSessionIdSource>,
     /// DSL: `stdout_json:<jq-style-path>`, `stderr_regex:<re>`, `file:<path>`.
     /// `None` means this CLI does not expose a resumable session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1894,6 +1919,12 @@ pub struct CommandSession {
     /// `{prompt}`. `None` means resume is not supported (each call is a first run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSessionIdSource {
+    LoomUuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2217,6 +2248,15 @@ pub enum PromptVia {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
+    /// New provider-catalog based runtime selection. When present, the host
+    /// resolves this into an `AgentTransport` before starting the worker.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "providerRef"
+    )]
+    pub provider_ref: Option<AgentProviderRef>,
+    #[serde(default)]
     pub transport: AgentTransport,
     #[serde(default)]
     pub autostart: bool,
@@ -2266,6 +2306,18 @@ pub struct AgentSpec {
         rename = "promptTemplate"
     )]
     pub prompt_template: Option<PromptTemplateSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.
@@ -2368,6 +2420,7 @@ impl AgentProviderSpec {
                         capabilities: actor.capabilities,
                         _meta: actor.meta,
                     },
+                    provider_ref: None,
                     transport: actor.transport.unwrap_or_else(|| transport.clone()),
                     autostart: actor.autostart.unwrap_or(defaults.autostart),
                     models: actor_models,

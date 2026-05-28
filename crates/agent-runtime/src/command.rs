@@ -557,7 +557,7 @@ fn spawn_and_collect(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in expanded_env(cfg, prompt) {
+    for (k, v) in expanded_env(cfg, prompt, session_id) {
         cmd.env(k, v);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
@@ -2001,11 +2001,20 @@ fn append_model_args(
     );
 }
 
-fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String, String> {
+fn expanded_env(
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = cfg
         .env
         .iter()
-        .map(|(k, v)| (k.clone(), expand_template(v, cfg, request, None, "")))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                expand_template(v, cfg, request, session_id, &request.content),
+            )
+        })
         .collect();
     for (k, v) in &request.env {
         env.entry(k.clone()).or_insert_with(|| v.clone());
@@ -3002,7 +3011,7 @@ mod tests {
             .template_vars
             .insert("agent.workspace".into(), "/tmp/channel/workspace".into());
 
-        let env = expanded_env(&cfg, &request);
+        let env = expanded_env(&cfg, &request, None);
 
         assert_eq!(
             env.get("LOOM_SERVER").map(String::as_str),
@@ -3015,6 +3024,28 @@ mod tests {
         assert_eq!(
             env.get("AGENTX_CHANNEL_ID").map(String::as_str),
             Some("channel_1")
+        );
+    }
+
+    #[test]
+    fn expanded_env_expands_prompt_outputs_and_session_id() {
+        let mut cfg = cfg();
+        cfg.env.insert("SESSION_ID".into(), "{session.id}".into());
+        cfg.env.insert("LEGACY_PROMPT".into(), "{prompt}".into());
+        cfg.env.insert("USER_PROMPT".into(), "{prompt.user}".into());
+        let mut request = prompt("full prompt");
+        request.outputs.insert("user".into(), "user prompt".into());
+
+        let env = expanded_env(&cfg, &request, Some("sid_123"));
+
+        assert_eq!(env.get("SESSION_ID").map(String::as_str), Some("sid_123"));
+        assert_eq!(
+            env.get("LEGACY_PROMPT").map(String::as_str),
+            Some("full prompt")
+        );
+        assert_eq!(
+            env.get("USER_PROMPT").map(String::as_str),
+            Some("user prompt")
         );
     }
 

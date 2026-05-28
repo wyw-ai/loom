@@ -20,12 +20,13 @@ pub mod interactive;
 pub mod mcp_servers;
 pub mod memory;
 pub mod profile;
+pub mod provider;
 pub mod server_url;
 pub mod usage;
 
 pub use adapter::{
     ActionChoice, Adapter, AdapterEvent, AdapterModelChoice, AdapterModelOptions, AdapterPrompt,
-    AdapterStartInfo, TokenUsage,
+    AdapterStartInfo, PromptPart, PromptRoleHint, TokenUsage,
 };
 pub use agents_md::ensure_agents_md;
 pub use bundle::{

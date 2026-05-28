@@ -4,7 +4,7 @@
 //! config, auto-detects supported local agent CLIs, synthesizes runtime
 //! `AgentSpec`s in memory, and then runs the shared agent worker implementation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +13,8 @@ use agent_runtime::discovery::{
     AgentDefinition, AgentProviderOverride, DetectedAgentProvider,
 };
 use anyhow::{anyhow, Context, Result};
-use proto::methods::{method, AgentSpec};
+use proto::methods::{method, AgentModelSpec, AgentProviderRef, AgentSpec, AgentTransport};
+use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -67,11 +68,13 @@ pub async fn run(
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
     let mut inventory_revision = 1u64;
-    let mut inventory_fingerprint = machine_inventory_fingerprint(&machine, &data_root, &providers);
+    let mut inventory_fingerprint =
+        machine_inventory_fingerprint(&machine, &data_root, &providers, &[]);
     let machine_inventory = Arc::new(Mutex::new(machine_inventory_meta(
         &machine,
         &data_root,
         &providers,
+        &[],
         inventory_revision,
     )));
     let (machine_command_tx, mut machine_command_rx) = mpsc::unbounded_channel();
@@ -254,8 +257,12 @@ fn refresh_machine_runtime(
         server_url,
     )?;
     *selected_machine = snapshot.machine.clone();
-    let next_fingerprint =
-        machine_inventory_fingerprint(&snapshot.machine, data_root, &snapshot.providers);
+    let next_fingerprint = machine_inventory_fingerprint(
+        &snapshot.machine,
+        data_root,
+        &snapshot.providers,
+        &snapshot.specs,
+    );
     if next_fingerprint != *inventory_fingerprint {
         *inventory_revision = inventory_revision.saturating_add(1);
         *inventory_fingerprint = next_fingerprint;
@@ -264,6 +271,7 @@ fn refresh_machine_runtime(
         &snapshot.machine,
         data_root,
         &snapshot.providers,
+        &snapshot.specs,
         *inventory_revision,
     );
     reconcile_agents(running_agents, snapshot.specs, server_url, data_root);
@@ -312,8 +320,8 @@ fn load_machine_specs(
         .into_iter()
         .flat_map(|provider| provider.into_agent_specs())
         .collect::<Vec<_>>();
-    annotate_machine_agent_specs(&mut specs, &machine);
     specs.extend(load_config_agent_specs()?);
+    annotate_machine_agent_specs(&mut specs, &machine);
 
     if !allow_actors.is_empty() {
         let allow = allow_actors
@@ -336,6 +344,277 @@ fn load_config_agent_specs() -> Result<Vec<AgentSpec>> {
         return Ok(Vec::new());
     }
     agent_serve::load_specs(&dir).with_context(|| format!("load AgentSpecs from {}", dir.display()))
+}
+
+fn agent_specs_dir() -> PathBuf {
+    crate::config::config_dir().join("agents")
+}
+
+fn agent_spec_path(actor_id: &str) -> PathBuf {
+    agent_specs_dir().join(actor_id).join("spec.json")
+}
+
+fn flat_agent_spec_path(actor_id: &str) -> PathBuf {
+    agent_specs_dir().join(format!("{actor_id}.json"))
+}
+
+fn load_config_agent_spec(actor_id: &str) -> Result<Option<AgentSpec>> {
+    let nested = agent_spec_path(actor_id);
+    let flat = flat_agent_spec_path(actor_id);
+    let path = if nested.exists() {
+        nested
+    } else if flat.exists() {
+        flat
+    } else {
+        return Ok(None);
+    };
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let spec: AgentSpec =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(spec))
+}
+
+fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
+    let path = agent_spec_path(&spec.actor.id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create agent spec dir {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(spec)?;
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+fn remove_config_agent_spec(actor_id: &str) -> Result<bool> {
+    let mut removed = false;
+    let nested = agent_spec_path(actor_id);
+    if nested.exists() {
+        std::fs::remove_file(&nested).with_context(|| format!("remove {}", nested.display()))?;
+        removed = true;
+        if let Some(parent) = nested.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+    let flat = flat_agent_spec_path(actor_id);
+    if flat.exists() {
+        std::fs::remove_file(&flat).with_context(|| format!("remove {}", flat.display()))?;
+        removed = true;
+    }
+    Ok(removed)
+}
+
+fn agent_spec_from_command(
+    command: &Value,
+    machine_id: &str,
+    providers: &[DetectedAgentProvider],
+) -> Result<AgentSpec> {
+    let name = required_str(command, "name")?.trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("agent name is required"));
+    }
+    let provider_id = required_str(command, "providerId")?.to_string();
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| anyhow!("provider `{provider_id}` is not available on this machine"))?;
+    let actor_id = command
+        .get("actorId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("actor_agent_{}_{}", slugify(&name), machine_id));
+    let description = command
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let model = command
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let reasoning_effort = command
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let avatar_url = command
+        .get("avatarUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    let mut meta = BTreeMap::new();
+    meta.insert("providerId".into(), json!(provider.id.clone()));
+    meta.insert("providerName".into(), json!(provider.display_name.clone()));
+    meta.insert(
+        "transportKind".into(),
+        json!(provider.transport_kind.clone()),
+    );
+    meta.insert("createdBy".into(), json!("loom-daemon"));
+    if let Some(reasoning_effort) = reasoning_effort.as_ref() {
+        meta.insert("reasoningEffort".into(), json!(reasoning_effort));
+    }
+    if let Some(description) = description.as_ref() {
+        meta.insert("description".into(), json!(description));
+    }
+    if let Some(avatar_url) = avatar_url.as_ref() {
+        meta.insert("avatarUrl".into(), json!(avatar_url));
+    }
+
+    Ok(AgentSpec {
+        actor: Actor {
+            id: actor_id,
+            kind: ActorKind::Agent,
+            display_name: name,
+            capabilities: None,
+            _meta: Some(meta),
+        },
+        provider_ref: Some(AgentProviderRef {
+            id: provider.id.clone(),
+            mode: Some("print".into()),
+            model: model.clone(),
+            reasoning_effort,
+        }),
+        transport: AgentTransport::default(),
+        autostart: command
+            .get("autostart")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        models: Some(AgentModelSpec {
+            default: model.or_else(|| provider.default_model.clone()),
+            choices: provider.model_choices.clone(),
+        }),
+        bundle: None,
+        identity: None,
+        memory: None,
+        announcement: None,
+        trigger: None,
+        prompt_template: None,
+    })
+}
+
+fn update_agent_spec_from_command(
+    mut spec: AgentSpec,
+    command: &Value,
+    providers: &[DetectedAgentProvider],
+) -> Result<AgentSpec> {
+    let mut selected_provider = spec.provider_ref.as_ref().and_then(|provider_ref| {
+        providers
+            .iter()
+            .find(|provider| provider.id == provider_ref.id)
+    });
+    if let Some(provider_id) =
+        optional_trimmed_str(command, "providerId").filter(|value| !value.is_empty())
+    {
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| anyhow!("provider `{provider_id}` is not available on this machine"))?;
+        let provider_ref = spec
+            .provider_ref
+            .get_or_insert_with(AgentProviderRef::default);
+        provider_ref.id = provider.id.clone();
+        provider_ref.mode.get_or_insert_with(|| "print".into());
+        selected_provider = Some(provider);
+    }
+    if let Some(display_name) =
+        optional_trimmed_str(command, "displayName").filter(|value| !value.is_empty())
+    {
+        spec.actor.display_name = display_name;
+    }
+    if let Some(description) = optional_trimmed_str(command, "description") {
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        if description.trim().is_empty() {
+            meta.remove("description");
+        } else {
+            meta.insert("description".into(), json!(description));
+        }
+    }
+    if let Some(model) = optional_trimmed_str(command, "model") {
+        let model = if model.trim().is_empty() {
+            None
+        } else {
+            Some(model)
+        };
+        let provider_ref = spec
+            .provider_ref
+            .get_or_insert_with(AgentProviderRef::default);
+        provider_ref.model = model.clone();
+        if let Some(models) = spec.models.as_mut() {
+            models.default =
+                model.or_else(|| selected_provider.and_then(|p| p.default_model.clone()));
+        }
+    }
+    if let Some(reasoning_effort) = optional_trimmed_str(command, "reasoningEffort") {
+        let reasoning_effort = if reasoning_effort.trim().is_empty() {
+            None
+        } else {
+            Some(reasoning_effort)
+        };
+        let provider_ref = spec
+            .provider_ref
+            .get_or_insert_with(AgentProviderRef::default);
+        provider_ref.reasoning_effort = reasoning_effort.clone();
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        if let Some(reasoning_effort) = reasoning_effort {
+            meta.insert("reasoningEffort".into(), json!(reasoning_effort));
+        } else {
+            meta.remove("reasoningEffort");
+        }
+    }
+    if let Some(value) = command.get("autostart").and_then(Value::as_bool) {
+        spec.autostart = value;
+    }
+    if let Some(avatar_url) = optional_trimmed_str(command, "avatarUrl") {
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        if avatar_url.trim().is_empty() {
+            meta.remove("avatarUrl");
+        } else {
+            meta.insert("avatarUrl".into(), json!(avatar_url));
+        }
+    }
+    if let Some(provider) = selected_provider {
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        meta.insert("providerId".into(), json!(provider.id.clone()));
+        meta.insert("providerName".into(), json!(provider.display_name.clone()));
+        meta.insert(
+            "transportKind".into(),
+            json!(provider.transport_kind.clone()),
+        );
+        spec.models = Some(AgentModelSpec {
+            default: spec
+                .provider_ref
+                .as_ref()
+                .and_then(|provider_ref| provider_ref.model.clone())
+                .or_else(|| provider.default_model.clone()),
+            choices: provider.model_choices.clone(),
+        });
+    }
+    Ok(spec)
+}
+
+fn agent_spec_from_machine_agent_config(
+    agent: &MachineAgentConfig,
+    providers: &[DetectedAgentProvider],
+) -> Result<AgentSpec> {
+    let definition = machine_agent_definition(agent);
+    provider_specs_from_agent_definitions(providers, &[definition])
+        .into_iter()
+        .flat_map(|provider| provider.into_agent_specs())
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "provider `{}` is not available on this machine",
+                agent.provider_id
+            )
+        })
 }
 
 fn reconcile_agents(
@@ -524,99 +803,74 @@ fn apply_machine_command(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("machine command op is required"))?;
     let mut cfg = load_desktop_config_or_default_if_missing()?;
-    let (machine_index, _) =
+    let (machine_index, config_changed) =
         ensure_selected_machine_config(&mut cfg, selected_machine_id, selected_machine)?;
+    if config_changed {
+        save_desktop_config(&cfg)?;
+        *selected_machine = cfg.machines[machine_index].clone();
+    }
 
     match op {
         "agent.create" => {
-            let agent = agent_config_from_command(command, selected_machine_id)?;
-            if cfg.machines[machine_index]
-                .agents
-                .iter()
-                .any(|existing| existing.actor_id == agent.actor_id)
-            {
-                return Err(anyhow!("agent actor already exists: {}", agent.actor_id));
-            }
             let providers = apply_provider_overrides(
                 detect_agent_cli_providers(),
                 &cfg.machines[machine_index].providers,
             );
-            if !providers
+            let spec = agent_spec_from_command(command, selected_machine_id, &providers)?;
+            if cfg.machines[machine_index]
+                .agents
                 .iter()
-                .any(|provider| provider.id == agent.provider_id)
+                .any(|existing| existing.actor_id == spec.actor.id)
+                || load_config_agent_spec(&spec.actor.id)?.is_some()
             {
-                return Err(anyhow!(
-                    "provider `{}` is not available on the remote machine",
-                    agent.provider_id
-                ));
+                return Err(anyhow!("agent actor already exists: {}", spec.actor.id));
             }
-            cfg.machines[machine_index].agents.push(agent.clone());
-            save_desktop_config(&cfg)?;
-            *selected_machine = cfg.machines[machine_index].clone();
-            Ok(json!({ "agent": agent }))
+            let path = write_config_agent_spec(&spec)?;
+            Ok(json!({ "agentSpec": spec, "path": path.display().to_string() }))
         }
         "agent.remove" => {
             let actor_id = required_str(command, "actorId")?;
             let machine = &mut cfg.machines[machine_index];
             let before = machine.agents.len();
             machine.agents.retain(|agent| agent.actor_id != actor_id);
-            if machine.agents.len() == before {
+            let removed_spec = remove_config_agent_spec(actor_id)?;
+            if machine.agents.len() == before && !removed_spec {
                 return Err(anyhow!("daemon-configured agent not found: {actor_id}"));
             }
-            save_desktop_config(&cfg)?;
+            if machine.agents.len() != before {
+                save_desktop_config(&cfg)?;
+            }
             *selected_machine = cfg.machines[machine_index].clone();
             Ok(json!({ "actorId": actor_id }))
         }
         "agent.update" => {
             let actor_id = required_str(command, "actorId")?;
+            let providers = apply_provider_overrides(
+                detect_agent_cli_providers(),
+                &cfg.machines[machine_index].providers,
+            );
+            if let Some(spec) = load_config_agent_spec(actor_id)? {
+                let spec = update_agent_spec_from_command(spec, command, &providers)?;
+                let path = write_config_agent_spec(&spec)?;
+                return Ok(json!({ "agentSpec": spec, "path": path.display().to_string() }));
+            }
             let agent_index = cfg.machines[machine_index]
                 .agents
                 .iter()
                 .position(|agent| agent.actor_id == actor_id)
                 .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
-            let provider_id = optional_trimmed_str(command, "providerId");
-            if let Some(value) = provider_id.as_deref().filter(|value| !value.is_empty()) {
-                let providers = apply_provider_overrides(
-                    detect_agent_cli_providers(),
-                    &cfg.machines[machine_index].providers,
-                );
-                if !providers.iter().any(|provider| provider.id == value) {
-                    return Err(anyhow!(
-                        "provider `{}` is not available on the remote machine",
-                        value
-                    ));
-                }
-            }
-            let agent = &mut cfg.machines[machine_index].agents[agent_index];
-            if let Some(value) = optional_trimmed_str(command, "displayName") {
-                if !value.is_empty() {
-                    agent.name = value;
-                }
-            }
-            if let Some(value) = optional_trimmed_str(command, "description") {
-                agent.description = value;
-            }
-            if let Some(value) = provider_id {
-                if !value.is_empty() {
-                    agent.provider_id = value;
-                }
-            }
-            if let Some(value) = optional_trimmed_str(command, "model") {
-                agent.model = value;
-            }
-            if let Some(value) = optional_trimmed_str(command, "reasoningEffort") {
-                agent.reasoning_effort = value;
-            }
-            if let Some(value) = command.get("autostart").and_then(Value::as_bool) {
-                agent.autostart = value;
-            }
-            if let Some(value) = optional_trimmed_str(command, "avatarUrl") {
-                agent.avatar_url = value;
-            }
-            let updated = agent.clone();
+            let legacy = cfg.machines[machine_index].agents[agent_index].clone();
+            let spec = agent_spec_from_machine_agent_config(&legacy, &providers)?;
+            let spec = update_agent_spec_from_command(spec, command, &providers)?;
+            let path = write_config_agent_spec(&spec)?;
+            cfg.machines[machine_index].agents.remove(agent_index);
             save_desktop_config(&cfg)?;
             *selected_machine = cfg.machines[machine_index].clone();
-            Ok(json!({ "agent": updated }))
+            Ok(json!({
+                "agentSpec": spec,
+                "path": path.display().to_string(),
+                "migratedFrom": "machine.agents"
+            }))
         }
         "agent.profile.read" => {
             let actor_id = required_str(command, "actorId")?;
@@ -704,53 +958,6 @@ fn ensure_selected_machine_config(
     Ok((cfg.machines.len() - 1, true))
 }
 
-fn agent_config_from_command(command: &Value, machine_id: &str) -> Result<MachineAgentConfig> {
-    let name = required_str(command, "name")?.trim().to_string();
-    if name.is_empty() {
-        return Err(anyhow!("agent name is required"));
-    }
-    let actor_id = command
-        .get("actorId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("actor_agent_{}_{}", slugify(&name), machine_id));
-    Ok(MachineAgentConfig {
-        provider_id: required_str(command, "providerId")?.to_string(),
-        actor_id,
-        name,
-        description: command
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        model: command
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        reasoning_effort: command
-            .get("reasoningEffort")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        autostart: command
-            .get("autostart")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        avatar_url: command
-            .get("avatarUrl")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-    })
-}
-
 fn resolve_machine_agent_profile_file(
     machine: &MachineConfig,
     data_root: &PathBuf,
@@ -761,6 +968,7 @@ fn resolve_machine_agent_profile_file(
         .agents
         .iter()
         .any(|agent| agent.actor_id == actor_id)
+        && load_config_agent_spec(actor_id)?.is_none()
     {
         return Err(anyhow!("unknown agent actor id: {actor_id}"));
     }
@@ -957,6 +1165,7 @@ fn machine_inventory_meta(
     machine: &MachineConfig,
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
+    specs: &[AgentSpec],
     revision: u64,
 ) -> serde_json::Value {
     json!({
@@ -983,6 +1192,7 @@ fn machine_inventory_meta(
         ],
         "providers": providers,
         "agents": &machine.agents,
+        "agentSpecs": specs,
     })
 }
 
@@ -990,6 +1200,7 @@ fn machine_inventory_fingerprint(
     machine: &MachineConfig,
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
+    specs: &[AgentSpec],
 ) -> String {
     serde_json::to_string(&json!({
         "machineId": &machine.id,
@@ -1001,6 +1212,7 @@ fn machine_inventory_fingerprint(
         "configDir": config::config_dir().display().to_string(),
         "providers": providers,
         "agents": &machine.agents,
+        "agentSpecs": specs,
     }))
     .unwrap_or_default()
 }
@@ -1756,6 +1968,7 @@ mod tests {
             transport_kind: "command".into(),
             args: vec!["exec".into()],
             transport_env: Default::default(),
+            transport: proto::methods::AgentTransport::default(),
             default_model: Some("gpt-5.5".into()),
             model_choices: Vec::new(),
         };
@@ -1782,6 +1995,90 @@ mod tests {
         assert_eq!(meta["workspaceId"], json!("ws_main"));
         assert_eq!(meta["ownerActorId"], json!("actor_human_88084"));
         assert_eq!(meta["providerId"], json!("codex"));
+    }
+
+    #[test]
+    fn agent_spec_from_command_uses_provider_ref_without_serialized_transport() {
+        let provider = DetectedAgentProvider {
+            id: "claude".into(),
+            display_name: "Claude Code".into(),
+            command: "claude".into(),
+            transport_kind: "command".into(),
+            args: Vec::new(),
+            transport_env: Default::default(),
+            transport: AgentTransport::default(),
+            default_model: Some("sonnet".into()),
+            model_choices: Vec::new(),
+        };
+        let spec = agent_spec_from_command(
+            &json!({
+                "providerId": "claude",
+                "actorId": "actor_agent_writer",
+                "name": "Writer",
+                "description": "Writes concise updates",
+                "model": "opus",
+                "reasoningEffort": "high",
+                "autostart": true
+            }),
+            "machine_test",
+            &[provider],
+        )
+        .expect("spec");
+
+        assert_eq!(
+            spec.provider_ref
+                .as_ref()
+                .map(|provider| provider.id.as_str()),
+            Some("claude")
+        );
+        assert_eq!(
+            spec.provider_ref
+                .as_ref()
+                .and_then(|provider| provider.model.as_deref()),
+            Some("opus")
+        );
+        assert!(spec.transport.is_empty());
+        let value = serde_json::to_value(&spec).expect("json");
+        assert!(value.get("providerRef").is_some());
+        assert!(value.get("transport").is_none());
+    }
+
+    #[test]
+    fn legacy_machine_agent_converts_to_agent_spec() {
+        let provider = DetectedAgentProvider {
+            id: "codex".into(),
+            display_name: "Codex CLI".into(),
+            command: "codex".into(),
+            transport_kind: "command".into(),
+            args: Vec::new(),
+            transport_env: Default::default(),
+            transport: AgentTransport::default(),
+            default_model: Some("gpt-5.5".into()),
+            model_choices: Vec::new(),
+        };
+        let mut legacy = agent("actor_agent_legacy");
+        legacy.name = "Legacy".into();
+        legacy.description = "Migrated on edit".into();
+        legacy.model = "gpt-5.5".into();
+
+        let spec = agent_spec_from_machine_agent_config(&legacy, &[provider]).expect("agent spec");
+
+        assert_eq!(spec.actor.id, "actor_agent_legacy");
+        assert_eq!(spec.actor.display_name, "Legacy");
+        assert_eq!(
+            spec.provider_ref
+                .as_ref()
+                .map(|provider| provider.id.as_str()),
+            Some("codex")
+        );
+        assert!(spec.transport.is_empty());
+        assert_eq!(
+            spec.actor
+                ._meta
+                .as_ref()
+                .and_then(|meta| meta.get("description")),
+            Some(&json!("Migrated on edit"))
+        );
     }
 
     #[test]

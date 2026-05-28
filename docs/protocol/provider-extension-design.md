@@ -12,10 +12,11 @@ Provider manifest 时忽略 Loom 原有能力。
 | 原有功能/边界 | 影响 | 设计结论 |
 | --- | --- | --- |
 | agent 启动与 provider discovery | 从 `provider id -> Rust hardcode` 改成 `ProviderManifest -> ProviderRuntimePlan` | 行为应由内置 manifest 复刻，启动入口不再按 provider id 分支。 |
-| AgentSpec | 不再保存完整 `transport` | AgentSpec 只保存 actor 身份、identity/memory/bundle、trigger/promptTemplate、providerRef 和选中的 model。 |
-| `desktop.toml` / machine config | 不再作为 agent/provider 配置源 | 只保存 workspace、server、machine、dataRoot 等宿主信息。agent 配置写入 `{loom.configDir}/agents/<actor_id>/spec.json`。 |
-| machine-level provider override | 被移除 | 用本地 ProviderManifest variant + `extends` 表达，不再在 machine config 里覆盖 command/args/env。 |
-| prompt 拼装 | 从单一 envelope 改成结构化 prompt parts | Loom 仍负责生成 identity、soul、memory、Loom 规则、latest message、handoff/task context；Provider 只决定这些 parts 怎么映射到 system/user/full。 |
+| AgentSpec | 不再保存完整 `transport` | AgentSpec 只保存 actor id/displayName、metadata、trigger/promptTemplate、providerRef 和选中的 model。 |
+| daemon machine 配置 | 仍是“agent 跑在哪”的宿主事实源 | daemon 拥有本机 provider registry、AgentSpec、profile 与运行状态；GUI/server 不直接写 daemon 私有配置。 |
+| GUI 本地 machine/agent 配置 | 从事实源降级为本地视图缓存 | GUI 通过 server 读取 daemon inventory，通过 machine command 请求 daemon 创建/更新/删除 agent。 |
+| machine-level provider override | 收敛为 daemon-local ProviderManifest variant | 如果某台 host 需要特殊 command/args/env，用该 daemon 的 `{loom.configDir}/providers/<id>.json` + `extends` 表达。 |
+| prompt 拼装 | 从单一 envelope 改成结构化 prompt parts | Loom 仍负责生成 actor context、Loom 规则、current state、message/task context；Provider 只决定这些 parts 怎么映射到 system/user/full。 |
 | handoff/task 触发语义 | 不改变 | `trigger_prefix`、`promptTemplate`、latest message、assignment context 仍由 Loom composer 产生；manifest 不能自己改写业务语义。 |
 | run trace 与 GUI 可见消息 | 不改变 | Provider stdout 仍进 run trace；GUI 可见消息仍来自 agent 显式 `loom message send`，或部署显式开启的 auto-publish。 |
 | AdapterEvent 边界 | 不改变 | `Text/ToolUse/Status/Finished/Error/ActionRequest` 仍是 adapter 到 Loom runtime 的公共事件；Provider session 捕获是 Provider runtime 内部事件，不扩展 GUI message 语义。 |
@@ -23,10 +24,11 @@ Provider manifest 时忽略 Loom 原有能力。
 | model/reasoning 选择 | 配置归属会改变 | ProviderManifest 提供 provider 级模型菜单和 argv/env 映射；AgentSpec 只记录具体 agent 选中的 model/reasoningEffort。 |
 | ServiceSpec / service 插件 | 不受影响 | service 进程仍由 ServiceSpec 管理，不进入 ProviderManifest 体系。 |
 
-因此这个方案会打破旧配置面的长期生效方式，但不改变 Loom 的核心运行模型：
+因此这个方案会打破“GUI 自己维护 agent/provider 定义”的旧路径，但不改变 Loom 的核心运行模型：
 actor/scope/message/run trace、显式 `loom message send`、AdapterEvent 翻译层、
-ServiceSpec 都应保持原语义。已有配置通过一次性导入工具转换；新 runtime 不维护新旧
-配置双读或覆盖优先级。
+ServiceSpec 都应保持原语义。已有配置通过 daemon 侧一次性导入工具转换；导入完成后，
+同一台 host 上 daemon 只保留一个 agent/provider 事实源，GUI 不再绕过 daemon 读写这些
+定义。
 
 ## 问题
 
@@ -53,9 +55,9 @@ system prompt、哪些进入 user prompt、是否插入分隔符、顺序如何�
 
 ## Loom 顶层边界
 
-Loom 仍然拥有 prompt 内容生成逻辑。ProviderManifest 不负责自己生成 identity、
+Loom 仍然拥有 prompt 内容生成逻辑。ProviderManifest 不负责自己生成 actor metadata、
 memory、handoff 或 assignment 内容。daemon 会先生成一组结构化 prompt parts，
-例如 actor identity、profile identity/soul、Loom 规则、当前时间、最近消息、
+例如 actor context、Loom 规则、当前时间、最近消息、
 最新 handoff/task message 等。Provider 负责决定这些 parts 的顺序、拼接方式，
 以及它们映射到 Provider 的 system/user prompt、argv、stdin 或 env 中哪个位置。
 
@@ -136,9 +138,9 @@ Loom runtime / actor policy，不属于 ProviderManifest。
 `args`/`env`/`stdin` 模板显式决定。也就是说，`--model {model}` 不应该藏在
 另一个隐式分支里。
 
-本地 Provider 可以通过 `extends` 继承内置 Provider，再用同一套 patch 语义覆盖
-mode。这样 `MachineConfig.providers[]` 这种 command/args/env 局部覆盖不需要继续
-作为独立配置面存在。
+daemon-local Provider 可以通过 `extends` 继承内置 Provider，再用同一套 patch 语义覆盖
+mode。这样旧 `MachineConfig.providers[]` 这种 command/args/env 局部覆盖不需要继续
+作为 GUI/server 可见的独立配置面存在。
 没有 `extends` 时，`modes.<name>` 是完整 Provider mode；存在 `extends` 时，
 `modes.<name>` 可以是 `ModePatch`，只覆盖被声明的字段。
 
@@ -160,8 +162,8 @@ mode。这样 `MachineConfig.providers[]` 这种 command/args/env 局部覆盖�
   对应当前 `interactive_command` transport。
 - `acp`：长生命周期 ACP stdio 进程。prompt 通过 `session/prompt` 发送，不走 argv。
 
-mode 选择应该由 AgentSpec 或 Provider 默认值显式决定。GUI 创建的 agent 默认使用
-`print`，除非 Provider 声明了更好的默认 mode。
+mode 选择应该由 AgentSpec 或 Provider 默认值显式决定。GUI 请求创建 agent 时默认提交
+`print`，除非目标 daemon 的 Provider inventory 声明了更好的默认 mode。
 
 ## Prompt Parts 与拼接策略
 
@@ -169,9 +171,7 @@ Loom prompt composer 应输出结构化 parts，而不是只输出一个字符�
 
 ```text
 trigger_prefix      AgentSpec triggerPromptPrefix
-actor_context       Loom 注入的 actor id/display identity
-identity            profile identity.md
-soul                profile soul.md
+actor_context       Loom 注入的 actor id/displayName 和当前 actor 上下文
 bootstrap_memory    长期/启动 memory
 scope_bootstrap     Loom CLI、协作规则、当前 scope 等首轮规则
 turn_memory         本 turn 选中的 memory
@@ -181,6 +181,11 @@ assignment_context  task assignment 的权威 JSON 上下文；非 task 场景�
 turn_input          prompt_template 包装后的 latest_message + assignment_context
 user_message        turn 侧输入，等价于 trigger_prefix + turn_input
 ```
+
+新模型不把历史 `identity.md` / `soul.md` 当作 agent 的标准字段或 Provider 必需输入；
+agent 的描述、展示名、头像等信息属于 `actor._meta`。如果旧 spec 仍携带
+`identity`/`soul`，只能作为遗留 profile 读取路径处理，不能进入新 ProviderManifest 的
+默认设计。
 
 每个 part 至少包含：
 
@@ -224,9 +229,9 @@ Provider manifest 可以把这些 parts 组合成任意命名 prompt 输出。�
 建议内置 preset：
 
 ```text
-loom_system  actor_context + identity + soul + bootstrap_memory
-             + scope_bootstrap + turn_memory + runtime_context
-loom_turn    user_message，承载 trigger_prefix 和 prompt_template 行为
+loom_system  actor_context + bootstrap_memory + scope_bootstrap
+loom_turn    turn_memory + runtime_context + user_message，承载每轮动态上下文、
+             trigger_prefix 和 prompt_template 行为
 loom_full    loom_system + loom_turn，等价于当前单字符串 envelope 的语义
 ```
 
@@ -244,7 +249,7 @@ manifest 显式引用了不存在的 `{prompt.<name>}`，校验就应该失败�
   "prompt": {
     "outputs": {
       "claude_system": {
-        "template": "{actor_context}\n\n{identity}\n\n{soul}\n\n{scope_bootstrap}"
+        "template": "{actor_context}\n\n{scope_bootstrap}"
       },
       "claude_user": {
         "join": "\n\n",
@@ -271,9 +276,9 @@ manifest 显式引用了不存在的 `{prompt.<name>}`，校验就应该失败�
   只有在 Provider 明确要接管 turn 文本包装时，才直接引用 `latest_message`、
   `assignment_context`、`turn_input` 或 `trigger_prefix`。
 
-这样 Claude 这种支持 system prompt 的 Provider 可以把稳定规则放到 system，
-把最新 handoff/task message 放到 user；而只支持一个 prompt 字符串的 Provider
-可以直接使用 `{prompt.full}`。
+这样 Claude 这种支持 system prompt 的 Provider 可以把较稳定的 actor context 和 Loom
+规则放到 system，把每轮 current state、message list、最新 handoff/task message
+放到 user；而只支持一个 prompt 字符串的 Provider 可以直接使用 `{prompt.full}`。
 
 ## 模板变量
 
@@ -722,7 +727,8 @@ Codex 或 Qoder。
 
 ## AgentSpec 方向
 
-AgentSpec 不复制 transport。GUI 创建的 agent 只引用 Provider 和 mode：
+AgentSpec 不复制 transport。GUI 请求创建 agent 时只提交 actor metadata、providerRef、
+model 等声明；真正写入由目标 daemon 完成：
 
 ```json
 {
@@ -735,23 +741,21 @@ AgentSpec 不复制 transport。GUI 创建的 agent 只引用 Provider 和 mode�
     "mode": "print",
     "model": "sonnet"
   },
-  "identity": {
-    "files": {
-      "identity": "identity.md",
-      "soul": "soul.md"
-    }
-  }
+  "autostart": true
 }
 ```
 
 daemon 在启动时把 `providerRef` resolve 成具体 runtime plan。手写高级配置也不在
-AgentSpec 里复制 command/args/parser；如果需要改 Provider 行为，应创建一个本地
-Provider variant，然后让 AgentSpec 引用新的 provider id。
+AgentSpec 里复制 command/args/parser；如果需要改 Provider 行为，应在目标 daemon
+的 provider registry 里创建一个本地 Provider variant，然后让 AgentSpec 引用新的
+provider id。
 
 ## 与 AgentSpec / `spec.json` 的边界
 
-Agent 自己的 `spec.json` 位于 `<agents>/<actor_id>/spec.json`。这个文件描述的是一个具体 agent actor；
-Provider manifest 描述的是一类 CLI/runtime 如何接入 Loom。两者不能继续混在一起。
+Agent 自己的 `spec.json` 位于 daemon 管辖的 `<agents>/<actor_id>/spec.json`。这个文件
+描述的是一个具体 agent actor；Provider manifest 描述的是一类 CLI/runtime 如何接入
+Loom。两者不能继续混在一起。GUI 和 server 可以缓存、展示或转发这份信息，但不能把
+自己维护的副本当作运行事实源。
 
 职责边界：
 
@@ -762,9 +766,9 @@ ProviderManifest
   prompt parts 映射、stdout/stderr parser、session 策略、provider 级模型菜单。
 
 AgentSpec / spec.json
-  描述“这个 agent 是谁、带什么个性和状态”
-  例如 actor id/displayName、autostart、identity/soul、memory、bundle、announcement、
-  trigger、promptTemplate、actor 选中的 model/reasoningEffort，以及 providerRef。
+  描述“这个 agent actor 是谁、如何被触发、选哪个 provider”
+  例如 actor id/displayName、metadata、autostart、trigger、promptTemplate、
+  actor 选中的 model/reasoningEffort，以及 providerRef。
 ```
 
 容易重复的字段和归属建议：
@@ -778,7 +782,7 @@ AgentSpec / spec.json
 | selected model / reasoning effort | AgentSpec 或运行时选择 | 这是具体 agent 的偏好，Provider 只定义如何映射到 argv/env。 |
 | prompt parts 如何进 system/user/full | ProviderManifest | 这是 Provider 接入形态。 |
 | promptTemplate / trigger_prefix | AgentSpec | 这是具体 agent 的触发语义和任务包装。 |
-| identity / soul / memory / bundle | AgentSpec | 这是 actor 的人格、记忆和附带资源。 |
+| metadata / description | AgentSpec | 这是 actor 的 UI 与调度元信息，不参与 Provider 启动规则。 |
 | autostart / avatar / displayName | AgentSpec | 这是 actor 生命周期和 UI 信息。 |
 
 因此新设计下，`spec.json` 的推荐形态是引用 provider，而不是复制 transport：
@@ -788,7 +792,10 @@ AgentSpec / spec.json
   "actor": {
     "id": "actor_agent_reviewer",
     "kind": "agent",
-    "displayName": "Reviewer"
+    "displayName": "Reviewer",
+    "_meta": {
+      "description": "Reviews code changes"
+    }
   },
   "providerRef": {
     "id": "claude",
@@ -797,12 +804,6 @@ AgentSpec / spec.json
     "reasoningEffort": "high"
   },
   "autostart": true,
-  "identity": {
-    "files": {
-      "identity": "identity.md",
-      "soul": "soul.md"
-    }
-  },
   "memory": {
     "delivery": {
       "prompt": true
@@ -817,7 +818,25 @@ variant。这样“运行适配规则”始终只存在于 ProviderManifest。
 
 ## 统一最终配置模型
 
-最终应收敛成三类事实源：
+最终应收敛成清晰的 ownership，而不是让 GUI、server、daemon 各自维护一份 agent 定义。
+
+三层职责：
+
+```text
+GUI
+  人在哪。只读 server 上的 daemon inventory；创建/更新/删除 agent 时发
+  machine command，不直接读写 daemon 的 agent/provider/profile 文件。
+
+server
+  沟通数据存在哪。保存 message/task/run trace、daemon 连接状态、daemon 发布的
+  inventory 快照，以及 machine command 队列/结果；不解释 provider，不生成 AgentSpec。
+
+daemon
+  agent 跑在哪。拥有目标 host 的 provider registry、AgentSpec、profile、session/runtime
+  state，并负责启动、停止、解析 Provider。
+```
+
+daemon 内部应收敛成三类事实源：
 
 ```text
 {loom.configDir}/providers/<provider_id>.json
@@ -841,8 +860,11 @@ built-in ProviderManifest
 ```
 
 `desktop.toml` / machine config 只保存 workspace、server、machine、dataRoot 等宿主
-信息。GUI 创建或编辑 agent 时，写 `agents/<actor_id>/spec.json`，不在
-`desktop.toml` 里维护 `machines[].agents[]`。
+信息，以及 daemon 选择本机 profile 所需的最小宿主配置。GUI 创建或编辑 agent 时不写
+本地文件；它向 server 发 machine command，server 转发给目标 daemon，由 daemon 写入
+自己的 `agents/<actor_id>/spec.json` 并刷新 inventory。即使目标是本机 daemon，也应走
+同一条 command/IPC 路径；daemon offline 时 GUI 只能显示 offline/不可编辑，不能自己
+落盘。
 
 统一后的职责：
 
@@ -850,9 +872,9 @@ built-in ProviderManifest
 | --- | --- | --- |
 | `AgentProviderSpec.provider + transport + actors[]` | provider 接入规则和多个 actor 混在一起 | 拆成 ProviderManifest + 多个 AgentSpec |
 | `AgentSpec.transport` | 每个 agent 复制 command/args/parser/session | 删除；改为 `providerRef` 指向 ProviderManifest |
-| `MachineConfig.providers[]` / `AgentProviderOverride` | 在 machine config 里局部覆盖 provider command/args/env | 改为本地 ProviderManifest，必要时用 `extends` 或 custom provider id |
-| `MachineConfig.agents[]` / `MachineAgentConfig` | GUI agent 信息和 AgentSpec 重复 | GUI 直接读写 AgentSpec，machine config 只保留宿主信息 |
-| `AgentDefinition` | MachineAgentConfig 到 AgentSpec 的中间展开结构 | 删除；GUI/CLI 直接读写 AgentSpec |
+| `MachineConfig.providers[]` / `AgentProviderOverride` | GUI/server 可能把 provider override 当成跨端事实源 | 改为 daemon-local ProviderManifest，必要时用 `extends` 或 custom provider id |
+| `MachineConfig.agents[]` / `MachineAgentConfig` | GUI agent 信息和 daemon AgentSpec 重复 | 由 daemon 迁移成 AgentSpec；GUI 只看 daemon inventory |
+| `AgentDefinition` | MachineAgentConfig 到 AgentSpec 的中间展开结构 | 删除；daemon command 直接生成/更新 AgentSpec |
 | runtime session id | 容易被误写入 spec | 写入 runtime state，由 session 策略生成或从输出捕获 |
 
 ### 高级手写配置
@@ -991,20 +1013,24 @@ loom provider doctor <provider_id>
 如果 manifest 提供 sample output，doctor 应直接跑 parser；如果没有 sample，可以
 只做静态检查和可执行文件检测，避免误触发真实模型调用。
 
-命令写入范围应遵守当前 `{loom.configDir}`。这意味着 GUI 对接多个 server/machine
-时，不同 config dir 下的 local Provider 互不污染；`loom provider list` 默认只看
-当前进程解析出的 `{loom.configDir}`。
+命令写入范围应遵守目标 daemon 的 `{loom.configDir}`。GUI 对接多个 server/machine 时，
+应通过目标 daemon 的 provider inventory 或 provider 管理 command 操作对应 config dir；
+不同 daemon 的 local Provider 互不污染。`loom provider list` 在 daemon/CLI 本机执行时
+只看当前进程解析出的 `{loom.configDir}`。
 
 ## Loom 顶层影响
 
 这个设计会改变 Loom 顶层配置边界，属于有意的架构收敛：
 
-- `desktop.toml` 不再是 agent 配置源，只保存 workspace、server、machine、dataRoot 等
-  宿主信息。
-- GUI 和 CLI 创建 agent 时写 `agents/<actor_id>/spec.json`，不是写
-  `machines[].agents[]`。
-- Provider command/args/env/parser/session 不再写在 machine config 或 AgentSpec 里；
-  这些都进入 ProviderManifest。
+- daemon 是 agent 运行与定义归属。GUI 不直接读写 daemon 私有文件；创建、更新、删除
+  agent 都通过 server machine command 或本机 daemon IPC，由 daemon 修改自己的
+  `agents/<actor_id>/spec.json` 并刷新 inventory。
+- server 保存 daemon 发布的 inventory 快照和 machine command 队列/结果；不解释
+  ProviderManifest，也不自行生成 AgentSpec。
+- `desktop.toml` 只保存 GUI/daemon 找到 server、workspace、machine、dataRoot 所需的
+  宿主信息；不能让 GUI 把 `machines[].agents[]` 当成可编辑事实源。
+- Provider command/args/env/parser/session 不写在 AgentSpec 里；这些进入目标 daemon 的
+  ProviderManifest。host-specific 差异用 daemon-local provider variant 表达。
 - 运行期 session id、进程状态和 run 缓存只写 runtime state，不写任何 spec。
 - run trace 和 GUI 可见 message 的边界不变：Provider stdout 进入 run trace；GUI
   可见消息仍来自 agent 显式 `loom message send` 或 Loom 的 auto-publish 策略。
@@ -1024,18 +1050,22 @@ loom provider doctor <provider_id>
    store。
 5. 实现 manifest-driven stdout/stderr decoder；复杂协议先通过 manifest 引用
    `builtin` decoder，后续可逐步改写成 JSONL reducer。
-6. 增加 `loom provider validate/add/list/show/remove/doctor`，并让 GUI 复用同一套
-   provider registry API。
-7. 增加最终版 AgentSpec `providerRef`，GUI 创建/编辑 agent 直接读写
-   `{loom.configDir}/agents/<actor_id>/spec.json`。
-8. 提供一次性导入工具，把现有 machine agent/provider override 配置转换成 AgentSpec
-   和 ProviderManifest variant。导入完成后，新写入路径只使用新模型。
-9. 删除 runtime 内对 `AgentProviderSpec.provider + transport + actors[]`、
-   `AgentSpec.transport`、`MachineConfig.providers[]`、`MachineConfig.agents[]` 的依赖。
+6. 增加 `loom provider validate/add/list/show/remove/doctor`。这些命令在 daemon/CLI
+   本机操作当前 `{loom.configDir}`；GUI 如需管理远端 Provider，必须通过目标 daemon
+   的 command/API。
+7. 增加最终版 AgentSpec `providerRef`，daemon 创建/编辑 agent 时写入自己的
+   `{loom.configDir}/agents/<actor_id>/spec.json`；GUI 只发 machine command 并等待
+   daemon inventory 刷新。
+8. 提供 daemon 侧一次性导入工具，把现有 `MachineConfig.agents[]` 和
+   `MachineConfig.providers[]` 转换成 AgentSpec 与 daemon-local ProviderManifest
+   variant。导入完成后，daemon 新写入路径只使用新模型。
+9. 删除 GUI/server 内对 `MachineConfig.providers[]`、`MachineConfig.agents[]` 的展示和
+   写入依赖；删除 runtime 内对 `AgentProviderSpec.provider + transport + actors[]`、
+   `AgentSpec.transport` 的依赖。
 
-一次性导入工具只服务已有配置升级；新 runtime 不做新旧配置双读，也不维护旧配置到
-新配置的运行时覆盖优先级。导入完成后，ProviderManifest、AgentSpec 和 runtime
-state 才是唯一生效边界。
+一次性导入工具只服务已有 daemon 配置升级；新 runtime 不做新旧配置双读，也不维护旧配置
+到新配置的运行时覆盖优先级。导入完成后，对单台 daemon 而言，ProviderManifest、
+AgentSpec 和 runtime state 才是唯一生效边界；GUI/server 只消费 daemon inventory。
 
 ## 待定问题
 

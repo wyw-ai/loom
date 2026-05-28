@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use agent_runtime::discovery::AgentProviderOverride;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -143,6 +144,7 @@ pub fn desktop_config_path() -> PathBuf {
     config_dir().join("desktop.toml")
 }
 
+#[cfg(test)]
 pub fn daemon_config_dir_for_machine(machine: &MachineConfig) -> PathBuf {
     let workspace_key = machine
         .workspace_id
@@ -301,12 +303,6 @@ pub fn apply_account_identity(cfg: &mut DesktopConfig) -> bool {
         }
     }
     changed
-}
-
-pub fn default_agent_data_root() -> PathBuf {
-    dirs::home_dir()
-        .map(|d| d.join(".agentx"))
-        .unwrap_or_else(|| PathBuf::from(".agentx"))
 }
 
 pub fn expand_home(value: &str) -> PathBuf {
@@ -666,6 +662,7 @@ fn safe_config_key(value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn short_config_key(value: &str, max_prefix_len: usize) -> String {
     let key = safe_config_key(value);
     if key.len() <= max_prefix_len {
@@ -674,6 +671,7 @@ fn short_config_key(value: &str, max_prefix_len: usize) -> String {
     format!("{}_{}", &key[..max_prefix_len], short_hash(value))
 }
 
+#[cfg(test)]
 fn short_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest[..4]

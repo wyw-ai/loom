@@ -77,10 +77,26 @@ pub trait Adapter: Send + Sync {
 pub struct AdapterPrompt {
     pub scope: ScopeRef,
     pub content: String,
+    pub parts: Vec<PromptPart>,
+    pub outputs: BTreeMap<String, String>,
     pub model: Option<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub template_vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptPart {
+    pub key: String,
+    pub title: String,
+    pub content: String,
+    pub role_hint: PromptRoleHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRoleHint {
+    System,
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

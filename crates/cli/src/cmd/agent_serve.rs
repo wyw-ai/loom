@@ -49,10 +49,12 @@ use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandCo
 use agent_runtime::usage;
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
-    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, TokenUsage,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, PromptPart,
+    PromptRoleHint, TokenUsage,
 };
 
 use crate::client::Client;
+use crate::config;
 use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
@@ -1212,7 +1214,7 @@ struct WorkerState {
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
     spec: AgentSpec,
     /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
-    /// here so prompt-envelope code can read identity/soul/memory without
+    /// here so prompt-envelope code can read legacy profile fields and memory without
     /// threading `paths` through every call.
     profile_dir: PathBuf,
     paths: AgentPaths,
@@ -1310,6 +1312,7 @@ struct PromptBreakdownSection {
 #[derive(Debug, Clone)]
 struct PromptTelemetry {
     content: String,
+    parts: Vec<PromptPart>,
     stats: PromptStats,
     breakdown: PromptBreakdown,
 }
@@ -2761,8 +2764,9 @@ async fn open_model_picker(
     adapter_start_error: Option<String>,
 ) -> Result<()> {
     let mut adapter_error = adapter_start_error;
+    let empty_prompt = prompt_telemetry(String::new(), &[]);
     let adapter_options = if adapter_error.is_none() {
-        match build_adapter_prompt(client, state, trigger.scope(), String::new(), None, None).await
+        match build_adapter_prompt(client, state, trigger.scope(), &empty_prompt, None, None).await
         {
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
@@ -2963,7 +2967,7 @@ async fn dispatch_trigger(
             client,
             state,
             trigger.scope(),
-            prompt.content,
+            &prompt,
             Some(&active),
             Some(&trigger),
         )
@@ -3003,7 +3007,7 @@ async fn build_adapter_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     scope: &ScopeRef,
-    content: String,
+    prompt: &PromptTelemetry,
     active: Option<&ActiveTurn>,
     trigger: Option<&AgentTrigger>,
 ) -> Result<AdapterPrompt> {
@@ -3017,9 +3021,21 @@ async fn build_adapter_prompt(
         .paths
         .template_vars(&state.actor_id, &channel_id, scope);
     extend_prompt_template_vars(&mut template_vars, state, trigger);
+    template_vars.insert(
+        "loom.configDir".into(),
+        config::config_dir().display().to_string(),
+    );
+    let outputs = agent_runtime::provider::render_prompt_outputs(
+        state.spec.transport.prompt.as_ref(),
+        &prompt.parts,
+        &prompt.content,
+    )
+    .map_err(|e| anyhow!("render provider prompt outputs: {e}"))?;
     Ok(AdapterPrompt {
         scope: scope.clone(),
-        content,
+        content: prompt.content.clone(),
+        parts: prompt.parts.clone(),
+        outputs,
         model: state.current_model(),
         cwd: scope_paths.workspace,
         env: state.paths.scope_env(
@@ -3441,18 +3457,18 @@ fn is_actor_ref_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')
 }
 
-fn actor_identity_manifest(actor_id: &str, display_name: &str) -> String {
+fn actor_context_manifest(actor_id: &str, display_name: &str) -> String {
     let mut actor_names = HashMap::new();
     if !display_name.trim().is_empty() {
         actor_names.insert(actor_id.to_string(), display_name.to_string());
     }
     let label = actor_label_with_fallback(actor_id, display_name, &actor_names);
     format!(
-        "=== System: Loom actor identity ===\n\
+        "=== System: Loom actor context ===\n\
          You are {label}.\n\
-         Treat this as your stable runtime identity. Other @actors in the\n\
+         Treat this as your stable runtime actor context. Other @actors in the\n\
          latest message are routing targets or people being discussed; they\n\
-         are not your identity."
+         are not this actor."
     )
 }
 
@@ -3580,7 +3596,7 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
-/// configure identity / memory fall back to the pre-envelope shape.
+/// configure legacy profile fields / memory fall back to the pre-envelope shape.
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -3589,7 +3605,7 @@ async fn compose_envelope_prompt(
 ) -> PromptTelemetry {
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
-    let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
     let conversation_context = recent_conversation_context(client, state, trigger).await;
     let runtime_context =
         join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
@@ -3674,11 +3690,30 @@ fn apply_trigger_prefix_to_prompt(
     let Some(prefix) = trigger_prefix.or_else(|| trigger_prefix_for_turn(spec, first_turn)) else {
         return prompt;
     };
-    if prompt.content.starts_with(prefix) {
+    if prompt.content.starts_with(prefix)
+        || prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "user_message" && part.content.starts_with(prefix))
+    {
         return prompt;
     }
 
-    prompt.content = format!("{prefix}{}", prompt.content);
+    if let Some(part) = prompt
+        .parts
+        .iter_mut()
+        .find(|part| part.key == "user_message")
+    {
+        part.content = format!("{prefix}{}", part.content);
+        prompt.content = prompt
+            .parts
+            .iter()
+            .map(|part| part.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    } else {
+        prompt.content = format!("{prefix}{}", prompt.content);
+    }
     prompt.stats = prompt_stats(&prompt.content);
 
     let stats = prompt_stats(prefix);
@@ -3814,6 +3849,11 @@ fn expand_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
 
 fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) -> PromptTelemetry {
     let stats = prompt_stats(&content);
+    let parts = sections
+        .iter()
+        .filter(|section| !section.content.trim().is_empty())
+        .map(prompt_part_from_section)
+        .collect::<Vec<_>>();
     let mut breakdown_sections: Vec<PromptBreakdownSection> = sections
         .iter()
         .filter(|section| !section.content.trim().is_empty())
@@ -3832,10 +3872,39 @@ fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) 
     recalculate_prompt_breakdown_percentages(&mut breakdown_sections);
     PromptTelemetry {
         content,
+        parts,
         stats,
         breakdown: PromptBreakdown {
             sections: breakdown_sections,
         },
+    }
+}
+
+fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPart {
+    PromptPart {
+        key: section.name.to_string(),
+        title: prompt_section_title(section.name).to_string(),
+        content: section.content.clone(),
+        role_hint: match section.name {
+            "actor_context" | "identity" | "soul" | "bootstrap_memory" | "scope_bootstrap" => {
+                PromptRoleHint::System
+            }
+            _ => PromptRoleHint::User,
+        },
+    }
+}
+
+fn prompt_section_title(name: &str) -> &str {
+    match name {
+        "actor_context" => "System: Loom actor context",
+        "identity" => "System: Legacy profile identity",
+        "soul" => "System: Legacy profile soul",
+        "bootstrap_memory" => "System: Bootstrap memory",
+        "turn_memory" => "Context: Turn memory",
+        "runtime_context" => "Context: Runtime context",
+        "scope_bootstrap" => "System: Loom multi-actor context",
+        "user_message" => "User message",
+        other => other,
     }
 }
 
@@ -3861,8 +3930,8 @@ fn prompt_stats(text: &str) -> PromptStats {
 fn prompt_section_label(name: &str) -> &str {
     match name {
         "actor_context" => "Actor Context",
-        "identity" => "Identity",
-        "soul" => "Soul",
+        "identity" => "Legacy Identity",
+        "soul" => "Legacy Soul",
         "bootstrap_memory" => "Bootstrap Memory",
         "turn_memory" => "Turn Memory",
         "runtime_context" => "Runtime Context",
@@ -4780,6 +4849,8 @@ mod tests {
                 session: None,
                 output_format: None,
                 prompt_via: proto::methods::PromptVia::default(),
+                prompt: None,
+                stdin: None,
                 timeout_ms: None,
                 idle_timeout_ms: None,
                 interactive: None,
@@ -5452,8 +5523,8 @@ mod tests {
     }
 
     #[test]
-    fn actor_identity_manifest_names_local_actor_with_display_and_id() {
-        let manifest = actor_identity_manifest("actor_agent_g_1234", "G仔");
+    fn actor_context_manifest_names_local_actor_with_display_and_id() {
+        let manifest = actor_context_manifest("actor_agent_g_1234", "G仔");
 
         assert!(manifest.contains("You are G仔 (@actor_agent_g_1234)."));
         assert!(manifest.contains("Other @actors"));

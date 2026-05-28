@@ -124,6 +124,15 @@ with the exact text users should see. Do not rely on final assistant text to\n\
 publish a reply. Use final assistant text only for private notes about what you\n\
 did, or keep it empty after tool calls. Use `loom --json run ignore --reason\n\
 \"...\"` when the correct visible behavior is no reply.\n\
+If the user or another actor asks you to hand off, wake, route, or notify a\n\
+specific actor, that routed visible message is required work. A plain\n\
+`notify_only` thread message does not wake the target actor. Send a message\n\
+whose text includes `@actor_id` and whose flags include `--intent\n\
+request_action --delivery-policy wake_agent`; only call `run ignore` after that\n\
+message was successfully sent or when no routed visible message is needed.\n\
+The same rule applies to turn-taking: when your visible message expects a\n\
+specific actor's next answer, guess, review, or decision, route it to that actor\n\
+with `@actor_id`, `--intent request_action`, and `--delivery-policy wake_agent`.\n\
 \n\
 Keep progress updates short, state uncertainty when it matters, and include the\n\
 key evidence behind conclusions. If more context is needed, query Loom first.\n\
@@ -205,6 +214,10 @@ Actor-to-actor routed messages are strong task-flow signals. When you delegate a
 substantial subtask to another actor from a channel common area, create or\n\
 reuse a task first, then send a routed message to the canonical thread target, for\n\
 example `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id ...\" --intent request_action --delivery-policy wake_agent`.\n\
+A handoff without an explicit `@actor_id` audience and `wake_agent` delivery is\n\
+only a visible note; it will not start the receiving agent.\n\
+For games, Q&A, reviews, or any other back-and-forth, each turn that needs the\n\
+other actor to respond must be a routed wake message to that actor.\n\
 If the current scope is already the right thread, use the current thread scope\n\
 or its canonical target instead of creating another one. Keep follow-up work,\n\
 evidence, review requests, and the final answer in that thread. The parent\n\
@@ -307,6 +320,10 @@ mod tests {
         assert!(out.contains("loom --json run ignore --reason"));
         assert!(out.contains("keyword heuristics"));
         assert!(out.contains("end the turn without visible answer text"));
+        assert!(out.contains("A plain\n`notify_only` thread message does not wake"));
+        assert!(out.contains("The same rule applies to turn-taking"));
+        assert!(out.contains("handoff without an explicit `@actor_id` audience"));
+        assert!(out.contains("each turn that needs the\nother actor to respond"));
         assert!(out.contains(
             "Human-to-actor routed messages in a channel common area start as a routing/triage"
         ));

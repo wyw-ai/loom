@@ -792,6 +792,7 @@ fn validate_prompt_references(
     let outputs = prompt_output_names(mode.prompt.as_ref());
     validate_prompt_outputs(manifest, mode_name, mode.prompt.as_ref())?;
     validate_template_variables(manifest, mode_name, mode, &outputs)?;
+    validate_session_spec(manifest, mode_name, mode)?;
     let references = prompt_references_in_mode(mode);
     for name in &references {
         if !outputs.contains(name) {
@@ -819,7 +820,6 @@ fn validate_prompt_references(
                 manifest.id
             ));
         }
-        validate_session_capture(manifest, mode_name, mode)?;
     }
     Ok(())
 }
@@ -831,7 +831,7 @@ fn prompt_output_names(prompt: Option<&ProviderPromptSpec>) -> HashSet<String> {
         .unwrap_or_else(|| HashSet::from(["full".into()]))
 }
 
-fn validate_session_capture(
+fn validate_session_spec(
     manifest: &ProviderManifest,
     mode_name: &str,
     mode: &ProviderModeSpec,
@@ -839,6 +839,14 @@ fn validate_session_capture(
     let Some(session) = mode.session.as_ref() else {
         return Ok(());
     };
+    if let Some(scope) = session.scope.as_deref() {
+        if !matches!(scope, "actor_scope" | "actor" | "turn") {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` uses unsupported session scope `{scope}`",
+                manifest.id
+            ));
+        }
+    }
     if matches!(
         session.id_source,
         Some(ProviderSessionIdSource::ProviderCapture)
@@ -1211,6 +1219,7 @@ fn runtime_plan_from_manifest(
                 ProviderSessionIdSource::LoomUuid => CommandSessionIdSource::LoomUuid,
                 ProviderSessionIdSource::ProviderCapture => CommandSessionIdSource::ProviderCapture,
             }),
+            scope: session.scope.clone(),
             first_run_capture: None,
             resume_args: if resume_args.is_empty() {
                 None
@@ -2330,6 +2339,40 @@ mod tests {
     }
 
     #[test]
+    fn manifest_validation_rejects_unknown_session_scope() {
+        let manifest = manifest(
+            "bad_session_scope",
+            "Bad Session Scope",
+            &["bad-session-scope"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    Some(ProviderSessionSpec {
+                        id_source: Some(ProviderSessionIdSource::LoomUuid),
+                        resume_args: vec![
+                            lit("--session-id"),
+                            lit("{session.id}"),
+                            lit("{prompt.full}"),
+                        ],
+                        scope: Some("workspace".into()),
+                    }),
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("bad session scope should fail");
+        assert!(
+            err.contains("unsupported session scope `workspace`"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn builtin_claude_uses_system_and_user_prompt_outputs() {
         let dir = temp_dir("path");
         make_executable(&dir.join("claude"));
@@ -2358,6 +2401,10 @@ mod tests {
         assert_eq!(
             transport.session.as_ref().and_then(|s| s.id_source),
             Some(CommandSessionIdSource::LoomUuid)
+        );
+        assert_eq!(
+            transport.session.as_ref().and_then(|s| s.scope.as_deref()),
+            Some("actor_scope")
         );
     }
 

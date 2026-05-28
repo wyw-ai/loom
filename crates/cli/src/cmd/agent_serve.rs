@@ -4042,6 +4042,9 @@ fn command_transport_can_resume(transport: &AgentTransport) -> bool {
     let Some(session) = transport.session.as_ref() else {
         return false;
     };
+    if session.scope.as_deref().map(str::trim) == Some("turn") {
+        return false;
+    }
     let has_resume_template = session
         .resume_args
         .as_ref()
@@ -5819,6 +5822,7 @@ mod tests {
         let mut loom_uuid = test_command_transport();
         loom_uuid.session = Some(proto::methods::CommandSession {
             id_source: Some(CommandSessionIdSource::LoomUuid),
+            scope: None,
             first_run_capture: None,
             resume_args: Some(vec!["--session-id".into(), "{session_id}".into()]),
             resume_arg_specs: Vec::new(),
@@ -5828,6 +5832,7 @@ mod tests {
         let mut resumable = test_command_transport();
         resumable.session = Some(proto::methods::CommandSession {
             id_source: None,
+            scope: None,
             first_run_capture: Some("stdout_json:.session_id".into()),
             resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
             resume_arg_specs: Vec::new(),
@@ -5837,6 +5842,7 @@ mod tests {
         let mut decoder_capture = test_command_transport();
         decoder_capture.session = Some(proto::methods::CommandSession {
             id_source: Some(CommandSessionIdSource::ProviderCapture),
+            scope: None,
             first_run_capture: None,
             resume_args: None,
             resume_arg_specs: vec![
@@ -5855,6 +5861,10 @@ mod tests {
             ..Default::default()
         });
         assert!(!command_transport_without_resume(&decoder_capture));
+
+        let mut turn_scoped = loom_uuid.clone();
+        turn_scoped.session.as_mut().unwrap().scope = Some("turn".into());
+        assert!(command_transport_without_resume(&turn_scoped));
 
         let mut broken_capture = decoder_capture.clone();
         broken_capture.decoder = None;

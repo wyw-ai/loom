@@ -72,6 +72,27 @@ pub struct ProviderRuntimePlan {
     pub idle_timeout_ms: Option<u64>,
 }
 
+/// Transport-neutral events produced by provider output decoders before Loom
+/// maps them into adapter-visible events or runtime bookkeeping.
+#[derive(Debug, Clone)]
+pub enum ProviderRuntimeEvent {
+    Text { content: String, is_partial: bool },
+    ToolUse { tool_name: String, input: Value },
+    Status { status: String },
+    Error { message: String },
+    Finished { success: bool, summary: String },
+    Session { session_id: String },
+}
+
+impl ProviderRuntimeEvent {
+    pub fn into_session_id(self) -> Option<String> {
+        match self {
+            ProviderRuntimeEvent::Session { session_id } => Some(session_id),
+            _ => None,
+        }
+    }
+}
+
 impl ProviderRuntimePlan {
     pub fn into_transport(self) -> AgentTransport {
         let output_format = self

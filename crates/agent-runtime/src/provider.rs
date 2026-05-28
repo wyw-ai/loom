@@ -49,6 +49,8 @@ pub struct ProviderRuntimePlan {
     pub transport_kind: String,
     pub command: String,
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_specs: Vec<ProviderArgSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +80,7 @@ impl ProviderRuntimePlan {
             kind: self.transport_kind,
             command: self.command,
             args: self.args,
+            arg_specs: self.arg_specs,
             env: self.env,
             auth_method: None,
             model: self.model,
@@ -1147,27 +1150,12 @@ fn runtime_plan_from_manifest(
     bin: &Path,
     provider_ref: &AgentProviderRef,
 ) -> Result<ProviderRuntimePlan, String> {
-    let mut args = Vec::new();
-    let mut model_args = Vec::new();
-    append_provider_args(
-        &mode.args,
-        &mut args,
-        &mut model_args,
-        provider_ref.reasoning_effort.as_deref(),
-    );
-    let mut resume_args = Vec::new();
-    let mut resume_model_args = Vec::new();
-    if let Some(session) = mode.session.as_ref() {
-        append_provider_args(
-            &session.resume_args,
-            &mut resume_args,
-            &mut resume_model_args,
-            provider_ref.reasoning_effort.as_deref(),
-        );
-        if model_args.is_empty() && !resume_model_args.is_empty() {
-            model_args = resume_model_args;
-        }
-    }
+    let args = flatten_args_for_inventory(&mode.args);
+    let resume_args = mode
+        .session
+        .as_ref()
+        .map(|session| flatten_args_for_inventory(&session.resume_args))
+        .unwrap_or_default();
 
     let plan = ProviderRuntimePlan {
         provider_id: manifest.id.clone(),
@@ -1179,6 +1167,7 @@ fn runtime_plan_from_manifest(
         },
         command: expand_static_command(&mode.command, bin),
         args: normalize_session_tokens(args),
+        arg_specs: mode.args.clone(),
         env: mode.env.clone(),
         model: provider_ref
             .model
@@ -1186,7 +1175,7 @@ fn runtime_plan_from_manifest(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
-        model_args: normalize_session_tokens(model_args),
+        model_args: Vec::new(),
         session: mode.session.as_ref().map(|session| CommandSession {
             id_source: session.id_source.map(|source| match source {
                 ProviderSessionIdSource::LoomUuid => CommandSessionIdSource::LoomUuid,
@@ -1198,6 +1187,7 @@ fn runtime_plan_from_manifest(
             } else {
                 Some(normalize_session_tokens(resume_args))
             },
+            resume_arg_specs: session.resume_args.clone(),
         }),
         output_format: output_format(&mode.stdout)?,
         decoder: Some(mode.stdout.clone()),
@@ -1209,29 +1199,6 @@ fn runtime_plan_from_manifest(
     };
     validate_manifest(manifest)?;
     Ok(plan)
-}
-
-fn append_provider_args(
-    specs: &[ProviderArgSpec],
-    args: &mut Vec<String>,
-    model_args: &mut Vec<String>,
-    reasoning_effort: Option<&str>,
-) {
-    for spec in specs {
-        match spec {
-            ProviderArgSpec::Literal(value) => args.push(value.clone()),
-            ProviderArgSpec::Conditional { when, args: nested } => {
-                let when = when.trim();
-                if when == "model" {
-                    append_literals(nested, model_args);
-                } else if matches!(when, "reasoningEffort" | "reasoning_effort")
-                    && reasoning_effort.is_some_and(|value| !value.trim().is_empty())
-                {
-                    append_literals(nested, args);
-                }
-            }
-        }
-    }
 }
 
 fn append_literals(specs: &[ProviderArgSpec], out: &mut Vec<String>) {
@@ -2232,6 +2199,14 @@ mod tests {
         assert_eq!(plan.transport_kind, "command");
         assert_eq!(plan.output_format, CommandOutputFormat::ClaudeStreamJson);
         assert_eq!(plan.model.as_deref(), Some("auto"));
+        assert!(
+            plan.model_args.is_empty(),
+            "provider conditionals should stay in arg_specs instead of legacy model_args"
+        );
+        assert!(plan.arg_specs.iter().any(|arg| matches!(
+            arg,
+            ProviderArgSpec::Conditional { when, .. } if when == "model"
+        )));
         assert!(plan
             .decoder
             .as_ref()
@@ -2239,9 +2214,11 @@ mod tests {
             .and_then(|capture| capture.session.as_ref())
             .is_some());
 
+        let arg_specs_len = plan.arg_specs.len();
         let transport = plan.into_transport();
         assert_eq!(transport.kind, "command");
         assert_eq!(transport.command, provider.command);
+        assert_eq!(transport.arg_specs.len(), arg_specs_len);
         assert_eq!(
             transport
                 .session
@@ -2249,6 +2226,10 @@ mod tests {
                 .and_then(|session| session.id_source),
             Some(CommandSessionIdSource::ProviderCapture)
         );
+        assert!(transport
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.resume_arg_specs.is_empty()));
     }
 
     #[test]

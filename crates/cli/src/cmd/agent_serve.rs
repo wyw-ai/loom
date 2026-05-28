@@ -3538,6 +3538,18 @@ fn actor_context_manifest(actor_id: &str, display_name: &str) -> String {
     )
 }
 
+fn agent_instructions_manifest(spec: &AgentSpec) -> String {
+    let Some(instructions) = spec
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return String::new();
+    };
+    format!("=== System: Agent instructions ===\n{instructions}")
+}
+
 #[derive(Debug, Clone)]
 struct LocalTimeInfo {
     local_rfc3339: String,
@@ -3672,6 +3684,7 @@ async fn compose_envelope_prompt(
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
     let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let agent_instructions = agent_instructions_manifest(&state.spec);
     let conversation_context = recent_conversation_context(client, state, trigger).await;
     let runtime_context =
         join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
@@ -3699,6 +3712,12 @@ async fn compose_envelope_prompt(
             name: "actor_context",
             content: actor_context.clone(),
         }];
+        if !agent_instructions.is_empty() {
+            sections.push(agent_runtime::PromptSection {
+                name: "agent_instructions",
+                content: agent_instructions.clone(),
+            });
+        }
         if !scope_bootstrap.is_empty() {
             sections.push(agent_runtime::PromptSection {
                 name: "scope_bootstrap",
@@ -3731,6 +3750,7 @@ async fn compose_envelope_prompt(
     let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             actor_context: &actor_context,
+            agent_instructions: &agent_instructions,
             profile_dir: &state.profile_dir,
             memory_spec,
             channel_id: channel_id.as_deref(),
@@ -4003,7 +4023,9 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
         content: raw_prompt_part_content(&section.content, &title),
         rendered_content: section.content.clone(),
         role_hint: match section.name {
-            "actor_context" | "bootstrap_memory" | "scope_bootstrap" => PromptRoleHint::System,
+            "actor_context" | "agent_instructions" | "bootstrap_memory" | "scope_bootstrap" => {
+                PromptRoleHint::System
+            }
             _ => PromptRoleHint::User,
         },
     }
@@ -4043,6 +4065,7 @@ fn rendered_prompt_from_parts(parts: &[PromptPart]) -> String {
 fn prompt_section_title(name: &str) -> &str {
     match name {
         "actor_context" => "System: Loom actor context",
+        "agent_instructions" => "System: Agent instructions",
         "bootstrap_memory" => "System: Bootstrap memory",
         "turn_memory" => "Context: Turn memory",
         "runtime_context" => "Context: Runtime context",
@@ -4078,6 +4101,7 @@ fn prompt_stats(text: &str) -> PromptStats {
 fn prompt_section_label(name: &str) -> &str {
     match name {
         "actor_context" => "Actor Context",
+        "agent_instructions" => "Agent Instructions",
         "bootstrap_memory" => "Bootstrap Memory",
         "turn_memory" => "Turn Memory",
         "runtime_context" => "Runtime Context",
@@ -5017,6 +5041,7 @@ mod tests {
                 capabilities: None,
                 _meta: None,
             },
+            instructions: None,
             provider_ref: AgentProviderRef {
                 id: "test".into(),
                 mode: Some("print".into()),

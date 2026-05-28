@@ -11,6 +11,7 @@ pub mod chat;
 pub mod coordination;
 pub mod daemon;
 pub mod group;
+pub mod machine;
 pub mod mcp_announcement;
 pub mod mcp_memory;
 pub mod memory;

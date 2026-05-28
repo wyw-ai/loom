@@ -145,6 +145,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: ProviderCmd,
     },
+    /// Manage daemon machines through server-routed machine commands.
+    Machine {
+        #[command(subcommand)]
+        sub: MachineCmd,
+    },
     /// Inspect actors known to the server.
     Actor {
         #[command(subcommand)]
@@ -1434,6 +1439,49 @@ enum ProviderCmd {
     Doctor { provider_id: String },
 }
 
+#[derive(Subcommand, Debug)]
+enum MachineCmd {
+    /// List daemon machines visible from the current server.
+    List,
+    /// Manage agents on a daemon-owned machine.
+    Agent {
+        #[command(subcommand)]
+        sub: MachineAgentCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MachineAgentCmd {
+    /// Create an AgentSpec on the target daemon via machine/command.
+    Create {
+        #[arg(long)]
+        machine: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "actor-id")]
+        actor_id: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        instructions: Option<String>,
+        #[arg(long = "instructions-file")]
+        instructions_file: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+        #[arg(long = "no-autostart")]
+        no_autostart: bool,
+    },
+    /// Remove an AgentSpec from the target daemon via machine/command.
+    Remove {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -2367,6 +2415,39 @@ async fn main() -> Result<()> {
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
+        Cmd::Machine { sub } => match sub {
+            MachineCmd::List => cmd::machine::list(client).await?,
+            MachineCmd::Agent { sub } => match sub {
+                MachineAgentCmd::Create {
+                    machine,
+                    provider,
+                    actor_id,
+                    name,
+                    instructions,
+                    instructions_file,
+                    model,
+                    reasoning_effort,
+                    no_autostart,
+                } => {
+                    cmd::machine::agent_create(
+                        client,
+                        machine,
+                        provider,
+                        actor_id,
+                        name,
+                        instructions,
+                        instructions_file,
+                        model,
+                        reasoning_effort,
+                        !no_autostart,
+                    )
+                    .await?
+                }
+                MachineAgentCmd::Remove { machine, actor_id } => {
+                    cmd::machine::agent_remove(client, machine, actor_id).await?
+                }
+            },
+        },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,
             ActorCmd::Upsert {

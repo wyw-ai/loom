@@ -5976,6 +5976,7 @@ function agentModelValue(agent: MachineInfo["agents"][number]) {
 }
 
 function agentDescriptionValue(agent: MachineInfo["agents"][number]) {
+  if (agent.spec.instructions) return agent.spec.instructions;
   const value = agent.spec.actor._meta?.description;
   return typeof value === "string" ? value : "";
 }

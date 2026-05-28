@@ -2,10 +2,13 @@
 //!
 //! Layout: `~/.loom-apps/desktop.toml`
 //!
-//! Daemon runtime configs are written separately below
-//! `~/.loom-apps/d/<workspace>/<owner-short>/<machine>/desktop.toml`.
-//! The GUI can track multiple server profiles in one desktop config, while a
-//! daemon should see only the workspace/machine it is launched for.
+//! The GUI desktop config is a local connection profile: account identity,
+//! server profiles, and the active server. Machines and agents are discovered
+//! from the connected server inventory instead of treated as local truth.
+//!
+//! Daemon runtime configs may still use the same TOML shape in scoped config
+//! dirs below `~/.loom-apps/d/<workspace>/<owner-short>/<machine>/desktop.toml`.
+//! Those files belong to daemon startup, not GUI host discovery.
 //!
 //! ```toml
 //! active = "default"
@@ -42,8 +45,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const ENV_CONFIG_DIR: &str = "LOOM_CONFIG_DIR";
-const LEGACY_ENV_CONFIG_DIR: &str = "JOI_CONFIG_DIR";
+pub const ENV_CONFIG_DIR: &str = "LOOM_GUI_CONFIG_DIR";
+const LEGACY_ENV_CONFIG_DIR: &str = "JOI_GUI_CONFIG_DIR";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,7 +171,7 @@ pub fn load_or_init() -> Result<DesktopConfig> {
     let path = desktop_config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(cfg) = toml::from_str::<DesktopConfig>(&text) {
-            return Ok(with_default_machines(cfg));
+            return Ok(normalize_desktop_config(cfg));
         }
     }
     // First-run seeding: if the TUI has already been used, mirror its profile
@@ -178,7 +181,7 @@ pub fn load_or_init() -> Result<DesktopConfig> {
         cfg.active = Some(seed.id.clone());
         cfg.workspaces.push(seed);
     }
-    cfg = with_default_machines(cfg);
+    cfg = normalize_desktop_config(cfg);
     save(&cfg).ok();
     Ok(cfg)
 }
@@ -368,23 +371,7 @@ pub fn active_owner_actor_id(cfg: &DesktopConfig) -> Option<String> {
     {
         return Some(actor_id.to_string());
     }
-
-    let active_workspace_id = active_workspace_id(cfg);
-    let mut owners = cfg
-        .machines
-        .iter()
-        .filter(|machine| machine.workspace_id.as_deref() == active_workspace_id)
-        .filter_map(|machine| machine.owner_actor_id.as_deref())
-        .map(str::trim)
-        .filter(|owner| !owner.is_empty())
-        .collect::<Vec<_>>();
-    owners.sort_unstable();
-    owners.dedup();
-    if owners.len() == 1 {
-        Some(owners[0].to_string())
-    } else {
-        None
-    }
+    None
 }
 
 pub fn machine_belongs_to_active_workspace(machine: &MachineConfig, cfg: &DesktopConfig) -> bool {
@@ -405,7 +392,8 @@ pub fn machine_belongs_to_workspace_and_owner(
         && machine.owner_actor_id.as_deref() == owner_actor_id
 }
 
-pub fn default_machine_for_workspace(
+#[cfg(test)]
+fn default_machine_for_workspace(
     workspace_id: &str,
     owner_actor_id: Option<&str>,
 ) -> MachineConfig {
@@ -427,7 +415,7 @@ pub fn default_machine_for_workspace(
     }
 }
 
-fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
+fn normalize_desktop_config(mut cfg: DesktopConfig) -> DesktopConfig {
     let mut changed = false;
 
     if let Some(account) = cfg.account.clone() {
@@ -448,10 +436,6 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
     }
 
     if cfg.workspaces.is_empty() {
-        if cfg.machines.is_empty() {
-            cfg.machines.push(default_machine());
-            changed = true;
-        }
         if changed {
             save(&cfg).ok();
         }
@@ -480,28 +464,6 @@ fn with_default_machines(mut cfg: DesktopConfig) -> DesktopConfig {
     }
     if cleanup_machine_configs(&mut cfg) {
         changed = true;
-    }
-
-    let active_owner_actor_id = active_owner_actor_id(&cfg);
-    let workspace_ids: Vec<String> = cfg
-        .workspaces
-        .iter()
-        .map(|workspace| workspace.id.clone())
-        .collect();
-    for workspace_id in workspace_ids {
-        if !cfg.machines.iter().any(|machine| {
-            machine_belongs_to_workspace_and_owner(
-                machine,
-                Some(workspace_id.as_str()),
-                active_owner_actor_id.as_deref(),
-            )
-        }) {
-            cfg.machines.push(default_machine_for_workspace(
-                &workspace_id,
-                active_owner_actor_id.as_deref(),
-            ));
-            changed = true;
-        }
     }
 
     if changed {
@@ -653,16 +615,6 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
     let mut changed = false;
     let account_display = cfg.account.as_ref().map(account_display_name);
     let account_actor_id = active_account_actor_id(cfg).map(ToString::to_string);
-    let workspace_owner_fallbacks = cfg
-        .workspaces
-        .iter()
-        .map(|workspace| {
-            (
-                workspace.id.clone(),
-                unique_machine_owner_for_workspace(cfg, &workspace.id),
-            )
-        })
-        .collect::<Vec<_>>();
     for workspace in &mut cfg.workspaces {
         if workspace.name.trim().is_empty() {
             workspace.name = "Local".into();
@@ -674,12 +626,6 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
         }
         if workspace.actor_id.trim().is_empty() {
             if let Some(actor_id) = account_actor_id.as_ref() {
-                workspace.actor_id = actor_id.clone();
-                changed = true;
-            } else if let Some((_, Some(actor_id))) = workspace_owner_fallbacks
-                .iter()
-                .find(|(workspace_id, _)| workspace_id == &workspace.id)
-            {
                 workspace.actor_id = actor_id.clone();
                 changed = true;
             } else {
@@ -702,38 +648,6 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
 
 fn local_actor_id_for_workspace(workspace_id: &str) -> String {
     format!("actor_human_local_{}", safe_config_key(workspace_id))
-}
-
-fn unique_machine_owner_for_workspace(cfg: &DesktopConfig, workspace_id: &str) -> Option<String> {
-    let mut owners = cfg
-        .machines
-        .iter()
-        .filter(|machine| machine.workspace_id.as_deref() == Some(workspace_id))
-        .filter_map(|machine| machine.owner_actor_id.as_deref())
-        .map(str::trim)
-        .filter(|owner| !owner.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    owners.sort();
-    owners.dedup();
-    if owners.len() == 1 {
-        owners.pop()
-    } else {
-        None
-    }
-}
-
-fn default_machine() -> MachineConfig {
-    MachineConfig {
-        workspace_id: None,
-        owner_actor_id: None,
-        id: "local".into(),
-        name: "Local Machine".into(),
-        kind: default_machine_kind(),
-        data_root: default_agent_data_root_expr(),
-        providers: Vec::new(),
-        agents: Vec::new(),
-    }
 }
 
 fn default_machine_kind() -> String {
@@ -879,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_filter_can_fallback_to_unique_machine_owner() {
+    fn machine_filter_does_not_infer_owner_from_local_machines() {
         let cfg = DesktopConfig {
             active: Some("default".into()),
             account: None,
@@ -896,20 +810,9 @@ mod tests {
             )],
         };
         let machine = default_machine_for_workspace("default", Some("actor_human_88084"));
-        let other_owner_machine = MachineConfig {
-            owner_actor_id: Some("actor_human_other".into()),
-            ..machine.clone()
-        };
 
-        assert_eq!(
-            active_owner_actor_id(&cfg).as_deref(),
-            Some("actor_human_88084")
-        );
-        assert!(machine_belongs_to_active_workspace(&machine, &cfg));
-        assert!(!machine_belongs_to_active_workspace(
-            &other_owner_machine,
-            &cfg
-        ));
+        assert_eq!(active_owner_actor_id(&cfg), None);
+        assert!(!machine_belongs_to_active_workspace(&machine, &cfg));
     }
 
     #[test]
@@ -945,6 +848,35 @@ id = "default"
             machine.data_root,
             "~/.agentx/machines/ws_local/actor_human_github_12345/local"
         );
+    }
+
+    #[test]
+    fn normalize_desktop_config_does_not_seed_gui_machine_truth() {
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(normalize_human_account(HumanAccount {
+                provider: "github".into(),
+                staff_id: "12345".into(),
+                nickname: "octocat".into(),
+                real_name: String::new(),
+                email: String::new(),
+                actor_id: String::new(),
+                avatar_url: String::new(),
+            })),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: "actor_human_github_12345".into(),
+                display_name: "octocat".into(),
+            }],
+            machines: Vec::new(),
+        };
+
+        let cfg = normalize_desktop_config(cfg);
+
+        assert!(cfg.machines.is_empty());
+        assert_eq!(cfg.workspaces[0].actor_id, "actor_human_github_12345");
     }
 
     #[test]

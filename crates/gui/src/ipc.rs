@@ -47,9 +47,7 @@ pub struct SaveWorkspacesArgs {
 #[tauri::command]
 pub async fn workspaces_save(args: SaveWorkspacesArgs) -> Result<DesktopConfig, String> {
     config::save(&args.config).map_err(|e| e.to_string())?;
-    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    sync_all_daemon_configs(&cfg).map_err(stringify)?;
-    Ok(cfg)
+    config::load_or_init().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -147,13 +145,10 @@ pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, Stri
         display_name,
     };
     cfg.workspaces.push(ws);
-    cfg.machines
-        .push(config::default_machine_for_workspace(&id, Some(&actor_id)));
     if args.activate {
         cfg.active = Some(id);
     }
     config::save(&cfg).map_err(|e| e.to_string())?;
-    sync_all_daemon_configs(&cfg).map_err(stringify)?;
     Ok(cfg)
 }
 
@@ -205,7 +200,6 @@ pub async fn workspace_remove(args: WorkspaceIdArgs) -> Result<DesktopConfig, St
         cfg.active = cfg.workspaces.first().map(|w| w.id.clone());
     }
     config::save(&cfg).map_err(|e| e.to_string())?;
-    sync_all_daemon_configs(&cfg).map_err(stringify)?;
     Ok(cfg)
 }
 
@@ -217,7 +211,6 @@ pub async fn set_active_workspace(args: WorkspaceIdArgs) -> Result<DesktopConfig
     }
     cfg.active = Some(args.id);
     config::save(&cfg).map_err(|e| e.to_string())?;
-    sync_all_daemon_configs(&cfg).map_err(stringify)?;
     Ok(cfg)
 }
 
@@ -270,10 +263,10 @@ pub async fn connect(
     let _ = app.emit("loom://connection", forward::ConnectionEvent::Open);
 
     // Persist the chosen workspace as active and refresh the daemon's
-    // single-workspace runtime config for this server profile.
+    // server profile. Daemon runtime config is maintained by daemon startup,
+    // not by GUI host discovery.
     cfg.active = Some(ws.id.clone());
     config::save(&cfg).map_err(stringify)?;
-    sync_active_daemon_configs(&cfg).map_err(stringify)?;
 
     Ok(json!({ "workspace": ws, "open": open }))
 }
@@ -1653,186 +1646,12 @@ async fn machines_from_config(
     client: Option<Arc<Client>>,
 ) -> Result<MachineListResult, String> {
     let server_url = active_server_url(cfg);
-
-    let mut machines = Vec::new();
-    for machine in cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
-    {
-        let daemon_config_dir = sync_daemon_config_for_machine(cfg, machine).map_err(stringify)?;
-        machines.push(
-            machine_info_with_daemon_config(machine, server_url, &daemon_config_dir)
-                .map_err(stringify)?,
-        );
-    }
-    let mut result = MachineListResult { machines };
+    let mut result = MachineListResult {
+        machines: Vec::new(),
+    };
     merge_server_machine_inventory(&mut result, cfg, client.as_ref(), server_url).await;
     apply_connection_status(&mut result, client).await;
     Ok(result)
-}
-
-fn sync_active_daemon_configs(cfg: &DesktopConfig) -> anyhow::Result<()> {
-    for machine in cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
-    {
-        sync_daemon_config_for_machine(cfg, machine)?;
-    }
-    Ok(())
-}
-
-fn sync_all_daemon_configs(cfg: &DesktopConfig) -> anyhow::Result<()> {
-    for machine in &cfg.machines {
-        if daemon_workspace_for_machine(cfg, machine).is_some() {
-            sync_daemon_config_for_machine(cfg, machine)?;
-        }
-    }
-    Ok(())
-}
-
-fn sync_daemon_config_for_machine(
-    cfg: &DesktopConfig,
-    machine: &MachineConfig,
-) -> anyhow::Result<PathBuf> {
-    let Some(mut workspace) = daemon_workspace_for_machine(cfg, machine) else {
-        anyhow::bail!("unknown workspace for machine {}", machine.id);
-    };
-    let owner_actor_id = daemon_owner_actor_id(cfg, &workspace, machine);
-    if workspace.actor_id.trim().is_empty() {
-        if let Some(owner_actor_id) = owner_actor_id.as_deref() {
-            workspace.actor_id = owner_actor_id.to_string();
-        }
-    }
-    if workspace.display_name.trim().is_empty() {
-        workspace.display_name = workspace
-            .actor_id
-            .strip_prefix("actor_human_")
-            .unwrap_or(workspace.actor_id.as_str())
-            .trim()
-            .to_string();
-    }
-
-    let mut scoped_machine = machine.clone();
-    scoped_machine.workspace_id = Some(workspace.id.clone());
-    if scoped_machine
-        .owner_actor_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        scoped_machine.owner_actor_id = owner_actor_id.clone();
-    }
-
-    let daemon_cfg = DesktopConfig {
-        active: Some(workspace.id.clone()),
-        account: daemon_account_for_owner(cfg, owner_actor_id.as_deref(), &workspace),
-        workspaces: vec![workspace],
-        machines: vec![scoped_machine.clone()],
-    };
-    let dir = config::daemon_config_dir_for_machine(&scoped_machine);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("create daemon config dir {}: {e}", dir.display()))?;
-    let path = dir.join("desktop.toml");
-    let text = toml::to_string_pretty(&daemon_cfg)?;
-    std::fs::write(&path, text)
-        .map_err(|e| anyhow::anyhow!("write daemon config {}: {e}", path.display()))?;
-    Ok(dir)
-}
-
-fn daemon_workspace_for_machine(cfg: &DesktopConfig, machine: &MachineConfig) -> Option<Workspace> {
-    if let Some(workspace_id) = machine
-        .workspace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return cfg
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .cloned();
-    }
-    if let Some(workspace) = config::active_workspace_id(cfg)
-        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
-    {
-        return Some(workspace.clone());
-    }
-    Some(Workspace {
-        id: "default".into(),
-        name: "Local".into(),
-        server_url: active_server_url(cfg).to_string(),
-        actor_id: cfg
-            .account
-            .as_ref()
-            .map(|account| account.actor_id.clone())
-            .unwrap_or_default(),
-        display_name: cfg
-            .account
-            .as_ref()
-            .map(account_display_name)
-            .unwrap_or_else(|| "Local".into()),
-    })
-}
-
-fn daemon_owner_actor_id(
-    cfg: &DesktopConfig,
-    workspace: &Workspace,
-    machine: &MachineConfig,
-) -> Option<String> {
-    machine
-        .owner_actor_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            let actor_id = workspace.actor_id.trim();
-            (!actor_id.is_empty()).then_some(actor_id)
-        })
-        .or_else(|| {
-            cfg.account
-                .as_ref()
-                .map(|account| account.actor_id.trim())
-                .filter(|value| !value.is_empty())
-        })
-        .map(ToString::to_string)
-}
-
-fn daemon_account_for_owner(
-    cfg: &DesktopConfig,
-    owner_actor_id: Option<&str>,
-    workspace: &Workspace,
-) -> Option<HumanAccount> {
-    let owner_actor_id = owner_actor_id?.trim();
-    if owner_actor_id.is_empty() {
-        return None;
-    }
-    if let Some(account) = cfg.account.as_ref() {
-        if account.actor_id.trim() == owner_actor_id {
-            return Some(account.clone());
-        }
-    }
-    let staff_id = owner_actor_id
-        .strip_prefix("actor_human_")
-        .unwrap_or(owner_actor_id)
-        .trim();
-    let nickname = [workspace.display_name.as_str(), staff_id, owner_actor_id]
-        .into_iter()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .unwrap_or(owner_actor_id)
-        .to_string();
-    Some(HumanAccount {
-        provider: "unknown".into(),
-        staff_id: staff_id.to_string(),
-        nickname,
-        real_name: String::new(),
-        email: String::new(),
-        actor_id: owner_actor_id.to_string(),
-        avatar_url: String::new(),
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2245,12 +2064,7 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
 }
 
 fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
-    let mut allowed_agents = cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
-        .flat_map(|machine| machine.agents.iter().map(|agent| agent.actor_id.clone()))
-        .collect::<HashSet<_>>();
+    let mut allowed_agents = HashSet::new();
 
     if let Some(actors) = value.get("actors").and_then(Value::as_array) {
         for actor in actors {
@@ -2927,7 +2741,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_list_filter_hides_agents_from_other_machine_owners() {
+    fn actor_list_filter_ignores_local_machine_agents() {
         let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
@@ -2961,7 +2775,7 @@ mod tests {
             .filter_map(|actor| actor["id"].as_str())
             .collect::<Vec<_>>();
 
-        assert!(actor_ids.contains(&"actor_agent_mine"));
+        assert!(!actor_ids.contains(&"actor_agent_mine"));
         assert!(!actor_ids.contains(&"actor_agent_other"));
         assert!(actor_ids.contains(&"actor_service_other"));
     }
@@ -2975,13 +2789,10 @@ mod tests {
                 id: "default".into(),
                 name: "Local".into(),
                 server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: String::new(),
-                display_name: String::new(),
+                actor_id: "actor_human_88084".into(),
+                display_name: "actor_human_88084".into(),
             }],
-            machines: vec![MachineConfig {
-                agents: Vec::new(),
-                ..test_machine("machine_remote", Some("actor_human_88084"), "unused")
-            }],
+            machines: Vec::new(),
         };
         let value = json!({
             "actors": [

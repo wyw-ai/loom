@@ -225,10 +225,6 @@ export function App() {
     name: "Local",
     serverUrl: "ws://127.0.0.1:7878/rpc",
   });
-  const [machineForm, setMachineForm] = useState({
-    name: "Local Host",
-    dataRoot: "",
-  });
   const [agentForm, setAgentForm] = useState<AgentFormState>({
     machineId: "",
     providerId: "",
@@ -843,26 +839,6 @@ export function App() {
     try {
       await loadMachines(true);
       pushNotice("Agent host status refreshed");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function createMachine() {
-    const name = machineForm.name.trim();
-    if (!name) return;
-    setBusy("machine:create");
-    setError(null);
-    try {
-      const result = await ipc.machineCreate({
-        name,
-        dataRoot: machineForm.dataRoot.trim() || undefined,
-      });
-      applyMachines(result.machines);
-      setMachineForm({ name: "Local Host", dataRoot: "" });
-      pushNotice(`Agent host ${name} added`);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1591,13 +1567,10 @@ export function App() {
             <ErrorBanner error={error} />
             <SettingsView
               busy={busy}
-              machineForm={machineForm}
-              setMachineForm={setMachineForm}
               agentForm={agentForm}
               setAgentForm={setAgentForm}
               machines={machines}
               onCheckMachines={checkMachines}
-              onAddMachine={createMachine}
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
               onUpdateAgent={updateAgent}
@@ -4070,13 +4043,10 @@ function AccountField({
 
 function SettingsView({
   busy,
-  machineForm,
-  setMachineForm,
   agentForm,
   setAgentForm,
   machines,
   onCheckMachines,
-  onAddMachine,
   onRemoveMachine,
   onAddAgent,
   onUpdateAgent,
@@ -4084,13 +4054,10 @@ function SettingsView({
   onOpenLocalPath,
 }: {
   busy: string | null;
-  machineForm: { name: string; dataRoot: string };
-  setMachineForm: (form: { name: string; dataRoot: string }) => void;
   agentForm: AgentFormState;
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
   onCheckMachines: () => void;
-  onAddMachine: () => void;
   onRemoveMachine: (machineId: string) => void;
   onAddAgent: () => void;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
@@ -4098,7 +4065,6 @@ function SettingsView({
   onOpenLocalPath: (path: string) => void;
 }) {
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
-  const [hostComposerOpen, setHostComposerOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const memberEntries = agentMemberEntries(machines);
   const selectedMemberEntry =
@@ -4159,7 +4125,7 @@ function SettingsView({
                     Hosts
                   </div>
                   <div className="mt-1 text-sm font-bold text-[#111827]">
-                    {machines.length} configured
+                    {machines.length} reported
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -4177,63 +4143,14 @@ function SettingsView({
                       <RefreshCw size={15} />
                     )}
                   </Button>
-                  <Button
-                    variant={hostComposerOpen ? "secondary" : "outline"}
-                    size="icon"
-                    title={hostComposerOpen ? "Close add host" : "Add host"}
-                    onClick={() => setHostComposerOpen((open) => !open)}
-                    className="h-9 w-9 rounded-lg border-[#dfe3ec] bg-white"
-                  >
-                    {hostComposerOpen ? <X size={15} /> : <Plus size={15} />}
-                  </Button>
                 </div>
               </div>
             </div>
-            {hostComposerOpen && (
-              <form
-                className="border-b border-[#edf0f5] bg-white p-4"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  onAddMachine();
-                }}
-              >
-                <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                  <Plus size={13} />
-                  Add Host
-                </div>
-                <div className="space-y-2">
-                  <Input
-                    value={machineForm.name}
-                    onChange={(event) =>
-                      setMachineForm({ ...machineForm, name: event.target.value })
-                    }
-                    placeholder="Host name"
-                    className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                  />
-                  <Input
-                    value={machineForm.dataRoot}
-                    onChange={(event) =>
-                      setMachineForm({ ...machineForm, dataRoot: event.target.value })
-                    }
-                    placeholder="Data root"
-                    className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                  />
-                  <Button
-                    type="submit"
-                    className="w-full rounded-lg"
-                    disabled={busy === "machine:create" || !machineForm.name.trim()}
-                  >
-                    <Plus size={15} />
-                    Add Host
-                  </Button>
-                </div>
-              </form>
-            )}
             <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
               <div className="space-y-2">
                 {machines.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                    No hosts configured.
+                    No hosts reported.
                   </div>
                 ) : (
                   machines.map((machine) => (
@@ -4293,7 +4210,7 @@ function SettingsView({
                 onRemoveAgent={onRemoveAgent}
               />
             ) : (
-              <EmptyState icon={Server} text="No hosts configured." />
+              <EmptyState icon={Server} text="No hosts reported." />
             )}
           </div>
         </div>
@@ -4423,6 +4340,7 @@ function MachineCard({
   const selectedProvider = resolveAgentProvider(agentForm, machine);
   const modelChoices = selectedProvider?.modelChoices ?? [];
   const canCreateAgent = machineCanCreateAgent(machine);
+  const canRemoveMachine = machine.capabilities.includes("machine.remove");
   const agentReady = Boolean(
     canCreateAgent && selectedProvider && agentForm.name.trim(),
   );
@@ -4700,7 +4618,7 @@ function MachineCard({
               Permanently remove this host after its agents are deleted.
             </div>
           </div>
-          {!machine.readOnly ? (
+          {canRemoveMachine ? (
             <Button
               variant="destructive"
               size="sm"
@@ -4713,7 +4631,7 @@ function MachineCard({
               Delete Host
             </Button>
           ) : (
-            <Badge variant="warning">read only</Badge>
+            <Badge variant="warning">managed by server</Badge>
           )}
         </div>
       </HostDetailSection>

@@ -1188,12 +1188,27 @@ fn runtime_plan_from_manifest(
     bin: &Path,
     provider_ref: &AgentProviderRef,
 ) -> Result<ProviderRuntimePlan, String> {
-    let args = flatten_args_for_inventory(&mode.args);
-    let resume_args = mode
+    let arg_specs = expand_static_arg_specs(&mode.args, bin);
+    let args = flatten_args_for_inventory(&arg_specs);
+    let resume_arg_specs = mode
         .session
         .as_ref()
-        .map(|session| flatten_args_for_inventory(&session.resume_args))
+        .map(|session| expand_static_arg_specs(&session.resume_args, bin))
         .unwrap_or_default();
+    let resume_args = if resume_arg_specs.is_empty() {
+        Vec::new()
+    } else {
+        flatten_args_for_inventory(&resume_arg_specs)
+    };
+    let env = mode
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), expand_static_template(value, bin)))
+        .collect::<BTreeMap<_, _>>();
+    let stdin = mode
+        .stdin
+        .as_ref()
+        .map(|value| expand_static_template(value, bin));
 
     let plan = ProviderRuntimePlan {
         provider_id: manifest.id.clone(),
@@ -1205,8 +1220,8 @@ fn runtime_plan_from_manifest(
         },
         command: expand_static_command(&mode.command, bin),
         args: normalize_session_tokens(args),
-        arg_specs: mode.args.clone(),
-        env: mode.env.clone(),
+        arg_specs,
+        env,
         model: provider_ref
             .model
             .as_deref()
@@ -1226,18 +1241,37 @@ fn runtime_plan_from_manifest(
             } else {
                 Some(normalize_session_tokens(resume_args))
             },
-            resume_arg_specs: session.resume_args.clone(),
+            resume_arg_specs,
         }),
         output_format: output_format(&mode.stdout)?,
         decoder: Some(mode.stdout.clone()),
         prompt_via: PromptVia::Args,
         prompt: mode.prompt.clone(),
-        stdin: mode.stdin.clone(),
+        stdin,
         timeout_ms: mode.timeout_ms,
         idle_timeout_ms: mode.idle_timeout_ms,
     };
     validate_manifest(manifest)?;
     Ok(plan)
+}
+
+fn expand_static_arg_specs(specs: &[ProviderArgSpec], bin: &Path) -> Vec<ProviderArgSpec> {
+    specs
+        .iter()
+        .map(|spec| match spec {
+            ProviderArgSpec::Literal(value) => {
+                ProviderArgSpec::Literal(expand_static_template(value, bin))
+            }
+            ProviderArgSpec::Conditional { when, args } => ProviderArgSpec::Conditional {
+                when: when.clone(),
+                args: expand_static_arg_specs(args, bin),
+            },
+        })
+        .collect()
+}
+
+fn expand_static_template(value: &str, bin: &Path) -> String {
+    value.replace("{bin}", &bin.display().to_string())
 }
 
 fn append_literals(specs: &[ProviderArgSpec], out: &mut Vec<String>) {
@@ -2470,6 +2504,87 @@ mod tests {
             .session
             .as_ref()
             .is_some_and(|session| !session.resume_arg_specs.is_empty()));
+    }
+
+    #[test]
+    fn provider_runtime_plan_expands_bin_in_static_templates() {
+        let bin = Path::new("/tmp/demo-agent");
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![
+                lit("--bin"),
+                lit("{bin}"),
+                when("model", vec![lit("--model-bin"), lit("{bin}")]),
+                lit("{prompt.full}"),
+            ],
+            full_prompt(),
+            "text",
+            Some(ProviderSessionSpec {
+                id_source: Some(ProviderSessionIdSource::LoomUuid),
+                resume_args: vec![
+                    lit("--resume"),
+                    lit("{session.id}"),
+                    lit("{bin}"),
+                    lit("{prompt.full}"),
+                ],
+                scope: Some("actor_scope".into()),
+            }),
+        );
+        provider_mode
+            .env
+            .insert("PROVIDER_BIN".into(), "{bin}".into());
+        provider_mode.stdin = Some("stdin:{bin}:{prompt.full}".into());
+        let manifest = manifest(
+            "bin_templates",
+            "Bin Templates",
+            &["demo-agent"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        let plan = runtime_plan_from_manifest(
+            &manifest,
+            "print",
+            manifest.modes.get("print").unwrap(),
+            bin,
+            &AgentProviderRef {
+                id: "bin_templates".into(),
+                mode: Some("print".into()),
+                model: Some("demo-model".into()),
+                reasoning_effort: None,
+            },
+        )
+        .expect("runtime plan");
+        let bin_text = bin.display().to_string();
+        let expected_stdin = format!("stdin:{bin_text}:{{prompt.full}}");
+
+        assert_eq!(plan.command, bin_text);
+        assert!(plan.args.contains(&bin_text));
+        assert_eq!(
+            plan.env.get("PROVIDER_BIN").map(String::as_str),
+            Some(bin_text.as_str())
+        );
+        assert_eq!(plan.stdin.as_deref(), Some(expected_stdin.as_str()));
+        assert!(plan.arg_specs.iter().any(|arg| matches!(
+            arg,
+            ProviderArgSpec::Conditional { args, .. }
+                if args.iter().any(|item| matches!(item, ProviderArgSpec::Literal(value) if value == &bin_text))
+        )));
+        let session = plan.session.as_ref().expect("session");
+        assert!(
+            session
+                .resume_args
+                .as_ref()
+                .is_some_and(|args| args.contains(&bin_text)),
+            "resume_args should expand bin"
+        );
+        assert!(
+            session
+                .resume_arg_specs
+                .iter()
+                .any(|arg| matches!(arg, ProviderArgSpec::Literal(value) if value == &bin_text)),
+            "resume_arg_specs should expand bin"
+        );
     }
 
     #[test]

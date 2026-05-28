@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config::{
-    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount,
-    MachineAgentConfig, MachineConfig, Workspace,
+    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount, MachineConfig,
+    Workspace,
 };
 use crate::forward;
 use crate::state::AppState;
@@ -1284,8 +1284,6 @@ pub async fn machine_create(
         name: name.to_string(),
         kind: "local".into(),
         data_root: data_root_expr,
-        providers: Vec::new(),
-        agents: Vec::new(),
     });
     config::save(&cfg).map_err(stringify)?;
     machines_from_config(&cfg, state.try_client().await).await
@@ -1462,11 +1460,7 @@ async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[Str
 }
 
 fn actor_ids_for_machine(machine: &MachineConfig) -> Vec<String> {
-    let mut actor_ids = vec![machine_connection_actor_id(machine)];
-    actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
-    actor_ids.sort();
-    actor_ids.dedup();
-    actor_ids
+    vec![machine_connection_actor_id(machine)]
 }
 
 fn stringify(e: anyhow::Error) -> String {
@@ -1513,8 +1507,6 @@ struct RemoteMachineMeta {
     providers: Vec<DetectedAgentProvider>,
     #[serde(default, rename = "agentSpecs")]
     agent_specs: Vec<AgentSpec>,
-    #[serde(default)]
-    agents: Vec<MachineAgentConfig>,
     capabilities: Vec<String>,
     revision: u64,
     observed_at: String,
@@ -1538,7 +1530,7 @@ async fn merge_server_machine_inventory(
     for actor in actors {
         if let Some(meta) = remote_machine_meta_from_actor(actor) {
             if is_legacy_remote_machine_inventory(&meta) {
-                cleanup_legacy_remote_machine_inventory(client, actor, &meta).await;
+                cleanup_legacy_remote_machine_inventory(client, actor).await;
                 continue;
             }
         }
@@ -1730,12 +1722,7 @@ fn server_machine_info_from_actor(
     for provider in &mut providers {
         provider.actor_count += agent_specs
             .iter()
-            .filter(|spec| {
-                spec.provider_ref
-                    .as_ref()
-                    .map(|provider_ref| provider_ref.id.as_str() == provider.id.as_str())
-                    .unwrap_or(false)
-            })
+            .filter(|spec| spec.provider_ref.id.as_str() == provider.id.as_str())
             .count();
     }
     let agents: Vec<MachineAgentInfo> = agent_specs
@@ -1835,31 +1822,12 @@ fn is_legacy_remote_machine_inventory(meta: &RemoteMachineMeta) -> bool {
         && meta.machine_id.contains("_actor_human_")
 }
 
-async fn cleanup_legacy_remote_machine_inventory(
-    client: &Arc<Client>,
-    actor: &Value,
-    meta: &RemoteMachineMeta,
-) {
+async fn cleanup_legacy_remote_machine_inventory(client: &Arc<Client>, actor: &Value) {
     let mut actor_ids = Vec::new();
     if let Some(actor_id) = actor.get("id").and_then(Value::as_str) {
         actor_ids.push(actor_id.to_string());
     }
-    actor_ids.extend(
-        meta.agents
-            .iter()
-            .map(|agent| agent.actor_id.clone())
-            .filter(|actor_id| !is_supported_remote_actor_id(actor_id)),
-    );
     delete_actors_from_server(Some(client.clone()), &actor_ids).await;
-}
-
-fn is_supported_remote_actor_id(actor_id: &str) -> bool {
-    let trimmed = actor_id.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 64
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
 }
 
 async fn temporary_machine_check_client(cfg: &DesktopConfig) -> Option<Arc<Client>> {
@@ -2309,7 +2277,7 @@ mod tests {
         })
     }
 
-    fn test_machine(id: &str, owner_actor_id: Option<&str>, agent_actor_id: &str) -> MachineConfig {
+    fn test_machine(id: &str, owner_actor_id: Option<&str>) -> MachineConfig {
         MachineConfig {
             workspace_id: Some("default".into()),
             owner_actor_id: owner_actor_id.map(ToString::to_string),
@@ -2317,17 +2285,6 @@ mod tests {
             name: id.into(),
             kind: "local".into(),
             data_root: "~/.agentx".into(),
-            providers: Vec::new(),
-            agents: vec![MachineAgentConfig {
-                provider_id: "codex".into(),
-                actor_id: agent_actor_id.into(),
-                name: agent_actor_id.into(),
-                description: String::new(),
-                model: String::new(),
-                reasoning_effort: String::new(),
-                autostart: false,
-                avatar_url: String::new(),
-            }],
         }
     }
 
@@ -2420,8 +2377,8 @@ mod tests {
                 display_name: account_display_name(&account),
             }],
             machines: vec![
-                test_machine("mine", Some(account.actor_id.as_str()), "actor_agent_mine"),
-                test_machine("other", Some("actor_human_other"), "actor_agent_other"),
+                test_machine("mine", Some(account.actor_id.as_str())),
+                test_machine("other", Some("actor_human_other")),
             ],
         };
         let value = json!({

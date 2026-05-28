@@ -1,20 +1,15 @@
-//! Local agent CLI discovery and provider-spec synthesis.
+//! Local agent CLI discovery.
 //!
 //! This module is intentionally small and side-effect free except for reading
-//! `PATH`. The GUI uses it to present supported local CLIs, while `loom-daemon`
-//! uses the same provider profiles to build runtime `AgentSpec`s from machine
-//! config without requiring on-disk provider JSON specs.
+//! `PATH`. The GUI and `loom-daemon` use it to present the provider inventory
+//! exposed by the daemon-local ProviderManifest registry.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
 
-use proto::methods::{
-    AgentActorDefaults, AgentActorSpec, AgentModelChoice, AgentModelSpec, AgentProviderInfo,
-    AgentProviderRef, AgentProviderSpec, AgentSpec, AgentTransport,
-};
+use proto::methods::{AgentModelChoice, AgentProviderRef, AgentTransport};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,97 +29,11 @@ pub struct DetectedAgentProvider {
     pub model_choices: Vec<AgentModelChoice>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProviderOverride {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentDefinition {
-    pub provider_id: String,
-    pub actor_id: String,
-    pub display_name: String,
-    pub description: Option<String>,
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub autostart: bool,
-    pub avatar_url: Option<String>,
-}
-
 pub fn detect_agent_cli_providers() -> Vec<DetectedAgentProvider> {
     detect_agent_cli_providers_in_path_with_config_dir(
         std::env::var_os("PATH").unwrap_or_default(),
         &crate::provider::loom_config_dir(),
     )
-}
-
-pub fn provider_specs_from_agent_definitions(
-    providers: &[DetectedAgentProvider],
-    definitions: &[AgentDefinition],
-) -> Vec<AgentProviderSpec> {
-    let mut specs = Vec::new();
-    for provider in providers {
-        let actors = definitions
-            .iter()
-            .filter(|definition| definition.provider_id == provider.id)
-            .map(|definition| actor_spec_from_definition(provider, definition))
-            .collect::<Vec<_>>();
-        if actors.is_empty() {
-            continue;
-        }
-        specs.push(provider.to_provider_spec(actors));
-    }
-    specs
-}
-
-pub fn apply_provider_overrides(
-    mut providers: Vec<DetectedAgentProvider>,
-    overrides: &[AgentProviderOverride],
-) -> Vec<DetectedAgentProvider> {
-    for override_config in overrides {
-        let Some(provider) = providers
-            .iter_mut()
-            .find(|provider| provider.id == override_config.id)
-        else {
-            continue;
-        };
-        if let Some(command) = override_config
-            .command
-            .as_deref()
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-        {
-            provider.command = command.to_string();
-            provider.transport.command = command.to_string();
-        }
-        if let Some(args) = &override_config.args {
-            provider.args = args.clone();
-            provider.transport.args = args.clone();
-        }
-        provider.transport_env.extend(
-            override_config
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
-        provider.transport.env.extend(override_config.env.clone());
-    }
-    providers
-}
-
-pub fn resolve_provider_ref_in_spec(spec: &mut AgentSpec) -> Result<(), String> {
-    let Some(provider_ref) = spec.provider_ref.clone() else {
-        return Ok(());
-    };
-    spec.transport = crate::provider::default_registry()?.resolve_transport(&provider_ref)?;
-    Ok(())
 }
 
 impl DetectedAgentProvider {
@@ -141,78 +50,6 @@ impl DetectedAgentProvider {
             transport.model = self.default_model.clone();
         }
         transport
-    }
-
-    pub fn to_provider_spec(&self, actors: Vec<AgentActorSpec>) -> AgentProviderSpec {
-        AgentProviderSpec {
-            provider: AgentProviderInfo {
-                id: self.id.clone(),
-                display_name: self.display_name.clone(),
-            },
-            transport: self.transport(),
-            defaults: AgentActorDefaults {
-                autostart: false,
-                models: model_spec(self.default_model.as_deref(), &self.model_choices),
-                bundle: None,
-                identity: None,
-                memory: None,
-                announcement: None,
-            },
-            actors,
-        }
-    }
-}
-
-fn actor_spec_from_definition(
-    provider: &DetectedAgentProvider,
-    definition: &AgentDefinition,
-) -> AgentActorSpec {
-    let mut meta = BTreeMap::new();
-    meta.insert("providerId".into(), json!(provider.id.clone()));
-    meta.insert("providerName".into(), json!(provider.display_name.clone()));
-    meta.insert(
-        "transportKind".into(),
-        json!(provider.transport_kind.clone()),
-    );
-    meta.insert("createdBy".into(), json!("loom-daemon"));
-    if let Some(reasoning_effort) = definition
-        .reasoning_effort
-        .as_deref()
-        .map(str::trim)
-        .filter(|reasoning_effort| !reasoning_effort.is_empty())
-    {
-        meta.insert("reasoningEffort".into(), json!(reasoning_effort));
-    }
-    if let Some(avatar_url) = definition
-        .avatar_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|avatar_url| !avatar_url.is_empty())
-    {
-        meta.insert("avatarUrl".into(), json!(avatar_url));
-    }
-    if let Some(description) = definition
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    {
-        meta.insert("description".into(), json!(description));
-    }
-
-    AgentActorSpec {
-        id: definition.actor_id.clone(),
-        display_name: Some(definition.display_name.clone()),
-        capabilities: None,
-        meta: Some(meta),
-        transport: None,
-        autostart: Some(definition.autostart),
-        model: definition.model.clone(),
-        models: None,
-        bundle: None,
-        identity: None,
-        memory: None,
-        announcement: None,
     }
 }
 
@@ -263,16 +100,6 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
             }
         })
         .collect()
-}
-
-fn model_spec(default: Option<&str>, choices: &[AgentModelChoice]) -> Option<AgentModelSpec> {
-    if default.is_none() && choices.is_empty() {
-        return None;
-    }
-    Some(AgentModelSpec {
-        default: default.map(ToOwned::to_owned),
-        choices: choices.to_vec(),
-    })
 }
 
 #[cfg(test)]
@@ -412,121 +239,5 @@ mod tests {
         assert!(opencode.args.contains(&"{prompt.full}".into()));
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
-    }
-
-    #[test]
-    fn builds_provider_specs_from_machine_agent_definitions() {
-        let provider = DetectedAgentProvider {
-            id: "codex".into(),
-            display_name: "Codex CLI".into(),
-            command: "/bin/codex".into(),
-            transport_kind: "command".into(),
-            args: vec![
-                "exec".into(),
-                "--skip-git-repo-check".into(),
-                "--sandbox".into(),
-                "danger-full-access".into(),
-                "-c".into(),
-                "sandbox_workspace_write.network_access=true".into(),
-                "--add-dir".into(),
-                "/tmp/loom-config".into(),
-            ],
-            transport_env: BTreeMap::new(),
-            transport: AgentTransport {
-                kind: "command".into(),
-                command: "/bin/codex".into(),
-                args: vec![
-                    "exec".into(),
-                    "--skip-git-repo-check".into(),
-                    "--sandbox".into(),
-                    "danger-full-access".into(),
-                    "-c".into(),
-                    "sandbox_workspace_write.network_access=true".into(),
-                    "--add-dir".into(),
-                    "/tmp/loom-config".into(),
-                ],
-                env: BTreeMap::from([("LOOM_NO_DAEMON".into(), "1".into())]),
-                ..Default::default()
-            },
-            default_model: None,
-            model_choices: Vec::new(),
-        };
-        let specs = provider_specs_from_agent_definitions(
-            &[provider],
-            &[AgentDefinition {
-                provider_id: "codex".into(),
-                actor_id: "actor_agent_builder".into(),
-                display_name: "Builder".into(),
-                description: Some("Builds patches".into()),
-                model: None,
-                reasoning_effort: None,
-                autostart: true,
-                avatar_url: None,
-            }],
-        );
-
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].provider.id, "codex");
-        assert_eq!(specs[0].actors[0].id, "actor_agent_builder");
-        assert_eq!(
-            specs[0].transport.args,
-            vec![
-                "exec",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "danger-full-access",
-                "-c",
-                "sandbox_workspace_write.network_access=true",
-                "--add-dir",
-                "/tmp/loom-config"
-            ]
-        );
-        assert_eq!(
-            specs[0]
-                .transport
-                .env
-                .get("LOOM_NO_DAEMON")
-                .map(String::as_str),
-            Some("1")
-        );
-    }
-
-    #[test]
-    fn provider_overrides_replace_command_args_and_merge_env() {
-        let providers = vec![DetectedAgentProvider {
-            id: "codex".into(),
-            display_name: "Codex CLI".into(),
-            command: "/usr/bin/codex".into(),
-            transport_kind: "command".into(),
-            args: vec!["exec".into(), "--skip-git-repo-check".into()],
-            transport_env: BTreeMap::new(),
-            transport: AgentTransport::default(),
-            default_model: None,
-            model_choices: Vec::new(),
-        }];
-        let providers = apply_provider_overrides(
-            providers,
-            &[AgentProviderOverride {
-                id: "codex".into(),
-                command: Some("/bin/bash".into()),
-                args: Some(vec![
-                    "-lc".into(),
-                    "vpn && exec codex \"$@\"".into(),
-                    "loom-codex".into(),
-                ]),
-                env: BTreeMap::from([("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into())]),
-            }],
-        );
-        let provider = &providers[0];
-        assert_eq!(provider.command, "/bin/bash");
-        assert_eq!(
-            provider.args,
-            vec!["-lc", "vpn && exec codex \"$@\"", "loom-codex"]
-        );
-        let transport = provider.transport();
-        assert_eq!(
-            transport.env.get("HTTPS_PROXY").map(String::as_str),
-            Some("http://127.0.0.1:7890")
-        );
     }
 }

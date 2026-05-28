@@ -237,6 +237,7 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
     if manifest.id.trim().is_empty() {
         return Err("provider id is required".into());
     }
+    validate_provider_id(&manifest.id)?;
     if manifest.modes.is_empty() {
         return Err(format!(
             "provider `{}` must define at least one mode",
@@ -256,9 +257,68 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
                 manifest.id
             ));
         }
+        validate_mode_command(manifest, mode_name, mode)?;
         validate_prompt_references(manifest, mode_name, mode)?;
     }
     Ok(())
+}
+
+fn validate_provider_id(id: &str) -> Result<(), String> {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return Err("provider id is required".into());
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "provider id `{id}` must start with a lowercase ascii letter or digit"
+        ));
+    }
+    if !chars
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(format!(
+            "provider id `{id}` may only contain lowercase ascii letters, digits, `_`, `-`, or `.`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mode_command(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    mode: &ProviderModeSpec,
+) -> Result<(), String> {
+    let command = mode.command.trim();
+    if command == "{bin}" {
+        if manifest.detect.candidates.is_empty() {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` uses `{{bin}}` but detect.candidates is empty",
+                manifest.id
+            ));
+        }
+        return Ok(());
+    }
+    if command.contains('{') || command.contains('}') {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` command may only use the `{{bin}}` template",
+            manifest.id
+        ));
+    }
+    if Path::new(command).components().count() > 1 {
+        return Ok(());
+    }
+    if manifest
+        .detect
+        .candidates
+        .iter()
+        .any(|candidate| candidate == command)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "provider `{}` mode `{mode_name}` command `{command}` must be `{{bin}}`, an explicit path, or one of detect.candidates",
+        manifest.id
+    ))
 }
 
 pub fn builtin_provider_manifests() -> Vec<ProviderManifest> {
@@ -2013,6 +2073,120 @@ mod tests {
 
         let err = validate_manifest(&manifest).expect_err("missing prompt should fail");
         assert!(err.contains("must pass one prompt output"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unstable_provider_id() {
+        let manifest = manifest(
+            "Bad Provider",
+            "Bad Provider",
+            &["bad-provider"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("bad provider id should fail");
+        assert!(err.contains("provider id `Bad Provider`"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_command_not_bound_to_detect_or_path() {
+        let manifest = manifest(
+            "bad_command",
+            "Bad Command",
+            &["safe-agent"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "other-agent",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("unbound command should fail");
+        assert!(
+            err.contains("command `other-agent` must be `{bin}`, an explicit path, or one of detect.candidates"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manifest_validation_allows_candidate_command_and_explicit_path() {
+        let candidate_command = manifest(
+            "candidate_command",
+            "Candidate Command",
+            &["candidate-agent"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "candidate-agent",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+        validate_manifest(&candidate_command).expect("candidate command should pass");
+
+        let explicit_path = manifest(
+            "explicit_path",
+            "Explicit Path",
+            &[],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "/opt/loom/providers/agent",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+        validate_manifest(&explicit_path).expect("explicit path should pass");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_non_bin_command_template() {
+        let manifest = manifest(
+            "bad_command_template",
+            "Bad Command Template",
+            &["bad-command-template"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{loom.configDir}/provider",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("command template should fail");
+        assert!(
+            err.contains("command may only use the `{bin}` template"),
+            "{err}"
+        );
     }
 
     #[test]

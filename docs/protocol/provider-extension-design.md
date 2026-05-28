@@ -1022,6 +1022,8 @@ Provider variant，用 `extends` 继承已有 Provider，再覆盖 mode：
 Provider manifest 使用前必须校验：
 
 - `id` 必须稳定、小写、唯一。
+- schema 必须严格；未知字段必须失败。这个规则同样适用于 `extends` patch 的
+  顶层、mode、args/env/prompt patch 结构，避免 typo 被 merge 阶段静默吞掉。
 - `command` 必须来自 `detect.candidates` 的解析结果，或者是显式路径。
 - 模板只能引用已知变量，除非开启显式 allow unknown。
 - command mode 下至少一个 `{prompt.<name>}` 必须出现在

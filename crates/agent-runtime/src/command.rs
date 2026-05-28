@@ -1958,9 +1958,9 @@ fn append_arg_specs(
             ProviderArgSpec::Literal(value) => {
                 out.push(expand_template(value, cfg, request, session_id, prompt));
             }
-            ProviderArgSpec::Conditional { when, args } => {
-                if arg_condition_matches(when, request) {
-                    append_arg_specs(out, args, cfg, request, session_id, prompt);
+            ProviderArgSpec::Conditional(spec) => {
+                if arg_condition_matches(&spec.when, request) {
+                    append_arg_specs(out, &spec.args, cfg, request, session_id, prompt);
                 }
             }
         }
@@ -2154,6 +2154,7 @@ fn _arc_keepalive(_: Arc<CommandAdapter>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::methods::ProviderConditionalArgSpec;
     use proto::methods::{ProviderDecoderEventSpec, ProviderJsonlReduceSpec};
     use proto::types::ScopeKind;
 
@@ -2300,20 +2301,20 @@ mod tests {
         cfg.model_args = vec!["--legacy-model".into(), "{model}".into()];
         cfg.arg_specs = vec![
             ProviderArgSpec::Literal("run".into()),
-            ProviderArgSpec::Conditional {
+            ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
                 when: "model".into(),
                 args: vec![
                     ProviderArgSpec::Literal("--model".into()),
                     ProviderArgSpec::Literal("{model}".into()),
                 ],
-            },
-            ProviderArgSpec::Conditional {
+            }),
+            ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
                 when: "reasoningEffort".into(),
                 args: vec![
                     ProviderArgSpec::Literal("--effort".into()),
                     ProviderArgSpec::Literal("{reasoningEffort}".into()),
                 ],
-            },
+            }),
             ProviderArgSpec::Literal("{prompt.full}".into()),
         ];
         let mut request = prompt("fallback prompt");
@@ -2345,13 +2346,13 @@ mod tests {
         let mut cfg = cfg();
         cfg.arg_specs = vec![
             ProviderArgSpec::Literal("run".into()),
-            ProviderArgSpec::Conditional {
+            ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
                 when: "model".into(),
                 args: vec![
                     ProviderArgSpec::Literal("--model".into()),
                     ProviderArgSpec::Literal("{model}".into()),
                 ],
-            },
+            }),
             ProviderArgSpec::Literal("{prompt.full}".into()),
         ];
         let mut request = prompt("fallback prompt");

@@ -27,12 +27,7 @@ pub fn list() -> Result<()> {
         return Ok(());
     }
     for a in res.agents {
-        let provider = a
-            .spec
-            .provider_ref
-            .as_ref()
-            .map(|provider_ref| provider_ref.id.as_str())
-            .unwrap_or("-");
+        let provider = a.spec.provider_ref.id.as_str();
         println!(
             "{}\t{}\tstatus={}\tprovider={}",
             a.spec.actor.id, a.spec.actor.display_name, a.status, provider,

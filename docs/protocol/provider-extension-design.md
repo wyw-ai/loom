@@ -873,7 +873,7 @@ built-in ProviderManifest
 | `AgentProviderSpec.provider + transport + actors[]` | provider 接入规则和多个 actor 混在一起 | 拆成 ProviderManifest + 多个 AgentSpec |
 | `AgentSpec.transport` | 每个 agent 复制 command/args/parser/session | 删除；改为 `providerRef` 指向 ProviderManifest |
 | `MachineConfig.providers[]` / `AgentProviderOverride` | GUI/server 可能把 provider override 当成跨端事实源 | 改为 daemon-local ProviderManifest，必要时用 `extends` 或 custom provider id |
-| `MachineConfig.agents[]` / `MachineAgentConfig` | GUI agent 信息和 daemon AgentSpec 重复 | 由 daemon 迁移成 AgentSpec；GUI 只看 daemon inventory |
+| `MachineConfig.agents[]` / `MachineAgentConfig` | GUI agent 信息和 daemon AgentSpec 重复 | 不再作为运行时输入；历史配置如需保留，应显式导入成 daemon-owned AgentSpec |
 | `AgentDefinition` | MachineAgentConfig 到 AgentSpec 的中间展开结构 | 删除；daemon command 直接生成/更新 AgentSpec |
 | runtime session id | 容易被误写入 spec | 写入 runtime state，由 session 策略生成或从输出捕获 |
 
@@ -1056,16 +1056,16 @@ loom provider doctor <provider_id>
 7. 增加最终版 AgentSpec `providerRef`，daemon 创建/编辑 agent 时写入自己的
    `{loom.configDir}/agents/<actor_id>/spec.json`；GUI 只发 machine command 并等待
    daemon inventory 刷新。
-8. 提供 daemon 侧一次性导入工具，把现有 `MachineConfig.agents[]` 和
-   `MachineConfig.providers[]` 转换成 AgentSpec 与 daemon-local ProviderManifest
-   variant。导入完成后，daemon 新写入路径只使用新模型。
-9. 删除 GUI/server 内对 `MachineConfig.providers[]`、`MachineConfig.agents[]` 的展示和
+8. 删除 GUI/server 内对 `MachineConfig.providers[]`、`MachineConfig.agents[]` 的展示和
    写入依赖；删除 runtime 内对 `AgentProviderSpec.provider + transport + actors[]`、
    `AgentSpec.transport` 的依赖。
+9. 如必须承接历史安装，可单独提供显式离线导入命令，把旧
+   `MachineConfig.agents[]` / `MachineConfig.providers[]` 转成 daemon-owned AgentSpec
+   与 ProviderManifest variant。这个命令不属于 daemon 正常启动路径。
 
-一次性导入工具只服务已有 daemon 配置升级；新 runtime 不做新旧配置双读，也不维护旧配置
-到新配置的运行时覆盖优先级。导入完成后，对单台 daemon 而言，ProviderManifest、
-AgentSpec 和 runtime state 才是唯一生效边界；GUI/server 只消费 daemon inventory。
+新 runtime 不做新旧配置双读，也不维护旧配置到新配置的运行时覆盖优先级。对单台
+daemon 而言，ProviderManifest、AgentSpec 和 runtime state 才是唯一生效边界；
+GUI/server 只消费 daemon inventory。
 
 ## 待定问题
 

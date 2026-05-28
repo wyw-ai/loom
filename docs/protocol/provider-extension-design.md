@@ -4,6 +4,30 @@
 尽量数据驱动，而不是继续把 provider id、启动参数和输出解析逻辑硬编码在
 Rust 里。
 
+## 对原有功能的影响
+
+这个设计不是纯内部重构，会有明确的顶层配置边界变化。先列出影响，避免后文只讨论
+Provider manifest 时忽略 Loom 原有能力。
+
+| 原有功能/边界 | 影响 | 设计结论 |
+| --- | --- | --- |
+| agent 启动与 provider discovery | 从 `provider id -> Rust hardcode` 改成 `ProviderManifest -> ProviderRuntimePlan` | 行为应由内置 manifest 复刻，启动入口不再按 provider id 分支。 |
+| AgentSpec | 不再保存完整 `transport` | AgentSpec 只保存 actor 身份、identity/memory/bundle、trigger/promptTemplate、providerRef 和选中的 model。 |
+| `desktop.toml` / machine config | 不再作为 agent/provider 配置源 | 只保存 workspace、server、machine、dataRoot 等宿主信息。agent 配置写入 `{loom.configDir}/agents/<actor_id>/spec.json`。 |
+| machine-level provider override | 被移除 | 用本地 ProviderManifest variant + `extends` 表达，不再在 machine config 里覆盖 command/args/env。 |
+| prompt 拼装 | 从单一 envelope 改成结构化 prompt parts | Loom 仍负责生成 identity、soul、memory、Loom 规则、latest message、handoff/task context；Provider 只决定这些 parts 怎么映射到 system/user/full。 |
+| handoff/task 触发语义 | 不改变 | `trigger_prefix`、`promptTemplate`、latest message、assignment context 仍由 Loom composer 产生；manifest 不能自己改写业务语义。 |
+| run trace 与 GUI 可见消息 | 不改变 | Provider stdout 仍进 run trace；GUI 可见消息仍来自 agent 显式 `loom message send`，或部署显式开启的 auto-publish。 |
+| AdapterEvent 边界 | 不改变 | `Text/ToolUse/Status/Finished/Error/ActionRequest` 仍是 adapter 到 Loom runtime 的公共事件；Provider session 捕获是 Provider runtime 内部事件，不扩展 GUI message 语义。 |
+| session/resume | 存储位置会改变 | session id 只进入 runtime state；由 `loom_uuid` 生成或由 decoder 内部捕获，不写 AgentSpec/machine config。 |
+| model/reasoning 选择 | 配置归属会改变 | ProviderManifest 提供 provider 级模型菜单和 argv/env 映射；AgentSpec 只记录具体 agent 选中的 model/reasoningEffort。 |
+| ServiceSpec / service 插件 | 不受影响 | service 进程仍由 ServiceSpec 管理，不进入 ProviderManifest 体系。 |
+
+因此这个方案会打破旧配置面的长期生效方式，但不改变 Loom 的核心运行模型：
+actor/scope/message/run trace、显式 `loom message send`、AdapterEvent 翻译层、
+ServiceSpec 都应保持原语义。已有配置通过一次性导入工具转换；新 runtime 不维护新旧
+配置双读或覆盖优先级。
+
 ## 问题
 
 当前一个 Provider 实际承担两类职责，但两者都部分硬编码：
@@ -20,15 +44,16 @@ Provider 的契约应该显式表达两个点：
 
 1. Loom 如何启动 Provider，以及如何把 Loom 拼好的 prompt 映射到 Provider
    的命令、参数、stdin 或 env。
-2. Loom 如何解析 Provider 的 stdout/stderr，并转换成内部 AdapterEvent。
+2. Loom 如何解析 Provider 的 stdout/stderr，转换成 `ProviderRuntimeEvent`；其中
+   文本、工具、状态、错误和完成事件再映射成现有 AdapterEvent。
 
-这里的“prompt”不应该只是一个已经拼死的 `{loom.envelope}` 字符串。Loom 应该先
+这里的“prompt”不应该只是一个已经拼死的单一大字符串。Loom 应该先
 产出一组结构化 prompt parts，再由 Provider 决定这些 parts 如何组合、哪些进入
 system prompt、哪些进入 user prompt、是否插入分隔符、顺序如何排列。
 
-## 需要保留的现有行为
+## Loom 顶层边界
 
-Loom 仍然拥有 prompt 内容生成逻辑。Provider spec 不负责自己生成 identity、
+Loom 仍然拥有 prompt 内容生成逻辑。ProviderManifest 不负责自己生成 identity、
 memory、handoff 或 assignment 内容。daemon 会先生成一组结构化 prompt parts，
 例如 actor identity、profile identity/soul、Loom 规则、当前时间、最近消息、
 最新 handoff/task message 等。Provider 负责决定这些 parts 的顺序、拼接方式，
@@ -36,7 +61,8 @@ memory、handoff 或 assignment 内容。daemon 会先生成一组结构化 prom
 
 Provider stdout 默认仍然只进入 run trace。Provider 结果是否成为 GUI 可见消息，
 应继续由 Loom 策略决定：默认必须由 agent 显式调用 `loom message send`；只有
-部署显式开启 auto-publish 时，最终文本才会自动发布成可见消息。
+部署显式开启 auto-publish 时，最终文本才会自动发布成可见消息。auto-publish 是
+Loom runtime / actor policy，不属于 ProviderManifest。
 
 ## 建议 Schema
 
@@ -82,29 +108,8 @@ Provider stdout 默认仍然只进入 run trace。Provider 结果是否成为 GU
         "-p", "{prompt.user}"
       ],
       "stdout": {
-        "format": "jsonl",
-        "events": [
-          {
-            "when": { "path": "$.type", "equals": "assistant" },
-            "emit": {
-              "type": "text",
-              "forEach": "$.message.content[*]",
-              "when": { "path": "$.type", "equals": "text" },
-              "text": "$.text",
-              "partial": false
-            }
-          },
-          {
-            "when": { "path": "$.type", "equals": "assistant" },
-            "emit": {
-              "type": "tool_use",
-              "forEach": "$.message.content[*]",
-              "when": { "path": "$.type", "equals": "tool_use" },
-              "name": "$.name",
-              "input": "$.input"
-            }
-          }
-        ]
+        "format": "builtin",
+        "name": "claude_stream_json"
       },
       "session": {
         "idSource": "loom_uuid",
@@ -125,17 +130,17 @@ Provider stdout 默认仍然只进入 run trace。Provider 结果是否成为 GU
 关键点是 `modes.print.args` 表达完整 argv 模板，同时 `modes.print.prompt.outputs`
 表达 prompt parts 的组合方式。manifest 可以把 `{prompt.system}`、
 `{prompt.user}`、`{prompt.full}` 或任意命名 prompt 输出放在任意位置，因此 Loom
-不再需要对 `-p`、末尾追加 prompt、stdin 或 env prompt 做 provider 特殊逻辑，
-只需要保留少量向后兼容能力。
+不再需要对 `-p`、末尾追加 prompt、stdin 或 env prompt 做 provider 特殊逻辑。
 
 `models` 只描述 UI 和默认模型选择；模型是否进入 CLI 参数，也由 mode 的
 `args`/`env`/`stdin` 模板显式决定。也就是说，`--model {model}` 不应该藏在
-另一个隐式 `modelArgs` 分支里。过渡期可以把现有 `transport.modelArgs` 编译进
-manifest，但新 manifest 应以 argv 模板为准。
+另一个隐式分支里。
 
 本地 Provider 可以通过 `extends` 继承内置 Provider，再用同一套 patch 语义覆盖
 mode。这样 `MachineConfig.providers[]` 这种 command/args/env 局部覆盖不需要继续
 作为独立配置面存在。
+没有 `extends` 时，`modes.<name>` 是完整 Provider mode；存在 `extends` 时，
+`modes.<name>` 可以是 `ModePatch`，只覆盖被声明的字段。
 
 `detect.candidates` 是最小检测方式。内置 Provider 还应在测试里固定一组 help/version
 样本，防止 CLI 升级后参数名变化但 manifest 仍然静默通过。自定义 Provider 可以先只
@@ -163,7 +168,7 @@ mode 选择应该由 AgentSpec 或 Provider 默认值显式决定。GUI 创建�
 Loom prompt composer 应输出结构化 parts，而不是只输出一个字符串。建议最小集合：
 
 ```text
-trigger_prefix      兼容现有 AgentSpec triggerPromptPrefix
+trigger_prefix      AgentSpec triggerPromptPrefix
 actor_context       Loom 注入的 actor id/display identity
 identity            profile identity.md
 soul                profile soul.md
@@ -173,9 +178,8 @@ turn_memory         本 turn 选中的 memory
 runtime_context     本地时间、最近消息等运行时上下文
 latest_message      Latest Loom message，含路由、scope、task 元信息
 assignment_context  task assignment 的权威 JSON 上下文；非 task 场景为空
-turn_input          兼容现有 user_text，包含 prompt_template 包装后的 latest_message
-                    + assignment_context
-user_message        turn_input 的兼容别名
+turn_input          prompt_template 包装后的 latest_message + assignment_context
+user_message        turn 侧输入，等价于 trigger_prefix + turn_input
 ```
 
 每个 part 至少包含：
@@ -190,8 +194,7 @@ user_message        turn_input 的兼容别名
 ```
 
 `part.content` 应该是未包标题的正文，标题由 `part.title` 和输出的 `renderTitle`
-决定，避免 Provider 模板里再手写一次标题导致重复。为了兼容旧实现，Loom 可以在
-迁移期继续保留 legacy envelope 文本，但新 composer 应尽量输出 raw content +
+决定，避免 Provider 模板里再手写一次标题导致重复。composer 输出 raw content +
 metadata。
 
 Provider manifest 可以把这些 parts 组合成任意命名 prompt 输出。输出支持三种写法：
@@ -221,19 +224,18 @@ Provider manifest 可以把这些 parts 组合成任意命名 prompt 输出。�
 建议内置 preset：
 
 ```text
-loom_system  trigger_prefix + actor_context + identity + soul
-             + bootstrap_memory + scope_bootstrap + turn_memory + runtime_context
-loom_turn    turn_input，保留现有 prompt_template 行为
+loom_system  actor_context + identity + soul + bootstrap_memory
+             + scope_bootstrap + turn_memory + runtime_context
+loom_turn    user_message，承载 trigger_prefix 和 prompt_template 行为
 loom_full    loom_system + loom_turn，等价于当前单字符串 envelope 的语义
 ```
 
 preset 不是黑盒。Provider 可以改用 `include` 或 `template` 完全控制顺序；未来 Loom
 新增 part 时，只需要更新 preset，旧 Provider 不会被迫修改 manifest。
 
-如果 manifest 没有声明 `prompt.outputs`，Loom 应自动提供一个兼容输出：
-`full = loom_full`。这保证旧 `AgentTransport` 或最小自定义 Provider 仍然能通过
-`{loom.envelope}` / `{prompt.full}` 获得当前语义。只要 manifest 显式引用了不存在的
-`{prompt.<name>}`，校验就应该失败。
+如果 manifest 没有声明 `prompt.outputs`，Loom 应自动提供默认输出：
+`full = loom_full`。这样最小自定义 Provider 可以直接引用 `{prompt.full}`。只要
+manifest 显式引用了不存在的 `{prompt.<name>}`，校验就应该失败。
 
 `template` 中可以直接引用原子 part：
 
@@ -265,11 +267,9 @@ preset 不是黑盒。Provider 可以改用 `include` 或 `template` 完全控�
 - `required` 可声明某个 part 缺失时启动失败，默认缺失就跳过。
 - `roleHint` 只是 Loom 默认建议，最终 system/user/assistant 映射由 Provider
   manifest 决定。
-- `user_message` 是兼容别名，配置新 Provider 时优先使用 `latest_message`、
-  `assignment_context` 或 preset，避免把一个已经合成过的 turn 输入再次包标题。
-- 如果 actor 依赖 `prompt_template`，Provider 使用 `turn_input` 或 `loom_turn`
-  能保留现有行为；直接使用 `latest_message`/`assignment_context` 则表示 Provider
-  明确接管 turn 文本包装方式。
+- `user_message` 是 turn 输入。配置新 Provider 时优先使用 `loom_turn` preset；
+  只有在 Provider 明确要接管 turn 文本包装时，才直接引用 `latest_message`、
+  `assignment_context`、`turn_input` 或 `trigger_prefix`。
 
 这样 Claude 这种支持 system prompt 的 Provider 可以把稳定规则放到 system，
 把最新 handoff/task message 放到 user；而只支持一个 prompt 字符串的 Provider
@@ -282,7 +282,6 @@ Provider 的 argv/env/stdin 模板应支持这些运行时变量：
 ```text
 {bin}                  检测到的可执行文件路径
 {prompt.<name>}        prompt.outputs 生成的命名 prompt，例如 system/user/full
-{loom.envelope}        兼容变量，等价于 {prompt.full}
 {loom.configDir}       当前 Loom 配置目录，可能是 per-machine/per-server 目录
 {loom.server}          server websocket URL
 {loom.actor}           actor id
@@ -317,7 +316,7 @@ Loom 不应该把 argv 拼成 shell 字符串再执行。
 ```
 
 `when` 只判断 Loom 运行时变量是否存在且非空。第一版不需要表达复杂逻辑；复杂逻辑
-应该拆成不同 mode，或者由 AgentSpec 覆盖 mode 配置。
+应该拆成不同 mode 或本地 Provider variant。
 
 对于较大的 prompt，Provider 可以要求通过 stdin 或 env 传入任意命名 prompt：
 
@@ -349,8 +348,8 @@ Provider session 不应该默认依赖 stdout 解析。更稳的优先级是：
 1. `loom_uuid`：Loom 为 `(provider, actor, scope)` 生成并持久化稳定 UUID，Provider
    每轮都通过 argv/env/stdin 收到同一个 `{session.id}`。如果 CLI 支持“指定 session
    id，不存在则创建、存在则继续”，优先使用这种方式。
-2. `provider_capture`：Provider 自己生成 session id，Loom 从 stdout/stderr/file
-   捕获后保存，后续通过 resume 参数传回。
+2. `provider_capture`：Provider 自己生成 session id，stdout/stderr decoder 发出
+   `ProviderRuntimeEvent::Session`，Loom 保存后在后续 turn 通过 resume 参数传回。
 3. `none`：每轮都是无状态新进程。
 
 建议 schema：
@@ -377,21 +376,25 @@ Provider session 不应该默认依赖 stdout 解析。更稳的优先级是：
 {
   "session": {
     "idSource": "provider_capture",
-    "capture": "stdout_jsonl:last($.session_id)",
+    "scope": "actor_scope",
     "resumeArgs": ["--resume", "{session.id}", "-p", "{prompt.user}"]
   }
 }
 ```
 
-`capture` 的含义是“从输出里解析 session id”，不是输出解析的必需步骤。Claude Code
-和 Copilot 这类支持指定 session id 的 Provider，不应该为了拿 session id 再解析
-stdout；stdout parser 只负责 run trace、最终文本、工具调用、usage 和错误。
+`provider_capture` 的含义是“session id 来自 Provider 输出”，但具体怎么从输出里取值
+仍属于 stdout/stderr parser。decoder 可以通过 JSONL reducer 或 builtin decoder 发出
+`ProviderRuntimeEvent::Session`，session manager 只消费这个事件并写 runtime state。
+Claude Code 和 Copilot 这类支持指定 session id 的 Provider，不应该为了拿
+session id 再解析 stdout；stdout parser 只负责 run trace、最终文本、工具调用、
+usage、错误，以及必要时的 `ProviderRuntimeEvent::Session`。
 
 ## 输出解析模型
 
-将 `CommandOutputFormat` 从扩展点降级为兼容别名，引入 Provider 自己声明的
-`stdout` / `stderr` parser spec。常见格式仍可保留 built-in alias，但自定义
-Provider 应该能在不改 Rust 的情况下描述解析方式。
+Provider 必须声明自己的 `stdout` / `stderr` parser spec。runtime 不再通过 provider id
+推断解析方式；即使 parser 的实现是内置 Rust 代码，也必须由 manifest 显式引用。
+parser 的输出先进入 `ProviderRuntimeEvent`；其中可见执行事件再映射到现有
+`AdapterEvent`，session 捕获等控制事件留在 Provider runtime 内部。
 
 推荐 parser 类型：
 
@@ -399,26 +402,26 @@ Provider 应该能在不改 Rust 的情况下描述解析方式。
 - `json`：把完整 stdout 解析成一个 JSON 文档，再提取字段。
 - `jsonl`：逐行解析 stdout JSON，边读边发事件。
 - `regex`：兜底文本提取方式。
-- `builtin`：兼容逃生口，用于过于复杂或性能敏感、暂时无法 DSL 化的 Rust parser。
+- `builtin`：命名内置 decoder，用于过于复杂或性能敏感、暂时无法 DSL 化的稳定协议。
 
 `builtin` 也必须写在 manifest 里，例如 `{ "format": "builtin", "name":
-"codex_stream_json" }`。这样 runtime 不再通过 provider id 推断解析方式；只是某些
-parser 的实现暂时仍在 Rust 里。
+"codex_stream_json" }`。这保持了“解析选择 provider 化”，同时允许复杂 decoder 先由
+Rust 实现。
 
-每个 parser 输出内部 AdapterEvent：
+每个 parser 输出 `ProviderRuntimeEvent`：
 
-- `text`：候选文本，进入 run trace；是否发布成可见消息仍由 Loom 策略决定。
-- `tool_use`：Provider 报告的工具调用 trace。
-- `status`：Provider 进度或状态 trace。
-- `error`：Provider 错误 trace。
+- `text`：候选文本，映射为 `AdapterEvent::Text` 并进入 run trace；是否发布成可见消息仍由 Loom 策略决定。
+- `tool_use`：Provider 报告的工具调用 trace，映射为 `AdapterEvent::ToolUse`。
+- `status`：Provider 进度或状态 trace，映射为 `AdapterEvent::StatusChange`。
+- `error`：Provider 错误 trace，映射为 `AdapterEvent::Error`。
 - `usage`：token usage metadata。
-- `session`：仅用于 `provider_capture` 模式下报告捕获到的 session id。
-- `finish`：显式完成信号；没有显式完成时，进程退出仍会产生 Finished。
+- `session`：Provider runtime 内部事件，仅用于 `provider_capture` 模式下报告捕获到的 session id，不进入 GUI message。
+- `finish`：显式完成信号，映射为 `AdapterEvent::Finished`；没有显式完成时，进程退出仍会产生 Finished。
 
 输出解析不能只靠“每条 JSON 映射一个事件”。Copilot/Codex 这类 CLI 会同时输出
 中间解释、工具轨迹、子 agent 轨迹和最终回答，Provider 需要能声明 stateful reducer：
 
-- `emit`：看到一条输入就发 AdapterEvent，适合 Claude assistant text/tool_use。
+- `emit`：看到一条输入就发 `ProviderRuntimeEvent`，适合 Claude assistant text/tool_use。
 - `reduce.finalText`：在整个 stdout 结束后，从多条 JSONL 中选最终文本。
 - `reduce.deltaText`：累积流式 delta，作为 finalText 的 fallback。
 - `capture.session`：仅在 Provider 不能由 Loom 指定 session id 时，从 JSONL 或完整
@@ -501,6 +504,10 @@ manifest 中，而不是通过 provider id 推断。
 
 ## 现有 Provider 接入结论
 
+本节只用于验证 ProviderManifest 能覆盖当前内置 Provider，不作为架构约束。新增
+Provider 不应该被迫模拟 Claude、Copilot 或 Codex 的启动/输出形态；只要能声明启动
+模板、prompt 映射、session 策略和输出解析，就应能接入。
+
 以下结论基于当前代码硬编码和本机 CLI help 抽查：
 
 ```text
@@ -565,7 +572,6 @@ Qoder CLI 的 print 接口与 Claude Code 接近，支持 `-p/--print`、`--outp
   "session": {
     "idSource": "provider_capture",
     "scope": "actor_scope",
-    "capture": "stdout_jsonl:last($.session_id)",
     "resumeArgs": [
       "--add-dir", "{loom.configDir}",
       "--permission-mode", "bypass_permissions",
@@ -581,7 +587,9 @@ Qoder CLI 的 print 接口与 Claude Code 接近，支持 `-p/--print`、`--outp
 ```
 
 Qoder session 直接按 `provider_capture + --resume` 接入：首轮从 stream-json 输出捕获
-Provider 生成的 session id，后续 turn 用 `--resume {session.id}`。
+Provider 生成的 session id，后续 turn 用 `--resume {session.id}`。这里
+`claude_stream_json` decoder 需要在看到 `session_id` 时发出
+`ProviderRuntimeEvent::Session`。
 
 ### GitHub Copilot CLI
 
@@ -657,7 +665,6 @@ Unix socket；这个行为必须进入 manifest/env。
   "session": {
     "idSource": "provider_capture",
     "scope": "actor_scope",
-    "capture": "stdout_jsonl:last($.session_id)",
     "resumeArgs": [
       "exec",
       "resume",
@@ -678,11 +685,12 @@ Codex 输出历史形态较多，短期用 builtin parser alias 更稳；中期�
 `task_complete`、`agent_message`、`item.completed`、`agent_message_content_delta`
 规则逐步迁移成 manifest reducer。Codex session 直接按 `provider_capture + resume`
 接入：首轮从 JSONL 输出捕获 Provider 生成的 session id，后续 turn 用
-`codex exec resume {session.id}`。
+`codex exec resume {session.id}`。这里 `codex_stream_json` decoder 需要在看到 session
+id 时发出 `ProviderRuntimeEvent::Session`。
 
 ### OpenCode
 
-OpenCode 当前本机未安装，不能把接入方式写成已验证事实。先保留现有行为假设：
+OpenCode 当前本机未安装，不能把接入方式写成已验证事实。当前只记录假设：
 `opencode run --dangerously-skip-permissions {prompt.full}`，输出按 `text` 处理。
 安装后需要补齐 CLI help、模型参数、权限参数、是否支持 JSON/JSONL 输出、是否支持
 system prompt 和 session resume，再更新内置 manifest。
@@ -696,7 +704,8 @@ ProviderManifest
   -> ProviderRuntimePlan
     -> CommandInvocation
     -> OutputDecoder
-      -> AdapterEvent
+      -> ProviderRuntimeEvent
+        -> AdapterEvent / session manager
 ```
 
 `ProviderManifest` 是配置，应保持可序列化、稳定。
@@ -707,32 +716,13 @@ ProviderManifest
 `CommandInvocation` 只负责启动和 supervise 进程，不再知道 Claude、Copilot、
 Codex 或 Qoder。
 
-`OutputDecoder` 消费 stdout/stderr，产生 `AdapterEvent`。之后仍然复用现有
-run trace 和可选 auto-publish pipeline。
-
-## 向后兼容
-
-不要马上移除 `AgentTransport`。建议分阶段迁移：
-
-1. 为当前内置 Provider 增加 manifest。
-2. discovery 加载内置 manifest 和本地 manifest。
-3. 过渡期内，把选中的 provider mode 编译成现有 `AgentTransport`。
-4. 将 command 输出解析移动到 manifest-driven decoder 后面。
-5. 将现有 command session map 扩展成支持 `loom_uuid`，让 `{session.id}` 可以在首次
-   启动前就存在；保留 `provider_capture` 兼容当前 stdout capture。
-6. 保留 `CommandOutputFormat` 作为别名：
-   - `text` -> manifest parser `format=text`
-   - `claude_stream_json` -> built-in manifest parser alias
-   - `copilot_json` -> manifest parser alias `copilot_jsonl_final_text`
-   - `codex_stream_json` -> 暂时保留 built-in parser alias
-   - `ndjson_lines` -> generic JSONL manifest
-7. AgentSpec 和 GUI 迁移完成后，让 `providerRef` 成为主配置；raw transport 只保留给
-   高级/手写 spec。
+`OutputDecoder` 消费 stdout/stderr，产生 `ProviderRuntimeEvent`。其中可见执行事件
+映射成现有 `AdapterEvent`，继续复用 run trace 和可选 auto-publish pipeline；session
+捕获事件只更新 runtime session store。
 
 ## AgentSpec 方向
 
-长期看，GUI 创建的 agent 不应该复制一大段 transport object，而应该引用 Provider
-和 mode：
+AgentSpec 不复制 transport。GUI 创建的 agent 只引用 Provider 和 mode：
 
 ```json
 {
@@ -754,14 +744,13 @@ run trace 和可选 auto-publish pipeline。
 }
 ```
 
-daemon 在启动时把 `providerRef` resolve 成具体 runtime plan。手写 spec 作者可以使用
-受控的 `modeOverride` 覆盖少量运行参数；完整 raw `transport` 只作为 legacy escape
-hatch 保留。
+daemon 在启动时把 `providerRef` resolve 成具体 runtime plan。手写高级配置也不在
+AgentSpec 里复制 command/args/parser；如果需要改 Provider 行为，应创建一个本地
+Provider variant，然后让 AgentSpec 引用新的 provider id。
 
 ## 与 AgentSpec / `spec.json` 的边界
 
-现有 Loom 已经有 agent 自己的 `spec.json`，通常位于 `<agents>/<actor_id>/spec.json`
-或 legacy flat `<agents>/<actor_id>.json`。这个文件描述的是一个具体 agent actor；
+Agent 自己的 `spec.json` 位于 `<agents>/<actor_id>/spec.json`。这个文件描述的是一个具体 agent actor；
 Provider manifest 描述的是一类 CLI/runtime 如何接入 Loom。两者不能继续混在一起。
 
 职责边界：
@@ -785,7 +774,7 @@ AgentSpec / spec.json
 | `command` / `args` / `env` / `stdin` | ProviderManifest | 默认不应该出现在每个 agent 的 `spec.json` 里。 |
 | stdout/stderr parser | ProviderManifest | 解析方式是 Provider 能力，不是 actor 个性。 |
 | session 策略 | ProviderManifest | `loom_uuid`、`provider_capture`、resumeArgs 都是 Provider 接入规则。 |
-| model choices | ProviderManifest 为主，AgentSpec 可收窄/覆盖 | Provider 给 UI 默认菜单；agent 可以指定默认 model 或限制 choices。 |
+| model choices | ProviderManifest | Provider 给 UI 默认菜单；agent 只记录选中的 model。 |
 | selected model / reasoning effort | AgentSpec 或运行时选择 | 这是具体 agent 的偏好，Provider 只定义如何映射到 argv/env。 |
 | prompt parts 如何进 system/user/full | ProviderManifest | 这是 Provider 接入形态。 |
 | promptTemplate / trigger_prefix | AgentSpec | 这是具体 agent 的触发语义和任务包装。 |
@@ -822,33 +811,17 @@ AgentSpec / spec.json
 }
 ```
 
-向后兼容上，现有 `AgentSpec.transport` 仍然可以保留为高级逃生口：
-
-- 如果 `spec.json` 只有 `providerRef`，daemon 从 ProviderManifest resolve 出完整
-  runtime plan。
-- 如果 `spec.json` 同时写了 `providerRef` 和局部 override，只允许覆盖明确列出的
-  安全字段，例如 timeout、env 追加、model 默认值；不建议覆盖 parser。
-- 如果 `spec.json` 写了完整 raw `transport`，按 legacy 行为运行，但 GUI 应标记为
-  advanced/custom transport，避免配置者误以为它会随 ProviderManifest 自动升级。
-
-现有 `AgentProviderSpec` 实际上同时包含 provider transport、defaults 和 `actors[]`，
-会把“Provider 接入规则”和“具体 actor 配置”绑在一个文件里。新模型应把它拆成：
-
-```text
-ProviderManifest       -> provider catalog / runtime adapter
-AgentSpec(spec.json)   -> actor instance, references providerRef
-```
-
-过渡期可以继续把旧 `AgentProviderSpec` 展开成多个 `AgentSpec`，但展开结果应尽快转成
-`providerRef`，不要在每个 actor 上复制同一份 `transport`。
+最终 AgentSpec 不包含 raw `transport`。如果某个 agent 需要特殊启动参数、不同 parser
+或不同 session 策略，应创建一个本地 Provider variant，再让 `providerRef.id` 指向该
+variant。这样“运行适配规则”始终只存在于 ProviderManifest。
 
 ## 统一最终配置模型
 
-最终应收敛成三类 source of truth：
+最终应收敛成三类事实源：
 
 ```text
 {loom.configDir}/providers/<provider_id>.json
-  ProviderManifest。描述 Provider 接入规则，shared by many agents。
+  ProviderManifest。描述 Provider 接入规则，可被多个 agent 复用。
 
 {loom.configDir}/agents/<actor_id>/spec.json
   AgentSpec。描述具体 agent actor，引用 providerRef。
@@ -857,40 +830,44 @@ AgentSpec(spec.json)   -> actor instance, references providerRef
   Runtime state。保存进程状态、session id、最近 run、临时缓存等，不进入配置。
 ```
 
-`desktop.toml` / machine config 应只保存 workspace、server、machine、dataRoot 等宿主
-信息。GUI 创建或编辑 agent 时，最终应该写 `agents/<actor_id>/spec.json`，而不是只在
-`desktop.toml` 里维护一份 `machines[].agents[]`。过渡期可以保留
-`MachineAgentConfig`，但它应该被视为 legacy 简化视图，并能无损迁移成 AgentSpec。
+resolve 顺序应固定，避免多处配置互相覆盖：
+
+```text
+built-in ProviderManifest
+  -> local ProviderManifest / extends patch
+  -> AgentSpec.providerRef 选择 provider + mode + model
+  -> runtime variables 展开成 ProviderRuntimePlan
+  -> runtime state 记录 session/run/process 状态
+```
+
+`desktop.toml` / machine config 只保存 workspace、server、machine、dataRoot 等宿主
+信息。GUI 创建或编辑 agent 时，写 `agents/<actor_id>/spec.json`，不在
+`desktop.toml` 里维护 `machines[].agents[]`。
 
 统一后的职责：
 
 | 当前位置 | 问题 | 最终归宿 |
 | --- | --- | --- |
 | `AgentProviderSpec.provider + transport + actors[]` | provider 接入规则和多个 actor 混在一起 | 拆成 ProviderManifest + 多个 AgentSpec |
-| `AgentSpec.transport` | 每个 agent 复制 command/args/parser/session | 改为 `providerRef`；raw transport 只做 legacy escape hatch |
+| `AgentSpec.transport` | 每个 agent 复制 command/args/parser/session | 删除；改为 `providerRef` 指向 ProviderManifest |
 | `MachineConfig.providers[]` / `AgentProviderOverride` | 在 machine config 里局部覆盖 provider command/args/env | 改为本地 ProviderManifest，必要时用 `extends` 或 custom provider id |
 | `MachineConfig.agents[]` / `MachineAgentConfig` | GUI agent 信息和 AgentSpec 重复 | GUI 直接读写 AgentSpec，machine config 只保留宿主信息 |
-| `AgentDefinition` | MachineAgentConfig 到 AgentSpec 的中间展开结构 | 迁移后删除或只作为 legacy importer |
-| runtime session id | 容易被误写入 spec | 写入 runtime state，由 session 策略生成或 capture |
+| `AgentDefinition` | MachineAgentConfig 到 AgentSpec 的中间展开结构 | 删除；GUI/CLI 直接读写 AgentSpec |
+| runtime session id | 容易被误写入 spec | 写入 runtime state，由 session 策略生成或从输出捕获 |
 
 ### 高级手写配置
 
-高级手写配置不应该再复制完整 ProviderManifest。它应该使用同一套 mode 子 schema 的
-**局部覆盖**，挂在 `providerRef.modeOverride` 下：
+高级手写配置仍然写 ProviderManifest，不写在 AgentSpec 里。做法是定义一个本地
+Provider variant，用 `extends` 继承已有 Provider，再覆盖 mode：
 
 ```json
 {
-  "actor": {
-    "id": "actor_agent_reviewer",
-    "kind": "agent",
-    "displayName": "Reviewer"
-  },
-  "providerRef": {
-    "id": "claude",
-    "mode": "print",
-    "model": "sonnet",
-    "reasoningEffort": "high",
-    "modeOverride": {
+  "schemaVersion": 1,
+  "id": "claude_review_budgeted",
+  "displayName": "Claude Code Review Budgeted",
+  "extends": "claude",
+  "modes": {
+    "print": {
       "timeoutMs": 900000,
       "env": {
         "merge": {
@@ -905,39 +882,41 @@ AgentSpec(spec.json)   -> actor instance, references providerRef
 }
 ```
 
-`modeOverride` 使用 Provider mode 的字段名，但语义是 patch，不是完整定义：
+`extends` 下的 `modes.<name>` 使用 Provider mode 的字段名，但语义是 patch，不是完整
+定义：
 
-| override 字段 | 合并规则 |
+| patch 字段 | 合并规则 |
 | --- | --- |
 | `timeoutMs` / `idleTimeoutMs` | 标量覆盖 |
 | `env.merge` | 合并到 provider env；同名 key 覆盖 |
 | `env.unset` | 从 provider env 删除指定 key |
-| `args.append` / `args.prepend` | 在 provider args 前后追加；适合安全小改动 |
-| `args.replace` | 整体替换 args；需要 GUI 标成 advanced |
+| `args.append` / `args.prepend` | 在 provider args 前后追加；元素使用同一套 argv item schema，适合安全小改动 |
+| `args.replace` | 整体替换 args；元素使用同一套 argv item schema |
 | `prompt.outputs` | 按 output name 替换或新增；不影响未提到的输出 |
 | `stdin` | 覆盖 stdin 模板 |
-| `stdout` / `stderr` parser | 整体替换；默认不建议普通 GUI 暴露 |
-| `session` | 整体替换；只给手写高级 spec |
+| `stdout` / `stderr` parser | 整体替换 |
+| `session` | 整体替换 |
 
-这样配置者可以复用 ProviderManifest 的启动/解析能力，只覆盖确实属于这个 agent 的差异。
-如果一个覆盖会被多个 agent 复用，应该提取成新的 ProviderManifest，例如：
+对应的 AgentSpec 仍然只是引用 provider：
 
 ```json
 {
-  "id": "claude_bare",
-  "extends": "claude",
-  "modes": {
-    "print": {
-      "args": {
-        "append": ["--bare"]
-      }
-    }
+  "actor": {
+    "id": "actor_agent_reviewer",
+    "kind": "agent",
+    "displayName": "Reviewer"
+  },
+  "providerRef": {
+    "id": "claude_review_budgeted",
+    "mode": "print",
+    "model": "sonnet",
+    "reasoningEffort": "high"
   }
 }
 ```
 
-规则是：**共享的运行适配差异进 ProviderManifest；单个 actor 的身份、记忆、触发和少量
-运行偏好进 AgentSpec；短期进程状态进 runtime state。**
+规则是：**运行适配差异进 ProviderManifest；单个 actor 的身份、记忆、触发和模型偏好进
+AgentSpec；短期进程状态进 runtime state。**
 
 ## 安全与校验
 
@@ -946,7 +925,7 @@ Provider manifest 使用前必须校验：
 - `id` 必须稳定、小写、唯一。
 - `command` 必须来自 `detect.candidates` 的解析结果，或者是显式路径。
 - 模板只能引用已知变量，除非开启显式 allow unknown。
-- command mode 下至少一个 `{prompt.<name>}` 或兼容 `{loom.envelope}` 必须出现在
+- command mode 下至少一个 `{prompt.<name>}` 必须出现在
   args/stdin/env 中；如果同一个组合输出被多处引用，必须显式声明允许重复发送。
   ACP mode 例外。
 - 对需要访问 Loom config 的 sandbox CLI，应建议或要求
@@ -978,7 +957,8 @@ loom provider add <file>
 
 把一个自定义 Provider 录入当前 `{loom.configDir}/providers/`。`add` 必须先跑
 `validate`；如果 `id` 已存在，默认失败，除非显式传 `--replace`。内置 Provider
-不能被删除，但是否允许本地 manifest 覆盖内置 Provider 需要单独设计。
+不能被删除。本地 Provider 如果要基于内置 Provider 改参数，应优先使用新 id +
+`extends`；不允许用本地 manifest 覆盖内置 Provider id。
 
 ```bash
 loom provider list
@@ -1015,38 +995,50 @@ loom provider doctor <provider_id>
 时，不同 config dir 下的 local Provider 互不污染；`loom provider list` 默认只看
 当前进程解析出的 `{loom.configDir}`。
 
-## 迁移计划
+## Loom 顶层影响
 
-1. 在 `proto` 或 `agent-runtime` 增加 manifest 类型和 parser 校验测试。
-2. 把当前内置 Provider 编码为 Rust 常量或 JSON resource。
-3. 将现有 prompt composer 调整为先输出结构化 parts，再由 Provider manifest
-   组合成 `{prompt.system}`、`{prompt.user}`、`{prompt.full}` 等命名输出。
-4. 实现 argv/env/stdin 模板展开，并支持上面列出的变量和条件 args。
-5. 先让内置 Provider manifest 使用 `builtin` parser alias 跑通，确保行为与当前
-   `CommandOutputFormat` 完全一致。
-6. 实现 `text`、`json`、`jsonl` 的 manifest parser engine，并用它重新表达 Claude
-   stream JSON 和 Copilot JSONL final-text reducer。它们能分别证明“逐条 emit”和
-   “进程结束 reducer”两类解析能力。
-7. 用 Claude manifest 验证 system/user prompt 拆分。Claude/Qoder 应优先使用
-   `--append-system-prompt`，避免覆盖 CLI 自带系统行为；如果某版本参数名变化，
-   manifest 只需调整 argv 模板，不影响 Loom prompt parts。
-8. Qoder/Codex 初期可以继续使用 builtin parser alias；当 JSONL 提取模型足够后再迁移。
-9. 更新 GUI machine inventory，展示 provider id、modes、默认 mode、models、
-   provider 是 built-in 还是 local。
-10. 增加 `loom provider validate/add/list/show/remove/doctor`，方便调试和管理
-    自定义 Provider。
-11. 将 `MachineConfig.agents[]` 迁移成 `{loom.configDir}/agents/<actor_id>/spec.json`；
-    GUI 创建/编辑 agent 改为读写 AgentSpec。
-12. 将 `MachineConfig.providers[]` / `AgentProviderOverride` 迁移成本地 ProviderManifest
-    或 `extends` provider；machine config 不再保存 command/args/env override。
-13. 保留 `AgentSpec.transport` 和旧 `AgentProviderSpec` loader 作为 legacy importer，
-    但新写入一律使用 `providerRef` + 可选 `modeOverride`。
+这个设计会改变 Loom 顶层配置边界，属于有意的架构收敛：
+
+- `desktop.toml` 不再是 agent 配置源，只保存 workspace、server、machine、dataRoot 等
+  宿主信息。
+- GUI 和 CLI 创建 agent 时写 `agents/<actor_id>/spec.json`，不是写
+  `machines[].agents[]`。
+- Provider command/args/env/parser/session 不再写在 machine config 或 AgentSpec 里；
+  这些都进入 ProviderManifest。
+- 运行期 session id、进程状态和 run 缓存只写 runtime state，不写任何 spec。
+- run trace 和 GUI 可见 message 的边界不变：Provider stdout 进入 run trace；GUI
+  可见消息仍来自 agent 显式 `loom message send` 或 Loom 的 auto-publish 策略。
+- ServiceSpec 不参与 ProviderManifest 体系。service 插件仍由 service spec 管理，
+  避免 agent provider 设计污染服务进程模型。
+
+## 落地顺序
+
+1. 增加 `ProviderManifest`、`ProviderMode`、`ProviderModePatch`、
+   `ProviderRuntimePlan` 类型，以及校验测试。
+2. 把内置 Claude/Qoder/Copilot/Codex Provider 编码成 manifest resource，并让 discovery
+   从 manifest resolve provider，而不是 match provider id。
+3. 实现 prompt parts composer 和 `prompt.outputs` 渲染，输出 `{prompt.system}`、
+   `{prompt.user}`、`{prompt.full}` 等命名 prompt。
+4. 实现 argv/env/stdin 模板展开、条件 args、`loom_uuid` / `provider_capture` session
+   策略，并让 decoder 产出的 `ProviderRuntimeEvent::Session` 写入 runtime session
+   store。
+5. 实现 manifest-driven stdout/stderr decoder；复杂协议先通过 manifest 引用
+   `builtin` decoder，后续可逐步改写成 JSONL reducer。
+6. 增加 `loom provider validate/add/list/show/remove/doctor`，并让 GUI 复用同一套
+   provider registry API。
+7. 增加最终版 AgentSpec `providerRef`，GUI 创建/编辑 agent 直接读写
+   `{loom.configDir}/agents/<actor_id>/spec.json`。
+8. 提供一次性导入工具，把现有 machine agent/provider override 配置转换成 AgentSpec
+   和 ProviderManifest variant。导入完成后，新写入路径只使用新模型。
+9. 删除 runtime 内对 `AgentProviderSpec.provider + transport + actors[]`、
+   `AgentSpec.transport`、`MachineConfig.providers[]`、`MachineConfig.agents[]` 的依赖。
+
+一次性导入工具只服务已有配置升级；新 runtime 不做新旧配置双读，也不维护旧配置到
+新配置的运行时覆盖优先级。导入完成后，ProviderManifest、AgentSpec 和 runtime
+state 才是唯一生效边界。
 
 ## 待定问题
 
-- Provider manifest 应放在 `.loom/providers`，还是只放在 per-machine config 目录？
-  per-machine 能避免之前 desktop config 的 server 冲突问题。
-- auto-publish 是否继续只由全局 env 控制，还是允许 provider/actor spec 显式配置？
 - OpenCode 安装后需要补齐 CLI help 和输出样本，再确认是否继续 text parser。
 - 复杂 Provider 是否需要 JavaScript/WASM parser hook，还是小型 JSONPath/regex DSL
   足够？

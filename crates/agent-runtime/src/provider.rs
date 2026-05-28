@@ -17,6 +17,8 @@ use proto::methods::{
     ProviderDetectSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
     ProviderPromptSpec, ProviderSessionIdSource, ProviderSessionSpec,
 };
+use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::adapter::PromptPart;
 
@@ -45,19 +47,7 @@ impl ProviderRegistry {
             validate_manifest(&manifest)?;
             manifests.insert(manifest.id.clone(), manifest);
         }
-        for manifest in load_local_manifests(config_dir)? {
-            validate_manifest(&manifest)?;
-            let manifest = if let Some(base_id) = manifest.extends.as_deref() {
-                let base = manifests.get(base_id).cloned().ok_or_else(|| {
-                    format!("provider `{}` extends unknown `{base_id}`", manifest.id)
-                })?;
-                merge_manifest(base, manifest)
-            } else {
-                manifest
-            };
-            validate_manifest(&manifest)?;
-            manifests.insert(manifest.id.clone(), manifest);
-        }
+        load_local_manifests(config_dir, &mut manifests)?;
         Ok(Self { manifests })
     }
 
@@ -67,6 +57,10 @@ impl ProviderRegistry {
 
     pub fn get(&self, id: &str) -> Option<&ProviderManifest> {
         self.manifests.get(id)
+    }
+
+    pub fn resolve_manifest_value(&self, value: Value) -> Result<ProviderManifest, String> {
+        resolve_manifest_value(&self.manifests, value)
     }
 
     pub fn detect_with_path(&self, path: OsString) -> Result<Vec<DetectedProvider>, String> {
@@ -381,12 +375,15 @@ fn join_parts<'a>(parts: impl IntoIterator<Item = &'a str>, join: &str) -> Strin
         .join(join)
 }
 
-fn load_local_manifests(config_dir: &Path) -> Result<Vec<ProviderManifest>, String> {
+fn load_local_manifests(
+    config_dir: &Path,
+    manifests: &mut BTreeMap<String, ProviderManifest>,
+) -> Result<(), String> {
     let dir = providers_dir(config_dir);
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut out = Vec::new();
+    let mut pending = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("read provider dir `{}`: {e}", dir.display()))?;
     for entry in entries {
@@ -397,29 +394,273 @@ fn load_local_manifests(config_dir: &Path) -> Result<Vec<ProviderManifest>, Stri
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("read provider manifest `{}`: {e}", path.display()))?;
-        let manifest = serde_json::from_str::<ProviderManifest>(&text)
+        let value = serde_json::from_str::<Value>(&text)
             .map_err(|e| format!("parse provider manifest `{}`: {e}", path.display()))?;
-        out.push(manifest);
+        pending.push((path, value));
     }
-    Ok(out)
+    pending.sort_by(|(a, _), (b, _)| a.cmp(b));
+    while !pending.is_empty() {
+        let mut unresolved = Vec::new();
+        let mut made_progress = false;
+        for (path, value) in pending {
+            let header = manifest_header(&value)
+                .map_err(|e| format!("parse provider manifest `{}`: {e}", path.display()))?;
+            if header
+                .extends
+                .as_ref()
+                .is_some_and(|base| !manifests.contains_key(base))
+            {
+                unresolved.push((path, value));
+                continue;
+            }
+            if manifests.contains_key(&header.id) {
+                return Err(format!(
+                    "provider `{}` from `{}` conflicts with an existing provider id",
+                    header.id,
+                    path.display()
+                ));
+            }
+            let manifest = resolve_manifest_value(manifests, value)
+                .map_err(|e| format!("resolve provider manifest `{}`: {e}", path.display()))?;
+            validate_manifest(&manifest)?;
+            manifests.insert(manifest.id.clone(), manifest);
+            made_progress = true;
+        }
+        if !made_progress {
+            let missing = unresolved
+                .iter()
+                .filter_map(|(path, value)| {
+                    manifest_header(value).ok().and_then(|header| {
+                        header
+                            .extends
+                            .map(|base| format!("{} extends `{base}`", path.display()))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!("unresolved provider extends chain: {missing}"));
+        }
+        pending = unresolved;
+    }
+    Ok(())
 }
 
-fn merge_manifest(mut base: ProviderManifest, patch: ProviderManifest) -> ProviderManifest {
-    base.id = patch.id;
-    base.extends = patch.extends;
-    if !patch.display_name.trim().is_empty() {
-        base.display_name = patch.display_name;
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderManifestHeader {
+    id: String,
+    #[serde(default)]
+    extends: Option<String>,
+}
+
+fn manifest_header(value: &Value) -> Result<ProviderManifestHeader, String> {
+    serde_json::from_value(value.clone()).map_err(|e| e.to_string())
+}
+
+fn resolve_manifest_value(
+    manifests: &BTreeMap<String, ProviderManifest>,
+    value: Value,
+) -> Result<ProviderManifest, String> {
+    let header = manifest_header(&value)?;
+    let resolved = if let Some(base_id) = header.extends.as_deref() {
+        let base = manifests
+            .get(base_id)
+            .ok_or_else(|| format!("provider `{}` extends unknown `{base_id}`", header.id))?;
+        merge_manifest_value(
+            serde_json::to_value(base).map_err(|e| e.to_string())?,
+            value,
+        )?
+    } else {
+        value
+    };
+    let manifest: ProviderManifest = serde_json::from_value(resolved).map_err(|e| e.to_string())?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn merge_manifest_value(mut base: Value, patch: Value) -> Result<Value, String> {
+    let base_obj = base
+        .as_object_mut()
+        .ok_or_else(|| "base provider manifest must be an object".to_string())?;
+    let patch_obj = patch
+        .as_object()
+        .ok_or_else(|| "provider manifest patch must be an object".to_string())?;
+
+    for key in ["schemaVersion", "id", "extends", "displayName", "models"] {
+        if let Some(value) = patch_obj.get(key) {
+            if key != "displayName" || value.as_str().is_some_and(|s| !s.trim().is_empty()) {
+                base_obj.insert(key.to_string(), value.clone());
+            }
+        }
     }
-    if !patch.detect.candidates.is_empty() {
-        base.detect = patch.detect;
+    if let Some(detect) = patch_obj.get("detect").and_then(Value::as_object) {
+        if detect
+            .get("candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            base_obj.insert("detect".into(), Value::Object(detect.clone()));
+        }
     }
-    for (name, mode) in patch.modes {
-        base.modes.insert(name, mode);
+    if let Some(patch_modes) = patch_obj.get("modes").and_then(Value::as_object) {
+        let base_modes = base_obj
+            .entry("modes")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| "base provider modes must be an object".to_string())?;
+        for (name, patch_mode) in patch_modes {
+            if let Some(base_mode) = base_modes.get_mut(name) {
+                apply_mode_patch(base_mode, patch_mode)?;
+            } else {
+                base_modes.insert(name.clone(), patch_mode.clone());
+            }
+        }
     }
-    if patch.models.is_some() {
-        base.models = patch.models;
+    Ok(base)
+}
+
+fn apply_mode_patch(base_mode: &mut Value, patch_mode: &Value) -> Result<(), String> {
+    let base = base_mode
+        .as_object_mut()
+        .ok_or_else(|| "base provider mode must be an object".to_string())?;
+    let patch = patch_mode
+        .as_object()
+        .ok_or_else(|| "provider mode patch must be an object".to_string())?;
+
+    for key in [
+        "transport",
+        "command",
+        "stdin",
+        "stdout",
+        "session",
+        "timeoutMs",
+        "idleTimeoutMs",
+    ] {
+        if let Some(value) = patch.get(key) {
+            base.insert(key.to_string(), value.clone());
+        }
     }
-    base
+    if let Some(args_patch) = patch.get("args") {
+        apply_args_patch(base, args_patch)?;
+    }
+    if let Some(env_patch) = patch.get("env") {
+        apply_env_patch(base, env_patch)?;
+    }
+    if let Some(prompt_patch) = patch.get("prompt") {
+        apply_prompt_patch(base, prompt_patch)?;
+    }
+    Ok(())
+}
+
+fn apply_args_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), String> {
+    if patch.is_array() {
+        base.insert("args".into(), patch.clone());
+        return Ok(());
+    }
+    let Some(obj) = patch.as_object() else {
+        return Err("args patch must be an array or object".into());
+    };
+    if let Some(replace) = obj.get("replace") {
+        ensure_array_field(replace, "args.replace")?;
+        base.insert("args".into(), replace.clone());
+        return Ok(());
+    }
+    let mut args = base
+        .get("args")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(prepend) = obj.get("prepend") {
+        let mut next = prepend
+            .as_array()
+            .ok_or_else(|| "args.prepend must be an array".to_string())?
+            .clone();
+        next.extend(args);
+        args = next;
+    }
+    if let Some(append) = obj.get("append") {
+        args.extend(
+            append
+                .as_array()
+                .ok_or_else(|| "args.append must be an array".to_string())?
+                .iter()
+                .cloned(),
+        );
+    }
+    base.insert("args".into(), Value::Array(args));
+    Ok(())
+}
+
+fn apply_env_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "env patch must be an object".to_string())?;
+    let is_patch = obj.contains_key("merge") || obj.contains_key("unset");
+    if !is_patch {
+        base.insert("env".into(), patch.clone());
+        return Ok(());
+    }
+    let mut env = base
+        .get("env")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(unset) = obj.get("unset") {
+        for key in unset
+            .as_array()
+            .ok_or_else(|| "env.unset must be an array".to_string())?
+        {
+            let key = key
+                .as_str()
+                .ok_or_else(|| "env.unset entries must be strings".to_string())?;
+            env.remove(key);
+        }
+    }
+    if let Some(merge) = obj.get("merge") {
+        for (key, value) in merge
+            .as_object()
+            .ok_or_else(|| "env.merge must be an object".to_string())?
+        {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    base.insert("env".into(), Value::Object(env));
+    Ok(())
+}
+
+fn apply_prompt_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), String> {
+    let obj = patch
+        .as_object()
+        .ok_or_else(|| "prompt patch must be an object".to_string())?;
+    let Some(outputs_patch) = obj.get("outputs") else {
+        base.insert("prompt".into(), patch.clone());
+        return Ok(());
+    };
+    let prompt = base
+        .entry("prompt")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "base prompt must be an object".to_string())?;
+    let outputs = prompt
+        .entry("outputs")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "base prompt.outputs must be an object".to_string())?;
+    for (name, output) in outputs_patch
+        .as_object()
+        .ok_or_else(|| "prompt.outputs must be an object".to_string())?
+    {
+        outputs.insert(name.clone(), output.clone());
+    }
+    Ok(())
+}
+
+fn ensure_array_field(value: &Value, name: &str) -> Result<(), String> {
+    if value.is_array() {
+        Ok(())
+    } else {
+        Err(format!("{name} must be an array"))
+    }
 }
 
 fn validate_prompt_references(
@@ -1303,5 +1544,92 @@ mod tests {
         .expect("write provider");
         let registry = ProviderRegistry::load(&config).expect("registry");
         assert!(registry.get("demo").is_some());
+    }
+
+    #[test]
+    fn extended_provider_mode_patch_merges_args_env_and_prompt_outputs() {
+        let config = temp_dir("extends");
+        let providers = providers_dir(&config);
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::write(
+            providers.join("codex_budgeted.json"),
+            r#"{
+              "schemaVersion": 1,
+              "id": "codex_budgeted",
+              "displayName": "Codex Budgeted",
+              "extends": "codex",
+              "modes": {
+                "print": {
+                  "timeoutMs": 12345,
+                  "env": {
+                    "unset": ["LOOM_NO_DAEMON"],
+                    "merge": { "EXTRA_FLAG": "1" }
+                  },
+                  "args": {
+                    "prepend": ["--prepended"],
+                    "append": ["--max-budget-usd", "5"]
+                  },
+                  "prompt": {
+                    "outputs": {
+                      "diagnostic": { "template": "{actor_context}" }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write provider");
+
+        let registry = ProviderRegistry::load(&config).expect("registry");
+        let manifest = registry.get("codex_budgeted").expect("provider");
+        let mode = manifest.modes.get("print").expect("print mode");
+        assert_eq!(mode.timeout_ms, Some(12345));
+        assert!(matches!(
+            mode.args.first(),
+            Some(ProviderArgSpec::Literal(value)) if value == "--prepended"
+        ));
+        assert!(mode
+            .args
+            .windows(2)
+            .any(|items| matches!(&items[0], ProviderArgSpec::Literal(value) if value == "--max-budget-usd")
+                && matches!(&items[1], ProviderArgSpec::Literal(value) if value == "5")));
+        assert_eq!(mode.env.get("EXTRA_FLAG").map(String::as_str), Some("1"));
+        assert!(!mode.env.contains_key("LOOM_NO_DAEMON"));
+        let outputs = &mode.prompt.as_ref().expect("prompt").outputs;
+        assert!(outputs.contains_key("full"));
+        assert!(outputs.contains_key("diagnostic"));
+        assert_eq!(
+            mode.stdout.name.as_deref(),
+            Some("codex_stream_json"),
+            "patch must preserve base parser"
+        );
+    }
+
+    #[test]
+    fn local_provider_cannot_shadow_existing_provider_id() {
+        let config = temp_dir("shadow");
+        let providers = providers_dir(&config);
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::write(
+            providers.join("claude.json"),
+            r#"{
+              "schemaVersion": 1,
+              "id": "claude",
+              "displayName": "Shadow Claude",
+              "detect": { "candidates": ["shadow-claude"] },
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "args": ["{prompt.full}"],
+                  "stdout": { "format": "text" }
+                }
+              }
+            }"#,
+        )
+        .expect("write provider");
+
+        let err = ProviderRegistry::load(&config).expect_err("shadow should fail");
+        assert!(err.contains("conflicts with an existing provider id"));
     }
 }

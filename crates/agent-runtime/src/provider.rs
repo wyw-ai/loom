@@ -56,17 +56,12 @@ pub struct ProviderRuntimePlan {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub model_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<CommandSession>,
-    pub output_format: CommandOutputFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder: Option<ProviderDecoderSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "stderr")]
     pub stderr_decoder: Option<ProviderDecoderSpec>,
-    #[serde(default)]
-    pub prompt_via: PromptVia,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<ProviderPromptSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +74,11 @@ pub struct ProviderRuntimePlan {
 
 impl ProviderRuntimePlan {
     pub fn into_transport(self) -> AgentTransport {
+        let output_format = self
+            .decoder
+            .as_ref()
+            .and_then(|decoder| output_format(decoder).ok())
+            .unwrap_or_default();
         AgentTransport {
             kind: self.transport_kind,
             command: self.command,
@@ -87,12 +87,12 @@ impl ProviderRuntimePlan {
             env: self.env,
             auth_method: None,
             model: self.model,
-            model_args: self.model_args,
+            model_args: Vec::new(),
             session: self.session,
-            output_format: Some(self.output_format),
+            output_format: Some(output_format),
             decoder: self.decoder,
             stderr_decoder: self.stderr_decoder,
-            prompt_via: self.prompt_via,
+            prompt_via: PromptVia::Args,
             prompt: self.prompt,
             stdin: self.stdin,
             timeout_ms: self.timeout_ms,
@@ -1610,7 +1610,6 @@ fn runtime_plan_from_manifest(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
-        model_args: Vec::new(),
         session: mode.session.as_ref().map(|session| CommandSession {
             id_source: session.id_source.map(|source| match source {
                 ProviderSessionIdSource::LoomUuid => CommandSessionIdSource::LoomUuid,
@@ -1625,15 +1624,14 @@ fn runtime_plan_from_manifest(
             },
             resume_arg_specs,
         }),
-        output_format: output_format(&mode.stdout)?,
         decoder: Some(mode.stdout.clone()),
         stderr_decoder: mode.stderr.clone(),
-        prompt_via: PromptVia::Args,
         prompt: mode.prompt.clone(),
         stdin,
         timeout_ms: mode.timeout_ms,
         idle_timeout_ms: mode.idle_timeout_ms,
     };
+    output_format(&mode.stdout)?;
     validate_manifest(manifest)?;
     Ok(plan)
 }
@@ -3177,12 +3175,11 @@ mod tests {
         assert_eq!(plan.provider_id, "qoder");
         assert_eq!(plan.mode, "print");
         assert_eq!(plan.transport_kind, "command");
-        assert_eq!(plan.output_format, CommandOutputFormat::ClaudeStreamJson);
         assert_eq!(plan.model.as_deref(), Some("auto"));
-        assert!(
-            plan.model_args.is_empty(),
-            "provider conditionals should stay in arg_specs instead of legacy model_args"
-        );
+        let serialized_plan = serde_json::to_value(&plan).expect("serialize runtime plan");
+        assert!(serialized_plan.get("outputFormat").is_none());
+        assert!(serialized_plan.get("promptVia").is_none());
+        assert!(serialized_plan.get("modelArgs").is_none());
         assert!(plan.arg_specs.iter().any(|arg| matches!(
             arg,
             ProviderArgSpec::Conditional(spec) if spec.when == "model"
@@ -3199,6 +3196,15 @@ mod tests {
         assert_eq!(transport.kind, "command");
         assert_eq!(transport.command, provider.command);
         assert_eq!(transport.arg_specs.len(), arg_specs_len);
+        assert_eq!(
+            transport.output_format,
+            Some(CommandOutputFormat::ClaudeStreamJson)
+        );
+        assert_eq!(transport.prompt_via, PromptVia::Args);
+        assert!(
+            transport.model_args.is_empty(),
+            "provider conditionals should stay in arg_specs instead of legacy model_args"
+        );
         assert_eq!(
             transport
                 .session

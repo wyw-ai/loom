@@ -763,7 +763,9 @@ ProviderManifest
 `ProviderManifest` 是配置，应保持可序列化、稳定。
 
 `ProviderRuntimePlan` 是检测、模型选择、scope 解析、模板展开之后的 resolved form。
-它包含具体 argv/env/stdin 和编译后的 decoder。
+它包含具体 argv/env/stdin 和编译后的 decoder，不包含 `PromptVia`、`modelArgs`、
+`CommandOutputFormat` 这类旧 command transport 控制字段；如果短期还需要生成
+`AgentTransport`，这些字段只能在最后一跳由 manifest 信息派生。
 
 `CommandInvocation` 只负责启动和 supervise 进程，不再知道 Claude、Copilot、
 Codex 或 Qoder。

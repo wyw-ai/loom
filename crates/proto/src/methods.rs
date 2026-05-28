@@ -2095,12 +2095,46 @@ pub struct ProviderDecoderSpec {
     pub format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default)]
+    pub events: Vec<ProviderDecoderEventSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduce: Option<ProviderJsonlReduceSpec>,
 }
 
 fn default_provider_decoder_format() -> String {
     "text".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDecoderEventSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<ProviderJsonConditionSpec>,
+    #[serde(default)]
+    pub emit: ProviderDecoderEmitSpec,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDecoderEmitSpec {
+    #[serde(default, rename = "type")]
+    pub emit_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "toolName")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

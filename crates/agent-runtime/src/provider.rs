@@ -971,6 +971,7 @@ fn mode(
         stdout: ProviderDecoderSpec {
             format: "builtin".into(),
             name: Some(stdout_name.into()),
+            events: Vec::new(),
             reduce: None,
         },
         session,
@@ -983,6 +984,7 @@ fn copilot_jsonl_decoder() -> ProviderDecoderSpec {
     ProviderDecoderSpec {
         format: "jsonl".into(),
         name: None,
+        events: Vec::new(),
         reduce: Some(ProviderJsonlReduceSpec {
             final_text: Some(ProviderJsonlTextReducerSpec {
                 mode: "lastNonEmpty".into(),

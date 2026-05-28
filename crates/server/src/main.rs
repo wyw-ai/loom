@@ -27,8 +27,8 @@ use crate::subscribe::Subscriptions;
 #[derive(Debug, Parser)]
 #[command(name = "loom-server", about = "Loom multi-actor collaboration server")]
 struct Args {
-    /// Address to bind, e.g. 127.0.0.1:7878
-    #[arg(long, default_value = "127.0.0.1:7878")]
+    /// Address to bind, e.g. 127.0.0.1:18888
+    #[arg(long, default_value = "127.0.0.1:18888")]
     bind: String,
 
     /// Data directory (SQLite store + artifacts). Defaults to the OS data

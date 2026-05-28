@@ -204,7 +204,7 @@ mod tests {
             &PathBuf::from("/data/profile"),
             None,
             Some(&ann(true)),
-            Some("ws://127.0.0.1:7878/rpc"),
+            Some("ws://127.0.0.1:18888/rpc"),
         );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["name"], "loom-announcement");
@@ -222,7 +222,7 @@ mod tests {
                 "--actor-id",
                 "actor_x",
                 "--server",
-                "ws://127.0.0.1:7878/rpc",
+                "ws://127.0.0.1:18888/rpc",
             ]
         );
     }

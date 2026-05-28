@@ -884,15 +884,16 @@ built-in ProviderManifest
   -> runtime state 记录 session/run/process 状态
 ```
 
-GUI local state 与 daemon machine config 应拆开理解，即使当前实现暂时复用同一个
-`desktop.toml` 文件，也不能复用同一组业务字段：
+GUI local state 与 daemon machine config 必须是不同文件和不同事实源：
 
 ```text
 GUI local state
+  GUI 的 desktop.toml。
   当前选中的 server、最近连接列表、窗口状态、人类 actor 选择等 UI/客户端信息。
   不包含 agents/providers/profile/memory。
 
 daemon machine config
+  daemon 的 daemon.toml。
   daemon 上线所需的 server URL、machine id、dataRoot/configDir、认证信息和本机能力。
   不包含 AgentSpec 列表，也不包含 ProviderManifest override 列表。
 ```
@@ -1078,9 +1079,10 @@ local Provider 互不污染。`loom provider list` 在 daemon/CLI 本机执行�
   操作当前 daemon config，但这不是 GUI 的数据路径。
 - server 保存 daemon 发布的 inventory 快照和 machine command 队列/结果；不解释
   ProviderManifest，也不自行生成 AgentSpec。
-- GUI local state 与 daemon machine config 不保存 agents/providers。即使实现上仍有
-  `desktop.toml`，它也只能承载连接选择、machine id、dataRoot/configDir 等宿主信息；
-  不能让 GUI 把 `machines[].agents[]` 或 provider override 当成可编辑事实源。
+- GUI local state 与 daemon machine config 不保存 agents/providers。GUI 的
+  `desktop.toml` 只承载连接选择和人类客户端偏好；daemon 的 `daemon.toml` 只承载
+  server URL、machine id、dataRoot/configDir 等宿主信息。两者不能复用同一个文件或
+  让 GUI 把 `machines[].agents[]`、provider override 当成可编辑事实源。
 - Provider command/args/env/parser/session 不写在 AgentSpec 里；这些进入目标 daemon 的
   ProviderManifest。host-specific 差异用 daemon-local provider variant 表达。
 - 运行期 session id、进程状态和 run 缓存只写 runtime state，不写任何 spec。

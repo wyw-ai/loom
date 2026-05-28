@@ -1418,19 +1418,18 @@ fn reduce_jsonl_text(stdout: &str, reducer: &ProviderJsonlTextReducerSpec) -> Op
         {
             continue;
         }
-        let Some(text) = json_path_lookup(&v, path) else {
-            continue;
-        };
-        match mode {
-            "firstNonEmpty" | "first_non_empty" => {
-                if let Some(text) = non_blank(text) {
-                    return Some(text);
+        for text in json_path_lookup_strings(&v, path) {
+            match mode {
+                "firstNonEmpty" | "first_non_empty" => {
+                    if let Some(text) = non_blank(text) {
+                        return Some(text);
+                    }
                 }
-            }
-            "concat" | "joinText" | "join_text" => concat.push_str(&text),
-            _ => {
-                if let Some(text) = non_blank(text) {
-                    last = Some(text);
+                "concat" | "joinText" | "join_text" => concat.push_str(&text),
+                _ => {
+                    if let Some(text) = non_blank(text) {
+                        last = Some(text);
+                    }
                 }
             }
         }
@@ -1714,11 +1713,21 @@ fn extract_json_path(stdout: &str, path: &str) -> Option<String> {
     found
 }
 
-/// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`. No filters,
-/// pipes, or functions.
+/// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`,
+/// `.items[*].id`. No filters, pipes, or functions.
 fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
-    let cur = json_path_lookup_value(root, path)?;
-    match cur {
+    json_path_lookup_strings(root, path).into_iter().next()
+}
+
+fn json_path_lookup_strings(root: &Value, path: &str) -> Vec<String> {
+    json_path_lookup_values(root, path)
+        .into_iter()
+        .filter_map(json_value_to_string)
+        .collect()
+}
+
+fn json_value_to_string(value: &Value) -> Option<String> {
+    match value {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
@@ -1726,28 +1735,47 @@ fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
 }
 
 fn json_path_lookup_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    json_path_lookup_values(root, path).into_iter().next()
+}
+
+fn json_path_lookup_values<'a>(root: &'a Value, path: &str) -> Vec<&'a Value> {
     let path = path
         .strip_prefix("$.")
         .or_else(|| path.strip_prefix('.'))
         .unwrap_or(path);
-    let mut cur = root;
+    let mut current = vec![root];
     for raw in path.split('.') {
         if raw.is_empty() {
             continue;
         }
         // Parse `name[3]` → key + indices.
         let (key, indices) = parse_segment(raw);
-        if !key.is_empty() {
-            cur = cur.get(key)?;
+        let mut next = Vec::new();
+        for value in current {
+            let Some(value) = (if key.is_empty() {
+                Some(value)
+            } else {
+                value.get(key)
+            }) else {
+                continue;
+            };
+            push_indexed_values(value, &indices, &mut next);
         }
-        for idx in indices {
-            cur = cur.get(idx)?;
+        current = next;
+        if current.is_empty() {
+            break;
         }
     }
-    Some(cur)
+    current
 }
 
-fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonPathIndex {
+    Index(usize),
+    Wildcard,
+}
+
+fn parse_segment(seg: &str) -> (&str, Vec<JsonPathIndex>) {
     let mut indices = Vec::new();
     let key_end = seg.find('[').unwrap_or(seg.len());
     let key = &seg[..key_end];
@@ -1757,12 +1785,36 @@ fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
             Some(c) if c > open => c,
             _ => break,
         };
-        if let Ok(n) = rest[open + 1..close].parse::<usize>() {
-            indices.push(n);
+        let index = &rest[open + 1..close];
+        if index == "*" {
+            indices.push(JsonPathIndex::Wildcard);
+        } else if let Ok(n) = index.parse::<usize>() {
+            indices.push(JsonPathIndex::Index(n));
         }
         rest = &rest[close + 1..];
     }
     (key, indices)
+}
+
+fn push_indexed_values<'a>(value: &'a Value, indices: &[JsonPathIndex], out: &mut Vec<&'a Value>) {
+    let Some((first, rest)) = indices.split_first() else {
+        out.push(value);
+        return;
+    };
+    match first {
+        JsonPathIndex::Index(idx) => {
+            if let Some(value) = value.get(*idx) {
+                push_indexed_values(value, rest, out);
+            }
+        }
+        JsonPathIndex::Wildcard => {
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    push_indexed_values(item, rest, out);
+                }
+            }
+        }
+    }
 }
 
 // ---------------- argv & template expansion ----------------
@@ -2254,6 +2306,17 @@ mod tests {
     }
 
     #[test]
+    fn json_path_wildcard_returns_values_in_order() {
+        let v: Value =
+            serde_json::from_str(r#"{"items":[{"id":"first"},{"id":"second"}]}"#).unwrap();
+        assert_eq!(
+            json_path_lookup_strings(&v, "$.items[*].id"),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(json_path_lookup(&v, "$.items[*].id"), Some("first".into()));
+    }
+
+    #[test]
     fn json_path_missing_returns_none() {
         let v: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
         assert!(json_path_lookup(&v, ".b").is_none());
@@ -2538,6 +2601,22 @@ mod tests {
 
         assert_eq!(
             extract_decoder_final_text(Some(&decoder), stdout),
+            Some("hello world".into())
+        );
+    }
+
+    #[test]
+    fn provider_jsonl_reducer_concats_wildcard_values() {
+        let reducer = ProviderJsonlTextReducerSpec {
+            mode: "concat".into(),
+            path: "$.items[*].text".into(),
+            when: None,
+            fallback: None,
+        };
+        let stdout = r#"{"items":[{"text":"hello "},{"text":"world"}]}"#;
+
+        assert_eq!(
+            reduce_jsonl_text_with_fallback(stdout, &reducer),
             Some("hello world".into())
         );
     }

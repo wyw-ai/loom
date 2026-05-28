@@ -213,8 +213,15 @@ mod tests {
         assert!(copilot.args.contains(&"{prompt.full}".into()));
         assert_eq!(
             copilot.transport().output_format,
-            Some(CommandOutputFormat::CopilotJson)
+            Some(CommandOutputFormat::NdjsonLines)
         );
+        assert!(copilot
+            .transport()
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.reduce.as_ref())
+            .and_then(|reduce| reduce.final_text.as_ref())
+            .is_some());
         let codex = providers
             .iter()
             .find(|provider| provider.id == "codex")

@@ -1604,6 +1604,7 @@ fn output_format(decoder: &ProviderDecoderSpec) -> Result<CommandOutputFormat, S
         ("builtin", Some("copilot_json")) => Ok(CommandOutputFormat::CopilotJson),
         ("builtin", Some("codex_stream_json")) => Ok(CommandOutputFormat::CodexStreamJson),
         ("builtin", Some("ndjson_lines")) => Ok(CommandOutputFormat::NdjsonLines),
+        ("json", _) => Ok(CommandOutputFormat::Text),
         ("jsonl", _) => Ok(CommandOutputFormat::NdjsonLines),
         ("builtin", Some(other)) => Err(format!("unknown builtin decoder `{other}`")),
         (other, _) => Err(format!("unknown decoder format `{other}`")),
@@ -2831,6 +2832,36 @@ mod tests {
         );
 
         validate_manifest(&manifest).expect("wildcard decoder path should pass");
+    }
+
+    #[test]
+    fn manifest_validation_allows_json_decoder() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            full_prompt(),
+            "text",
+            None,
+        );
+        provider_mode.stdout.format = "json".into();
+        provider_mode.stdout.name = None;
+        provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.result.text".into(),
+                when: None,
+                fallback: None,
+            }),
+        });
+        let manifest = manifest(
+            "json_decoder",
+            "JSON Decoder",
+            &["json-decoder"],
+            BTreeMap::from([("print".into(), provider_mode)]),
+            &[],
+        );
+
+        validate_manifest(&manifest).expect("json decoder should pass");
     }
 
     #[test]

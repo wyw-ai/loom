@@ -89,7 +89,13 @@ pub struct AdapterPrompt {
 pub struct PromptPart {
     pub key: String,
     pub title: String,
+    /// Provider-facing body without the Loom section title. Provider manifests
+    /// decide whether to render `title` via `renderTitle`.
     pub content: String,
+    /// Legacy/full-prompt body as it appeared in the composed Loom envelope.
+    /// This lets callers preserve the old envelope string while exposing raw
+    /// parts to provider prompt rendering.
+    pub rendered_content: String,
     pub role_hint: PromptRoleHint,
 }
 

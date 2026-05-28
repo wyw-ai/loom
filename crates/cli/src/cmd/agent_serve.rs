@@ -3771,6 +3771,7 @@ fn push_extra_prompt_part(prompt: &mut PromptTelemetry, key: &'static str, conte
         key: key.to_string(),
         title: prompt_section_title(key).to_string(),
         content: content.to_string(),
+        rendered_content: content.to_string(),
         role_hint: PromptRoleHint::User,
     });
 }
@@ -3788,7 +3789,7 @@ fn apply_trigger_prefix_to_prompt(
     let already_prefixed = prompt
         .parts
         .iter()
-        .any(|part| part.key == "user_message" && part.content.starts_with(prefix))
+        .any(|part| part.key == "user_message" && part.rendered_content.starts_with(prefix))
         || (!has_user_message_part && prompt.content.starts_with(prefix));
     if already_prefixed {
         ensure_trigger_prefix_prompt_part(&mut prompt, prefix);
@@ -3801,12 +3802,8 @@ fn apply_trigger_prefix_to_prompt(
         .find(|part| part.key == "user_message")
     {
         part.content = format!("{prefix}{}", part.content);
-        prompt.content = prompt
-            .parts
-            .iter()
-            .map(|part| part.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        part.rendered_content = format!("{prefix}{}", part.rendered_content);
+        prompt.content = rendered_prompt_from_parts(&prompt.parts);
     } else {
         prompt.content = format!("{prefix}{}", prompt.content);
     }
@@ -3844,6 +3841,7 @@ fn ensure_trigger_prefix_prompt_part(prompt: &mut PromptTelemetry, prefix: &str)
             key: "trigger_prefix".to_string(),
             title: prompt_section_title("trigger_prefix").to_string(),
             content: prefix.to_string(),
+            rendered_content: prefix.to_string(),
             role_hint: PromptRoleHint::User,
         },
     );
@@ -3998,15 +3996,48 @@ fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) 
 }
 
 fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPart {
+    let title = prompt_section_title(section.name).to_string();
     PromptPart {
         key: section.name.to_string(),
-        title: prompt_section_title(section.name).to_string(),
-        content: section.content.clone(),
+        title: title.clone(),
+        content: raw_prompt_part_content(&section.content, &title),
+        rendered_content: section.content.clone(),
         role_hint: match section.name {
             "actor_context" | "bootstrap_memory" | "scope_bootstrap" => PromptRoleHint::System,
             _ => PromptRoleHint::User,
         },
     }
+}
+
+fn raw_prompt_part_content(content: &str, title: &str) -> String {
+    let Some((first_line, rest)) = content.split_once('\n') else {
+        return content.to_string();
+    };
+    if prompt_heading_matches_title(first_line, title) {
+        rest.to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+fn prompt_heading_matches_title(line: &str, title: &str) -> bool {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix("=== ")
+        .and_then(|line| line.strip_suffix(" ==="))
+    else {
+        return false;
+    };
+    let inner = inner.trim();
+    inner == title || inner.starts_with(&format!("{title} "))
+}
+
+fn rendered_prompt_from_parts(parts: &[PromptPart]) -> String {
+    parts
+        .iter()
+        .map(|part| part.rendered_content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn prompt_section_title(name: &str) -> &str {
@@ -6018,6 +6049,75 @@ mod tests {
     }
 
     #[test]
+    fn prompt_parts_are_raw_while_full_prompt_stays_rendered() {
+        let sections = vec![
+            agent_runtime::PromptSection {
+                name: "actor_context",
+                content: "=== System: Loom actor context ===\nYou are Demo.".into(),
+            },
+            agent_runtime::PromptSection {
+                name: "user_message",
+                content: "=== User message ===\nhello".into(),
+            },
+        ];
+
+        let prompt = prompt_telemetry(
+            sections
+                .iter()
+                .map(|section| section.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            &sections,
+        );
+
+        assert!(prompt
+            .content
+            .contains("=== System: Loom actor context ==="));
+        assert!(prompt.content.contains("=== User message ==="));
+        let actor_context = prompt
+            .parts
+            .iter()
+            .find(|part| part.key == "actor_context")
+            .expect("actor context part");
+        assert_eq!(actor_context.content, "You are Demo.");
+        assert_eq!(
+            actor_context.rendered_content,
+            "=== System: Loom actor context ===\nYou are Demo."
+        );
+        let user_message = prompt
+            .parts
+            .iter()
+            .find(|part| part.key == "user_message")
+            .expect("user message part");
+        assert_eq!(user_message.content, "hello");
+        assert_eq!(user_message.rendered_content, "=== User message ===\nhello");
+
+        let default_outputs =
+            agent_runtime::provider::render_prompt_outputs(None, &prompt.parts, &prompt.content)
+                .expect("default provider prompt output");
+        assert_eq!(default_outputs.get("full"), Some(&prompt.content));
+
+        let raw_outputs = agent_runtime::provider::render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                outputs: BTreeMap::from([(
+                    "raw".into(),
+                    ProviderPromptOutputSpec {
+                        template: Some("{actor_context}\n\n{user_message}".into()),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &prompt.parts,
+            &prompt.content,
+        )
+        .expect("raw provider prompt output");
+        assert_eq!(
+            raw_outputs.get("raw").map(String::as_str),
+            Some("You are Demo.\n\nhello")
+        );
+    }
+
+    #[test]
     fn trigger_prefix_is_first_in_final_prompt() {
         let mut spec = sample_spec(None);
         spec.trigger = Some(TriggerSpec {
@@ -6034,6 +6134,16 @@ mod tests {
 
         assert!(prompt.content.starts_with("/router\n=== User message ==="));
         assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
+        let user_message = prompt
+            .parts
+            .iter()
+            .find(|part| part.key == "user_message")
+            .expect("user message part");
+        assert_eq!(user_message.content, "/router\n[loom envelope]\nhello");
+        assert_eq!(
+            user_message.rendered_content,
+            "/router\n=== User message ===\n[loom envelope]\nhello"
+        );
         let keys = prompt
             .parts
             .iter()

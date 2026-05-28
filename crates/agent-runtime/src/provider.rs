@@ -389,10 +389,11 @@ fn render_prompt_output(
         }
     }
 
-    let render_title = output.render_title.unwrap_or_default();
     let mut rendered = if let Some(template) = output.template.as_ref() {
+        let render_title = output.render_title.unwrap_or(ProviderRenderTitle::Never);
         render_prompt_template(template, &part_map, render_title)
     } else {
+        let render_title = output.render_title.unwrap_or(ProviderRenderTitle::Auto);
         let include = if !output.include.is_empty() {
             output.include.clone()
         } else if let Some(preset) = output.preset.as_deref() {
@@ -439,7 +440,8 @@ fn render_prompt_part(part: &PromptPart, render_title: ProviderRenderTitle) -> S
                 format!("{heading}\n{}", part.content)
             }
         }
-        ProviderRenderTitle::Never | ProviderRenderTitle::Auto => part.content.clone(),
+        ProviderRenderTitle::Never => part.content.clone(),
+        ProviderRenderTitle::Auto => part.rendered_content.clone(),
     }
 }
 
@@ -2258,6 +2260,7 @@ mod tests {
             key: key.into(),
             title: key.into(),
             content: content.into(),
+            rendered_content: content.into(),
             role_hint: crate::adapter::PromptRoleHint::User,
         }
     }
@@ -2363,6 +2366,7 @@ mod tests {
             key: "actor_context".into(),
             title: "System: Loom actor context".into(),
             content: "You are @demo.".into(),
+            rendered_content: "=== System: Loom actor context ===\nYou are @demo.".into(),
             role_hint: crate::adapter::PromptRoleHint::System,
         }];
         let outputs = render_prompt_outputs(
@@ -2406,7 +2410,8 @@ mod tests {
         let parts = vec![PromptPart {
             key: "actor_context".into(),
             title: "System: Loom actor context".into(),
-            content: "=== System: Loom actor context ===\nYou are @demo.".into(),
+            content: "You are @demo.".into(),
+            rendered_content: "=== System: Loom actor context ===\nYou are @demo.".into(),
             role_hint: crate::adapter::PromptRoleHint::System,
         }];
         let outputs = render_prompt_outputs(

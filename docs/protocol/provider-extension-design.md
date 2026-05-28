@@ -772,7 +772,10 @@ Codex 或 Qoder。
 
 `OutputDecoder` 消费 stdout/stderr，产生 `ProviderRuntimeEvent`。其中可见执行事件
 映射成现有 `AdapterEvent`，继续复用 run trace 和可选 auto-publish pipeline；session
-捕获事件只更新 runtime session store。
+捕获事件只更新 runtime session store。Provider decoder 一旦存在，行级事件解析就只
+看 decoder 的 `events` 或 `builtin name`，不能再隐式回退到旧
+`CommandOutputFormat` parser；旧 parser 只服务没有 Provider decoder 的 command
+transport。
 
 ## AgentSpec 方向
 

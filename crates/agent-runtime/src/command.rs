@@ -851,25 +851,59 @@ fn collect_stdout_line(
 ) -> OutputLineEvents {
     collected_stdout.push_str(line);
     let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
-    if let Some(events) =
-        translate_decoder_event_line(cfg.decoder.as_ref(), parsed_line, &prompt.scope, sender)
-    {
-        return events;
+    if let Some(decoder) = cfg.decoder.as_ref() {
+        return collect_provider_decoder_line(decoder, parsed_line, &prompt.scope, sender);
     }
-    match cfg.output_format {
+    collect_legacy_output_line(cfg.output_format, parsed_line, &prompt.scope, sender)
+}
+
+fn collect_legacy_output_line(
+    output_format: CommandOutputFormat,
+    parsed_line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    match output_format {
         CommandOutputFormat::NdjsonLines => OutputLineEvents {
-            emitted_text: translate_ndjson_line(parsed_line, &prompt.scope, sender),
+            emitted_text: translate_ndjson_line(parsed_line, scope, sender),
             emitted_finish: false,
         },
         CommandOutputFormat::ClaudeStreamJson => OutputLineEvents {
-            emitted_text: translate_claude_stream_line(parsed_line, &prompt.scope, sender),
+            emitted_text: translate_claude_stream_line(parsed_line, scope, sender),
             emitted_finish: false,
         },
         CommandOutputFormat::CodexStreamJson => OutputLineEvents {
-            emitted_text: translate_codex_event_line(parsed_line, &prompt.scope, sender),
+            emitted_text: translate_codex_event_line(parsed_line, scope, sender),
             emitted_finish: false,
         },
         CommandOutputFormat::Text | CommandOutputFormat::CopilotJson => OutputLineEvents::default(),
+    }
+}
+
+fn collect_provider_decoder_line(
+    decoder: &ProviderDecoderSpec,
+    parsed_line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    if !decoder.events.is_empty() {
+        return translate_decoder_event_line(Some(decoder), parsed_line, scope, sender)
+            .unwrap_or_default();
+    }
+    match (decoder.format.as_str(), decoder.name.as_deref()) {
+        ("builtin", Some("claude_stream_json" | "qoder_stream_json")) => OutputLineEvents {
+            emitted_text: translate_claude_stream_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        ("builtin", Some("codex_stream_json")) => OutputLineEvents {
+            emitted_text: translate_codex_event_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        ("builtin", Some("ndjson_lines")) => OutputLineEvents {
+            emitted_text: translate_ndjson_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        _ => OutputLineEvents::default(),
     }
 }
 
@@ -881,7 +915,8 @@ fn collect_decoder_buffer(
 ) -> OutputLineEvents {
     let mut events = OutputLineEvents::default();
     for line in text.lines() {
-        if let Some(emitted) = translate_decoder_event_line(decoder, line, scope, sender) {
+        if let Some(decoder) = decoder {
+            let emitted = collect_provider_decoder_line(decoder, line, scope, sender);
             events.emitted_text |= emitted.emitted_text;
             events.emitted_finish |= emitted.emitted_finish;
         }
@@ -900,7 +935,7 @@ fn truncate_for_summary(s: &str) -> String {
     }
 }
 
-// ---------------- output_format translators ----------------
+// ---------------- provider and legacy output translators ----------------
 
 #[derive(Debug, Clone, Copy, Default)]
 struct OutputLineEvents {
@@ -2547,6 +2582,80 @@ mod tests {
                 ..
             } if summary == "ok"
         ));
+    }
+
+    #[test]
+    fn provider_builtin_decoder_streams_without_legacy_output_format() {
+        let mut cfg = cfg();
+        cfg.output_format = CommandOutputFormat::Text;
+        cfg.decoder = Some(ProviderDecoderSpec {
+            format: "builtin".into(),
+            name: Some("claude_stream_json".into()),
+            events: Vec::new(),
+            reduce: None,
+            capture: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut collected = String::new();
+
+        let events = collect_stdout_line(
+            &cfg,
+            &prompt("ignored"),
+            &tx,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"from decoder"}]}}"#,
+            &mut collected,
+        );
+
+        assert!(events.emitted_text);
+        match rx.try_recv().expect("text event") {
+            AdapterEvent::Text {
+                content,
+                is_partial,
+                ..
+            } => {
+                assert_eq!(content, "from decoder");
+                assert!(!is_partial);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_decoder_without_events_does_not_fall_back_to_legacy_ndjson() {
+        let mut cfg = cfg();
+        cfg.output_format = CommandOutputFormat::NdjsonLines;
+        cfg.decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: Some(ProviderJsonlReduceSpec {
+                final_text: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.text".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+            capture: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut collected = String::new();
+
+        let events = collect_stdout_line(
+            &cfg,
+            &prompt("ignored"),
+            &tx,
+            r#"{"type":"text","text":"legacy ndjson would stream this"}"#,
+            &mut collected,
+        );
+
+        assert!(!events.emitted_text);
+        assert!(rx.try_recv().is_err());
+        assert!(collected.contains("legacy ndjson would stream this"));
+        assert_eq!(
+            extract_configured_decoder_final_text(&cfg, &collected, ""),
+            Some("legacy ndjson would stream this".into())
+        );
     }
 
     #[test]

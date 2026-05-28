@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use proto::methods::{CommandOutputFormat, PromptVia};
+use proto::methods::{CommandOutputFormat, CommandSessionIdSource, PromptVia};
 use proto::types::ScopeRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -68,6 +68,7 @@ pub struct CommandConfig {
     /// Argv template appended when the prompt selects a model. `{model}` is
     /// expanded only after a non-empty selected model exists.
     pub model_args: Vec<String>,
+    pub session_id_source: Option<CommandSessionIdSource>,
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
     pub output_format: CommandOutputFormat,
@@ -111,6 +112,7 @@ impl CommandConfig {
             args,
             env,
             model_args: spec.model_args.clone(),
+            session_id_source: session.as_ref().and_then(|s| s.id_source),
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
             output_format: spec.output_format.unwrap_or_default(),
@@ -319,12 +321,25 @@ fn run_prompt(
     // First-run vs resume: if a usable session is on disk AND the spec supports
     // resume, build the argv from `resume_args`; otherwise build the first-run
     // argv from `args`.
+    let first_run_session_id = if resume_session_id.is_none()
+        && matches!(
+            cfg.session_id_source,
+            Some(CommandSessionIdSource::LoomUuid)
+        ) {
+        Some(uuid::Uuid::new_v4().to_string())
+    } else {
+        None
+    };
+
     let (argv, is_first_run) = match (resume_session_id.as_deref(), cfg.resume_args.as_ref()) {
         (Some(sid), Some(template)) => (
             expand_argv(template, &cfg, &prompt, Some(sid), &content),
             false,
         ),
-        _ => (expand_first_run_argv(&cfg, &prompt, &content), true),
+        _ => (
+            expand_first_run_argv(&cfg, &prompt, first_run_session_id.as_deref(), &content),
+            true,
+        ),
     };
 
     let result = spawn_and_collect(&cfg, &prompt, &argv, &sender, &slot);
@@ -350,7 +365,16 @@ fn run_prompt(
         let _ = delete_session(&cfg, &scope);
         tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
             "command transport: dropped stale session and retrying first-run prompt");
-        let first_run_argv = expand_first_run_argv(&cfg, &prompt, &content);
+        let retry_session_id = if matches!(
+            cfg.session_id_source,
+            Some(CommandSessionIdSource::LoomUuid)
+        ) {
+            Some(uuid::Uuid::new_v4().to_string())
+        } else {
+            None
+        };
+        let first_run_argv =
+            expand_first_run_argv(&cfg, &prompt, retry_session_id.as_deref(), &content);
         outcome = match spawn_and_collect(&cfg, &prompt, &first_run_argv, &sender, &slot) {
             Ok(o) => o,
             Err(e) => {
@@ -368,11 +392,22 @@ fn run_prompt(
             }
         };
         retried_as_first_run = true;
+        if outcome.exit_code == 0 {
+            if let Some(sid) = retry_session_id.as_deref() {
+                if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
+                    tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
+                }
+            }
+        }
     }
 
     // First-run capture: try once, save to disk on success.
     if (is_first_run || retried_as_first_run) && outcome.exit_code == 0 {
-        if let Some(rule) = cfg.first_run_capture.as_ref() {
+        if let Some(sid) = first_run_session_id.as_deref() {
+            if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
+                tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
+            }
+        } else if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
                     if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
@@ -1281,19 +1316,20 @@ fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
 fn expand_first_run_argv(
     cfg: &CommandConfig,
     request: &AdapterPrompt,
+    session_id: Option<&str>,
     prompt: &str,
 ) -> Vec<String> {
     let mut argv: Vec<String> = cfg
         .args
         .iter()
-        .map(|a| expand_template(a, cfg, request, None, prompt))
+        .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
     if matches!(cfg.prompt_via, PromptVia::Args) {
         let already = cfg.args.iter().any(|a| a.contains("{prompt}"));
         if !already {
             if let Some(pos) = prompt_flag_without_value(&argv) {
                 let mut model_args = Vec::new();
-                append_model_args(&mut model_args, cfg, request, None, prompt);
+                append_model_args(&mut model_args, cfg, request, session_id, prompt);
                 let model_len = model_args.len();
                 argv.splice(pos..pos, model_args);
                 argv.insert(pos + model_len + 1, prompt.to_string());
@@ -1301,7 +1337,7 @@ fn expand_first_run_argv(
             }
         }
     }
-    append_model_args(&mut argv, cfg, request, None, prompt);
+    append_model_args(&mut argv, cfg, request, session_id, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
         // Only append when the template didn't already place {prompt} itself.
         let already = argv.iter().any(|a| a == prompt);
@@ -1436,6 +1472,7 @@ mod tests {
             args: vec!["-n".into()],
             env: BTreeMap::new(),
             model_args: Vec::new(),
+            session_id_source: None,
             first_run_capture: None,
             resume_args: None,
             output_format: CommandOutputFormat::Text,
@@ -1497,7 +1534,7 @@ mod tests {
         let mut request = prompt("hello");
         request.model = Some("model_a".into());
 
-        let argv = expand_first_run_argv(&cfg, &request, "hello");
+        let argv = expand_first_run_argv(&cfg, &request, None, "hello");
 
         assert_eq!(
             argv,
@@ -1518,7 +1555,7 @@ mod tests {
         let mut request = prompt("hello");
         request.model = Some("model_a".into());
 
-        let argv = expand_first_run_argv(&cfg, &request, "hello");
+        let argv = expand_first_run_argv(&cfg, &request, None, "hello");
 
         assert_eq!(
             argv,
@@ -1537,7 +1574,7 @@ mod tests {
         let mut cfg = cfg();
         cfg.model_args = vec!["--model".into(), "{model}".into()];
 
-        let argv = expand_first_run_argv(&cfg, &prompt("hello"), "hello");
+        let argv = expand_first_run_argv(&cfg, &prompt("hello"), None, "hello");
 
         assert_eq!(argv, vec!["-n".to_string(), "hello".to_string()]);
     }
@@ -1778,7 +1815,7 @@ mod tests {
     fn first_run_argv_appends_prompt_when_args_mode() {
         let cfg = cfg();
         let request = prompt("what time is it");
-        let argv = expand_first_run_argv(&cfg, &request, "what time is it");
+        let argv = expand_first_run_argv(&cfg, &request, None, "what time is it");
         assert_eq!(argv, vec!["-n", "what time is it"]);
     }
 
@@ -1787,7 +1824,7 @@ mod tests {
         let mut cfg = cfg();
         cfg.args = vec!["--input".into(), "{prompt}".into()];
         let request = prompt("hi");
-        let argv = expand_first_run_argv(&cfg, &request, "hi");
+        let argv = expand_first_run_argv(&cfg, &request, None, "hi");
         assert_eq!(argv, vec!["--input", "hi"]);
     }
 

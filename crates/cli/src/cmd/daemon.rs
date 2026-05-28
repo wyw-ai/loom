@@ -313,6 +313,7 @@ fn load_machine_specs(
         .flat_map(|provider| provider.into_agent_specs())
         .collect::<Vec<_>>();
     annotate_machine_agent_specs(&mut specs, &machine);
+    specs.extend(load_config_agent_specs()?);
 
     if !allow_actors.is_empty() {
         let allow = allow_actors
@@ -327,6 +328,14 @@ fn load_machine_specs(
         providers,
         specs,
     })
+}
+
+fn load_config_agent_specs() -> Result<Vec<AgentSpec>> {
+    let dir = crate::config::config_dir().join("agents");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    agent_serve::load_specs(&dir).with_context(|| format!("load AgentSpecs from {}", dir.display()))
 }
 
 fn reconcile_agents(

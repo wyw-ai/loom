@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use proto::methods::{
     AgentActorDefaults, AgentActorSpec, AgentModelChoice, AgentModelSpec, AgentProviderInfo,
-    AgentProviderSpec, AgentTransport, CommandOutputFormat, CommandSession, IdentityFiles,
-    IdentityScaffoldSpec, IdentitySpec, PromptVia,
+    AgentProviderRef, AgentProviderSpec, AgentSpec, AgentTransport, CommandOutputFormat,
+    CommandSession, CommandSessionIdSource, IdentityFiles, IdentityScaffoldSpec, IdentitySpec,
+    PromptVia,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -155,6 +156,74 @@ pub fn apply_provider_overrides(
     providers
 }
 
+pub fn resolve_provider_ref_in_spec(spec: &mut AgentSpec) -> Result<(), String> {
+    let Some(provider_ref) = spec.provider_ref.clone() else {
+        return Ok(());
+    };
+    let mode = provider_ref.mode.as_deref().unwrap_or("print");
+    if mode != "print" && mode != "command" {
+        return Err(format!(
+            "providerRef for {} requested unsupported mode `{mode}`",
+            spec.actor.id
+        ));
+    }
+    let provider = detect_agent_cli_providers()
+        .into_iter()
+        .find(|provider| provider.id == provider_ref.id)
+        .ok_or_else(|| {
+            format!(
+                "provider `{}` referenced by {} was not detected on PATH",
+                provider_ref.id, spec.actor.id
+            )
+        })?;
+    let mut transport = provider.transport();
+    if provider_ref
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .is_none()
+    {
+        transport.model = None;
+    }
+    apply_provider_ref_options(&mut transport, &provider_ref);
+    spec.transport = transport;
+    Ok(())
+}
+
+fn apply_provider_ref_options(transport: &mut AgentTransport, provider_ref: &AgentProviderRef) {
+    if let Some(model) = provider_ref
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        transport.model = Some(model.to_string());
+    }
+    if let Some(reasoning_effort) = provider_ref
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match provider_ref.id.as_str() {
+            "opencode" => {
+                transport.args.push("--variant".into());
+                transport.args.push(reasoning_effort.to_string());
+            }
+            "qoder" => {
+                transport.args.push("--reasoning-effort".into());
+                transport.args.push(reasoning_effort.to_string());
+            }
+            "copilot" => {
+                transport.args.push("--effort".into());
+                transport.args.push(reasoning_effort.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
         let mut env = self.transport_env.clone();
@@ -165,6 +234,17 @@ impl DetectedAgentProvider {
             // CLI calls use LOOM_SERVER directly.
             env.entry("LOOM_NO_DAEMON".into())
                 .or_insert_with(|| "1".into());
+        }
+        if self.id == "opencode" {
+            // OpenCode keeps a SQLite store under XDG_DATA_HOME. Use an
+            // actor-local store so a user's interactive opencode process does
+            // not lock the daemon-run provider.
+            env.entry("XDG_DATA_HOME".into())
+                .or_insert_with(|| "{agent.profile}/opencode/data".into());
+            env.entry("XDG_STATE_HOME".into())
+                .or_insert_with(|| "{agent.profile}/opencode/state".into());
+            env.entry("XDG_CACHE_HOME".into())
+                .or_insert_with(|| "{agent.profile}/opencode/cache".into());
         }
         AgentTransport {
             kind: self.transport_kind.clone(),
@@ -484,6 +564,8 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
             args.push("--output-format".into());
             args.push("stream-json".into());
             args.push("--verbose".into());
+            args.push("--session-id".into());
+            args.push("{session_id}".into());
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
         }
         "qoder" => {
@@ -535,7 +617,8 @@ fn command_session_for_provider(
 ) -> Option<CommandSession> {
     match provider_id {
         "claude" => Some(CommandSession {
-            first_run_capture: Some("stdout_json:.session_id".into()),
+            id_source: Some(CommandSessionIdSource::LoomUuid),
+            first_run_capture: None,
             resume_args: Some(claude_resume_args(first_run_args)),
         }),
         _ => None,
@@ -543,14 +626,22 @@ fn command_session_for_provider(
 }
 
 fn claude_resume_args(first_run_args: &[String]) -> Vec<String> {
-    let mut args = first_run_args
-        .iter()
-        .filter(|arg| arg.as_str() != "-p")
-        .cloned()
-        .collect::<Vec<_>>();
-    args.push("--resume".into());
-    args.push("{session_id}".into());
-    args.push("-p".into());
+    let mut args = Vec::with_capacity(first_run_args.len());
+    let mut i = 0;
+    while i < first_run_args.len() {
+        if first_run_args[i] == "--session-id"
+            && first_run_args
+                .get(i + 1)
+                .is_some_and(|arg| arg == "{session_id}")
+        {
+            args.push("--resume".into());
+            args.push("{session_id}".into());
+            i += 2;
+            continue;
+        }
+        args.push(first_run_args[i].clone());
+        i += 1;
+    }
     args
 }
 
@@ -705,6 +796,8 @@ mod tests {
             "--output-format",
             "stream-json",
             "--verbose",
+            "--session-id",
+            "{session_id}",
         ]);
         expected.push("-p");
         assert_eq!(claude.args, expected);
@@ -714,11 +807,15 @@ mod tests {
             Some(CommandOutputFormat::ClaudeStreamJson)
         );
         assert_eq!(
+            claude_transport.session.as_ref().and_then(|s| s.id_source),
+            Some(CommandSessionIdSource::LoomUuid)
+        );
+        assert_eq!(
             claude_transport
                 .session
                 .as_ref()
                 .and_then(|s| s.first_run_capture.as_deref()),
-            Some("stdout_json:.session_id")
+            None
         );
         assert_eq!(
             claude_transport

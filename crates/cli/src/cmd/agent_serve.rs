@@ -257,7 +257,7 @@ fn default_specs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".loom").join("agents"))
 }
 
-fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
+pub(crate) fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
     let mut out = Vec::new();
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("read specs dir {}", dir.display()))?
@@ -912,6 +912,9 @@ impl AgentPaths {
                 active.trigger_source_id.clone(),
             );
             env.insert("LOOM_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+            if let Some(target) = active.reply_target.as_deref() {
+                env.insert("LOOM_REPLY_TARGET".into(), target.to_string());
+            }
             if let Some(path) = active.no_reply_file.as_ref() {
                 env.insert(LOOM_NO_REPLY_FILE_ENV.into(), path.display().to_string());
             }
@@ -1749,7 +1752,13 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
     }
 }
 
-async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
+async fn run_agent_worker(
+    mut spec: AgentSpec,
+    server_url: String,
+    data_root: PathBuf,
+) -> Result<()> {
+    agent_runtime::discovery::resolve_provider_ref_in_spec(&mut spec)
+        .map_err(|e| anyhow!("resolve providerRef for {}: {e}", spec.actor.id))?;
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -3781,6 +3790,9 @@ fn extend_prompt_template_vars(
     if let Some(trigger) = trigger {
         vars.insert("trigger.id".into(), trigger.id().to_string());
         vars.insert("trigger.actor_id".into(), trigger.actor_id().to_string());
+        if let Some(target) = trigger.reply_target() {
+            vars.insert("reply.target".into(), target);
+        }
     }
     if let Some(template) = state.spec.prompt_template.as_ref() {
         if let Some(active_skill) = template.active_skill.as_deref() {
@@ -3930,7 +3942,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            current scope = {scope_kind}:{scope_id}\n\
          \n\
          You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
-         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
+         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, LOOM_REPLY_TARGET, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
          so commands like:\n\
            loom --json inbox list --no-ack\n\
            \"$LOOM_CLI\" --json inbox list --no-ack\n\
@@ -3945,7 +3957,8 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            loom --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
         Assistant text is internal run transcript only. It is not published to\n\
         the channel or thread. For any visible reply, call\n\
-        `loom --json message send --target ... --text ...`; after that, final\n\
+        `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text ...`\n\
+        when LOOM_REPLY_TARGET is set; after that, final\n\
         assistant text may be empty or a private note. When no visible reply is\n\
         needed, call `loom --json run ignore --reason \"...\"`.\n\
         Only send messages when you have actionable content: a requested\n\
@@ -4738,6 +4751,7 @@ mod tests {
                 capabilities: None,
                 _meta: None,
             },
+            provider_ref: None,
             transport: AgentTransport {
                 kind: "command".into(),
                 command: "echo".into(),
@@ -4979,6 +4993,10 @@ mod tests {
             Some("chan_demo")
         );
         assert_eq!(env.get("LOOM_RUN_ID").map(String::as_str), Some("run_demo"));
+        assert_eq!(
+            env.get("LOOM_REPLY_TARGET").map(String::as_str),
+            Some("#chan_demo")
+        );
         let expected_no_reply_file = root.join("no-reply.json").display().to_string();
         assert_eq!(
             env.get(LOOM_NO_REPLY_FILE_ENV).map(String::as_str),
@@ -5615,6 +5633,7 @@ mod tests {
 
         let mut resumable = sample_spec(None);
         resumable.transport.session = Some(proto::methods::CommandSession {
+            id_source: None,
             first_run_capture: Some("stdout_json:.session_id".into()),
             resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
         });
@@ -5794,6 +5813,38 @@ mod tests {
         assert!(vars
             .get("workspace.dir")
             .is_some_and(|value| value.contains("chan_demo")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn prompt_template_vars_include_reply_target_for_message() {
+        let root = temp_path("prompt-template-reply-target");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let spec = sample_spec(None);
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+
+        let vars = prompt_template_vars(&state, &AgentTrigger::Message(message), "chan_demo");
+
+        assert_eq!(
+            vars.get("reply.target").map(String::as_str),
+            Some("#chan_demo:msg_root")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

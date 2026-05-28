@@ -3961,6 +3961,17 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         when LOOM_REPLY_TARGET is set; after that, final\n\
         assistant text may be empty or a private note. When no visible reply is\n\
         needed, call `loom --json run ignore --reason \"...\"`.\n\
+        If the user or another actor asks you to hand off, wake, route, or\n\
+        notify a specific actor, that routed visible message is required work.\n\
+        A plain notify_only thread message does not wake the target actor. Send\n\
+        a message whose text includes `@actor_id` and whose flags include\n\
+        `--intent request_action --delivery-policy wake_agent`; only call\n\
+        `run ignore` after that message was successfully sent or when no\n\
+        routed visible message is needed.\n\
+        The same rule applies to turn-taking: when your visible message expects\n\
+        a specific actor's next answer, guess, review, or decision, route it to\n\
+        that actor with `@actor_id`, `--intent request_action`, and\n\
+        `--delivery-policy wake_agent`.\n\
         Only send messages when you have actionable content: a requested\n\
         answer, a claimed work unit and result, a material state change, a\n\
         needed question, or a real blocker. Do not send visibility-only\n\
@@ -4002,6 +4013,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         `loom task assign` requires a machine-readable contract. Do not fall back\n\
         to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
+        A direct handoff without an explicit `@actor_id` audience and\n\
+        `wake_agent` delivery is only a visible note; it will not start the\n\
+        receiving agent.\n\
+        For games, Q&A, reviews, or any other back-and-forth, each turn that\n\
+        needs the other actor to respond must be a routed wake message to that\n\
+        actor.\n\
          `loom ask-user-question` is for choices or missing input; its JSON\n\
          output is the human's answer to your question, not an approval.\n\
          `loom request-approval` is for approve/reject gates before risky work.\n\

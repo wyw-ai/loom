@@ -3353,7 +3353,9 @@ impl Store {
                     .and_then(|ids| ids.last())
                     .cloned()
             };
-            if latest.as_deref() != Some(expected) {
+            let expected_is_unstarted_thread_root =
+                latest.is_none() && resolved.thread_root_message_id.as_deref() == Some(expected);
+            if latest.as_deref() != Some(expected) && !expected_is_unstarted_thread_root {
                 return Err(StoreError::Conflict(format!(
                     "message target {} has latest message {}, expected {expected}",
                     resolved.target,
@@ -3512,6 +3514,11 @@ impl Store {
         limit: u32,
         before_message_id: Option<&str>,
     ) -> StoreResult<(Vec<Message>, bool)> {
+        if let Some(messages) =
+            self.read_unstarted_thread_root_for_target(actor_id, target, limit, before_message_id)?
+        {
+            return Ok((messages, false));
+        }
         let resolved = self.resolve_message_target_for_read(target, actor_id)?;
         self.check_scope_access(&resolved.scope, actor_id)?;
         let inner = self.inner.read();
@@ -3531,6 +3538,41 @@ impl Store {
             .filter_map(|id| inner.messages.get(id).cloned())
             .collect();
         Ok((messages, has_more))
+    }
+
+    fn read_unstarted_thread_root_for_target(
+        &self,
+        actor_id: &str,
+        target: &str,
+        _limit: u32,
+        before_message_id: Option<&str>,
+    ) -> StoreResult<Option<Vec<Message>>> {
+        let Some(raw) = target.trim().strip_prefix('#') else {
+            return Ok(None);
+        };
+        let Some((channel_id, root_message_id)) = raw.trim().split_once(':') else {
+            return Ok(None);
+        };
+        if channel_id.is_empty() || root_message_id.is_empty() || root_message_id.contains(':') {
+            return Ok(None);
+        }
+        if self
+            .find_thread_by_root(channel_id, root_message_id)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let root = self
+            .get_message(root_message_id)
+            .ok_or_else(|| StoreError::NotFound(format!("message {root_message_id}")))?;
+        if root.scope.kind != ScopeKind::Channel || root.scope.id != channel_id {
+            return Ok(None);
+        }
+        self.check_scope_access(&root.scope, actor_id)?;
+        if before_message_id == Some(root.id.as_str()) {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(vec![root]))
     }
 
     pub fn search_message_records(
@@ -6423,7 +6465,35 @@ mod tests {
         let root = send_test_message(&store, "actor_alice", &format!("#{}", channel.id), "root");
         let target = format!("#{}:{}", channel.id, root.id);
 
-        let first = send_test_message(&store, "actor_alice", &target, "first reply");
+        let (unstarted_messages, unstarted_has_more) = store
+            .read_messages_for_target("actor_alice", &target, 10, None)
+            .expect("read unstarted thread target");
+        assert!(!unstarted_has_more);
+        assert_eq!(
+            unstarted_messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![root.id.as_str()]
+        );
+
+        let first = store
+            .append_message(
+                "actor_alice".into(),
+                target.clone(),
+                MessageKind::Human,
+                "first reply".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                Some(root.id.clone()),
+            )
+            .expect("append first reply with channel root if-latest");
         let second = send_test_message(&store, "actor_alice", &target, "second reply");
 
         assert_eq!(

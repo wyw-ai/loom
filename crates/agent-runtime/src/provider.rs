@@ -18,7 +18,7 @@ use proto::methods::{
     ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
     ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::adapter::PromptPart;
@@ -39,6 +39,61 @@ pub struct DetectedProvider {
 #[derive(Debug, Clone)]
 pub struct ProviderRegistry {
     manifests: BTreeMap<String, ProviderManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRuntimePlan {
+    pub provider_id: String,
+    pub mode: String,
+    pub transport_kind: String,
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<CommandSession>,
+    pub output_format: CommandOutputFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder: Option<ProviderDecoderSpec>,
+    #[serde(default)]
+    pub prompt_via: PromptVia,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ProviderPromptSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+}
+
+impl ProviderRuntimePlan {
+    pub fn into_transport(self) -> AgentTransport {
+        AgentTransport {
+            kind: self.transport_kind,
+            command: self.command,
+            args: self.args,
+            env: self.env,
+            auth_method: None,
+            model: self.model,
+            model_args: self.model_args,
+            session: self.session,
+            output_format: Some(self.output_format),
+            decoder: self.decoder,
+            prompt_via: self.prompt_via,
+            prompt: self.prompt,
+            stdin: self.stdin,
+            timeout_ms: self.timeout_ms,
+            idle_timeout_ms: self.idle_timeout_ms,
+            interactive: None,
+            provider: None,
+        }
+    }
 }
 
 impl ProviderRegistry {
@@ -104,6 +159,14 @@ impl ProviderRegistry {
         &self,
         provider_ref: &AgentProviderRef,
     ) -> Result<AgentTransport, String> {
+        self.resolve_runtime_plan(provider_ref)
+            .map(ProviderRuntimePlan::into_transport)
+    }
+
+    pub fn resolve_runtime_plan(
+        &self,
+        provider_ref: &AgentProviderRef,
+    ) -> Result<ProviderRuntimePlan, String> {
         let manifest = self
             .get(&provider_ref.id)
             .ok_or_else(|| format!("provider `{}` not found", provider_ref.id))?;
@@ -127,7 +190,7 @@ impl ProviderRegistry {
                     manifest.detect.candidates.join(", ")
                 )
             })?;
-        transport_from_manifest(manifest, mode, &bin, provider_ref)
+        runtime_plan_from_manifest(manifest, mode_name, mode, &bin, provider_ref)
     }
 }
 
@@ -1057,12 +1120,33 @@ fn collect_prompt_refs(value: &str, refs: &mut HashSet<String>) {
     }
 }
 
+#[cfg(test)]
 fn transport_from_manifest(
     manifest: &ProviderManifest,
     mode: &ProviderModeSpec,
     bin: &Path,
     provider_ref: &AgentProviderRef,
 ) -> Result<AgentTransport, String> {
+    runtime_plan_from_manifest(
+        manifest,
+        provider_ref
+            .mode
+            .as_deref()
+            .unwrap_or(default_mode_name(manifest)),
+        mode,
+        bin,
+        provider_ref,
+    )
+    .map(ProviderRuntimePlan::into_transport)
+}
+
+fn runtime_plan_from_manifest(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    mode: &ProviderModeSpec,
+    bin: &Path,
+    provider_ref: &AgentProviderRef,
+) -> Result<ProviderRuntimePlan, String> {
     let mut args = Vec::new();
     let mut model_args = Vec::new();
     append_provider_args(
@@ -1085,8 +1169,10 @@ fn transport_from_manifest(
         }
     }
 
-    let transport = AgentTransport {
-        kind: if mode.transport.trim().is_empty() {
+    let plan = ProviderRuntimePlan {
+        provider_id: manifest.id.clone(),
+        mode: mode_name.to_string(),
+        transport_kind: if mode.transport.trim().is_empty() {
             "command".into()
         } else {
             mode.transport.clone()
@@ -1094,7 +1180,6 @@ fn transport_from_manifest(
         command: expand_static_command(&mode.command, bin),
         args: normalize_session_tokens(args),
         env: mode.env.clone(),
-        auth_method: None,
         model: provider_ref
             .model
             .as_deref()
@@ -1114,18 +1199,16 @@ fn transport_from_manifest(
                 Some(normalize_session_tokens(resume_args))
             },
         }),
-        output_format: Some(output_format(&mode.stdout)?),
+        output_format: output_format(&mode.stdout)?,
         decoder: Some(mode.stdout.clone()),
         prompt_via: PromptVia::Args,
         prompt: mode.prompt.clone(),
         stdin: mode.stdin.clone(),
         timeout_ms: mode.timeout_ms,
         idle_timeout_ms: mode.idle_timeout_ms,
-        interactive: None,
-        provider: None,
     };
     validate_manifest(manifest)?;
-    Ok(transport)
+    Ok(plan)
 }
 
 fn append_provider_args(
@@ -2115,6 +2198,56 @@ mod tests {
         assert_eq!(
             transport.session.as_ref().and_then(|s| s.id_source),
             Some(CommandSessionIdSource::LoomUuid)
+        );
+    }
+
+    #[test]
+    fn provider_runtime_plan_resolves_before_adapter_transport() {
+        let dir = temp_dir("runtime-plan-path");
+        make_executable(&dir.join("qodercli"));
+        let registry = ProviderRegistry::load(&temp_dir("runtime-plan-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "qoder")
+            .expect("qoder");
+        let provider_ref = AgentProviderRef {
+            id: "qoder".into(),
+            mode: Some("print".into()),
+            model: Some("auto".into()),
+            reasoning_effort: Some("high".into()),
+        };
+        let plan = runtime_plan_from_manifest(
+            &provider.manifest,
+            "print",
+            provider.manifest.modes.get("print").unwrap(),
+            Path::new(&provider.command),
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        assert_eq!(plan.provider_id, "qoder");
+        assert_eq!(plan.mode, "print");
+        assert_eq!(plan.transport_kind, "command");
+        assert_eq!(plan.output_format, CommandOutputFormat::ClaudeStreamJson);
+        assert_eq!(plan.model.as_deref(), Some("auto"));
+        assert!(plan
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some());
+
+        let transport = plan.into_transport();
+        assert_eq!(transport.kind, "command");
+        assert_eq!(transport.command, provider.command);
+        assert_eq!(
+            transport
+                .session
+                .as_ref()
+                .and_then(|session| session.id_source),
+            Some(CommandSessionIdSource::ProviderCapture)
         );
     }
 

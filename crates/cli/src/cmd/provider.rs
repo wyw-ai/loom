@@ -272,8 +272,8 @@ fn provider_mode_detail(
                 .and_then(|models| models.default.clone()),
             reasoning_effort: None,
         };
-        match registry.resolve_transport(&provider_ref) {
-            Ok(transport) => serde_json::to_value(transport).context("serialize runtime plan")?,
+        match registry.resolve_runtime_plan(&provider_ref) {
+            Ok(plan) => serde_json::to_value(plan).context("serialize runtime plan")?,
             Err(err) => json!({ "error": err }),
         }
     } else {

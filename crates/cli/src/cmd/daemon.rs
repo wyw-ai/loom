@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{detect_agent_cli_providers, DetectedAgentProvider};
-use agent_runtime::provider::{builtin_provider_manifests, providers_dir, validate_manifest};
+use agent_runtime::provider::{
+    builtin_provider_manifests, providers_dir, validate_manifest, ProviderRegistry,
+};
 use anyhow::{anyhow, Context, Result};
 #[cfg(test)]
 use proto::methods::AgentTransport;
@@ -810,13 +812,16 @@ fn apply_machine_command(
             let manifest_value = command
                 .get("manifest")
                 .ok_or_else(|| anyhow!("manifest is required"))?;
-            let manifest: ProviderManifest = serde_json::from_value(manifest_value.clone())
-                .context("parse provider manifest")?;
+            let registry =
+                ProviderRegistry::load(&config::config_dir()).map_err(|err| anyhow!(err))?;
+            let manifest = registry
+                .resolve_manifest_value(manifest_value.clone())
+                .map_err(|err| anyhow!(err))?;
             let replace = command
                 .get("replace")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let path = write_local_provider_manifest(&manifest, replace)?;
+            let path = write_local_provider_manifest(&manifest, manifest_value, replace)?;
             Ok(json!({
                 "providerManifest": manifest,
                 "path": path.display().to_string(),
@@ -865,7 +870,11 @@ fn machine_host_config(machine: &MachineConfig) -> MachineConfig {
     machine.clone()
 }
 
-fn write_local_provider_manifest(manifest: &ProviderManifest, replace: bool) -> Result<PathBuf> {
+fn write_local_provider_manifest(
+    manifest: &ProviderManifest,
+    raw: &Value,
+    replace: bool,
+) -> Result<PathBuf> {
     validate_manifest(manifest).map_err(|err| anyhow!(err))?;
     if builtin_provider_manifests()
         .iter()
@@ -887,7 +896,7 @@ fn write_local_provider_manifest(manifest: &ProviderManifest, replace: bool) -> 
             path.display()
         ));
     }
-    let text = serde_json::to_string_pretty(manifest).context("serialize provider manifest")?;
+    let text = serde_json::to_string_pretty(raw).context("serialize provider manifest")?;
     std::fs::write(&path, text)
         .with_context(|| format!("write provider manifest {}", path.display()))?;
     Ok(path)

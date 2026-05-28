@@ -24,10 +24,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, AgentTransport, BundleInstallMode, InboxListResult,
-    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
-    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
-    TriggerPrefixApplyOn,
+    AgentModelChoice, AgentSpec, AgentTransport, BundleInstallMode, CommandSessionIdSource,
+    InboxListResult, MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult,
+    RunCloseResult, RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult,
+    ThreadListResult, TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -4035,9 +4035,30 @@ fn command_transport_without_resume(transport: &AgentTransport) -> bool {
     if transport.kind != "command" {
         return false;
     }
-    match transport.session.as_ref() {
-        Some(session) => session.first_run_capture.is_none() || session.resume_args.is_none(),
-        None => true,
+    !command_transport_can_resume(transport)
+}
+
+fn command_transport_can_resume(transport: &AgentTransport) -> bool {
+    let Some(session) = transport.session.as_ref() else {
+        return false;
+    };
+    let has_resume_template = session
+        .resume_args
+        .as_ref()
+        .is_some_and(|args| !args.is_empty())
+        || !session.resume_arg_specs.is_empty();
+    if !has_resume_template {
+        return false;
+    }
+    match session.id_source {
+        Some(CommandSessionIdSource::LoomUuid) => true,
+        Some(CommandSessionIdSource::ProviderCapture) => transport
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some(),
+        None => session.first_run_capture.is_some(),
     }
 }
 
@@ -5795,6 +5816,15 @@ mod tests {
         let no_session = test_command_transport();
         assert!(command_transport_without_resume(&no_session));
 
+        let mut loom_uuid = test_command_transport();
+        loom_uuid.session = Some(proto::methods::CommandSession {
+            id_source: Some(CommandSessionIdSource::LoomUuid),
+            first_run_capture: None,
+            resume_args: Some(vec!["--session-id".into(), "{session_id}".into()]),
+            resume_arg_specs: Vec::new(),
+        });
+        assert!(!command_transport_without_resume(&loom_uuid));
+
         let mut resumable = test_command_transport();
         resumable.session = Some(proto::methods::CommandSession {
             id_source: None,
@@ -5803,6 +5833,32 @@ mod tests {
             resume_arg_specs: Vec::new(),
         });
         assert!(!command_transport_without_resume(&resumable));
+
+        let mut decoder_capture = test_command_transport();
+        decoder_capture.session = Some(proto::methods::CommandSession {
+            id_source: Some(CommandSessionIdSource::ProviderCapture),
+            first_run_capture: None,
+            resume_args: None,
+            resume_arg_specs: vec![
+                proto::methods::ProviderArgSpec::Literal("--resume".into()),
+                proto::methods::ProviderArgSpec::Literal("{session_id}".into()),
+            ],
+        });
+        decoder_capture.decoder = Some(proto::methods::ProviderDecoderSpec {
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(proto::methods::ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        });
+        assert!(!command_transport_without_resume(&decoder_capture));
+
+        let mut broken_capture = decoder_capture.clone();
+        broken_capture.decoder = None;
+        assert!(command_transport_without_resume(&broken_capture));
 
         let mut acp = test_command_transport();
         acp.kind = "acp_stdio".into();

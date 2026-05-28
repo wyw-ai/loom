@@ -13,8 +13,6 @@ use agent_runtime::provider::{
     builtin_provider_manifests, providers_dir, validate_manifest, ProviderRegistry,
 };
 use anyhow::{anyhow, Context, Result};
-#[cfg(test)]
-use proto::methods::AgentTransport;
 use proto::methods::{AgentModelSpec, AgentProviderRef, AgentSpec, ProviderManifest};
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -1439,7 +1437,7 @@ mod tests {
             transport_kind: "command".into(),
             args: Vec::new(),
             transport_env: Default::default(),
-            transport: AgentTransport::default(),
+            runtime_plan: None,
             default_model: Some("sonnet".into()),
             model_choices: Vec::new(),
         };

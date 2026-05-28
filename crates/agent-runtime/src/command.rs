@@ -74,6 +74,7 @@ pub struct CommandConfig {
     /// expanded only after a non-empty selected model exists.
     pub model_args: Vec<String>,
     pub session_id_source: Option<CommandSessionIdSource>,
+    pub session_scope: Option<String>,
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
     pub resume_arg_specs: Vec<ProviderArgSpec>,
@@ -123,6 +124,16 @@ impl CommandConfig {
         }
         let session = spec.session.clone();
         if let Some(session) = session.as_ref() {
+            let scope = session
+                .scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .unwrap_or("actor_scope");
+            if scope != "actor_scope" {
+                hasher.update(b"\x00session_scope\x00");
+                hasher.update(scope.as_bytes());
+            }
             if session.resume_arg_specs.is_empty() {
                 if let Some(args) = session.resume_args.as_ref() {
                     for a in args {
@@ -146,6 +157,7 @@ impl CommandConfig {
             env,
             model_args: spec.model_args.clone(),
             session_id_source: session.as_ref().and_then(|s| s.id_source),
+            session_scope: session.as_ref().and_then(|s| s.scope.clone()),
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
             resume_arg_specs: session
@@ -1543,18 +1555,33 @@ struct SessionRecord {
     command_signature: String,
 }
 
-fn session_path(cfg: &CommandConfig, scope: &ScopeRef) -> PathBuf {
+fn session_path(cfg: &CommandConfig, scope: &ScopeRef) -> Option<PathBuf> {
+    match session_scope(cfg) {
+        "turn" => return None,
+        "actor" => return Some(cfg.sessions_dir.join(&cfg.actor_id).join("actor.json")),
+        _ => {}
+    }
     let kind = match scope.kind {
         proto::types::ScopeKind::Thread => "thread",
         proto::types::ScopeKind::Channel => "channel",
     };
-    cfg.sessions_dir
-        .join(&cfg.actor_id)
-        .join(format!("{kind}-{}.json", scope.id))
+    Some(
+        cfg.sessions_dir
+            .join(&cfg.actor_id)
+            .join(format!("{kind}-{}.json", scope.id)),
+    )
+}
+
+fn session_scope(cfg: &CommandConfig) -> &str {
+    cfg.session_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or("actor_scope")
 }
 
 fn load_session(cfg: &CommandConfig, scope: &ScopeRef) -> Option<SessionRecord> {
-    let path = session_path(cfg, scope);
+    let path = session_path(cfg, scope)?;
     let text = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -1565,7 +1592,9 @@ fn save_session(
     session_id: &str,
     command_signature: &str,
 ) -> std::io::Result<()> {
-    let path = session_path(cfg, scope);
+    let Some(path) = session_path(cfg, scope) else {
+        return Ok(());
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1614,7 +1643,9 @@ fn command_signature_for_prompt(cfg: &CommandConfig, request: &AdapterPrompt) ->
 }
 
 fn delete_session(cfg: &CommandConfig, scope: &ScopeRef) -> std::io::Result<()> {
-    let path = session_path(cfg, scope);
+    let Some(path) = session_path(cfg, scope) else {
+        return Ok(());
+    };
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -2005,6 +2036,7 @@ mod tests {
             env: BTreeMap::new(),
             model_args: Vec::new(),
             session_id_source: None,
+            session_scope: None,
             first_run_capture: None,
             resume_args: None,
             resume_arg_specs: Vec::new(),
@@ -2776,12 +2808,37 @@ mod tests {
     #[test]
     fn session_path_distinguishes_thread_and_channel() {
         let cfg = cfg();
-        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same"));
-        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "same"));
+        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same")).unwrap();
+        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "same")).unwrap();
 
         assert_ne!(thread, channel);
         assert!(thread.ends_with("thread-same.json"));
         assert!(channel.ends_with("channel-same.json"));
+    }
+
+    #[test]
+    fn session_scope_actor_reuses_one_path_across_scopes() {
+        let mut cfg = cfg();
+        cfg.session_scope = Some("actor".into());
+        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "thread-a")).unwrap();
+        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "channel-b")).unwrap();
+
+        assert_eq!(thread, channel);
+        assert!(thread.ends_with("actor.json"));
+    }
+
+    #[test]
+    fn session_scope_turn_does_not_persist() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.session_scope = Some("turn".into());
+        let scope = named_scope(ScopeKind::Channel, "chan");
+
+        assert!(session_path(&cfg, &scope).is_none());
+        save_session(&cfg, &scope, "sid", "sig").unwrap();
+        assert!(load_session(&cfg, &scope).is_none());
+        assert!(!root.exists());
     }
 
     #[test]

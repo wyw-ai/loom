@@ -325,11 +325,36 @@ fn render_prompt_output(
 }
 
 fn render_prompt_template(template: &str, parts: &BTreeMap<&str, &PromptPart>) -> String {
-    let mut out = template.to_string();
-    for (key, part) in parts {
-        out = out.replace(&format!("{{{key}}}"), &part.content);
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = &after_open[..end];
+        if is_prompt_part_placeholder(key) {
+            if let Some(part) = parts.get(key) {
+                out.push_str(&part.content);
+            }
+        } else {
+            out.push('{');
+            out.push_str(key);
+            out.push('}');
+        }
+        rest = &after_open[end + 1..];
     }
+    out.push_str(rest);
     out
+}
+
+fn is_prompt_part_placeholder(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn preset_parts(preset: &str) -> Result<Vec<&'static str>, String> {
@@ -1193,6 +1218,30 @@ mod tests {
         assert_eq!(
             outputs.get("user").map(String::as_str),
             Some("runtime context\n\nuser message")
+        );
+    }
+
+    #[test]
+    fn prompt_template_missing_part_expands_to_empty_string() {
+        let parts = vec![prompt_part("actor_context", "actor context")];
+        let outputs = render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                outputs: BTreeMap::from([(
+                    "system".into(),
+                    ProviderPromptOutputSpec {
+                        template: Some("{actor_context}\n{assignment_context}\n{json:keep}".into()),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &parts,
+            "full prompt",
+        )
+        .expect("outputs");
+
+        assert_eq!(
+            outputs.get("system").map(String::as_str),
+            Some("actor context\n\n{json:keep}")
         );
     }
 

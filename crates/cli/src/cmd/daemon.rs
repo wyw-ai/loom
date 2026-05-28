@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{detect_agent_cli_providers, DetectedAgentProvider};
+use agent_runtime::provider::{builtin_provider_manifests, providers_dir, validate_manifest};
 use anyhow::{anyhow, Context, Result};
 #[cfg(test)]
 use proto::methods::AgentTransport;
-use proto::methods::{method, AgentModelSpec, AgentProviderRef, AgentSpec};
+use proto::methods::{method, AgentModelSpec, AgentProviderRef, AgentSpec, ProviderManifest};
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -166,7 +166,6 @@ pub async fn run(
                 let result = handle_machine_command(
                     &selected_machine_id,
                     &mut selected_machine,
-                    &data_root,
                     command.payload,
                 );
                 if result.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -493,7 +492,6 @@ fn agent_spec_from_command(
             choices: provider.model_choices.clone(),
         }),
         bundle: None,
-        identity: None,
         memory: None,
         announcement: None,
         trigger: None,
@@ -693,7 +691,6 @@ fn print_providers(providers: &[DetectedAgentProvider]) {
 fn handle_machine_command(
     selected_machine_id: &str,
     selected_machine: &mut MachineConfig,
-    data_root: &PathBuf,
     payload: Value,
 ) -> Value {
     let command_id = payload
@@ -721,16 +718,15 @@ fn handle_machine_command(
     if machine_id != selected_machine_id {
         return machine_command_error(result_prefix(), "command targets a different machine");
     }
-    let result =
-        match apply_machine_command(selected_machine_id, selected_machine, data_root, &payload) {
-            Ok(output) => {
-                let mut result = result_prefix();
-                result["ok"] = json!(true);
-                result["output"] = output;
-                result
-            }
-            Err(err) => machine_command_error(result_prefix(), format!("{err:#}")),
-        };
+    let result = match apply_machine_command(selected_machine_id, selected_machine, &payload) {
+        Ok(output) => {
+            let mut result = result_prefix();
+            result["ok"] = json!(true);
+            result["output"] = output;
+            result
+        }
+        Err(err) => machine_command_error(result_prefix(), format!("{err:#}")),
+    };
     result
 }
 
@@ -765,7 +761,6 @@ fn machine_command_error(mut result: Value, error: impl Into<String>) -> Value {
 fn apply_machine_command(
     selected_machine_id: &str,
     selected_machine: &mut MachineConfig,
-    data_root: &PathBuf,
     payload: &Value,
 ) -> Result<Value> {
     let command = payload
@@ -811,49 +806,28 @@ fn apply_machine_command(
             }
             Err(anyhow!("daemon-configured agent not found: {actor_id}"))
         }
-        "agent.profile.read" => {
-            let actor_id = required_str(command, "actorId")?;
-            let file = required_str(command, "file")?;
-            let path = resolve_machine_agent_profile_file(data_root, actor_id, file)?;
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            let sha256 = sha256_text(&text);
+        "provider.add" => {
+            let manifest_value = command
+                .get("manifest")
+                .ok_or_else(|| anyhow!("manifest is required"))?;
+            let manifest: ProviderManifest = serde_json::from_value(manifest_value.clone())
+                .context("parse provider manifest")?;
+            let replace = command
+                .get("replace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = write_local_provider_manifest(&manifest, replace)?;
             Ok(json!({
+                "providerManifest": manifest,
                 "path": path.display().to_string(),
-                "text": text,
-                "sha256": sha256,
             }))
         }
-        "agent.profile.write" => {
-            let actor_id = required_str(command, "actorId")?;
-            let file = required_str(command, "file")?;
-            let text = command
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("text is required"))?;
-            let base_sha256 = command
-                .get("baseSha256")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("profile.write requires baseSha256"))?;
-            let path = resolve_machine_agent_profile_file(data_root, actor_id, file)?;
-            let current_text = std::fs::read_to_string(&path).unwrap_or_default();
-            let current_sha256 = sha256_text(&current_text);
-            if current_sha256 != base_sha256 {
-                return Err(anyhow!(
-                    "profile_conflict: current profile hash {current_sha256} does not match base {base_sha256}"
-                ));
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create directory {}", parent.display()))?;
-            }
-            std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-            *selected_machine = cfg.machines[machine_index].clone();
+        "provider.remove" => {
+            let provider_id = required_str(command, "providerId")?;
+            let path = remove_local_provider_manifest(provider_id)?;
             Ok(json!({
+                "providerId": provider_id,
                 "path": path.display().to_string(),
-                "text": text,
-                "sha256": sha256_text(text),
             }))
         }
         other => Err(anyhow!("unsupported machine command op: {other}")),
@@ -891,24 +865,53 @@ fn machine_host_config(machine: &MachineConfig) -> MachineConfig {
     machine.clone()
 }
 
-fn resolve_machine_agent_profile_file(
-    data_root: &PathBuf,
-    actor_id: &str,
-    file: &str,
-) -> Result<PathBuf> {
-    if load_config_agent_spec(actor_id)?.is_none() {
-        return Err(anyhow!("unknown agent actor id: {actor_id}"));
+fn write_local_provider_manifest(manifest: &ProviderManifest, replace: bool) -> Result<PathBuf> {
+    validate_manifest(manifest).map_err(|err| anyhow!(err))?;
+    if builtin_provider_manifests()
+        .iter()
+        .any(|builtin| builtin.id == manifest.id)
+    {
+        return Err(anyhow!(
+            "cannot add local provider `{}` because it would shadow a built-in provider",
+            manifest.id
+        ));
     }
-    let file_name = match file.trim() {
-        "identity" => "identity.md",
-        "soul" => "soul.md",
-        other => return Err(anyhow!("unknown profile file: {other}")),
-    };
-    Ok(data_root
-        .join("agents")
-        .join(actor_id)
-        .join("profile")
-        .join(file_name))
+    let dir = providers_dir(&config::config_dir());
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create provider dir {}", dir.display()))?;
+    let path = dir.join(format!("{}.json", manifest.id));
+    if path.exists() && !replace {
+        return Err(anyhow!(
+            "local provider `{}` already exists at {}; pass replace=true to overwrite",
+            manifest.id,
+            path.display()
+        ));
+    }
+    let text = serde_json::to_string_pretty(manifest).context("serialize provider manifest")?;
+    std::fs::write(&path, text)
+        .with_context(|| format!("write provider manifest {}", path.display()))?;
+    Ok(path)
+}
+
+fn remove_local_provider_manifest(provider_id: &str) -> Result<PathBuf> {
+    if builtin_provider_manifests()
+        .iter()
+        .any(|builtin| builtin.id == provider_id)
+    {
+        return Err(anyhow!(
+            "built-in provider `{provider_id}` cannot be removed"
+        ));
+    }
+    let path = providers_dir(&config::config_dir()).join(format!("{provider_id}.json"));
+    if !path.exists() {
+        return Err(anyhow!(
+            "local provider `{provider_id}` not found at {}",
+            path.display()
+        ));
+    }
+    std::fs::remove_file(&path)
+        .with_context(|| format!("remove provider manifest {}", path.display()))?;
+    Ok(path)
 }
 
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -926,12 +929,6 @@ fn optional_trimmed_str(value: &Value, field: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .map(ToString::to_string)
-}
-
-fn sha256_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn slugify(value: &str) -> String {
@@ -1067,8 +1064,8 @@ fn machine_inventory_meta(
             "machine.command",
             "agent.create",
             "agent.remove",
-            "agent.profile.read",
-            "agent.profile.write"
+            "provider.add",
+            "provider.remove"
         ],
         "providers": providers,
         "agentSpecs": specs,
@@ -1824,7 +1821,6 @@ mod tests {
                 choices: Vec::new(),
             }),
             bundle: None,
-            identity: None,
             memory: None,
             announcement: None,
             trigger: None,
@@ -1896,7 +1892,6 @@ mod tests {
             autostart: true,
             models: None,
             bundle: None,
-            identity: None,
             memory: None,
             announcement: None,
             trigger: None,
@@ -1908,6 +1903,12 @@ mod tests {
             machine_inventory_meta(&machine, &PathBuf::from("/tmp/loom-data"), &[], &[spec], 7);
 
         assert!(meta.get("agents").is_none());
+        let capabilities = meta
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .expect("capabilities");
+        assert!(capabilities.iter().any(|item| item == "provider.add"));
+        assert!(capabilities.iter().any(|item| item == "provider.remove"));
         assert_eq!(
             meta.get("agentSpecs")
                 .and_then(Value::as_array)

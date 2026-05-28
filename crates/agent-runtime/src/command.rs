@@ -13,9 +13,8 @@
 //!     `CopilotJson`. CodexStreamJson is wired through but its translation
 //!     table is a placeholder per the doc.
 //!   * `prompt_via`: `Args`, `Stdin`, `Env`.
-//!   * `first_run_capture`: `stdout_json:<path>`, `file:<path>`. The
-//!     `stderr_regex:` form is recognised but returns an unimplemented error so
-//!     it is obvious in logs (rather than silently swallowed).
+//!   * `decoder.capture.session` for provider-owned session ids. Legacy
+//!     `first_run_capture` remains available to direct command transports.
 //!   * Session bookkeeping: written to disk, read back on next prompt; signature
 //!     mismatch invalidates and forces a first-run path.
 //!
@@ -426,6 +425,11 @@ fn run_prompt(
         if let Some(sid) = first_run_session_id.as_deref() {
             if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
                 tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
+            }
+        } else if let Some(sid) = capture_decoder_session_id(cfg.decoder.as_ref(), &outcome.stdout)
+        {
+            if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
+                tracing::warn!(actor = %cfg.actor_id, %e, "failed to save decoder-captured command session");
             }
         } else if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
@@ -1315,11 +1319,28 @@ fn extract_decoder_final_text(
     let reducer = decoder
         .and_then(|decoder| decoder.reduce.as_ref())
         .and_then(|reduce| reduce.final_text.as_ref())?;
+    reduce_jsonl_text_with_fallback(stdout, reducer)
+}
+
+fn capture_decoder_session_id(
+    decoder: Option<&ProviderDecoderSpec>,
+    stdout: &str,
+) -> Option<String> {
+    let reducer = decoder
+        .and_then(|decoder| decoder.capture.as_ref())
+        .and_then(|capture| capture.session.as_ref())?;
+    reduce_jsonl_text_with_fallback(stdout, reducer)
+}
+
+fn reduce_jsonl_text_with_fallback(
+    stdout: &str,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Option<String> {
     reduce_jsonl_text(stdout, reducer).or_else(|| {
         reducer
             .fallback
             .as_deref()
-            .and_then(|fallback| reduce_jsonl_text(stdout, fallback))
+            .and_then(|fallback| reduce_jsonl_text_with_fallback(stdout, fallback))
     })
 }
 
@@ -2071,6 +2092,7 @@ mod tests {
                 },
             ],
             reduce: None,
+            capture: None,
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let scope = scope();
@@ -2161,6 +2183,39 @@ mod tests {
                       {\"type\":\"result\",\"session_id\":\"second\"}\n";
         assert_eq!(
             extract_json_path(stdout, ".session_id"),
+            Some("second".into())
+        );
+    }
+
+    #[test]
+    fn decoder_capture_session_picks_last_matching_jsonl_value() {
+        let decoder = ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        in_values: Some(vec![
+                            Value::String("system".into()),
+                            Value::String("result".into()),
+                        ]),
+                        ..Default::default()
+                    }),
+                    fallback: None,
+                }),
+            }),
+        };
+        let stdout = "{\"type\":\"debug\",\"session_id\":\"ignored\"}\n\
+                      {\"type\":\"system\",\"session_id\":\"first\"}\n\
+                      {\"type\":\"result\",\"session_id\":\"second\"}\n";
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&decoder), stdout),
             Some("second".into())
         );
     }
@@ -2548,6 +2603,47 @@ mod tests {
         assert_eq!(second.scope.kind, ScopeKind::Channel);
         assert_eq!(second.created_at, first.created_at);
         assert!(second.last_used_at > first.last_used_at);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_prompt_saves_decoder_captured_provider_session() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sid_decoder\"}'".into(),
+        ];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.session_id_source = Some(CommandSessionIdSource::ProviderCapture);
+        cfg.resume_args = Some(vec![
+            "--resume".into(),
+            "{session_id}".into(),
+            "{prompt}".into(),
+        ]);
+        cfg.decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), prompt("ignored"), tx, slot).expect("run prompt");
+
+        let saved = load_session(&cfg, &scope()).expect("saved session");
+        assert_eq!(saved.session_id, "sid_decoder");
         std::fs::remove_dir_all(root).ok();
     }
 

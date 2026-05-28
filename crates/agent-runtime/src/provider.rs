@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use proto::methods::{
     AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
-    CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderDecoderSpec,
-    ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
+    CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderDecoderCaptureSpec,
+    ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
     ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
     ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
 };
@@ -730,6 +730,33 @@ fn validate_prompt_references(
                 manifest.id
             ));
         }
+        validate_session_capture(manifest, mode_name, mode)?;
+    }
+    Ok(())
+}
+
+fn validate_session_capture(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    mode: &ProviderModeSpec,
+) -> Result<(), String> {
+    let Some(session) = mode.session.as_ref() else {
+        return Ok(());
+    };
+    if matches!(
+        session.id_source,
+        Some(ProviderSessionIdSource::ProviderCapture)
+    ) && mode
+        .stdout
+        .capture
+        .as_ref()
+        .and_then(|capture| capture.session.as_ref())
+        .is_none()
+    {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` uses provider_capture but stdout.capture.session is missing",
+            manifest.id
+        ));
     }
     Ok(())
 }
@@ -1080,7 +1107,7 @@ fn transport_from_manifest(
                 ProviderSessionIdSource::LoomUuid => CommandSessionIdSource::LoomUuid,
                 ProviderSessionIdSource::ProviderCapture => CommandSessionIdSource::ProviderCapture,
             }),
-            first_run_capture: session.capture.clone(),
+            first_run_capture: None,
             resume_args: if resume_args.is_empty() {
                 None
             } else {
@@ -1269,6 +1296,7 @@ fn mode(
             name: Some(stdout_name.into()),
             events: Vec::new(),
             reduce: None,
+            capture: None,
         },
         session,
         timeout_ms: None,
@@ -1312,6 +1340,18 @@ fn copilot_jsonl_decoder() -> ProviderDecoderSpec {
                     fallback: None,
                 })),
             }),
+        }),
+        capture: None,
+    }
+}
+
+fn session_capture(path: &str) -> ProviderDecoderCaptureSpec {
+    ProviderDecoderCaptureSpec {
+        session: Some(ProviderJsonlTextReducerSpec {
+            mode: "lastNonEmpty".into(),
+            path: path.into(),
+            when: None,
+            fallback: None,
         }),
     }
 }
@@ -1411,7 +1451,6 @@ fn claude_manifest() -> ProviderManifest {
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
-        capture: None,
         resume_args,
         scope: Some("actor_scope".into()),
     };
@@ -1476,7 +1515,6 @@ fn qoder_manifest() -> ProviderManifest {
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::ProviderCapture),
-        capture: Some("stdout_json:.session_id".into()),
         resume_args,
         scope: Some("actor_scope".into()),
     };
@@ -1484,16 +1522,17 @@ fn qoder_manifest() -> ProviderManifest {
         "qoder",
         "Qoder CLI",
         &["qodercli"],
-        BTreeMap::from([(
-            "print".into(),
-            mode(
+        BTreeMap::from([("print".into(), {
+            let mut mode = mode(
                 "{bin}",
                 first_args,
                 base_prompt(),
                 "claude_stream_json",
                 Some(session),
-            ),
-        )]),
+            );
+            mode.stdout.capture = Some(session_capture("$.session_id"));
+            mode
+        })]),
         &[
             ("auto", "Auto"),
             ("ultimate", "Ultimate"),
@@ -1525,7 +1564,6 @@ fn copilot_manifest() -> ProviderManifest {
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
-        capture: None,
         resume_args: args.clone(),
         scope: Some("actor_scope".into()),
     };
@@ -1602,11 +1640,11 @@ fn codex_manifest() -> ProviderManifest {
         "codex_stream_json",
         Some(ProviderSessionSpec {
             id_source: Some(ProviderSessionIdSource::ProviderCapture),
-            capture: Some("stdout_json:.session_id".into()),
             resume_args,
             scope: Some("actor_scope".into()),
         }),
     );
+    mode.stdout.capture = Some(session_capture("$.session_id"));
     mode.env.insert("LOOM_NO_DAEMON".into(), "1".into());
     manifest(
         "codex",
@@ -1992,6 +2030,63 @@ mod tests {
     }
 
     #[test]
+    fn manifest_validation_rejects_legacy_session_capture() {
+        let err = serde_json::from_str::<ProviderManifest>(
+            r#"{
+              "schemaVersion": 1,
+              "id": "legacy_capture",
+              "detect": { "candidates": ["legacy-capture"] },
+              "modes": {
+                "print": {
+                  "transport": "command",
+                  "command": "{bin}",
+                  "args": ["{prompt.full}"],
+                  "stdout": { "format": "text" },
+                  "session": {
+                    "idSource": "provider_capture",
+                    "capture": "stdout_json:.session_id",
+                    "resumeArgs": ["--resume", "{session.id}", "{prompt.full}"]
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect_err("legacy capture should fail schema parsing");
+        assert!(err.to_string().contains("unknown field `capture`"), "{err}");
+    }
+
+    #[test]
+    fn provider_capture_requires_stdout_capture_session() {
+        let manifest = manifest(
+            "missing_capture",
+            "Missing Capture",
+            &["missing-capture"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    full_prompt(),
+                    "text",
+                    Some(ProviderSessionSpec {
+                        id_source: Some(ProviderSessionIdSource::ProviderCapture),
+                        resume_args: vec![
+                            lit("--resume"),
+                            lit("{session.id}"),
+                            lit("{prompt.full}"),
+                        ],
+                        scope: Some("actor_scope".into()),
+                    }),
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("missing capture should fail");
+        assert!(err.contains("stdout.capture.session is missing"), "{err}");
+    }
+
+    #[test]
     fn builtin_claude_uses_system_and_user_prompt_outputs() {
         let dir = temp_dir("path");
         make_executable(&dir.join("claude"));
@@ -2021,6 +2116,30 @@ mod tests {
             transport.session.as_ref().and_then(|s| s.id_source),
             Some(CommandSessionIdSource::LoomUuid)
         );
+    }
+
+    #[test]
+    fn builtin_provider_capture_sessions_are_declared_on_stdout_decoder() {
+        for provider_id in ["qoder", "codex"] {
+            let manifest = builtin_provider_manifests()
+                .into_iter()
+                .find(|manifest| manifest.id == provider_id)
+                .expect("provider");
+            let mode = manifest.modes.get("print").expect("print mode");
+            let session = mode.session.as_ref().expect("session");
+            assert_eq!(
+                session.id_source,
+                Some(ProviderSessionIdSource::ProviderCapture)
+            );
+            assert!(
+                mode.stdout
+                    .capture
+                    .as_ref()
+                    .and_then(|capture| capture.session.as_ref())
+                    .is_some(),
+                "{provider_id} should capture session through stdout decoder"
+            );
+        }
     }
 
     #[test]

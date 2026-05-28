@@ -453,6 +453,32 @@ Rust 实现。
 - `capture.session`：仅在 Provider 不能由 Loom 指定 session id 时，从 JSONL 或完整
   JSON 中捕获最后一个非空 session id。
 
+`capture.session` 属于 decoder，不属于 `session` 本身。`session.idSource =
+provider_capture` 只说明 session id 的来源是 Provider 输出；具体从哪种 stdout/stderr
+协议里取值必须由 parser 声明。例如：
+
+```json
+{
+  "session": {
+    "idSource": "provider_capture",
+    "scope": "actor_scope",
+    "resumeArgs": ["--resume", "{session.id}", "-p", "{prompt.user}"]
+  },
+  "stdout": {
+    "format": "jsonl",
+    "capture": {
+      "session": {
+        "mode": "lastNonEmpty",
+        "path": "$.session_id"
+      }
+    }
+  }
+}
+```
+
+因此 `session.capture` 不应继续存在于 ProviderManifest；否则会把 stdout 协议细节混回
+session 策略里。
+
 Copilot 当前 `--output-format json --stream off` 实际是 JSONL，每行一个事件。现有
 `CommandOutputFormat::CopilotJson` 的关键逻辑是：忽略 sub-agent 和 parent tool call
 事件，忽略 thinking/reasoning phase，取最后一个 root `assistant.message`，如果没有

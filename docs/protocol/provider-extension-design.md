@@ -280,12 +280,13 @@ project note 等文件”的场景，同时不把这些名字做成 Loom 标准�
   agent workspace 下 `{paths.cwd}/.loom/<path>`。
 - 每个声明项生成一个普通 prompt part，key 固定为 `workspace_file.<key>`。Provider
   后续用 `include` 或 `template` 引用它，例如 `{workspace_file.persona}`。
-- 文件不存在且 `optional=true` 时该 part 为空并自动跳过；`optional=false` 时本轮启动
-  失败并给出配置错误。
+- `optional` 默认是 `true`。文件不存在且 `optional=true` 时该 part 自动跳过；
+  `optional=false` 时本轮启动失败并给出配置错误。
+- `maxBytes` 默认是 `32768`，只限制单个声明文件的 UTF-8 文本内容。
 - 读取内容作为 raw content；标题来自 manifest 的 `title`，是否渲染标题仍由
   `renderTitle` 控制。
-- `roleHint` 只是默认建议。文件是否进入 system/user/full 仍由当前 Provider 的
-  `prompt.outputs` 决定。
+- `roleHint` 默认是 `system`，也只是默认建议。文件是否进入 system/user/full 仍由当前
+  Provider 的 `prompt.outputs` 决定。
 
 第一版只支持显式声明的相对文件路径，不支持随意扫描所有文件进入 prompt。原因是
 prompt 文件会影响模型行为和 token 成本，必须可校验、可解释、顺序稳定。后续如确实
@@ -1194,8 +1195,8 @@ Provider manifest 使用前必须校验：
 - `command` 必须来自 `detect.candidates` 的解析结果，或者是显式路径。
 - 模板只能引用已知变量，除非开启显式 allow unknown。
 - `prompt.workspaceFiles` 只能声明 `.loom` 下的相对路径；禁止绝对路径、`..`、
-  空路径、控制字符和平台相关路径逃逸。`key` 必须稳定、小写、唯一，并且只能生成
-  `workspace_file.<key>` 这一类 prompt part。
+  空路径、控制字符、反斜杠路径分隔符、软链接和平台相关路径逃逸。`key` 必须稳定、
+  小写、唯一，并且只能生成 `workspace_file.<key>` 这一类 prompt part。
 - workspace prompt 文件必须限制大小，第一版建议每个文件默认上限 32 KiB；超限应失败
   或按 manifest 明确声明的策略截断，不能静默把大文件塞进 prompt。
 - command mode 下至少一个 `{prompt.<name>}` 必须出现在
@@ -1221,10 +1222,17 @@ backend API。
 loom provider example
 ```
 
-输出一个通用 ProviderManifest 模板，作为新增 Provider 的标准起点。模板应是当前
-schema 可直接 `validate` 的 JSON，不包含只存在于文档假设里的字段。它展示最小必要
-边界：`detect.candidates`、`modes.print.command/args`、`prompt.outputs`、
-stdout parser 和 provider 级 models。
+输出一个详细的通用 ProviderManifest 示例说明，包含配置流程、字段解释、
+`prompt.workspaceFiles` 行为说明，以及一段可复制的 JSON 模板。JSON 模板必须是当前
+schema 可直接 `validate` 的内容，不包含只存在于文档假设里的字段。它展示最小必要
+边界：`detect.candidates`、`modes.print.command/args`、`prompt.workspaceFiles`、
+`prompt.outputs`、stdout parser 和 provider 级 models。默认模板会声明一个可选的
+`.loom/persona.md`，并示范如何用 `workspace_file.persona` 注入到命名 prompt 输出中。
+如果调用者需要机器可读的裸 JSON，应使用：
+
+```bash
+loom --json provider example
+```
 
 ```bash
 loom provider example --claude

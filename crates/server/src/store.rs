@@ -274,6 +274,16 @@ impl Store {
         }
     }
 
+    fn validate_explicit_channel_actor(&self, channel_id: &str, actor_id: &str) -> StoreResult<()> {
+        let inner = self.inner.read();
+        validate_explicit_channel_actor_inner(&inner, channel_id, actor_id)
+    }
+
+    fn is_explicit_channel_member(&self, channel_id: &str, actor_id: &str) -> bool {
+        let inner = self.inner.read();
+        is_explicit_channel_member_inner(&inner, channel_id, actor_id)
+    }
+
     /// Resolve a `ScopeRef` to its owning channel and check membership.
     /// Returns `Ok(())` when allowed, `Err(InvalidState)` when denied,
     /// `Err(NotFound)` when the scope doesn't exist.
@@ -876,9 +886,9 @@ impl Store {
             )));
         }
         if let Some(owner) = owner_actor_id.as_ref() {
-            if !self.is_channel_member(&channel_id, owner) {
+            if !self.is_explicit_channel_member(&channel_id, owner) {
                 return Err(StoreError::InvalidState(format!(
-                    "task owner {owner} is not a member of channel {channel_id}"
+                    "task owner {owner} is not an explicit actor in channel {channel_id}"
                 )));
             }
         }
@@ -1761,18 +1771,13 @@ impl Store {
         let mut task = self
             .get_task(task_id)
             .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
-        if !self.is_channel_member(&task.channel_id, &from_actor_id) {
+        if !self.is_explicit_channel_member(&task.channel_id, &from_actor_id) {
             return Err(StoreError::InvalidState(format!(
-                "assignment sender {from_actor_id} is not a member of channel {}",
+                "assignment sender {from_actor_id} is not an explicit actor in channel {}",
                 task.channel_id
             )));
         }
-        if !self.is_channel_member(&task.channel_id, &to_actor_id) {
-            return Err(StoreError::InvalidState(format!(
-                "assignment recipient {to_actor_id} is not a member of channel {}",
-                task.channel_id
-            )));
-        }
+        self.validate_explicit_channel_actor(&task.channel_id, &to_actor_id)?;
         if is_terminal_task_status(task.status)
             && matches!(
                 assignment_type,
@@ -2928,7 +2933,7 @@ impl Store {
         let resolved = self.resolve_message_target_for_append(&target, &owner_actor_id)?;
         self.check_scope_access(&resolved.scope, &owner_actor_id)?;
         for actor_id in &participants {
-            self.validate_scope_actor(&resolved.scope, actor_id)?;
+            self.validate_scope_routing_actor(&resolved.scope, actor_id)?;
         }
         if let Some(task_id) = task_id.as_deref() {
             let task = self
@@ -3239,7 +3244,7 @@ impl Store {
                 "actor {actor_id} cannot reassign coordination session {session_id}"
             )));
         }
-        self.validate_scope_actor(&session.scope, &to_actor_id)?;
+        self.validate_scope_routing_actor(&session.scope, &to_actor_id)?;
         let Some(pos) = session
             .participants
             .iter()
@@ -3393,6 +3398,8 @@ impl Store {
         merge_mentions(&mut mentions, explicit_mentions);
         let mut audience = explicit_audience;
         merge_audience_from_mentions(&mut audience, &mentions);
+        self.validate_message_mentions(&resolved.scope, &mentions)?;
+        self.validate_message_audience(&resolved.scope, &audience)?;
         let task_context = resolved
             .task_id
             .as_deref()
@@ -3432,7 +3439,7 @@ impl Store {
         }
         if let Some(private_actor_ids) = private_actor_ids {
             for actor_id in private_actor_ids {
-                self.validate_scope_actor(&message.scope, &actor_id)?;
+                self.validate_scope_routing_actor(&message.scope, &actor_id)?;
             }
         }
 
@@ -3927,7 +3934,7 @@ impl Store {
         for mention in mentions {
             match mention.kind {
                 MessageMentionKind::Actor => {
-                    self.validate_scope_actor(scope, &mention.actor_or_group_id)?;
+                    self.validate_scope_routing_actor(scope, &mention.actor_or_group_id)?;
                 }
                 MessageMentionKind::Group => {
                     self.validate_scope_group(scope, &mention.actor_or_group_id)?;
@@ -3947,7 +3954,7 @@ impl Store {
     ) -> StoreResult<()> {
         for audience in audience {
             match audience.kind {
-                AudienceKind::Actor => self.validate_scope_actor(scope, &audience.id)?,
+                AudienceKind::Actor => self.validate_scope_routing_actor(scope, &audience.id)?,
                 AudienceKind::Group => self.validate_scope_group(scope, &audience.id)?,
                 AudienceKind::All | AudienceKind::Agents | AudienceKind::Humans => {}
             }
@@ -4004,6 +4011,22 @@ impl Store {
         if !is_channel_member_inner(&inner, channel_id, actor_id) {
             return Err(StoreError::InvalidState(format!(
                 "actor {actor_id} is not a member of channel {channel_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_scope_routing_actor(&self, scope: &ScopeRef, actor_id: &str) -> StoreResult<()> {
+        let inner = self.inner.read();
+        let Some(channel_id) = scope_channel_id_inner(&inner, scope) else {
+            return Err(StoreError::NotFound(format!(
+                "scope {:?}:{}",
+                scope.kind, scope.id
+            )));
+        };
+        if !is_explicit_channel_member_inner(&inner, channel_id, actor_id) {
+            return Err(StoreError::InvalidState(format!(
+                "actor {actor_id} is not an explicit actor in channel {channel_id}"
             )));
         }
         Ok(())
@@ -4131,7 +4154,7 @@ impl Store {
         group
             .member_actor_ids
             .iter()
-            .filter(|actor_id| is_channel_member_inner(&inner, channel_id, actor_id))
+            .filter(|actor_id| is_explicit_channel_member_inner(&inner, channel_id, actor_id))
             .filter_map(|actor_id| inner.actors.get(actor_id))
             .filter(|actor| match actor.kind {
                 ActorKind::Human => true,
@@ -4196,6 +4219,13 @@ impl Store {
         // ACL gate: a non-member can't append into a private channel/thread.
         // Public channels short-circuit to allow.
         self.check_scope_access(&scope, &actor_id)?;
+        for relation in &relations {
+            if matches!(relation.kind, RelationKind::DirectedTo)
+                && relation.target.kind == RefKind::Actor
+            {
+                self.validate_scope_routing_actor(&scope, &relation.target.id)?;
+            }
+        }
 
         let now = Utc::now();
         let (event_id, seq) = {
@@ -5241,12 +5271,17 @@ fn validate_actor_group_member_inner(
     channel_id: &str,
     actor_id: &str,
 ) -> StoreResult<()> {
-    if !inner.actors.contains_key(actor_id) {
-        return Err(StoreError::NotFound(format!("actor {actor_id}")));
-    }
-    if !is_channel_member_inner(inner, channel_id, actor_id) {
+    validate_explicit_channel_actor_inner(inner, channel_id, actor_id)
+}
+
+fn validate_explicit_channel_actor_inner(
+    inner: &Inner,
+    channel_id: &str,
+    actor_id: &str,
+) -> StoreResult<()> {
+    if !is_explicit_channel_member_inner(inner, channel_id, actor_id) {
         return Err(StoreError::InvalidState(format!(
-            "actor {actor_id} is not a member of channel {channel_id}"
+            "actor {actor_id} is not an explicit actor in channel {channel_id}"
         )));
     }
     Ok(())
@@ -5273,6 +5308,13 @@ fn is_channel_member_inner(inner: &Inner, channel_id: &str, actor_id: &str) -> b
             ChannelVisibility::Public => true,
             ChannelVisibility::Private => channel.members.iter().any(|member| member == actor_id),
         })
+}
+
+fn is_explicit_channel_member_inner(inner: &Inner, channel_id: &str, actor_id: &str) -> bool {
+    inner
+        .channels
+        .get(channel_id)
+        .is_some_and(|channel| channel.members.iter().any(|member| member == actor_id))
 }
 
 fn is_terminal_run_status(status: RunStatus) -> bool {
@@ -6233,6 +6275,55 @@ mod tests {
     }
 
     #[test]
+    fn public_channel_mentions_require_explicit_channel_actor() {
+        let store = fresh_store();
+        for actor in [
+            test_actor("actor_alice", ActorKind::Human, "Alice"),
+            test_actor("actor_agent_local", ActorKind::Agent, "Local"),
+            test_actor("actor_agent_elsewhere", ActorKind::Agent, "Elsewhere"),
+        ] {
+            store.upsert_actor(actor).unwrap();
+        }
+        let channel = store.create_channel("public".into(), None).unwrap();
+        store.grant_channel(&channel.id, "actor_alice").unwrap();
+        store
+            .grant_channel(&channel.id, "actor_agent_local")
+            .unwrap();
+        assert!(store.is_channel_member(&channel.id, "actor_agent_elsewhere"));
+
+        let err = store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "@Elsewhere please take this".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect_err("non-explicit actor mention must be rejected");
+        assert!(matches!(
+            err,
+            StoreError::InvalidState(message)
+                if message.contains("not an explicit actor in channel")
+        ));
+
+        let ok = send_test_message(
+            &store,
+            "actor_alice",
+            &format!("#{}", channel.id),
+            "@Local please take this",
+        );
+        assert_eq!(ok.mentions[0].actor_or_group_id, "actor_agent_local");
+    }
+
+    #[test]
     fn at_all_with_wake_policy_wakes_agent_members() {
         let store = fresh_store();
         store
@@ -6759,6 +6850,9 @@ mod tests {
                 .unwrap();
         }
         let channel = store.create_channel("public".into(), None).unwrap();
+        store.grant_channel(&channel.id, "actor_alice").unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        store.grant_channel(&channel.id, "actor_carol").unwrap();
         let mut metadata = Meta::default();
         metadata.insert("private".into(), serde_json::json!(true));
         metadata.insert("privateTo".into(), serde_json::json!(["actor_bob"]));
@@ -7924,6 +8018,63 @@ mod tests {
                 && delivery.change.source_ids.contains(&request.id)
                 && delivery.change.source_ids.contains(&response.id)
         }));
+    }
+
+    #[test]
+    fn task_assignment_rejects_public_channel_actor_without_explicit_membership() {
+        let store = fresh_store();
+        for actor in [
+            test_actor("actor_owner", ActorKind::Human, "Owner"),
+            test_actor("actor_agent_local", ActorKind::Agent, "Local"),
+            test_actor("actor_agent_elsewhere", ActorKind::Agent, "Elsewhere"),
+        ] {
+            store.upsert_actor(actor).unwrap();
+        }
+        let ch = store.create_channel("public-task".into(), None).unwrap();
+        store.grant_channel(&ch.id, "actor_owner").unwrap();
+        store.grant_channel(&ch.id, "actor_agent_local").unwrap();
+        assert!(store.is_channel_member(&ch.id, "actor_agent_elsewhere"));
+        let task = create_owned_task(&store, &ch.id, "public task");
+
+        let err = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_agent_elsewhere".into(),
+                TaskAssignmentType::Fix,
+                "fix".into(),
+                Some(serde_json::json!({
+                    "target": {"target_key": "repo#main", "head": "h1"},
+                    "effects": {"authorized": ["repo.push"]},
+                    "workspace": {"resource_key": "worktree:repo", "write_mode": "write"},
+                    "idempotency_key": "elsewhere"
+                })),
+                None,
+            )
+            .expect_err("non-explicit assignment recipient must be rejected");
+        assert!(matches!(
+            err,
+            StoreError::InvalidState(message)
+                if message.contains("not an explicit actor in channel")
+        ));
+
+        let (assignment, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_agent_local".into(),
+                TaskAssignmentType::Fix,
+                "fix".into(),
+                Some(serde_json::json!({
+                    "target": {"target_key": "repo#main", "head": "h1"},
+                    "effects": {"authorized": ["repo.push"]},
+                    "workspace": {"resource_key": "worktree:repo", "write_mode": "write"},
+                    "idempotency_key": "local"
+                })),
+                None,
+            )
+            .expect("explicit channel actor assignment");
+        assert_eq!(assignment.to_actor_id, "actor_agent_local");
     }
 
     #[test]

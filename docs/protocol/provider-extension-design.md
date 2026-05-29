@@ -1218,6 +1218,27 @@ backend API。
 建议第一版命令：
 
 ```bash
+loom provider example
+```
+
+输出一个通用 ProviderManifest 模板，作为新增 Provider 的标准起点。模板应是当前
+schema 可直接 `validate` 的 JSON，不包含只存在于文档假设里的字段。它展示最小必要
+边界：`detect.candidates`、`modes.print.command/args`、`prompt.outputs`、
+stdout parser 和 provider 级 models。
+
+```bash
+loom provider example --claude
+loom provider example --opencode
+loom provider example --claude --opencode
+```
+
+输出 Loom 当前内置的官方 Provider manifest 示例。第一版至少支持
+`--claude`、`--qoder`、`--copilot`、`--codex`、`--opencode`；多个 flag 同时出现时输出
+JSON 数组。这个命令必须读取 built-in manifest，而不是读取本机 local provider
+override，这样配置者看到的是官方基线写法；如果要看本机最终 resolved 配置，应使用
+`loom provider show <provider_id>`。
+
+```bash
 loom provider validate <file>
 ```
 
@@ -1320,9 +1341,10 @@ local Provider 互不污染。`loom provider list` 在 daemon/CLI 本机执行�
    store。
 9. 实现 manifest-driven stdout/stderr decoder；复杂协议先通过 manifest 引用
    `builtin` decoder，后续可逐步改写成 JSONL reducer。
-10. 增加 `loom provider validate/add/list/show/remove/doctor`。这些命令在 daemon/CLI
-   本机操作当前 `{loom.configDir}`；GUI 如需管理远端 Provider，必须通过目标 daemon
-   的 server machine command。
+10. 增加 `loom provider example/validate/add/list/show/remove/doctor`。这些命令在
+   daemon/CLI 本机操作当前 `{loom.configDir}`；GUI 如需管理远端 Provider，必须通过
+   目标 daemon 的 server machine command。`example` 是只读命令，默认输出通用模板；
+   provider flag 输出内置官方 manifest。
 
 新 runtime 不做新旧配置双读，也不维护旧配置到新配置的运行时覆盖优先级。对单台
 daemon 而言，ProviderManifest、AgentSpec 和 runtime state 才是唯一生效边界；

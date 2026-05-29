@@ -394,14 +394,18 @@ export function App() {
   );
 
   const connectWorkspace = useCallback(
-    async (workspaceId: string, options: { automatic?: boolean } = {}) => {
+    async (
+      workspaceId: string,
+      options: { automatic?: boolean; quiet?: boolean } = {},
+    ): Promise<Workspace | null> => {
       const automatic = options.automatic === true;
+      const quiet = options.quiet === true;
       if (!automatic) {
         autoReconnectRef.current = true;
         reconnectAttemptRef.current = 0;
       }
       clearReconnectTimer();
-      if (!automatic) setBusy(`connect:${workspaceId}`);
+      if (!automatic && !quiet) setBusy(`connect:${workspaceId}`);
       setConnection("connecting");
       setError(automatic ? "Connection lost. Reconnecting..." : null);
       try {
@@ -412,16 +416,20 @@ export function App() {
         setConnection("open");
         reconnectAttemptRef.current = 0;
         await loadWorkspaceData(result.workspace);
-        pushNotice(
-          automatic
-            ? `Reconnected to ${result.workspace.name}`
-            : `Connected to ${result.workspace.name}`,
-        );
+        if (!quiet) {
+          pushNotice(
+            automatic
+              ? `Reconnected to ${result.workspace.name}`
+              : `Connected to ${result.workspace.name}`,
+          );
+        }
+        return result.workspace;
       } catch (err) {
         setConnection("error");
         setError(automatic ? "Connection lost. Reconnecting..." : errorText(err));
+        return null;
       } finally {
-        if (!automatic) setBusy(null);
+        if (!automatic && !quiet) setBusy(null);
       }
     },
     [clearReconnectTimer, loadWorkspaceData, pushNotice],
@@ -992,12 +1000,23 @@ export function App() {
 
   async function createChannelWithTitle(rawTitle: string) {
     const title = rawTitle.trim();
-    if (!title || !workspace) return;
+    const currentWorkspace = workspaceRef.current ?? workspace;
+    if (!title) return;
+    if (!currentWorkspace) {
+      setError("Add or select a space before creating a channel.");
+      return;
+    }
     setBusy("channel:create");
     try {
+      let channelWorkspace = currentWorkspace;
+      if (connection !== "open") {
+        const connected = await connectWorkspace(currentWorkspace.id, { quiet: true });
+        if (!connected) return;
+        channelWorkspace = connected;
+      }
       const result = await ipc.channelCreate({
         title,
-        actorId: workspace.actorId,
+        actorId: channelWorkspace.actorId,
       });
       setChannels((current) => sortChannels(upsert(current, result.channel)));
       setActiveChannelId(result.channel.id);
@@ -1391,6 +1410,8 @@ export function App() {
           channels={channels}
           channelGroups={channelGroups}
           connection={connection}
+          hasWorkspace={Boolean(workspace)}
+          workspaceName={workspace?.name ?? null}
           activeChannelId={activeChannelId}
           activeThreadId={activeThreadId}
           threadsByChannel={threadsByChannel}
@@ -1791,6 +1812,8 @@ function Sidebar({
   channels,
   channelGroups,
   connection,
+  hasWorkspace,
+  workspaceName,
   activeChannelId,
   activeThreadId,
   threadsByChannel,
@@ -1808,6 +1831,8 @@ function Sidebar({
   channels: Channel[];
   channelGroups: ChannelGroup[];
   connection: ConnectionState;
+  hasWorkspace: boolean;
+  workspaceName: string | null;
   activeChannelId: string | null;
   activeThreadId: string | null;
   threadsByChannel: Record<string, Thread[]>;
@@ -1856,7 +1881,7 @@ function Sidebar({
     const title = createTitle.trim();
     if (!title || !createKind) return;
     if (createKind === "channel") {
-      if (connection !== "open") return;
+      if (!hasWorkspace) return;
       onAddChannel(title);
     } else {
       onAddChannelGroup(title);
@@ -2119,9 +2144,14 @@ function Sidebar({
                         placeholder={createKind === "channel" ? "Channel name" : "Section name"}
                         className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                       />
-                      {createKind === "channel" && connection !== "open" && (
+                      {createKind === "channel" && !hasWorkspace && (
                         <div className="text-xs font-medium text-amber-700">
-                          Connect a space before creating a channel.
+                          Add or select a space before creating a channel.
+                        </div>
+                      )}
+                      {createKind === "channel" && hasWorkspace && connection !== "open" && (
+                        <div className="text-xs font-medium text-amber-700">
+                          {`Will connect to ${workspaceName ?? "this space"} before creating.`}
                         </div>
                       )}
                       <div className="flex justify-end gap-2 pt-1">
@@ -2133,10 +2163,12 @@ function Sidebar({
                           size="sm"
                           disabled={
                             !createTitle.trim() ||
-                            (createKind === "channel" && connection !== "open")
+                            (createKind === "channel" && !hasWorkspace)
                           }
                         >
-                          Create
+                          {createKind === "channel" && connection !== "open"
+                            ? "Connect & create"
+                            : "Create"}
                         </Button>
                       </div>
                     </form>

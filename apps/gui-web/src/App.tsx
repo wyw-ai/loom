@@ -10,13 +10,13 @@ import type {
   ComponentType,
   CSSProperties,
   FormEvent,
+  MouseEvent,
   PointerEvent,
   ReactNode,
 } from "react";
-import ReactMarkdown from "react-markdown";
+import { createPortal } from "react-dom";
+import ReactMarkdown, { type Components } from "react-markdown";
 import {
-  Activity,
-  AtSign,
   Bell,
   Bot,
   Check,
@@ -32,6 +32,7 @@ import {
   Lock,
   Loader2,
   LogOut,
+  MessageCircle,
   MessageSquare,
   Pencil,
   Plus,
@@ -70,13 +71,21 @@ import {
   type Workspace,
 } from "@/ipc/types";
 import { Badge } from "@/components/ui/badge";
+import {
+  AgentIdentityBadge,
+  type AgentIdentityBadgeProps,
+} from "@/components/agent/AgentIdentityBadge";
+import {
+  AgentProviderIcon,
+  agentProviderIconKey,
+} from "@/components/agent/AgentProviderIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn, formatTime, shortId } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
-type View = "chat" | "threads" | "channels" | "inbox" | "tasks" | "spaces" | "account" | "settings";
+type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "spaces" | "account" | "settings";
 type ChannelPanelTab = "threads" | "members" | "tasks";
 type ChannelGroup = {
   id: string;
@@ -110,6 +119,11 @@ type ChannelPointerDrag = {
   startY: number;
   pointerId: number;
   dragging: boolean;
+};
+type ChannelContextMenu = {
+  channelId: string;
+  x: number;
+  y: number;
 };
 type PanelResizeKind = "sidebar" | "detail";
 type PanelSizes = {
@@ -175,12 +189,27 @@ type ChannelMemberPanelItem = {
 const supportedReactionEmojis = ["👍", "👀", "✅", "🥳", "💔"];
 const avatarCount = 25;
 const agentAvatarIndexes = [1, 5, 10, 15, 20, 25] as const;
+const agentMessageBadgePopoverScale = 0.5;
+const agentMessageBadgeCompactWidth = 256;
+const agentMessageBadgeDetailWidth = 668;
+const agentMessageBadgeCompactHeight = 490;
+const agentMessageBadgeDetailHeight = 1352;
 const avatarLibraryUrls = Array.from(
   { length: avatarCount },
   (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
 );
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 const ungroupedChannelGroupId = "__ungrouped";
+const channelContextMenuWidthPx = 44 * 4;
+const channelContextMenuItemHeightPx = 36;
+const channelContextMenuItemCount = 2;
+const channelContextMenuPaddingPx = 4;
+const channelContextMenuBorderPx = 1;
+const channelContextMenuViewportPaddingPx = 8;
+const channelContextMenuHeightPx =
+  channelContextMenuPaddingPx * 2 +
+  channelContextMenuItemHeightPx * channelContextMenuItemCount +
+  channelContextMenuBorderPx * 2;
 const panelLayoutStorageKey = "loom:panel-layout:v1";
 const detailPanelBreakpoint = 1280;
 const railWidth = 72;
@@ -204,6 +233,7 @@ export function App() {
   const [connection, setConnection] = useState<ConnectionState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
+  const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [channelGroups, setChannelGroups] = useState<ChannelGroup[]>(() =>
     loadChannelGroups(channelGroupStorageKey(null)),
@@ -211,8 +241,10 @@ export function App() {
   const [threadsByChannel, setThreadsByChannel] = useState<Record<string, Thread[]>>({});
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [activeDirectActorId, setActiveDirectActorId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [threadMessages, setThreadMessages] = useState<Message[]>([]);
+  const [directMessages, setDirectMessages] = useState<Message[]>([]);
   const [threadStatsById, setThreadStatsById] = useState<Record<string, ThreadActivityStats>>({});
   const [actors, setActors] = useState<Record<string, Actor>>({});
   const [, setRuns] = useState<Record<string, Run>>({});
@@ -221,6 +253,8 @@ export function App() {
   const [machines, setMachines] = useState<MachineInfo[]>([]);
   const [draft, setDraft] = useState("");
   const [threadDraft, setThreadDraft] = useState("");
+  const [directDraft, setDirectDraft] = useState("");
+  const [directScopesByActorId, setDirectScopesByActorId] = useState<Record<string, ScopeRef>>({});
   const [workspaceForm, setWorkspaceForm] = useState({
     name: "Local",
     serverUrl: "ws://127.0.0.1:7878/rpc",
@@ -244,6 +278,8 @@ export function App() {
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
+  const activeDirectScopeRef = useRef<ScopeRef | null>(null);
+  const activeDirectActorIdRef = useRef<string | null>(null);
   const actorIdRef = useRef<string | null>(null);
   const targetRef = useRef<string | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
@@ -255,7 +291,9 @@ export function App() {
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
-  const activeChannel = channels.find((channel) => channel.id === activeChannelId) ?? null;
+  const visibleChannels = channels.filter((channel) => !isDirectChannel(channel));
+  const activeChannel =
+    visibleChannels.find((channel) => channel.id === activeChannelId) ?? null;
   const channelGroupsKey = channelGroupStorageKey(workspace);
   const channelThreads = activeChannel
     ? threadsByChannel[activeChannel.id] ?? []
@@ -270,12 +308,24 @@ export function App() {
   const activeThreadScope: ScopeRef | null = activeThread
     ? { kind: "thread", id: activeThread.id }
     : null;
-  const allThreads = flattenThreads(threadsByChannel, channels);
-  const channelIdsKey = channels.map((channel) => channel.id).join("|");
+  const allThreads = flattenThreads(threadsByChannel, visibleChannels);
+  const channelIdsKey = visibleChannels.map((channel) => channel.id).join("|");
   const actorList = Object.values(actors).sort((a, b) =>
     displayName(a).localeCompare(displayName(b)),
   );
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
+  const agentActorIdsKey = agentActors.map((actor) => actor.id).join("|");
+  const activeDirectActor =
+    agentActors.find((actor) => actor.id === activeDirectActorId) ?? null;
+  const activeDirectTarget = activeDirectActor
+    ? directMessageTarget(activeDirectActor.id)
+    : null;
+  const activeDirectScope =
+    activeDirectActor && workspace
+      ? directScopeForActor(channels, workspace.actorId, activeDirectActor.id) ??
+        directScopesByActorId[activeDirectActor.id] ??
+        null
+      : null;
   const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
   const channelAgentActors = activeChannel
     ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
@@ -289,6 +339,11 @@ export function App() {
   const activeThreadTask = activeThread
     ? tasksBySourceMessageId[activeThread.rootMessageId] ?? null
     : null;
+
+  const openAgentSettings = useCallback((actorId: string) => {
+    setSettingsAgentId(actorId);
+    setView("settings");
+  }, []);
 
   const applyConfig = useCallback((next: DesktopConfig) => {
     setConfig(next);
@@ -375,11 +430,13 @@ export function App() {
       }
       if (channelResult.status === "fulfilled") {
         const nextChannels = sortChannels(channelResult.value.channels);
+        const nextVisibleChannels = nextChannels.filter((channel) => !isDirectChannel(channel));
         setChannels(nextChannels);
         setActiveChannelId((currentChannel) =>
-          currentChannel && nextChannels.some((channel) => channel.id === currentChannel)
+          currentChannel &&
+          nextVisibleChannels.some((channel) => channel.id === currentChannel)
             ? currentChannel
-            : nextChannels[0]?.id ?? null,
+            : nextVisibleChannels[0]?.id ?? null,
         );
       }
       if (taskResult.status === "fulfilled") {
@@ -480,6 +537,10 @@ export function App() {
   }, [workspace]);
 
   useEffect(() => {
+    activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
+  }, [activeDirectActor?.id]);
+
+  useEffect(() => {
     savePanelSizes(panelSizes);
   }, [panelSizes]);
 
@@ -500,6 +561,22 @@ export function App() {
   useEffect(() => {
     setChannelGroups(loadChannelGroups(channelGroupsKey));
   }, [channelGroupsKey]);
+
+  useEffect(() => {
+    setActiveDirectActorId(null);
+    setDirectMessages([]);
+    setDirectDraft("");
+    setDirectScopesByActorId({});
+  }, [workspace?.id]);
+
+  useEffect(() => {
+    if (view !== "direct") return;
+    setActiveDirectActorId((current) =>
+      current && agentActors.some((actor) => actor.id === current)
+        ? current
+        : agentActors[0]?.id ?? null,
+    );
+  }, [agentActorIdsKey, view]);
 
   useEffect(() => {
     if (
@@ -557,10 +634,10 @@ export function App() {
   }, [activeChannel?.id, activeChannel?.members.join("|"), connection]);
 
   useEffect(() => {
-    if (connection !== "open" || channels.length === 0) return;
+    if (connection !== "open" || visibleChannels.length === 0) return;
     let alive = true;
     void Promise.allSettled(
-      channels.map((channel) =>
+      visibleChannels.map((channel) =>
         ipc.threadList(channel.id).then((result) => ({
           channelId: channel.id,
           threads: result.threads,
@@ -646,24 +723,68 @@ export function App() {
     threadMessageTarget,
   ]);
 
+  useEffect(() => {
+    activeDirectScopeRef.current = activeDirectScope;
+    if (!activeDirectActor || !activeDirectTarget || connection !== "open") {
+      setDirectMessages([]);
+      return;
+    }
+    if (!activeDirectScope) {
+      setDirectMessages([]);
+      return;
+    }
+
+    let alive = true;
+    setDirectMessages([]);
+    void ipc.scopeSubscribe(activeDirectScope).catch(() => {});
+    void ipc
+      .messageList({ target: activeDirectTarget, limit: 150 })
+      .then((result) => {
+        if (!alive) return;
+        setError(null);
+        setDirectMessages(sortMessages(result.messages.map(normalizeMessage)));
+      })
+      .catch((err) => setError(errorText(err)));
+
+    return () => {
+      alive = false;
+      void ipc.scopeUnsubscribe(activeDirectScope).catch(() => {});
+    };
+  }, [
+    activeDirectActor?.id,
+    activeDirectScope ? scopeKey(activeDirectScope) : null,
+    activeDirectTarget,
+    connection,
+  ]);
+
   function handleStream(update: StreamUpdate) {
     switch (update.kind) {
       case "channel.created":
       case "channel.updated":
       case "channel.invited": {
         const channel = update.data.channel as Channel | undefined;
-        if (channel) setChannels((current) => sortChannels(upsert(current, channel)));
+        if (channel) {
+          setChannels((current) => sortChannels(upsert(current, channel)));
+          const peerActorId = directChannelPeerId(channel, actorIdRef.current);
+          if (peerActorId) {
+            setDirectScopesByActorId((current) => ({
+              ...current,
+              [peerActorId]: { kind: "channel", id: channel.id },
+            }));
+          }
+        }
+        return;
+      }
+      case "channel.deleted": {
+        const channelId = update.data.channelId as string | undefined;
+        if (!channelId) return;
+        applyChannelDeleted(channelId);
         return;
       }
       case "channel.revoked": {
         const channelId = update.data.channelId as string | undefined;
         if (!channelId) return;
-        setChannels((current) => current.filter((channel) => channel.id !== channelId));
-        setThreadsByChannel((current) => {
-          const next = { ...current };
-          delete next[channelId];
-          return next;
-        });
+        applyChannelDeleted(channelId);
         return;
       }
       case "thread.created":
@@ -714,6 +835,18 @@ export function App() {
         ) {
           setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
         }
+        if (
+          (update.scope &&
+            activeDirectScopeRef.current &&
+            sameScope(update.scope, activeDirectScopeRef.current)) ||
+          messageBelongsToDirectActor(
+            message,
+            activeDirectActorIdRef.current,
+            actorIdRef.current,
+          )
+        ) {
+          setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
+        }
         return;
       }
       case "message.updated": {
@@ -731,6 +864,18 @@ export function App() {
           sameScope(update.scope, activeThreadScopeRef.current)
         ) {
           setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
+        }
+        if (
+          (update.scope &&
+            activeDirectScopeRef.current &&
+            sameScope(update.scope, activeDirectScopeRef.current)) ||
+          messageBelongsToDirectActor(
+            message,
+            activeDirectActorIdRef.current,
+            actorIdRef.current,
+          )
+        ) {
+          setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
         }
         setInbox((current) =>
           current.map((item) =>
@@ -764,6 +909,54 @@ export function App() {
     }
   }
 
+  function applyChannelDeleted(channelId: string) {
+    const deletedThreads = threadsByChannel[channelId] ?? [];
+    const deletedChannel = channels.find((channel) => channel.id === channelId) ?? null;
+    const fallbackChannelId =
+      channels.find((channel) => channel.id !== channelId && !isDirectChannel(channel))
+        ?.id ?? null;
+    setChannels((current) => current.filter((channel) => channel.id !== channelId));
+    const deletedDirectPeerId = directChannelPeerId(deletedChannel, actorIdRef.current);
+    if (deletedDirectPeerId) {
+      setDirectScopesByActorId((current) => {
+        const next = { ...current };
+        delete next[deletedDirectPeerId];
+        return next;
+      });
+    }
+    setThreadsByChannel((current) => {
+      const next = { ...current };
+      delete next[channelId];
+      return next;
+    });
+    setTasks((current) => current.filter((task) => task.channelId !== channelId));
+    setThreadStatsById((current) => {
+      const next = { ...current };
+      for (const thread of deletedThreads) delete next[thread.id];
+      return next;
+    });
+    updateChannelGroups((current) =>
+      current.map((group) => ({
+        ...group,
+        channelIds: group.channelIds.filter((id) => id !== channelId),
+      })),
+    );
+    setActiveChannelId((current) =>
+      current === channelId ? fallbackChannelId : current,
+    );
+    setActiveThreadId((current) =>
+      current && deletedThreads.some((thread) => thread.id === current)
+        ? null
+        : current,
+    );
+    if (activeChannelId === channelId) {
+      setChannelPanelTab(null);
+      setReplyTo(null);
+      setMessages([]);
+      setThreadMessages([]);
+    }
+  }
+
   async function login(provider: ipc.LoginProvider) {
     setBusy(`login:${provider}`);
     setError(null);
@@ -791,6 +984,10 @@ export function App() {
       setChannels([]);
       setMessages([]);
       setThreadMessages([]);
+      setDirectMessages([]);
+      setDirectDraft("");
+      setActiveDirectActorId(null);
+      setDirectScopesByActorId({});
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1029,6 +1226,50 @@ export function App() {
     }
   }
 
+  async function renameChannel(channel: Channel, rawTitle: string) {
+    const title = rawTitle.trim();
+    if (!title || title === channel.title) return;
+    setBusy(`channel:rename:${channel.id}`);
+    setError(null);
+    try {
+      const result = await ipc.channelUpdate({
+        channelId: channel.id,
+        title,
+        topic: channel.topic,
+      });
+      setChannels((current) => sortChannels(upsert(current, result.channel)));
+      pushNotice(`Renamed #${channel.title} to #${result.channel.title}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteChannel(channel: Channel) {
+    setBusy(`channel:delete:${channel.id}`);
+    setError(null);
+    try {
+      const result = await ipc.channelDelete({
+        channelId: channel.id,
+        cascade: true,
+      });
+      if (result.deleted) {
+        applyChannelDeleted(channel.id);
+        const deletedThreads = result.deletedThreads ?? 0;
+        pushNotice(
+          deletedThreads > 0
+            ? `Deleted #${channel.title} and ${deletedThreads} threads`
+            : `Deleted #${channel.title}`,
+        );
+      }
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function sendMessage() {
     const body = draft.trim();
     if (!body || !target) return;
@@ -1117,6 +1358,38 @@ export function App() {
     }
   }
 
+  async function sendDirectMessage() {
+    const body = directDraft.trim();
+    if (!body || !activeDirectActor || !activeDirectTarget) return;
+    const directMentions = mentionAudience(body, actors, workspace?.actorId);
+    if (directMentions.length > 0) {
+      setError("Direct messages do not support @ mentions.");
+      return;
+    }
+    setBusy(`direct:message:send:${activeDirectActor.id}`);
+    setError(null);
+    try {
+      const result = await ipc.messageSend({
+        target: activeDirectTarget,
+        body,
+        deliveryPolicy: "wake_agent",
+        intent: "request_action",
+      });
+      const message = normalizeMessage(result.message);
+      activeDirectScopeRef.current = message.scope;
+      setDirectScopesByActorId((current) => ({
+        ...current,
+        [activeDirectActor.id]: message.scope,
+      }));
+      setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
+      setDirectDraft("");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function startThread(message: Message) {
     if (!activeChannel) return;
     const existing = channelThreads.find(
@@ -1161,12 +1434,25 @@ export function App() {
         messageId: message.id,
         emoji,
       });
-      setMessages((current) => sortMessages(upsertMessage(current, result.message)));
-      setThreadMessages((current) =>
-        current.some((item) => item.id === result.message.id)
-          ? sortMessages(upsertMessage(current, result.message))
-          : current,
-      );
+      const updatedMessage = normalizeMessage(result.message);
+      if (
+        activeScopeRef.current &&
+        sameScope(updatedMessage.scope, activeScopeRef.current)
+      ) {
+        setMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
+      }
+      if (
+        activeThreadScopeRef.current &&
+        sameScope(updatedMessage.scope, activeThreadScopeRef.current)
+      ) {
+        setThreadMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
+      }
+      if (
+        activeDirectScopeRef.current &&
+        sameScope(updatedMessage.scope, activeDirectScopeRef.current)
+      ) {
+        setDirectMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
+      }
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1177,6 +1463,45 @@ export function App() {
   async function answerAction(message: Message, optionId: string, accepted: boolean) {
     const responseTarget = message.target || target;
     if (!responseTarget || !workspace) return;
+    const responseKind = accepted ? "accepted" : "declined";
+    setBusy(`action:${message.id}:${optionId}`);
+    try {
+      await ipc.messageSend({
+        target: responseTarget,
+        body: `${responseKind}: ${optionId}`,
+        parentMessageId: message.id,
+        audience: [{ kind: "actor", id: message.authorActorId }],
+        intent: "notify",
+        deliveryPolicy: "wake_agent",
+        metadata: {
+          kind: "action.response",
+          optionId,
+          responseKind,
+          requestMessageId: message.id,
+        },
+      });
+      await ipc.deliveryAck({
+        actorId: workspace.actorId,
+        sourceId: message.id,
+      });
+      setInbox((current) =>
+        current.filter((item) => item.delivery.sourceId !== message.id),
+      );
+      pushNotice(`Action ${responseKind}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function answerDirectAction(message: Message, optionId: string, accepted: boolean) {
+    if (!workspace) return;
+    const peerActorId =
+      directPeerForMessage(message, workspace.actorId) ?? activeDirectActor?.id ?? null;
+    const responseTarget = peerActorId
+      ? directMessageTarget(peerActorId)
+      : message.target;
     const responseKind = accepted ? "accepted" : "declined";
     setBusy(`action:${message.id}:${optionId}`);
     try {
@@ -1292,6 +1617,7 @@ export function App() {
     view === "chat" ||
     view === "threads" ||
     view === "channels" ||
+    view === "direct" ||
     view === "inbox" ||
     view === "tasks" ||
     view === "settings";
@@ -1407,19 +1733,24 @@ export function App() {
         <Sidebar
           view={view}
           setView={setView}
-          channels={channels}
+          busy={busy}
+          channels={visibleChannels}
           channelGroups={channelGroups}
           connection={connection}
           hasWorkspace={Boolean(workspace)}
           workspaceName={workspace?.name ?? null}
           activeChannelId={activeChannelId}
+          activeDirectActorId={activeDirectActorId}
           activeThreadId={activeThreadId}
+          directAgents={agentActors}
           threadsByChannel={threadsByChannel}
           onAddChannel={(title) => {
             void createChannelWithTitle(title);
           }}
           onAddChannelGroup={addChannelGroup}
           onMoveChannelToGroup={moveChannelToGroup}
+          onDeleteChannel={deleteChannel}
+          onRenameChannel={renameChannel}
           onRemoveChannelGroup={removeChannelGroup}
           onRenameChannelGroup={renameChannelGroup}
           onSelectChannel={(id) => {
@@ -1432,6 +1763,12 @@ export function App() {
             setView("chat");
             setActiveChannelId(thread.channelId);
             setActiveThreadId(thread.id);
+            setChannelPanelTab(null);
+          }}
+          onSelectDirectAgent={(actorId) => {
+            setView("direct");
+            setActiveDirectActorId(actorId);
+            setActiveThreadId(null);
             setChannelPanelTab(null);
           }}
           onToggleChannelGroup={toggleChannelGroup}
@@ -1468,6 +1805,7 @@ export function App() {
             <MessageFeed
               actors={actors}
               feedKey={target ?? "channel:none"}
+              machines={machines}
               messages={messages}
               tasksBySourceMessageId={tasksBySourceMessageId}
               channelThreads={channelThreads}
@@ -1477,6 +1815,7 @@ export function App() {
               onStartThread={startThread}
               onToggleReaction={toggleMessageReaction}
               onAnswerAction={answerAction}
+              onOpenAgentSettings={openAgentSettings}
               currentActorId={workspace?.actorId ?? null}
               busy={busy}
             />
@@ -1497,8 +1836,9 @@ export function App() {
             <ErrorBanner error={error} />
             <ThreadsView
               actors={actors}
-              channels={channels}
+              channels={visibleChannels}
               messages={messages}
+              machines={machines}
               threadMessages={threadMessages}
               threadStatsById={threadStatsById}
               threads={allThreads}
@@ -1516,6 +1856,7 @@ export function App() {
               onCloseThread={() => setActiveThreadId(null)}
               onSendThreadMessage={sendThreadMessage}
               onToggleReaction={toggleMessageReaction}
+              onOpenAgentSettings={openAgentSettings}
               busy={busy}
               disabled={connection !== "open" || !threadMessageTarget}
             />
@@ -1525,7 +1866,8 @@ export function App() {
             <ErrorBanner error={error} />
             <ChannelsView
               actors={actors}
-              channels={channels}
+              busy={busy}
+              channels={visibleChannels}
               channelGroups={channelGroups}
               threadsByChannel={threadsByChannel}
               activeChannel={activeChannel}
@@ -1534,6 +1876,35 @@ export function App() {
                 setActiveThreadId(null);
                 setChannelPanelTab(null);
               }}
+              onDeleteChannel={deleteChannel}
+            />
+          </>
+        ) : view === "direct" ? (
+          <>
+            <ErrorBanner error={error} />
+            <DirectMessagesView
+              actors={actors}
+              agents={agentActors}
+              busy={busy}
+              currentActorId={workspace?.actorId ?? null}
+              disabled={connection !== "open" || !activeDirectActor}
+              draft={directDraft}
+              linkedChannel={activeChannel}
+              machines={machines}
+              messages={directMessages}
+              selectedAgent={activeDirectActor}
+              setDraft={setDirectDraft}
+              onOpenLinkedChannel={(channelId) => {
+                setView("chat");
+                setActiveChannelId(channelId);
+                setActiveThreadId(null);
+                setChannelPanelTab(null);
+              }}
+              onSelectAgent={setActiveDirectActorId}
+              onAnswerAction={answerDirectAction}
+              onSend={sendDirectMessage}
+              onToggleReaction={toggleMessageReaction}
+              onOpenAgentSettings={openAgentSettings}
             />
           </>
         ) : view === "inbox" ? (
@@ -1544,6 +1915,14 @@ export function App() {
               inbox={inbox}
               onOpen={(message) => {
                 if (!message) return;
+                const directPeerId = directPeerForMessage(message, workspace?.actorId ?? null);
+                if (directPeerId && actors[directPeerId]?.kind === "agent") {
+                  setView("direct");
+                  setActiveDirectActorId(directPeerId);
+                  setActiveThreadId(null);
+                  setChannelPanelTab(null);
+                  return;
+                }
                 setView("chat");
                 setActiveChannelId(channelFromMessage(message));
                 setActiveThreadId(threadIdForMessage(threadsByChannel, message));
@@ -1556,7 +1935,7 @@ export function App() {
         ) : view === "tasks" ? (
           <>
             <ErrorBanner error={error} />
-            <TasksView tasks={tasks} channels={channels} />
+            <TasksView tasks={tasks} channels={visibleChannels} />
           </>
         ) : view === "spaces" ? (
           <>
@@ -1591,6 +1970,7 @@ export function App() {
               agentForm={agentForm}
               setAgentForm={setAgentForm}
               machines={machines}
+              targetAgentId={settingsAgentId}
               onCheckMachines={checkMachines}
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
@@ -1619,6 +1999,7 @@ export function App() {
             currentActorId={workspace?.actorId ?? null}
             disabled={connection !== "open" || !threadMessageTarget}
             draft={threadDraft}
+            machines={machines}
             messages={threadMessages}
             setDraft={setThreadDraft}
             task={activeThreadTask}
@@ -1628,6 +2009,7 @@ export function App() {
             onClose={() => setActiveThreadId(null)}
             onSend={sendThreadMessage}
             onToggleReaction={toggleMessageReaction}
+            onOpenAgentSettings={openAgentSettings}
           />
         ) : channelPanelTab && activeChannel ? (
           <ChannelPanel
@@ -1809,39 +2191,51 @@ function ResizeHandle({
 function Sidebar({
   view,
   setView,
+  busy,
   channels,
   channelGroups,
   connection,
   hasWorkspace,
   workspaceName,
   activeChannelId,
+  activeDirectActorId,
   activeThreadId,
+  directAgents,
   threadsByChannel,
   onAddChannel,
   onAddChannelGroup,
   onMoveChannelToGroup,
+  onDeleteChannel,
+  onRenameChannel,
   onRemoveChannelGroup,
   onRenameChannelGroup,
   onSelectChannel,
+  onSelectDirectAgent,
   onSelectThread,
   onToggleChannelGroup,
 }: {
   view: View;
   setView: (view: View) => void;
+  busy: string | null;
   channels: Channel[];
   channelGroups: ChannelGroup[];
   connection: ConnectionState;
   hasWorkspace: boolean;
   workspaceName: string | null;
   activeChannelId: string | null;
+  activeDirectActorId: string | null;
   activeThreadId: string | null;
+  directAgents: Actor[];
   threadsByChannel: Record<string, Thread[]>;
   onAddChannel: (title: string) => void;
   onAddChannelGroup: (title: string) => void;
   onMoveChannelToGroup: (channelId: string, groupId: string) => void;
+  onDeleteChannel: (channel: Channel) => void;
+  onRenameChannel: (channel: Channel, title: string) => void;
   onRemoveChannelGroup: (groupId: string) => void;
   onRenameChannelGroup: (groupId: string, title: string) => void;
   onSelectChannel: (channelId: string) => void;
+  onSelectDirectAgent: (actorId: string) => void;
   onSelectThread: (thread: Thread) => void;
   onToggleChannelGroup: (groupId: string) => void;
 }) {
@@ -1851,24 +2245,42 @@ function Sidebar({
   const [editingSectionId, setEditingSectionId] = useState<string | null>(null);
   const [sectionTitleDraft, setSectionTitleDraft] = useState("");
   const [deleteSectionId, setDeleteSectionId] = useState<string | null>(null);
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const [channelTitleDraft, setChannelTitleDraft] = useState("");
+  const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
+  const [channelContextMenu, setChannelContextMenu] =
+    useState<ChannelContextMenu | null>(null);
   const [draggingChannelId, setDraggingChannelId] = useState<string | null>(null);
   const [dragOverSectionId, setDragOverSectionId] = useState<string | null>(null);
   const dragSessionRef = useRef<ChannelPointerDrag | null>(null);
   const dragListenerCleanupRef = useRef<(() => void) | null>(null);
   const suppressChannelClickRef = useRef<string | null>(null);
   const sections = channelGroupSections(channelGroups, channels);
+  const contextMenuChannel = channelContextMenu
+    ? channels.find((channel) => channel.id === channelContextMenu.channelId) ?? null
+    : null;
   const navItems = [
     { id: "chat" as const, label: "Home", icon: Home },
-    { id: "threads" as const, label: "Threads", icon: MessageSquare },
-    { id: "inbox" as const, label: "Mentions", icon: AtSign },
-    { id: "tasks" as const, label: "Activity", icon: Activity },
     { id: "channels" as const, label: "All Channels", icon: Hash },
+    { id: "direct" as const, label: "Direct Messages", icon: MessageCircle },
+    { id: "threads" as const, label: "Threads", icon: MessageSquare },
+    { id: "inbox" as const, label: "Inbox", icon: Bell },
+    { id: "tasks" as const, label: "Tasks", icon: Check },
     { id: "settings" as const, label: "Hosts", icon: Server },
   ];
   const closeCreateMenu = () => {
     setCreateMenuOpen(false);
     setCreateKind(null);
     setCreateTitle("");
+  };
+
+  const closeDeleteChannelConfirm = () => {
+    setDeleteChannelId(null);
+  };
+
+  const closeRenameChannel = () => {
+    setEditingChannelId(null);
+    setChannelTitleDraft("");
   };
 
   const handleOpenCreate = (kind: "channel" | "section") => {
@@ -1893,6 +2305,9 @@ function Sidebar({
     setEditingSectionId(section.id);
     setSectionTitleDraft(section.title);
     setDeleteSectionId(null);
+    closeDeleteChannelConfirm();
+    closeRenameChannel();
+    setChannelContextMenu(null);
   };
 
   const submitRenameSection = (
@@ -1914,6 +2329,70 @@ function Sidebar({
       setSectionTitleDraft("");
     }
     setDeleteSectionId(null);
+  };
+
+  const requestDeleteChannel = (channelId: string) => {
+    closeCreateMenu();
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    closeRenameChannel();
+    setChannelContextMenu(null);
+    setDeleteChannelId(channelId);
+  };
+
+  const startRenameChannel = (channel: Channel) => {
+    closeCreateMenu();
+    closeDeleteChannelConfirm();
+    setChannelContextMenu(null);
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setEditingChannelId(channel.id);
+    setChannelTitleDraft(channel.title);
+  };
+
+  const submitRenameChannel = (
+    event: FormEvent<HTMLFormElement>,
+    channel: Channel,
+  ) => {
+    event.preventDefault();
+    const title = channelTitleDraft.trim();
+    if (!title) return;
+    onRenameChannel(channel, title);
+    closeRenameChannel();
+  };
+
+  const openChannelContextMenu = (
+    event: MouseEvent<HTMLElement>,
+    channel: Channel,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelChannelDrag();
+    closeCreateMenu();
+    closeDeleteChannelConfirm();
+    closeRenameChannel();
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setChannelContextMenu({
+      channelId: channel.id,
+      x: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          event.clientX,
+          window.innerWidth - channelContextMenuWidthPx - channelContextMenuViewportPaddingPx,
+        ),
+      ),
+      y: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          event.clientY,
+          window.innerHeight - channelContextMenuHeightPx - channelContextMenuViewportPaddingPx,
+        ),
+      ),
+    });
   };
 
   const sectionIdAtPoint = (x: number, y: number) => {
@@ -2062,6 +2541,22 @@ function Sidebar({
     );
   };
 
+  useEffect(() => {
+    if (!channelContextMenu) return;
+    const close = () => setChannelContextMenu(null);
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [channelContextMenu]);
+
   useEffect(() => () => cleanupChannelDragListeners(), []);
   return (
     <aside className="flex min-h-0 min-w-0 flex-col bg-[#fbfbfd]">
@@ -2086,6 +2581,41 @@ function Sidebar({
           })}
         </div>
       </div>
+
+      {view === "direct" && (
+        <div className="border-b border-[#edf0f5] p-3">
+          <div className="mb-2 flex items-center justify-between px-1">
+            <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+              Agents
+            </span>
+            <span className="count-badge h-5 min-w-5 text-[10px]">
+              {directAgents.length}
+            </span>
+          </div>
+          <div className="space-y-1">
+            {directAgents.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-[#8a93a5]">
+                No agents available.
+              </div>
+            ) : (
+              directAgents.map((actor) => {
+                const selected = actor.id === activeDirectActorId;
+                return (
+                  <button
+                    key={actor.id}
+                    type="button"
+                    className={cn("nav-row h-10 text-sm", selected && "nav-row-active")}
+                    onClick={() => onSelectDirectAgent(actor.id)}
+                  >
+                    <ActorAvatar actor={actor} fallback={actor.id} small />
+                    <span className="min-w-0 flex-1 truncate">{displayName(actor)}</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="border-b border-[#edf0f5] p-3">
@@ -2230,6 +2760,7 @@ function Sidebar({
                           setDeleteSectionId(section.id);
                           setEditingSectionId(null);
                           setSectionTitleDraft("");
+                          closeDeleteChannelConfirm();
                         }}
                       >
                         <Trash2 size={12} />
@@ -2294,6 +2825,8 @@ function Sidebar({
                     section.channels.map((channel) => {
                       const selected = channel.id === activeChannelId && !activeThreadId;
                       const threads = threadsByChannel[channel.id] ?? [];
+                      const deleteBusy = busy === `channel:delete:${channel.id}`;
+                      const renameBusy = busy === `channel:rename:${channel.id}`;
                       return (
                         <div
                           key={channel.id}
@@ -2313,12 +2846,17 @@ function Sidebar({
                               onPointerMove={updateChannelDrag}
                               onPointerUp={finishChannelDrag}
                               onPointerCancel={cancelChannelDrag}
+                              onContextMenu={(event) =>
+                                openChannelContextMenu(event, channel)
+                              }
                               onClick={() => {
                                 if (suppressChannelClickRef.current === channel.id) {
                                   suppressChannelClickRef.current = null;
                                   return;
                                 }
                                 closeCreateMenu();
+                                closeDeleteChannelConfirm();
+                                closeRenameChannel();
                                 onSelectChannel(channel.id);
                               }}
                             >
@@ -2342,6 +2880,54 @@ function Sidebar({
                               </Badge>
                             </button>
                           </div>
+                          {editingChannelId === channel.id && (
+                            <form
+                              className="channel-section-editor"
+                              onSubmit={(event) => submitRenameChannel(event, channel)}
+                            >
+                              <Input
+                                autoFocus
+                                value={channelTitleDraft}
+                                onChange={(event) =>
+                                  setChannelTitleDraft(event.target.value)
+                                }
+                                placeholder="Channel name"
+                                className="h-8 rounded-lg border-[#dfe3ec] bg-white text-xs shadow-none"
+                              />
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={renameBusy}
+                                onClick={closeRenameChannel}
+                              >
+                                Cancel
+                              </Button>
+                              <Button
+                                type="submit"
+                                size="sm"
+                                disabled={!channelTitleDraft.trim() || renameBusy}
+                              >
+                                {renameBusy ? (
+                                  <Loader2 className="animate-spin" size={13} />
+                                ) : (
+                                  "Save"
+                                )}
+                              </Button>
+                            </form>
+                          )}
+                          {deleteChannelId === channel.id && (
+                            <ChannelDeleteConfirm
+                              compact
+                              channel={channel}
+                              deleteBusy={deleteBusy}
+                              onCancel={closeDeleteChannelConfirm}
+                              onConfirm={() => {
+                                onDeleteChannel(channel);
+                                closeDeleteChannelConfirm();
+                              }}
+                            />
+                          )}
                           {channel.id === activeChannelId && threads.length > 0 && (
                             <div className="ml-4 mt-1 space-y-1 border-l border-[#e1e5ef] pl-2">
                               {threads.map((thread) => (
@@ -2353,6 +2939,8 @@ function Sidebar({
                                   )}
                                   onClick={() => {
                                     closeCreateMenu();
+                                    closeDeleteChannelConfirm();
+                                    closeRenameChannel();
                                     onSelectThread(thread);
                                   }}
                                 >
@@ -2372,6 +2960,42 @@ function Sidebar({
           ))}
         </div>
       </div>
+      {channelContextMenu &&
+        contextMenuChannel &&
+        createPortal(
+          <div
+            className="fixed z-50 rounded-lg border border-[#dfe3ec] bg-white p-1 text-sm shadow-soft"
+            style={{
+              left: channelContextMenu.x,
+              top: channelContextMenu.y,
+              width: channelContextMenuWidthPx,
+            }}
+            role="menu"
+            aria-label={`Channel actions for ${contextMenuChannel.title}`}
+            onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+              role="menuitem"
+              onClick={() => startRenameChannel(contextMenuChannel)}
+            >
+              <Pencil size={14} />
+              Rename
+            </button>
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-red-600 hover:bg-red-50"
+              role="menuitem"
+              onClick={() => requestDeleteChannel(contextMenuChannel.id)}
+            >
+              <Trash2 size={14} />
+              Delete
+            </button>
+          </div>,
+          document.body,
+        )}
     </aside>
   );
 }
@@ -2444,7 +3068,10 @@ function ChatHeader({
 
 function MessageFeed({
   actors,
+  allowReply = true,
+  allowThreads = true,
   feedKey,
+  machines,
   messages,
   tasksBySourceMessageId,
   channelThreads,
@@ -2454,11 +3081,15 @@ function MessageFeed({
   onStartThread,
   onToggleReaction,
   onAnswerAction,
+  onOpenAgentSettings,
   currentActorId,
   busy,
 }: {
   actors: Record<string, Actor>;
+  allowReply?: boolean;
+  allowThreads?: boolean;
   feedKey: string;
+  machines: MachineInfo[];
   messages: Message[];
   tasksBySourceMessageId: Record<string, Task>;
   channelThreads: Thread[];
@@ -2468,6 +3099,7 @@ function MessageFeed({
   onStartThread: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
+  onOpenAgentSettings: (actorId: string) => void;
   currentActorId: string | null;
   busy: string | null;
 }) {
@@ -2520,13 +3152,16 @@ function MessageFeed({
                   key={message.id}
                   actor={actors[message.authorActorId]}
                   actors={actors}
+                  machines={machines}
                   message={message}
                   workflowSourceIds={workflowSourceIds}
                   onReply={onReply}
                   onStartThread={onStartThread}
                   onToggleReaction={onToggleReaction}
                   onAnswerAction={onAnswerAction}
-                  canStartThread={canUseAsThreadRoot(message)}
+                  onOpenAgentSettings={onOpenAgentSettings}
+                  canReply={allowReply}
+                  canStartThread={allowThreads && canUseAsThreadRoot(message)}
                   threadSummary={threadSummary}
                   threadStats={
                     threadSummary ? threadStatsById[threadSummary.id] : undefined
@@ -2547,12 +3182,15 @@ function MessageFeed({
 function MessageRow({
   actor,
   actors,
+  machines,
   message,
   workflowSourceIds,
   onReply,
   onStartThread,
   onToggleReaction,
   onAnswerAction,
+  onOpenAgentSettings,
+  canReply,
   canStartThread,
   threadSummary,
   threadStats,
@@ -2562,12 +3200,15 @@ function MessageRow({
 }: {
   actor?: Actor;
   actors: Record<string, Actor>;
+  machines: MachineInfo[];
   message: Message;
   workflowSourceIds: Set<string>;
   onReply: (message: Message) => void;
   onStartThread: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
+  onOpenAgentSettings: (actorId: string) => void;
+  canReply: boolean;
   canStartThread: boolean;
   threadSummary: Thread | null;
   threadStats?: ThreadActivityStats;
@@ -2586,7 +3227,14 @@ function MessageRow({
     return <WorkflowEventRow actor={actor} actors={actors} message={message} />;
   }
   if (isWorkflowResultMessage(message, workflowSourceIds)) {
-    return <WorkflowResultRow actor={actor} message={message} />;
+    return (
+      <WorkflowResultRow
+        actor={actor}
+        machines={machines}
+        message={message}
+        onOpenAgentSettings={onOpenAgentSettings}
+      />
+    );
   }
   return (
     <article
@@ -2596,7 +3244,12 @@ function MessageRow({
       )}
     >
       <div className="flex items-start gap-4">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <AgentMessageAvatar
+          actor={actor}
+          fallback={message.authorActorId}
+          machines={machines}
+          onOpenAgentSettings={onOpenAgentSettings}
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
@@ -2609,7 +3262,7 @@ function MessageRow({
             )}
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <ReactMarkdown>{displayBody}</ReactMarkdown>
+            <MessageMarkdown actors={actors} body={displayBody} />
           </div>
           {attachments.length > 0 && (
             <AttachmentStack attachments={attachments} />
@@ -2670,10 +3323,12 @@ function MessageRow({
             />
           )}
           <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
-            <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
-              <Reply size={14} />
-              Reply
-            </Button>
+            {canReply && (
+              <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
+                <Reply size={14} />
+                Reply
+              </Button>
+            )}
             {reactions.length === 0 && (
               <ReactionPicker
                 busy={busy}
@@ -2854,15 +3509,24 @@ function WorkflowEventRow({
 
 function WorkflowResultRow({
   actor,
+  machines,
   message,
+  onOpenAgentSettings,
 }: {
   actor?: Actor;
+  machines: MachineInfo[];
   message: Message;
+  onOpenAgentSettings: (actorId: string) => void;
 }) {
   return (
     <article className="group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]">
       <div className="flex items-start gap-4">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <AgentMessageAvatar
+          actor={actor}
+          fallback={message.authorActorId}
+          machines={machines}
+          onOpenAgentSettings={onOpenAgentSettings}
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
@@ -2885,6 +3549,8 @@ function Composer({
   onClearReply,
   onSend,
   mentionAgents,
+  placeholder = "Message",
+  disabledPlaceholder = "Connect and select a channel",
   busy,
 }: {
   draft: string;
@@ -2895,6 +3561,8 @@ function Composer({
   onClearReply: () => void;
   onSend: () => void;
   mentionAgents: Actor[];
+  placeholder?: string;
+  disabledPlaceholder?: string;
   busy: boolean;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -3038,7 +3706,7 @@ function Composer({
               }
             }}
             disabled={disabled}
-            placeholder={disabled ? "Connect and select a channel" : "Message"}
+            placeholder={disabled ? disabledPlaceholder : placeholder}
             className="max-h-48 min-h-[44px] flex-1 border-0 bg-transparent px-0 py-1 shadow-none focus-visible:ring-0"
           />
           <Button
@@ -3062,6 +3730,7 @@ function ThreadPanel({
   currentActorId,
   disabled,
   draft,
+  machines,
   messages,
   setDraft,
   task,
@@ -3071,6 +3740,7 @@ function ThreadPanel({
   onClose,
   onSend,
   onToggleReaction,
+  onOpenAgentSettings,
 }: {
   actors: Record<string, Actor>;
   channel: Channel | null;
@@ -3078,6 +3748,7 @@ function ThreadPanel({
   currentActorId: string | null;
   disabled: boolean;
   draft: string;
+  machines: MachineInfo[];
   messages: Message[];
   setDraft: (value: string) => void;
   task: Task | null;
@@ -3087,6 +3758,7 @@ function ThreadPanel({
   onClose: () => void;
   onSend: () => void;
   onToggleReaction: (message: Message, emoji: string) => void;
+  onOpenAgentSettings: (actorId: string) => void;
 }) {
   const rootMessage = thread
     ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
@@ -3168,7 +3840,9 @@ function ThreadPanel({
                   actors={actors}
                   busy={busy}
                   currentActorId={currentActorId}
+                  machines={machines}
                   message={rootMessage}
+                  onOpenAgentSettings={onOpenAgentSettings}
                   onToggleReaction={onToggleReaction}
                   root
                 />
@@ -3200,7 +3874,9 @@ function ThreadPanel({
                           actors={actors}
                           busy={busy}
                           currentActorId={currentActorId}
+                          machines={machines}
                           message={message}
+                          onOpenAgentSettings={onOpenAgentSettings}
                           onToggleReaction={onToggleReaction}
                         />
                       ))}
@@ -3228,17 +3904,21 @@ function ThreadConversationMessage({
   actor,
   actors,
   currentActorId,
+  machines,
   message,
   busy,
   root = false,
+  onOpenAgentSettings,
   onToggleReaction,
 }: {
   actor?: Actor;
   actors: Record<string, Actor>;
   currentActorId: string | null;
+  machines: MachineInfo[];
   message: Message;
   busy: string | null;
   root?: boolean;
+  onOpenAgentSettings: (actorId: string) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
 }) {
   const reactions = message.reactions ?? [];
@@ -3255,7 +3935,13 @@ function ThreadConversationMessage({
       )}
     >
       <div className="flex items-start gap-4">
-        <ActorAvatar actor={actor} fallback={message.authorActorId} />
+        <AgentMessageAvatar
+          actor={actor}
+          fallback={message.authorActorId}
+          machines={machines}
+          onOpenAgentSettings={onOpenAgentSettings}
+          preferredPlacement="left"
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">
@@ -3266,7 +3952,7 @@ function ThreadConversationMessage({
             </span>
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <ReactMarkdown>{displayBody}</ReactMarkdown>
+            <MessageMarkdown actors={actors} body={displayBody} />
           </div>
           {pollChoices.length > 0 && (
             <PollCard choices={pollChoices} disabled />
@@ -3320,6 +4006,42 @@ function ThreadConversationMessage({
         </div>
       </div>
     </article>
+  );
+}
+
+function MessageMarkdown({
+  actors,
+  body,
+}: {
+  actors: Record<string, Actor>;
+  body: string;
+}) {
+  const components: Components = {
+    a({ href, children, node: _node, ...props }) {
+      const actorId = href ? actorMentionActorId(href) : null;
+      if (actorId) {
+        return (
+          <span
+            className="message-mention"
+            data-actor-id={actorId}
+            title={actorName(actors, actorId)}
+          >
+            {children}
+          </span>
+        );
+      }
+      return (
+        <a href={href} rel="noreferrer" target="_blank" {...props}>
+          {children}
+        </a>
+      );
+    },
+  };
+
+  return (
+    <ReactMarkdown remarkPlugins={[actorMentionRemarkPlugin(actors)]} components={components}>
+      {body}
+    </ReactMarkdown>
   );
 }
 
@@ -3414,6 +4136,7 @@ function ThreadsView({
   actors,
   channels,
   messages,
+  machines,
   threadMessages,
   threadStatsById,
   threads,
@@ -3427,12 +4150,14 @@ function ThreadsView({
   onCloseThread,
   onSendThreadMessage,
   onToggleReaction,
+  onOpenAgentSettings,
   busy,
   disabled,
 }: {
   actors: Record<string, Actor>;
   channels: Channel[];
   messages: Message[];
+  machines: MachineInfo[];
   threadMessages: Message[];
   threadStatsById: Record<string, ThreadActivityStats>;
   threads: ThreadWithChannel[];
@@ -3446,6 +4171,7 @@ function ThreadsView({
   onCloseThread: () => void;
   onSendThreadMessage: () => void;
   onToggleReaction: (message: Message, emoji: string) => void;
+  onOpenAgentSettings: (actorId: string) => void;
   busy: string | null;
   disabled: boolean;
 }) {
@@ -3512,6 +4238,7 @@ function ThreadsView({
           currentActorId={currentActorId}
           disabled={disabled}
           draft={threadDraft}
+          machines={machines}
           messages={threadMessages}
           setDraft={setThreadDraft}
           task={activeThreadTask}
@@ -3521,6 +4248,7 @@ function ThreadsView({
           onClose={onCloseThread}
           onSend={onSendThreadMessage}
           onToggleReaction={onToggleReaction}
+          onOpenAgentSettings={onOpenAgentSettings}
         />
       </div>
     </section>
@@ -3595,25 +4323,33 @@ function ThreadListCard({
 
 function ChannelsView({
   actors,
+  busy,
   channels,
   channelGroups,
   threadsByChannel,
   activeChannel,
   onSelectChannel,
+  onDeleteChannel,
 }: {
   actors: Record<string, Actor>;
+  busy: string | null;
   channels: Channel[];
   channelGroups: ChannelGroup[];
   threadsByChannel: Record<string, Thread[]>;
   activeChannel: Channel | null;
   onSelectChannel: (channelId: string) => void;
+  onDeleteChannel: (channel: Channel) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
   const filteredChannels = channels.filter((channel) => {
     const text = `${channel.title} ${channel.topic ?? ""} ${channel.visibility}`.toLowerCase();
     return text.includes(query.trim().toLowerCase());
   });
   const sections = channelGroupSections(channelGroups, filteredChannels);
+  const closeDeleteConfirm = () => {
+    setDeleteChannelId(null);
+  };
   return (
     <section className="flex min-h-0 flex-1 flex-col bg-white">
       <div className="flex h-[96px] shrink-0 items-center justify-between border-b border-[#e2e6ef] bg-white px-6">
@@ -3643,6 +4379,7 @@ function ChannelsView({
             <span>Type</span>
             <span>Members</span>
             <span>Activity</span>
+            <span className="text-right">Actions</span>
           </div>
           {sections.map((section) => (
             <div key={section.id}>
@@ -3652,16 +4389,36 @@ function ChannelsView({
                   <span>({section.channels.length} channels)</span>
                 </div>
               )}
-              {section.channels.map((channel) => (
-                <ChannelTableRow
-                  key={channel.id}
-                  actors={actors}
-                  channel={channel}
-                  selected={activeChannel?.id === channel.id}
-                  threads={threadsByChannel[channel.id] ?? []}
-                  onSelect={() => onSelectChannel(channel.id)}
-                />
-              ))}
+              {section.channels.map((channel) => {
+                const threads = threadsByChannel[channel.id] ?? [];
+                const deleteBusy = busy === `channel:delete:${channel.id}`;
+                return (
+                  <Fragment key={channel.id}>
+                    <ChannelTableRow
+                      actors={actors}
+                      channel={channel}
+                      deleteBusy={deleteBusy}
+                      selected={activeChannel?.id === channel.id}
+                      threads={threads}
+                      onRequestDelete={() => {
+                        setDeleteChannelId(channel.id);
+                      }}
+                      onSelect={() => onSelectChannel(channel.id)}
+                    />
+                    {deleteChannelId === channel.id && (
+                      <ChannelDeleteConfirm
+                        channel={channel}
+                        deleteBusy={deleteBusy}
+                        onCancel={closeDeleteConfirm}
+                        onConfirm={() => {
+                          onDeleteChannel(channel);
+                          closeDeleteConfirm();
+                        }}
+                      />
+                    )}
+                  </Fragment>
+                );
+              })}
             </div>
           ))}
           {filteredChannels.length === 0 && <EmptyState icon={Hash} text="No channels." />}
@@ -3674,22 +4431,33 @@ function ChannelsView({
 function ChannelTableRow({
   actors,
   channel,
+  deleteBusy,
   selected,
   threads,
+  onRequestDelete,
   onSelect,
 }: {
   actors: Record<string, Actor>;
   channel: Channel;
+  deleteBusy: boolean;
   selected: boolean;
   threads: Thread[];
+  onRequestDelete: () => void;
   onSelect: () => void;
 }) {
   const members = channel.members.map((actorId) => actors[actorId] ?? fallbackActor(actorId));
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       className={cn("channel-table-row", selected && "channel-table-row-active")}
       onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
     >
       <span className="flex min-w-0 items-center gap-3">
         <span className="channel-icon">
@@ -3716,7 +4484,270 @@ function ChannelTableRow({
         <Clock size={13} />
         {threads.length > 0 ? `${threads.length} threads` : "No threads"}
       </span>
-    </button>
+      <span className="flex justify-end">
+        <button
+          type="button"
+          title={`Delete #${channel.title}`}
+          disabled={deleteBusy}
+          className="composer-icon h-8 min-w-8 text-red-500 hover:text-red-600"
+          onKeyDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onRequestDelete();
+          }}
+        >
+          {deleteBusy ? <Loader2 className="animate-spin" size={14} /> : <Trash2 size={14} />}
+        </button>
+      </span>
+    </div>
+  );
+}
+
+function ChannelDeleteConfirm({
+  channel,
+  compact = false,
+  deleteBusy,
+  onCancel,
+  onConfirm,
+}: {
+  channel: Channel;
+  compact?: boolean;
+  deleteBusy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  if (compact) {
+    return (
+      <div
+        className="mb-2 mt-1 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-red-900"
+        role="alertdialog"
+        aria-label={`Delete #${channel.title}`}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-xs font-bold" title={`Delete #${channel.title}?`}>
+              Delete channel?
+            </div>
+            <div className="truncate text-[11px] font-medium text-red-700">
+              Threads included.
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              className="composer-icon h-7 min-w-7 text-red-700 hover:text-red-800"
+              title="Cancel"
+              aria-label="Cancel channel delete"
+              onClick={onCancel}
+            >
+              <X size={13} />
+            </button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={deleteBusy}
+              className="h-7 px-2 text-[11px] bg-red-600 text-white hover:bg-red-700"
+              onClick={onConfirm}
+            >
+              {deleteBusy ? <Loader2 className="animate-spin" size={12} /> : "Delete"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="my-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900">
+      <div className="flex items-start gap-3">
+        <Trash2 className="mt-0.5 shrink-0 text-red-500" size={16} />
+        <div className="min-w-0 flex-1">
+          <div className="font-bold">Delete #{channel.title}?</div>
+          <div className="mt-1 text-xs font-medium text-red-700">
+            This will delete the channel and all threads in this channel.
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button type="button" variant="outline" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            disabled={deleteBusy}
+            className="bg-red-600 text-white hover:bg-red-700"
+            onClick={onConfirm}
+          >
+            {deleteBusy ? <Loader2 className="animate-spin" size={13} /> : <Trash2 size={13} />}
+            Delete
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DirectMessagesView({
+  actors,
+  agents,
+  busy,
+  currentActorId,
+  disabled,
+  draft,
+  linkedChannel,
+  machines,
+  messages,
+  selectedAgent,
+  setDraft,
+  onOpenLinkedChannel,
+  onSelectAgent,
+  onAnswerAction,
+  onSend,
+  onToggleReaction,
+  onOpenAgentSettings,
+}: {
+  actors: Record<string, Actor>;
+  agents: Actor[];
+  busy: string | null;
+  currentActorId: string | null;
+  disabled: boolean;
+  draft: string;
+  linkedChannel: Channel | null;
+  machines: MachineInfo[];
+  messages: Message[];
+  selectedAgent: Actor | null;
+  setDraft: (value: string) => void;
+  onOpenLinkedChannel: (channelId: string) => void;
+  onSelectAgent: (actorId: string) => void;
+  onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
+  onSend: () => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
+  onOpenAgentSettings: (actorId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const filteredAgents = agents.filter((agent) => {
+    const text = `${displayName(agent)} ${agent.id}`.toLowerCase();
+    return text.includes(query.trim().toLowerCase());
+  });
+  const selectedBusy = selectedAgent
+    ? busy === `direct:message:send:${selectedAgent.id}`
+    : false;
+  return (
+    <section className="grid min-h-0 flex-1 grid-cols-[minmax(260px,340px)_minmax(0,1fr)] bg-white">
+      <aside className="min-h-0 border-r border-[#e2e6ef] bg-[#fbfbfd]">
+        <div className="flex h-[96px] flex-col justify-center border-b border-[#e2e6ef] px-5">
+          <h1 className="text-[22px] font-bold text-[#111827]">Direct Messages</h1>
+          <div className="mt-1 text-sm font-medium text-[#667085]">
+            {agents.length} agents
+          </div>
+        </div>
+        <div className="p-4">
+          <label className="search-pill mb-4 h-10">
+            <Search size={16} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search agents"
+              className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[#8a93a5]"
+            />
+          </label>
+          <div className="space-y-1">
+            {filteredAgents.map((agent) => {
+              const selected = selectedAgent?.id === agent.id;
+              return (
+                <button
+                  key={agent.id}
+                  type="button"
+                  className={cn(
+                    "flex min-h-12 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors",
+                    selected
+                      ? "bg-[#efecff] text-[#4f3fd7]"
+                      : "text-[#303849] hover:bg-[#f0f1f8]",
+                  )}
+                  onClick={() => onSelectAgent(agent.id)}
+                >
+                  <ActorAvatar actor={agent} fallback={agent.id} small />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-bold">
+                      {displayName(agent)}
+                    </span>
+                    <span className="block truncate text-xs font-medium text-[#667085]">
+                      {shortActorAlias(agent.id)}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+            {filteredAgents.length === 0 && (
+              <EmptyState icon={Bot} text="No agents." />
+            )}
+          </div>
+        </div>
+      </aside>
+      <div className="flex min-h-0 min-w-0 flex-col bg-white">
+        {!selectedAgent ? (
+          <div className="flex min-h-0 flex-1 items-center justify-center p-8">
+            <EmptyState icon={MessageCircle} text="Select an agent." />
+          </div>
+        ) : (
+          <>
+            <header className="flex h-[86px] shrink-0 items-center gap-4 border-b border-[#e2e6ef] bg-white px-6">
+              <ActorAvatar actor={selectedAgent} fallback={selectedAgent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[22px] font-bold leading-tight text-[#111827]">
+                  {displayName(selectedAgent)}
+                </div>
+                <div className="mt-1 truncate text-sm text-[#485063]">
+                  {selectedAgent.id}
+                </div>
+              </div>
+              {linkedChannel && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onOpenLinkedChannel(linkedChannel.id)}
+                >
+                  <Hash size={14} />
+                  {linkedChannel.title}
+                </Button>
+              )}
+            </header>
+            <MessageFeed
+              actors={actors}
+              allowReply={false}
+              allowThreads={false}
+              feedKey={`direct:${selectedAgent.id}`}
+              machines={machines}
+              messages={messages}
+              tasksBySourceMessageId={{}}
+              channelThreads={[]}
+              threadStatsById={{}}
+              emptyText="No direct messages."
+              onReply={() => {}}
+              onStartThread={() => {}}
+              onToggleReaction={onToggleReaction}
+              onAnswerAction={onAnswerAction}
+              onOpenAgentSettings={onOpenAgentSettings}
+              currentActorId={currentActorId}
+              busy={busy}
+            />
+            <Composer
+              draft={draft}
+              setDraft={setDraft}
+              disabled={disabled}
+              replyTo={null}
+              actorName=""
+              onClearReply={() => {}}
+              onSend={onSend}
+              mentionAgents={[]}
+              placeholder={`Message ${displayName(selectedAgent)}`}
+              disabledPlaceholder="Connect and select an agent"
+              busy={selectedBusy}
+            />
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -4078,6 +5109,7 @@ function SettingsView({
   agentForm,
   setAgentForm,
   machines,
+  targetAgentId,
   onCheckMachines,
   onRemoveMachine,
   onAddAgent,
@@ -4089,6 +5121,7 @@ function SettingsView({
   agentForm: AgentFormState;
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
+  targetAgentId: string | null;
   onCheckMachines: () => void;
   onRemoveMachine: (machineId: string) => void;
   onAddAgent: () => void;
@@ -4097,7 +5130,7 @@ function SettingsView({
   onOpenLocalPath: (path: string) => void;
 }) {
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
   const memberEntries = agentMemberEntries(machines);
   const selectedMemberEntry =
     selectedAgentId === null
@@ -4131,6 +5164,13 @@ function SettingsView({
       setSelectedAgentId(null);
     }
   }, [memberEntries, selectedAgentId]);
+
+  useEffect(() => {
+    if (!targetAgentId) return;
+    const entry = findAgentMemberEntry(machines, targetAgentId);
+    setSelectedAgentId(targetAgentId);
+    if (entry) setSelectedMachineId(entry.machine.id);
+  }, [machines, targetAgentId]);
 
   function selectMachine(machine: MachineInfo) {
     setSelectedMachineId(machine.id);
@@ -4961,8 +6001,10 @@ function HostDetailSection({
 }
 
 function ProviderBadge({ provider }: { provider: MachineAgentProviderInfo }) {
+  const iconKey = agentProviderIconKey(provider.id, provider.name);
   return (
-    <Badge variant="outline">
+    <Badge variant="outline" className="gap-1.5">
+      {iconKey && <AgentProviderIcon iconKey={iconKey} className="h-3.5 w-3.5" />}
       {provider.name}
       {provider.actorCount > 0 ? ` (${provider.actorCount})` : ""}
     </Badge>
@@ -5732,6 +6774,190 @@ function ActorAvatar({
   );
 }
 
+function AgentMessageAvatar({
+  actor,
+  fallback,
+  machines,
+  onOpenAgentSettings,
+  preferredPlacement = "right",
+  small,
+}: {
+  actor?: Actor;
+  fallback: string;
+  machines: MachineInfo[];
+  onOpenAgentSettings: (actorId: string) => void;
+  preferredPlacement?: "left" | "right";
+  small?: boolean;
+}) {
+  const actorId = actor?.id ?? fallback;
+  const entry = findAgentMemberEntry(machines, actorId);
+  const avatarActor = actor ?? entry?.agent.spec.actor;
+  const [open, setOpen] = useState(false);
+  const [badgeExpanded, setBadgeExpanded] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
+  const anchorRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current === null) return;
+    window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+
+  const updatePopoverPosition = useCallback((expanded = badgeExpanded) => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    const margin = 16;
+    const gap = 12;
+    const fallbackWidth =
+      (expanded ? agentMessageBadgeDetailWidth : agentMessageBadgeCompactWidth) *
+      agentMessageBadgePopoverScale;
+    const fallbackHeight =
+      (expanded ? agentMessageBadgeDetailHeight : agentMessageBadgeCompactHeight) *
+      agentMessageBadgePopoverScale;
+    const content = popoverRef.current?.firstElementChild;
+    const contentRect = content?.getBoundingClientRect();
+    const visualWidth =
+      contentRect && contentRect.width > 0
+        ? Math.min(contentRect.width, window.innerWidth - margin * 2)
+        : Math.min(fallbackWidth, window.innerWidth - margin * 2);
+    const visualHeight =
+      contentRect && contentRect.height > 0 ? contentRect.height : fallbackHeight;
+    const maxVisualHeight = Math.max(120, window.innerHeight - margin * 2);
+    const clampedVisualHeight = Math.min(visualHeight, maxVisualHeight);
+    let left =
+      preferredPlacement === "left"
+        ? rect.left - visualWidth - gap
+        : rect.right + gap;
+
+    if (left + visualWidth > window.innerWidth - margin) {
+      left = rect.left - visualWidth - gap;
+    }
+    if (left < margin) {
+      left = Math.min(window.innerWidth - margin - visualWidth, rect.right + gap);
+    }
+    if (left < margin) left = margin;
+
+    const maxTop = Math.max(margin, window.innerHeight - margin - clampedVisualHeight);
+    const top = Math.max(margin, Math.min(rect.top - 12, maxTop));
+    const availableVisualHeight = Math.max(120, window.innerHeight - top - margin);
+    setPopoverStyle({
+      left,
+      top,
+      "--agent-message-avatar-popover-max-height": `${availableVisualHeight / agentMessageBadgePopoverScale}px`,
+    } as CSSProperties);
+  }, [badgeExpanded, preferredPlacement]);
+
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    if (!open) setBadgeExpanded(false);
+    updatePopoverPosition(false);
+    setOpen(true);
+  }, [clearCloseTimer, open, updatePopoverPosition]);
+
+  const scheduleClose = useCallback(() => {
+    clearCloseTimer();
+    closeTimerRef.current = window.setTimeout(() => setOpen(false), 180);
+  }, [clearCloseTimer]);
+
+  useEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    const reposition = () => updatePopoverPosition();
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open, updatePopoverPosition]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    const popover = popoverRef.current;
+    if (!popover || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => updatePopoverPosition());
+    observer.observe(popover);
+    if (popover.firstElementChild) observer.observe(popover.firstElementChild);
+    return () => observer.disconnect();
+  }, [badgeExpanded, open, updatePopoverPosition]);
+
+  useEffect(() => {
+    if (!open) setBadgeExpanded(false);
+  }, [open]);
+
+  useEffect(() => () => clearCloseTimer(), [clearCloseTimer]);
+
+  if (!entry || avatarActor?.kind !== "agent") {
+    return <ActorAvatar actor={actor} fallback={fallback} small={small} />;
+  }
+
+  const badgeProps = agentIdentityBadgeProps(entry);
+  const entryActorId = entry.agent.spec.actor.id;
+  const display = displayName(avatarActor);
+
+  function openSettings() {
+    setOpen(false);
+    onOpenAgentSettings(entryActorId);
+  }
+
+  const scaledPopoverStyle = {
+    ...popoverStyle,
+    "--agent-message-avatar-popover-scale": agentMessageBadgePopoverScale,
+  } as CSSProperties;
+
+  const popover =
+    open && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            ref={popoverRef}
+            className="agent-message-avatar-popover"
+            style={scaledPopoverStyle}
+            onFocus={openPopover}
+            onMouseEnter={openPopover}
+            onMouseLeave={scheduleClose}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setOpen(false);
+            }}
+          >
+            <AgentIdentityBadge
+              {...badgeProps}
+              onAvatarClick={openSettings}
+              onExpandedChange={setBadgeExpanded}
+            />
+          </div>,
+          document.body,
+        )
+      : null;
+
+  return (
+    <>
+      <span className="agent-message-avatar">
+        <button
+          ref={anchorRef}
+          type="button"
+          className="agent-message-avatar__button"
+          title={`Open ${display} agent settings`}
+          aria-label={`Open ${display} agent settings`}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onClick={openSettings}
+          onFocus={openPopover}
+          onBlur={scheduleClose}
+          onMouseEnter={openPopover}
+          onMouseLeave={scheduleClose}
+        >
+          <ActorAvatar actor={avatarActor} fallback={fallback} small={small} />
+        </button>
+      </span>
+      {popover}
+    </>
+  );
+}
+
 function AvatarStack({
   actors,
   max,
@@ -6017,6 +7243,10 @@ function agentReasoningEffort(agent: MachineInfo["agents"][number]) {
   return agent.spec.providerRef.reasoningEffort ?? "";
 }
 
+function agentProviderId(agent: MachineInfo["agents"][number]) {
+  return metadataString(agent.spec.actor._meta, ["providerId", "provider_id"]);
+}
+
 function agentAvatarValue(agent: MachineInfo["agents"][number]) {
   return metadataAvatarUrl(agent.spec.actor._meta) ?? actorAvatarUrl(agent.spec.actor, agent.spec.actor.id);
 }
@@ -6026,7 +7256,8 @@ function providerForAgent(
   agent: MachineInfo["agents"][number],
   preferredProviderId?: string,
 ) {
-  const preferred = machine.providers.find((provider) => provider.id === preferredProviderId);
+  const providerId = preferredProviderId || agentProviderId(agent);
+  const preferred = machine.providers.find((provider) => provider.id === providerId);
   if (preferred) return preferred;
   const providerRef = machine.providers.find(
     (provider) => provider.id === agent.spec.providerRef.id,
@@ -6048,16 +7279,91 @@ function agentSettingsDraft(
   machine: MachineInfo,
   agent: MachineInfo["agents"][number],
 ): AgentSettingsDraft {
-  const provider = providerForAgent(machine, agent);
+  const providerId = agentProviderId(agent);
+  const provider = providerForAgent(machine, agent, providerId ?? undefined);
   return {
     displayName: agentDisplayName(agent),
     description: agentDescriptionValue(agent),
-    providerId: provider?.id ?? "",
+    providerId: providerId ?? provider?.id ?? "",
     model: agentModelValue(agent) || provider?.defaultModel || "",
     reasoningEffort: agentReasoningEffort(agent),
     autostart: Boolean(agent.spec.autostart),
     avatarUrl: agentAvatarValue(agent),
   };
+}
+
+function agentIdentityBadgeProps(entry: AgentMemberEntry): AgentIdentityBadgeProps {
+  const provider = providerForAgent(entry.machine, entry.agent);
+  const providerName = provider?.name || provider?.id || "AI Runtime";
+  const iconKey = agentProviderIconKey(provider?.id, providerName);
+  return {
+    avatarUrl: agentAvatarValue(entry.agent),
+    agentName: agentDisplayName(entry.agent),
+    providerName,
+    providerMark: providerMark(providerName),
+    providerIcon: iconKey ? <AgentProviderIcon iconKey={iconKey} /> : undefined,
+    modelName: agentModelLabel(entry.agent, provider),
+    usedTokensLabel: agentContextUsedLabel(entry.agent),
+    remainingLabel: agentContextRemainingLabel(entry.agent),
+    online: isOnlinePresenceStatus(entry.agent.status, entry.agent),
+  };
+}
+
+function agentModelLabel(
+  agent: MachineInfo["agents"][number],
+  provider?: MachineAgentProviderInfo,
+) {
+  const model = agentModelValue(agent);
+  const modelChoices = [
+    ...(provider?.modelChoices ?? []),
+    ...(agent.spec.models?.choices ?? []),
+  ];
+  return modelChoices.find((choice) => choice.id === model)?.label || model || "Default model";
+}
+
+function providerMark(providerName: string) {
+  if (/anthropic|claude/i.test(providerName)) return "AI";
+  const words = providerName.match(/[A-Za-z0-9]+/g) ?? [];
+  if (words.length >= 2) {
+    const first = words[0]?.[0] ?? "";
+    const second = words[1]?.[0] ?? "";
+    return `${first}${second}`.toUpperCase() || "AI";
+  }
+  return providerName.trim().slice(0, 2).toUpperCase() || "AI";
+}
+
+function agentContextUsedLabel(agent: MachineInfo["agents"][number]) {
+  const meta = agent.spec._meta;
+  const explicit = metadataString(meta, ["contextUsedLabel", "usedTokensLabel"]);
+  if (explicit) return explicit;
+  const used = metadataNumber(meta, ["contextUsedTokens", "usedTokens"]);
+  const total = metadataNumber(meta, ["contextWindowTokens", "totalTokens", "maxTokens"]);
+  if (typeof used === "number" && typeof total === "number" && total > 0) {
+    return `${compactTokenCount(used)} / ${compactTokenCount(total)} tokens`;
+  }
+  return "112.0K / 128.0K tokens";
+}
+
+function agentContextRemainingLabel(agent: MachineInfo["agents"][number]) {
+  const meta = agent.spec._meta;
+  const explicit = metadataString(meta, ["contextRemainingLabel", "remainingLabel"]);
+  if (explicit) return explicit;
+  const remainingPercent = metadataNumber(meta, ["contextRemainingPercent", "remainingPercent"]);
+  if (typeof remainingPercent === "number") {
+    const normalized = remainingPercent <= 1 ? remainingPercent * 100 : remainingPercent;
+    return `${Math.max(0, Math.round(normalized))}%`;
+  }
+  const used = metadataNumber(meta, ["contextUsedTokens", "usedTokens"]);
+  const total = metadataNumber(meta, ["contextWindowTokens", "totalTokens", "maxTokens"]);
+  if (typeof used === "number" && typeof total === "number" && total > 0) {
+    return `${Math.max(0, Math.round(((total - used) / total) * 100))}%`;
+  }
+  return "13%";
+}
+
+function compactTokenCount(value: number) {
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
+  return `${Math.round(value)}`;
 }
 
 function actorAvatarUrl(actor: Actor | undefined, fallback: string) {
@@ -6125,6 +7431,94 @@ function capitalize(value: string) {
 
 function actorName(actors: Record<string, Actor>, actorId: string) {
   return actors[actorId] ? displayName(actors[actorId]) : actorId;
+}
+
+type MarkdownNode = {
+  type?: string;
+  value?: string;
+  children?: MarkdownNode[];
+  url?: string;
+  title?: string | null;
+};
+
+const actorMentionUrlPrefix = "https://loom.local/actors/";
+const actorMentionPattern =
+  /@((?:actor_(?:agent|human|service)_|actor_)[A-Za-z0-9_:-]+)/g;
+
+function actorMentionRemarkPlugin(actors: Record<string, Actor>) {
+  return function transformActorMentions() {
+    return (tree: MarkdownNode) => {
+      transformMarkdownTextMentions(tree, actors);
+    };
+  };
+}
+
+function transformMarkdownTextMentions(
+  node: MarkdownNode,
+  actors: Record<string, Actor>,
+) {
+  if (node.type === "link" || node.type === "linkReference") return;
+  if (!node.children) return;
+
+  for (let index = 0; index < node.children.length; index += 1) {
+    const child = node.children[index];
+    if (child.type === "text" && typeof child.value === "string") {
+      const replacement = actorMentionNodes(child.value, actors);
+      if (replacement) {
+        node.children.splice(index, 1, ...replacement);
+        index += replacement.length - 1;
+      }
+      continue;
+    }
+    transformMarkdownTextMentions(child, actors);
+  }
+}
+
+function actorMentionNodes(
+  value: string,
+  actors: Record<string, Actor>,
+): MarkdownNode[] | null {
+  const nodes: MarkdownNode[] = [];
+  let lastIndex = 0;
+  let matched = false;
+  actorMentionPattern.lastIndex = 0;
+
+  for (const match of value.matchAll(actorMentionPattern)) {
+    const actorId = match[1];
+    const actor = actors[actorId];
+    if (!actor || match.index === undefined) continue;
+
+    if (match.index > lastIndex) {
+      nodes.push({ type: "text", value: value.slice(lastIndex, match.index) });
+    }
+    nodes.push({
+      type: "link",
+      url: actorMentionUrl(actor.id),
+      title: actor.id,
+      children: [{ type: "text", value: `@${displayName(actor)}` }],
+    });
+    lastIndex = match.index + match[0].length;
+    matched = true;
+  }
+
+  if (!matched) return null;
+  if (lastIndex < value.length) {
+    nodes.push({ type: "text", value: value.slice(lastIndex) });
+  }
+  return nodes;
+}
+
+function actorMentionUrl(actorId: string) {
+  return `${actorMentionUrlPrefix}${encodeURIComponent(actorId)}`;
+}
+
+function actorMentionActorId(href: string) {
+  if (!href.startsWith(actorMentionUrlPrefix)) return null;
+  try {
+    return decodeURIComponent(href.slice(actorMentionUrlPrefix.length));
+  } catch {
+    return null;
+  }
 }
 
 function channelTopic(channel: Channel | null | undefined) {
@@ -6495,6 +7889,64 @@ function canUseAsThreadRoot(message: Message) {
     !message.parentMessageId &&
     !message.threadRootMessageId
   );
+}
+
+function directMessageTarget(actorId: string) {
+  return `dm:@${actorId}`;
+}
+
+function directTargetActorId(target: string) {
+  const raw = target.trim().match(/^dm:@?([^:]+)$/)?.[1];
+  return raw?.trim() || null;
+}
+
+function isDirectChannel(channel: Channel | null | undefined) {
+  return Boolean(
+    channel &&
+      channel.title.startsWith("dm:") &&
+      channel.members.length === 2 &&
+      channel.visibility === "private",
+  );
+}
+
+function directChannelPeerId(
+  channel: Channel | null | undefined,
+  currentActorId: string | null | undefined,
+) {
+  if (!channel || !isDirectChannel(channel) || !currentActorId) return null;
+  if (!channel.members.includes(currentActorId)) return null;
+  return channel.members.find((actorId) => actorId !== currentActorId) ?? null;
+}
+
+function directScopeForActor(
+  channels: Channel[],
+  currentActorId: string,
+  peerActorId: string,
+): ScopeRef | null {
+  const channel = channels.find(
+    (candidate) => directChannelPeerId(candidate, currentActorId) === peerActorId,
+  );
+  return channel ? { kind: "channel", id: channel.id } : null;
+}
+
+function messageBelongsToDirectActor(
+  message: Message,
+  peerActorId: string | null,
+  currentActorId: string | null,
+) {
+  if (!peerActorId || !directTargetActorId(message.target)) return false;
+  if (message.authorActorId === peerActorId) return true;
+  if (currentActorId && message.authorActorId !== currentActorId) return false;
+  return directTargetActorId(message.target) === peerActorId;
+}
+
+function directPeerForMessage(message: Message, currentActorId: string | null) {
+  const targetActorId = directTargetActorId(message.target);
+  if (!targetActorId) return null;
+  if (currentActorId && message.authorActorId !== currentActorId) {
+    return message.authorActorId;
+  }
+  return targetActorId;
 }
 
 function isChannelMember(channel: Channel, actorId: string) {

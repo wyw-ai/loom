@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::handlers;
 use crate::state::AppState;
-use crate::store::StoreEvent;
+use crate::store::{Store, StoreEvent};
 use crate::subscribe::Connection;
 
 pub async fn ws_upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -368,6 +368,95 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
+    if let StoreEvent::ChannelDeleted {
+        channel_id,
+        visibility,
+        members,
+    } = &ev
+    {
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel_id.clone(),
+        };
+        let payload = json!({
+            "kind": sk::CHANNEL_DELETED,
+            "scope": scope,
+            "data": { "channelId": channel_id },
+        });
+        match visibility {
+            ChannelVisibility::Public => {
+                state
+                    .subscriptions
+                    .broadcast_to_all(method::STREAM_UPDATE, payload);
+                tracing::debug!(
+                    channel = %channel_id,
+                    "channel.deleted broadcast to all",
+                );
+            }
+            ChannelVisibility::Private => {
+                for actor_id in members {
+                    let delivered =
+                        send_actor_inbox(state, actor_id, method::STREAM_UPDATE, payload.clone());
+                    tracing::debug!(
+                        channel = %channel_id,
+                        actor = %actor_id,
+                        delivered,
+                        "channel.deleted actor-inbox push (private)",
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // Internal events are not scope-broadcast as chat content, but directed
+    // events still need the actor-inbox wake path. This is what lets
+    // reminder.fire and service callback events wake an agent that is not
+    // subscribed to the scope at the moment the event is appended.
+    if let StoreEvent::EventCreated(event) = &ev {
+        let scope = event.scope.clone();
+        let payload = json!({
+            "kind": sk::EVENT_CREATED,
+            "scope": scope,
+            "data": { "event": event },
+        });
+        let mut already_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for target_id in state.store.delivery_recipients_for_source(&event.id) {
+            if !already_sent.insert(target_id.clone()) {
+                continue;
+            }
+            if !state.store.is_channel_member(
+                &channel_id_for_scope(state, &event.scope).unwrap_or_default(),
+                &target_id,
+            ) && !is_public_scope(state, &event.scope)
+            {
+                tracing::debug!(
+                    event = %event.id,
+                    target = %target_id,
+                    scope = ?event.scope,
+                    "event actor-inbox push skipped: target not a member of private channel",
+                );
+                continue;
+            }
+            let mut inbox_payload = payload.clone();
+            inbox_payload["delivery"] = json!({
+                "sourceId": event.id.clone(),
+                "actorId": target_id.clone(),
+                "source": "actor_inbox",
+            });
+            let delivered =
+                send_actor_inbox(state, &target_id, method::STREAM_UPDATE, inbox_payload);
+            tracing::debug!(
+                event = %event.id,
+                from = %event.actor_id,
+                target = %target_id,
+                delivered,
+                "event actor-inbox fanout",
+            );
+        }
+        return;
+    }
+
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::MessageCreated(m) => (sk::MESSAGE_CREATED, json!({ "message": m })),
@@ -390,19 +479,40 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         }
         StoreEvent::ChannelGranted { .. }
         | StoreEvent::ChannelRevoked { .. }
-        | StoreEvent::ChannelCreated(_) => {
-            unreachable!("channel grant/revoke/created handled above")
+        | StoreEvent::ChannelCreated(_)
+        | StoreEvent::ChannelDeleted { .. } => {
+            unreachable!("channel grant/revoke/create/delete handled above")
         }
     };
     let Some(scope) = scope else {
         return;
     };
     let payload = json!({ "kind": kind, "scope": scope, "data": data });
-    broadcast_stream_update(state, &scope, &payload);
+    let private_allowed = match &ev {
+        StoreEvent::MessageCreated(message) | StoreEvent::MessageUpdated(message) => {
+            Store::message_private_actor_ids(message)
+        }
+        _ => None,
+    };
+    if let Some(allowed) = private_allowed.as_ref() {
+        broadcast_filtered(state, &scope, method::STREAM_UPDATE, &payload, allowed);
+    } else {
+        broadcast_stream_update(state, &scope, &payload);
+    }
     if let Some(thread_scope) = thread_scope_for_event(&ev) {
         let thread_payload =
             json!({ "kind": kind, "scope": thread_scope.clone(), "data": data.clone() });
-        broadcast_stream_update(state, &thread_scope, &thread_payload);
+        if let Some(allowed) = private_allowed.as_ref() {
+            broadcast_filtered(
+                state,
+                &thread_scope,
+                method::STREAM_UPDATE,
+                &thread_payload,
+                allowed,
+            );
+        } else {
+            broadcast_stream_update(state, &thread_scope, &thread_payload);
+        }
     }
 
     // Actor-inbox delivery: new messages with delivery rows are pushed
@@ -414,6 +524,9 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         already_sent.insert(message.author_actor_id.clone());
         for target_id in state.store.delivery_recipients_for_source(&message.id) {
             if !already_sent.insert(target_id.clone()) {
+                continue;
+            }
+            if !Store::message_visible_to_actor(message, &target_id) {
                 continue;
             }
             if !state.store.is_channel_member(
@@ -695,6 +808,88 @@ mod tests {
         assert_eq!(value["params"]["data"]["message"]["id"], message.id);
         assert_eq!(value["params"]["delivery"]["actorId"], "actor_agent");
         assert_eq!(value["params"]["delivery"]["sourceId"], message.id);
+    }
+
+    #[test]
+    fn fanout_scope_private_message_only_reaches_allowed_subscribers() {
+        let state = fresh_state("scope-private-message");
+        for (id, kind, name) in [
+            ("actor_alice", ActorKind::Human, "Alice"),
+            ("actor_bob", ActorKind::Human, "Bob"),
+            ("actor_carol", ActorKind::Human, "Carol"),
+        ] {
+            state
+                .store
+                .upsert_actor(Actor {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    capabilities: None,
+                    _meta: None,
+                })
+                .expect("actor");
+        }
+        let channel = state
+            .store
+            .create_channel("private delivery".into(), None)
+            .expect("channel");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let (tx_bob, mut rx_bob) = mpsc::unbounded_channel::<String>();
+        let (tx_carol, mut rx_carol) = mpsc::unbounded_channel::<String>();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_bob".into(),
+            actor_id: Some("actor_bob".into()),
+            tx: tx_bob,
+        });
+        state.subscriptions.add_connection(Connection {
+            id: "conn_carol".into(),
+            actor_id: Some("actor_carol".into()),
+            tx: tx_carol,
+        });
+        assert!(state.subscriptions.subscribe("conn_bob", scope.clone()));
+        assert!(state.subscriptions.subscribe("conn_carol", scope.clone()));
+
+        let mut metadata = Meta::default();
+        metadata.insert("private".into(), json!(true));
+        metadata.insert("privateTo".into(), json!(["actor_bob"]));
+        let message = state
+            .store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "secret".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_bob".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                metadata,
+                None,
+            )
+            .expect("message");
+
+        fanout(&state, StoreEvent::MessageCreated(message));
+
+        let bob_frame = rx_bob.try_recv().expect("bob receives private frame");
+        let value: Value = serde_json::from_str(&bob_frame).expect("json notification");
+        assert_eq!(
+            value["params"]["kind"],
+            proto::methods::stream_kind::MESSAGE_CREATED
+        );
+        assert!(
+            rx_carol.try_recv().is_err(),
+            "non-recipient subscriber must not receive private message frames"
+        );
     }
 
     #[test]

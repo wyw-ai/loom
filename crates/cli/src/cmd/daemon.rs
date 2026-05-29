@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent_runtime::discovery::{detect_agent_cli_providers, DetectedAgentProvider};
+use agent_runtime::discovery::{
+    detect_agent_cli_providers, normalize_model_id_for_provider, DetectedAgentProvider,
+};
 use agent_runtime::provider::{
     builtin_provider_manifests, providers_dir, validate_manifest, ProviderRegistry,
 };
@@ -439,7 +441,7 @@ fn agent_spec_from_command(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+        .map(|value| normalize_model_id_for_provider(&provider.id, value));
     let reasoning_effort = command
         .get("reasoningEffort")
         .and_then(Value::as_str)
@@ -519,6 +521,24 @@ fn update_agent_spec_from_command(
             .ok_or_else(|| anyhow!("provider `{provider_id}` is not available on this machine"))?;
         spec.provider_ref.id = provider.id.clone();
         spec.provider_ref.mode.get_or_insert_with(|| "print".into());
+        if let Some(model) = spec.provider_ref.model.as_mut() {
+            *model = normalize_model_id_for_provider(&provider.id, model);
+        }
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        meta.insert("providerId".into(), json!(provider.id.clone()));
+        meta.insert("providerName".into(), json!(provider.display_name.clone()));
+        meta.insert(
+            "transportKind".into(),
+            json!(provider.transport_kind.clone()),
+        );
+        if let Some(models) = spec.models.as_mut() {
+            models.default = spec
+                .provider_ref
+                .model
+                .clone()
+                .or_else(|| provider.default_model.clone());
+            models.choices = provider.model_choices.clone();
+        }
         selected_provider = Some(provider);
     }
     if let Some(display_name) =
@@ -547,7 +567,10 @@ fn update_agent_spec_from_command(
         let model = if model.trim().is_empty() {
             None
         } else {
-            Some(model)
+            Some(normalize_model_id_for_provider(
+                &spec.provider_ref.id,
+                &model,
+            ))
         };
         spec.provider_ref.model = model.clone();
         if let Some(models) = spec.models.as_mut() {

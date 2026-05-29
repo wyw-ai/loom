@@ -39,6 +39,14 @@
     "category": "DeveloperTool",
     "shortDescription": "Loom multi-actor collaboration desktop client",
     "longDescription": "Desktop client for Loom over the Loom WebSocket protocol, parallel to the `loom chat` TUI.",
-    "icon": ["icons/icon.png"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

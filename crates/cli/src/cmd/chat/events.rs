@@ -349,6 +349,10 @@ fn handle_notification(app: &mut App, scope: &ScopeRef, n: proto::Notification) 
             apply_channel_revoked(app, &data);
             return;
         }
+        stream_kind::CHANNEL_DELETED => {
+            apply_channel_deleted(app, &data);
+            return;
+        }
         _ => {}
     }
     // Parse the embedded scope and message up front so we can recognize an
@@ -602,6 +606,38 @@ fn apply_channel_revoked(app: &mut App, data: &serde_json::Value) {
             .unwrap_or_else(|| actor_id.clone());
         app.set_status(format!("{} left #{}", display, title));
     }
+}
+
+fn apply_channel_deleted(app: &mut App, data: &serde_json::Value) {
+    let channel_id = data
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if channel_id.is_empty() {
+        return;
+    }
+
+    let title = if let Some(s) = app.sidebar.as_mut() {
+        let title = s
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| channel_id.clone());
+        s.remove_channel(&channel_id);
+        title
+    } else {
+        channel_id.clone()
+    };
+
+    if current_chat_channel(app).as_deref() == Some(channel_id.as_str()) {
+        app.history.push_system(format!(
+            "#{} was deleted; this scope is no longer writable",
+            title
+        ));
+    }
+    app.set_status(format!("channel deleted: #{}", title));
 }
 
 async fn drain_notifications(app: &mut App, scope: &ScopeRef, client: &Client) -> bool {
@@ -1583,7 +1619,7 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
             let res = client
                 .call::<_, ChannelDeleteResult>(
                     method::CHANNEL_DELETE,
-                    json!({ "channelId": channel_id, "cascade": false }),
+                    json!({ "channelId": channel_id, "cascade": true }),
                 )
                 .await;
             match res {

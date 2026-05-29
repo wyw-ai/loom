@@ -38,6 +38,19 @@ pub fn detect_agent_cli_providers() -> Vec<DetectedAgentProvider> {
     )
 }
 
+pub fn normalize_model_id_for_provider(provider_id: &str, model: &str) -> String {
+    let model = model.trim();
+    if provider_id != "claude" {
+        return model.to_string();
+    }
+    match model {
+        "claude-sonnet-4.6" => "claude-sonnet-4-6".into(),
+        "claude-opus-4.7" => "claude-opus-4-7".into(),
+        "claude-haiku-4.5" => "claude-haiku-4-5".into(),
+        _ => model.to_string(),
+    }
+}
+
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
         if let Some(plan) = self.runtime_plan.clone() {
@@ -239,5 +252,21 @@ mod tests {
         assert!(opencode.args.contains(&"{prompt.full}".into()));
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn normalizes_legacy_claude_model_ids_only_for_claude() {
+        assert_eq!(
+            normalize_model_id_for_provider("claude", "claude-sonnet-4.6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            normalize_model_id_for_provider("claude", "claude-opus-4.7"),
+            "claude-opus-4-7"
+        );
+        assert_eq!(
+            normalize_model_id_for_provider("copilot", "claude-opus-4.7"),
+            "claude-opus-4.7"
+        );
     }
 }

@@ -44,6 +44,11 @@ pub enum StoreEvent {
     DeliveryUpdated(Delivery),
     MachineCommandUpdated(MachineCommand),
     ChannelUpdated(Channel),
+    ChannelDeleted {
+        channel_id: String,
+        visibility: ChannelVisibility,
+        members: Vec<String>,
+    },
     /// `actor_id` was just added to `channel_id`'s ACL. ws::fanout pushes
     /// this directly to the affected actor's connection (if any) — never
     /// broadcast to scope subscribers.
@@ -81,6 +86,7 @@ impl StoreEvent {
                 kind: ScopeKind::Channel,
                 id: c.id.clone(),
             }),
+            StoreEvent::ChannelDeleted { .. } => None,
             StoreEvent::TaskAssignmentChanged { task, .. } => Some(ScopeRef {
                 kind: ScopeKind::Channel,
                 id: task.channel_id.clone(),
@@ -594,9 +600,9 @@ impl Store {
     /// — soft-delete, events left orphaned) before the channel row is
     /// removed. Returns `(removed_channel, removed_thread_count)`.
     pub fn delete_channel(&self, id: &str, cascade: bool) -> StoreResult<(bool, u32)> {
-        if self.get_channel(id).is_none() {
-            return Err(StoreError::NotFound(format!("channel {id}")));
-        }
+        let channel = self
+            .get_channel(id)
+            .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
         // Snapshot child ids under read lock so we can release it before the
         // per-thread `delete_thread` calls (each takes its own write lock).
         let child_ids: Vec<String> = self
@@ -648,6 +654,13 @@ impl Store {
                 .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
             removed
         };
+        if removed {
+            self.emit(StoreEvent::ChannelDeleted {
+                channel_id: channel.id,
+                visibility: channel.visibility,
+                members: channel.members,
+            });
+        }
         Ok((removed, deleted_threads))
     }
 
@@ -3406,6 +3419,22 @@ impl Store {
             reactions: Vec::new(),
             metadata,
         };
+        let private_actor_ids = Self::message_private_actor_ids(&message);
+        if message.intent == MessageIntent::RequestAction
+            && message.delivery_policy == DeliveryPolicy::WakeAgent
+            && message.audience.is_empty()
+            && resolved.direct_actor.is_none()
+            && private_actor_ids.as_ref().is_none_or(|ids| ids.is_empty())
+        {
+            return Err(StoreError::InvalidState(
+                "request_action wake_agent messages require an explicit delivery target: mention @actor/@all/@agents, pass audience, use --private-to, or send to dm:@actor".into(),
+            ));
+        }
+        if let Some(private_actor_ids) = private_actor_ids {
+            for actor_id in private_actor_ids {
+                self.validate_scope_actor(&message.scope, &actor_id)?;
+            }
+        }
 
         self.journal
             .append(&Mutation::MessageAppend(message.clone()))?;
@@ -3454,6 +3483,37 @@ impl Store {
         self.inner.read().messages.get(id).cloned()
     }
 
+    pub fn get_event(&self, id: &str) -> Option<Event> {
+        self.inner.read().events.get(id).cloned()
+    }
+
+    pub fn message_private_actor_ids(message: &Message) -> Option<HashSet<String>> {
+        let mut is_private = message
+            .metadata
+            .get("private")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || message
+                .metadata
+                .get("visibility")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("private"));
+        let mut allowed = HashSet::from([message.author_actor_id.clone()]);
+        if let Some(value) = message.metadata.get("privateTo") {
+            collect_private_actor_ids(value, &mut allowed);
+            is_private = true;
+        }
+        if let Some(value) = message.metadata.get("privateActorIds") {
+            collect_private_actor_ids(value, &mut allowed);
+            is_private = true;
+        }
+        is_private.then_some(allowed)
+    }
+
+    pub fn message_visible_to_actor(message: &Message, actor_id: &str) -> bool {
+        Self::message_private_actor_ids(message).is_none_or(|allowed| allowed.contains(actor_id))
+    }
+
     pub fn toggle_message_reaction(
         &self,
         actor_id: String,
@@ -3474,6 +3534,9 @@ impl Store {
             .get_message(message_id)
             .ok_or_else(|| StoreError::NotFound(format!("message {message_id}")))?;
         self.check_scope_access(&message.scope, &actor_id)?;
+        if !Self::message_visible_to_actor(&message, &actor_id) {
+            return Err(StoreError::NotFound(format!("message {message_id}")));
+        }
 
         match message
             .reactions
@@ -3531,12 +3594,24 @@ impl Store {
             None => ids.len(),
         };
         let limit = limit.max(1) as usize;
-        let start = end.saturating_sub(limit);
-        let has_more = start > 0;
-        let messages = ids[start..end]
-            .iter()
-            .filter_map(|id| inner.messages.get(id).cloned())
-            .collect();
+        let mut messages = Vec::new();
+        let mut idx = end;
+        let mut has_more = false;
+        while idx > 0 {
+            idx -= 1;
+            let Some(message) = inner.messages.get(&ids[idx]) else {
+                continue;
+            };
+            if !Self::message_visible_to_actor(message, actor_id) {
+                continue;
+            }
+            if messages.len() == limit {
+                has_more = true;
+                break;
+            }
+            messages.push(message.clone());
+        }
+        messages.reverse();
         Ok((messages, has_more))
     }
 
@@ -3587,10 +3662,13 @@ impl Store {
             return Ok(Vec::new());
         }
         let scope_filter = match target {
-            Some(target) => Some(
-                self.resolve_message_target_for_read(target, actor_id)?
-                    .scope,
-            ),
+            Some(target) => {
+                let scope = self
+                    .resolve_message_target_for_read(target, actor_id)?
+                    .scope;
+                self.check_scope_access(&scope, actor_id)?;
+                Some(scope)
+            }
             None => None,
         };
         let limit = limit.max(1) as usize;
@@ -3602,6 +3680,7 @@ impl Store {
             .filter(|message| {
                 scope_filter.is_some() || can_access_scope_inner(&inner, &message.scope, actor_id)
             })
+            .filter(|message| Self::message_visible_to_actor(message, actor_id))
             .filter(|message| message.body.to_ascii_lowercase().contains(&needle))
             .cloned()
             .collect();
@@ -3955,7 +4034,16 @@ impl Store {
         message: &Message,
         direct_actor: Option<&str>,
     ) -> Vec<String> {
+        let private_allowed = Self::message_private_actor_ids(message);
         let mut recipients = Vec::new();
+        if let Some(allowed) = private_allowed.as_ref() {
+            recipients.extend(
+                allowed
+                    .iter()
+                    .filter(|actor_id| actor_id.as_str() != message.author_actor_id.as_str())
+                    .cloned(),
+            );
+        }
         if let Some(actor_id) = direct_actor {
             recipients.push(actor_id.to_string());
         }
@@ -3992,7 +4080,14 @@ impl Store {
         if message.scope.kind == ScopeKind::Thread {
             recipients.extend(self.thread_attention_recipients(message));
         }
-        unique_nonempty(recipients)
+        let recipients = unique_nonempty(recipients);
+        match private_allowed {
+            Some(allowed) => recipients
+                .into_iter()
+                .filter(|actor_id| allowed.contains(actor_id))
+                .collect(),
+            None => recipients,
+        }
     }
 
     fn thread_attention_recipients(&self, message: &Message) -> Vec<String> {
@@ -5339,6 +5434,35 @@ fn message_title(message: &Message) -> String {
     format!("Task from {}", message.id)
 }
 
+fn collect_private_actor_ids(value: &serde_json::Value, out: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_private_actor_ids(value, out);
+            }
+        }
+        serde_json::Value::String(raw) => {
+            for part in raw.split(',') {
+                if let Some(actor_id) = normalize_private_actor_id(part) {
+                    out.insert(actor_id);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_private_actor_id(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if let Some(rest) = value.strip_prefix("dm:") {
+        value = rest.trim();
+    }
+    if let Some(rest) = value.strip_prefix('@') {
+        value = rest.trim();
+    }
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn unique_nonempty(ids: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -6161,6 +6285,82 @@ mod tests {
     }
 
     #[test]
+    fn request_action_wake_requires_explicit_delivery_target() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("private-flow".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+
+        let err = store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "please continue the next step".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect_err("targetless wake should fail");
+
+        assert!(
+            matches!(err, StoreError::InvalidState(message) if message.contains("explicit delivery target"))
+        );
+
+        store
+            .append_message(
+                "actor_alice".into(),
+                "dm:@actor_agent_bot".into(),
+                MessageKind::Human,
+                "please handle this privately".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("direct wake has an implicit actor target");
+
+        let mut metadata = Meta::default();
+        metadata.insert("private".into(), serde_json::json!(true));
+        metadata.insert("privateTo".into(), serde_json::json!(["actor_agent_bot"]));
+        store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "please handle this same-scope private note".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                metadata,
+                None,
+            )
+            .expect("same-scope private wake has private recipients");
+    }
+
+    #[test]
     fn custom_group_mentions_notify_humans_without_waking_agents() {
         let store = fresh_store();
         store
@@ -6544,6 +6744,93 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, message.id);
+    }
+
+    #[test]
+    fn same_scope_private_message_is_visible_and_delivered_only_to_private_recipient() {
+        let store = fresh_store();
+        for (id, name) in [
+            ("actor_alice", "Alice"),
+            ("actor_bob", "Bob"),
+            ("actor_carol", "Carol"),
+        ] {
+            store
+                .upsert_actor(test_actor(id, ActorKind::Human, name))
+                .unwrap();
+        }
+        let channel = store.create_channel("public".into(), None).unwrap();
+        let mut metadata = Meta::default();
+        metadata.insert("private".into(), serde_json::json!(true));
+        metadata.insert("privateTo".into(), serde_json::json!(["actor_bob"]));
+        let message = store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "@actor_carol secret role: seer".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_bob".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                metadata,
+                None,
+            )
+            .expect("append private message");
+
+        let target = format!("#{}", channel.id);
+        let (alice_messages, _) = store
+            .read_messages_for_target("actor_alice", &target, 10, None)
+            .expect("alice read");
+        let (bob_messages, _) = store
+            .read_messages_for_target("actor_bob", &target, 10, None)
+            .expect("bob read");
+        let (carol_messages, _) = store
+            .read_messages_for_target("actor_carol", &target, 10, None)
+            .expect("carol read");
+        assert_eq!(
+            alice_messages.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            vec![&message.id]
+        );
+        assert_eq!(
+            bob_messages.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            vec![&message.id]
+        );
+        assert!(carol_messages.is_empty());
+
+        assert_eq!(
+            store
+                .list_deliveries("actor_bob", Some(DeliveryState::Pending), 10, None)
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .list_deliveries("actor_carol", Some(DeliveryState::Pending), 10, None)
+                .is_empty(),
+            "mentions inside a private message must not widen delivery"
+        );
+        assert_eq!(
+            store
+                .search_message_records("actor_bob", "seer", None, 10)
+                .expect("bob search")
+                .len(),
+            1
+        );
+        assert!(store
+            .search_message_records("actor_carol", "seer", None, 10)
+            .expect("carol search")
+            .is_empty());
+        assert!(matches!(
+            store.toggle_message_reaction("actor_carol".into(), &message.id, "👀".into()),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]

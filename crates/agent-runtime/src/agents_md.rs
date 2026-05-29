@@ -89,6 +89,7 @@ These variables are already set in your process env:\n\
 - `LOOM_ACTOR`  — your actor id ({actor_id}).\n\
 - `LOOM_SCOPE_ID` — current thread or channel scope id for this turn.\n\
 - `LOOM_SCOPE_KIND` — `thread` or `channel` for this turn.\n\
+- `LOOM_REPLY_TARGET` — canonical current reply target, when this turn was triggered by a message.\n\
 - `LOOM_TURN_ID` — current Loom turn/run id.\n\
 - `LOOM_TRIGGER_MESSAGE_ID` — id of the message that triggered this turn.\n\
 - `LOOM_TRIGGER_ACTOR` — actor id of the human or agent that triggered this turn.\n\
@@ -156,6 +157,12 @@ latest again and rebase; do not blindly retry the old text.\n\
 `@all` and multi-actor routed work is concurrent by default. Do not assume the\n\
 daemon serialized other agents ahead of you; use the latest thread state as the\n\
 source of truth and rebase your visible output against it.\n\
+Coordinator selection is single-owner triage. If the request is to choose, pick,\n\
+elect, or name a facilitator, moderator, host, lead, owner, or coordinator, the\n\
+actor that successfully claims the source message or has already visibly taken\n\
+that coordinator role owns the flow. If you are not that owner, do not announce\n\
+a competing plan, repartition roles, or start the coordinated process; only\n\
+respond when the owner explicitly asks you for your part.\n\
 When you contribute to shared work owned by another actor, post only the\n\
 still-needed delta in the canonical thread: the internal unit you claimed, the\n\
 result you produced, what remains, and whether the task owner needs to close the\n\
@@ -177,6 +184,33 @@ and do not send another confirmation. If your decision is \"no action needed\" o
 \"not for me\", call `loom --json run ignore --reason \"not directed at me\"` and\n\
 then end the turn without visible answer text. The runtime will not infer\n\
 no-reply from message text or keyword heuristics. Do not explain the silence.\n\
+\n\
+Routing is machine-readable, not natural-language. If your visible message asks\n\
+any agent/player/participant to do another step (confirm, discuss, vote, choose,\n\
+investigate, DM you, publish a result, or take a turn), it must explicitly route\n\
+to those actors and wake them:\n\
+`loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id please ...\" --intent request_action --delivery-policy wake_agent`.\n\
+Text such as \"大家\", \"你们几个\", \"当前参与者\", or \"participants\" is not a delivery\n\
+target by itself. Use exact @mentions, `--private-to` for hidden same-scope\n\
+prompts, or `@all`/`@agents` with `--delivery-policy wake_agent` only when every\n\
+matching agent should start a turn. Use `notify_only` only for pure summaries\n\
+that require no one to act.\n\
+Hidden or private information must stay private even when the current\n\
+conversation is public to the channel. This includes hidden roles or states,\n\
+secrets, credentials, private votes/actions, medical/legal/personal details, and\n\
+any instruction that says to DM, privately tell, or keep something hidden. Send\n\
+those with `--private-to` in the same thread/scope, or `--to` only for a\n\
+deliberate separate DM; a public summary may only say that private messages were\n\
+sent. In workflows with private phases, never put an actor name beside a hidden\n\
+state, secret, or private action prompt in public; send the private instruction\n\
+to that actor privately.\n\
+Turn handoffs count as action requests. If you are replying to a directed turn\n\
+and your message completes your step but requires a coordinator, DM, caller, or\n\
+next actor to continue (for example \"发言结束\", \"my vote is X\", or \"night action\n\
+submitted\"), address that handoff explicitly to the actor who must continue and\n\
+use `--intent request_action --delivery-policy wake_agent`, not `notify_only`.\n\
+If you do not know who must continue, read the latest thread/task context before\n\
+sending.\n\
 \n\
 ### Collaboration routing\n\
 \n\
@@ -253,6 +287,10 @@ loom --json artifact read <art_id> [--offset N] [--max-bytes N]\n\
 \n\
 Send messages, DMs, attachments, and reminders:\n\
 \n\
+Use `--to` for a global actor DM. Use `--private-to` when the message must stay\n\
+inside the current channel/thread scope and wake the recipient's same-scope\n\
+agent session.\n\
+\n\
 ```\n\
 loom --json message send --target '#<channel_id>' --text \"thread title\"   # returns message.id\n\
 loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
@@ -262,6 +300,8 @@ LOOMMSG\n\
 loom --json message send --to <actor_id> <<'LOOMMSG'\n\
 private note\n\
 LOOMMSG\n\
+loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
+loom --json message react <message_id> ✅\n\
 loom --json message send --target '#<channel_id>:<root_message_id>' --text \"@actor_id please take this\" --intent request_action --delivery-policy wake_agent\n\
 loom --json task claim --source-message <channel_message_id>\n\
 loom --json task claim <task_id>\n\
@@ -280,10 +320,13 @@ loom --json artifact publish --in <scope_id> [--channel] \\\n\
     --name <file> [--media-type <type>] (--text <body> | --file <path>)\n\
 loom --json reminder schedule --target '#<channel_id>:<root_message_id>' \\\n\
     --title \"follow up\" --delay-seconds 3600\n\
+loom --json reminder schedule --title \"private self reminder\" --delay-seconds 600\n\
 ```\n\
 \n\
-Use `--to <actor_id>` for private messages. Thread targets are rooted at\n\
-channel messages; thread-in-thread targets are not supported.\n\
+Use `--to <actor_id>` for private messages. A reminder without `--target` is\n\
+scheduled for you in the current Loom scope when these env vars are present.\n\
+Thread targets are rooted at channel messages; thread-in-thread targets are not\n\
+supported.\n\
 \n\
 Attachment workflow: upload local files with `attachment upload`, attach the\n\
 returned artifact id to a message with `message send --attachment-id`, and read\n\
@@ -324,6 +367,18 @@ mod tests {
         assert!(out.contains("The same rule applies to turn-taking"));
         assert!(out.contains("handoff without an explicit `@actor_id` audience"));
         assert!(out.contains("each turn that needs the\nother actor to respond"));
+        assert!(out.contains("Routing is machine-readable, not natural-language"));
+        assert!(out.contains("--intent request_action --delivery-policy wake_agent"));
+        assert!(out.contains("当前参与者"));
+        assert!(out.contains("Coordinator selection is single-owner triage"));
+        assert!(out.contains("facilitator, moderator, host, lead"));
+        assert!(out.contains("Hidden or private information must stay private"));
+        assert!(out.contains("hidden roles or states"));
+        assert!(out.contains("workflows with private phases"));
+        assert!(out.contains("credentials"));
+        assert!(out.contains("Turn handoffs count as action requests"));
+        assert!(out.contains("发言结束"));
+        assert!(out.contains("Use `notify_only` only for pure summaries"));
         assert!(out.contains(
             "Human-to-actor routed messages in a channel common area start as a routing/triage"
         ));

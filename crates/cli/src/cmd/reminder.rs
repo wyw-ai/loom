@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use proto::methods::*;
-use proto::types::ReminderStatus;
+use proto::types::{ReminderStatus, ScopeKind, ScopeRef};
 use serde_json::json;
 
 use crate::client::Client;
@@ -27,7 +27,7 @@ pub async fn schedule(
                 .await?
                 .scope,
         ),
-        None => None,
+        None => current_scope_from_env(),
     };
     let fire_at = fire_at.map(parse_time).transpose()?;
     let res: ReminderScheduleResult = client
@@ -140,6 +140,23 @@ fn print_reminder_result(reminder: &proto::types::Reminder) {
             reminder.id, reminder.status, reminder.fire_at, reminder.title
         );
     }
+}
+
+fn current_scope_from_env() -> Option<ScopeRef> {
+    let id = std::env::var("LOOM_SCOPE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let kind = match std::env::var("LOOM_SCOPE_KIND")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("channel") => ScopeKind::Channel,
+        Some("thread") => ScopeKind::Thread,
+        _ => return None,
+    };
+    Some(ScopeRef { kind, id })
 }
 
 fn parse_time(raw: String) -> Result<DateTime<Utc>> {

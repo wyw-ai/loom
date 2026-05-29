@@ -123,6 +123,13 @@ export async function channelUpdate(params: {
   return invoke("channel_update", { params });
 }
 
+export async function channelDelete(params: {
+  channelId: string;
+  cascade?: boolean;
+}): Promise<{ deleted: boolean; deletedThreads?: number }> {
+  return invoke("channel_delete", { params });
+}
+
 export async function channelMembers(
   channelId: string,
 ): Promise<{ members: Actor[] }> {

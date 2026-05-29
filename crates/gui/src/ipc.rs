@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_runtime::discovery::{
-    apply_provider_overrides, detect_agent_cli_providers, provider_specs_from_agent_definitions,
-    AgentDefinition, DetectedAgentProvider,
+    apply_provider_overrides, detect_agent_cli_providers, normalize_model_id_for_provider,
+    provider_specs_from_agent_definitions, AgentDefinition, DetectedAgentProvider,
 };
 use proto::methods::method;
 use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec};
@@ -1472,11 +1472,11 @@ pub async fn machine_agent_create(
     }
     let actor_id_for_upsert = actor_id.clone();
     cfg.machines[machine_index].agents.push(MachineAgentConfig {
-        provider_id: args.provider_id,
+        provider_id: args.provider_id.clone(),
         actor_id,
         name: name.to_string(),
         description: args.description.trim().to_string(),
-        model: args.model.trim().to_string(),
+        model: normalize_model_id_for_provider(&args.provider_id, &args.model),
         reasoning_effort: args.reasoning_effort.trim().to_string(),
         autostart: args.autostart,
         avatar_url: args.avatar_url.trim().to_string(),
@@ -2443,7 +2443,10 @@ fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
         actor_id: agent.actor_id.clone(),
         display_name: agent.name.clone(),
         description: non_empty(agent.description.trim()),
-        model: non_empty(agent.model.trim()),
+        model: non_empty(&normalize_model_id_for_provider(
+            &agent.provider_id,
+            &agent.model,
+        )),
         reasoning_effort: non_empty(agent.reasoning_effort.trim()),
         autostart: agent.autostart,
         avatar_url: non_empty(agent.avatar_url.trim()),
@@ -2493,8 +2496,9 @@ fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Opti
             agent.description = description.trim().to_string();
         }
         if let Some(model) = args.model.as_deref() {
-            agent.model = model.trim().to_string();
+            agent.model = normalize_model_id_for_provider(&agent.provider_id, model);
         }
+        agent.model = normalize_model_id_for_provider(&agent.provider_id, &agent.model);
         if let Some(reasoning_effort) = args.reasoning_effort.as_deref() {
             agent.reasoning_effort = reasoning_effort.trim().to_string();
         }
@@ -2859,14 +2863,14 @@ mod tests {
                     "command": "/usr/bin/claude",
                     "transportKind": "command",
                     "args": ["-p"],
-                    "defaultModel": "claude-sonnet-4.6",
+                    "defaultModel": "claude-sonnet-4-6",
                     "modelChoices": []
                 }],
                 "agents": [{
                     "providerId": "claude",
                     "actorId": "actor_remote_agent",
                     "name": "Remote Agent",
-                    "model": "claude-sonnet-4.6",
+                    "model": "claude-sonnet-4-6",
                     "autostart": true
                 }]
             }
@@ -3033,14 +3037,14 @@ mod tests {
                     "command": "/usr/bin/claude",
                     "transportKind": "command",
                     "args": ["-p"],
-                    "defaultModel": "claude-sonnet-4.6",
+                    "defaultModel": "claude-sonnet-4-6",
                     "modelChoices": []
                 }],
                 "agents": [{
                     "providerId": "claude",
                     "actorId": "actor_remote_agent",
                     "name": "Remote Agent",
-                    "model": "claude-sonnet-4.6",
+                    "model": "claude-sonnet-4-6",
                     "autostart": true
                 }]
             }

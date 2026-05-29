@@ -542,11 +542,11 @@ enum ChannelCmd {
     /// List channels visible to this caller (public channels + private
     /// channels the caller is a member of).
     List,
-    /// Delete a channel. Refuses when child threads exist unless --cascade is set.
+    /// Delete a channel and its child threads.
     Delete {
         channel_id: String,
-        /// Also delete child threads before removing the channel.
-        #[arg(long)]
+        /// Kept for compatibility; channel delete cascades by default.
+        #[arg(long, hide = true)]
         cascade: bool,
     },
     /// Add an actor to a channel's member set.
@@ -1017,6 +1017,9 @@ enum MessageCmd {
         /// Direct-message recipient. Equivalent to --target dm:@<actor>.
         #[arg(long, conflicts_with = "target")]
         to: Option<String>,
+        /// Same-scope private recipient. The message remains in the current channel/thread scope.
+        #[arg(long = "private-to")]
+        private_to: Vec<String>,
         #[arg(long)]
         text: Option<String>,
         /// Message intent: chat, ask, request_action, assign_task, status_update, review, notify.
@@ -1049,6 +1052,8 @@ enum MessageCmd {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Toggle this actor's emoji reaction on a message.
+    React { message_id: String, emoji: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1057,6 +1062,9 @@ enum InboxCmd {
     List {
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Delivery state to list: pending, delivered, failed, or all.
+        #[arg(long, default_value = "pending")]
+        state: String,
         #[arg(long = "no-ack")]
         no_ack: bool,
     },
@@ -1736,8 +1744,8 @@ async fn main() -> Result<()> {
             ChannelCmd::List => cmd::channel::list(client).await?,
             ChannelCmd::Delete {
                 channel_id,
-                cascade,
-            } => cmd::channel::delete(client, channel_id, cascade).await?,
+                cascade: _,
+            } => cmd::channel::delete(client, channel_id).await?,
             ChannelCmd::Invite {
                 channel_id,
                 actor_id,
@@ -1793,6 +1801,7 @@ async fn main() -> Result<()> {
             MessageCmd::Send {
                 target,
                 to,
+                private_to,
                 text,
                 intent,
                 delivery_policy,
@@ -1804,6 +1813,7 @@ async fn main() -> Result<()> {
                     cfg.actor_id,
                     target,
                     to,
+                    private_to,
                     text,
                     intent,
                     delivery_policy,
@@ -1822,11 +1832,16 @@ async fn main() -> Result<()> {
                 target,
                 limit,
             } => cmd::message::search(client, cfg.actor_id, query, target, limit).await?,
+            MessageCmd::React { message_id, emoji } => {
+                cmd::message::reaction_toggle(client, cfg.actor_id, message_id, emoji).await?
+            }
         },
         Cmd::Inbox { sub } => match sub {
-            InboxCmd::List { limit, no_ack } => {
-                cmd::message::inbox_list(client, cfg.actor_id, limit, !no_ack).await?
-            }
+            InboxCmd::List {
+                limit,
+                state,
+                no_ack,
+            } => cmd::message::inbox_list(client, cfg.actor_id, limit, !no_ack, state).await?,
         },
         Cmd::Action { sub } => match sub {
             ActionCmd::Accept { message_id, option } => {
@@ -2548,6 +2563,7 @@ mod tests {
                     MessageCmd::Send {
                         target,
                         to,
+                        private_to,
                         intent,
                         delivery_policy,
                         if_latest,
@@ -2557,10 +2573,61 @@ mod tests {
             } => {
                 assert_eq!(target, None);
                 assert_eq!(to.as_deref(), Some("actor_reviewer"));
+                assert!(private_to.is_empty());
                 assert_eq!(intent.as_deref(), Some("request_action"));
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
                 assert_eq!(text.as_deref(), Some("please review"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_send_accepts_same_scope_private_recipient() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "message",
+            "send",
+            "--private-to",
+            "@actor_player",
+            "--text",
+            "your role is seer",
+        ])
+        .expect("parse message send");
+
+        match args.cmd {
+            Cmd::Message {
+                sub:
+                    MessageCmd::Send {
+                        target,
+                        to,
+                        private_to,
+                        text,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(to, None);
+                assert_eq!(private_to, vec!["@actor_player"]);
+                assert_eq!(text.as_deref(), Some("your role is seer"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_react_accepts_message_id_and_emoji() {
+        let args = Args::try_parse_from(["loom", "message", "react", "msg_123", "✅"])
+            .expect("parse message react");
+
+        match args.cmd {
+            Cmd::Message {
+                sub: MessageCmd::React { message_id, emoji },
+            } => {
+                assert_eq!(message_id, "msg_123");
+                assert_eq!(emoji, "✅");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2598,14 +2665,22 @@ mod tests {
 
     #[test]
     fn inbox_list_is_the_directed_inbox_surface() {
-        let args = Args::try_parse_from(["loom", "inbox", "list", "--no-ack", "--limit", "7"])
-            .expect("parse inbox list");
+        let args = Args::try_parse_from([
+            "loom", "inbox", "list", "--no-ack", "--limit", "7", "--state", "all",
+        ])
+        .expect("parse inbox list");
 
         match args.cmd {
             Cmd::Inbox {
-                sub: InboxCmd::List { limit, no_ack },
+                sub:
+                    InboxCmd::List {
+                        limit,
+                        state,
+                        no_ack,
+                    },
             } => {
                 assert_eq!(limit, 7);
+                assert_eq!(state, "all");
                 assert!(no_ack);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -2613,8 +2688,8 @@ mod tests {
     }
 
     #[test]
-    fn channel_delete_accepts_cascade_flag() {
-        let args = Args::try_parse_from(["loom", "channel", "delete", "chan_123", "--cascade"])
+    fn channel_delete_parses_without_cascade_flag() {
+        let args = Args::try_parse_from(["loom", "channel", "delete", "chan_123"])
             .expect("parse channel delete");
 
         match args.cmd {
@@ -2626,7 +2701,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(channel_id, "chan_123");
-                assert!(cascade);
+                assert!(!cascade);
             }
             other => panic!("unexpected command: {other:?}"),
         }

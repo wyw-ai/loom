@@ -758,6 +758,18 @@
     text-decoration: none;
   }
 
+  .message-mention {
+    display: inline-flex;
+    max-width: 100%;
+    align-items: baseline;
+    border-radius: 6px;
+    background: #eef4ff;
+    padding: 0 0.28rem;
+    color: #3155a6;
+    font-weight: 650;
+    vertical-align: baseline;
+  }
+
   .message-markdown code {
     border-radius: 6px;
     background: #f0f1f8;

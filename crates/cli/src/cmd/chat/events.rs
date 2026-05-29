@@ -1619,7 +1619,7 @@ async fn handle_confirm(client: &Arc<Client>, app: &mut App, kind: ConfirmKind) 
             let res = client
                 .call::<_, ChannelDeleteResult>(
                     method::CHANNEL_DELETE,
-                    json!({ "channelId": channel_id, "cascade": false }),
+                    json!({ "channelId": channel_id, "cascade": true }),
                 )
                 .await;
             match res {

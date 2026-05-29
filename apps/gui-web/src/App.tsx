@@ -10,6 +10,7 @@ import type {
   ComponentType,
   CSSProperties,
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   MouseEvent,
   PointerEvent,
   ReactNode,
@@ -328,7 +329,7 @@ export function App() {
       : null;
   const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
   const channelAgentActors = activeChannel
-    ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
+    ? channelMentionAgentActors(activeChannel, actors)
     : [];
   const channelTasks = activeChannel
     ? tasks.filter((task) => task.channelId === activeChannel.id)
@@ -1277,7 +1278,14 @@ export function App() {
     try {
       const parentMessageId = replyTo?.id;
       const repliedActor = replyTo ? actors[replyTo.authorActorId] : undefined;
-      const mentionedAudience = mentionAudience(body, actors, workspace?.actorId);
+      const mentionableActors = activeChannel
+        ? channelMentionActors(activeChannel, actors)
+        : [];
+      const mentionedAudience = mentionAudience(
+        body,
+        mentionableActors,
+        workspace?.actorId,
+      );
       const replyAudience =
         repliedActor && repliedActor.id !== workspace?.actorId
           ? [{ kind: "actor" as const, id: repliedActor.id }]
@@ -1286,7 +1294,8 @@ export function App() {
       const unavailableAgents = activeChannel
         ? directedTo.filter(
             (audience) =>
-              audience.kind === "actor" && !isChannelMember(activeChannel, audience.id),
+              audience.kind === "actor" &&
+              !isChannelMentionActor(activeChannel, audience.id),
           )
         : [];
       if (unavailableAgents.length > 0) {
@@ -1323,11 +1332,19 @@ export function App() {
     if (!body || !threadMessageTarget) return;
     setBusy("thread:message:send");
     try {
-      const mentionedAudience = mentionAudience(body, actors, workspace?.actorId);
+      const mentionableActors = activeChannel
+        ? channelMentionActors(activeChannel, actors)
+        : [];
+      const mentionedAudience = mentionAudience(
+        body,
+        mentionableActors,
+        workspace?.actorId,
+      );
       const unavailableAgents = activeChannel
         ? mentionedAudience.filter(
             (audience) =>
-              audience.kind === "actor" && !isChannelMember(activeChannel, audience.id),
+              audience.kind === "actor" &&
+              !isChannelMentionActor(activeChannel, audience.id),
           )
         : [];
       if (unavailableAgents.length > 0) {
@@ -1361,7 +1378,11 @@ export function App() {
   async function sendDirectMessage() {
     const body = directDraft.trim();
     if (!body || !activeDirectActor || !activeDirectTarget) return;
-    const directMentions = mentionAudience(body, actors, workspace?.actorId);
+    const directMentions = mentionAudience(
+      body,
+      Object.values(actors),
+      workspace?.actorId,
+    );
     if (directMentions.length > 0) {
       setError("Direct messages do not support @ mentions.");
       return;
@@ -1999,6 +2020,7 @@ export function App() {
             currentActorId={workspace?.actorId ?? null}
             disabled={connection !== "open" || !threadMessageTarget}
             draft={threadDraft}
+            mentionAgents={channelAgentActors}
             machines={machines}
             messages={threadMessages}
             setDraft={setThreadDraft}
@@ -3540,6 +3562,59 @@ function WorkflowResultRow({
   );
 }
 
+function MentionMenu({
+  options,
+  selectedIndex,
+  onSelect,
+}: {
+  options: MentionOption[];
+  selectedIndex: number;
+  onSelect: (option: MentionOption) => void;
+}) {
+  return (
+    <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-xl border border-[#dfe3ec] bg-white shadow-soft">
+      <div className="border-b border-[#edf0f5] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+        Mentions
+      </div>
+      <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
+        {options.map((option, index) => (
+          <button
+            key={`${option.kind}:${option.id}`}
+            type="button"
+            className={cn(
+              "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
+              index === selectedIndex
+                ? "bg-[#f1efff] text-[#5843d7]"
+                : "hover:bg-[#f7f8fb]",
+            )}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              onSelect(option);
+            }}
+          >
+            {option.actor ? (
+              <ActorAvatar actor={option.actor} fallback={option.actor.id} small />
+            ) : (
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
+                <Users size={14} />
+              </span>
+            )}
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-medium">{option.title}</span>
+              <span className="block truncate text-xs text-muted-foreground">
+                {option.detail}
+              </span>
+            </span>
+            <span className="font-mono text-xs text-muted-foreground">
+              {option.token}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Composer({
   draft,
   setDraft,
@@ -3622,46 +3697,11 @@ function Composer({
         )}
         <div className="composer-box relative">
           {showMentions && (
-            <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-xl border border-[#dfe3ec] bg-white shadow-soft">
-              <div className="border-b border-[#edf0f5] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-                Mentions
-              </div>
-              <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
-                {mentionOptions.map((option, index) => (
-                  <button
-                    key={`${option.kind}:${option.id}`}
-                    type="button"
-                    className={cn(
-                      "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
-                      index === effectiveMentionIndex
-                        ? "bg-[#f1efff] text-[#5843d7]"
-                        : "hover:bg-[#f7f8fb]",
-                    )}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      chooseMention(option);
-                    }}
-                  >
-                    {option.actor ? (
-                      <ActorAvatar actor={option.actor} fallback={option.actor.id} small />
-                    ) : (
-                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
-                        <Users size={14} />
-                      </span>
-                    )}
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{option.title}</span>
-                      <span className="block truncate text-xs text-muted-foreground">
-                        {option.detail}
-                      </span>
-                    </span>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      {option.token}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
+            <MentionMenu
+              options={mentionOptions}
+              selectedIndex={effectiveMentionIndex}
+              onSelect={chooseMention}
+            />
           )}
           <Textarea
             ref={textareaRef}
@@ -3674,6 +3714,7 @@ function Composer({
             onClick={(event) => syncCaret(event.currentTarget)}
             onKeyUp={(event) => syncCaret(event.currentTarget)}
             onKeyDown={(event) => {
+              if (isComposingKeyEvent(event)) return;
               if (showMentions) {
                 if (event.key === "ArrowDown") {
                   event.preventDefault();
@@ -3700,7 +3741,7 @@ function Composer({
                   return;
                 }
               }
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (shouldSendOnEnter(event)) {
                 event.preventDefault();
                 onSend();
               }
@@ -3730,6 +3771,7 @@ function ThreadPanel({
   currentActorId,
   disabled,
   draft,
+  mentionAgents,
   machines,
   messages,
   setDraft,
@@ -3748,6 +3790,7 @@ function ThreadPanel({
   currentActorId: string | null;
   disabled: boolean;
   draft: string;
+  mentionAgents: Actor[];
   machines: MachineInfo[];
   messages: Message[];
   setDraft: (value: string) => void;
@@ -3894,6 +3937,7 @@ function ThreadPanel({
         setDraft={setDraft}
         disabled={disabled || !thread}
         busy={busy === "thread:message:send"}
+        mentionAgents={mentionAgents}
         onSend={onSend}
       />
     </aside>
@@ -4095,22 +4139,109 @@ function ThreadComposer({
   setDraft,
   disabled,
   busy,
+  mentionAgents,
   onSend,
 }: {
   draft: string;
   setDraft: (value: string) => void;
   disabled: boolean;
   busy: boolean;
+  mentionAgents: Actor[];
   onSend: () => void;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [caretIndex, setCaretIndex] = useState(draft.length);
+  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
+  const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const activeMention = activeMentionQuery(draft, caretIndex);
+  const mentionKey = activeMention
+    ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`
+    : null;
+  const mentionOptions = activeMention
+    ? mentionCandidates(mentionAgents, activeMention)
+    : [];
+  const showMentions =
+    !disabled &&
+    !busy &&
+    activeMention !== null &&
+    dismissedMentionKey !== mentionKey &&
+    mentionOptions.length > 0;
+  const effectiveMentionIndex = mentionOptions.length
+    ? Math.min(selectedMentionIndex, mentionOptions.length - 1)
+    : 0;
+  const selectedMention = showMentions ? mentionOptions[effectiveMentionIndex] : null;
+
+  useEffect(() => {
+    setSelectedMentionIndex(0);
+  }, [mentionKey]);
+
+  function syncCaret(element: HTMLTextAreaElement) {
+    setCaretIndex(element.selectionStart ?? element.value.length);
+  }
+
+  function chooseMention(option: MentionOption) {
+    const before = draft.slice(0, option.start);
+    const after = draft.slice(option.end).replace(/^\s*/, "");
+    const next = `${before}${option.token} ${after}`;
+    const nextCaret = before.length + option.token.length + 1;
+    setDraft(next);
+    setCaretIndex(nextCaret);
+    setDismissedMentionKey(null);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
   return (
     <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
       <div className="composer-box composer-box-compact relative">
+        {showMentions && (
+          <MentionMenu
+            options={mentionOptions}
+            selectedIndex={effectiveMentionIndex}
+            onSelect={chooseMention}
+          />
+        )}
         <Textarea
+          ref={textareaRef}
           value={draft}
-          onChange={(event) => setDraft(event.target.value)}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            syncCaret(event.currentTarget);
+            setDismissedMentionKey(null);
+          }}
+          onClick={(event) => syncCaret(event.currentTarget)}
+          onKeyUp={(event) => syncCaret(event.currentTarget)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
+            if (isComposingKeyEvent(event)) return;
+            if (showMentions) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setSelectedMentionIndex((index) =>
+                  (index + 1) % mentionOptions.length,
+                );
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setSelectedMentionIndex((index) =>
+                  (index - 1 + mentionOptions.length) % mentionOptions.length,
+                );
+                return;
+              }
+              if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
+                event.preventDefault();
+                chooseMention(selectedMention);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setDismissedMentionKey(mentionKey);
+                return;
+              }
+            }
+            if (shouldSendOnEnter(event)) {
               event.preventDefault();
               onSend();
             }
@@ -4238,6 +4369,9 @@ function ThreadsView({
           currentActorId={currentActorId}
           disabled={disabled}
           draft={threadDraft}
+          mentionAgents={
+            activeChannel ? channelMentionAgentActors(activeChannel, actors) : []
+          }
           machines={machines}
           messages={threadMessages}
           setDraft={setThreadDraft}
@@ -7748,13 +7882,20 @@ function machineCanCreateAgent(machine: MachineInfo) {
   );
 }
 
+function isComposingKeyEvent(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+  return event.nativeEvent.isComposing || event.keyCode === 229;
+}
+
+function shouldSendOnEnter(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+  return event.key === "Enter" && !event.shiftKey && !isComposingKeyEvent(event);
+}
+
 function mentionAudience(
   body: string,
-  actors: Record<string, Actor>,
+  mentionableActors: Actor[],
   selfActorId?: string,
 ): AudienceRef[] {
   const audience: AudienceRef[] = [];
-  const actorList = Object.values(actors);
   for (const rawToken of mentionTokens(body)) {
     const key = rawToken.toLowerCase();
     if (key === "all") {
@@ -7769,7 +7910,7 @@ function mentionAudience(
       audience.push({ kind: "humans", id: "humans", display: "@humans" });
       continue;
     }
-    const actor = actorList.find((candidate) => {
+    const actor = mentionableActors.find((candidate) => {
       if (candidate.id === selfActorId) return false;
       return (
         candidate.id.toLowerCase() === key ||
@@ -7949,8 +8090,20 @@ function directPeerForMessage(message: Message, currentActorId: string | null) {
   return targetActorId;
 }
 
-function isChannelMember(channel: Channel, actorId: string) {
-  return channel.visibility === "public" || channel.members.includes(actorId);
+function channelMentionActors(channel: Channel, actors: Record<string, Actor>) {
+  return channel.members
+    .map((actorId) => actors[actorId])
+    .filter((actor): actor is Actor => Boolean(actor) && actor.kind !== "service");
+}
+
+function channelMentionAgentActors(channel: Channel, actors: Record<string, Actor>) {
+  return channelMentionActors(channel, actors).filter(
+    (actor) => actor.kind === "agent",
+  );
+}
+
+function isChannelMentionActor(channel: Channel, actorId: string) {
+  return channel.members.includes(actorId);
 }
 
 function isExplicitChannelMember(channel: Channel, actorId: string) {

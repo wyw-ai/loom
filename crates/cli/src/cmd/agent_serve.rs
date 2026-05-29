@@ -23,12 +23,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
-    method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, AgentTransport, BundleInstallMode, ChannelMembersResult,
-    CommandSessionIdSource, InboxListResult, MessageListResult, MessageSendResult,
-    PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
-    TriggerPrefixApplyOn,
+    method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
+    AgentSpec, AgentTransport, BundleInstallMode, ChannelMembersResult, CommandSessionIdSource,
+    InboxListResult, MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult,
+    RunCloseResult, RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult,
+    ThreadListResult, TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -1256,10 +1255,6 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
-    /// Actor id → display name cache used when rendering trigger prompts.
-    /// The server keeps actor rows authoritative; this cache is a fallback
-    /// when actor/list is temporarily unavailable.
-    actor_display_cache: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -1419,10 +1414,6 @@ impl WorkerState {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
-        let mut actor_display_cache = HashMap::new();
-        if !spec.actor.display_name.trim().is_empty() {
-            actor_display_cache.insert(spec.actor.id.clone(), spec.actor.display_name.clone());
-        }
         Self {
             actor_id,
             spec,
@@ -1441,7 +1432,6 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
-            actor_display_cache: Mutex::new(actor_display_cache),
         }
     }
 
@@ -1593,25 +1583,6 @@ impl WorkerState {
         self.selected_model
             .lock()
             .expect("selected_model poisoned")
-            .clone()
-    }
-
-    fn cache_actor_displays(&self, actors: impl IntoIterator<Item = (String, String)>) {
-        let mut cache = self
-            .actor_display_cache
-            .lock()
-            .expect("actor_display_cache poisoned");
-        for (id, display) in actors {
-            if !id.trim().is_empty() && !display.trim().is_empty() {
-                cache.insert(id, display);
-            }
-        }
-    }
-
-    fn actor_display_snapshot(&self) -> HashMap<String, String> {
-        self.actor_display_cache
-            .lock()
-            .expect("actor_display_cache poisoned")
             .clone()
     }
 
@@ -3335,7 +3306,7 @@ async fn render_trigger_prompt(
     state: &Arc<WorkerState>,
     trigger: &AgentTrigger,
 ) -> TriggerPromptText {
-    let actor_names = actor_display_map_for_prompt(client, state).await;
+    let actor_names = actor_display_map_for_prompt(client, state, trigger.scope()).await;
     let latest_message = render_trigger_prompt_with_names(
         &state.actor_id,
         &state.spec.actor.display_name,
@@ -3387,7 +3358,7 @@ async fn recent_conversation_context(
     if messages.is_empty() {
         return String::new();
     }
-    let actor_names = actor_display_map_for_prompt(client, state).await;
+    let actor_names = actor_display_map_for_prompt(client, state, &message.scope).await;
     format_recent_conversation_context(&messages, message, &actor_names)
 }
 
@@ -3520,28 +3491,40 @@ fn join_prompt_sections(sections: impl IntoIterator<Item = String>) -> String {
 async fn actor_display_map_for_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    scope: &ScopeRef,
 ) -> HashMap<String, String> {
+    let Some(channel_id) = resolve_channel_for_scope(client, state, scope).await else {
+        return local_actor_display_map(state);
+    };
     match client
-        .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
+        .call::<_, ChannelMembersResult>(
+            method::CHANNEL_MEMBERS,
+            json!({ "channelId": channel_id }),
+        )
         .await
     {
-        Ok(result) => {
-            state.cache_actor_displays(
-                result
-                    .actors
-                    .into_iter()
-                    .map(|actor| (actor.id, actor.display_name)),
-            );
-        }
+        Ok(result) => result
+            .members
+            .into_iter()
+            .map(|actor| (actor.id, actor.display_name))
+            .collect::<HashMap<_, _>>(),
         Err(err) => {
             tracing::debug!(
                 actor = %state.actor_id,
+                channel = %channel_id,
                 %err,
-                "actor/list failed while rendering prompt; using cached actor display names",
+                "channel/members failed while rendering prompt; using local actor display name",
             );
+            local_actor_display_map(state)
         }
     }
-    state.actor_display_snapshot()
+}
+
+fn local_actor_display_map(state: &WorkerState) -> HashMap<String, String> {
+    HashMap::from([(
+        state.actor_id.clone(),
+        state.spec.actor.display_name.clone(),
+    )])
 }
 
 fn render_trigger_prompt_with_names(

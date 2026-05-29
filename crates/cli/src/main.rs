@@ -1420,6 +1420,24 @@ enum AgentBundleCmd {
 
 #[derive(Subcommand, Debug)]
 enum ProviderCmd {
+    /// Print a provider manifest example. No flag prints a generic template; provider flags print built-in manifests.
+    Example {
+        /// Print the built-in Claude Code provider manifest.
+        #[arg(long)]
+        claude: bool,
+        /// Print the built-in Qoder CLI provider manifest.
+        #[arg(long)]
+        qoder: bool,
+        /// Print the built-in GitHub Copilot CLI provider manifest.
+        #[arg(long)]
+        copilot: bool,
+        /// Print the built-in Codex CLI provider manifest.
+        #[arg(long)]
+        codex: bool,
+        /// Print the built-in OpenCode provider manifest.
+        #[arg(long)]
+        opencode: bool,
+    },
     /// Validate a provider manifest JSON file.
     Validate { path: PathBuf },
     /// Add a provider manifest into the current LOOM_CONFIG_DIR.
@@ -1621,6 +1639,19 @@ async fn main() -> Result<()> {
 
     if let Cmd::Provider { sub } = args.cmd {
         match sub {
+            ProviderCmd::Example {
+                claude,
+                qoder,
+                copilot,
+                codex,
+                opencode,
+            } => cmd::provider::example(cmd::provider::ExampleSelection {
+                claude,
+                qoder,
+                copilot,
+                codex,
+                opencode,
+            })?,
             ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
             ProviderCmd::Add { path, replace } => cmd::provider::add(path, replace)?,
             ProviderCmd::List => cmd::provider::list()?,
@@ -2943,6 +2974,25 @@ mod tests {
             } => {
                 assert_eq!(path, PathBuf::from("demo.json"));
                 assert!(replace);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_example_accepts_builtin_flags() {
+        let args = Args::try_parse_from(["loom", "provider", "example", "--claude", "--opencode"])
+            .expect("parse provider example");
+
+        match args.cmd {
+            Cmd::Provider {
+                sub:
+                    ProviderCmd::Example {
+                        claude, opencode, ..
+                    },
+            } => {
+                assert!(claude);
+                assert!(opencode);
             }
             other => panic!("unexpected command: {other:?}"),
         }

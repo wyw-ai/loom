@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use agent_runtime::provider::{providers_dir, DetectedProvider, ProviderRegistry};
+use agent_runtime::provider::{
+    builtin_provider_manifests, providers_dir, DetectedProvider, ProviderRegistry,
+};
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{AgentProviderRef, ProviderManifest, ProviderModeSpec};
 use serde_json::{json, Map, Value};
@@ -179,6 +181,53 @@ pub fn doctor(provider_id: String) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExampleSelection {
+    pub claude: bool,
+    pub qoder: bool,
+    pub copilot: bool,
+    pub codex: bool,
+    pub opencode: bool,
+}
+
+impl ExampleSelection {
+    fn selected_ids(self) -> Vec<&'static str> {
+        let mut ids = Vec::new();
+        if self.claude {
+            ids.push("claude");
+        }
+        if self.qoder {
+            ids.push("qoder");
+        }
+        if self.copilot {
+            ids.push("copilot");
+        }
+        if self.codex {
+            ids.push("codex");
+        }
+        if self.opencode {
+            ids.push("opencode");
+        }
+        ids
+    }
+}
+
+pub fn example(selection: ExampleSelection) -> Result<()> {
+    let mut examples = if selection.selected_ids().is_empty() {
+        vec![standard_provider_example()]
+    } else {
+        official_provider_examples(selection)?
+    };
+    let value = if examples.len() == 1 {
+        examples.remove(0)
+    } else {
+        Value::Array(examples)
+    };
+    let text = serde_json::to_string_pretty(&value).context("serialize provider example")?;
+    println!("{text}");
+    Ok(())
+}
+
 fn read_and_resolve_manifest_file(path: &Path) -> Result<(ProviderManifest, serde_json::Value)> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let raw = serde_json::from_str::<serde_json::Value>(&text)
@@ -192,6 +241,68 @@ fn read_and_resolve_manifest_file(path: &Path) -> Result<(ProviderManifest, serd
 
 fn resolve_manifest_file(path: &Path) -> Result<ProviderManifest> {
     read_and_resolve_manifest_file(path).map(|(manifest, _)| manifest)
+}
+
+fn standard_provider_example() -> Value {
+    json!({
+        "schemaVersion": 1,
+        "id": "my_provider",
+        "displayName": "My Provider",
+        "detect": {
+            "candidates": ["my-agent"]
+        },
+        "modes": {
+            "print": {
+                "transport": "command",
+                "command": "{bin}",
+                "prompt": {
+                    "outputs": {
+                        "full": {
+                            "preset": "loom_full"
+                        }
+                    }
+                },
+                "args": [
+                    "run",
+                    {
+                        "when": "model",
+                        "args": ["--model", "{model}"]
+                    },
+                    "{prompt.full}"
+                ],
+                "stdout": {
+                    "format": "text"
+                }
+            }
+        },
+        "models": {
+            "default": "default",
+            "choices": [
+                {
+                    "id": "default",
+                    "label": "Default"
+                }
+            ]
+        }
+    })
+}
+
+fn official_provider_examples(selection: ExampleSelection) -> Result<Vec<Value>> {
+    let selected = selection.selected_ids();
+    let builtins = builtin_provider_manifests();
+    selected
+        .into_iter()
+        .map(|id| {
+            builtins
+                .iter()
+                .find(|manifest| manifest.id == id)
+                .ok_or_else(|| anyhow!("official provider `{id}` not found"))
+                .and_then(|manifest| {
+                    serde_json::to_value(manifest)
+                        .with_context(|| format!("serialize provider `{id}`"))
+                })
+        })
+        .collect()
 }
 
 fn provider_summary(
@@ -483,5 +594,36 @@ mod tests {
                     .is_some_and(|message| message.contains("candidates: claude"))
         }));
         std::fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn standard_provider_example_is_valid_manifest() {
+        let config_dir = temp_config_dir("example");
+        let registry = ProviderRegistry::load(&config_dir).expect("registry");
+        let manifest = registry
+            .resolve_manifest_value(standard_provider_example())
+            .expect("example manifest");
+
+        assert_eq!(manifest.id, "my_provider");
+        assert!(manifest.modes["print"]
+            .args
+            .iter()
+            .any(|arg| matches!(arg, proto::methods::ProviderArgSpec::Literal(value) if value == "{prompt.full}")));
+        std::fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn official_provider_examples_use_builtin_manifests() {
+        let examples = official_provider_examples(ExampleSelection {
+            claude: true,
+            opencode: true,
+            ..Default::default()
+        })
+        .expect("official examples");
+
+        assert_eq!(examples.len(), 2);
+        assert_eq!(examples[0]["id"], "claude");
+        assert_eq!(examples[1]["id"], "opencode");
+        assert_eq!(examples[1]["models"]["default"], "opencode/big-pickle");
     }
 }

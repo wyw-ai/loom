@@ -16,7 +16,7 @@
 //!   * a translator task drains `AdapterEvent`s and writes final messages plus
 //!     private `run.append` trace frames back to the server.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,17 +24,16 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, BundleInstallMode, InboxListResult, MessageListResult,
-    MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    AgentModelChoice, AgentSpec, BundleInstallMode, ChannelMembersResult, InboxListResult,
+    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
+    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, Run, RunStatus,
+    Actor, ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, Run, RunStatus,
     ScopeKind, ScopeRef, TaskAssignmentStatus,
 };
-#[cfg(test)]
 use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -912,6 +911,9 @@ impl AgentPaths {
                 active.trigger_source_id.clone(),
             );
             env.insert("LOOM_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+            if let Some(reply_target) = active.reply_target.as_ref() {
+                env.insert("LOOM_REPLY_TARGET".into(), reply_target.clone());
+            }
             if let Some(path) = active.no_reply_file.as_ref() {
                 env.insert(LOOM_NO_REPLY_FILE_ENV.into(), path.display().to_string());
             }
@@ -1137,7 +1139,6 @@ fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
 #[derive(Clone)]
 enum AgentTrigger {
     Message(Message),
-    #[cfg(test)]
     Event(Event),
 }
 
@@ -1145,7 +1146,6 @@ impl AgentTrigger {
     fn id(&self) -> &str {
         match self {
             AgentTrigger::Message(message) => &message.id,
-            #[cfg(test)]
             AgentTrigger::Event(event) => &event.id,
         }
     }
@@ -1153,7 +1153,6 @@ impl AgentTrigger {
     fn scope(&self) -> &ScopeRef {
         match self {
             AgentTrigger::Message(message) => &message.scope,
-            #[cfg(test)]
             AgentTrigger::Event(event) => &event.scope,
         }
     }
@@ -1161,7 +1160,6 @@ impl AgentTrigger {
     fn actor_id(&self) -> &str {
         match self {
             AgentTrigger::Message(message) => &message.author_actor_id,
-            #[cfg(test)]
             AgentTrigger::Event(event) => &event.actor_id,
         }
     }
@@ -1169,7 +1167,6 @@ impl AgentTrigger {
     fn meta_value(&self, key: &str) -> Option<&Value> {
         match self {
             AgentTrigger::Message(message) => message.metadata.get(key),
-            #[cfg(test)]
             AgentTrigger::Event(event) => event
                 .payload
                 .get("_meta")
@@ -1182,7 +1179,6 @@ impl AgentTrigger {
     fn reply_target(&self) -> Option<String> {
         match self {
             AgentTrigger::Message(message) => Some(reply_target_for_message(message)),
-            #[cfg(test)]
             AgentTrigger::Event(_) => None,
         }
     }
@@ -1193,6 +1189,9 @@ impl AgentTrigger {
 }
 
 fn reply_target_for_message(message: &Message) -> String {
+    if message.target.starts_with("dm:") {
+        return format!("dm:@{}", message.author_actor_id);
+    }
     match message.scope.kind {
         ScopeKind::Thread => message.target.clone(),
         ScopeKind::Channel
@@ -2125,6 +2124,36 @@ async fn notification_loop(
             }
             continue;
         }
+        if kind == stream_kind::EVENT_CREATED {
+            let Some(event_value) = params.get("data").and_then(|d| d.get("event")).cloned() else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_value::<Event>(event_value) else {
+                continue;
+            };
+            if !is_for_us(&event, actor_id) {
+                continue;
+            }
+            if !state.remember_source(&event.id) {
+                continue;
+            }
+            match handle_event_trigger(
+                &client,
+                &state,
+                &adapter,
+                &event_tx,
+                &mut started,
+                actor_id,
+                event,
+            )
+            .await
+            {
+                Ok(TriggerOutcome::Dispatched) => {}
+                Ok(TriggerOutcome::Queued) => {}
+                Err(e) => eprintln!("[{actor_id}] failed to handle event trigger: {e}"),
+            }
+            continue;
+        }
         if kind == stream_kind::RUN_UPDATED {
             let Some(run_value) = params.get("data").and_then(|d| d.get("run")).cloned() else {
                 continue;
@@ -2294,7 +2323,6 @@ async fn append_model_selection_failure_message(
     .map(|_| ())
 }
 
-#[cfg(test)]
 fn is_for_us(event: &Event, actor_id: &str) -> bool {
     // Self-authored directed events are still explicit routing signals. They are not
     // the normal way to enter a thread, but generated callbacks or deliberate
@@ -2321,6 +2349,9 @@ fn is_message_for_us_with_delivery(
     actor_inbox_delivery: bool,
 ) -> bool {
     if message.author_actor_id == actor_id {
+        return false;
+    }
+    if is_runtime_failure_message(message) {
         return false;
     }
     if message.target == format!("dm:@{actor_id}") {
@@ -2371,7 +2402,6 @@ fn is_local_actor_inbox_delivery(trigger: &AgentTrigger, actor_id: &str) -> bool
                 .and_then(Value::as_str)
                 == Some(actor_id)
         }
-        #[cfg(test)]
         AgentTrigger::Event(_) => false,
     }
 }
@@ -2409,10 +2439,22 @@ fn message_counts_as_actor_inbox_attention(message: &Message, actor_id: &str) ->
             .any(|audience| audience.kind == AudienceKind::Group)
 }
 
+fn is_runtime_failure_message(message: &Message) -> bool {
+    message
+        .metadata
+        .get("runtimeFailure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || message
+            .metadata
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "agent.runtime_failure")
+}
+
 fn trigger_message(trigger: &AgentTrigger) -> Option<&Message> {
     match trigger {
         AgentTrigger::Message(message) => Some(message),
-        #[cfg(test)]
         AgentTrigger::Event(_) => None,
     }
 }
@@ -2441,6 +2483,35 @@ async fn handle_message_trigger(
     if let Some(err) = try_ensure_adapter_started(state, adapter, event_tx, started).await {
         return Err(anyhow!(
             "adapter start failed while handling message trigger: {err}"
+        ));
+    }
+    handle_trigger(client, state, adapter, trigger).await
+}
+
+async fn handle_event_trigger(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    event_tx: &mpsc::UnboundedSender<AdapterEvent>,
+    started: &mut bool,
+    actor_id: &str,
+    event: Event,
+) -> Result<TriggerOutcome> {
+    let trigger = AgentTrigger::Event(event);
+    match handle_control_command(client, state, adapter, event_tx, started, &trigger).await {
+        Ok(true) => {
+            record_delivery_seen_by_id(client, actor_id, trigger.id()).await?;
+            return Ok(TriggerOutcome::Dispatched);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            record_delivery_seen_by_id(client, actor_id, trigger.id()).await?;
+            return Err(e);
+        }
+    }
+    if let Some(err) = try_ensure_adapter_started(state, adapter, event_tx, started).await {
+        return Err(anyhow!(
+            "adapter start failed while handling event trigger: {err}"
         ));
     }
     handle_trigger(client, state, adapter, trigger).await
@@ -2591,20 +2662,81 @@ async fn drain_pending_inbox(
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            let _ = handle_message_trigger(
+            match handle_message_trigger(
                 client, state, adapter, event_tx, started, actor_id, message,
             )
-            .await?;
+            .await
+            {
+                Ok(_) => {}
+                Err(e) if is_missing_scope_error(&e) => {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        source = %source_id,
+                        %e,
+                        "acknowledging pending message delivery for missing scope"
+                    );
+                    record_delivery_seen_by_id(client, actor_id, &source_id).await?;
+                }
+                Err(e) => return Err(e),
+            }
+            continue;
+        }
+        if let Some(event) = entry.event {
+            if !state.remember_source(&event.id) {
+                if state.has_pending_source(&event.id) || state.has_active_trigger(&event.id) {
+                    continue;
+                }
+                tracing::warn!(
+                    actor = %actor_id,
+                    event = %event.id,
+                    "retrying pending event delivery that was seen but is no longer active or queued"
+                );
+            }
+            let too_old = now.signed_duration_since(event.occurred_at) > max_age;
+            if too_old {
+                tracing::info!(
+                    actor = %actor_id,
+                    event = %event.id,
+                    occurred_at = %event.occurred_at,
+                    "dropping stale pending event delivery from durable inbox"
+                );
+                record_delivery_seen_by_id(client, actor_id, &event.id).await?;
+                continue;
+            }
+            if !is_for_us(&event, actor_id) {
+                record_delivery_seen_by_id(client, actor_id, &event.id).await?;
+                continue;
+            }
+            match handle_event_trigger(client, state, adapter, event_tx, started, actor_id, event)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_missing_scope_error(&e) => {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        source = %source_id,
+                        %e,
+                        "acknowledging pending event delivery for missing scope"
+                    );
+                    record_delivery_seen_by_id(client, actor_id, &source_id).await?;
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
         tracing::warn!(
             actor = %actor_id,
             source = %source_id,
-            "acknowledging inbox delivery whose source is no longer a message"
+            "acknowledging inbox delivery whose source is no longer a message or event"
         );
         record_delivery_seen_by_id(client, actor_id, &source_id).await?;
     }
     Ok(())
+}
+
+fn is_missing_scope_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("code -32000") && (message.contains("thread ") || message.contains("channel "))
 }
 
 fn pending_inbox_max_age() -> chrono::Duration {
@@ -2655,7 +2787,6 @@ async fn handle_control_command(
                 return Ok(true);
             }
         }
-        #[cfg(test)]
         AgentTrigger::Event(_) => {}
     }
     match render_prompt(trigger).trim() {
@@ -2963,6 +3094,15 @@ async fn dispatch_trigger(
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => return Ok(trigger),
             Err(e) => {
+                publish_failed_turn_notice(
+                    client,
+                    state,
+                    &active,
+                    &state.actor_id,
+                    &format!("adapter send_prompt failed: {e}"),
+                    None,
+                )
+                .await;
                 let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
                 if let Err(ack_err) = record_delivery_seen(client, state, &trigger).await {
                     tracing::warn!(
@@ -3063,7 +3203,6 @@ fn render_prompt(trigger: &AgentTrigger) -> String {
             }
             serde_json::to_string(&message.metadata).unwrap_or_default()
         }
-        #[cfg(test)]
         AgentTrigger::Event(event) => {
             if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
                 return text.to_string();
@@ -3133,6 +3272,77 @@ async fn recent_conversation_context(
     format_recent_conversation_context(&messages, message, &actor_names)
 }
 
+async fn current_scope_members_context(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+) -> String {
+    let Some(channel_id) = resolve_channel_for_scope(client, state, scope).await else {
+        return String::new();
+    };
+    let result: Result<ChannelMembersResult> = client
+        .call(
+            method::CHANNEL_MEMBERS,
+            json!({
+                "channelId": channel_id,
+            }),
+        )
+        .await
+        .with_context(|| format!("channel.members channelId={channel_id}"));
+    match result {
+        Ok(result) => format_current_scope_members_context(&channel_id, &result.members),
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                channel = %channel_id,
+                %err,
+                "current scope members unavailable"
+            );
+            String::new()
+        }
+    }
+}
+
+fn format_current_scope_members_context(channel_id: &str, members: &[Actor]) -> String {
+    if members.is_empty() {
+        return String::new();
+    }
+    let lines = members
+        .iter()
+        .map(actor_member_prompt_label)
+        .map(|label| format!("- {label}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "=== Current Loom channel members ===\n\
+         Channel: #{channel_id}\n\
+         This is the authoritative member list for the channel that owns the\n\
+         current scope. Use this list, not `loom actor list`, when identifying\n\
+         current participants/players or deciding who is available in this\n\
+         channel. `loom actor list` is a global registry and can include stale\n\
+         actors from other workspaces.\n\
+         {lines}"
+    )
+}
+
+fn actor_member_prompt_label(actor: &Actor) -> String {
+    let display = actor.display_name.trim();
+    let kind = actor_kind_prompt_label(actor.kind);
+    if display.is_empty() || display == actor.id {
+        format!("@{} ({kind})", actor.id)
+    } else {
+        format!("{} (@{}, {kind})", display, actor.id)
+    }
+}
+
+fn actor_kind_prompt_label(kind: ActorKind) -> &'static str {
+    match kind {
+        ActorKind::Human => "human",
+        ActorKind::Agent => "agent",
+        ActorKind::Service => "service",
+    }
+}
+
 fn format_recent_conversation_context(
     messages: &[Message],
     trigger: &Message,
@@ -3150,9 +3360,13 @@ fn format_recent_conversation_context(
             if body.is_empty() {
                 return None;
             }
+            let visibility = message_visibility_label(message, actor_names)
+                .map(|label| format!(" [{label}]"))
+                .unwrap_or_default();
             Some(format!(
-                "- {}: {}",
+                "- {}{}: {}",
                 actor_label(&message.author_actor_id, actor_names),
+                visibility,
                 body
             ))
         })
@@ -3268,12 +3482,84 @@ fn render_trigger_prompt_with_names(
         out.push_str(&target_labels.join(", "));
         out.push('\n');
     }
+    if let Some(message) = trigger_message(trigger) {
+        if let Some(visibility) = message_visibility_label(message, actor_names) {
+            out.push_str("Visibility: ");
+            out.push_str(&visibility);
+            out.push('\n');
+        }
+    }
     if let Some(task_context) = trigger_task_context(trigger) {
         out.push_str(&task_context);
     }
     out.push_str("Visible message:\n");
     out.push_str(&visible);
     out
+}
+
+fn message_visibility_label(
+    message: &Message,
+    actor_names: &HashMap<String, String>,
+) -> Option<String> {
+    let actor_ids = private_actor_ids_for_prompt(&message.metadata);
+    if !actor_ids.is_empty() {
+        let labels = actor_ids
+            .iter()
+            .map(|actor_id| actor_label(actor_id, actor_names))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("private to {labels}"));
+    }
+    let private = message
+        .metadata
+        .get("private")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || message
+            .metadata
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("private"));
+    private.then_some("private".into())
+}
+
+fn private_actor_ids_for_prompt(metadata: &Meta) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for key in ["privateTo", "privateActorIds"] {
+        if let Some(value) = metadata.get(key) {
+            collect_private_actor_ids_for_prompt(value, &mut out);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn collect_private_actor_ids_for_prompt(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_private_actor_ids_for_prompt(value, out);
+            }
+        }
+        Value::String(raw) => {
+            for part in raw.split(',') {
+                if let Some(actor_id) = normalize_private_actor_id_for_prompt(part) {
+                    out.insert(actor_id);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_private_actor_id_for_prompt(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    if let Some(rest) = value.strip_prefix("dm:") {
+        value = rest.trim();
+    }
+    if let Some(rest) = value.strip_prefix('@') {
+        value = rest.trim();
+    }
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn trigger_task_context(trigger: &AgentTrigger) -> Option<String> {
@@ -3362,7 +3648,6 @@ fn trigger_target_ids(trigger: &AgentTrigger) -> Vec<String> {
                 }
             }
         }
-        #[cfg(test)]
         AgentTrigger::Event(event) => {
             for relation in &event.relations {
                 if matches!(relation.kind, RelationKind::DirectedTo)
@@ -3582,8 +3867,12 @@ async fn compose_envelope_prompt(
     let first_turn = state.take_seed_slot(&scope.id);
     let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
     let conversation_context = recent_conversation_context(client, state, trigger).await;
-    let runtime_context =
-        join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
+    let members_context = current_scope_members_context(client, state, scope).await;
+    let runtime_context = join_prompt_sections([
+        local_time_manifest(),
+        members_context,
+        conversation_context.clone(),
+    ]);
     let scope_bootstrap = if first_turn || command_transport_without_resume(&state.spec) {
         seed_manifest(&state.actor_id, scope)
     } else {
@@ -3930,16 +4219,22 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            current scope = {scope_kind}:{scope_id}\n\
          \n\
          You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
-         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
+         LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
          so commands like:\n\
            loom --json inbox list --no-ack\n\
+           loom --json inbox list --state all --no-ack\n\
            \"$LOOM_CLI\" --json inbox list --no-ack\n\
+           loom --json channel members \"$LOOM_CHANNEL_ID\"\n\
            loom --json message read --target '#<channel_id>:<root_message_id>'\n\
            loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
+          loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
+          loom --json message send --to <actor_id> --text \"global DM in a separate channel\"\n\
+           loom --json message react <message_id> ✅\n\
            loom --json run ignore --reason \"not directed at me\"\n\
            loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"\n\
            loom --json task complete <task_id> --result \"short outcome summary\"\n\
            loom --json artifact get <art_id|artifact://...>\n\
+           loom --json reminder schedule --title \"follow up\" --delay-seconds 3600\n\
            loom --json task assign <task_id> --to <actor_id> --type <type> --instruction <text> --contract-file <path>\n\
            loom --json ask-user-question --title \"Choose option\" --question \"Which option?\" --choice a=A --choice b=B\n\
            loom --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
@@ -3966,6 +4261,14 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         `@all` and multi-actor routed work is concurrent by default. Do not\n\
         assume the daemon serialized other agents ahead of you; use the latest\n\
         thread state as the source of truth and rebase visible output against it.\n\
+        Coordinator selection is single-owner triage. If the request is to\n\
+        choose, pick, elect, or name a facilitator, moderator, host, lead,\n\
+        owner, or coordinator, the actor that successfully claims the source\n\
+        message or has already visibly taken that coordinator role owns the\n\
+        flow. If you\n\
+        are not that owner, do not announce a competing plan, repartition roles,\n\
+        or start the coordinated process; only respond when the owner explicitly\n\
+        asks you for your part.\n\
         When you contribute to shared work owned by another actor, post only\n\
         the still-needed delta in the canonical thread: the internal unit you\n\
         claimed, the result you produced, what remains, and whether the task\n\
@@ -3986,6 +4289,34 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         end the turn without visible answer text. The runtime will not infer\n\
         no-reply from message text or keyword heuristics. Do not send a\n\
         confirmation or explain the silence.\n\
+        Routing is machine-readable, not natural-language. If your visible\n\
+        message asks any agent/player/participant to do another step (confirm,\n\
+        discuss, vote, choose, investigate, DM you, publish a result, or take a\n\
+        turn), it must explicitly route to those actors and wake them:\n\
+          loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id please ...\" --intent request_action --delivery-policy wake_agent\n\
+        Text such as \"大家\", \"你们几个\", \"当前参与者\", or \"participants\" is not a\n\
+        delivery target by itself. Use exact @mentions, --private-to for hidden\n\
+        same-scope prompts, or @all/@agents with --delivery-policy wake_agent\n\
+        only when every matching agent should start a turn. Use notify_only\n\
+        only for pure summaries that require no one to act.\n\
+        Hidden or private information must stay private even when the current\n\
+        conversation is public to the channel. This includes hidden roles or\n\
+        states, secrets, credentials, private votes/actions,\n\
+        medical/legal/personal details, and any instruction that says to DM,\n\
+        privately tell, or keep something hidden. Send those with --private-to\n\
+        in the same thread/scope, or --to only for a deliberate separate DM; a\n\
+        public summary may only say that private messages were sent. In\n\
+        workflows with private phases, never put an actor name beside a hidden\n\
+        state, secret, or private action prompt in public; send the private\n\
+        instruction to that actor privately.\n\
+        Turn handoffs count as action requests. If you are replying to a\n\
+        directed turn and your message completes your step but requires a\n\
+        coordinator, DM, caller, or next actor to continue (for example\n\
+        \"发言结束\", \"my vote is X\", or \"night action submitted\"), address that\n\
+        handoff explicitly to the actor who must continue and use --intent\n\
+        request_action --delivery-policy wake_agent, not notify_only. If you do\n\
+        not know who must continue, read the latest thread/task context before\n\
+        sending.\n\
         `loom task assign` requires a machine-readable contract. Do not fall back\n\
         to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
@@ -3999,6 +4330,17 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          target creates or reuses the thread automatically. Use\n\
          `loom --json thread list` only when you need to map a thread scope id\n\
          back to that target.\n\
+         Treat each Loom channel/thread as an isolated agent session. For private\n\
+         notes that belong to the current game, meeting, or work scope, use\n\
+         `loom --json message send --private-to <actor_id> --text ...`; it stays\n\
+         in this scope and is only visible to the sender and recipient. Use\n\
+         `--to` only when you intentionally want a separate global DM channel;\n\
+         global DMs are not current-scope state.\n\
+         For current participants, players, or availability inside this\n\
+         channel, use the injected channel-members section or\n\
+         `loom --json channel members \"$LOOM_CHANNEL_ID\"`. Do not use\n\
+         `loom actor list` for that decision: it is a global registry and can\n\
+         include stale actors from other workspaces.\n\
          Use `--json` for machine-readable output and `loom <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\
@@ -4205,10 +4547,26 @@ async fn translate_one(
             } else {
                 let _ = state.take_text(&active.id);
             }
-            if !success && agent_text_auto_publish_enabled() {
+            if !success {
+                publish_failed_turn_notice(
+                    client,
+                    state,
+                    &active,
+                    actor_id,
+                    &summary,
+                    usage.as_ref(),
+                )
+                .await;
+            }
+            if !success {
                 if let Some(text) = failed_turn_text(&summary) {
-                    let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                    flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                    append_trace(
+                        client,
+                        &active.run_id,
+                        TraceKind::Error,
+                        json!({ "message": text }),
+                    )
+                    .await?;
                 }
             }
             let run_status = if active.cancel_requested {
@@ -4276,6 +4634,124 @@ fn failed_turn_text(summary: &str) -> Option<String> {
     } else {
         Some(format!("Agent run failed:\n\n{summary}"))
     }
+}
+
+async fn publish_failed_turn_notice(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    active: &ActiveTurn,
+    actor_id: &str,
+    summary: &str,
+    provider_usage: Option<&TokenUsage>,
+) {
+    if active.cancel_requested || turn_no_reply_requested(active) {
+        return;
+    }
+    let Some(text) = failed_turn_text(summary) else {
+        return;
+    };
+    let mut meta = build_turn_meta(state, active, provider_usage, &text);
+    meta.insert("kind".into(), json!("agent.runtime_failure"));
+    meta.insert("runtimeFailure".into(), json!(true));
+    if let Err(e) = flush_failure_text(client, actor_id, active, text, Some(meta)).await {
+        tracing::warn!(
+            actor = %actor_id,
+            turn = %active.id,
+            scope = %active.scope.id,
+            %e,
+            "failed to publish agent runtime failure"
+        );
+    }
+}
+
+struct FailureNotice {
+    body: String,
+    audience_actor_id: Option<String>,
+    intent: MessageIntent,
+    delivery_policy: DeliveryPolicy,
+}
+
+fn failure_notice_for_turn(actor_id: &str, active: &ActiveTurn, text: String) -> FailureNotice {
+    let trigger_actor = active.trigger_actor.trim();
+    if !trigger_actor.is_empty() && trigger_actor != actor_id {
+        FailureNotice {
+            body: format!(
+                "@{trigger_actor} Agent run failed; handoff or retry is needed.\n\n{text}"
+            ),
+            audience_actor_id: Some(trigger_actor.to_string()),
+            intent: MessageIntent::StatusUpdate,
+            delivery_policy: DeliveryPolicy::NotifyOnly,
+        }
+    } else {
+        FailureNotice {
+            body: text,
+            audience_actor_id: None,
+            intent: MessageIntent::StatusUpdate,
+            delivery_policy: DeliveryPolicy::NotifyOnly,
+        }
+    }
+}
+
+async fn flush_failure_text(
+    client: &Arc<Client>,
+    actor_id: &str,
+    active: &ActiveTurn,
+    text: String,
+    meta: Option<Meta>,
+) -> Result<()> {
+    let notice = failure_notice_for_turn(actor_id, active, text);
+    if active.trigger_is_message {
+        if let Some(target) = active.reply_target.as_deref() {
+            let parent_message_id =
+                parent_message_id_for_reply_target(&active.trigger_source_id, target);
+            return send_agent_message(
+                client,
+                target,
+                notice.body,
+                parent_message_id,
+                notice.audience_actor_id,
+                notice.intent,
+                notice.delivery_policy,
+                meta.unwrap_or_default(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                tracing::warn!(
+                    actor = %actor_id,
+                    turn = %active.id,
+                    scope = %active.scope.id,
+                    %e,
+                    "failure message.send failed"
+                );
+                e
+            });
+        }
+    }
+    send_scope_message(
+        client,
+        &active.scope,
+        notice.body,
+        active
+            .trigger_is_message
+            .then(|| active.trigger_source_id.clone()),
+        notice.audience_actor_id,
+        notice.intent,
+        notice.delivery_policy,
+        meta.unwrap_or_default(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        tracing::warn!(
+            actor = %actor_id,
+            turn = %active.id,
+            scope = %active.scope.id,
+            %e,
+            "failure content.add failed"
+        );
+        e
+    })
 }
 
 fn parent_message_id_for_reply_target(trigger_source_id: &str, target: &str) -> Option<String> {
@@ -4819,6 +5295,26 @@ mod tests {
         }
     }
 
+    fn sample_active_turn(trigger_actor: &str) -> ActiveTurn {
+        ActiveTurn {
+            id: "turn_failure".into(),
+            run_id: "run_failure".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_failure".into(),
+            },
+            trigger_source_id: "msg_failure".into(),
+            trigger_is_message: true,
+            reply_target: Some("#chan_failure".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: trigger_actor.into(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        }
+    }
+
     #[test]
     fn bundle_paths_resolve_custom_root_and_current() {
         let root = temp_path("bundle-paths");
@@ -4996,6 +5492,10 @@ mod tests {
             env.get("LOOM_TRIGGER_ACTOR").map(String::as_str),
             Some("human_alice")
         );
+        assert_eq!(
+            env.get("LOOM_REPLY_TARGET").map(String::as_str),
+            Some("#chan_demo")
+        );
         assert!(env.get("LOOM_CURRENT_TIME").is_some());
         assert!(env.get("LOOM_CURRENT_TIME_UTC").is_some());
         assert!(env.get("LOOM_LOCAL_UTC_OFFSET").is_some());
@@ -5035,6 +5535,22 @@ mod tests {
         );
 
         assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn direct_message_replies_target_sender() {
+        let message = sample_message(
+            "msg_dm",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dm".into(),
+            },
+            "dm:@actor_alice",
+            None,
+            None,
+        );
+
+        assert_eq!(reply_target_for_message(&message), "dm:@actor_human");
     }
 
     #[test]
@@ -5118,6 +5634,36 @@ mod tests {
 
         message.delivery_policy = DeliveryPolicy::WakeAgent;
         assert!(is_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn runtime_failure_message_does_not_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_runtime_failure",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_failed".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+        message
+            .metadata
+            .insert("kind".into(), json!("agent.runtime_failure"));
+        message
+            .metadata
+            .insert("runtimeFailure".into(), json!(true));
+
+        assert!(!is_message_for_us(&message, "actor_agent_echo"));
+        assert!(!is_inbox_message_for_us(&message, "actor_agent_echo"));
     }
 
     #[test]
@@ -5376,6 +5922,151 @@ mod tests {
         assert!(context.contains("Recent Loom conversation"));
         assert!(context.contains("Echo (@actor_agent_echo): 1"));
         assert!(!context.contains("@actor_human"));
+    }
+
+    #[test]
+    fn prompt_context_marks_same_scope_private_messages() {
+        let trigger = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_private_workflow".into(),
+            },
+            "#chan_private_workflow",
+            None,
+            None,
+        );
+        let mut private_reply = sample_message(
+            "msg_private",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_private_workflow".into(),
+            },
+            "#chan_private_workflow:msg_root",
+            None,
+            Some("msg_root"),
+        );
+        private_reply.author_actor_id = "actor_agent_coordinator".into();
+        private_reply.kind = MessageKind::Agent;
+        private_reply.body = "私密说明：审批码 alpha".into();
+        private_reply.metadata.insert("private".into(), json!(true));
+        private_reply
+            .metadata
+            .insert("privateTo".into(), json!(["actor_agent_recipient"]));
+        let mut names = HashMap::new();
+        names.insert("actor_agent_coordinator".into(), "Coordinator".into());
+        names.insert("actor_agent_recipient".into(), "Recipient".into());
+
+        let context =
+            format_recent_conversation_context(&[trigger.clone(), private_reply], &trigger, &names);
+
+        assert!(context.contains(
+            "Coordinator (@actor_agent_coordinator) [private to Recipient (@actor_agent_recipient)]: 私密说明：审批码 alpha"
+        ));
+    }
+
+    #[test]
+    fn latest_prompt_marks_private_visibility() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_agent_coordinator".into(), "Coordinator".into());
+        actor_names.insert("actor_agent_recipient".into(), "Recipient".into());
+        let mut message = sample_message(
+            "msg_private",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_private_workflow".into(),
+            },
+            "#chan_private_workflow:msg_root",
+            None,
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_coordinator".into();
+        message.body = "私密说明：审批码 alpha".into();
+        message.metadata.insert("private".into(), json!(true));
+        message
+            .metadata
+            .insert("privateTo".into(), json!(["actor_agent_recipient"]));
+        mark_actor_inbox_delivery(&mut message, "actor_agent_recipient");
+
+        let prompt = render_trigger_prompt_with_names(
+            "actor_agent_recipient",
+            "Recipient",
+            &AgentTrigger::Message(message),
+            &actor_names,
+        );
+
+        assert!(prompt.contains("Visibility: private to Recipient (@actor_agent_recipient)"));
+        assert!(prompt.contains("Visible message:"));
+    }
+
+    #[test]
+    fn current_scope_members_context_warns_against_global_actor_registry() {
+        let members = vec![
+            Actor {
+                id: "actor_human_boyd".into(),
+                kind: ActorKind::Human,
+                display_name: "boyd".into(),
+                capabilities: None,
+                _meta: None,
+            },
+            Actor {
+                id: "actor_agent_qzz".into(),
+                kind: ActorKind::Agent,
+                display_name: "Q仔".into(),
+                capabilities: None,
+                _meta: None,
+            },
+        ];
+
+        let context = format_current_scope_members_context("chan_werewolf", &members);
+
+        assert!(context.contains("Current Loom channel members"));
+        assert!(context.contains("boyd (@actor_human_boyd, human)"));
+        assert!(context.contains("Q仔 (@actor_agent_qzz, agent)"));
+        assert!(context.contains("not `loom actor list`"));
+        assert!(context.contains("stale"));
+    }
+
+    #[test]
+    fn seed_manifest_separates_same_scope_private_from_global_dm() {
+        let manifest = seed_manifest(
+            "actor_agent_dm",
+            &ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_private_workflow".into(),
+            },
+        );
+
+        assert!(manifest.contains("message send --private-to <actor_id>"));
+        assert!(manifest.contains("same-scope private note"));
+        assert!(manifest.contains("message send --to <actor_id>"));
+        assert!(manifest.contains("global DM in a separate channel"));
+        assert!(manifest.contains("isolated agent session"));
+        assert!(manifest.contains("global DMs are not current-scope state"));
+    }
+
+    #[test]
+    fn seed_manifest_requires_wake_for_actionable_participant_prompts() {
+        let manifest = seed_manifest(
+            "actor_agent_dm",
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_private_workflow".into(),
+            },
+        );
+
+        assert!(manifest.contains("Routing is machine-readable, not natural-language"));
+        assert!(manifest.contains("--intent request_action --delivery-policy wake_agent"));
+        assert!(manifest.contains("当前参与者"));
+        assert!(manifest.contains("Coordinator selection is single-owner triage"));
+        assert!(manifest.contains("facilitator, moderator, host, lead"));
+        assert!(manifest.contains("Hidden or private information must stay private"));
+        assert!(manifest.contains("hidden roles"));
+        assert!(manifest.contains("workflows with private phases"));
+        assert!(manifest.contains("credentials"));
+        assert!(manifest.contains("Turn handoffs count as action requests"));
+        assert!(manifest.contains("发言结束"));
+        assert!(manifest.contains("pure summaries"));
     }
 
     #[test]
@@ -6020,6 +6711,51 @@ mod tests {
             failed_turn_text("Not inside a trusted directory").as_deref(),
             Some("Agent run failed:\n\nNot inside a trusted directory")
         );
+    }
+
+    #[test]
+    fn failure_notice_mentions_trigger_actor_without_waking_it() {
+        let active = sample_active_turn("actor_agent_sender");
+
+        let notice = failure_notice_for_turn(
+            "actor_agent_failed",
+            &active,
+            "Agent run failed:\n\n429 FreeUsageLimitError".into(),
+        );
+
+        assert!(notice
+            .body
+            .starts_with("@actor_agent_sender Agent run failed; handoff or retry is needed."));
+        assert!(notice.body.contains("429 FreeUsageLimitError"));
+        assert_eq!(
+            notice.audience_actor_id.as_deref(),
+            Some("actor_agent_sender")
+        );
+        assert!(matches!(notice.intent, MessageIntent::StatusUpdate));
+        assert!(matches!(notice.delivery_policy, DeliveryPolicy::NotifyOnly));
+    }
+
+    #[test]
+    fn failure_notice_does_not_self_wake() {
+        let active = sample_active_turn("actor_agent_failed");
+
+        let notice = failure_notice_for_turn(
+            "actor_agent_failed",
+            &active,
+            "Agent run failed:\n\nlocal setup failed".into(),
+        );
+
+        assert_eq!(notice.body, "Agent run failed:\n\nlocal setup failed");
+        assert_eq!(notice.audience_actor_id, None);
+        assert!(matches!(notice.intent, MessageIntent::StatusUpdate));
+        assert!(matches!(notice.delivery_policy, DeliveryPolicy::NotifyOnly));
+    }
+
+    #[test]
+    fn missing_scope_error_matches_stale_thread_delivery() {
+        let err = anyhow!("rpc `run.open` failed: thread thread_f247db3313b9 (code -32000)");
+
+        assert!(is_missing_scope_error(&err));
     }
 
     #[test]

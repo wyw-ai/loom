@@ -17,6 +17,9 @@ use proto::methods::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+const DEFAULT_COMMAND_IDLE_TIMEOUT_MS: u64 = 3 * 60 * 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectedAgentProvider {
@@ -155,6 +158,19 @@ pub fn apply_provider_overrides(
     providers
 }
 
+pub fn normalize_model_id_for_provider(provider_id: &str, model: &str) -> String {
+    let model = model.trim();
+    if provider_id != "claude" {
+        return model.to_string();
+    }
+    match model {
+        "claude-sonnet-4.6" => "claude-sonnet-4-6".into(),
+        "claude-opus-4.7" => "claude-opus-4-7".into(),
+        "claude-haiku-4.5" => "claude-haiku-4-5".into(),
+        _ => model.to_string(),
+    }
+}
+
 impl DetectedAgentProvider {
     pub fn transport(&self) -> AgentTransport {
         let mut env = self.transport_env.clone();
@@ -177,8 +193,8 @@ impl DetectedAgentProvider {
             session: command_session_for_provider(&self.id, &self.args),
             output_format: Some(command_output_format_for_provider(&self.id)),
             prompt_via: PromptVia::Args,
-            timeout_ms: None,
-            idle_timeout_ms: None,
+            timeout_ms: Some(DEFAULT_COMMAND_TIMEOUT_MS),
+            idle_timeout_ms: Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS),
             interactive: None,
             provider: None,
         }
@@ -240,7 +256,11 @@ fn actor_spec_from_definition(
         meta: Some(meta),
         transport: None,
         autostart: Some(definition.autostart),
-        model: definition.model.clone(),
+        model: definition
+            .model
+            .as_deref()
+            .map(|model| normalize_model_id_for_provider(&provider.id, model))
+            .filter(|model| !model.is_empty()),
         models: None,
         bundle: None,
         identity: Some(IdentitySpec {
@@ -315,9 +335,9 @@ fn model_choices_for_provider(provider_id: &str) -> (Option<String>, Vec<AgentMo
 const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("sonnet", "Sonnet"),
     ("opus", "Opus"),
-    ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
-    ("claude-opus-4.7", "Claude Opus 4.7"),
-    ("claude-haiku-4.5", "Claude Haiku 4.5"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("claude-opus-4-7", "Claude Opus 4.7"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5"),
 ];
 
 const COPILOT_MODELS: &[(&str, &str)] = &[
@@ -505,15 +525,19 @@ fn provider_args(def: &ProviderDef, config_dir: &Path) -> Vec<String> {
         "codex" => {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
             args.push("--json".into());
-            args.push("--sandbox".into());
-            args.push("danger-full-access".into());
+            args.push("--dangerously-bypass-approvals-and-sandbox".into());
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
             append_add_dir_arg(&mut args, &loom_config_dir);
         }
         "opencode" => {
             args.extend(def.args.iter().map(|arg| (*arg).to_string()));
+            args.push("--print-logs".into());
+            args.push("--log-level".into());
+            args.push("WARN".into());
             args.push("--dangerously-skip-permissions".into());
+            args.push("--format".into());
+            args.push("json".into());
         }
         _ => args.extend(def.args.iter().map(|arg| (*arg).to_string())),
     }
@@ -525,6 +549,7 @@ fn command_output_format_for_provider(provider_id: &str) -> CommandOutputFormat 
         "claude" | "qoder" => CommandOutputFormat::ClaudeStreamJson,
         "copilot" => CommandOutputFormat::CopilotJson,
         "codex" => CommandOutputFormat::CodexStreamJson,
+        "opencode" => CommandOutputFormat::OpencodeJson,
         _ => CommandOutputFormat::Text,
     }
 }
@@ -534,24 +559,114 @@ fn command_session_for_provider(
     first_run_args: &[String],
 ) -> Option<CommandSession> {
     match provider_id {
-        "claude" => Some(CommandSession {
+        "claude" if has_prompt_flag(first_run_args) => Some(CommandSession {
             first_run_capture: Some("stdout_json:.session_id".into()),
-            resume_args: Some(claude_resume_args(first_run_args)),
+            resume_args: Some(prompt_resume_args(first_run_args, "--resume", "{session_id}")),
+        }),
+        "qoder" if has_prompt_flag(first_run_args) => Some(CommandSession {
+            first_run_capture: Some("stdout_json_any:.sessionId|.session_id".into()),
+            resume_args: Some(prompt_resume_args(first_run_args, "--resume", "{session_id}")),
+        }),
+        "copilot" if has_prompt_flag(first_run_args) => Some(CommandSession {
+            first_run_capture: Some("stdout_json_any:.data.sessionId|.sessionId".into()),
+            resume_args: Some(prompt_resume_args(
+                first_run_args,
+                "--resume={session_id}",
+                "-p",
+            )),
+        }),
+        "codex" => codex_resume_args(first_run_args).map(|resume_args| CommandSession {
+            first_run_capture: Some(
+                "stdout_json_any:.payload.id|.session_id|.thread_id|.sessionId".into(),
+            ),
+            resume_args: Some(resume_args),
+        }),
+        "opencode" => opencode_resume_args(first_run_args).map(|resume_args| CommandSession {
+            first_run_capture: Some(
+                "stdout_json_any:.properties.sessionID|.properties.info.sessionID|.sessionID|.sessionId"
+                    .into(),
+            ),
+            resume_args: Some(resume_args),
         }),
         _ => None,
     }
 }
 
-fn claude_resume_args(first_run_args: &[String]) -> Vec<String> {
+fn prompt_resume_args(
+    first_run_args: &[String],
+    resume_flag: &str,
+    resume_value_or_prompt_flag: &str,
+) -> Vec<String> {
     let mut args = first_run_args
         .iter()
-        .filter(|arg| arg.as_str() != "-p")
+        .filter(|arg| !matches!(arg.as_str(), "-p" | "--prompt"))
         .cloned()
         .collect::<Vec<_>>();
-    args.push("--resume".into());
-    args.push("{session_id}".into());
+    args.push(resume_flag.into());
+    if resume_value_or_prompt_flag != "-p" {
+        args.push(resume_value_or_prompt_flag.into());
+        args.push("-p".into());
+        return args;
+    }
     args.push("-p".into());
     args
+}
+
+fn codex_resume_args(first_run_args: &[String]) -> Option<Vec<String>> {
+    if first_run_args.first().map(String::as_str) != Some("exec") {
+        return None;
+    }
+
+    let mut args = vec!["exec".into(), "resume".into()];
+    if first_run_args
+        .iter()
+        .any(|arg| arg == "--skip-git-repo-check")
+    {
+        args.push("--skip-git-repo-check".into());
+    }
+    args.push("--json".into());
+    if codex_first_run_is_full_access(first_run_args) {
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    append_flag_values(&mut args, first_run_args, &["-c", "--config"]);
+    args.push("{session_id}".into());
+    Some(args)
+}
+
+fn codex_first_run_is_full_access(first_run_args: &[String]) -> bool {
+    first_run_args
+        .iter()
+        .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        || first_run_args
+            .windows(2)
+            .any(|window| window[0] == "--sandbox" && window[1] == "danger-full-access")
+}
+
+fn opencode_resume_args(first_run_args: &[String]) -> Option<Vec<String>> {
+    if first_run_args.first().map(String::as_str) != Some("run") {
+        return None;
+    }
+    let mut args = first_run_args.to_vec();
+    args.push("--session".into());
+    args.push("{session_id}".into());
+    Some(args)
+}
+
+fn has_prompt_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "-p" | "--prompt"))
+}
+
+fn append_flag_values(args: &mut Vec<String>, source: &[String], flags: &[&str]) {
+    let mut iter = source.iter();
+    while let Some(arg) = iter.next() {
+        if flags.iter().any(|flag| arg.as_str() == *flag) {
+            if let Some(value) = iter.next() {
+                args.push(arg.clone());
+                args.push(value.clone());
+            }
+        }
+    }
 }
 
 fn append_add_dir_arg(args: &mut Vec<String>, dir: &Path) {
@@ -694,6 +809,14 @@ mod tests {
         let add_dir = vec!["--add-dir", config_dir_arg.as_str()];
 
         assert_eq!(ids, vec!["claude", "qoder", "copilot", "codex", "opencode"]);
+        for provider in &providers {
+            let transport = provider.transport();
+            assert_eq!(transport.timeout_ms, Some(DEFAULT_COMMAND_TIMEOUT_MS));
+            assert_eq!(
+                transport.idle_timeout_ms,
+                Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS)
+            );
+        }
         let claude = providers
             .iter()
             .find(|provider| provider.id == "claude")
@@ -753,6 +876,32 @@ mod tests {
             qoder.transport().output_format,
             Some(CommandOutputFormat::ClaudeStreamJson)
         );
+        assert_eq!(
+            qoder
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.first_run_capture.as_deref()),
+            Some("stdout_json_any:.sessionId|.session_id")
+        );
+        assert_eq!(
+            qoder
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.resume_args.as_ref())
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "--add-dir",
+                config_dir_arg.as_str(),
+                "--yolo",
+                "--output-format",
+                "stream-json",
+                "--resume",
+                "{session_id}",
+                "-p",
+            ])
+        );
         let copilot = providers
             .iter()
             .find(|provider| provider.id == "copilot")
@@ -769,6 +918,33 @@ mod tests {
             copilot.transport().output_format,
             Some(CommandOutputFormat::CopilotJson)
         );
+        assert_eq!(
+            copilot
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.first_run_capture.as_deref()),
+            Some("stdout_json_any:.data.sessionId|.sessionId")
+        );
+        assert_eq!(
+            copilot
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.resume_args.as_ref())
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "--add-dir",
+                config_dir_arg.as_str(),
+                "--yolo",
+                "--output-format",
+                "json",
+                "--stream",
+                "off",
+                "--resume={session_id}",
+                "-p",
+            ])
+        );
         let codex = providers
             .iter()
             .find(|provider| provider.id == "codex")
@@ -777,8 +953,7 @@ mod tests {
             "exec",
             "--skip-git-repo-check",
             "--json",
-            "--sandbox",
-            "danger-full-access",
+            "--dangerously-bypass-approvals-and-sandbox",
             "-c",
             "sandbox_workspace_write.network_access=true",
         ];
@@ -796,11 +971,79 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            codex
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.first_run_capture.as_deref()),
+            Some("stdout_json_any:.payload.id|.session_id|.thread_id|.sessionId")
+        );
+        assert_eq!(
+            codex
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.resume_args.as_ref())
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "exec",
+                "resume",
+                "--skip-git-repo-check",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "{session_id}",
+            ])
+        );
         let opencode = providers
             .iter()
             .find(|provider| provider.id == "opencode")
             .expect("opencode provider");
-        assert_eq!(opencode.args, vec!["run", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            opencode.args,
+            vec![
+                "run",
+                "--print-logs",
+                "--log-level",
+                "WARN",
+                "--dangerously-skip-permissions",
+                "--format",
+                "json"
+            ]
+        );
+        assert_eq!(
+            opencode.transport().output_format,
+            Some(CommandOutputFormat::OpencodeJson)
+        );
+        assert_eq!(
+            opencode
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.first_run_capture.as_deref()),
+            Some("stdout_json_any:.properties.sessionID|.properties.info.sessionID|.sessionID|.sessionId")
+        );
+        assert_eq!(
+            opencode
+                .transport()
+                .session
+                .as_ref()
+                .and_then(|s| s.resume_args.as_ref())
+                .map(|args| args.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "run",
+                "--print-logs",
+                "--log-level",
+                "WARN",
+                "--dangerously-skip-permissions",
+                "--format",
+                "json",
+                "--session",
+                "{session_id}",
+            ])
+        );
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
     }
@@ -815,8 +1058,8 @@ mod tests {
             args: vec![
                 "exec".into(),
                 "--skip-git-repo-check".into(),
-                "--sandbox".into(),
-                "danger-full-access".into(),
+                "--json".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
                 "-c".into(),
                 "sandbox_workspace_write.network_access=true".into(),
                 "--add-dir".into(),
@@ -848,8 +1091,8 @@ mod tests {
             vec![
                 "exec",
                 "--skip-git-repo-check",
-                "--sandbox",
-                "danger-full-access",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "-c",
                 "sandbox_workspace_write.network_access=true",
                 "--add-dir",
@@ -863,6 +1106,39 @@ mod tests {
                 .get("LOOM_NO_DAEMON")
                 .map(String::as_str),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn normalizes_legacy_claude_model_ids_for_command_runtime() {
+        let provider = DetectedAgentProvider {
+            id: "claude".into(),
+            display_name: "Claude Code".into(),
+            command: "/bin/claude".into(),
+            transport_kind: "command".into(),
+            args: vec!["-p".into()],
+            transport_env: BTreeMap::new(),
+            default_model: Some("sonnet".into()),
+            model_choices: Vec::new(),
+        };
+        let specs = provider_specs_from_agent_definitions(
+            &[provider],
+            &[AgentDefinition {
+                provider_id: "claude".into(),
+                actor_id: "actor_agent_claude".into(),
+                display_name: "Claude".into(),
+                description: None,
+                model: Some("claude-opus-4.7".into()),
+                reasoning_effort: None,
+                autostart: true,
+                avatar_url: None,
+            }],
+        );
+
+        assert_eq!(specs[0].actors[0].model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(
+            normalize_model_id_for_provider("copilot", "claude-opus-4.7"),
+            "claude-opus-4.7"
         );
     }
 

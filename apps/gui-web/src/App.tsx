@@ -10,11 +10,12 @@ import type {
   ComponentType,
   CSSProperties,
   FormEvent,
+  MouseEvent,
   PointerEvent,
   ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import {
   Bell,
   Bot,
@@ -31,6 +32,7 @@ import {
   Lock,
   Loader2,
   LogOut,
+  MessageCircle,
   MessageSquare,
   Pencil,
   Plus,
@@ -83,7 +85,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn, formatTime, shortId } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
-type View = "chat" | "threads" | "channels" | "inbox" | "tasks" | "spaces" | "account" | "settings";
+type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "spaces" | "account" | "settings";
 type ChannelPanelTab = "threads" | "members" | "tasks";
 type ChannelGroup = {
   id: string;
@@ -117,6 +119,11 @@ type ChannelPointerDrag = {
   startY: number;
   pointerId: number;
   dragging: boolean;
+};
+type ChannelContextMenu = {
+  channelId: string;
+  x: number;
+  y: number;
 };
 type PanelResizeKind = "sidebar" | "detail";
 type PanelSizes = {
@@ -193,6 +200,16 @@ const avatarLibraryUrls = Array.from(
 );
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 const ungroupedChannelGroupId = "__ungrouped";
+const channelContextMenuWidthPx = 44 * 4;
+const channelContextMenuItemHeightPx = 36;
+const channelContextMenuItemCount = 2;
+const channelContextMenuPaddingPx = 4;
+const channelContextMenuBorderPx = 1;
+const channelContextMenuViewportPaddingPx = 8;
+const channelContextMenuHeightPx =
+  channelContextMenuPaddingPx * 2 +
+  channelContextMenuItemHeightPx * channelContextMenuItemCount +
+  channelContextMenuBorderPx * 2;
 const panelLayoutStorageKey = "loom:panel-layout:v1";
 const detailPanelBreakpoint = 1280;
 const railWidth = 72;
@@ -224,8 +241,10 @@ export function App() {
   const [threadsByChannel, setThreadsByChannel] = useState<Record<string, Thread[]>>({});
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [activeDirectActorId, setActiveDirectActorId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [threadMessages, setThreadMessages] = useState<Message[]>([]);
+  const [directMessages, setDirectMessages] = useState<Message[]>([]);
   const [threadStatsById, setThreadStatsById] = useState<Record<string, ThreadActivityStats>>({});
   const [actors, setActors] = useState<Record<string, Actor>>({});
   const [, setRuns] = useState<Record<string, Run>>({});
@@ -234,6 +253,8 @@ export function App() {
   const [machines, setMachines] = useState<MachineInfo[]>([]);
   const [draft, setDraft] = useState("");
   const [threadDraft, setThreadDraft] = useState("");
+  const [directDraft, setDirectDraft] = useState("");
+  const [directScopesByActorId, setDirectScopesByActorId] = useState<Record<string, ScopeRef>>({});
   const [workspaceForm, setWorkspaceForm] = useState({
     name: "Local",
     serverUrl: "ws://127.0.0.1:7878/rpc",
@@ -261,6 +282,8 @@ export function App() {
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
+  const activeDirectScopeRef = useRef<ScopeRef | null>(null);
+  const activeDirectActorIdRef = useRef<string | null>(null);
   const actorIdRef = useRef<string | null>(null);
   const targetRef = useRef<string | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
@@ -272,7 +295,9 @@ export function App() {
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
-  const activeChannel = channels.find((channel) => channel.id === activeChannelId) ?? null;
+  const visibleChannels = channels.filter((channel) => !isDirectChannel(channel));
+  const activeChannel =
+    visibleChannels.find((channel) => channel.id === activeChannelId) ?? null;
   const channelGroupsKey = channelGroupStorageKey(workspace);
   const channelThreads = activeChannel
     ? threadsByChannel[activeChannel.id] ?? []
@@ -287,12 +312,24 @@ export function App() {
   const activeThreadScope: ScopeRef | null = activeThread
     ? { kind: "thread", id: activeThread.id }
     : null;
-  const allThreads = flattenThreads(threadsByChannel, channels);
-  const channelIdsKey = channels.map((channel) => channel.id).join("|");
+  const allThreads = flattenThreads(threadsByChannel, visibleChannels);
+  const channelIdsKey = visibleChannels.map((channel) => channel.id).join("|");
   const actorList = Object.values(actors).sort((a, b) =>
     displayName(a).localeCompare(displayName(b)),
   );
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
+  const agentActorIdsKey = agentActors.map((actor) => actor.id).join("|");
+  const activeDirectActor =
+    agentActors.find((actor) => actor.id === activeDirectActorId) ?? null;
+  const activeDirectTarget = activeDirectActor
+    ? directMessageTarget(activeDirectActor.id)
+    : null;
+  const activeDirectScope =
+    activeDirectActor && workspace
+      ? directScopeForActor(channels, workspace.actorId, activeDirectActor.id) ??
+        directScopesByActorId[activeDirectActor.id] ??
+        null
+      : null;
   const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
   const channelAgentActors = activeChannel
     ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
@@ -397,11 +434,13 @@ export function App() {
       }
       if (channelResult.status === "fulfilled") {
         const nextChannels = sortChannels(channelResult.value.channels);
+        const nextVisibleChannels = nextChannels.filter((channel) => !isDirectChannel(channel));
         setChannels(nextChannels);
         setActiveChannelId((currentChannel) =>
-          currentChannel && nextChannels.some((channel) => channel.id === currentChannel)
+          currentChannel &&
+          nextVisibleChannels.some((channel) => channel.id === currentChannel)
             ? currentChannel
-            : nextChannels[0]?.id ?? null,
+            : nextVisibleChannels[0]?.id ?? null,
         );
       }
       if (taskResult.status === "fulfilled") {
@@ -494,6 +533,10 @@ export function App() {
   }, [workspace]);
 
   useEffect(() => {
+    activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
+  }, [activeDirectActor?.id]);
+
+  useEffect(() => {
     savePanelSizes(panelSizes);
   }, [panelSizes]);
 
@@ -514,6 +557,22 @@ export function App() {
   useEffect(() => {
     setChannelGroups(loadChannelGroups(channelGroupsKey));
   }, [channelGroupsKey]);
+
+  useEffect(() => {
+    setActiveDirectActorId(null);
+    setDirectMessages([]);
+    setDirectDraft("");
+    setDirectScopesByActorId({});
+  }, [workspace?.id]);
+
+  useEffect(() => {
+    if (view !== "direct") return;
+    setActiveDirectActorId((current) =>
+      current && agentActors.some((actor) => actor.id === current)
+        ? current
+        : agentActors[0]?.id ?? null,
+    );
+  }, [agentActorIdsKey, view]);
 
   useEffect(() => {
     if (
@@ -571,10 +630,10 @@ export function App() {
   }, [activeChannel?.id, activeChannel?.members.join("|"), connection]);
 
   useEffect(() => {
-    if (connection !== "open" || channels.length === 0) return;
+    if (connection !== "open" || visibleChannels.length === 0) return;
     let alive = true;
     void Promise.allSettled(
-      channels.map((channel) =>
+      visibleChannels.map((channel) =>
         ipc.threadList(channel.id).then((result) => ({
           channelId: channel.id,
           threads: result.threads,
@@ -660,13 +719,56 @@ export function App() {
     threadMessageTarget,
   ]);
 
+  useEffect(() => {
+    activeDirectScopeRef.current = activeDirectScope;
+    if (!activeDirectActor || !activeDirectTarget || connection !== "open") {
+      setDirectMessages([]);
+      return;
+    }
+    if (!activeDirectScope) {
+      setDirectMessages([]);
+      return;
+    }
+
+    let alive = true;
+    setDirectMessages([]);
+    void ipc.scopeSubscribe(activeDirectScope).catch(() => {});
+    void ipc
+      .messageList({ target: activeDirectTarget, limit: 150 })
+      .then((result) => {
+        if (!alive) return;
+        setError(null);
+        setDirectMessages(sortMessages(result.messages.map(normalizeMessage)));
+      })
+      .catch((err) => setError(errorText(err)));
+
+    return () => {
+      alive = false;
+      void ipc.scopeUnsubscribe(activeDirectScope).catch(() => {});
+    };
+  }, [
+    activeDirectActor?.id,
+    activeDirectScope ? scopeKey(activeDirectScope) : null,
+    activeDirectTarget,
+    connection,
+  ]);
+
   function handleStream(update: StreamUpdate) {
     switch (update.kind) {
       case "channel.created":
       case "channel.updated":
       case "channel.invited": {
         const channel = update.data.channel as Channel | undefined;
-        if (channel) setChannels((current) => sortChannels(upsert(current, channel)));
+        if (channel) {
+          setChannels((current) => sortChannels(upsert(current, channel)));
+          const peerActorId = directChannelPeerId(channel, actorIdRef.current);
+          if (peerActorId) {
+            setDirectScopesByActorId((current) => ({
+              ...current,
+              [peerActorId]: { kind: "channel", id: channel.id },
+            }));
+          }
+        }
         return;
       }
       case "channel.deleted": {
@@ -729,6 +831,18 @@ export function App() {
         ) {
           setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
         }
+        if (
+          (update.scope &&
+            activeDirectScopeRef.current &&
+            sameScope(update.scope, activeDirectScopeRef.current)) ||
+          messageBelongsToDirectActor(
+            message,
+            activeDirectActorIdRef.current,
+            actorIdRef.current,
+          )
+        ) {
+          setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
+        }
         return;
       }
       case "message.updated": {
@@ -746,6 +860,18 @@ export function App() {
           sameScope(update.scope, activeThreadScopeRef.current)
         ) {
           setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
+        }
+        if (
+          (update.scope &&
+            activeDirectScopeRef.current &&
+            sameScope(update.scope, activeDirectScopeRef.current)) ||
+          messageBelongsToDirectActor(
+            message,
+            activeDirectActorIdRef.current,
+            actorIdRef.current,
+          )
+        ) {
+          setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
         }
         setInbox((current) =>
           current.map((item) =>
@@ -781,9 +907,19 @@ export function App() {
 
   function applyChannelDeleted(channelId: string) {
     const deletedThreads = threadsByChannel[channelId] ?? [];
+    const deletedChannel = channels.find((channel) => channel.id === channelId) ?? null;
     const fallbackChannelId =
-      channels.find((channel) => channel.id !== channelId)?.id ?? null;
+      channels.find((channel) => channel.id !== channelId && !isDirectChannel(channel))
+        ?.id ?? null;
     setChannels((current) => current.filter((channel) => channel.id !== channelId));
+    const deletedDirectPeerId = directChannelPeerId(deletedChannel, actorIdRef.current);
+    if (deletedDirectPeerId) {
+      setDirectScopesByActorId((current) => {
+        const next = { ...current };
+        delete next[deletedDirectPeerId];
+        return next;
+      });
+    }
     setThreadsByChannel((current) => {
       const next = { ...current };
       delete next[channelId];
@@ -844,6 +980,10 @@ export function App() {
       setChannels([]);
       setMessages([]);
       setThreadMessages([]);
+      setDirectMessages([]);
+      setDirectDraft("");
+      setActiveDirectActorId(null);
+      setDirectScopesByActorId({});
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1091,13 +1231,33 @@ export function App() {
     }
   }
 
-  async function deleteChannel(channel: Channel, cascade: boolean) {
+  async function renameChannel(channel: Channel, rawTitle: string) {
+    const title = rawTitle.trim();
+    if (!title || title === channel.title) return;
+    setBusy(`channel:rename:${channel.id}`);
+    setError(null);
+    try {
+      const result = await ipc.channelUpdate({
+        channelId: channel.id,
+        title,
+        topic: channel.topic,
+      });
+      setChannels((current) => sortChannels(upsert(current, result.channel)));
+      pushNotice(`Renamed #${channel.title} to #${result.channel.title}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteChannel(channel: Channel) {
     setBusy(`channel:delete:${channel.id}`);
     setError(null);
     try {
       const result = await ipc.channelDelete({
         channelId: channel.id,
-        cascade,
+        cascade: true,
       });
       if (result.deleted) {
         applyChannelDeleted(channel.id);
@@ -1203,6 +1363,38 @@ export function App() {
     }
   }
 
+  async function sendDirectMessage() {
+    const body = directDraft.trim();
+    if (!body || !activeDirectActor || !activeDirectTarget) return;
+    const directMentions = mentionAudience(body, actors, workspace?.actorId);
+    if (directMentions.length > 0) {
+      setError("Direct messages do not support @ mentions.");
+      return;
+    }
+    setBusy(`direct:message:send:${activeDirectActor.id}`);
+    setError(null);
+    try {
+      const result = await ipc.messageSend({
+        target: activeDirectTarget,
+        body,
+        deliveryPolicy: "wake_agent",
+        intent: "request_action",
+      });
+      const message = normalizeMessage(result.message);
+      activeDirectScopeRef.current = message.scope;
+      setDirectScopesByActorId((current) => ({
+        ...current,
+        [activeDirectActor.id]: message.scope,
+      }));
+      setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
+      setDirectDraft("");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function startThread(message: Message) {
     if (!activeChannel) return;
     const existing = channelThreads.find(
@@ -1247,12 +1439,25 @@ export function App() {
         messageId: message.id,
         emoji,
       });
-      setMessages((current) => sortMessages(upsertMessage(current, result.message)));
-      setThreadMessages((current) =>
-        current.some((item) => item.id === result.message.id)
-          ? sortMessages(upsertMessage(current, result.message))
-          : current,
-      );
+      const updatedMessage = normalizeMessage(result.message);
+      if (
+        activeScopeRef.current &&
+        sameScope(updatedMessage.scope, activeScopeRef.current)
+      ) {
+        setMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
+      }
+      if (
+        activeThreadScopeRef.current &&
+        sameScope(updatedMessage.scope, activeThreadScopeRef.current)
+      ) {
+        setThreadMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
+      }
+      if (
+        activeDirectScopeRef.current &&
+        sameScope(updatedMessage.scope, activeDirectScopeRef.current)
+      ) {
+        setDirectMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
+      }
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1263,6 +1468,45 @@ export function App() {
   async function answerAction(message: Message, optionId: string, accepted: boolean) {
     const responseTarget = message.target || target;
     if (!responseTarget || !workspace) return;
+    const responseKind = accepted ? "accepted" : "declined";
+    setBusy(`action:${message.id}:${optionId}`);
+    try {
+      await ipc.messageSend({
+        target: responseTarget,
+        body: `${responseKind}: ${optionId}`,
+        parentMessageId: message.id,
+        audience: [{ kind: "actor", id: message.authorActorId }],
+        intent: "notify",
+        deliveryPolicy: "wake_agent",
+        metadata: {
+          kind: "action.response",
+          optionId,
+          responseKind,
+          requestMessageId: message.id,
+        },
+      });
+      await ipc.deliveryAck({
+        actorId: workspace.actorId,
+        sourceId: message.id,
+      });
+      setInbox((current) =>
+        current.filter((item) => item.delivery.sourceId !== message.id),
+      );
+      pushNotice(`Action ${responseKind}`);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function answerDirectAction(message: Message, optionId: string, accepted: boolean) {
+    if (!workspace) return;
+    const peerActorId =
+      directPeerForMessage(message, workspace.actorId) ?? activeDirectActor?.id ?? null;
+    const responseTarget = peerActorId
+      ? directMessageTarget(peerActorId)
+      : message.target;
     const responseKind = accepted ? "accepted" : "declined";
     setBusy(`action:${message.id}:${optionId}`);
     try {
@@ -1378,6 +1622,7 @@ export function App() {
     view === "chat" ||
     view === "threads" ||
     view === "channels" ||
+    view === "direct" ||
     view === "inbox" ||
     view === "tasks" ||
     view === "settings";
@@ -1494,11 +1739,13 @@ export function App() {
           view={view}
           setView={setView}
           busy={busy}
-          channels={channels}
+          channels={visibleChannels}
           channelGroups={channelGroups}
           connection={connection}
           activeChannelId={activeChannelId}
+          activeDirectActorId={activeDirectActorId}
           activeThreadId={activeThreadId}
+          directAgents={agentActors}
           threadsByChannel={threadsByChannel}
           onAddChannel={(title) => {
             void createChannelWithTitle(title);
@@ -1506,6 +1753,7 @@ export function App() {
           onAddChannelGroup={addChannelGroup}
           onMoveChannelToGroup={moveChannelToGroup}
           onDeleteChannel={deleteChannel}
+          onRenameChannel={renameChannel}
           onRemoveChannelGroup={removeChannelGroup}
           onRenameChannelGroup={renameChannelGroup}
           onSelectChannel={(id) => {
@@ -1518,6 +1766,12 @@ export function App() {
             setView("chat");
             setActiveChannelId(thread.channelId);
             setActiveThreadId(thread.id);
+            setChannelPanelTab(null);
+          }}
+          onSelectDirectAgent={(actorId) => {
+            setView("direct");
+            setActiveDirectActorId(actorId);
+            setActiveThreadId(null);
             setChannelPanelTab(null);
           }}
           onToggleChannelGroup={toggleChannelGroup}
@@ -1585,7 +1839,7 @@ export function App() {
             <ErrorBanner error={error} />
             <ThreadsView
               actors={actors}
-              channels={channels}
+              channels={visibleChannels}
               messages={messages}
               machines={machines}
               threadMessages={threadMessages}
@@ -1616,7 +1870,7 @@ export function App() {
             <ChannelsView
               actors={actors}
               busy={busy}
-              channels={channels}
+              channels={visibleChannels}
               channelGroups={channelGroups}
               threadsByChannel={threadsByChannel}
               activeChannel={activeChannel}
@@ -1628,6 +1882,34 @@ export function App() {
               onDeleteChannel={deleteChannel}
             />
           </>
+        ) : view === "direct" ? (
+          <>
+            <ErrorBanner error={error} />
+            <DirectMessagesView
+              actors={actors}
+              agents={agentActors}
+              busy={busy}
+              currentActorId={workspace?.actorId ?? null}
+              disabled={connection !== "open" || !activeDirectActor}
+              draft={directDraft}
+              linkedChannel={activeChannel}
+              machines={machines}
+              messages={directMessages}
+              selectedAgent={activeDirectActor}
+              setDraft={setDirectDraft}
+              onOpenLinkedChannel={(channelId) => {
+                setView("chat");
+                setActiveChannelId(channelId);
+                setActiveThreadId(null);
+                setChannelPanelTab(null);
+              }}
+              onSelectAgent={setActiveDirectActorId}
+              onAnswerAction={answerDirectAction}
+              onSend={sendDirectMessage}
+              onToggleReaction={toggleMessageReaction}
+              onOpenAgentSettings={openAgentSettings}
+            />
+          </>
         ) : view === "inbox" ? (
           <>
             <ErrorBanner error={error} />
@@ -1636,6 +1918,14 @@ export function App() {
               inbox={inbox}
               onOpen={(message) => {
                 if (!message) return;
+                const directPeerId = directPeerForMessage(message, workspace?.actorId ?? null);
+                if (directPeerId && actors[directPeerId]?.kind === "agent") {
+                  setView("direct");
+                  setActiveDirectActorId(directPeerId);
+                  setActiveThreadId(null);
+                  setChannelPanelTab(null);
+                  return;
+                }
                 setView("chat");
                 setActiveChannelId(channelFromMessage(message));
                 setActiveThreadId(threadIdForMessage(threadsByChannel, message));
@@ -1648,7 +1938,7 @@ export function App() {
         ) : view === "tasks" ? (
           <>
             <ErrorBanner error={error} />
-            <TasksView tasks={tasks} channels={channels} />
+            <TasksView tasks={tasks} channels={visibleChannels} />
           </>
         ) : view === "spaces" ? (
           <>
@@ -1912,15 +2202,19 @@ function Sidebar({
   channelGroups,
   connection,
   activeChannelId,
+  activeDirectActorId,
   activeThreadId,
+  directAgents,
   threadsByChannel,
   onAddChannel,
   onAddChannelGroup,
   onMoveChannelToGroup,
   onDeleteChannel,
+  onRenameChannel,
   onRemoveChannelGroup,
   onRenameChannelGroup,
   onSelectChannel,
+  onSelectDirectAgent,
   onSelectThread,
   onToggleChannelGroup,
 }: {
@@ -1931,15 +2225,19 @@ function Sidebar({
   channelGroups: ChannelGroup[];
   connection: ConnectionState;
   activeChannelId: string | null;
+  activeDirectActorId: string | null;
   activeThreadId: string | null;
+  directAgents: Actor[];
   threadsByChannel: Record<string, Thread[]>;
   onAddChannel: (title: string) => void;
   onAddChannelGroup: (title: string) => void;
   onMoveChannelToGroup: (channelId: string, groupId: string) => void;
-  onDeleteChannel: (channel: Channel, cascade: boolean) => void;
+  onDeleteChannel: (channel: Channel) => void;
+  onRenameChannel: (channel: Channel, title: string) => void;
   onRemoveChannelGroup: (groupId: string) => void;
   onRenameChannelGroup: (groupId: string, title: string) => void;
   onSelectChannel: (channelId: string) => void;
+  onSelectDirectAgent: (actorId: string) => void;
   onSelectThread: (thread: Thread) => void;
   onToggleChannelGroup: (groupId: string) => void;
 }) {
@@ -1949,17 +2247,24 @@ function Sidebar({
   const [editingSectionId, setEditingSectionId] = useState<string | null>(null);
   const [sectionTitleDraft, setSectionTitleDraft] = useState("");
   const [deleteSectionId, setDeleteSectionId] = useState<string | null>(null);
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const [channelTitleDraft, setChannelTitleDraft] = useState("");
   const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
-  const [deleteTitleConfirm, setDeleteTitleConfirm] = useState("");
+  const [channelContextMenu, setChannelContextMenu] =
+    useState<ChannelContextMenu | null>(null);
   const [draggingChannelId, setDraggingChannelId] = useState<string | null>(null);
   const [dragOverSectionId, setDragOverSectionId] = useState<string | null>(null);
   const dragSessionRef = useRef<ChannelPointerDrag | null>(null);
   const dragListenerCleanupRef = useRef<(() => void) | null>(null);
   const suppressChannelClickRef = useRef<string | null>(null);
   const sections = channelGroupSections(channelGroups, channels);
+  const contextMenuChannel = channelContextMenu
+    ? channels.find((channel) => channel.id === channelContextMenu.channelId) ?? null
+    : null;
   const navItems = [
     { id: "chat" as const, label: "Home", icon: Home },
     { id: "channels" as const, label: "All Channels", icon: Hash },
+    { id: "direct" as const, label: "Direct Messages", icon: MessageCircle },
     { id: "threads" as const, label: "Threads", icon: MessageSquare },
     { id: "inbox" as const, label: "Inbox", icon: Bell },
     { id: "tasks" as const, label: "Tasks", icon: Check },
@@ -1973,7 +2278,11 @@ function Sidebar({
 
   const closeDeleteChannelConfirm = () => {
     setDeleteChannelId(null);
-    setDeleteTitleConfirm("");
+  };
+
+  const closeRenameChannel = () => {
+    setEditingChannelId(null);
+    setChannelTitleDraft("");
   };
 
   const handleOpenCreate = (kind: "channel" | "section") => {
@@ -1999,6 +2308,8 @@ function Sidebar({
     setSectionTitleDraft(section.title);
     setDeleteSectionId(null);
     closeDeleteChannelConfirm();
+    closeRenameChannel();
+    setChannelContextMenu(null);
   };
 
   const submitRenameSection = (
@@ -2027,8 +2338,63 @@ function Sidebar({
     setDeleteSectionId(null);
     setEditingSectionId(null);
     setSectionTitleDraft("");
+    closeRenameChannel();
+    setChannelContextMenu(null);
     setDeleteChannelId(channelId);
-    setDeleteTitleConfirm("");
+  };
+
+  const startRenameChannel = (channel: Channel) => {
+    closeCreateMenu();
+    closeDeleteChannelConfirm();
+    setChannelContextMenu(null);
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setEditingChannelId(channel.id);
+    setChannelTitleDraft(channel.title);
+  };
+
+  const submitRenameChannel = (
+    event: FormEvent<HTMLFormElement>,
+    channel: Channel,
+  ) => {
+    event.preventDefault();
+    const title = channelTitleDraft.trim();
+    if (!title) return;
+    onRenameChannel(channel, title);
+    closeRenameChannel();
+  };
+
+  const openChannelContextMenu = (
+    event: MouseEvent<HTMLElement>,
+    channel: Channel,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelChannelDrag();
+    closeCreateMenu();
+    closeDeleteChannelConfirm();
+    closeRenameChannel();
+    setDeleteSectionId(null);
+    setEditingSectionId(null);
+    setSectionTitleDraft("");
+    setChannelContextMenu({
+      channelId: channel.id,
+      x: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          event.clientX,
+          window.innerWidth - channelContextMenuWidthPx - channelContextMenuViewportPaddingPx,
+        ),
+      ),
+      y: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          event.clientY,
+          window.innerHeight - channelContextMenuHeightPx - channelContextMenuViewportPaddingPx,
+        ),
+      ),
+    });
   };
 
   const sectionIdAtPoint = (x: number, y: number) => {
@@ -2177,6 +2543,22 @@ function Sidebar({
     );
   };
 
+  useEffect(() => {
+    if (!channelContextMenu) return;
+    const close = () => setChannelContextMenu(null);
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [channelContextMenu]);
+
   useEffect(() => () => cleanupChannelDragListeners(), []);
   return (
     <aside className="flex min-h-0 min-w-0 flex-col bg-[#fbfbfd]">
@@ -2201,6 +2583,41 @@ function Sidebar({
           })}
         </div>
       </div>
+
+      {view === "direct" && (
+        <div className="border-b border-[#edf0f5] p-3">
+          <div className="mb-2 flex items-center justify-between px-1">
+            <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+              Agents
+            </span>
+            <span className="count-badge h-5 min-w-5 text-[10px]">
+              {directAgents.length}
+            </span>
+          </div>
+          <div className="space-y-1">
+            {directAgents.length === 0 ? (
+              <div className="px-3 py-2 text-xs text-[#8a93a5]">
+                No agents available.
+              </div>
+            ) : (
+              directAgents.map((actor) => {
+                const selected = actor.id === activeDirectActorId;
+                return (
+                  <button
+                    key={actor.id}
+                    type="button"
+                    className={cn("nav-row h-10 text-sm", selected && "nav-row-active")}
+                    onClick={() => onSelectDirectAgent(actor.id)}
+                  >
+                    <ActorAvatar actor={actor} fallback={actor.id} small />
+                    <span className="min-w-0 flex-1 truncate">{displayName(actor)}</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="border-b border-[#edf0f5] p-3">
@@ -2404,6 +2821,7 @@ function Sidebar({
                       const selected = channel.id === activeChannelId && !activeThreadId;
                       const threads = threadsByChannel[channel.id] ?? [];
                       const deleteBusy = busy === `channel:delete:${channel.id}`;
+                      const renameBusy = busy === `channel:rename:${channel.id}`;
                       return (
                         <div
                           key={channel.id}
@@ -2423,6 +2841,9 @@ function Sidebar({
                               onPointerMove={updateChannelDrag}
                               onPointerUp={finishChannelDrag}
                               onPointerCancel={cancelChannelDrag}
+                              onContextMenu={(event) =>
+                                openChannelContextMenu(event, channel)
+                              }
                               onClick={() => {
                                 if (suppressChannelClickRef.current === channel.id) {
                                   suppressChannelClickRef.current = null;
@@ -2430,6 +2851,7 @@ function Sidebar({
                                 }
                                 closeCreateMenu();
                                 closeDeleteChannelConfirm();
+                                closeRenameChannel();
                                 onSelectChannel(channel.id);
                               }}
                             >
@@ -2452,38 +2874,53 @@ function Sidebar({
                                 {threads.length}
                               </Badge>
                             </button>
-                            <button
-                              type="button"
-                              title={`Delete #${channel.title}`}
-                              disabled={deleteBusy}
-                              className={cn(
-                                "composer-icon h-7 min-w-7 text-red-500 opacity-0 hover:text-red-600 group-hover/channel:opacity-100",
-                                (selected || deleteChannelId === channel.id) && "opacity-100",
-                              )}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                requestDeleteChannel(channel.id);
-                              }}
-                            >
-                              {deleteBusy ? (
-                                <Loader2 className="animate-spin" size={13} />
-                              ) : (
-                                <Trash2 size={13} />
-                              )}
-                            </button>
                           </div>
+                          {editingChannelId === channel.id && (
+                            <form
+                              className="channel-section-editor"
+                              onSubmit={(event) => submitRenameChannel(event, channel)}
+                            >
+                              <Input
+                                autoFocus
+                                value={channelTitleDraft}
+                                onChange={(event) =>
+                                  setChannelTitleDraft(event.target.value)
+                                }
+                                placeholder="Channel name"
+                                className="h-8 rounded-lg border-[#dfe3ec] bg-white text-xs shadow-none"
+                              />
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={renameBusy}
+                                onClick={closeRenameChannel}
+                              >
+                                Cancel
+                              </Button>
+                              <Button
+                                type="submit"
+                                size="sm"
+                                disabled={!channelTitleDraft.trim() || renameBusy}
+                              >
+                                {renameBusy ? (
+                                  <Loader2 className="animate-spin" size={13} />
+                                ) : (
+                                  "Save"
+                                )}
+                              </Button>
+                            </form>
+                          )}
                           {deleteChannelId === channel.id && (
                             <ChannelDeleteConfirm
+                              compact
                               channel={channel}
-                              confirmTitle={deleteTitleConfirm}
                               deleteBusy={deleteBusy}
-                              threads={threads}
                               onCancel={closeDeleteChannelConfirm}
-                              onConfirm={(cascade) => {
-                                onDeleteChannel(channel, cascade);
+                              onConfirm={() => {
+                                onDeleteChannel(channel);
                                 closeDeleteChannelConfirm();
                               }}
-                              setConfirmTitle={setDeleteTitleConfirm}
                             />
                           )}
                           {channel.id === activeChannelId && threads.length > 0 && (
@@ -2498,6 +2935,7 @@ function Sidebar({
                                   onClick={() => {
                                     closeCreateMenu();
                                     closeDeleteChannelConfirm();
+                                    closeRenameChannel();
                                     onSelectThread(thread);
                                   }}
                                 >
@@ -2517,6 +2955,42 @@ function Sidebar({
           ))}
         </div>
       </div>
+      {channelContextMenu &&
+        contextMenuChannel &&
+        createPortal(
+          <div
+            className="fixed z-50 rounded-lg border border-[#dfe3ec] bg-white p-1 text-sm shadow-soft"
+            style={{
+              left: channelContextMenu.x,
+              top: channelContextMenu.y,
+              width: channelContextMenuWidthPx,
+            }}
+            role="menu"
+            aria-label={`Channel actions for ${contextMenuChannel.title}`}
+            onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+              role="menuitem"
+              onClick={() => startRenameChannel(contextMenuChannel)}
+            >
+              <Pencil size={14} />
+              Rename
+            </button>
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-red-600 hover:bg-red-50"
+              role="menuitem"
+              onClick={() => requestDeleteChannel(contextMenuChannel.id)}
+            >
+              <Trash2 size={14} />
+              Delete
+            </button>
+          </div>,
+          document.body,
+        )}
     </aside>
   );
 }
@@ -2589,6 +3063,8 @@ function ChatHeader({
 
 function MessageFeed({
   actors,
+  allowReply = true,
+  allowThreads = true,
   feedKey,
   machines,
   messages,
@@ -2605,6 +3081,8 @@ function MessageFeed({
   busy,
 }: {
   actors: Record<string, Actor>;
+  allowReply?: boolean;
+  allowThreads?: boolean;
   feedKey: string;
   machines: MachineInfo[];
   messages: Message[];
@@ -2677,7 +3155,8 @@ function MessageFeed({
                   onToggleReaction={onToggleReaction}
                   onAnswerAction={onAnswerAction}
                   onOpenAgentSettings={onOpenAgentSettings}
-                  canStartThread={canUseAsThreadRoot(message)}
+                  canReply={allowReply}
+                  canStartThread={allowThreads && canUseAsThreadRoot(message)}
                   threadSummary={threadSummary}
                   threadStats={
                     threadSummary ? threadStatsById[threadSummary.id] : undefined
@@ -2706,6 +3185,7 @@ function MessageRow({
   onToggleReaction,
   onAnswerAction,
   onOpenAgentSettings,
+  canReply,
   canStartThread,
   threadSummary,
   threadStats,
@@ -2723,6 +3203,7 @@ function MessageRow({
   onToggleReaction: (message: Message, emoji: string) => void;
   onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
   onOpenAgentSettings: (actorId: string) => void;
+  canReply: boolean;
   canStartThread: boolean;
   threadSummary: Thread | null;
   threadStats?: ThreadActivityStats;
@@ -2776,7 +3257,7 @@ function MessageRow({
             )}
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <ReactMarkdown>{displayBody}</ReactMarkdown>
+            <MessageMarkdown actors={actors} body={displayBody} />
           </div>
           {attachments.length > 0 && (
             <AttachmentStack attachments={attachments} />
@@ -2837,10 +3318,12 @@ function MessageRow({
             />
           )}
           <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
-            <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
-              <Reply size={14} />
-              Reply
-            </Button>
+            {canReply && (
+              <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
+                <Reply size={14} />
+                Reply
+              </Button>
+            )}
             {reactions.length === 0 && (
               <ReactionPicker
                 busy={busy}
@@ -3061,6 +3544,8 @@ function Composer({
   onClearReply,
   onSend,
   mentionAgents,
+  placeholder = "Message",
+  disabledPlaceholder = "Connect and select a channel",
   busy,
 }: {
   draft: string;
@@ -3071,6 +3556,8 @@ function Composer({
   onClearReply: () => void;
   onSend: () => void;
   mentionAgents: Actor[];
+  placeholder?: string;
+  disabledPlaceholder?: string;
   busy: boolean;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -3214,7 +3701,7 @@ function Composer({
               }
             }}
             disabled={disabled}
-            placeholder={disabled ? "Connect and select a channel" : "Message"}
+            placeholder={disabled ? disabledPlaceholder : placeholder}
             className="max-h-48 min-h-[44px] flex-1 border-0 bg-transparent px-0 py-1 shadow-none focus-visible:ring-0"
           />
           <Button
@@ -3460,7 +3947,7 @@ function ThreadConversationMessage({
             </span>
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <ReactMarkdown>{displayBody}</ReactMarkdown>
+            <MessageMarkdown actors={actors} body={displayBody} />
           </div>
           {pollChoices.length > 0 && (
             <PollCard choices={pollChoices} disabled />
@@ -3514,6 +4001,42 @@ function ThreadConversationMessage({
         </div>
       </div>
     </article>
+  );
+}
+
+function MessageMarkdown({
+  actors,
+  body,
+}: {
+  actors: Record<string, Actor>;
+  body: string;
+}) {
+  const components: Components = {
+    a({ href, children, node: _node, ...props }) {
+      const actorId = href ? actorMentionActorId(href) : null;
+      if (actorId) {
+        return (
+          <span
+            className="message-mention"
+            data-actor-id={actorId}
+            title={actorName(actors, actorId)}
+          >
+            {children}
+          </span>
+        );
+      }
+      return (
+        <a href={href} rel="noreferrer" target="_blank" {...props}>
+          {children}
+        </a>
+      );
+    },
+  };
+
+  return (
+    <ReactMarkdown remarkPlugins={[actorMentionRemarkPlugin(actors)]} components={components}>
+      {body}
+    </ReactMarkdown>
   );
 }
 
@@ -3810,11 +4333,10 @@ function ChannelsView({
   threadsByChannel: Record<string, Thread[]>;
   activeChannel: Channel | null;
   onSelectChannel: (channelId: string) => void;
-  onDeleteChannel: (channel: Channel, cascade: boolean) => void;
+  onDeleteChannel: (channel: Channel) => void;
 }) {
   const [query, setQuery] = useState("");
   const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
-  const [deleteTitleConfirm, setDeleteTitleConfirm] = useState("");
   const filteredChannels = channels.filter((channel) => {
     const text = `${channel.title} ${channel.topic ?? ""} ${channel.visibility}`.toLowerCase();
     return text.includes(query.trim().toLowerCase());
@@ -3822,7 +4344,6 @@ function ChannelsView({
   const sections = channelGroupSections(channelGroups, filteredChannels);
   const closeDeleteConfirm = () => {
     setDeleteChannelId(null);
-    setDeleteTitleConfirm("");
   };
   return (
     <section className="flex min-h-0 flex-1 flex-col bg-white">
@@ -3876,22 +4397,18 @@ function ChannelsView({
                       threads={threads}
                       onRequestDelete={() => {
                         setDeleteChannelId(channel.id);
-                        setDeleteTitleConfirm("");
                       }}
                       onSelect={() => onSelectChannel(channel.id)}
                     />
                     {deleteChannelId === channel.id && (
                       <ChannelDeleteConfirm
                         channel={channel}
-                        confirmTitle={deleteTitleConfirm}
                         deleteBusy={deleteBusy}
-                        threads={threads}
                         onCancel={closeDeleteConfirm}
-                        onConfirm={(cascade) => {
-                          onDeleteChannel(channel, cascade);
+                        onConfirm={() => {
+                          onDeleteChannel(channel);
                           closeDeleteConfirm();
                         }}
-                        setConfirmTitle={setDeleteTitleConfirm}
                       />
                     )}
                   </Fragment>
@@ -3983,23 +4500,58 @@ function ChannelTableRow({
 
 function ChannelDeleteConfirm({
   channel,
-  confirmTitle,
+  compact = false,
   deleteBusy,
-  threads,
   onCancel,
   onConfirm,
-  setConfirmTitle,
 }: {
   channel: Channel;
-  confirmTitle: string;
+  compact?: boolean;
   deleteBusy: boolean;
-  threads: Thread[];
   onCancel: () => void;
-  onConfirm: (cascade: boolean) => void;
-  setConfirmTitle: (value: string) => void;
+  onConfirm: () => void;
 }) {
-  const cascade = threads.length > 0;
-  const titleMatches = confirmTitle.trim() === channel.title;
+  if (compact) {
+    return (
+      <div
+        className="mb-2 mt-1 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-red-900"
+        role="alertdialog"
+        aria-label={`Delete #${channel.title}`}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-xs font-bold" title={`Delete #${channel.title}?`}>
+              Delete channel?
+            </div>
+            <div className="truncate text-[11px] font-medium text-red-700">
+              Threads included.
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              className="composer-icon h-7 min-w-7 text-red-700 hover:text-red-800"
+              title="Cancel"
+              aria-label="Cancel channel delete"
+              onClick={onCancel}
+            >
+              <X size={13} />
+            </button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={deleteBusy}
+              className="h-7 px-2 text-[11px] bg-red-600 text-white hover:bg-red-700"
+              onClick={onConfirm}
+            >
+              {deleteBusy ? <Loader2 className="animate-spin" size={12} /> : "Delete"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="my-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900">
       <div className="flex items-start gap-3">
@@ -4007,19 +4559,8 @@ function ChannelDeleteConfirm({
         <div className="min-w-0 flex-1">
           <div className="font-bold">Delete #{channel.title}?</div>
           <div className="mt-1 text-xs font-medium text-red-700">
-            {cascade
-              ? `This will delete the channel and ${threads.length} thread${threads.length === 1 ? "" : "s"}.`
-              : "This channel has no threads and will be removed."}
+            This will delete the channel and all threads in this channel.
           </div>
-          {cascade && (
-            <Input
-              autoFocus
-              value={confirmTitle}
-              onChange={(event) => setConfirmTitle(event.target.value)}
-              placeholder={`Type ${channel.title} to confirm`}
-              className="mt-3 h-9 rounded-lg border-red-200 bg-white text-sm text-red-900 shadow-none placeholder:text-red-300"
-            />
-          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <Button type="button" variant="outline" size="sm" onClick={onCancel}>
@@ -4028,9 +4569,9 @@ function ChannelDeleteConfirm({
           <Button
             type="button"
             size="sm"
-            disabled={deleteBusy || (cascade && !titleMatches)}
+            disabled={deleteBusy}
             className="bg-red-600 text-white hover:bg-red-700"
-            onClick={() => onConfirm(cascade)}
+            onClick={onConfirm}
           >
             {deleteBusy ? <Loader2 className="animate-spin" size={13} /> : <Trash2 size={13} />}
             Delete
@@ -4038,6 +4579,170 @@ function ChannelDeleteConfirm({
         </div>
       </div>
     </div>
+  );
+}
+
+function DirectMessagesView({
+  actors,
+  agents,
+  busy,
+  currentActorId,
+  disabled,
+  draft,
+  linkedChannel,
+  machines,
+  messages,
+  selectedAgent,
+  setDraft,
+  onOpenLinkedChannel,
+  onSelectAgent,
+  onAnswerAction,
+  onSend,
+  onToggleReaction,
+  onOpenAgentSettings,
+}: {
+  actors: Record<string, Actor>;
+  agents: Actor[];
+  busy: string | null;
+  currentActorId: string | null;
+  disabled: boolean;
+  draft: string;
+  linkedChannel: Channel | null;
+  machines: MachineInfo[];
+  messages: Message[];
+  selectedAgent: Actor | null;
+  setDraft: (value: string) => void;
+  onOpenLinkedChannel: (channelId: string) => void;
+  onSelectAgent: (actorId: string) => void;
+  onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
+  onSend: () => void;
+  onToggleReaction: (message: Message, emoji: string) => void;
+  onOpenAgentSettings: (actorId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const filteredAgents = agents.filter((agent) => {
+    const text = `${displayName(agent)} ${agent.id}`.toLowerCase();
+    return text.includes(query.trim().toLowerCase());
+  });
+  const selectedBusy = selectedAgent
+    ? busy === `direct:message:send:${selectedAgent.id}`
+    : false;
+  return (
+    <section className="grid min-h-0 flex-1 grid-cols-[minmax(260px,340px)_minmax(0,1fr)] bg-white">
+      <aside className="min-h-0 border-r border-[#e2e6ef] bg-[#fbfbfd]">
+        <div className="flex h-[96px] flex-col justify-center border-b border-[#e2e6ef] px-5">
+          <h1 className="text-[22px] font-bold text-[#111827]">Direct Messages</h1>
+          <div className="mt-1 text-sm font-medium text-[#667085]">
+            {agents.length} agents
+          </div>
+        </div>
+        <div className="p-4">
+          <label className="search-pill mb-4 h-10">
+            <Search size={16} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search agents"
+              className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[#8a93a5]"
+            />
+          </label>
+          <div className="space-y-1">
+            {filteredAgents.map((agent) => {
+              const selected = selectedAgent?.id === agent.id;
+              return (
+                <button
+                  key={agent.id}
+                  type="button"
+                  className={cn(
+                    "flex min-h-12 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors",
+                    selected
+                      ? "bg-[#efecff] text-[#4f3fd7]"
+                      : "text-[#303849] hover:bg-[#f0f1f8]",
+                  )}
+                  onClick={() => onSelectAgent(agent.id)}
+                >
+                  <ActorAvatar actor={agent} fallback={agent.id} small />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-bold">
+                      {displayName(agent)}
+                    </span>
+                    <span className="block truncate text-xs font-medium text-[#667085]">
+                      {shortActorAlias(agent.id)}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+            {filteredAgents.length === 0 && (
+              <EmptyState icon={Bot} text="No agents." />
+            )}
+          </div>
+        </div>
+      </aside>
+      <div className="flex min-h-0 min-w-0 flex-col bg-white">
+        {!selectedAgent ? (
+          <div className="flex min-h-0 flex-1 items-center justify-center p-8">
+            <EmptyState icon={MessageCircle} text="Select an agent." />
+          </div>
+        ) : (
+          <>
+            <header className="flex h-[86px] shrink-0 items-center gap-4 border-b border-[#e2e6ef] bg-white px-6">
+              <ActorAvatar actor={selectedAgent} fallback={selectedAgent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[22px] font-bold leading-tight text-[#111827]">
+                  {displayName(selectedAgent)}
+                </div>
+                <div className="mt-1 truncate text-sm text-[#485063]">
+                  {selectedAgent.id}
+                </div>
+              </div>
+              {linkedChannel && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onOpenLinkedChannel(linkedChannel.id)}
+                >
+                  <Hash size={14} />
+                  {linkedChannel.title}
+                </Button>
+              )}
+            </header>
+            <MessageFeed
+              actors={actors}
+              allowReply={false}
+              allowThreads={false}
+              feedKey={`direct:${selectedAgent.id}`}
+              machines={machines}
+              messages={messages}
+              tasksBySourceMessageId={{}}
+              channelThreads={[]}
+              threadStatsById={{}}
+              emptyText="No direct messages."
+              onReply={() => {}}
+              onStartThread={() => {}}
+              onToggleReaction={onToggleReaction}
+              onAnswerAction={onAnswerAction}
+              onOpenAgentSettings={onOpenAgentSettings}
+              currentActorId={currentActorId}
+              busy={busy}
+            />
+            <Composer
+              draft={draft}
+              setDraft={setDraft}
+              disabled={disabled}
+              replyTo={null}
+              actorName=""
+              onClearReply={() => {}}
+              onSend={onSend}
+              mentionAgents={[]}
+              placeholder={`Message ${displayName(selectedAgent)}`}
+              disabledPlaceholder="Connect and select an agent"
+              busy={selectedBusy}
+            />
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -6590,6 +7295,10 @@ function agentReasoningEffort(agent: MachineInfo["agents"][number]) {
   return typeof value === "string" ? value : "";
 }
 
+function agentProviderId(agent: MachineInfo["agents"][number]) {
+  return metadataString(agent.spec.actor._meta, ["providerId", "provider_id"]);
+}
+
 function agentAvatarValue(agent: MachineInfo["agents"][number]) {
   return metadataAvatarUrl(agent.spec.actor._meta) ?? actorAvatarUrl(agent.spec.actor, agent.spec.actor.id);
 }
@@ -6599,7 +7308,8 @@ function providerForAgent(
   agent: MachineInfo["agents"][number],
   preferredProviderId?: string,
 ) {
-  const preferred = machine.providers.find((provider) => provider.id === preferredProviderId);
+  const providerId = preferredProviderId || agentProviderId(agent);
+  const preferred = machine.providers.find((provider) => provider.id === providerId);
   if (preferred) return preferred;
   const model = agentModelValue(agent);
   return (
@@ -6617,11 +7327,12 @@ function agentSettingsDraft(
   machine: MachineInfo,
   agent: MachineInfo["agents"][number],
 ): AgentSettingsDraft {
-  const provider = providerForAgent(machine, agent);
+  const providerId = agentProviderId(agent);
+  const provider = providerForAgent(machine, agent, providerId ?? undefined);
   return {
     displayName: agentDisplayName(agent),
     description: agentDescriptionValue(agent),
-    providerId: provider?.id ?? "",
+    providerId: providerId ?? provider?.id ?? "",
     model: agentModelValue(agent) || provider?.defaultModel || "",
     reasoningEffort: agentReasoningEffort(agent),
     autostart: Boolean(agent.spec.autostart),
@@ -6768,6 +7479,94 @@ function capitalize(value: string) {
 
 function actorName(actors: Record<string, Actor>, actorId: string) {
   return actors[actorId] ? displayName(actors[actorId]) : actorId;
+}
+
+type MarkdownNode = {
+  type?: string;
+  value?: string;
+  children?: MarkdownNode[];
+  url?: string;
+  title?: string | null;
+};
+
+const actorMentionUrlPrefix = "https://loom.local/actors/";
+const actorMentionPattern =
+  /@((?:actor_(?:agent|human|service)_|actor_)[A-Za-z0-9_:-]+)/g;
+
+function actorMentionRemarkPlugin(actors: Record<string, Actor>) {
+  return function transformActorMentions() {
+    return (tree: MarkdownNode) => {
+      transformMarkdownTextMentions(tree, actors);
+    };
+  };
+}
+
+function transformMarkdownTextMentions(
+  node: MarkdownNode,
+  actors: Record<string, Actor>,
+) {
+  if (node.type === "link" || node.type === "linkReference") return;
+  if (!node.children) return;
+
+  for (let index = 0; index < node.children.length; index += 1) {
+    const child = node.children[index];
+    if (child.type === "text" && typeof child.value === "string") {
+      const replacement = actorMentionNodes(child.value, actors);
+      if (replacement) {
+        node.children.splice(index, 1, ...replacement);
+        index += replacement.length - 1;
+      }
+      continue;
+    }
+    transformMarkdownTextMentions(child, actors);
+  }
+}
+
+function actorMentionNodes(
+  value: string,
+  actors: Record<string, Actor>,
+): MarkdownNode[] | null {
+  const nodes: MarkdownNode[] = [];
+  let lastIndex = 0;
+  let matched = false;
+  actorMentionPattern.lastIndex = 0;
+
+  for (const match of value.matchAll(actorMentionPattern)) {
+    const actorId = match[1];
+    const actor = actors[actorId];
+    if (!actor || match.index === undefined) continue;
+
+    if (match.index > lastIndex) {
+      nodes.push({ type: "text", value: value.slice(lastIndex, match.index) });
+    }
+    nodes.push({
+      type: "link",
+      url: actorMentionUrl(actor.id),
+      title: actor.id,
+      children: [{ type: "text", value: `@${displayName(actor)}` }],
+    });
+    lastIndex = match.index + match[0].length;
+    matched = true;
+  }
+
+  if (!matched) return null;
+  if (lastIndex < value.length) {
+    nodes.push({ type: "text", value: value.slice(lastIndex) });
+  }
+  return nodes;
+}
+
+function actorMentionUrl(actorId: string) {
+  return `${actorMentionUrlPrefix}${encodeURIComponent(actorId)}`;
+}
+
+function actorMentionActorId(href: string) {
+  if (!href.startsWith(actorMentionUrlPrefix)) return null;
+  try {
+    return decodeURIComponent(href.slice(actorMentionUrlPrefix.length));
+  } catch {
+    return null;
+  }
 }
 
 function channelTopic(channel: Channel | null | undefined) {
@@ -7138,6 +7937,64 @@ function canUseAsThreadRoot(message: Message) {
     !message.parentMessageId &&
     !message.threadRootMessageId
   );
+}
+
+function directMessageTarget(actorId: string) {
+  return `dm:@${actorId}`;
+}
+
+function directTargetActorId(target: string) {
+  const raw = target.trim().match(/^dm:@?([^:]+)$/)?.[1];
+  return raw?.trim() || null;
+}
+
+function isDirectChannel(channel: Channel | null | undefined) {
+  return Boolean(
+    channel &&
+      channel.title.startsWith("dm:") &&
+      channel.members.length === 2 &&
+      channel.visibility === "private",
+  );
+}
+
+function directChannelPeerId(
+  channel: Channel | null | undefined,
+  currentActorId: string | null | undefined,
+) {
+  if (!channel || !isDirectChannel(channel) || !currentActorId) return null;
+  if (!channel.members.includes(currentActorId)) return null;
+  return channel.members.find((actorId) => actorId !== currentActorId) ?? null;
+}
+
+function directScopeForActor(
+  channels: Channel[],
+  currentActorId: string,
+  peerActorId: string,
+): ScopeRef | null {
+  const channel = channels.find(
+    (candidate) => directChannelPeerId(candidate, currentActorId) === peerActorId,
+  );
+  return channel ? { kind: "channel", id: channel.id } : null;
+}
+
+function messageBelongsToDirectActor(
+  message: Message,
+  peerActorId: string | null,
+  currentActorId: string | null,
+) {
+  if (!peerActorId || !directTargetActorId(message.target)) return false;
+  if (message.authorActorId === peerActorId) return true;
+  if (currentActorId && message.authorActorId !== currentActorId) return false;
+  return directTargetActorId(message.target) === peerActorId;
+}
+
+function directPeerForMessage(message: Message, currentActorId: string | null) {
+  const targetActorId = directTargetActorId(message.target);
+  if (!targetActorId) return null;
+  if (currentActorId && message.authorActorId !== currentActorId) {
+    return message.authorActorId;
+  }
+  return targetActorId;
 }
 
 function isChannelMember(channel: Channel, actorId: string) {

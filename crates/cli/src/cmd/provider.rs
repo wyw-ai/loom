@@ -267,6 +267,11 @@ Prompt flow in this template:
   - prompt.outputs.full joins the selected parts in the declared order.
   - args finally passes "{{prompt.full}}" to the provider CLI.
 
+Common runtime path variables:
+  - {{agent.configDir}} points at the current agent's config directory, normally $LOOM_CONFIG_DIR/agents/<actor_id>.
+  - {{agent.specPath}} points at that agent's spec.json.
+  - {{loom.configDir}} remains available for advanced providers that intentionally need daemon-level config, but built-in providers avoid exposing it by default.
+
 Workspace file rules:
   - path is relative to the current agent workspace's .loom directory.
   - optional=true means a missing file is skipped.
@@ -709,6 +714,8 @@ mod tests {
 
         assert!(text.contains("Provider manifest example"));
         assert!(text.contains("loom --json provider example"));
+        assert!(text.contains("agent.configDir"));
+        assert!(text.contains("loom.configDir"));
         assert!(text.contains(".loom/persona.md"));
         assert!(text.contains("workspace_file.persona"));
         assert!(text.contains("```json"));

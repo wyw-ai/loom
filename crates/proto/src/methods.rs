@@ -2101,8 +2101,33 @@ impl Default for ProviderArgSpec {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderPromptSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_files: Vec<ProviderWorkspaceFileSpec>,
     #[serde(default)]
     pub outputs: std::collections::BTreeMap<String, ProviderPromptOutputSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderWorkspaceFileSpec {
+    pub key: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "roleHint")]
+    pub role_hint: Option<ProviderPromptRoleHint>,
+    #[serde(default = "default_provider_workspace_file_optional")]
+    pub optional: bool,
+    #[serde(default = "default_provider_workspace_file_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_provider_workspace_file_optional() -> bool {
+    true
+}
+
+fn default_provider_workspace_file_max_bytes() -> u64 {
+    32 * 1024
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2137,6 +2162,13 @@ pub enum ProviderRenderTitle {
     Never,
     #[default]
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPromptRoleHint {
+    System,
+    User,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

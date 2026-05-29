@@ -1435,7 +1435,7 @@ enum AgentBundleCmd {
 
 #[derive(Subcommand, Debug)]
 enum ProviderCmd {
-    /// Print a provider manifest example. No flag prints a generic template; provider flags print built-in manifests.
+    /// Print a provider manifest example. Built-ins show the official runtime argv and default agent-scoped add-dir.
     Example {
         /// Print the built-in Claude Code provider manifest.
         #[arg(long)]

@@ -89,6 +89,7 @@ pub async fn run(
             specs.len(),
         ));
     }
+    ensure_agent_config_dirs(&specs)?;
 
     eprintln!(
         "loom agent serve: loaded {} agent(s) from {}",
@@ -307,6 +308,19 @@ fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
     let spec: AgentSpec =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(spec))
+}
+
+fn agent_config_dir(actor_id: &str) -> PathBuf {
+    config::config_dir().join("agents").join(actor_id)
+}
+
+fn ensure_agent_config_dirs(specs: &[AgentSpec]) -> Result<()> {
+    for spec in specs {
+        let dir = agent_config_dir(&spec.actor.id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create agent config dir {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// The path to the Loom CLI. `loom-daemon` is often launched by absolute path,
@@ -831,6 +845,15 @@ impl AgentPaths {
         );
         vars.insert("agent.root".into(), scope.agent_root.display().to_string());
         vars.insert("agent.profile".into(), self.profile.display().to_string());
+        let agent_config_dir = agent_config_dir(actor_id);
+        vars.insert(
+            "agent.configDir".into(),
+            agent_config_dir.display().to_string(),
+        );
+        vars.insert(
+            "agent.specPath".into(),
+            agent_config_dir.join("spec.json").display().to_string(),
+        );
         vars.insert("agent.logs".into(), scope.logs.display().to_string());
         vars.insert("agent.skills".into(), scope.skills.display().to_string());
         vars.insert("scope.skills".into(), scope.skills.display().to_string());
@@ -7008,6 +7031,12 @@ mod tests {
         assert!(vars
             .get("workspace.dir")
             .is_some_and(|value| value.contains("chan_demo")));
+        assert!(vars
+            .get("agent.configDir")
+            .is_some_and(|value| value.ends_with("agents/actor_demo")));
+        assert!(vars
+            .get("agent.specPath")
+            .is_some_and(|value| value.ends_with("agents/actor_demo/spec.json")));
         std::fs::remove_dir_all(root).ok();
     }
 

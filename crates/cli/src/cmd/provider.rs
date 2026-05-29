@@ -213,11 +213,18 @@ impl ExampleSelection {
 }
 
 pub fn example(selection: ExampleSelection) -> Result<()> {
-    let mut examples = if selection.selected_ids().is_empty() {
-        vec![standard_provider_example()]
-    } else {
-        official_provider_examples(selection)?
-    };
+    if selection.selected_ids().is_empty() {
+        let value = standard_provider_example();
+        if render::is_json() {
+            let text =
+                serde_json::to_string_pretty(&value).context("serialize provider example")?;
+            println!("{text}");
+        } else {
+            println!("{}", standard_provider_example_text(&value)?);
+        }
+        return Ok(());
+    }
+    let mut examples = official_provider_examples(selection)?;
     let value = if examples.len() == 1 {
         examples.remove(0)
     } else {
@@ -226,6 +233,61 @@ pub fn example(selection: ExampleSelection) -> Result<()> {
     let text = serde_json::to_string_pretty(&value).context("serialize provider example")?;
     println!("{text}");
     Ok(())
+}
+
+fn standard_provider_example_text(value: &Value) -> Result<String> {
+    let json_text = serde_json::to_string_pretty(value).context("serialize provider example")?;
+    Ok(format!(
+        r#"Provider manifest example
+
+This is a complete generic ProviderManifest template. It is meant as a starting point for adding a command-line agent provider to Loom.
+
+Suggested workflow:
+  loom --json provider example > /tmp/my_provider.json
+  loom provider validate /tmp/my_provider.json
+  loom provider add /tmp/my_provider.json
+  loom provider doctor my_provider
+
+Where to install it:
+  $LOOM_CONFIG_DIR/providers/my_provider.json
+
+What to edit first:
+  1. id: stable lowercase provider id. Use a new id for local variants.
+  2. displayName: human-friendly name shown in Loom tools.
+  3. detect.candidates: command names Loom may find on the daemon host.
+  4. modes.print.command: normally "{{bin}}", meaning the detected command path.
+  5. modes.print.args: the exact argv order for the provider CLI.
+  6. models.default / models.choices: values shown in GUI and substituted into "{{model}}".
+  7. stdout: how Loom reads agent output. Use "text" for plain stdout, or a provider decoder for JSON/JSONL streams.
+
+Prompt flow in this template:
+  - Loom first composes standard prompt parts such as actor_context, agent_instructions, scope_bootstrap, runtime_context, and user_message.
+  - prompt.workspaceFiles declares optional files under the current agent workspace's .loom directory.
+  - The example reads .loom/persona.md when present and exposes it as the prompt part "workspace_file.persona".
+  - prompt.outputs.full joins the selected parts in the declared order.
+  - args finally passes "{{prompt.full}}" to the provider CLI.
+
+Workspace file rules:
+  - path is relative to the current agent workspace's .loom directory.
+  - optional=true means a missing file is skipped.
+  - optional=false makes the turn fail when the file is missing.
+  - maxBytes limits the single file size.
+  - The file only affects the provider if prompt.outputs references "workspace_file.<key>".
+
+Provider-specific examples:
+  loom provider example --claude
+  loom provider example --qoder
+  loom provider example --copilot
+  loom provider example --codex
+  loom provider example --opencode
+
+JSON template:
+
+```json
+{json_text}
+```
+"#
+    ))
 }
 
 fn read_and_resolve_manifest_file(path: &Path) -> Result<(ProviderManifest, serde_json::Value)> {
@@ -256,9 +318,29 @@ fn standard_provider_example() -> Value {
                 "transport": "command",
                 "command": "{bin}",
                 "prompt": {
+                    "workspaceFiles": [
+                        {
+                            "key": "persona",
+                            "path": "persona.md",
+                            "title": "System: Provider persona",
+                            "roleHint": "system",
+                            "optional": true,
+                            "maxBytes": 32768
+                        }
+                    ],
                     "outputs": {
                         "full": {
-                            "preset": "loom_full"
+                            "join": "\n\n",
+                            "include": [
+                                "actor_context",
+                                "agent_instructions",
+                                "workspace_file.persona",
+                                "bootstrap_memory",
+                                "scope_bootstrap",
+                                "turn_memory",
+                                "runtime_context",
+                                "user_message"
+                            ]
                         }
                     }
                 },
@@ -605,11 +687,32 @@ mod tests {
             .expect("example manifest");
 
         assert_eq!(manifest.id, "my_provider");
+        assert_eq!(
+            manifest.modes["print"]
+                .prompt
+                .as_ref()
+                .and_then(|prompt| prompt.workspace_files.first())
+                .map(|file| file.key.as_str()),
+            Some("persona")
+        );
         assert!(manifest.modes["print"]
             .args
             .iter()
             .any(|arg| matches!(arg, proto::methods::ProviderArgSpec::Literal(value) if value == "{prompt.full}")));
         std::fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn standard_provider_example_text_explains_workspace_files_and_contains_json() {
+        let text =
+            standard_provider_example_text(&standard_provider_example()).expect("example text");
+
+        assert!(text.contains("Provider manifest example"));
+        assert!(text.contains("loom --json provider example"));
+        assert!(text.contains(".loom/persona.md"));
+        assert!(text.contains("workspace_file.persona"));
+        assert!(text.contains("```json"));
+        assert!(text.contains("\"workspaceFiles\""));
     }
 
     #[test]

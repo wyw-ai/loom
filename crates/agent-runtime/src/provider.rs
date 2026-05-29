@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use proto::methods::{
     AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
@@ -17,12 +17,13 @@ use proto::methods::{
     ProviderDecoderCaptureSpec, ProviderDecoderEmitSpec, ProviderDecoderEventSpec,
     ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
     ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
-    ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
+    ProviderPromptRoleHint, ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource,
+    ProviderSessionSpec, ProviderWorkspaceFileSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::adapter::PromptPart;
+use crate::adapter::{PromptPart, PromptRoleHint};
 
 #[derive(Debug, Clone)]
 pub struct DetectedProvider {
@@ -380,8 +381,131 @@ pub fn render_prompt_outputs(
     Ok(outputs)
 }
 
+pub fn workspace_prompt_parts(
+    spec: Option<&ProviderPromptSpec>,
+    workspace: &Path,
+) -> Result<Vec<PromptPart>, String> {
+    let Some(spec) = spec else {
+        return Ok(Vec::new());
+    };
+    let mut parts = Vec::new();
+    for file in &spec.workspace_files {
+        validate_workspace_file_spec(file).map_err(|err| {
+            format!(
+                "workspace prompt file `{}` is invalid: {err}",
+                file.key.trim()
+            )
+        })?;
+        let loom_root = workspace.join(".loom");
+        let path = loom_root.join(Path::new(&file.path));
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && file.optional => continue,
+            Err(err) => {
+                return Err(format!(
+                    "read workspace prompt file `{}` at {}: {err}",
+                    file.key,
+                    path.display()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "workspace prompt file `{}` at {} must not be a symlink",
+                file.key,
+                path.display()
+            ));
+        }
+        let root_metadata = std::fs::symlink_metadata(&loom_root).map_err(|err| {
+            format!(
+                "read workspace prompt root {} for `{}`: {err}",
+                loom_root.display(),
+                file.key
+            )
+        })?;
+        if root_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "workspace prompt root {} for `{}` must not be a symlink",
+                loom_root.display(),
+                file.key
+            ));
+        }
+        if !root_metadata.is_dir() {
+            return Err(format!(
+                "workspace prompt root {} for `{}` is not a directory",
+                loom_root.display(),
+                file.key
+            ));
+        }
+        let canonical_root = std::fs::canonicalize(&loom_root).map_err(|err| {
+            format!(
+                "resolve workspace prompt root {} for `{}`: {err}",
+                loom_root.display(),
+                file.key
+            )
+        })?;
+        let canonical_path = std::fs::canonicalize(&path).map_err(|err| {
+            format!(
+                "resolve workspace prompt file `{}` at {}: {err}",
+                file.key,
+                path.display()
+            )
+        })?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(format!(
+                "workspace prompt file `{}` at {} resolves outside {}",
+                file.key,
+                path.display(),
+                loom_root.display()
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "workspace prompt file `{}` at {} is not a regular file",
+                file.key,
+                path.display()
+            ));
+        }
+        if metadata.len() > file.max_bytes {
+            return Err(format!(
+                "workspace prompt file `{}` at {} is {} bytes, above maxBytes {}",
+                file.key,
+                path.display(),
+                metadata.len(),
+                file.max_bytes
+            ));
+        }
+        let content = std::fs::read_to_string(&path).map_err(|err| {
+            format!(
+                "read workspace prompt file `{}` at {} as utf-8: {err}",
+                file.key,
+                path.display()
+            )
+        })?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        let title = file
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Workspace file: .loom/{}", file.path));
+        parts.push(PromptPart {
+            key: workspace_file_prompt_part_key(&file.key),
+            title: title.clone(),
+            rendered_content: format!("=== {title} ===\n{content}"),
+            content,
+            role_hint: provider_role_hint(file.role_hint),
+        });
+    }
+    Ok(parts)
+}
+
 fn default_prompt_outputs() -> ProviderPromptSpec {
     ProviderPromptSpec {
+        workspace_files: Vec::new(),
         outputs: BTreeMap::from([(
             "full".into(),
             ProviderPromptOutputSpec {
@@ -497,6 +621,10 @@ fn render_prompt_template(
 }
 
 fn is_prompt_part_placeholder(key: &str) -> bool {
+    is_builtin_prompt_part_placeholder(key) || key.starts_with("workspace_file.")
+}
+
+fn is_builtin_prompt_part_placeholder(key: &str) -> bool {
     !key.is_empty()
         && key
             .chars()
@@ -826,29 +954,33 @@ fn apply_prompt_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<()
     let obj = patch
         .as_object()
         .ok_or_else(|| "prompt patch must be an object".to_string())?;
-    let Some(outputs_patch) = obj.get("outputs") else {
-        return if obj.is_empty() {
-            Ok(())
-        } else {
-            Err("prompt patch must use outputs".into())
-        };
-    };
-    reject_unknown_keys(obj, &["outputs"], "prompt patch")?;
+    if obj.is_empty() {
+        return Ok(());
+    }
+    reject_unknown_keys(obj, &["outputs", "workspaceFiles"], "prompt patch")?;
     let prompt = base
         .entry("prompt")
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| "base prompt must be an object".to_string())?;
-    let outputs = prompt
-        .entry("outputs")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| "base prompt.outputs must be an object".to_string())?;
-    for (name, output) in outputs_patch
-        .as_object()
-        .ok_or_else(|| "prompt.outputs must be an object".to_string())?
-    {
-        outputs.insert(name.clone(), output.clone());
+    if let Some(workspace_files) = obj.get("workspaceFiles") {
+        if !workspace_files.is_array() {
+            return Err("prompt.workspaceFiles must be an array".into());
+        }
+        prompt.insert("workspaceFiles".into(), workspace_files.clone());
+    }
+    if let Some(outputs_patch) = obj.get("outputs") {
+        let outputs = prompt
+            .entry("outputs")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| "base prompt.outputs must be an object".to_string())?;
+        for (name, output) in outputs_patch
+            .as_object()
+            .ok_or_else(|| "prompt.outputs must be an object".to_string())?
+        {
+            outputs.insert(name.clone(), output.clone());
+        }
     }
     Ok(())
 }
@@ -1272,6 +1404,77 @@ fn valid_json_path_key(key: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
+fn validate_workspace_file_spec(file: &ProviderWorkspaceFileSpec) -> Result<(), String> {
+    validate_workspace_file_key(&file.key)?;
+    validate_workspace_file_path(&file.path)?;
+    if file.max_bytes == 0 {
+        return Err("maxBytes must be greater than zero".into());
+    }
+    if let Some(title) = file.title.as_deref() {
+        if title.contains('\0') {
+            return Err("title must not contain NUL bytes".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_file_key(key: &str) -> Result<(), String> {
+    if !is_workspace_file_key(key) {
+        return Err(format!(
+            "key `{key}` must start with a lowercase letter or digit and contain only lowercase letters, digits, `_`, or `-`"
+        ));
+    }
+    Ok(())
+}
+
+fn is_workspace_file_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+}
+
+fn validate_workspace_file_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if path.contains('\0') {
+        return Err("path must not contain NUL bytes".into());
+    }
+    if path.contains('\\') {
+        return Err("path must use `/` as the separator".into());
+    }
+    let path = Path::new(path);
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {
+                return Err("path must not contain `.` components".into());
+            }
+            Component::ParentDir => {
+                return Err("path must not contain `..` components".into());
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("path must be relative under .loom".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workspace_file_prompt_part_key(key: &str) -> String {
+    format!("workspace_file.{key}")
+}
+
+fn provider_role_hint(role_hint: Option<ProviderPromptRoleHint>) -> PromptRoleHint {
+    match role_hint {
+        Some(ProviderPromptRoleHint::User) => PromptRoleHint::User,
+        Some(ProviderPromptRoleHint::System) | None => PromptRoleHint::System,
+    }
+}
+
 fn validate_prompt_outputs(
     manifest: &ProviderManifest,
     mode_name: &str,
@@ -1280,6 +1483,22 @@ fn validate_prompt_outputs(
     let Some(prompt) = prompt else {
         return Ok(());
     };
+    let mut workspace_parts = HashSet::new();
+    for file in &prompt.workspace_files {
+        validate_workspace_file_spec(file).map_err(|err| {
+            format!(
+                "provider `{}` mode `{mode_name}` workspace file `{}`: {err}",
+                manifest.id, file.key
+            )
+        })?;
+        let part_key = workspace_file_prompt_part_key(&file.key);
+        if !workspace_parts.insert(part_key.clone()) {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` declares duplicate workspace prompt part `{part_key}`",
+                manifest.id
+            ));
+        }
+    }
     for (output_name, output) in &prompt.outputs {
         if let Some(preset) = output.preset.as_deref() {
             preset_parts(preset).map_err(|err| {
@@ -1293,7 +1512,7 @@ fn validate_prompt_outputs(
             if key == "full" {
                 continue;
             }
-            if !is_known_prompt_part(key) {
+            if !is_known_prompt_part(key) && !workspace_parts.contains(key) {
                 return Err(format!(
                     "provider `{}` mode `{mode_name}` prompt output `{output_name}` references unknown prompt part `{key}`",
                     manifest.id
@@ -1302,7 +1521,7 @@ fn validate_prompt_outputs(
         }
         if let Some(template) = output.template.as_deref() {
             for key in prompt_part_placeholders(template) {
-                if !is_known_prompt_part(&key) {
+                if !is_known_prompt_part(&key) && !workspace_parts.contains(&key) {
                     return Err(format!(
                         "provider `{}` mode `{mode_name}` prompt output `{output_name}` references unknown prompt part `{key}`",
                         manifest.id
@@ -1774,6 +1993,7 @@ fn command_exists(path: &Path) -> bool {
 
 fn base_prompt() -> ProviderPromptSpec {
     ProviderPromptSpec {
+        workspace_files: Vec::new(),
         outputs: BTreeMap::from([
             (
                 "system".into(),
@@ -1802,6 +2022,7 @@ fn base_prompt() -> ProviderPromptSpec {
 
 fn full_prompt() -> ProviderPromptSpec {
     ProviderPromptSpec {
+        workspace_files: Vec::new(),
         outputs: BTreeMap::from([(
             "full".into(),
             ProviderPromptOutputSpec {
@@ -2473,6 +2694,7 @@ mod tests {
         let parts = vec![prompt_part("actor_context", "actor context")];
         let outputs = render_prompt_outputs(
             Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
                 outputs: BTreeMap::from([(
                     "system".into(),
                     ProviderPromptOutputSpec {
@@ -2499,6 +2721,7 @@ mod tests {
         let parts = vec![prompt_part("actor_context", "actor context")];
         let outputs = render_prompt_outputs(
             Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
                 outputs: BTreeMap::from([(
                     "system".into(),
                     ProviderPromptOutputSpec {
@@ -2529,6 +2752,7 @@ mod tests {
         }];
         let outputs = render_prompt_outputs(
             Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
                 outputs: BTreeMap::from([
                     (
                         "with_title".into(),
@@ -2574,6 +2798,7 @@ mod tests {
         }];
         let outputs = render_prompt_outputs(
             Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
                 outputs: BTreeMap::from([(
                     "system".into(),
                     ProviderPromptOutputSpec {
@@ -2789,6 +3014,7 @@ mod tests {
                     "{bin}",
                     vec![lit("{prompt.full}")],
                     ProviderPromptSpec {
+                        workspace_files: Vec::new(),
                         outputs: BTreeMap::from([(
                             "full".into(),
                             ProviderPromptOutputSpec {
@@ -2806,6 +3032,236 @@ mod tests {
 
         let err = validate_manifest(&manifest).expect_err("unknown part should fail");
         assert!(err.contains("unknown prompt part `identity`"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_accepts_declared_workspace_prompt_part() {
+        let manifest = manifest(
+            "workspace_part",
+            "Workspace Part",
+            &["workspace-part"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    ProviderPromptSpec {
+                        workspace_files: vec![ProviderWorkspaceFileSpec {
+                            key: "persona".into(),
+                            path: "persona.md".into(),
+                            title: Some("System: Persona".into()),
+                            role_hint: Some(ProviderPromptRoleHint::System),
+                            optional: true,
+                            max_bytes: 32768,
+                        }],
+                        outputs: BTreeMap::from([(
+                            "full".into(),
+                            ProviderPromptOutputSpec {
+                                include: vec![
+                                    "actor_context".into(),
+                                    "workspace_file.persona".into(),
+                                    "user_message".into(),
+                                ],
+                                ..Default::default()
+                            },
+                        )]),
+                    },
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        validate_manifest(&manifest).expect("declared workspace prompt part should pass");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_undeclared_workspace_prompt_part_reference() {
+        let manifest = manifest(
+            "undeclared_workspace_part",
+            "Undeclared Workspace Part",
+            &["undeclared-workspace-part"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    ProviderPromptSpec {
+                        workspace_files: Vec::new(),
+                        outputs: BTreeMap::from([(
+                            "full".into(),
+                            ProviderPromptOutputSpec {
+                                include: vec!["workspace_file.persona".into()],
+                                ..Default::default()
+                            },
+                        )]),
+                    },
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("undeclared workspace part should fail");
+        assert!(
+            err.contains("unknown prompt part `workspace_file.persona`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_workspace_prompt_file_path_escape() {
+        let manifest = manifest(
+            "bad_workspace_file",
+            "Bad Workspace File",
+            &["bad-workspace-file"],
+            BTreeMap::from([(
+                "print".into(),
+                mode(
+                    "{bin}",
+                    vec![lit("{prompt.full}")],
+                    ProviderPromptSpec {
+                        workspace_files: vec![ProviderWorkspaceFileSpec {
+                            key: "persona".into(),
+                            path: "../persona.md".into(),
+                            title: None,
+                            role_hint: None,
+                            optional: true,
+                            max_bytes: 32768,
+                        }],
+                        outputs: BTreeMap::from([(
+                            "full".into(),
+                            ProviderPromptOutputSpec {
+                                include: vec!["workspace_file.persona".into()],
+                                ..Default::default()
+                            },
+                        )]),
+                    },
+                    "text",
+                    None,
+                ),
+            )]),
+            &[],
+        );
+
+        let err = validate_manifest(&manifest).expect_err("path escape should fail");
+        assert!(err.contains("path must not contain `..`"), "{err}");
+    }
+
+    #[test]
+    fn workspace_prompt_parts_read_declared_files() {
+        let workspace = temp_dir("workspace-prompt-parts");
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).expect("loom dir");
+        std::fs::write(loom_dir.join("persona.md"), "Be concise.").expect("persona");
+        let spec = ProviderPromptSpec {
+            workspace_files: vec![ProviderWorkspaceFileSpec {
+                key: "persona".into(),
+                path: "persona.md".into(),
+                title: Some("System: Persona".into()),
+                role_hint: Some(ProviderPromptRoleHint::System),
+                optional: true,
+                max_bytes: 32768,
+            }],
+            outputs: BTreeMap::new(),
+        };
+
+        let parts = workspace_prompt_parts(Some(&spec), &workspace).expect("workspace parts");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].key, "workspace_file.persona");
+        assert_eq!(parts[0].title, "System: Persona");
+        assert_eq!(parts[0].content, "Be concise.");
+        assert_eq!(
+            parts[0].rendered_content,
+            "=== System: Persona ===\nBe concise."
+        );
+        assert_eq!(parts[0].role_hint, PromptRoleHint::System);
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn workspace_prompt_parts_skip_optional_missing_and_fail_required_missing() {
+        let workspace = temp_dir("workspace-prompt-missing");
+        let mut spec = ProviderPromptSpec {
+            workspace_files: vec![ProviderWorkspaceFileSpec {
+                key: "persona".into(),
+                path: "persona.md".into(),
+                title: None,
+                role_hint: None,
+                optional: true,
+                max_bytes: 32768,
+            }],
+            outputs: BTreeMap::new(),
+        };
+
+        let parts = workspace_prompt_parts(Some(&spec), &workspace).expect("optional missing");
+        assert!(parts.is_empty());
+
+        spec.workspace_files[0].optional = false;
+        let err = workspace_prompt_parts(Some(&spec), &workspace)
+            .expect_err("required missing should fail");
+        assert!(
+            err.contains("read workspace prompt file `persona`"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_prompt_parts_reject_symlink() {
+        let workspace = temp_dir("workspace-prompt-symlink");
+        let loom_dir = workspace.join(".loom");
+        std::fs::create_dir_all(&loom_dir).expect("loom dir");
+        let target = workspace.join("outside.md");
+        std::fs::write(&target, "outside").expect("target");
+        std::os::unix::fs::symlink(&target, loom_dir.join("persona.md")).expect("symlink");
+        let spec = ProviderPromptSpec {
+            workspace_files: vec![ProviderWorkspaceFileSpec {
+                key: "persona".into(),
+                path: "persona.md".into(),
+                title: None,
+                role_hint: None,
+                optional: true,
+                max_bytes: 32768,
+            }],
+            outputs: BTreeMap::new(),
+        };
+
+        let err = workspace_prompt_parts(Some(&spec), &workspace).expect_err("symlink fails");
+        assert!(err.contains("must not be a symlink"), "{err}");
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_prompt_parts_reject_parent_symlink_escape() {
+        let workspace = temp_dir("workspace-prompt-parent-symlink");
+        let loom_dir = workspace.join(".loom");
+        let outside_dir = workspace.join("outside");
+        std::fs::create_dir_all(&loom_dir).expect("loom dir");
+        std::fs::create_dir_all(&outside_dir).expect("outside dir");
+        std::fs::write(outside_dir.join("persona.md"), "outside").expect("outside file");
+        std::os::unix::fs::symlink(&outside_dir, loom_dir.join("rules")).expect("symlink dir");
+        let spec = ProviderPromptSpec {
+            workspace_files: vec![ProviderWorkspaceFileSpec {
+                key: "persona".into(),
+                path: "rules/persona.md".into(),
+                title: None,
+                role_hint: None,
+                optional: true,
+                max_bytes: 32768,
+            }],
+            outputs: BTreeMap::new(),
+        };
+
+        let err =
+            workspace_prompt_parts(Some(&spec), &workspace).expect_err("parent symlink fails");
+        assert!(err.contains("resolves outside"), "{err}");
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]
@@ -3671,7 +4127,7 @@ mod tests {
             }"#,
         );
         assert!(
-            prompt_err.contains("prompt patch must use outputs"),
+            prompt_err.contains("prompt patch contains unknown field `outputsWrong`"),
             "{prompt_err}"
         );
     }

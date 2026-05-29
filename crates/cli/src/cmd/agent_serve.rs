@@ -3080,16 +3080,23 @@ async fn build_adapter_prompt(
         template_vars.insert("loom.trigger.id".into(), active.trigger_source_id.clone());
         template_vars.insert("loom.trigger.actor".into(), active.trigger_actor.clone());
     }
+    let mut parts = prompt.parts.clone();
+    let workspace_parts = agent_runtime::provider::workspace_prompt_parts(
+        state.transport.prompt.as_ref(),
+        &scope_paths.workspace,
+    )
+    .map_err(|e| anyhow!("load provider workspace prompt files: {e}"))?;
+    parts.extend(workspace_parts);
     let outputs = agent_runtime::provider::render_prompt_outputs(
         state.transport.prompt.as_ref(),
-        &prompt.parts,
+        &parts,
         &prompt.content,
     )
     .map_err(|e| anyhow!("render provider prompt outputs: {e}"))?;
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content: prompt.content.clone(),
-        parts: prompt.parts.clone(),
+        parts,
         outputs,
         model: state.current_model(),
         cwd: scope_paths.workspace,
@@ -6124,6 +6131,7 @@ mod tests {
 
         let raw_outputs = agent_runtime::provider::render_prompt_outputs(
             Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
                 outputs: BTreeMap::from([(
                     "raw".into(),
                     ProviderPromptOutputSpec {
@@ -6235,6 +6243,7 @@ mod tests {
 
         let outputs = agent_runtime::provider::render_prompt_outputs(
             Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
                 outputs: BTreeMap::from([(
                     "custom_user".into(),
                     ProviderPromptOutputSpec {

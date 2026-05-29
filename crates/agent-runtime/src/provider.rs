@@ -1708,6 +1708,8 @@ fn is_supported_runtime_template_var(name: &str) -> bool {
             | "paths.cwd"
             | "workspace.dir"
             | "agent.root"
+            | "agent.configDir"
+            | "agent.specPath"
             | "agent.profile"
             | "agent.workspace"
             | "agent.logs"
@@ -2211,7 +2213,7 @@ fn manifest(
 fn claude_manifest() -> ProviderManifest {
     let first_args = vec![
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         lit("--permission-mode"),
         lit("bypassPermissions"),
         lit("--output-format"),
@@ -2227,7 +2229,7 @@ fn claude_manifest() -> ProviderManifest {
     ];
     let resume_args = vec![
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         lit("--permission-mode"),
         lit("bypassPermissions"),
         lit("--output-format"),
@@ -2273,7 +2275,7 @@ fn claude_manifest() -> ProviderManifest {
 fn qoder_manifest() -> ProviderManifest {
     let first_args = vec![
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         lit("--yolo"),
         lit("--output-format"),
         lit("stream-json"),
@@ -2289,7 +2291,7 @@ fn qoder_manifest() -> ProviderManifest {
     ];
     let resume_args = vec![
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         lit("--yolo"),
         lit("--output-format"),
         lit("stream-json"),
@@ -2338,7 +2340,7 @@ fn qoder_manifest() -> ProviderManifest {
 fn copilot_manifest() -> ProviderManifest {
     let args = vec![
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         lit("--yolo"),
         lit("--output-format"),
         lit("json"),
@@ -2406,7 +2408,7 @@ fn codex_manifest() -> ProviderManifest {
         lit("-c"),
         lit("sandbox_workspace_write.network_access=true"),
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         when("model", vec![lit("--model"), lit("{model}")]),
         lit("{prompt.full}"),
     ];
@@ -2421,7 +2423,7 @@ fn codex_manifest() -> ProviderManifest {
         lit("-c"),
         lit("sandbox_workspace_write.network_access=true"),
         lit("--add-dir"),
-        lit("{loom.configDir}"),
+        lit("{agent.configDir}"),
         when("model", vec![lit("--model"), lit("{model}")]),
         lit("{prompt.full}"),
     ];
@@ -3680,6 +3682,8 @@ mod tests {
         assert!(transport.args.contains(&"--append-system-prompt".into()));
         assert!(transport.args.contains(&"{prompt.system}".into()));
         assert!(transport.args.contains(&"{prompt.user}".into()));
+        assert!(transport.args.contains(&"{agent.configDir}".into()));
+        assert!(!transport.args.contains(&"{loom.configDir}".into()));
         assert_eq!(
             transport.session.as_ref().and_then(|s| s.id_source),
             Some(CommandSessionIdSource::LoomUuid)
@@ -3688,6 +3692,25 @@ mod tests {
             transport.session.as_ref().and_then(|s| s.scope.as_deref()),
             Some("actor_scope")
         );
+    }
+
+    #[test]
+    fn builtins_default_add_dir_to_agent_config_dir() {
+        for provider_id in ["claude", "qoder", "copilot", "codex"] {
+            let manifest = builtin_provider_manifests()
+                .into_iter()
+                .find(|manifest| manifest.id == provider_id)
+                .expect("provider");
+            let rendered = serde_json::to_string(&manifest).expect("manifest json");
+            assert!(
+                rendered.contains("{agent.configDir}"),
+                "{provider_id} should expose only the current agent config dir by default"
+            );
+            assert!(
+                !rendered.contains("{loom.configDir}"),
+                "{provider_id} should not expose the daemon config dir by default"
+            );
+        }
     }
 
     #[test]

@@ -133,7 +133,7 @@ inventory 的是目标 daemon。即使 GUI 和 daemon 在同一台机器，也�
         }
       },
       "args": [
-        "--add-dir", "{loom.configDir}",
+        "--add-dir", "{agent.configDir}",
         "--permission-mode", "bypassPermissions",
         "--output-format", "stream-json",
         "--verbose",
@@ -397,6 +397,8 @@ Provider 的 argv/env/stdin 模板应支持这些运行时变量：
 {bin}                  检测到的可执行文件路径
 {prompt.<name>}        prompt.outputs 生成的命名 prompt，例如 system/user/full
 {loom.configDir}       目标 daemon 的配置目录；按 host/machine 隔离，不随 GUI 当前 server 切换
+{agent.configDir}      当前 agent 自己的配置目录，通常为 {loom.configDir}/agents/<actor_id>
+{agent.specPath}       当前 agent 的 spec.json，通常为 {agent.configDir}/spec.json
 {loom.server}          server websocket URL
 {loom.actor}           actor id
 {loom.scope.id}        当前 channel/thread scope id
@@ -410,6 +412,9 @@ Provider 的 argv/env/stdin 模板应支持这些运行时变量：
                        也可能是从 Provider 输出捕获的 id
 {paths.cwd}            本 turn 工作目录
 ```
+
+daemon 启动 agent 前必须确保 `{agent.configDir}` 已存在；这个目录是官方
+Provider 默认开放给 sandbox CLI 的最小配置视图。
 
 模板展开必须 argv-safe：JSON 数组里的每个元素展开后仍然是一个 argv token。
 Loom 不应该把 argv 拼成 shell 字符串再执行。
@@ -672,7 +677,7 @@ Claude Code 支持非交互 `-p/--print`、`--output-format stream-json`、
 ```json
 {
   "args": [
-    "--add-dir", "{loom.configDir}",
+    "--add-dir", "{agent.configDir}",
     "--permission-mode", "bypassPermissions",
     "--output-format", "stream-json",
     "--verbose",
@@ -700,7 +705,7 @@ Qoder CLI 的 print 接口与 Claude Code 接近，支持 `-p/--print`、`--outp
 ```json
 {
   "args": [
-    "--add-dir", "{loom.configDir}",
+    "--add-dir", "{agent.configDir}",
     "--permission-mode", "bypass_permissions",
     "--output-format", "stream-json",
     { "when": "model", "args": ["--model", "{model}"] },
@@ -713,7 +718,7 @@ Qoder CLI 的 print 接口与 Claude Code 接近，支持 `-p/--print`、`--outp
     "idSource": "provider_capture",
     "scope": "actor_scope",
     "resumeArgs": [
-      "--add-dir", "{loom.configDir}",
+      "--add-dir", "{agent.configDir}",
       "--permission-mode", "bypass_permissions",
       "--output-format", "stream-json",
       { "when": "model", "args": ["--model", "{model}"] },
@@ -749,7 +754,7 @@ Session 建议用 Loom 生成的稳定 UUID，通过 `--resume {session.id}` 传
     }
   },
   "args": [
-    "--add-dir", "{loom.configDir}",
+    "--add-dir", "{agent.configDir}",
     "--yolo",
     "--output-format", "json",
     "--stream", "off",
@@ -797,7 +802,7 @@ Unix socket；这个行为必须进入 manifest/env。
     "--json",
     "--sandbox", "danger-full-access",
     "-c", "sandbox_workspace_write.network_access=true",
-    "--add-dir", "{loom.configDir}",
+    "--add-dir", "{agent.configDir}",
     { "when": "model", "args": ["--model", "{model}"] },
     "{prompt.full}"
   ],
@@ -813,7 +818,7 @@ Unix socket；这个行为必须进入 manifest/env。
       "--json",
       "--sandbox", "danger-full-access",
       "-c", "sandbox_workspace_write.network_access=true",
-      "--add-dir", "{loom.configDir}",
+      "--add-dir", "{agent.configDir}",
       { "when": "model", "args": ["--model", "{model}"] },
       "{prompt.full}"
     ]
@@ -957,7 +962,8 @@ provider id。
 ## 与 AgentSpec / `spec.json` 的边界
 
 Agent 自己的 `spec.json` 位于目标 daemon 管辖的
-`{loom.configDir}/agents/<actor_id>/spec.json`。这个文件描述的是一个具体 agent
+`{agent.specPath}`（通常是 `{loom.configDir}/agents/<actor_id>/spec.json`）。
+这个文件描述的是一个具体 agent
 actor；Provider manifest 描述的是一类 CLI/runtime 如何接入 Loom。两者不能继续混在
 一起。server 只能保存 daemon inventory 快照，GUI 只能展示快照或发 command；任何
 GUI/server 侧副本都不能参与运行时 resolve。
@@ -1054,7 +1060,7 @@ daemon 内部应收敛成三类事实源：
 {loom.configDir}/providers/<provider_id>.json
   ProviderManifest。描述 Provider 接入规则，可被多个 agent 复用。
 
-{loom.configDir}/agents/<actor_id>/spec.json
+{agent.specPath} ({loom.configDir}/agents/<actor_id>/spec.json)
   AgentSpec。描述具体 agent actor，引用 providerRef。
 
 {loom.dataRoot}/runtime/...
@@ -1202,8 +1208,9 @@ Provider manifest 使用前必须校验：
 - command mode 下至少一个 `{prompt.<name>}` 必须出现在
   args/stdin/env 中；如果同一个组合输出被多处引用，必须显式声明允许重复发送。
   ACP mode 例外。
-- 对需要访问 Loom config 的 sandbox CLI，应建议或要求
-  `--add-dir {loom.configDir}`。
+- 官方 Provider 对 sandbox CLI 默认只应开放当前 agent 的配置目录：
+  `--add-dir {agent.configDir}`。`{loom.configDir}` 仍可用于自定义高级 Provider，
+  但表示有意开放 daemon 级配置。
 - parser 每行/每个文档的提取工作必须有边界。
 - regex parser 要限制输入大小，避免灾难性回溯。
 
@@ -1333,7 +1340,7 @@ local Provider 互不污染。`loom provider list` 在 daemon/CLI 本机执行�
    `AgentProviderSpec.provider + transport + actors[]`、`AgentSpec.transport` 的依赖。
    如必须承接历史安装，只提供显式离线导入命令，不做 runtime 双读或 merge。
 3. 增加最终版 AgentSpec `providerRef`，daemon 创建/编辑 agent 时写入自己的
-   `{loom.configDir}/agents/<actor_id>/spec.json`；GUI 只发 machine command 并等待
+   `{agent.specPath}`；GUI 只发 machine command 并等待
    daemon inventory 刷新。
 4. 增加 `ProviderManifest`、`ProviderMode`、`ProviderModePatch`、
    `ProviderRuntimePlan` 类型，以及校验测试。

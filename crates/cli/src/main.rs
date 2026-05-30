@@ -1034,6 +1034,22 @@ enum MessageCmd {
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
+    /// Ask one or more actors/groups to act and wake agent recipients.
+    Ask {
+        /// Recipients to ask, for example @actor_id, @all, @agents, @humans, or group:<id>.
+        #[arg(required = true)]
+        recipients: Vec<String>,
+        /// Destination target, for example #chan_123 or #chan_123:msg_456.
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        /// Only send if this is still the latest message in the target scope.
+        #[arg(long = "if-latest")]
+        if_latest: Option<String>,
+        #[arg(long = "attachment-id")]
+        attachment_ids: Vec<String>,
+    },
     /// Read messages from #channel, #channel:root-message, or dm:@actor.
     Read {
         #[arg(long)]
@@ -1822,6 +1838,24 @@ async fn main() -> Result<()> {
                 )
                 .await?
             }
+            MessageCmd::Ask {
+                recipients,
+                target,
+                text,
+                if_latest,
+                attachment_ids,
+            } => {
+                cmd::message::ask(
+                    client,
+                    cfg.actor_id,
+                    target,
+                    recipients,
+                    text,
+                    if_latest,
+                    attachment_ids,
+                )
+                .await?
+            }
             MessageCmd::Read {
                 target,
                 limit,
@@ -2578,6 +2612,45 @@ mod tests {
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
                 assert_eq!(text.as_deref(), Some("please review"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_ask_accepts_multiple_recipients_and_target_options() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "message",
+            "ask",
+            "@actor_a",
+            "@actor_b",
+            "@all",
+            "--target",
+            "#chan_123:msg_root",
+            "--if-latest",
+            "msg_latest",
+            "--text",
+            "please respond",
+        ])
+        .expect("parse message ask");
+
+        match args.cmd {
+            Cmd::Message {
+                sub:
+                    MessageCmd::Ask {
+                        recipients,
+                        target,
+                        text,
+                        if_latest,
+                        ..
+                    },
+            } => {
+                assert_eq!(recipients, vec!["@actor_a", "@actor_b", "@all"]);
+                assert_eq!(target.as_deref(), Some("#chan_123:msg_root"));
+                assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(text.as_deref(), Some("please respond"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

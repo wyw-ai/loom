@@ -64,6 +64,7 @@ import {
   type MachineAgentProviderInfo,
   type MachineInfo,
   type Message,
+  type MessageMention,
   type Run,
   type ScopeRef,
   type StreamUpdate,
@@ -3284,7 +3285,11 @@ function MessageRow({
             )}
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown actors={actors} body={displayBody} />
+            <MessageMarkdown
+              actors={actors}
+              body={displayBody}
+              mentions={displayBody === message.body ? message.mentions : []}
+            />
           </div>
           {attachments.length > 0 && (
             <AttachmentStack attachments={attachments} />
@@ -3996,7 +4001,11 @@ function ThreadConversationMessage({
             </span>
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown actors={actors} body={displayBody} />
+            <MessageMarkdown
+              actors={actors}
+              body={displayBody}
+              mentions={displayBody === message.body ? message.mentions : []}
+            />
           </div>
           {pollChoices.length > 0 && (
             <PollCard choices={pollChoices} disabled />
@@ -4056,9 +4065,11 @@ function ThreadConversationMessage({
 function MessageMarkdown({
   actors,
   body,
+  mentions = [],
 }: {
   actors: Record<string, Actor>;
   body: string;
+  mentions?: MessageMention[];
 }) {
   const components: Components = {
     a({ href, children, node: _node, ...props }) {
@@ -4083,7 +4094,10 @@ function MessageMarkdown({
   };
 
   return (
-    <ReactMarkdown remarkPlugins={[actorMentionRemarkPlugin(actors)]} components={components}>
+    <ReactMarkdown
+      remarkPlugins={[actorMentionRemarkPlugin(actors, mentions)]}
+      components={components}
+    >
       {body}
     </ReactMarkdown>
   );
@@ -7577,12 +7591,16 @@ type MarkdownNode = {
 
 const actorMentionUrlPrefix = "https://loom.local/actors/";
 const actorMentionPattern =
-  /@((?:actor_(?:agent|human|service)_|actor_)[A-Za-z0-9_:-]+)/g;
+  /@([^\s,.;:!?()[\]{}<>"'`]+)/g;
 
-function actorMentionRemarkPlugin(actors: Record<string, Actor>) {
+function actorMentionRemarkPlugin(
+  actors: Record<string, Actor>,
+  mentions: MessageMention[] = [],
+) {
+  const explicitActorMentions = actorMentionLookup(mentions);
   return function transformActorMentions() {
     return (tree: MarkdownNode) => {
-      transformMarkdownTextMentions(tree, actors);
+      transformMarkdownTextMentions(tree, actors, explicitActorMentions);
     };
   };
 }
@@ -7590,6 +7608,7 @@ function actorMentionRemarkPlugin(actors: Record<string, Actor>) {
 function transformMarkdownTextMentions(
   node: MarkdownNode,
   actors: Record<string, Actor>,
+  explicitActorMentions: Map<string, string>,
 ) {
   if (node.type === "link" || node.type === "linkReference") return;
   if (!node.children) return;
@@ -7597,20 +7616,21 @@ function transformMarkdownTextMentions(
   for (let index = 0; index < node.children.length; index += 1) {
     const child = node.children[index];
     if (child.type === "text" && typeof child.value === "string") {
-      const replacement = actorMentionNodes(child.value, actors);
+      const replacement = actorMentionNodes(child.value, actors, explicitActorMentions);
       if (replacement) {
         node.children.splice(index, 1, ...replacement);
         index += replacement.length - 1;
       }
       continue;
     }
-    transformMarkdownTextMentions(child, actors);
+    transformMarkdownTextMentions(child, actors, explicitActorMentions);
   }
 }
 
 function actorMentionNodes(
   value: string,
   actors: Record<string, Actor>,
+  explicitActorMentions: Map<string, string>,
 ): MarkdownNode[] | null {
   const nodes: MarkdownNode[] = [];
   let lastIndex = 0;
@@ -7618,7 +7638,9 @@ function actorMentionNodes(
   actorMentionPattern.lastIndex = 0;
 
   for (const match of value.matchAll(actorMentionPattern)) {
-    const actorId = match[1];
+    const token = match[1];
+    const actorId = actorIdForMentionToken(token, actors, explicitActorMentions);
+    if (!actorId) continue;
     const actor = actors[actorId];
     if (!actor || match.index === undefined) continue;
 
@@ -7640,6 +7662,39 @@ function actorMentionNodes(
     nodes.push({ type: "text", value: value.slice(lastIndex) });
   }
   return nodes;
+}
+
+function actorMentionLookup(mentions: MessageMention[]) {
+  const lookup = new Map<string, string>();
+  for (const mention of mentions) {
+    if (mention.kind !== "actor") continue;
+    const display = mention.display.trim();
+    if (!display) continue;
+    lookup.set(normalizeMentionToken(display), mention.actorOrGroupId);
+  }
+  return lookup;
+}
+
+function actorIdForMentionToken(
+  token: string,
+  actors: Record<string, Actor>,
+  explicitActorMentions: Map<string, string>,
+) {
+  const key = normalizeMentionToken(token);
+  if (key === "all" || key === "agents" || key === "humans") return null;
+  const explicitActorId = explicitActorMentions.get(key);
+  if (explicitActorId) return explicitActorId;
+  return Object.values(actors).find((actor) => {
+    return (
+      normalizeMentionToken(actor.id) === key ||
+      normalizeMentionToken(displayName(actor)) === key ||
+      normalizeMentionToken(shortActorAlias(actor.id)) === key
+    );
+  })?.id ?? null;
+}
+
+function normalizeMentionToken(value: string) {
+  return value.trim().replace(/^@+/, "").toLowerCase();
 }
 
 function actorMentionUrl(actorId: string) {

@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,6 +46,8 @@ use crate::provider::ProviderRuntimeEvent;
 use crate::usage::extract_token_usage_from_text;
 
 #[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 enum ProcessOutput {
@@ -61,6 +63,37 @@ enum ProcessOutput {
 struct InFlight {
     pid: Option<u32>,
     cancel_requested: bool,
+    running: bool,
+}
+
+struct RunSlotGuard {
+    slot: Arc<Mutex<InFlight>>,
+}
+
+impl RunSlotGuard {
+    fn acquire(slot: Arc<Mutex<InFlight>>, scope: &ScopeRef) -> Result<Self, String> {
+        let mut state = slot.lock();
+        if state.running {
+            return Err(format!(
+                "command transport session already in flight for {}",
+                scope_label(scope)
+            ));
+        }
+        state.running = true;
+        state.pid = None;
+        state.cancel_requested = false;
+        drop(state);
+        Ok(Self { slot })
+    }
+}
+
+impl Drop for RunSlotGuard {
+    fn drop(&mut self) {
+        let mut state = self.slot.lock();
+        state.pid = None;
+        state.cancel_requested = false;
+        state.running = false;
+    }
 }
 
 /// Snapshot of the bits of `AgentTransport` the command adapter cares about.
@@ -261,9 +294,6 @@ impl Adapter for CommandAdapter {
         let sender = self.sender()?;
         let cfg = self.cfg.clone();
         let slot = self.slot_for(&prompt.scope.id);
-        // Reset cancel flag for this scope's new prompt; old PID is already
-        // gone (cleared after the previous wait).
-        slot.lock().cancel_requested = false;
         // Detach the command turn so the actor worker can keep processing
         // other scopes while a long-running provider command is active. The
         // blocking worker reports completion through AdapterEvent::Finished.
@@ -369,6 +399,39 @@ fn run_prompt(
     slot: Arc<Mutex<InFlight>>,
 ) -> Result<(), String> {
     let scope = prompt.scope.clone();
+    let _run_slot = match RunSlotGuard::acquire(slot.clone(), &scope) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
+                message: e.clone(),
+            });
+            let _ = sender.send(AdapterEvent::Finished {
+                scope: Some(scope.clone()),
+                success: false,
+                summary: e.clone(),
+                usage: None,
+            });
+            return Ok(());
+        }
+    };
+    let _session_lock = match acquire_session_lock(&cfg, &scope) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let message = format!("command adapter session lock error: {e}");
+            let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
+                message: message.clone(),
+            });
+            let _ = sender.send(AdapterEvent::Finished {
+                scope: Some(scope.clone()),
+                success: false,
+                summary: message.clone(),
+                usage: None,
+            });
+            return Err(message);
+        }
+    };
     let content = prompt.content.clone();
     let command_signature = command_signature_for_prompt(&cfg, &prompt);
     let session = load_session(&cfg, &scope);
@@ -521,6 +584,17 @@ fn run_prompt(
         let _ = delete_session(&cfg, &scope);
         tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
             "command transport: dropped stale session after resume failure");
+    } else if !is_first_run
+        && !retried_as_first_run
+        && outcome.exit_code != 0
+        && looks_like_signed_thinking_replay_error(&outcome.stderr, &outcome.stdout)
+    {
+        // Claude Code can occasionally persist a transcript tail whose signed
+        // thinking blocks cannot be replayed into Anthropic's next request. We
+        // do not edit Claude's JSONL; we only stop reusing this session id.
+        let _ = delete_session(&cfg, &scope);
+        tracing::warn!(actor = %cfg.actor_id, scope = %scope.id,
+            "command transport: dropped Claude session after signed-thinking replay error");
     } else if !is_first_run && !retried_as_first_run && outcome.exit_code == 0 {
         if let Some(sid) = resume_session_id.as_deref() {
             if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
@@ -2188,6 +2262,91 @@ fn session_scope(cfg: &CommandConfig) -> &str {
         .unwrap_or("actor_scope")
 }
 
+fn scope_label(scope: &ScopeRef) -> String {
+    let kind = match scope.kind {
+        proto::types::ScopeKind::Thread => "thread",
+        proto::types::ScopeKind::Channel => "channel",
+    };
+    format!("{kind}:{}", scope.id)
+}
+
+fn session_lock_path(cfg: &CommandConfig, scope: &ScopeRef) -> Option<PathBuf> {
+    let path = session_path(cfg, scope)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.json");
+    Some(path.with_file_name(format!("{file_name}.lock")))
+}
+
+#[cfg(unix)]
+struct SessionLockGuard {
+    file: Option<std::fs::File>,
+}
+
+#[cfg(not(unix))]
+struct SessionLockGuard;
+
+#[cfg(unix)]
+fn acquire_session_lock(cfg: &CommandConfig, scope: &ScopeRef) -> Result<SessionLockGuard, String> {
+    let Some(path) = session_lock_path(cfg, scope) else {
+        return Ok(SessionLockGuard { file: None });
+    };
+    acquire_lock_file(&path)
+}
+
+#[cfg(unix)]
+fn acquire_lock_file(path: &Path) -> Result<SessionLockGuard, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create session lock dir `{}`: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("failed to open session lock `{}`: {e}", path.display()))?;
+
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(format!(
+            "failed to lock session `{}`: {err}",
+            path.display()
+        ));
+    }
+
+    Ok(SessionLockGuard { file: Some(file) })
+}
+
+#[cfg(not(unix))]
+fn acquire_session_lock(
+    _cfg: &CommandConfig,
+    _scope: &ScopeRef,
+) -> Result<SessionLockGuard, String> {
+    Ok(SessionLockGuard)
+}
+
+#[cfg(unix)]
+impl Drop for SessionLockGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 fn load_session(cfg: &CommandConfig, scope: &ScopeRef) -> Option<SessionRecord> {
     let path = session_path(cfg, scope)?;
     let text = std::fs::read_to_string(&path).ok()?;
@@ -2266,6 +2425,14 @@ fn looks_like_session_lost(stderr: &str, stdout: &str) -> bool {
         || s.contains("unknown session")
         || s.contains("no such session")
         || s.contains("no conversation found with session id")
+}
+
+fn looks_like_signed_thinking_replay_error(stderr: &str, stdout: &str) -> bool {
+    let s = format!("{stderr}\n{stdout}").to_ascii_lowercase();
+    (s.contains("thinking") || s.contains("redacted_thinking"))
+        && s.contains("latest assistant message")
+        && s.contains("cannot be modified")
+        && s.contains("original response")
 }
 
 // ---------------- first_run_capture ----------------
@@ -3736,6 +3903,33 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_signed_thinking_replay_error_matches_claude_400() {
+        let stderr = "API Error: 400 messages.7.content.3: thinking or \
+                      redacted_thinking blocks in the latest assistant message \
+                      cannot be modified. These blocks must remain as they were \
+                      in the original response.";
+
+        assert!(looks_like_signed_thinking_replay_error(stderr, ""));
+        assert!(!looks_like_signed_thinking_replay_error(
+            "API Error: 400 unrelated provider error",
+            ""
+        ));
+    }
+
+    #[test]
+    fn run_slot_guard_rejects_concurrent_prompt_for_same_scope() {
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+        let scope = scope();
+        let guard = RunSlotGuard::acquire(slot.clone(), &scope).expect("first acquire");
+
+        assert!(slot.lock().running);
+        assert!(RunSlotGuard::acquire(slot.clone(), &scope).is_err());
+
+        drop(guard);
+        assert!(!slot.lock().running);
+    }
+
+    #[test]
     fn session_path_distinguishes_thread_and_channel() {
         let cfg = cfg();
         let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same")).unwrap();
@@ -3937,6 +4131,29 @@ mod tests {
             }
         }
         assert_eq!(texts, vec!["sid_arg_specs\n"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn signed_thinking_replay_error_drops_saved_resume_session() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "sh".into();
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.resume_args = Some(vec![
+            "-c".into(),
+            "printf '%s\\n' 'API Error: 400 messages.7.content.3: thinking or redacted_thinking blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.' >&2; exit 1".into(),
+        ]);
+        let request = prompt("ignored");
+        let signature = command_signature_for_prompt(&cfg, &request);
+        save_session(&cfg, &request.scope, "bad_sid", &signature).expect("save session");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), request.clone(), tx, slot).expect("run prompt");
+
+        assert!(load_session(&cfg, &request.scope).is_none());
         std::fs::remove_dir_all(root).ok();
     }
 

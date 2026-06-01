@@ -1,0 +1,113 @@
+{
+  "detect": {
+    "candidates": [
+      "claude"
+    ]
+  },
+  "displayName": "Claude Code",
+  "id": "claude",
+  "models": {
+    "choices": [
+      {
+        "id": "sonnet",
+        "label": "Sonnet"
+      },
+      {
+        "id": "opus",
+        "label": "Opus"
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "label": "Claude Sonnet 4.6"
+      },
+      {
+        "id": "claude-opus-4-7",
+        "label": "Claude Opus 4.7"
+      },
+      {
+        "id": "claude-haiku-4-5",
+        "label": "Claude Haiku 4.5"
+      }
+    ],
+    "default": "sonnet"
+  },
+  "modes": {
+    "print": {
+      "args": [
+        "--add-dir",
+        "{agent.configDir}",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "{session.id}",
+        {
+          "args": [
+            "--model",
+            "{model}"
+          ],
+          "when": "model"
+        },
+        "--append-system-prompt",
+        "{prompt.system}",
+        "-p",
+        "{prompt.user}"
+      ],
+      "command": "{bin}",
+      "prompt": {
+        "outputs": {
+          "full": {
+            "include": [],
+            "preset": "loom_full",
+            "required": []
+          },
+          "system": {
+            "include": [],
+            "preset": "loom_system",
+            "required": []
+          },
+          "user": {
+            "include": [],
+            "preset": "loom_turn",
+            "required": []
+          }
+        }
+      },
+      "session": {
+        "idSource": "loom_uuid",
+        "resumeArgs": [
+          "--add-dir",
+          "{agent.configDir}",
+          "--permission-mode",
+          "bypassPermissions",
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--resume",
+          "{session.id}",
+          {
+            "args": [
+              "--model",
+              "{model}"
+            ],
+            "when": "model"
+          },
+          "--append-system-prompt",
+          "{prompt.system}",
+          "-p",
+          "{prompt.user}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "events": [],
+        "format": "builtin",
+        "name": "claude_stream_json"
+      },
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

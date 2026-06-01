@@ -1,12 +1,12 @@
 {
   "actor": {
-    "id": "actor_codex",
+    "id": "actor_copilot",
     "kind": "agent",
-    "displayName": "Codex"
+    "displayName": "Copilot"
   },
   "instructions": "Use Loom message commands for visible replies and handoffs. Keep work scoped to the current channel or thread.",
   "providerRef": {
-    "id": "codex",
+    "id": "copilot",
     "mode": "print",
     "model": "gpt-5.5"
   },

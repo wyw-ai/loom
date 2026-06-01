@@ -1,0 +1,113 @@
+{
+  "detect": {
+    "candidates": [
+      "codex",
+      "codexcli"
+    ]
+  },
+  "displayName": "Codex CLI",
+  "id": "codex",
+  "models": {
+    "choices": [
+      {
+        "id": "gpt-5.5",
+        "label": "GPT-5.5"
+      },
+      {
+        "id": "gpt-5.4",
+        "label": "GPT-5.4"
+      },
+      {
+        "id": "gpt-5.4-mini",
+        "label": "GPT-5.4 Mini"
+      },
+      {
+        "id": "gpt-5.3-codex",
+        "label": "GPT-5.3 Codex"
+      },
+      {
+        "id": "gpt-5.3-codex-spark",
+        "label": "GPT-5.3 Codex Spark"
+      },
+      {
+        "id": "gpt-5.2",
+        "label": "GPT-5.2"
+      }
+    ],
+    "default": "gpt-5.5"
+  },
+  "modes": {
+    "print": {
+      "args": [
+        "exec",
+        "--skip-git-repo-check",
+        "--json",
+        "--sandbox",
+        "danger-full-access",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+        "--add-dir",
+        "{agent.configDir}",
+        {
+          "args": [
+            "--model",
+            "{model}"
+          ],
+          "when": "model"
+        },
+        "{prompt.full}"
+      ],
+      "command": "{bin}",
+      "env": {
+        "LOOM_NO_DAEMON": "1"
+      },
+      "prompt": {
+        "outputs": {
+          "full": {
+            "include": [],
+            "preset": "loom_full",
+            "required": []
+          }
+        }
+      },
+      "session": {
+        "idSource": "provider_capture",
+        "resumeArgs": [
+          "exec",
+          "resume",
+          "{session.id}",
+          "--skip-git-repo-check",
+          "--json",
+          "--sandbox",
+          "danger-full-access",
+          "-c",
+          "sandbox_workspace_write.network_access=true",
+          "--add-dir",
+          "{agent.configDir}",
+          {
+            "args": [
+              "--model",
+              "{model}"
+            ],
+            "when": "model"
+          },
+          "{prompt.full}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "capture": {
+          "session": {
+            "mode": "lastNonEmpty",
+            "path": "$.session_id"
+          }
+        },
+        "events": [],
+        "format": "builtin",
+        "name": "codex_stream_json"
+      },
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

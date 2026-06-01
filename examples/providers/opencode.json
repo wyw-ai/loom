@@ -1,0 +1,147 @@
+{
+  "detect": {
+    "candidates": [
+      "opencode"
+    ]
+  },
+  "displayName": "OpenCode",
+  "id": "opencode",
+  "models": {
+    "choices": [
+      {
+        "id": "opencode/big-pickle",
+        "label": "OpenCode Big Pickle"
+      },
+      {
+        "id": "opencode/deepseek-v4-flash-free",
+        "label": "OpenCode DeepSeek V4 Flash Free"
+      },
+      {
+        "id": "opencode/mimo-v2.5-free",
+        "label": "OpenCode Mimo V2.5 Free"
+      },
+      {
+        "id": "opencode/nemotron-3-super-free",
+        "label": "OpenCode Nemotron 3 Super Free"
+      }
+    ],
+    "default": "opencode/big-pickle"
+  },
+  "modes": {
+    "print": {
+      "args": [
+        "run",
+        "--dangerously-skip-permissions",
+        "--format",
+        "json",
+        {
+          "args": [
+            "--model",
+            "{model}"
+          ],
+          "when": "model"
+        },
+        {
+          "args": [
+            "--variant",
+            "{reasoningEffort}"
+          ],
+          "when": "reasoningEffort"
+        },
+        "{prompt.full}"
+      ],
+      "command": "{bin}",
+      "env": {
+        "XDG_CACHE_HOME": "{agent.profile}/opencode/cache",
+        "XDG_DATA_HOME": "{agent.profile}/opencode/data",
+        "XDG_STATE_HOME": "{agent.profile}/opencode/state"
+      },
+      "prompt": {
+        "outputs": {
+          "full": {
+            "include": [],
+            "preset": "loom_full",
+            "required": []
+          }
+        }
+      },
+      "session": {
+        "idSource": "provider_capture",
+        "resumeArgs": [
+          "run",
+          "--dangerously-skip-permissions",
+          "--format",
+          "json",
+          "--session",
+          "{session.id}",
+          {
+            "args": [
+              "--model",
+              "{model}"
+            ],
+            "when": "model"
+          },
+          {
+            "args": [
+              "--variant",
+              "{reasoningEffort}"
+            ],
+            "when": "reasoningEffort"
+          },
+          "{prompt.full}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "capture": {
+          "session": {
+            "mode": "lastNonEmpty",
+            "path": "$.sessionID"
+          }
+        },
+        "events": [
+          {
+            "emit": {
+              "input": "$.part.state.input",
+              "toolName": "$.part.tool",
+              "type": "tool_use"
+            },
+            "when": {
+              "all": [],
+              "any": [],
+              "equals": "tool_use",
+              "path": "$.type"
+            }
+          },
+          {
+            "emit": {
+              "message": "$.error.data.message",
+              "type": "error"
+            },
+            "when": {
+              "all": [],
+              "any": [],
+              "equals": "error",
+              "path": "$.type"
+            }
+          }
+        ],
+        "format": "jsonl",
+        "reduce": {
+          "finalText": {
+            "mode": "lastNonEmpty",
+            "path": "$.part.text",
+            "when": {
+              "all": [],
+              "any": [],
+              "equals": "text",
+              "path": "$.type"
+            }
+          }
+        }
+      },
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

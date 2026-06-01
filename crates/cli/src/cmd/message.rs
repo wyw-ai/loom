@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
 use proto::types::{AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, MessageIntent};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::render;
@@ -27,16 +27,7 @@ pub async fn send(
         bail!("use either --to for global DM or --private-to for same-scope private delivery, not both");
     }
     let target = resolve_send_target(client.as_ref(), target, to, !private_to.is_empty()).await?;
-    let body = match text {
-        Some(t) => t,
-        None => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .context("read stdin")?;
-            buf
-        }
-    };
+    let body = read_message_body(text)?;
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
@@ -82,6 +73,65 @@ pub async fn send(
         println!("message {}", res.message.id);
     }
     Ok(())
+}
+
+pub async fn ask(
+    client: Arc<Client>,
+    _actor_id: String,
+    target: Option<String>,
+    recipients: Vec<String>,
+    text: Option<String>,
+    if_latest: Option<String>,
+    attachment_ids: Vec<String>,
+) -> Result<()> {
+    let target = resolve_send_target(client.as_ref(), target, None, false).await?;
+    let body = read_message_body(text)?;
+    if body.trim().is_empty() && attachment_ids.is_empty() {
+        bail!("message body is empty");
+    }
+    let params = build_ask_params(target, recipients, body, if_latest, attachment_ids)?;
+    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("message {}", res.message.id);
+    }
+    Ok(())
+}
+
+fn read_message_body(text: Option<String>) -> Result<String> {
+    match text {
+        Some(t) => Ok(t),
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read stdin")?;
+            Ok(buf)
+        }
+    }
+}
+
+fn build_ask_params(
+    target: String,
+    recipients: Vec<String>,
+    body: String,
+    if_latest: Option<String>,
+    attachment_ids: Vec<String>,
+) -> Result<Value> {
+    let audience = normalize_audience_refs(recipients)?;
+    let mut params = json!({
+        "target": target,
+        "body": body,
+        "attachments": attachment_ids,
+        "audience": audience,
+        "intent": MessageIntent::Ask,
+        "deliveryPolicy": DeliveryPolicy::WakeAgent,
+    });
+    if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
+        params["ifLatestMessageId"] = json!(if_latest);
+    }
+    Ok(params)
 }
 
 async fn resolve_send_target(
@@ -173,6 +223,55 @@ fn normalize_actor_ids(raw_values: Vec<String>) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn normalize_audience_refs(raw_values: Vec<String>) -> Result<Vec<AudienceRef>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for raw in raw_values {
+        for part in raw.split(',') {
+            let mut value = part.trim();
+            if let Some(rest) = value.strip_prefix('@') {
+                value = rest.trim();
+            }
+            if value.is_empty() {
+                continue;
+            }
+            let lower = value.to_ascii_lowercase();
+            let (kind, id) = match lower.as_str() {
+                "all" => (AudienceKind::All, "all".to_string()),
+                "agents" => (AudienceKind::Agents, "agents".to_string()),
+                "humans" => (AudienceKind::Humans, "humans".to_string()),
+                _ => {
+                    if let Some(group_id) = value.strip_prefix("group:") {
+                        let group_id = group_id.trim();
+                        if group_id.is_empty() {
+                            bail!("empty group recipient in message ask");
+                        }
+                        (AudienceKind::Group, group_id.to_string())
+                    } else if value.starts_with("actor_") {
+                        (AudienceKind::Actor, value.to_string())
+                    } else {
+                        bail!(
+                            "invalid message ask recipient `{value}`; use an actor id like @actor_..., @all, @agents, @humans, or group:<id>"
+                        );
+                    }
+                }
+            };
+            let seen_key = format!("{kind:?}:{id}");
+            if seen.insert(seen_key) {
+                out.push(AudienceRef {
+                    kind,
+                    id,
+                    display: None,
+                });
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("message ask requires at least one recipient");
+    }
+    Ok(out)
+}
+
 fn parse_message_intent(raw: Option<String>) -> Result<Option<MessageIntent>> {
     raw.map(|value| {
         serde_json::from_value::<MessageIntent>(json!(value.trim())).with_context(|| {
@@ -180,6 +279,74 @@ fn parse_message_intent(raw: Option<String>) -> Result<Option<MessageIntent>> {
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_ask_params_wake_single_actor() {
+        let params = build_ask_params(
+            "#chan_1:msg_root".into(),
+            vec!["@actor_agent_qzz_729cf432".into()],
+            "Q仔，请开始白天发言。".into(),
+            Some("msg_latest".into()),
+            Vec::new(),
+        )
+        .expect("build ask params");
+
+        assert_eq!(params["target"], "#chan_1:msg_root");
+        assert_eq!(params["intent"], "ask");
+        assert_eq!(params["deliveryPolicy"], "wake_agent");
+        assert_eq!(params["ifLatestMessageId"], "msg_latest");
+        assert_eq!(params["audience"][0]["kind"], "actor");
+        assert_eq!(params["audience"][0]["id"], "actor_agent_qzz_729cf432");
+    }
+
+    #[test]
+    fn message_ask_params_support_multiple_and_all_recipients() {
+        let params = build_ask_params(
+            "#chan_1".into(),
+            vec![
+                "@actor_agent_a".into(),
+                "actor_agent_b,@all,@agents,@humans,group:reviewers".into(),
+            ],
+            "please respond".into(),
+            None,
+            Vec::new(),
+        )
+        .expect("build ask params");
+        let audience = params["audience"].as_array().expect("audience array");
+
+        assert_eq!(audience.len(), 6);
+        assert_eq!(audience[0]["kind"], "actor");
+        assert_eq!(audience[0]["id"], "actor_agent_a");
+        assert_eq!(audience[1]["kind"], "actor");
+        assert_eq!(audience[1]["id"], "actor_agent_b");
+        assert_eq!(audience[2]["kind"], "all");
+        assert_eq!(audience[2]["id"], "all");
+        assert_eq!(audience[3]["kind"], "agents");
+        assert_eq!(audience[3]["id"], "agents");
+        assert_eq!(audience[4]["kind"], "humans");
+        assert_eq!(audience[4]["id"], "humans");
+        assert_eq!(audience[5]["kind"], "group");
+        assert_eq!(audience[5]["id"], "reviewers");
+    }
+
+    #[test]
+    fn message_ask_rejects_display_name_recipient() {
+        let err = build_ask_params(
+            "#chan_1".into(),
+            vec!["@Q仔".into()],
+            "please respond".into(),
+            None,
+            Vec::new(),
+        )
+        .expect_err("display name should not be accepted");
+
+        assert!(err.to_string().contains("use an actor id"));
+    }
 }
 
 fn parse_delivery_policy(raw: Option<String>) -> Result<Option<DeliveryPolicy>> {

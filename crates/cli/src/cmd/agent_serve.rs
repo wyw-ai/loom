@@ -4227,6 +4227,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            loom --json channel members \"$LOOM_CHANNEL_ID\"\n\
            loom --json message read --target '#<channel_id>:<root_message_id>'\n\
            loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
+           loom --json message ask @actor_id --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"please continue\"\n\
           loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
           loom --json message send --to <actor_id> --text \"global DM in a separate channel\"\n\
            loom --json message react <message_id> ✅\n\
@@ -4289,16 +4290,18 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         end the turn without visible answer text. The runtime will not infer\n\
         no-reply from message text or keyword heuristics. Do not send a\n\
         confirmation or explain the silence.\n\
-        Routing is machine-readable, not natural-language. If your visible\n\
-        message asks any agent/player/participant to do another step (confirm,\n\
-        discuss, vote, choose, investigate, DM you, publish a result, or take a\n\
-        turn), it must explicitly route to those actors and wake them:\n\
-          loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id please ...\" --intent request_action --delivery-policy wake_agent\n\
-        Text such as \"大家\", \"你们几个\", \"当前参与者\", or \"participants\" is not a\n\
-        delivery target by itself. Use exact @mentions, --private-to for hidden\n\
-        same-scope prompts, or @all/@agents with --delivery-policy wake_agent\n\
-        only when every matching agent should start a turn. Use notify_only\n\
-        only for pure summaries that require no one to act.\n\
+        Action requests are explicit CLI calls, not natural-language side\n\
+        effects. If your visible message asks any agent/player/participant to\n\
+        do another step (confirm, discuss, vote, choose, investigate, DM you,\n\
+        publish a result, or take a turn), use `loom --json message ask`, not\n\
+        plain `message send`:\n\
+          loom --json message ask @actor_id --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"please ...\"\n\
+        You may pass multiple recipients (`@actor_a @actor_b`) or @all/@agents\n\
+        only when every matching actor should start a turn. Text such as \"大家\",\n\
+        \"你们几个\", \"当前参与者\", or \"participants\" is not a delivery target by\n\
+        itself. Use exact actor ids with `message ask`, --private-to for hidden\n\
+        same-scope prompts, and plain `message send` only for summaries that\n\
+        require no one to act.\n\
         Hidden or private information must stay private even when the current\n\
         conversation is public to the channel. This includes hidden roles or\n\
         states, secrets, credentials, private votes/actions,\n\
@@ -4313,10 +4316,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         directed turn and your message completes your step but requires a\n\
         coordinator, DM, caller, or next actor to continue (for example\n\
         \"发言结束\", \"my vote is X\", or \"night action submitted\"), address that\n\
-        handoff explicitly to the actor who must continue and use --intent\n\
-        request_action --delivery-policy wake_agent, not notify_only. If you do\n\
-        not know who must continue, read the latest thread/task context before\n\
-        sending.\n\
+        handoff explicitly to the actor who must continue and use\n\
+        `loom --json message ask @actor_id --target ... --text ...`, not\n\
+        notify_only. If you do not know who must continue, read the latest\n\
+        thread/task context before sending.\n\
         `loom task assign` requires a machine-readable contract. Do not fall back\n\
         to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
@@ -6055,8 +6058,10 @@ mod tests {
             },
         );
 
-        assert!(manifest.contains("Routing is machine-readable, not natural-language"));
-        assert!(manifest.contains("--intent request_action --delivery-policy wake_agent"));
+        assert!(manifest.contains("Action requests are explicit CLI calls"));
+        assert!(manifest.contains("loom --json message ask @actor_id"));
+        assert!(manifest.contains("@actor_a @actor_b"));
+        assert!(manifest.contains("@all"));
         assert!(manifest.contains("当前参与者"));
         assert!(manifest.contains("Coordinator selection is single-owner triage"));
         assert!(manifest.contains("facilitator, moderator, host, lead"));
@@ -6066,7 +6071,7 @@ mod tests {
         assert!(manifest.contains("credentials"));
         assert!(manifest.contains("Turn handoffs count as action requests"));
         assert!(manifest.contains("发言结束"));
-        assert!(manifest.contains("pure summaries"));
+        assert!(manifest.contains("plain `message send` only for summaries"));
     }
 
     #[test]

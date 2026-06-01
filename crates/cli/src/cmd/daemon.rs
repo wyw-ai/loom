@@ -356,7 +356,12 @@ fn flat_agent_spec_path(actor_id: &str) -> PathBuf {
     agent_specs_dir().join(format!("{actor_id}.json"))
 }
 
+fn validate_agent_actor_id(actor_id: &str) -> Result<()> {
+    proto::path_component::validate_path_component(actor_id, "actor_id").map_err(|err| anyhow!(err))
+}
+
 fn load_config_agent_spec(actor_id: &str) -> Result<Option<AgentSpec>> {
+    validate_agent_actor_id(actor_id)?;
     let nested = agent_spec_path(actor_id);
     let flat = flat_agent_spec_path(actor_id);
     let path = if nested.exists() {
@@ -374,6 +379,7 @@ fn load_config_agent_spec(actor_id: &str) -> Result<Option<AgentSpec>> {
 }
 
 fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
+    validate_agent_actor_id(&spec.actor.id)?;
     let path = agent_spec_path(&spec.actor.id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -385,6 +391,7 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
 }
 
 fn remove_config_agent_spec(actor_id: &str) -> Result<bool> {
+    validate_agent_actor_id(actor_id)?;
     let mut removed = false;
     let nested = agent_spec_path(actor_id);
     if nested.exists() {
@@ -1503,6 +1510,39 @@ mod tests {
         let value = serde_json::to_value(&spec).expect("json");
         assert!(value.get("providerRef").is_some());
         assert!(value.get("transport").is_none());
+    }
+
+    #[test]
+    fn config_agent_file_operations_reject_path_traversal_actor_ids() {
+        for actor_id in ["../escape", "actor/slash", ".hidden", "foo..bar"] {
+            assert!(load_config_agent_spec(actor_id).is_err(), "{actor_id}");
+            assert!(remove_config_agent_spec(actor_id).is_err(), "{actor_id}");
+        }
+
+        let spec = AgentSpec {
+            actor: Actor {
+                id: "../escape".into(),
+                kind: ActorKind::Agent,
+                display_name: "Unsafe".into(),
+                capabilities: None,
+                _meta: None,
+            },
+            instructions: None,
+            provider_ref: AgentProviderRef {
+                id: "claude".into(),
+                mode: Some("print".into()),
+                model: None,
+                reasoning_effort: None,
+            },
+            autostart: false,
+            models: None,
+            bundle: None,
+            memory: None,
+            announcement: None,
+            trigger: None,
+            prompt_template: None,
+        };
+        assert!(write_config_agent_spec(&spec).is_err());
     }
 
     #[test]

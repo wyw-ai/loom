@@ -229,6 +229,7 @@ struct RunOutcome {
     stderr: String,
     session_id: String,
     command_signature: String,
+    used_first_run: bool,
     usage: Option<TokenUsage>,
 }
 
@@ -246,6 +247,14 @@ fn run_prompt(
                     scope: Some(prompt.scope.clone()),
                     status: format!("stderr: {}", truncate(&outcome.stderr, 500)),
                 });
+            }
+            if !outcome.success
+                && !outcome.used_first_run
+                && looks_like_signed_thinking_replay_error(&outcome.stderr, &outcome.stdout)
+            {
+                let _ = delete_session(&cfg, &prompt.scope);
+                tracing::warn!(actor = %cfg.actor_id, scope = %prompt.scope.id,
+                    "interactive command transport: dropped Claude session after signed-thinking replay error");
             }
             if outcome.success {
                 save_session(
@@ -478,6 +487,7 @@ fn run_prompt_inner(
         stderr,
         session_id,
         command_signature,
+        used_first_run,
         usage,
     })
 }
@@ -809,6 +819,22 @@ fn save_session(
     std::fs::write(path, serde_json::to_string_pretty(&record)?)
 }
 
+fn delete_session(cfg: &InteractiveCommandConfig, scope: &ScopeRef) -> std::io::Result<()> {
+    let path = session_path(cfg, scope);
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn looks_like_signed_thinking_replay_error(stderr: &str, stdout: &str) -> bool {
+    let s = format!("{stderr}\n{stdout}").to_ascii_lowercase();
+    (s.contains("thinking") || s.contains("redacted_thinking"))
+        && s.contains("latest assistant message")
+        && s.contains("cannot be modified")
+        && s.contains("original response")
+}
+
 fn contains_sentinel_line(text: &str, sentinel: &str) -> bool {
     text.lines().any(|line| line.trim() == sentinel)
 }
@@ -1060,6 +1086,42 @@ mod tests {
 
         assert_eq!(second.created_at, first.created_at);
         assert!(second.last_used_at > first.last_used_at);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn signed_thinking_replay_error_matches_claude_400() {
+        let stderr = "API Error: 400 messages.7.content.3: thinking or \
+                      redacted_thinking blocks in the latest assistant message \
+                      cannot be modified. These blocks must remain as they were \
+                      in the original response.";
+
+        assert!(looks_like_signed_thinking_replay_error(stderr, ""));
+        assert!(!looks_like_signed_thinking_replay_error(
+            "API Error: 400 unrelated provider error",
+            ""
+        ));
+    }
+
+    #[test]
+    fn signed_thinking_replay_error_drops_saved_interactive_session() {
+        let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
+        let mut cfg = cfg(root.clone());
+        cfg.command = "sh".into();
+        cfg.spec.session.resume_args = vec![
+            "-c".into(),
+            "printf '%s\\n' 'API Error: 400 messages.7.content.3: thinking or redacted_thinking blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.' >&2; exit 1".into(),
+        ];
+        let scope = scope(ScopeKind::Thread, "thr");
+        let req = prompt(scope.clone(), "ignored");
+        let signature = command_signature_for_prompt(&cfg, &req).expect("signature");
+        save_session(&cfg, &scope, "bad_sid", &signature).expect("save session");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), req, tx, slot).expect("run prompt");
+
+        assert!(load_session(&cfg, &scope).is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

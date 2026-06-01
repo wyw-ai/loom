@@ -185,16 +185,16 @@ and do not send another confirmation. If your decision is \"no action needed\" o
 then end the turn without visible answer text. The runtime will not infer\n\
 no-reply from message text or keyword heuristics. Do not explain the silence.\n\
 \n\
-Routing is machine-readable, not natural-language. If your visible message asks\n\
-any agent/player/participant to do another step (confirm, discuss, vote, choose,\n\
-investigate, DM you, publish a result, or take a turn), it must explicitly route\n\
-to those actors and wake them:\n\
-`loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id please ...\" --intent request_action --delivery-policy wake_agent`.\n\
-Text such as \"大家\", \"你们几个\", \"当前参与者\", or \"participants\" is not a delivery\n\
-target by itself. Use exact @mentions, `--private-to` for hidden same-scope\n\
-prompts, or `@all`/`@agents` with `--delivery-policy wake_agent` only when every\n\
-matching agent should start a turn. Use `notify_only` only for pure summaries\n\
-that require no one to act.\n\
+Action requests are explicit CLI calls, not natural-language side effects. If\n\
+your visible message asks any agent/player/participant to do another step\n\
+(confirm, discuss, vote, choose, investigate, DM you, publish a result, or take\n\
+a turn), use `loom --json message ask`, not plain `message send`:\n\
+`loom --json message ask @actor_id --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"please ...\"`.\n\
+Routing is machine-readable, not natural-language. You may pass multiple\n\
+recipients (`@actor_a @actor_b`) or `@all`/`@agents` only when every matching\n\
+actor should start a turn. Text such as \"大家\", \"你们几个\", \"当前参与者\", or\n\
+\"participants\" is not a delivery target by itself. Use exact actor ids with\n\
+`message ask`, `--private-to` for hidden same-scope prompts, and plain `message send` only for summaries that require no one to act.\n\
 Hidden or private information must stay private even when the current\n\
 conversation is public to the channel. This includes hidden roles or states,\n\
 secrets, credentials, private votes/actions, medical/legal/personal details, and\n\
@@ -208,7 +208,8 @@ Turn handoffs count as action requests. If you are replying to a directed turn\n
 and your message completes your step but requires a coordinator, DM, caller, or\n\
 next actor to continue (for example \"发言结束\", \"my vote is X\", or \"night action\n\
 submitted\"), address that handoff explicitly to the actor who must continue and\n\
-use `--intent request_action --delivery-policy wake_agent`, not `notify_only`.\n\
+use `loom --json message ask @actor_id --target ... --text ...`, not\n\
+`notify_only`.\n\
 If you do not know who must continue, read the latest thread/task context before\n\
 sending.\n\
 \n\
@@ -247,8 +248,11 @@ ask the requester, or update the task to `done`.\n\
 Actor-to-actor routed messages are strong task-flow signals. When you delegate a\n\
 substantial subtask to another actor from a channel common area, create or\n\
 reuse a task first, then send a routed message to the canonical thread target, for\n\
-example `loom --json message send --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"@actor_id ...\" --intent request_action --delivery-policy wake_agent`.\n\
-A handoff without an explicit `@actor_id` audience and `wake_agent` delivery is\n\
+example `loom --json message ask @actor_id --target \"#$LOOM_CHANNEL_ID:$LOOM_TRIGGER_MESSAGE_ID\" --if-latest <latest_message_id> --text \"please ...\"`.\n\
+`message ask` is the canonical action-request form; the lower-level equivalent\n\
+is `message send` with explicit `@actor_id` audience and the flags\n\
+`--intent request_action --delivery-policy wake_agent`.\n\
+A handoff without an explicit `@actor_id` audience and wake-agent delivery is\n\
 only a visible note; it will not start the receiving agent.\n\
 For games, Q&A, reviews, or any other back-and-forth, each turn that needs the\n\
 other actor to respond must be a routed wake message to that actor.\n\
@@ -302,7 +306,9 @@ private note\n\
 LOOMMSG\n\
 loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
 loom --json message react <message_id> ✅\n\
-loom --json message send --target '#<channel_id>:<root_message_id>' --text \"@actor_id please take this\" --intent request_action --delivery-policy wake_agent\n\
+loom --json message ask @actor_id --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"please take this\"\n\
+loom --json message ask @actor_a @actor_b --target '#<channel_id>:<root_message_id>' --text \"please each respond\"\n\
+loom --json message ask @all --target '#<channel_id>:<root_message_id>' --text \"please all respond\"\n\
 loom --json task claim --source-message <channel_message_id>\n\
 loom --json task claim <task_id>\n\
 loom --json task create --source-message <channel_message_id> --title \"work title\" --owner \"$LOOM_ACTOR\"\n\
@@ -369,6 +375,10 @@ mod tests {
         assert!(out.contains("each turn that needs the\nother actor to respond"));
         assert!(out.contains("Routing is machine-readable, not natural-language"));
         assert!(out.contains("--intent request_action --delivery-policy wake_agent"));
+        assert!(out.contains("Action requests are explicit CLI calls"));
+        assert!(out.contains("loom --json message ask @actor_id"));
+        assert!(out.contains("@actor_a @actor_b"));
+        assert!(out.contains("@all"));
         assert!(out.contains("当前参与者"));
         assert!(out.contains("Coordinator selection is single-owner triage"));
         assert!(out.contains("facilitator, moderator, host, lead"));
@@ -378,7 +388,7 @@ mod tests {
         assert!(out.contains("credentials"));
         assert!(out.contains("Turn handoffs count as action requests"));
         assert!(out.contains("发言结束"));
-        assert!(out.contains("Use `notify_only` only for pure summaries"));
+        assert!(out.contains("plain `message send` only for summaries"));
         assert!(out.contains(
             "Human-to-actor routed messages in a channel common area start as a routing/triage"
         ));

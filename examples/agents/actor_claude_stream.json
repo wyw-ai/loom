@@ -1,0 +1,49 @@
+{
+  "provider": {
+    "id": "claude_stream",
+    "displayName": "Claude Code Stream"
+  },
+  "transport": {
+    "kind": "command",
+    "command": "claude",
+    "args": [
+      "--permission-mode",
+      "bypassPermissions",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "-p"
+    ],
+    "env": {},
+    "model": "claude-sonnet-4.6",
+    "modelArgs": [
+      "--model",
+      "{model}"
+    ],
+    "session": {
+      "firstRunCapture": "stdout_json:.session_id",
+      "resumeArgs": [
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--resume",
+        "{session_id}",
+        "-p"
+      ]
+    },
+    "outputFormat": "claude_stream_json",
+    "promptVia": "args",
+    "timeoutMs": 3600000,
+    "idleTimeoutMs": 60000
+  },
+  "actors": [
+    {
+      "id": "actor_claude_stream",
+      "displayName": "Claude Stream",
+      "capabilities": {}
+    }
+  ],
+  "autostart": false
+}

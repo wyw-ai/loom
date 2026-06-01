@@ -1067,25 +1067,25 @@ export function App() {
     }
   }
 
-  async function createAgent() {
+  async function createAgent(): Promise<boolean> {
     const name = agentForm.name.trim();
     const machine = resolveAgentMachine(agentForm, machines);
     const provider = resolveAgentProvider(agentForm, machine);
     if (!machine) {
       setError("Add an agent host before creating an agent.");
-      return;
+      return false;
     }
     if (!machineCanCreateAgent(machine)) {
       setError(`Agent host ${machine.name} is read-only or does not support agent creation.`);
-      return;
+      return false;
     }
     if (!provider) {
       setError(`No agent runtime is available for ${machine.name}.`);
-      return;
+      return false;
     }
     if (!name) {
       setError("Agent name is required.");
-      return;
+      return false;
     }
     setBusy("agent:create");
     setError(null);
@@ -1107,8 +1107,10 @@ export function App() {
         await loadWorkspaceData(workspace);
       }
       pushNotice(`Agent ${name} added`);
+      return true;
     } catch (err) {
       setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -5272,13 +5274,16 @@ function SettingsView({
   targetAgentId: string | null;
   onCheckMachines: () => void;
   onRemoveMachine: (machineId: string) => void;
-  onAddAgent: () => void;
+  onAddAgent: () => Promise<boolean> | boolean;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
+  const [createAgentMachineId, setCreateAgentMachineId] = useState<string | null>(null);
+  const [memberCreateMenuOpen, setMemberCreateMenuOpen] = useState(false);
+  const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
   const memberEntries = agentMemberEntries(machines);
   const selectedMemberEntry =
     selectedAgentId === null
@@ -5289,6 +5294,9 @@ function SettingsView({
     machines.find((machine) => machine.id === selectedMachineId) ??
     machines.find((machine) => machine.id === agentForm.machineId) ??
     machines[0];
+  const createAgentMachine = createAgentMachineId
+    ? machines.find((machine) => machine.id === createAgentMachineId) ?? null
+    : null;
 
   useEffect(() => {
     if (machines.length === 0) {
@@ -5320,6 +5328,29 @@ function SettingsView({
     if (entry) setSelectedMachineId(entry.machine.id);
   }, [machines, targetAgentId]);
 
+  useEffect(() => {
+    if (!createAgentMachineId) return;
+    if (!machines.some((machine) => machine.id === createAgentMachineId)) {
+      setCreateAgentMachineId(null);
+    }
+  }, [createAgentMachineId, machines]);
+
+  useEffect(() => {
+    if (!memberCreateMenuOpen) return;
+    const close = (event: globalThis.MouseEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Node &&
+        memberCreateMenuRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setMemberCreateMenuOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [memberCreateMenuOpen]);
+
   function selectMachine(machine: MachineInfo) {
     setSelectedMachineId(machine.id);
     setSelectedAgentId(null);
@@ -5330,6 +5361,26 @@ function SettingsView({
     setSelectedMachineId(entry.machine.id);
     setSelectedAgentId(entry.agent.spec.actor.id);
     setAgentForm(agentFormForMachine(agentForm, entry.machine));
+  }
+
+  function openCreateAgentDialog(machine?: MachineInfo | null) {
+    const nextMachine =
+      machine ??
+      (selectedMachine && machineCanCreateAgent(selectedMachine)
+        ? selectedMachine
+        : null) ??
+      machines.find(
+        (item) => machineCanCreateAgent(item) && item.providers.length > 0,
+      ) ??
+      machines.find(machineCanCreateAgent) ??
+      selectedMachine ??
+      machines[0];
+    if (!nextMachine) return;
+    setSelectedMachineId(nextMachine.id);
+    setSelectedAgentId(null);
+    setAgentForm(agentFormForMachine(agentForm, nextMachine));
+    setCreateAgentMachineId(nextMachine.id);
+    setMemberCreateMenuOpen(false);
   }
 
   return (
@@ -5388,7 +5439,46 @@ function SettingsView({
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
                     Members
                   </div>
-                  <span className="count-badge">{memberEntries.length}</span>
+                  <div ref={memberCreateMenuRef} className="relative flex items-center gap-1.5">
+                    <span className="count-badge">{memberEntries.length}</span>
+                    <button
+                      type="button"
+                      className="composer-icon h-7 min-w-9 gap-0.5 rounded-lg border border-[#dfe3ec] bg-white text-[#503ed4]"
+                      title="Add member"
+                      aria-expanded={memberCreateMenuOpen}
+                      onClick={() => setMemberCreateMenuOpen((open) => !open)}
+                    >
+                      <Plus size={13} />
+                      <ChevronDown size={12} />
+                    </button>
+                    {memberCreateMenuOpen && (
+                      <div className="absolute right-0 top-full z-30 mt-2 w-48 rounded-xl border border-[#dfe3ec] bg-white p-1.5 shadow-[0_18px_44px_rgb(16_24_40_/_0.16)]">
+                        <button
+                          type="button"
+                          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm font-semibold text-[#303849] hover:bg-[#f5f3ff]"
+                          onClick={() => openCreateAgentDialog()}
+                        >
+                          <Bot size={15} className="text-[#503ed4]" />
+                          Agent
+                        </button>
+                        <button
+                          type="button"
+                          disabled
+                          className="mt-1 flex w-full cursor-not-allowed items-start gap-2 rounded-lg px-2.5 py-2 text-left opacity-55"
+                        >
+                          <Server size={15} className="mt-0.5 text-[#667085]" />
+                          <span className="min-w-0">
+                            <span className="block text-sm font-semibold text-[#303849]">
+                              Service
+                            </span>
+                            <span className="block text-xs font-medium text-[#667085]">
+                              Coming Soon
+                            </span>
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <div className="space-y-1.5">
                   {memberEntries.length === 0 ? (
@@ -5422,9 +5512,7 @@ function SettingsView({
               <MachineCard
                 machine={selectedMachine}
                 busy={busy}
-                agentForm={agentForm}
-                setAgentForm={setAgentForm}
-                onAddAgent={onAddAgent}
+                onOpenCreateAgent={openCreateAgentDialog}
                 onRemove={onRemoveMachine}
                 onOpenLocalPath={onOpenLocalPath}
                 onRemoveAgent={onRemoveAgent}
@@ -5435,6 +5523,16 @@ function SettingsView({
           </div>
         </div>
       </div>
+      {createAgentMachine && (
+        <AgentCreateDialog
+          agentForm={agentForm}
+          busy={busy}
+          machine={createAgentMachine}
+          setAgentForm={setAgentForm}
+          onAddAgent={onAddAgent}
+          onClose={() => setCreateAgentMachineId(null)}
+        />
+      )}
     </section>
   );
 }
@@ -5541,48 +5639,20 @@ function MemberListItem({
 function MachineCard({
   machine,
   busy,
-  agentForm,
-  setAgentForm,
-  onAddAgent,
+  onOpenCreateAgent,
   onRemove,
   onOpenLocalPath,
   onRemoveAgent,
 }: {
   machine: MachineInfo;
   busy: string | null;
-  agentForm: AgentFormState;
-  setAgentForm: (form: AgentFormState) => void;
-  onAddAgent: () => void;
+  onOpenCreateAgent: (machine: MachineInfo) => void;
   onRemove: (machineId: string) => void;
   onOpenLocalPath: (path: string) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
-  const selectedProvider = resolveAgentProvider(agentForm, machine);
-  const modelChoices = selectedProvider?.modelChoices ?? [];
   const canCreateAgent = machineCanCreateAgent(machine);
   const canRemoveMachine = machine.capabilities.includes("machine.remove");
-  const agentReady = Boolean(
-    canCreateAgent && selectedProvider && agentForm.name.trim(),
-  );
-  const createStatusText = !canCreateAgent
-    ? "This host is read-only for the current account."
-    : !selectedProvider
-      ? "No runtime detected for this host."
-      : `${selectedProvider.name} on ${machine.name}`;
-  const [agentComposerOpen, setAgentComposerOpen] = useState(false);
-
-  useEffect(() => {
-    setAgentComposerOpen(false);
-  }, [machine.id]);
-
-  function updateAgentForm(patch: Partial<AgentFormState>) {
-    setAgentForm({
-      ...agentForm,
-      machineId: machine.id,
-      providerId: selectedProvider?.id ?? agentForm.providerId,
-      ...patch,
-    });
-  }
 
   return (
     <div className="min-h-full bg-white">
@@ -5681,12 +5751,12 @@ function MachineCard({
         count={machine.agents.length}
         action={
           <Button
-            onClick={() => setAgentComposerOpen((open) => !open)}
-            disabled={!agentComposerOpen && !canCreateAgent}
+            onClick={() => onOpenCreateAgent(machine)}
+            disabled={!canCreateAgent || machine.providers.length === 0}
             className="rounded-lg"
           >
-            {agentComposerOpen ? <X size={15} /> : <Plus size={15} />}
-            {agentComposerOpen ? "Close" : "Create Agent"}
+            <Plus size={15} />
+            Create Agent
           </Button>
         }
       >
@@ -5707,127 +5777,6 @@ function MachineCard({
             ))
           )}
         </div>
-
-        {agentComposerOpen && (
-          <form
-            className="mt-5 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] p-4 shadow-sm"
-            onSubmit={(event) => {
-              event.preventDefault();
-              onAddAgent();
-            }}
-          >
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]">
-                <Bot size={14} />
-                New Agent
-              </div>
-              <Badge variant={canCreateAgent ? "outline" : "warning"}>
-                {canCreateAgent ? "available" : "read only"}
-              </Badge>
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              <select
-                value={selectedProvider?.id ?? ""}
-                onChange={(event) => {
-                  const provider = machine.providers.find(
-                    (item) => item.id === event.target.value,
-                  );
-                  setAgentForm({
-                    ...agentForm,
-                    machineId: machine.id,
-                    providerId: event.target.value,
-                    model: provider?.defaultModel ?? "",
-                  });
-                }}
-                className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-                disabled={machine.providers.length === 0 || !canCreateAgent}
-              >
-                {machine.providers.length === 0 ? (
-                  <option value="">No runtimes</option>
-                ) : (
-                  machine.providers.map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))
-                )}
-              </select>
-              <Input
-                value={agentForm.name}
-                onChange={(event) => updateAgentForm({ name: event.target.value })}
-                placeholder="Agent name"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canCreateAgent}
-              />
-              <Input
-                value={agentForm.actorId}
-                onChange={(event) => updateAgentForm({ actorId: event.target.value })}
-                placeholder="Actor id (optional)"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canCreateAgent}
-              />
-              {modelChoices.length > 0 ? (
-                <select
-                  value={agentForm.model || selectedProvider?.defaultModel || ""}
-                  onChange={(event) => updateAgentForm({ model: event.target.value })}
-                  className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-                  disabled={!canCreateAgent}
-                >
-                  {modelChoices.map((choice) => (
-                    <option key={choice.id} value={choice.id}>
-                      {choice.label}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <Input
-                  value={agentForm.model}
-                  onChange={(event) => updateAgentForm({ model: event.target.value })}
-                  placeholder="Model"
-                  className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                  disabled={!canCreateAgent}
-                />
-              )}
-              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
-                <input
-                  type="checkbox"
-                  checked={agentForm.autostart}
-                  onChange={(event) =>
-                    updateAgentForm({ autostart: event.target.checked })
-                  }
-                  disabled={!canCreateAgent}
-                />
-                Autostart
-              </label>
-              <Textarea
-                value={agentForm.description}
-                onChange={(event) => updateAgentForm({ description: event.target.value })}
-                placeholder="Agent instructions"
-                className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2 xl:col-span-4"
-                disabled={!canCreateAgent}
-              />
-            </div>
-
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs font-medium text-[#667085]">
-                {createStatusText}
-              </div>
-              <Button
-                type="submit"
-                disabled={busy === "agent:create" || !agentReady}
-                className="rounded-lg"
-              >
-                {busy === "agent:create" ? (
-                  <Loader2 className="animate-spin" size={15} />
-                ) : (
-                  <Plus size={15} />
-                )}
-                Create Agent
-              </Button>
-            </div>
-          </form>
-        )}
       </HostDetailSection>
 
       <HostDetailSection title="Actions">
@@ -5856,6 +5805,274 @@ function MachineCard({
         </div>
       </HostDetailSection>
     </div>
+  );
+}
+
+const customModelOptionValue = "__loom_custom_model__";
+
+function AgentCreateDialog({
+  agentForm,
+  busy,
+  machine,
+  setAgentForm,
+  onAddAgent,
+  onClose,
+}: {
+  agentForm: AgentFormState;
+  busy: string | null;
+  machine: MachineInfo;
+  setAgentForm: (form: AgentFormState) => void;
+  onAddAgent: () => Promise<boolean> | boolean;
+  onClose: () => void;
+}) {
+  const selectedProvider = resolveAgentProvider(agentForm, machine);
+  const modelChoices = selectedProvider?.modelChoices ?? [];
+  const [customModelActive, setCustomModelActive] = useState(false);
+  const canCreateAgent = machineCanCreateAgent(machine);
+  const creating = busy === "agent:create";
+  const agentReady = Boolean(
+    canCreateAgent && selectedProvider && agentForm.name.trim(),
+  );
+  const modelValue = agentForm.model || selectedProvider?.defaultModel || "";
+  const modelIsKnown =
+    !modelValue || modelChoices.some((choice) => choice.id === modelValue);
+  const showCustomModel =
+    modelChoices.length === 0 || customModelActive || !modelIsKnown;
+  const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
+  const createStatusText = !canCreateAgent
+    ? "This host is read-only for the current account."
+    : !selectedProvider
+      ? "No runtime detected for this host."
+      : `${selectedProvider.name} on ${machine.name}`;
+
+  useEffect(() => {
+    setCustomModelActive(false);
+  }, [selectedProvider?.id]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  function updateAgentForm(patch: Partial<AgentFormState>) {
+    setAgentForm({
+      ...agentForm,
+      machineId: machine.id,
+      providerId: selectedProvider?.id ?? agentForm.providerId,
+      ...patch,
+    });
+  }
+
+  function selectProvider(provider: MachineAgentProviderInfo) {
+    setCustomModelActive(false);
+    setAgentForm({
+      ...agentForm,
+      machineId: machine.id,
+      providerId: provider.id,
+      model: provider.defaultModel || provider.modelChoices[0]?.id || "",
+    });
+  }
+
+  async function submitAgent(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const created = await onAddAgent();
+    if (created) onClose();
+  }
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="agent-create-title"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <form
+        className="flex max-h-[min(760px,calc(100vh-48px))] w-full max-w-3xl flex-col rounded-2xl border border-[#dfe3ec] bg-white shadow-[0_28px_80px_rgb(16_24_40_/_0.22)]"
+        onSubmit={submitAgent}
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-4">
+          <div className="min-w-0">
+            <div
+              id="agent-create-title"
+              className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]"
+            >
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
+                <Bot size={15} />
+              </span>
+              New Agent
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+              <span className="font-semibold text-[#303849]">{machine.name}</span>
+              <span className="text-[#a0a6b3]">/</span>
+              <span>{createStatusText}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant={canCreateAgent ? "outline" : "warning"}>
+              {canCreateAgent ? "available" : "read only"}
+            </Badge>
+            <button
+              type="button"
+              className="composer-icon h-8 min-w-8"
+              title="Close"
+              onClick={onClose}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
+          <div className="space-y-5">
+            <section>
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+                Runtime
+              </div>
+              {machine.providers.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                  No runtimes detected for this host.
+                </div>
+              ) : (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {machine.providers.map((provider) => {
+                    const selected = selectedProvider?.id === provider.id;
+                    const iconKey = agentProviderIconKey(provider.id, provider.name);
+                    return (
+                      <button
+                        key={provider.id}
+                        type="button"
+                        disabled={!canCreateAgent}
+                        className={cn(
+                          "flex min-h-[68px] items-center gap-3 rounded-xl border bg-white px-3 py-3 text-left transition-colors",
+                          selected
+                            ? "border-[#8f82ff] bg-[#f7f5ff] ring-2 ring-[#ece8ff]"
+                            : "border-[#e2e6ef] hover:border-[#c8c1ff]",
+                        )}
+                        onClick={() => selectProvider(provider)}
+                      >
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+                          {iconKey ? (
+                            <AgentProviderIcon iconKey={iconKey} className="h-5 w-5" />
+                          ) : (
+                            <Bot size={18} />
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-bold text-[#111827]">
+                            {provider.name}
+                          </span>
+                          <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                            {provider.defaultModel || `${provider.modelChoices.length} models`}
+                          </span>
+                        </span>
+                        {selected && <Check size={16} className="shrink-0 text-[#503ed4]" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            <section className="grid gap-3 md:grid-cols-2">
+              <Input
+                value={agentForm.name}
+                onChange={(event) => updateAgentForm({ name: event.target.value })}
+                placeholder="Agent name"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canCreateAgent}
+              />
+              <Input
+                value={agentForm.actorId}
+                onChange={(event) => updateAgentForm({ actorId: event.target.value })}
+                placeholder="Actor id (optional)"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canCreateAgent}
+              />
+              <div className="space-y-2">
+                {modelChoices.length > 0 ? (
+                  <select
+                    value={modelSelectValue}
+                    onChange={(event) => {
+                      if (event.target.value === customModelOptionValue) {
+                        setCustomModelActive(true);
+                        updateAgentForm({
+                          model: modelIsKnown ? "" : agentForm.model,
+                        });
+                        return;
+                      }
+                      setCustomModelActive(false);
+                      updateAgentForm({ model: event.target.value });
+                    }}
+                    className="h-10 w-full rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+                    disabled={!canCreateAgent}
+                  >
+                    <option value="">Default model</option>
+                    {modelChoices.map((choice) => (
+                      <option key={choice.id} value={choice.id}>
+                        {choice.label || choice.id}
+                      </option>
+                    ))}
+                    <option value={customModelOptionValue}>Custom...</option>
+                  </select>
+                ) : null}
+                {showCustomModel && (
+                  <Input
+                    value={agentForm.model}
+                    onChange={(event) => updateAgentForm({ model: event.target.value })}
+                    placeholder="Custom model"
+                    className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canCreateAgent}
+                  />
+                )}
+              </div>
+              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+                <input
+                  type="checkbox"
+                  checked={agentForm.autostart}
+                  onChange={(event) =>
+                    updateAgentForm({ autostart: event.target.checked })
+                  }
+                  disabled={!canCreateAgent}
+                />
+                Autostart
+              </label>
+              <Textarea
+                value={agentForm.description}
+                onChange={(event) => updateAgentForm({ description: event.target.value })}
+                placeholder="Agent instructions"
+                className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
+                disabled={!canCreateAgent}
+              />
+            </section>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
+          <div className="text-xs font-medium text-[#667085]">
+            {createStatusText}
+          </div>
+          <Button
+            type="submit"
+            disabled={creating || !agentReady}
+            className="rounded-lg"
+          >
+            {creating ? (
+              <Loader2 className="animate-spin" size={15} />
+            ) : (
+              <Plus size={15} />
+            )}
+            Create Agent
+          </Button>
+        </div>
+      </form>
+    </div>,
+    document.body,
   );
 }
 

@@ -2044,6 +2044,8 @@ pub struct ProviderModeSpec {
     pub command: String,
     #[serde(default)]
     pub args: Vec<ProviderArgSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "modelArgs")]
+    pub model_args: Vec<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2064,6 +2066,10 @@ pub struct ProviderModeSpec {
         rename = "idleTimeoutMs"
     )]
     pub idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<InteractiveCommandSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<InteractiveProviderSpec>,
 }
 
 fn default_provider_transport() -> String {

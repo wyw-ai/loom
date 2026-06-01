@@ -176,6 +176,13 @@ inventory 的是目标 daemon。即使 GUI 和 daemon 在同一台机器，也�
 `args`/`env`/`stdin` 模板显式决定。也就是说，`--model {model}` 不应该藏在
 另一个隐式分支里。
 
+如果 Provider 还需要非 print 的长交互模式，应在同一个 manifest 下增加另一个
+mode，例如 Claude 的 `nonprint`。这个 mode 使用
+`transport: "interactive_command"`，通过 `modelArgs`、`interactive.session.newArgs`、
+`interactive.session.resumeArgs`、`interactive.prompt.completionContract` 和
+`provider.settings` 描述旧 `AgentSpec.transport.interactive` 的能力。AgentSpec 只用
+`providerRef.mode` 选择 `print` 或 `nonprint`，不复制这些启动细节。
+
 daemon-local Provider 可以通过 `extends` 继承内置 Provider，再用同一套 patch 语义覆盖
 mode。这样旧 `MachineConfig.providers[]` 这种 command/args/env 局部覆盖不需要继续
 作为 GUI/server 可见的独立配置面存在。
@@ -1374,5 +1381,3 @@ GUI/server 只消费 daemon inventory。
 - models 应该静态写在 manifest、通过 provider command 动态发现，还是两者都支持并
   使用 cache fallback？
 - workspace prompt 文件是否需要第一版就支持受限 glob，还是先只支持显式文件路径？
-- `interactive_command` 和 command `print` mode 是否现在就合并到同一 manifest
-  schema，还是等 print mode 稳定后再处理 interactive？

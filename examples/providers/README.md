@@ -27,3 +27,6 @@ loom provider add examples/providers/claude.json
 - `ProviderManifest` 保存 command/args/env、prompt outputs、parser、session 策略。
 - `AgentSpec` 保存 actor metadata、instructions、model/reasoning 选择和 `providerRef`。
 - 不再使用旧的 `provider + transport + actors[]` 文件形态。
+
+Claude 示例里的一个 provider manifest 同时声明 `print` 和 `nonprint` 两个 mode。
+对应的两个 agent 示例分别通过 `providerRef.mode` 选择具体接入方式。

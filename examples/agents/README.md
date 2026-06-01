@@ -6,6 +6,7 @@ runtime spec，不再加载这个目录。
 
 | 文件 | 命令 | 备注 |
 | --- | --- | --- |
+| [`actor_claude_stream.json`](actor_claude_stream.json) | `claude -p --output-format stream-json` | Claude Code command 模式；通过 `stdout_json:.session_id` 记录 session，后续使用 `--resume {session_id}` |
 | [`actor_claude_nonprint.json`](actor_claude_nonprint.json) | `claude` | Claude Code `interactive_command` 非 `--print` 模式；依赖 sentinel 判断完成并在完成后关闭 provider 进程 |
 | [`actor_codex.json`](actor_codex.json) | `npx -y @zed-industries/codex-acp` | Zed 维护的 Codex ACP 包 |
 | [`actor_opencode.json`](actor_opencode.json) | `opencode acp` | 需要本机已装 `opencode` CLI |
@@ -106,7 +107,9 @@ command / interactive_command runtime 可以通过 `transport.modelArgs` 声明 
 「配置 agent」一节。Command transport（`claude -p` 这种一次性 CLI）的写法
 见 [`docs/command-transport-v0.md`](../../docs/command-transport-v0.md)。
 
-`actor_claude_nonprint.json` 使用 Claude Code 的普通交互模式，不带 `--print`。
+优先使用 `actor_claude_stream.json` 这种 `claude -p --output-format stream-json`
+command 模式。`actor_claude_nonprint.json` 使用 Claude Code 的普通交互模式，
+不带 `--print`，主要保留为旧 sentinel 方案参考。
 如果你需要指定独立的 Claude settings 文件，可以把 `provider.settings` 改成：
 
 ```json

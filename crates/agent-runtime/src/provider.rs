@@ -12,13 +12,17 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use proto::methods::{
-    AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, CommandOutputFormat,
-    CommandSession, CommandSessionIdSource, PromptVia, ProviderArgSpec, ProviderConditionalArgSpec,
-    ProviderDecoderCaptureSpec, ProviderDecoderEmitSpec, ProviderDecoderEventSpec,
-    ProviderDecoderSpec, ProviderDetectSpec, ProviderJsonConditionSpec, ProviderJsonlReduceSpec,
-    ProviderJsonlTextReducerSpec, ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec,
-    ProviderPromptRoleHint, ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource,
-    ProviderSessionSpec, ProviderWorkspaceFileSpec,
+    AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, ClaudeSettingsMode,
+    ClaudeSettingsSpec, CommandOutputFormat, CommandSession, CommandSessionIdSource,
+    InteractiveCommandSpec, InteractiveCompletionContractSpec, InteractiveCompletionSpec,
+    InteractiveKillAction, InteractiveKillKind, InteractiveKillSpec, InteractiveOutputSpec,
+    InteractivePromptSpec, InteractiveProviderSpec, InteractiveSessionSpec, PromptVia,
+    ProviderArgSpec, ProviderConditionalArgSpec, ProviderDecoderCaptureSpec,
+    ProviderDecoderEmitSpec, ProviderDecoderEventSpec, ProviderDecoderSpec, ProviderDetectSpec,
+    ProviderJsonConditionSpec, ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec,
+    ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec, ProviderPromptRoleHint,
+    ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
+    ProviderWorkspaceFileSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -57,6 +61,8 @@ pub struct ProviderRuntimePlan {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "modelArgs")]
+    pub model_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<CommandSession>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +77,10 @@ pub struct ProviderRuntimePlan {
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<InteractiveCommandSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<InteractiveProviderSpec>,
 }
 
 /// Transport-neutral events produced by provider output decoders before Loom
@@ -109,7 +119,7 @@ impl ProviderRuntimePlan {
             env: self.env,
             auth_method: None,
             model: self.model,
-            model_args: Vec::new(),
+            model_args: self.model_args,
             session: self.session,
             output_format: Some(output_format),
             decoder: self.decoder,
@@ -119,8 +129,8 @@ impl ProviderRuntimePlan {
             stdin: self.stdin,
             timeout_ms: self.timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
-            interactive: None,
-            provider: None,
+            interactive: self.interactive,
+            provider: self.provider,
         }
     }
 }
@@ -289,6 +299,7 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
             validate_decoder_spec(manifest, mode_name, "stderr", stderr)?;
         }
         validate_prompt_references(manifest, mode_name, mode)?;
+        validate_interactive_mode(manifest, mode_name, mode)?;
     }
     Ok(())
 }
@@ -1046,6 +1057,48 @@ fn validate_prompt_references(
     Ok(())
 }
 
+fn validate_interactive_mode(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    mode: &ProviderModeSpec,
+) -> Result<(), String> {
+    if mode.transport != "interactive_command" {
+        return Ok(());
+    }
+    let Some(interactive) = mode.interactive.as_ref() else {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` uses interactive_command but missing interactive config",
+            manifest.id
+        ));
+    };
+    if interactive.session.new_args.is_empty() {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` interactive.session.newArgs is required",
+            manifest.id
+        ));
+    }
+    if !string_args_have_prompt_reference(&interactive.session.new_args) {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` interactive.session.newArgs must pass the prompt",
+            manifest.id
+        ));
+    }
+    if !interactive.session.resume_args.is_empty()
+        && !string_args_have_prompt_reference(&interactive.session.resume_args)
+    {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` interactive.session.resumeArgs must pass the prompt",
+            manifest.id
+        ));
+    }
+    Ok(())
+}
+
+fn string_args_have_prompt_reference(args: &[String]) -> bool {
+    args.iter()
+        .any(|value| template_placeholders(value).any(|name| is_prompt_delivery_var(&name)))
+}
+
 fn prompt_output_names(prompt: Option<&ProviderPromptSpec>) -> HashSet<String> {
     prompt
         .filter(|prompt| !prompt.outputs.is_empty())
@@ -1544,6 +1597,9 @@ fn validate_template_variables(
             validate_template_variable(manifest, mode_name, where_, &name, outputs)?;
         }
     }
+    for value in &mode.model_args {
+        validate_string_template(manifest, mode_name, "modelArgs", value, outputs)?;
+    }
     if let Some(session) = mode.session.as_ref() {
         for arg in &session.resume_args {
             for (where_, value) in arg_templates(arg, "session.resumeArgs") {
@@ -1553,9 +1609,58 @@ fn validate_template_variables(
             }
         }
     }
+    if let Some(interactive) = mode.interactive.as_ref() {
+        for value in &interactive.session.new_args {
+            validate_string_template(
+                manifest,
+                mode_name,
+                "interactive.session.newArgs",
+                value,
+                outputs,
+            )?;
+        }
+        for value in &interactive.session.resume_args {
+            validate_string_template(
+                manifest,
+                mode_name,
+                "interactive.session.resumeArgs",
+                value,
+                outputs,
+            )?;
+        }
+        validate_string_template(
+            manifest,
+            mode_name,
+            "interactive.prompt.template",
+            &interactive.prompt.template,
+            outputs,
+        )?;
+    }
+    if let Some(path) = mode
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.settings.as_ref())
+        .filter(|settings| settings.mode == ClaudeSettingsMode::Custom)
+        .and_then(|settings| settings.path.as_deref())
+    {
+        validate_string_template(manifest, mode_name, "provider.settings.path", path, outputs)?;
+    }
     validate_condition_names(manifest, mode_name, &mode.args)?;
     if let Some(session) = mode.session.as_ref() {
         validate_condition_names(manifest, mode_name, &session.resume_args)?;
+    }
+    Ok(())
+}
+
+fn validate_string_template(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    where_: &str,
+    value: &str,
+    outputs: &HashSet<String>,
+) -> Result<(), String> {
+    for name in template_placeholders(value) {
+        validate_template_variable(manifest, mode_name, where_, &name, outputs)?;
     }
     Ok(())
 }
@@ -1836,6 +1941,11 @@ fn runtime_plan_from_manifest(
         .iter()
         .map(|(key, value)| (key.clone(), expand_static_template(value, bin)))
         .collect::<BTreeMap<_, _>>();
+    let model_args = mode
+        .model_args
+        .iter()
+        .map(|value| expand_static_template(value, bin))
+        .collect::<Vec<_>>();
     let stdin = mode
         .stdin
         .as_ref()
@@ -1859,6 +1969,7 @@ fn runtime_plan_from_manifest(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
+        model_args,
         session: mode.session.as_ref().map(|session| CommandSession {
             id_source: session.id_source.map(|source| match source {
                 ProviderSessionIdSource::LoomUuid => CommandSessionIdSource::LoomUuid,
@@ -1879,6 +1990,8 @@ fn runtime_plan_from_manifest(
         stdin,
         timeout_ms: mode.timeout_ms,
         idle_timeout_ms: mode.idle_timeout_ms,
+        interactive: mode.interactive.clone(),
+        provider: mode.provider.clone(),
     };
     output_format(&mode.stdout)?;
     validate_manifest(manifest)?;
@@ -2046,6 +2159,7 @@ fn mode(
         transport: "command".into(),
         command: command.into(),
         args,
+        model_args: Vec::new(),
         env: BTreeMap::new(),
         stdin: None,
         prompt: Some(prompt),
@@ -2060,6 +2174,8 @@ fn mode(
         session,
         timeout_ms: None,
         idle_timeout_ms: None,
+        interactive: None,
+        provider: None,
     }
 }
 
@@ -2248,20 +2364,96 @@ fn claude_manifest() -> ProviderManifest {
         resume_args,
         scope: Some("actor_scope".into()),
     };
+    let nonprint_mode = ProviderModeSpec {
+        transport: "interactive_command".into(),
+        command: "{bin}".into(),
+        args: vec![lit("--add-dir"), lit("{agent.configDir}")],
+        model_args: vec!["--model".into(), "{model}".into()],
+        env: BTreeMap::new(),
+        stdin: None,
+        prompt: None,
+        stdout: ProviderDecoderSpec {
+            format: "text".into(),
+            ..Default::default()
+        },
+        stderr: None,
+        session: None,
+        timeout_ms: None,
+        idle_timeout_ms: None,
+        interactive: Some(InteractiveCommandSpec {
+            session: InteractiveSessionSpec {
+                new_args: vec![
+                    "--permission-mode".into(),
+                    "bypassPermissions".into(),
+                    "{prompt}".into(),
+                    "--session-id".into(),
+                    "{session_id}".into(),
+                ],
+                resume_args: vec![
+                    "--permission-mode".into(),
+                    "bypassPermissions".into(),
+                    "{prompt}".into(),
+                    "--resume".into(),
+                    "{session_id}".into(),
+                ],
+                ..Default::default()
+            },
+            prompt: InteractivePromptSpec {
+                completion_contract: InteractiveCompletionContractSpec {
+                    sentinel: "__LOOM_DONE__".into(),
+                    instruction: "When your final user-visible answer is complete, output __LOOM_DONE__ on a line by itself. Do not output anything after it.".into(),
+                },
+                ..Default::default()
+            },
+            completion: InteractiveCompletionSpec {
+                idle_timeout_ms: Some(60_000),
+                max_turn_ms: 3_600_000,
+                ..Default::default()
+            },
+            output: InteractiveOutputSpec::default(),
+            kill: InteractiveKillSpec {
+                on_complete: InteractiveKillAction {
+                    action: InteractiveKillKind::Sigterm,
+                    grace_ms: Some(3000),
+                    fallback: Some(InteractiveKillKind::Sigkill),
+                },
+                on_cancel: InteractiveKillAction {
+                    action: InteractiveKillKind::Sigterm,
+                    grace_ms: Some(1000),
+                    fallback: Some(InteractiveKillKind::Sigkill),
+                },
+                on_timeout: InteractiveKillAction {
+                    action: InteractiveKillKind::Sigkill,
+                    grace_ms: None,
+                    fallback: None,
+                },
+            },
+        }),
+        provider: Some(InteractiveProviderSpec {
+            kind: "claude".into(),
+            settings: Some(ClaudeSettingsSpec {
+                mode: ClaudeSettingsMode::Global,
+                path: None,
+            }),
+        }),
+    };
     manifest(
         "claude",
         "Claude Code",
         &["claude"],
-        BTreeMap::from([(
-            "print".into(),
-            mode(
-                "{bin}",
-                first_args,
-                base_prompt(),
-                "claude_stream_json",
-                Some(session),
+        BTreeMap::from([
+            (
+                "print".into(),
+                mode(
+                    "{bin}",
+                    first_args,
+                    base_prompt(),
+                    "claude_stream_json",
+                    Some(session),
+                ),
             ),
-        )]),
+            ("nonprint".into(), nonprint_mode),
+        ]),
         &[
             ("sonnet", "Sonnet"),
             ("opus", "Opus"),
@@ -3691,6 +3883,51 @@ mod tests {
         assert_eq!(
             transport.session.as_ref().and_then(|s| s.scope.as_deref()),
             Some("actor_scope")
+        );
+    }
+
+    #[test]
+    fn builtin_claude_nonprint_resolves_interactive_transport() {
+        let dir = temp_dir("claude-nonprint-path");
+        make_executable(&dir.join("claude"));
+        let registry =
+            ProviderRegistry::load(&temp_dir("claude-nonprint-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "claude")
+            .expect("claude");
+        let transport = transport_from_manifest(
+            &provider.manifest,
+            provider.manifest.modes.get("nonprint").unwrap(),
+            Path::new(&provider.command),
+            &AgentProviderRef {
+                id: "claude".into(),
+                mode: Some("nonprint".into()),
+                model: Some("sonnet".into()),
+                reasoning_effort: None,
+            },
+        )
+        .expect("transport");
+
+        assert_eq!(transport.kind, "interactive_command");
+        assert_eq!(transport.args, vec!["--add-dir", "{agent.configDir}"]);
+        assert_eq!(transport.model_args, vec!["--model", "{model}"]);
+        let interactive = transport.interactive.as_ref().expect("interactive config");
+        assert!(interactive.session.new_args.contains(&"{prompt}".into()));
+        assert!(interactive
+            .session
+            .new_args
+            .contains(&"--session-id".into()));
+        assert!(interactive.session.resume_args.contains(&"{prompt}".into()));
+        assert!(interactive.session.resume_args.contains(&"--resume".into()));
+        assert_eq!(
+            transport
+                .provider
+                .as_ref()
+                .map(|provider| provider.kind.as_str()),
+            Some("claude")
         );
     }
 

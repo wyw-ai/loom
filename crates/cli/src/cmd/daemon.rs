@@ -360,6 +360,11 @@ fn validate_agent_actor_id(actor_id: &str) -> Result<()> {
     proto::path_component::validate_path_component(actor_id, "actor_id").map_err(|err| anyhow!(err))
 }
 
+fn validate_machine_id(machine_id: &str) -> Result<()> {
+    proto::path_component::validate_path_component(machine_id, "machine_id")
+        .map_err(|err| anyhow!(err))
+}
+
 fn load_config_agent_spec(actor_id: &str) -> Result<Option<AgentSpec>> {
     validate_agent_actor_id(actor_id)?;
     let nested = agent_spec_path(actor_id);
@@ -1119,6 +1124,9 @@ fn select_machine_for_daemon(
     data_root: Option<&PathBuf>,
 ) -> Result<(MachineConfig, bool)> {
     let requested = requested.and_then(|id| non_empty(id.trim()));
+    if let Some(machine_id) = requested.as_deref() {
+        validate_machine_id(machine_id)?;
+    }
     let machine_name = machine_name.and_then(|name| non_empty(name.trim()));
     let data_root_path = data_root
         .cloned()
@@ -1543,6 +1551,18 @@ mod tests {
             prompt_template: None,
         };
         assert!(write_config_agent_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn select_machine_for_daemon_rejects_unsafe_machine_ids() {
+        let mut cfg = DaemonConfig::default();
+
+        for machine_id in ["../escape", "machine/slash", ".hidden", "foo..bar"] {
+            assert!(
+                select_machine_for_daemon(&mut cfg, Some(machine_id), None, None).is_err(),
+                "{machine_id}"
+            );
+        }
     }
 
     #[test]

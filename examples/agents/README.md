@@ -12,7 +12,8 @@ provider manifest，再让 agent 的 `providerRef.id` 指向它。
 
 | 文件 | providerRef | 说明 |
 | --- | --- | --- |
-| [`claude.json`](claude.json) | `claude` / `print` | Claude Code agent，system/user prompt 由 provider manifest 拆分注入 |
+| [`actor_claude_stream.json`](actor_claude_stream.json) | `claude` / `print` | Claude Code `-p --output-format stream-json` 模式，system/user prompt 由 provider manifest 拆分注入 |
+| [`actor_claude_nonprint.json`](actor_claude_nonprint.json) | `claude` / `nonprint` | Claude Code 普通交互模式，用 sentinel 判断完成 |
 | [`codex.json`](codex.json) | `codex` / `print` | Codex CLI agent |
 | [`copilot.json`](copilot.json) | `copilot` / `print` | GitHub Copilot CLI agent |
 | [`opencode.json`](opencode.json) | `opencode` / `print` | OpenCode agent |

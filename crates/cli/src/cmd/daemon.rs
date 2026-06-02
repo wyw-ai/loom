@@ -5,7 +5,7 @@
 //! agent worker implementation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{
@@ -15,7 +15,9 @@ use agent_runtime::provider::{
     builtin_provider_manifests, providers_dir, validate_manifest, ProviderRegistry,
 };
 use anyhow::{anyhow, Context, Result};
-use proto::methods::{AgentModelSpec, AgentProviderRef, AgentSpec, ProviderManifest};
+use proto::methods::{
+    AgentModelSpec, AgentPromptAssemblySpec, AgentProviderRef, AgentSpec, ProviderManifest,
+};
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -365,6 +367,28 @@ fn validate_machine_id(machine_id: &str) -> Result<()> {
         .map_err(|err| anyhow!(err))
 }
 
+fn validate_provider_id_for_path(provider_id: &str) -> Result<()> {
+    proto::path_component::validate_path_component(provider_id, "provider_id")
+        .map_err(|err| anyhow!(err))?;
+    let mut chars = provider_id.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("provider id is required"));
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(anyhow!(
+            "provider id `{provider_id}` must start with a lowercase ascii letter or digit"
+        ));
+    }
+    if chars.any(|ch| {
+        !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.'))
+    }) {
+        return Err(anyhow!(
+            "provider id `{provider_id}` may only contain lowercase ascii letters, digits, `_`, `-`, or `.`"
+        ));
+    }
+    Ok(())
+}
+
 fn load_config_agent_spec(actor_id: &str) -> Result<Option<AgentSpec>> {
     validate_agent_actor_id(actor_id)?;
     let nested = agent_spec_path(actor_id);
@@ -446,8 +470,7 @@ fn agent_spec_from_command(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| description.clone());
+        .map(ToString::to_string);
     let model = command
         .get("model")
         .and_then(Value::as_str)
@@ -466,6 +489,14 @@ fn agent_spec_from_command(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let prompt_assembly = command
+        .get("promptAssembly")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<AgentPromptAssemblySpec>(value.clone())
+                .context("parse promptAssembly")
+        })
+        .transpose()?;
 
     let mut meta = BTreeMap::new();
     meta.insert("providerId".into(), json!(provider.id.clone()));
@@ -512,6 +543,7 @@ fn agent_spec_from_command(
         memory: None,
         announcement: None,
         trigger: None,
+        prompt_assembly,
         prompt_template: None,
     })
 }
@@ -562,10 +594,8 @@ fn update_agent_spec_from_command(
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         if description.trim().is_empty() {
             meta.remove("description");
-            spec.instructions = None;
         } else {
             meta.insert("description".into(), json!(description));
-            spec.instructions = Some(description);
         }
     }
     if let Some(instructions) = optional_trimmed_str(command, "instructions") {
@@ -614,6 +644,16 @@ fn update_agent_spec_from_command(
         } else {
             meta.insert("avatarUrl".into(), json!(avatar_url));
         }
+    }
+    if let Some(value) = command.get("promptAssembly") {
+        spec.prompt_assembly = if value.is_null() {
+            None
+        } else {
+            Some(
+                serde_json::from_value::<AgentPromptAssemblySpec>(value.clone())
+                    .context("parse promptAssembly")?,
+            )
+        };
     }
     if let Some(provider) = selected_provider {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
@@ -854,6 +894,34 @@ fn apply_machine_command(
             }
             Err(anyhow!("daemon-configured agent not found: {actor_id}"))
         }
+        "agent.prompt.preview" => {
+            let actor_id = required_str(command, "actorId")?;
+            let spec = load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            render_agent_prompt_preview(&spec, command, &data_root)
+        }
+        "agent.file.list" => {
+            let actor_id = required_str(command, "actorId")?;
+            load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            list_agent_files(actor_id, command, &data_root)
+        }
+        "agent.file.read" => {
+            let actor_id = required_str(command, "actorId")?;
+            load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            read_agent_file(actor_id, command, &data_root)
+        }
+        "agent.file.write" => {
+            let actor_id = required_str(command, "actorId")?;
+            load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            write_agent_file(actor_id, command, &data_root)
+        }
         "provider.add" => {
             let manifest_value = command
                 .get("manifest")
@@ -943,6 +1011,7 @@ fn write_local_provider_manifest(
 }
 
 fn remove_local_provider_manifest(provider_id: &str) -> Result<PathBuf> {
+    validate_provider_id_for_path(provider_id)?;
     if builtin_provider_manifests()
         .iter()
         .any(|builtin| builtin.id == provider_id)
@@ -961,6 +1030,749 @@ fn remove_local_provider_manifest(provider_id: &str) -> Result<PathBuf> {
     std::fs::remove_file(&path)
         .with_context(|| format!("remove provider manifest {}", path.display()))?;
     Ok(path)
+}
+
+const AGENT_FILE_MAX_BYTES: u64 = 128 * 1024;
+
+fn render_agent_prompt_preview(
+    spec: &AgentSpec,
+    command: &Value,
+    data_root: &Path,
+) -> Result<Value> {
+    let scope = command.get("scope").cloned().unwrap_or_else(|| {
+        json!({
+            "kind": "channel",
+            "id": command
+                .get("channelId")
+                .and_then(Value::as_str)
+                .unwrap_or("preview")
+        })
+    });
+    let sample_message = command
+        .get("sampleMessage")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let assembly_value = if let Some(value) = command.get("promptAssembly") {
+        if value.is_null() {
+            None
+        } else {
+            Some(value.clone())
+        }
+    } else {
+        spec.prompt_assembly
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .context("serialize agent promptAssembly")?
+    };
+    let assembly = assembly_value.as_ref();
+    let mut warnings = Vec::<String>::new();
+    let mut parts = default_prompt_preview_parts(spec, &scope, sample_message, data_root);
+    parts.extend(load_prompt_assembly_files(
+        &spec.actor.id,
+        assembly,
+        command,
+        data_root,
+        &mut warnings,
+    )?);
+    let outputs = render_prompt_assembly_outputs(assembly, &parts, &mut warnings);
+    let bindings = provider_prompt_bindings(spec)?;
+    Ok(json!({
+        "actorId": spec.actor.id,
+        "scope": scope,
+        "parts": parts,
+        "outputs": outputs,
+        "bindings": bindings,
+        "warnings": warnings,
+    }))
+}
+
+fn default_prompt_preview_parts(
+    spec: &AgentSpec,
+    scope: &Value,
+    sample_message: &str,
+    data_root: &Path,
+) -> Vec<Value> {
+    let mut parts = Vec::new();
+    parts.push(prompt_preview_part(
+        "actor_context",
+        "Actor context",
+        "builtin",
+        format!("Actor: {} ({})", spec.actor.display_name, spec.actor.id),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "agent_instructions",
+        "Agent instructions",
+        "agentSpec.instructions",
+        spec.instructions.clone().unwrap_or_default(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "bootstrap_memory",
+        "Bootstrap memory",
+        "memory",
+        String::new(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "turn_memory",
+        "Turn memory",
+        "memory",
+        String::new(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "scope_bootstrap",
+        "Scope bootstrap",
+        "builtin",
+        format!(
+            "Scope: {} {}",
+            scope
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("channel"),
+            scope.get("id").and_then(Value::as_str).unwrap_or("preview")
+        ),
+        false,
+    ));
+    let profile_prompt_files =
+        profile_prompt_files_preview_content(&spec.actor.id, data_root).unwrap_or_default();
+    parts.push(prompt_preview_part(
+        "profile_prompt_files",
+        "Profile prompt files",
+        "profile:prompts",
+        profile_prompt_files,
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "runtime_context",
+        "Runtime context",
+        "builtin",
+        format!(
+            "Scope: {} {}",
+            scope
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("channel"),
+            scope.get("id").and_then(Value::as_str).unwrap_or("preview")
+        ),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "assignment_context",
+        "Assignment context",
+        "sample",
+        String::new(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "user_message",
+        "User message",
+        "sampleMessage",
+        sample_message.to_string(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "latest_message",
+        "Latest message",
+        "sampleMessage",
+        sample_message.to_string(),
+        false,
+    ));
+    parts
+}
+
+fn profile_prompt_files_preview_content(actor_id: &str, data_root: &Path) -> Result<String> {
+    let profile_root = agent_file_root(actor_id, "profile", &Value::Null, data_root)?;
+    let prompts_dir = profile_root.join("prompts");
+    let metadata = match std::fs::symlink_metadata(&prompts_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(err) => return Err(anyhow!("read metadata {}: {err}", prompts_dir.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(String::new());
+    }
+    let mut file_names = Vec::new();
+    for entry in std::fs::read_dir(&prompts_dir)
+        .with_context(|| format!("read {}", prompts_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().trim().to_string();
+        if !file_name.is_empty() {
+            file_names.push(file_name);
+        }
+    }
+    file_names.sort();
+    let sections = file_names
+        .into_iter()
+        .filter_map(|file_name| {
+            let relative = Path::new("prompts").join(&file_name);
+            match read_safe_text_file(&profile_root, &relative, AGENT_FILE_MAX_BYTES) {
+                Ok(content) => {
+                    let content = content.trim_end_matches(['\r', '\n']);
+                    if content.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!("=== Profile prompt: {file_name} ===\n{content}"))
+                    }
+                }
+                Err(_) => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(sections.join("\n\n"))
+}
+
+fn prompt_preview_part(
+    key: &str,
+    title: &str,
+    source: &str,
+    content: String,
+    missing: bool,
+) -> Value {
+    json!({
+        "key": key,
+        "title": title,
+        "source": source,
+        "bytes": content.len(),
+        "empty": content.trim().is_empty(),
+        "missing": missing,
+        "content": content,
+    })
+}
+
+fn load_prompt_assembly_files(
+    actor_id: &str,
+    assembly: Option<&Value>,
+    command: &Value,
+    data_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Value>> {
+    let Some(files) = assembly
+        .and_then(|value| value.get("files"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut parts = Vec::new();
+    for file in files {
+        let key = file
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("promptAssembly.files[].key is required"))?;
+        let root = file
+            .get("root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("profile");
+        let path = file
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("promptAssembly.files[].path is required"))?;
+        let optional = file
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let max_bytes = file
+            .get("maxBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(AGENT_FILE_MAX_BYTES)
+            .min(AGENT_FILE_MAX_BYTES);
+        let root_dir = agent_file_root(actor_id, root, command, data_root)?;
+        let relative = validated_relative_path(path, "path")?;
+        let full_path = root_dir.join(&relative);
+        match read_safe_text_file(&root_dir, &relative, max_bytes) {
+            Ok(content) => {
+                parts.push(prompt_preview_part(
+                    &format!("file.{key}"),
+                    file.get("title").and_then(Value::as_str).unwrap_or(key),
+                    &format!("{root}:{}", relative.display()),
+                    content,
+                    false,
+                ));
+            }
+            Err(err) if optional => {
+                warnings.push(format!(
+                    "optional prompt file `{}` is missing or unreadable: {err:#}",
+                    full_path.display()
+                ));
+                parts.push(prompt_preview_part(
+                    &format!("file.{key}"),
+                    file.get("title").and_then(Value::as_str).unwrap_or(key),
+                    &format!("{root}:{}", relative.display()),
+                    String::new(),
+                    true,
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(parts)
+}
+
+fn render_prompt_assembly_outputs(
+    assembly: Option<&Value>,
+    parts: &[Value],
+    warnings: &mut Vec<String>,
+) -> Value {
+    let part_map = parts
+        .iter()
+        .filter_map(|part| {
+            Some((
+                part.get("key")?.as_str()?.to_string(),
+                part.get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let outputs = assembly
+        .and_then(|value| value.get("outputs"))
+        .and_then(Value::as_object);
+    let system = outputs
+        .and_then(|outputs| outputs.get("system"))
+        .map(|spec| render_prompt_output_preview(spec, &part_map, warnings))
+        .unwrap_or_else(|| {
+            join_prompt_preview_parts(
+                &part_map,
+                &[
+                    "actor_context",
+                    "agent_instructions",
+                    "bootstrap_memory",
+                    "scope_bootstrap",
+                    "profile_prompt_files",
+                ],
+                "\n\n",
+                warnings,
+            )
+        });
+    let user = outputs
+        .and_then(|outputs| outputs.get("user"))
+        .map(|spec| render_prompt_output_preview(spec, &part_map, warnings))
+        .unwrap_or_else(|| {
+            join_prompt_preview_parts(
+                &part_map,
+                &[
+                    "turn_memory",
+                    "runtime_context",
+                    "assignment_context",
+                    "user_message",
+                ],
+                "\n\n",
+                warnings,
+            )
+        });
+    let full = outputs
+        .and_then(|outputs| outputs.get("full"))
+        .map(|spec| {
+            let mut prompt_map = part_map.clone();
+            prompt_map.insert("prompt.system".into(), system.clone());
+            prompt_map.insert("prompt.user".into(), user.clone());
+            render_prompt_output_preview(spec, &prompt_map, warnings)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| join_non_empty([system.as_str(), user.as_str()], "\n\n"));
+    json!({
+        "system": system,
+        "user": user,
+        "full": full,
+    })
+}
+
+fn render_prompt_output_preview(
+    spec: &Value,
+    parts: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> String {
+    if let Some(template) = spec.get("template").and_then(Value::as_str) {
+        return render_prompt_template_preview(template, parts, warnings);
+    }
+    let join = spec.get("join").and_then(Value::as_str).unwrap_or("\n\n");
+    let include = prompt_output_preview_include(spec, warnings);
+    join_prompt_preview_parts(
+        parts,
+        &include.iter().map(String::as_str).collect::<Vec<_>>(),
+        join,
+        warnings,
+    )
+}
+
+fn prompt_output_preview_include(spec: &Value, warnings: &mut Vec<String>) -> Vec<String> {
+    if let Some(items) = spec.get("include").and_then(Value::as_array) {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+    }
+    match spec.get("preset").and_then(Value::as_str) {
+        Some("loom_system") => [
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+            "profile_prompt_files",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        Some("loom_turn") => [
+            "turn_memory",
+            "runtime_context",
+            "assignment_context",
+            "user_message",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        Some("loom_full") => [
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+            "profile_prompt_files",
+            "turn_memory",
+            "runtime_context",
+            "assignment_context",
+            "user_message",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        Some(other) => {
+            warnings.push(format!("unknown prompt preset `{other}`"));
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+fn render_prompt_template_preview(
+    template: &str,
+    parts: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> String {
+    let mut out = template.to_string();
+    for key in template_placeholders(template) {
+        if let Some(value) = parts.get(&key) {
+            out = out.replace(&format!("{{{key}}}"), value);
+        } else {
+            warnings.push(format!("unknown prompt template variable `{key}`"));
+            out = out.replace(&format!("{{{key}}}"), "");
+        }
+    }
+    out
+}
+
+fn template_placeholders(value: &str) -> impl Iterator<Item = String> + '_ {
+    let mut rest = value;
+    std::iter::from_fn(move || loop {
+        let start = rest.find('{')?;
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('}') else {
+            rest = "";
+            return None;
+        };
+        let key = &after_open[..end];
+        rest = &after_open[end + 1..];
+        if !key.trim().is_empty() {
+            return Some(key.to_string());
+        }
+    })
+}
+
+fn join_prompt_preview_parts(
+    parts: &BTreeMap<String, String>,
+    include: &[&str],
+    join: &str,
+    warnings: &mut Vec<String>,
+) -> String {
+    let mut values = Vec::new();
+    for key in include {
+        match parts.get(*key) {
+            Some(value) if !value.trim().is_empty() => values.push(value.as_str()),
+            Some(_) => {}
+            None => warnings.push(format!("unknown prompt part `{key}`")),
+        }
+    }
+    join_non_empty(values, join)
+}
+
+fn join_non_empty<'a>(values: impl IntoIterator<Item = &'a str>, join: &str) -> String {
+    values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(join)
+}
+
+fn provider_prompt_bindings(spec: &AgentSpec) -> Result<Value> {
+    let registry = ProviderRegistry::load(&config::config_dir()).map_err(|err| anyhow!(err))?;
+    let transport = registry
+        .resolve_transport(&spec.provider_ref)
+        .map_err(|err| anyhow!(err))?;
+    let mut refs = BTreeMap::<String, Vec<String>>::new();
+    refs.insert(
+        "args".into(),
+        transport
+            .args
+            .iter()
+            .flat_map(|value| prompt_binding_refs(value))
+            .collect(),
+    );
+    refs.insert(
+        "env".into(),
+        transport
+            .env
+            .values()
+            .flat_map(|value| prompt_binding_refs(value))
+            .collect(),
+    );
+    refs.insert(
+        "stdin".into(),
+        transport
+            .stdin
+            .as_deref()
+            .into_iter()
+            .flat_map(prompt_binding_refs)
+            .collect(),
+    );
+    Ok(json!({
+        "providerId": spec.provider_ref.id,
+        "mode": spec.provider_ref.mode,
+        "transport": transport.kind,
+        "promptRefs": refs,
+    }))
+}
+
+fn prompt_binding_refs(value: &str) -> Vec<String> {
+    template_placeholders(value)
+        .filter(|key| key == "prompt" || key.starts_with("prompt."))
+        .collect()
+}
+
+fn list_agent_files(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
+    let root_name = required_str(command, "root")?;
+    let root = agent_file_root(actor_id, root_name, command, data_root)?;
+    let prefix = command
+        .get("prefix")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let prefix = validated_relative_path(prefix, "prefix")?;
+    let dir = root.join(&prefix);
+    let mut files = Vec::new();
+    if dir.exists() {
+        let dir_metadata = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("read metadata {}", dir.display()))?;
+        if dir_metadata.file_type().is_symlink() {
+            return Err(anyhow!("{} must not be a symlink", dir.display()));
+        }
+        if !dir_metadata.is_dir() {
+            return Err(anyhow!("{} is not a directory", dir.display()));
+        }
+        ensure_inside_root(&root, &dir)?;
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("read metadata {}", path.display()))?;
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            files.push(json!({
+                "path": relative,
+                "bytes": metadata.len(),
+                "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+            }));
+        }
+    }
+    files.sort_by(|a, b| {
+        a.get("path")
+            .and_then(Value::as_str)
+            .cmp(&b.get("path").and_then(Value::as_str))
+    });
+    Ok(json!({ "root": root_name, "prefix": prefix.display().to_string(), "files": files }))
+}
+
+fn read_agent_file(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
+    let root_name = required_str(command, "root")?;
+    let root = agent_file_root(actor_id, root_name, command, data_root)?;
+    let path = validated_relative_path(required_str(command, "path")?, "path")?;
+    let max_bytes = command
+        .get("maxBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(AGENT_FILE_MAX_BYTES)
+        .min(AGENT_FILE_MAX_BYTES);
+    let content = read_safe_text_file(&root, &path, max_bytes)?;
+    Ok(json!({
+        "root": root_name,
+        "path": path.display().to_string(),
+        "content": content,
+    }))
+}
+
+fn write_agent_file(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
+    let root_name = required_str(command, "root")?;
+    let root = agent_file_root(actor_id, root_name, command, data_root)?;
+    let path = validated_relative_path(required_str(command, "path")?, "path")?;
+    let content = command
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("content is required"))?;
+    if content.len() as u64 > AGENT_FILE_MAX_BYTES {
+        return Err(anyhow!(
+            "content is {} bytes, above maxBytes {}",
+            content.len(),
+            AGENT_FILE_MAX_BYTES
+        ));
+    }
+    write_safe_text_file(&root, &path, content)?;
+    Ok(json!({
+        "root": root_name,
+        "path": path.display().to_string(),
+        "bytes": content.len(),
+    }))
+}
+
+fn agent_file_root(
+    actor_id: &str,
+    root: &str,
+    command: &Value,
+    data_root: &Path,
+) -> Result<PathBuf> {
+    validate_agent_actor_id(actor_id)?;
+    match root {
+        "profile" => Ok(data_root.join("agents").join(actor_id).join("profile")),
+        "scopeWorkspace" | "scope-workspace" => {
+            let channel_id = command
+                .get("channelId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    command
+                        .get("scope")
+                        .and_then(|scope| scope.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("channelId is required for scopeWorkspace files"))?;
+            proto::path_component::validate_path_component(channel_id, "channel_id")
+                .map_err(|err| anyhow!(err))?;
+            Ok(data_root
+                .join("channels")
+                .join(channel_id)
+                .join("agents")
+                .join(actor_id)
+                .join("workspace"))
+        }
+        other => Err(anyhow!("unsupported agent file root `{other}`")),
+    }
+}
+
+fn validated_relative_path(value: &str, field: &str) -> Result<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(anyhow!("{field} must be relative"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "{field} must not contain parent or root components"
+                ));
+            }
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn read_safe_text_file(root: &Path, relative: &Path, max_bytes: u64) -> Result<String> {
+    let path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("read metadata {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("{} must not be a symlink", path.display()));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(anyhow!(
+            "{} is {} bytes, above maxBytes {}",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        ));
+    }
+    ensure_inside_root(root, &path)?;
+    std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+}
+
+fn write_safe_text_file(root: &Path, relative: &Path, content: &str) -> Result<()> {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("read metadata {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!("{} must not be a symlink", path.display()));
+        }
+    }
+    ensure_inside_root(root, path.parent().unwrap_or(root))?;
+    std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+}
+
+fn ensure_inside_root(root: &Path, path: &Path) -> Result<()> {
+    let root = if root.exists() {
+        std::fs::canonicalize(root).with_context(|| format!("resolve {}", root.display()))?
+    } else {
+        root.to_path_buf()
+    };
+    let path = if path.exists() {
+        std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    if !path.starts_with(&root) {
+        return Err(anyhow!(
+            "{} resolves outside {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn system_time_rfc3339(time: std::time::SystemTime) -> Option<String> {
+    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+    Some(datetime.to_rfc3339())
 }
 
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -1048,7 +1860,12 @@ fn machine_inventory_meta(
             "connection.status",
             "machine.command",
             "agent.create",
+            "agent.update",
             "agent.remove",
+            "agent.prompt.preview",
+            "agent.file.list",
+            "agent.file.read",
+            "agent.file.write",
             "provider.add",
             "provider.remove"
         ],
@@ -1471,6 +2288,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         }];
         let machine = machine("machine_2eabfd47", Some("actor_human_88084"));
@@ -1502,7 +2320,8 @@ mod tests {
                 "providerId": "claude",
                 "actorId": "actor_agent_writer",
                 "name": "Writer",
-                "description": "Writes concise updates",
+                "description": "Concise writing agent",
+                "instructions": "Writes concise updates",
                 "model": "opus",
                 "reasoningEffort": "high",
                 "autostart": true
@@ -1548,9 +2367,58 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         };
         assert!(write_config_agent_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn provider_remove_rejects_unsafe_provider_ids() {
+        for provider_id in [
+            "../daemon",
+            "provider/slash",
+            ".hidden",
+            "foo..bar",
+            "Claude",
+        ] {
+            assert!(
+                validate_provider_id_for_path(provider_id).is_err(),
+                "{provider_id}"
+            );
+        }
+
+        assert!(validate_provider_id_for_path("claude.local").is_ok());
+        assert!(validate_provider_id_for_path("my-provider_1").is_ok());
+    }
+
+    #[test]
+    fn prompt_preview_understands_profile_prompt_files_variable() {
+        let parts = vec![prompt_preview_part(
+            "profile_prompt_files",
+            "Profile prompt files",
+            "profile:prompts",
+            "Profile prompt content".into(),
+            false,
+        )];
+        let assembly = json!({
+            "outputs": {
+                "system": { "template": "{profile_prompt_files}" },
+                "user": { "template": "" },
+                "full": { "include": ["prompt.system", "prompt.user"] }
+            }
+        });
+        let mut warnings = Vec::new();
+
+        let outputs = render_prompt_assembly_outputs(Some(&assembly), &parts, &mut warnings);
+
+        assert_eq!(outputs["system"], json!("Profile prompt content"));
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("profile_prompt_files")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -1589,6 +2457,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         };
         annotate_machine_agent_specs(std::slice::from_mut(&mut spec), &machine);

@@ -89,10 +89,7 @@ pub async fn agent_create(
         "autostart": autostart,
     });
     insert_if_nonempty(&mut command, "actorId", actor_id);
-    insert_if_nonempty(&mut command, "instructions", instructions.clone());
-    // Current GUI still displays this field as "Agent instructions"; keep the
-    // metadata mirror so older clients show the same text without owning it.
-    insert_if_nonempty(&mut command, "description", instructions);
+    insert_if_nonempty(&mut command, "instructions", instructions);
     insert_if_nonempty(&mut command, "model", model);
     insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
 

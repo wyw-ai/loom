@@ -17,17 +17,18 @@
 //!     private `run.append` trace frames back to the server.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
-    AgentSpec, AgentTransport, BundleInstallMode, ChannelMembersResult, CommandSessionIdSource,
-    InboxListResult, MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult,
-    RunCloseResult, RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult,
-    ThreadListResult, TriggerPrefixApplyOn,
+    AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
+    BundleInstallMode, ChannelMembersResult, CommandSessionIdSource, InboxListResult,
+    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
+    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -282,11 +283,35 @@ pub(crate) fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
             .with_context(|| format!("read {}", target.display()))?;
         match serde_json::from_str::<AgentSpec>(&text) {
             Ok(spec) => out.push(spec),
-            Err(e) => eprintln!("[warn] skipping {}: {}", target.display(), e),
+            Err(e) if looks_like_legacy_agent_provider_spec(&text) => {
+                return Err(anyhow!(
+                    "legacy agent provider spec `{}` is no longer loaded by loom-daemon: \
+                     it uses the old provider/transport/actors[] shape. Migrate it to \
+                     daemon-local AgentSpec files with top-level providerRef, or recreate \
+                     the agents from the GUI/`loom agent` commands. Parse error: {e}",
+                    target.display()
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "parse AgentSpec `{}`: {e}. AgentSpec must include top-level providerRef.",
+                    target.display()
+                ));
+            }
         }
     }
     out.sort_by(|a, b| a.actor.id.cmp(&b.actor.id));
     Ok(out)
+}
+
+fn looks_like_legacy_agent_provider_spec(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    value.get("provider").is_some()
+        && value.get("transport").is_some()
+        && value.get("actors").and_then(Value::as_array).is_some()
+        && value.get("providerRef").is_none()
 }
 
 fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
@@ -3215,18 +3240,14 @@ async fn build_adapter_prompt(
         template_vars.insert("loom.trigger.actor".into(), active.trigger_actor.clone());
     }
     let mut parts = prompt.parts.clone();
-    let workspace_parts = agent_runtime::provider::workspace_prompt_parts(
-        state.transport.prompt.as_ref(),
+    parts.extend(load_agent_prompt_file_parts(
+        state.spec.prompt_assembly.as_ref(),
+        &state.profile_dir,
         &scope_paths.workspace,
-    )
-    .map_err(|e| anyhow!("load provider workspace prompt files: {e}"))?;
-    parts.extend(workspace_parts);
-    let outputs = agent_runtime::provider::render_prompt_outputs(
-        state.transport.prompt.as_ref(),
-        &parts,
-        &prompt.content,
-    )
-    .map_err(|e| anyhow!("render provider prompt outputs: {e}"))?;
+        &state.paths.bundle_current,
+    )?);
+    let outputs =
+        render_agent_prompt_outputs(state.spec.prompt_assembly.as_ref(), &parts, &prompt.content)?;
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content: prompt.content.clone(),
@@ -3243,6 +3264,422 @@ async fn build_adapter_prompt(
         ),
         template_vars,
     })
+}
+
+const AGENT_PROMPT_FILE_MAX_BYTES: u64 = 128 * 1024;
+const PROFILE_PROMPTS_DIR: &str = "prompts";
+const PROFILE_PROMPT_FILES_PART_KEY: &str = "profile_prompt_files";
+
+fn load_profile_prompt_files_section(profile_dir: &Path) -> String {
+    let prompts_dir = profile_dir.join(PROFILE_PROMPTS_DIR);
+    let metadata = match std::fs::symlink_metadata(&prompts_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(err) => {
+            tracing::warn!(
+                path = %prompts_dir.display(),
+                %err,
+                "failed to inspect profile prompts directory"
+            );
+            return String::new();
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        tracing::warn!(
+            path = %prompts_dir.display(),
+            "profile prompts path is not a regular directory"
+        );
+        return String::new();
+    }
+    let entries = match std::fs::read_dir(&prompts_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(
+                path = %prompts_dir.display(),
+                %err,
+                "failed to read profile prompts directory"
+            );
+            return String::new();
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy().trim().to_string();
+        if file_name.is_empty() {
+            continue;
+        }
+        files.push(file_name);
+    }
+    files.sort();
+
+    let sections = files
+        .into_iter()
+        .filter_map(|file_name| {
+            let relative = Path::new(&file_name);
+            match read_agent_prompt_text_file(&prompts_dir, relative, AGENT_PROMPT_FILE_MAX_BYTES) {
+                Ok(content) => {
+                    let content = content.trim_end_matches(['\r', '\n']);
+                    if content.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!("=== Profile prompt: {file_name} ===\n{content}"))
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        file = %prompts_dir.join(relative).display(),
+                        %err,
+                        "failed to load profile prompt file"
+                    );
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    sections.join("\n\n")
+}
+
+fn load_agent_prompt_file_parts(
+    assembly: Option<&AgentPromptAssemblySpec>,
+    profile_dir: &Path,
+    scope_workspace: &Path,
+    bundle_root: &Path,
+) -> Result<Vec<PromptPart>> {
+    let Some(assembly) = assembly else {
+        return Ok(Vec::new());
+    };
+    let mut parts = Vec::new();
+    for file in &assembly.files {
+        let key = validate_agent_prompt_file_key(&file.key)?;
+        let root = agent_prompt_file_root(&file.root, profile_dir, scope_workspace, bundle_root)?;
+        let relative = validated_agent_prompt_relative_path(&file.path)?;
+        let max_bytes = file.max_bytes.min(AGENT_PROMPT_FILE_MAX_BYTES);
+        match read_agent_prompt_text_file(root, &relative, max_bytes) {
+            Ok(content) => {
+                let title = file
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(key);
+                let content = content.trim_end_matches(['\r', '\n']).to_string();
+                let rendered_content = if title.is_empty() {
+                    content.clone()
+                } else {
+                    format!("=== {title} ===\n{content}")
+                };
+                parts.push(PromptPart {
+                    key: format!("file.{key}"),
+                    title: title.to_string(),
+                    content,
+                    rendered_content,
+                    role_hint: match file.role_hint.unwrap_or(AgentPromptRoleHint::System) {
+                        AgentPromptRoleHint::System => PromptRoleHint::System,
+                        AgentPromptRoleHint::User => PromptRoleHint::User,
+                    },
+                });
+            }
+            Err(err) if file.optional => {
+                tracing::warn!(
+                    root = %file.root,
+                    path = %file.path,
+                    %err,
+                    "optional agent prompt file was not loaded"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(parts)
+}
+
+fn render_agent_prompt_outputs(
+    assembly: Option<&AgentPromptAssemblySpec>,
+    parts: &[PromptPart],
+    full_prompt: &str,
+) -> Result<BTreeMap<String, String>> {
+    let default_outputs = default_agent_prompt_outputs();
+    let output_specs = assembly
+        .filter(|assembly| !assembly.outputs.is_empty())
+        .map(|assembly| &assembly.outputs)
+        .unwrap_or(&default_outputs);
+    let mut values = parts
+        .iter()
+        .map(|part| (part.key.clone(), part.rendered_content.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(assembly) = assembly {
+        for (key, value) in &assembly.vars {
+            values.insert(format!("var.{key}"), value.clone());
+        }
+    }
+    let mut outputs = BTreeMap::new();
+    for name in output_render_order(output_specs) {
+        let spec = output_specs
+            .get(name)
+            .ok_or_else(|| anyhow!("missing prompt output spec `{name}`"))?;
+        let rendered = render_agent_prompt_output(name, spec, &values, &outputs, full_prompt)?;
+        values.insert(format!("prompt.{name}"), rendered.clone());
+        outputs.insert(name.to_string(), rendered);
+    }
+    Ok(outputs)
+}
+
+fn output_render_order(outputs: &BTreeMap<String, AgentPromptOutputSpec>) -> Vec<&str> {
+    let mut names = Vec::new();
+    for name in ["system", "user", "full"] {
+        if outputs.contains_key(name) {
+            names.push(name);
+        }
+    }
+    names.extend(
+        outputs
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !matches!(*name, "system" | "user" | "full")),
+    );
+    names
+}
+
+fn default_agent_prompt_outputs() -> BTreeMap<String, AgentPromptOutputSpec> {
+    BTreeMap::from([
+        (
+            "system".into(),
+            AgentPromptOutputSpec {
+                preset: Some("loom_system".into()),
+                ..Default::default()
+            },
+        ),
+        (
+            "user".into(),
+            AgentPromptOutputSpec {
+                preset: Some("loom_turn".into()),
+                ..Default::default()
+            },
+        ),
+        (
+            "full".into(),
+            AgentPromptOutputSpec {
+                preset: Some("loom_full".into()),
+                ..Default::default()
+            },
+        ),
+    ])
+}
+
+fn render_agent_prompt_output(
+    name: &str,
+    output: &AgentPromptOutputSpec,
+    values: &BTreeMap<String, String>,
+    outputs: &BTreeMap<String, String>,
+    full_prompt: &str,
+) -> Result<String> {
+    for required in &output.required {
+        if !values
+            .get(required)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(anyhow!("required prompt part `{required}` is missing"));
+        }
+    }
+    let mut vars = values.clone();
+    for (name, value) in outputs {
+        vars.insert(format!("prompt.{name}"), value.clone());
+    }
+    let mut rendered = if let Some(template) = output.template.as_deref() {
+        render_agent_prompt_template(template, &vars)?
+    } else if name == "full"
+        && output.preset.as_deref() == Some("loom_full")
+        && output.include.is_empty()
+    {
+        full_prompt.to_string()
+    } else {
+        let include = if !output.include.is_empty() {
+            output.include.clone()
+        } else if let Some(preset) = output.preset.as_deref() {
+            agent_prompt_preset_parts(preset)?
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            vec!["prompt.full".into()]
+        };
+        let join = output.join.as_deref().unwrap_or("\n\n");
+        join_non_empty(
+            include
+                .iter()
+                .filter_map(|key| vars.get(key))
+                .map(String::as_str),
+            join,
+        )
+    };
+    if let Some(prefix) = output.prefix.as_ref() {
+        rendered = format!("{prefix}{rendered}");
+    }
+    if let Some(suffix) = output.suffix.as_ref() {
+        rendered.push_str(suffix);
+    }
+    Ok(rendered)
+}
+
+fn agent_prompt_preset_parts(preset: &str) -> Result<Vec<&'static str>> {
+    match preset {
+        "loom_system" => Ok(vec![
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+            PROFILE_PROMPT_FILES_PART_KEY,
+        ]),
+        "loom_turn" => Ok(vec![
+            "turn_memory",
+            "runtime_context",
+            "assignment_context",
+            "user_message",
+        ]),
+        "loom_full" => Ok(vec![
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+            PROFILE_PROMPT_FILES_PART_KEY,
+            "turn_memory",
+            "runtime_context",
+            "assignment_context",
+            "user_message",
+        ]),
+        other => Err(anyhow!("unknown prompt preset `{other}`")),
+    }
+}
+
+fn render_agent_prompt_template(
+    template: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('}') else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let key = &after_open[..end];
+        if key.trim().is_empty() {
+            out.push_str("{}");
+        } else {
+            let value = values
+                .get(key)
+                .ok_or_else(|| anyhow!("unknown prompt template variable `{key}`"))?;
+            out.push_str(value);
+        }
+        rest = &after_open[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn join_non_empty<'a>(values: impl IntoIterator<Item = &'a str>, join: &str) -> String {
+    values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(join)
+}
+
+fn validate_agent_prompt_file_key(key: &str) -> Result<&str> {
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(anyhow!("invalid agent prompt file key `{key}`"));
+    }
+    Ok(key)
+}
+
+fn agent_prompt_file_root<'a>(
+    root: &str,
+    profile_dir: &'a Path,
+    scope_workspace: &'a Path,
+    bundle_root: &'a Path,
+) -> Result<&'a Path> {
+    match root {
+        "profile" => Ok(profile_dir),
+        "scopeWorkspace" | "scope-workspace" => Ok(scope_workspace),
+        "bundle" => Ok(bundle_root),
+        other => Err(anyhow!("unsupported agent prompt file root `{other}`")),
+    }
+}
+
+fn validated_agent_prompt_relative_path(value: &str) -> Result<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("agent prompt file path is required"));
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(anyhow!("agent prompt file path must be relative"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "agent prompt file path must not contain parent or root components"
+                ));
+            }
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn read_agent_prompt_text_file(root: &Path, relative: &Path, max_bytes: u64) -> Result<String> {
+    let path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("read metadata {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("{} must not be a symlink", path.display()));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(anyhow!(
+            "{} is {} bytes, above maxBytes {}",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        ));
+    }
+    ensure_path_inside_root(root, &path)?;
+    std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+}
+
+fn ensure_path_inside_root(root: &Path, path: &Path) -> Result<()> {
+    let root =
+        std::fs::canonicalize(root).with_context(|| format!("resolve {}", root.display()))?;
+    let path =
+        std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?;
+    if !path.starts_with(&root) {
+        return Err(anyhow!(
+            "{} resolves outside {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(())
 }
 
 async fn no_reply_file_for_turn(
@@ -3990,6 +4427,7 @@ async fn compose_envelope_prompt(
         members_context,
         conversation_context.clone(),
     ]);
+    let profile_prompt_files = load_profile_prompt_files_section(&state.profile_dir);
     let scope_bootstrap = if first_turn || command_transport_without_resume(&state.transport) {
         seed_manifest(&state.actor_id, scope)
     } else {
@@ -4026,6 +4464,7 @@ async fn compose_envelope_prompt(
                 content: scope_bootstrap.clone(),
             });
         }
+        push_profile_prompt_files_section(&mut sections, profile_prompt_files.clone());
         sections.push(agent_runtime::PromptSection {
             name: "runtime_context",
             content: runtime_context.clone(),
@@ -4049,7 +4488,7 @@ async fn compose_envelope_prompt(
         return prompt;
     }
 
-    let (prompt, sections) =
+    let (_prompt, mut sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             actor_context: &actor_context,
             agent_instructions: &agent_instructions,
@@ -4061,6 +4500,12 @@ async fn compose_envelope_prompt(
             user_message: &turn_input,
             scope_bootstrap: &scope_bootstrap,
         });
+    push_profile_prompt_files_section(&mut sections, profile_prompt_files);
+    let prompt = sections
+        .iter()
+        .map(|section| section.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let mut prompt = apply_trigger_prefix_to_prompt(
         &state.spec,
         prompt_telemetry(prompt, &sections),
@@ -4069,6 +4514,31 @@ async fn compose_envelope_prompt(
     );
     add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
     prompt
+}
+
+fn push_profile_prompt_files_section(
+    sections: &mut Vec<agent_runtime::PromptSection>,
+    content: String,
+) {
+    if content.trim().is_empty() {
+        return;
+    }
+    let insert_at = sections
+        .iter()
+        .position(|section| {
+            matches!(
+                section.name,
+                "turn_memory" | "runtime_context" | "user_message"
+            )
+        })
+        .unwrap_or(sections.len());
+    sections.insert(
+        insert_at,
+        agent_runtime::PromptSection {
+            name: "profile_prompt_files",
+            content,
+        },
+    );
 }
 
 fn add_turn_input_prompt_parts(
@@ -4325,9 +4795,11 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
         content: raw_prompt_part_content(&section.content, &title),
         rendered_content: section.content.clone(),
         role_hint: match section.name {
-            "actor_context" | "agent_instructions" | "bootstrap_memory" | "scope_bootstrap" => {
-                PromptRoleHint::System
-            }
+            "actor_context"
+            | "agent_instructions"
+            | "bootstrap_memory"
+            | "scope_bootstrap"
+            | "profile_prompt_files" => PromptRoleHint::System,
             _ => PromptRoleHint::User,
         },
     }
@@ -4372,6 +4844,7 @@ fn prompt_section_title(name: &str) -> &str {
         "turn_memory" => "Context: Turn memory",
         "runtime_context" => "Context: Runtime context",
         "scope_bootstrap" => "System: Loom multi-actor context",
+        "profile_prompt_files" => "System: Profile prompt files",
         "trigger_prefix" => "Trigger prefix",
         "latest_message" => "Latest Loom message",
         "assignment_context" => "Loom assignment context",
@@ -4408,6 +4881,7 @@ fn prompt_section_label(name: &str) -> &str {
         "turn_memory" => "Turn Memory",
         "runtime_context" => "Runtime Context",
         "scope_bootstrap" => "Scope Bootstrap",
+        "profile_prompt_files" => "Profile Prompt Files",
         "trigger_prefix" => "Trigger Prefix",
         "latest_message" => "Latest Message",
         "assignment_context" => "Assignment Context",
@@ -5519,7 +5993,8 @@ async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Res
 mod tests {
     use super::*;
     use proto::methods::{
-        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentProviderRef,
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentPromptAssemblySpec,
+        AgentPromptFileSpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentProviderRef,
         ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
@@ -5546,6 +6021,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         }
     }
@@ -5689,6 +6165,55 @@ mod tests {
             ensure_bundle("actor_demo", &spec, &bundle_paths, &paths).expect_err("must reject");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn load_specs_rejects_legacy_agent_provider_specs_with_migration_hint() {
+        let root = temp_path("legacy-spec");
+        std::fs::create_dir_all(&root).expect("create specs dir");
+        std::fs::write(
+            root.join("claude.json"),
+            r#"{
+                "provider": { "id": "claude" },
+                "transport": { "kind": "command" },
+                "actors": []
+            }"#,
+        )
+        .expect("write legacy spec");
+
+        let err = load_specs(&root).expect_err("legacy spec must fail explicitly");
+        let message = err.to_string();
+
+        assert!(message.contains("legacy agent provider spec"));
+        assert!(message.contains("providerRef"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn profile_prompt_files_section_reads_first_level_files_by_name() {
+        let root = temp_path("profile-prompts");
+        let prompts_dir = root.join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        std::fs::write(prompts_dir.join("b-style.md"), "Use short answers.")
+            .expect("write b prompt");
+        std::fs::write(prompts_dir.join("a-system.md"), "Keep project context.")
+            .expect("write a prompt");
+        std::fs::create_dir_all(prompts_dir.join("nested")).expect("create nested prompt dir");
+        std::fs::write(prompts_dir.join("nested").join("ignored.md"), "ignored")
+            .expect("write nested prompt");
+
+        let section = load_profile_prompt_files_section(&root);
+
+        assert!(section.contains("=== Profile prompt: a-system.md ==="));
+        assert!(section.contains("Keep project context."));
+        assert!(section.contains("=== Profile prompt: b-style.md ==="));
+        assert!(section.contains("Use short answers."));
+        assert!(!section.contains("ignored"));
+        assert!(
+            section.find("a-system.md").expect("a heading")
+                < section.find("b-style.md").expect("b heading")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6420,6 +6945,133 @@ mod tests {
         assert!(manifest.contains("Current UTC time:"));
         assert!(manifest.contains("RFC3339 UTC"));
         assert!(manifest.contains("GUI/chat timestamps"));
+    }
+
+    #[test]
+    fn agent_prompt_assembly_renders_system_user_and_full_outputs() {
+        let parts = vec![
+            PromptPart {
+                key: "actor_context".into(),
+                title: "Actor".into(),
+                content: "actor raw".into(),
+                rendered_content: "=== Actor ===\nactor raw".into(),
+                role_hint: PromptRoleHint::System,
+            },
+            PromptPart {
+                key: "agent_instructions".into(),
+                title: "Instructions".into(),
+                content: "be concise".into(),
+                rendered_content: "=== Instructions ===\nbe concise".into(),
+                role_hint: PromptRoleHint::System,
+            },
+            PromptPart {
+                key: "runtime_context".into(),
+                title: "Runtime".into(),
+                content: "time now".into(),
+                rendered_content: "=== Runtime ===\ntime now".into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "user_message".into(),
+                title: "User".into(),
+                content: "hello".into(),
+                rendered_content: "=== User ===\nhello".into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "file.persona".into(),
+                title: "Persona".into(),
+                content: "reviewer".into(),
+                rendered_content: "=== Persona ===\nreviewer".into(),
+                role_hint: PromptRoleHint::System,
+            },
+        ];
+        let assembly = AgentPromptAssemblySpec {
+            vars: BTreeMap::new(),
+            files: Vec::new(),
+            outputs: BTreeMap::from([
+                (
+                    "system".into(),
+                    AgentPromptOutputSpec {
+                        include: vec![
+                            "actor_context".into(),
+                            "agent_instructions".into(),
+                            "file.persona".into(),
+                        ],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "user".into(),
+                    AgentPromptOutputSpec {
+                        template: Some("{runtime_context}\n\n{user_message}".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "full".into(),
+                    AgentPromptOutputSpec {
+                        template: Some("{prompt.system}\n\n{prompt.user}".into()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        };
+
+        let outputs = render_agent_prompt_outputs(Some(&assembly), &parts, "legacy full")
+            .expect("render prompt assembly");
+
+        assert!(outputs["system"].contains("=== Persona ===\nreviewer"));
+        assert!(outputs["user"].contains("=== Runtime ===\ntime now"));
+        assert!(outputs["full"].contains("=== Instructions ===\nbe concise"));
+        assert!(outputs["full"].contains("=== User ===\nhello"));
+    }
+
+    #[test]
+    fn agent_prompt_assembly_loads_profile_and_scope_workspace_files() {
+        let root = temp_path("prompt-assembly-files");
+        let profile = root.join("profile");
+        let workspace = root.join("workspace");
+        let bundle = root.join("bundle");
+        std::fs::create_dir_all(profile.join("prompts")).expect("profile prompts");
+        std::fs::create_dir_all(workspace.join(".loom")).expect("workspace loom");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        std::fs::write(profile.join("prompts/persona.md"), "profile persona\n")
+            .expect("write persona");
+        std::fs::write(workspace.join(".loom/rules.md"), "scope rules\n").expect("write rules");
+        let assembly = AgentPromptAssemblySpec {
+            vars: BTreeMap::new(),
+            files: vec![
+                AgentPromptFileSpec {
+                    key: "persona".into(),
+                    root: "profile".into(),
+                    path: "prompts/persona.md".into(),
+                    title: Some("Persona".into()),
+                    role_hint: Some(AgentPromptRoleHint::System),
+                    optional: false,
+                    max_bytes: 32 * 1024,
+                },
+                AgentPromptFileSpec {
+                    key: "rules".into(),
+                    root: "scopeWorkspace".into(),
+                    path: ".loom/rules.md".into(),
+                    title: Some("Rules".into()),
+                    role_hint: Some(AgentPromptRoleHint::User),
+                    optional: false,
+                    max_bytes: 32 * 1024,
+                },
+            ],
+            outputs: BTreeMap::new(),
+        };
+
+        let parts = load_agent_prompt_file_parts(Some(&assembly), &profile, &workspace, &bundle)
+            .expect("load prompt files");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].key, "file.persona");
+        assert_eq!(parts[0].content, "profile persona");
+        assert_eq!(parts[1].key, "file.rules");
+        assert_eq!(parts[1].role_hint, PromptRoleHint::User);
     }
 
     #[test]

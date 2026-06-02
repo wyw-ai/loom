@@ -1,8 +1,8 @@
 //! Daemon agent worker internals.
 //!
-//! `loom-daemon` synthesizes `AgentSpec`s from the desktop machine config and
-//! uses this module to open a dedicated WebSocket per agent, then supervise
-//! that one agent through the shared `agent-runtime` adapter trait.
+//! `loom-daemon` loads daemon-local `AgentSpec`s and uses this module to open a
+//! dedicated WebSocket per agent, then supervise that one agent through the
+//! shared `agent-runtime` adapter trait.
 //!
 //! Architecture:
 //!   * one tokio task per agent ⇒ one `Client` ⇒ one WS frame to the server
@@ -23,11 +23,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
-    method, stream_kind, ActorListResult, AgentConfigActivateResult, AgentConfigPublishResult,
-    AgentModelChoice, AgentSpec, BundleInstallMode, ChannelMembersResult, InboxListResult,
-    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
-    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
-    TriggerPrefixApplyOn,
+    method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
+    AgentSpec, AgentTransport, BundleInstallMode, ChannelMembersResult, CommandSessionIdSource,
+    InboxListResult, MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult,
+    RunCloseResult, RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult,
+    ThreadListResult, TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -48,10 +48,12 @@ use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandCo
 use agent_runtime::usage;
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
-    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, TokenUsage,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, PromptPart,
+    PromptRoleHint, TokenUsage,
 };
 
 use crate::client::Client;
+use crate::config;
 use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
@@ -86,6 +88,7 @@ pub async fn run(
             specs.len(),
         ));
     }
+    ensure_agent_config_dirs(&specs)?;
 
     eprintln!(
         "loom agent serve: loaded {} agent(s) from {}",
@@ -256,7 +259,7 @@ fn default_specs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".loom").join("agents"))
 }
 
-fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
+pub(crate) fn load_specs(dir: &Path) -> Result<Vec<AgentSpec>> {
     let mut out = Vec::new();
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("read specs dir {}", dir.display()))?
@@ -304,6 +307,19 @@ fn reload_spec(specs_dir: &Path, actor_id: &str) -> Result<Option<AgentSpec>> {
     let spec: AgentSpec =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(spec))
+}
+
+fn agent_config_dir(actor_id: &str) -> PathBuf {
+    config::config_dir().join("agents").join(actor_id)
+}
+
+fn ensure_agent_config_dirs(specs: &[AgentSpec]) -> Result<()> {
+    for spec in specs {
+        let dir = agent_config_dir(&spec.actor.id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create agent config dir {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// The path to the Loom CLI. `loom-daemon` is often launched by absolute path,
@@ -726,21 +742,7 @@ impl AgentPaths {
         std::fs::create_dir_all(&self.profile)?;
         std::fs::create_dir_all(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
-        if spec.identity.is_some() || spec.memory.is_some() {
-            let identity = spec.identity.as_ref();
-            let identity_file = identity
-                .map(|s| s.files.identity.as_str())
-                .unwrap_or("identity.md");
-            let soul_file = identity.map(|s| s.files.soul.as_str()).unwrap_or("soul.md");
-            let description = identity
-                .and_then(|s| s.description.as_deref())
-                .unwrap_or("");
-            let identity_seed = identity
-                .and_then(|s| s.scaffold.as_ref())
-                .and_then(|s| s.identity.as_deref());
-            let soul_seed = identity
-                .and_then(|s| s.scaffold.as_ref())
-                .and_then(|s| s.soul.as_deref());
+        if spec.memory.is_some() {
             let memory_root = spec
                 .memory
                 .as_ref()
@@ -749,14 +751,7 @@ impl AgentPaths {
             if let Err(e) =
                 agent_runtime::ensure_profile_scaffold(&agent_runtime::ProfileScaffold {
                     profile_dir: &self.profile,
-                    actor_id,
-                    display_name: &spec.actor.display_name,
-                    description,
-                    identity_file,
-                    soul_file,
                     memory_root,
-                    identity_seed,
-                    soul_seed,
                 })
             {
                 tracing::warn!(actor = %actor_id, %e, "failed to scaffold profile");
@@ -849,6 +844,15 @@ impl AgentPaths {
         );
         vars.insert("agent.root".into(), scope.agent_root.display().to_string());
         vars.insert("agent.profile".into(), self.profile.display().to_string());
+        let agent_config_dir = agent_config_dir(actor_id);
+        vars.insert(
+            "agent.configDir".into(),
+            agent_config_dir.display().to_string(),
+        );
+        vars.insert(
+            "agent.specPath".into(),
+            agent_config_dir.join("spec.json").display().to_string(),
+        );
         vars.insert("agent.logs".into(), scope.logs.display().to_string());
         vars.insert("agent.skills".into(), scope.skills.display().to_string());
         vars.insert("scope.skills".into(), scope.skills.display().to_string());
@@ -1207,8 +1211,11 @@ struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
     spec: AgentSpec,
+    /// Runtime-only provider resolution. This is intentionally separate from
+    /// AgentSpec so providerRef resolution does not rewrite on-disk spec data.
+    transport: AgentTransport,
     /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
-    /// here so prompt-envelope code can read identity/soul/memory without
+    /// here so prompt-envelope code can read legacy profile fields and memory without
     /// threading `paths` through every call.
     profile_dir: PathBuf,
     paths: AgentPaths,
@@ -1248,10 +1255,6 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
-    /// Actor id → display name cache used when rendering trigger prompts.
-    /// The server keeps actor rows authoritative; this cache is a fallback
-    /// when actor/list is temporarily unavailable.
-    actor_display_cache: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -1306,6 +1309,7 @@ struct PromptBreakdownSection {
 #[derive(Debug, Clone)]
 struct PromptTelemetry {
     content: String,
+    parts: Vec<PromptPart>,
     stats: PromptStats,
     breakdown: PromptBreakdown,
 }
@@ -1334,6 +1338,31 @@ struct ModelStateFile {
     model: String,
 }
 
+#[cfg(test)]
+fn test_command_transport() -> AgentTransport {
+    AgentTransport {
+        kind: "command".into(),
+        command: "echo".into(),
+        args: Vec::new(),
+        arg_specs: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        auth_method: None,
+        model: None,
+        model_args: Vec::new(),
+        session: None,
+        output_format: None,
+        decoder: None,
+        stderr_decoder: None,
+        prompt_via: proto::methods::PromptVia::default(),
+        prompt: None,
+        stdin: None,
+        timeout_ms: None,
+        idle_timeout_ms: None,
+        interactive: None,
+        provider: None,
+    }
+}
+
 impl WorkerState {
     #[cfg(test)]
     fn new(
@@ -1343,9 +1372,29 @@ impl WorkerState {
         paths: AgentPaths,
         agent_server_url: String,
     ) -> Self {
+        Self::new_with_transport(
+            actor_id,
+            spec,
+            test_command_transport(),
+            profile_dir,
+            paths,
+            agent_server_url,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_transport(
+        actor_id: String,
+        spec: AgentSpec,
+        transport: AgentTransport,
+        profile_dir: PathBuf,
+        paths: AgentPaths,
+        agent_server_url: String,
+    ) -> Self {
         Self::new_with_agent_config_version(
             actor_id,
             spec,
+            transport,
             profile_dir,
             paths,
             agent_server_url,
@@ -1356,21 +1405,19 @@ impl WorkerState {
     fn new_with_agent_config_version(
         actor_id: String,
         spec: AgentSpec,
+        transport: AgentTransport,
         profile_dir: PathBuf,
         paths: AgentPaths,
         agent_server_url: String,
         agent_config_version_id: String,
     ) -> Self {
         let selected_model = load_model_state(&profile_dir)
-            .filter(|model| persisted_model_is_allowed(&spec, model))
+            .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
-        let mut actor_display_cache = HashMap::new();
-        if !spec.actor.display_name.trim().is_empty() {
-            actor_display_cache.insert(spec.actor.id.clone(), spec.actor.display_name.clone());
-        }
         Self {
             actor_id,
             spec,
+            transport,
             profile_dir,
             paths,
             agent_server_url,
@@ -1385,7 +1432,6 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
-            actor_display_cache: Mutex::new(actor_display_cache),
         }
     }
 
@@ -1540,25 +1586,6 @@ impl WorkerState {
             .clone()
     }
 
-    fn cache_actor_displays(&self, actors: impl IntoIterator<Item = (String, String)>) {
-        let mut cache = self
-            .actor_display_cache
-            .lock()
-            .expect("actor_display_cache poisoned");
-        for (id, display) in actors {
-            if !id.trim().is_empty() && !display.trim().is_empty() {
-                cache.insert(id, display);
-            }
-        }
-    }
-
-    fn actor_display_snapshot(&self) -> HashMap<String, String> {
-        self.actor_display_cache
-            .lock()
-            .expect("actor_display_cache poisoned")
-            .clone()
-    }
-
     fn model_choices(&self) -> Vec<AgentModelChoice> {
         model_choices_for_spec(&self.spec)
     }
@@ -1686,12 +1713,12 @@ fn model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
         .any(|choice| choice.id == model)
 }
 
-fn persisted_model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
+fn persisted_model_is_allowed(spec: &AgentSpec, transport: &AgentTransport, model: &str) -> bool {
     let model = model.trim();
     if model.is_empty() {
         return false;
     }
-    if transport_supports_runtime_model_options(spec) {
+    if transport_supports_runtime_model_options(transport) {
         return true;
     }
     let choices = model_choices_for_spec(spec);
@@ -1701,8 +1728,8 @@ fn persisted_model_is_allowed(spec: &AgentSpec, model: &str) -> bool {
     choices.iter().any(|choice| choice.id == model)
 }
 
-fn transport_supports_runtime_model_options(spec: &AgentSpec) -> bool {
-    spec.transport.kind == "acp_stdio"
+fn transport_supports_runtime_model_options(transport: &AgentTransport) -> bool {
+    transport.kind == "acp_stdio"
 }
 
 fn model_choices_for_spec(spec: &AgentSpec) -> Vec<AgentModelChoice> {
@@ -1749,6 +1776,8 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
 }
 
 async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
+    let transport = resolve_transport_for_spec(&spec)
+        .map_err(|e| anyhow!("resolve transport for {}: {e}", spec.actor.id))?;
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -1778,7 +1807,8 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     client
         .open_connection_as(&actor_id, actor_kind, Some(&display_name))
         .await?;
-    let agent_config_version_id = publish_runtime_agent_config(&client, &actor_id, &spec).await?;
+    let agent_config_version_id =
+        publish_runtime_agent_config(&client, &actor_id, &spec, &transport).await?;
     eprintln!(
         "[{actor_id}] connected to {server_url} as {:?}",
         spec.actor.kind
@@ -1794,13 +1824,14 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     let state = Arc::new(WorkerState::new_with_agent_config_version(
         actor_id.clone(),
         spec.clone(),
+        transport.clone(),
         paths.profile.clone(),
         paths.clone(),
         agent_server_url.clone(),
         agent_config_version_id,
     ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
-    let adapter = build_adapter(&spec, &paths, &bundle_paths, &agent_server_url)?;
+    let adapter = build_adapter(&spec, &transport, &paths, &bundle_paths, &agent_server_url)?;
 
     // Translator: AdapterEvent → server RPC. Drains until adapter drops the
     // sender (worker exit) — at which point the loop falls out and the task
@@ -1823,10 +1854,17 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     result
 }
 
+fn resolve_transport_for_spec(spec: &AgentSpec) -> Result<AgentTransport> {
+    agent_runtime::provider::default_registry()
+        .and_then(|registry| registry.resolve_transport(&spec.provider_ref))
+        .map_err(|e| anyhow!(e))
+}
+
 async fn publish_runtime_agent_config(
     client: &Client,
     actor_id: &str,
     spec: &AgentSpec,
+    transport: &AgentTransport,
 ) -> Result<String> {
     let spec_json = serde_json::to_value(spec).context("serialize agent spec")?;
     let spec_bytes = serde_json::to_vec(spec).context("serialize agent spec for hash")?;
@@ -1842,7 +1880,7 @@ async fn publish_runtime_agent_config(
         .context("serialize prompt template")?
         .unwrap_or_default();
     let model = default_model_for_spec(spec)
-        .or_else(|| spec.transport.model.clone())
+        .or_else(|| transport.model.clone())
         .unwrap_or_default();
     let capabilities = spec
         .actor
@@ -1866,7 +1904,7 @@ async fn publish_runtime_agent_config(
                 "version": version,
                 "prompt": prompt,
                 "model": model,
-                "adapter": spec.transport.kind,
+                "adapter": transport.kind,
                 "tools": spec_json,
                 "capabilityTags": capabilities,
                 "metadata": {
@@ -1892,17 +1930,17 @@ async fn publish_runtime_agent_config(
 
 fn build_adapter(
     spec: &AgentSpec,
+    transport: &AgentTransport,
     paths: &AgentPaths,
     bundle_paths: &BundlePaths,
     server_url: &str,
 ) -> Result<Arc<dyn Adapter>> {
-    let mut process_env: BTreeMap<String, String> = spec
-        .transport
+    let mut process_env: BTreeMap<String, String> = transport
         .env
         .iter()
         .map(|(k, v)| (k.clone(), paths.expand(v, Some(bundle_paths))))
         .collect();
-    let mut command_env = spec.transport.env.clone();
+    let mut command_env = transport.env.clone();
     let loom_binary = current_loom_binary();
     inject_loom_cli_env(&mut process_env, loom_binary.as_deref());
     inject_loom_cli_env(&mut command_env, loom_binary.as_deref());
@@ -1961,14 +1999,13 @@ fn build_adapter(
     }
     insert_static_local_time_env(&mut process_env);
     insert_static_local_time_env(&mut command_env);
-    let process_args: Vec<String> = spec
-        .transport
+    let process_args: Vec<String> = transport
         .args
         .iter()
         .map(|a| paths.expand(a, Some(bundle_paths)))
         .collect();
 
-    match spec.transport.kind.as_str() {
+    match transport.kind.as_str() {
         "acp_stdio" => {
             let mcp_servers = agent_runtime::build_mcp_servers(
                 loom_binary.as_deref(),
@@ -1979,11 +2016,11 @@ fn build_adapter(
                 Some(server_url),
             );
             let cfg = AcpConfig {
-                command: spec.transport.command.clone(),
+                command: transport.command.clone(),
                 args: process_args,
                 env: process_env,
                 process_cwd: paths.root.clone(),
-                auth_method: spec.transport.auth_method.clone(),
+                auth_method: transport.auth_method.clone(),
                 mcp_servers,
             };
             Ok(Arc::new(AcpAdapter::new(cfg)))
@@ -1991,30 +2028,30 @@ fn build_adapter(
         "command" => {
             let cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
-                spec.transport.command.clone(),
-                spec.transport.args.clone(),
+                transport.command.clone(),
+                transport.args.clone(),
                 command_env,
-                &spec.transport,
+                transport,
                 paths.sessions.clone(),
             );
             Ok(Arc::new(CommandAdapter::new(cfg)))
         }
         "interactive_command" => {
-            let interactive = spec.transport.interactive.clone().unwrap_or_default();
+            let interactive = transport.interactive.clone().unwrap_or_default();
             let model = spec
-                .transport
-                .model
-                .clone()
-                .or_else(|| spec.models.as_ref().and_then(|m| m.default.clone()));
+                .models
+                .as_ref()
+                .and_then(|m| m.default.clone())
+                .or_else(|| transport.model.clone());
             let cfg = InteractiveCommandConfig::new(
                 spec.actor.id.clone(),
-                spec.transport.command.clone(),
-                &spec.transport.args,
+                transport.command.clone(),
+                &transport.args,
                 command_env,
                 model,
-                spec.transport.model_args.clone(),
+                transport.model_args.clone(),
                 interactive,
-                spec.transport.provider.clone(),
+                transport.provider.clone(),
                 paths.sessions.clone(),
                 paths.profile.clone(),
             );
@@ -2668,12 +2705,12 @@ async fn drain_pending_inbox(
             .await
             {
                 Ok(_) => {}
-                Err(e) if is_missing_scope_error(&e) => {
+                Err(e) if is_unreachable_scope_error(&e) => {
                     tracing::warn!(
                         actor = %actor_id,
                         source = %source_id,
                         %e,
-                        "acknowledging pending message delivery for missing scope"
+                        "acknowledging pending message delivery for unreachable scope"
                     );
                     record_delivery_seen_by_id(client, actor_id, &source_id).await?;
                 }
@@ -2711,12 +2748,12 @@ async fn drain_pending_inbox(
                 .await
             {
                 Ok(_) => {}
-                Err(e) if is_missing_scope_error(&e) => {
+                Err(e) if is_unreachable_scope_error(&e) => {
                     tracing::warn!(
                         actor = %actor_id,
                         source = %source_id,
                         %e,
-                        "acknowledging pending event delivery for missing scope"
+                        "acknowledging pending event delivery for unreachable scope"
                     );
                     record_delivery_seen_by_id(client, actor_id, &source_id).await?;
                 }
@@ -2734,9 +2771,11 @@ async fn drain_pending_inbox(
     Ok(())
 }
 
-fn is_missing_scope_error(error: &anyhow::Error) -> bool {
+fn is_unreachable_scope_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
-    message.contains("code -32000") && (message.contains("thread ") || message.contains("channel "))
+    (message.contains("code -32000")
+        && (message.contains("thread ") || message.contains("channel ")))
+        || (message.contains("code -32002") && message.contains("is not a member of channel"))
 }
 
 fn pending_inbox_max_age() -> chrono::Duration {
@@ -2883,8 +2922,9 @@ async fn open_model_picker(
     adapter_start_error: Option<String>,
 ) -> Result<()> {
     let mut adapter_error = adapter_start_error;
+    let empty_prompt = prompt_telemetry(String::new(), &[]);
     let adapter_options = if adapter_error.is_none() {
-        match build_adapter_prompt(client, state, trigger.scope(), String::new(), None, None).await
+        match build_adapter_prompt(client, state, trigger.scope(), &empty_prompt, None, None).await
         {
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
@@ -3057,8 +3097,8 @@ async fn dispatch_trigger(
                 }),
             )
             .await?;
-        let user_text = render_trigger_prompt(client, state, &trigger).await;
-        let prompt = compose_envelope_prompt(client, state, &trigger, &user_text).await;
+        let turn_input = render_trigger_prompt(client, state, &trigger).await;
+        let prompt = compose_envelope_prompt(client, state, &trigger, &turn_input).await;
         let no_reply_file =
             no_reply_file_for_turn(client, state, trigger.scope(), &run_res.run.id).await;
         let active = ActiveTurn {
@@ -3085,7 +3125,7 @@ async fn dispatch_trigger(
             client,
             state,
             trigger.scope(),
-            prompt.content,
+            &prompt,
             Some(&active),
             Some(&trigger),
         )
@@ -3134,7 +3174,7 @@ async fn build_adapter_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     scope: &ScopeRef,
-    content: String,
+    prompt: &PromptTelemetry,
     active: Option<&ActiveTurn>,
     trigger: Option<&AgentTrigger>,
 ) -> Result<AdapterPrompt> {
@@ -3148,9 +3188,50 @@ async fn build_adapter_prompt(
         .paths
         .template_vars(&state.actor_id, &channel_id, scope);
     extend_prompt_template_vars(&mut template_vars, state, trigger);
+    template_vars.insert("loom.actor".into(), state.actor_id.clone());
+    template_vars.insert("loom.scope.id".into(), scope.id.clone());
+    template_vars.insert(
+        "loom.scope.kind".into(),
+        scope_kind_name(scope.kind).to_string(),
+    );
+    template_vars.insert("loom.server".into(), state.agent_server_url.clone());
+    template_vars.insert(
+        "loom.configDir".into(),
+        config::config_dir().display().to_string(),
+    );
+    template_vars.insert(
+        "paths.cwd".into(),
+        scope_paths.workspace.display().to_string(),
+    );
+    if let Some(model) = state.current_model() {
+        template_vars.insert("model".into(), model);
+    }
+    if let Some(reasoning_effort) = state.spec.provider_ref.reasoning_effort.as_deref() {
+        template_vars.insert("reasoningEffort".into(), reasoning_effort.to_string());
+    }
+    if let Some(active) = active {
+        template_vars.insert("loom.run.id".into(), active.run_id.clone());
+        template_vars.insert("loom.trigger.id".into(), active.trigger_source_id.clone());
+        template_vars.insert("loom.trigger.actor".into(), active.trigger_actor.clone());
+    }
+    let mut parts = prompt.parts.clone();
+    let workspace_parts = agent_runtime::provider::workspace_prompt_parts(
+        state.transport.prompt.as_ref(),
+        &scope_paths.workspace,
+    )
+    .map_err(|e| anyhow!("load provider workspace prompt files: {e}"))?;
+    parts.extend(workspace_parts);
+    let outputs = agent_runtime::provider::render_prompt_outputs(
+        state.transport.prompt.as_ref(),
+        &parts,
+        &prompt.content,
+    )
+    .map_err(|e| anyhow!("render provider prompt outputs: {e}"))?;
     Ok(AdapterPrompt {
         scope: scope.clone(),
-        content,
+        content: prompt.content.clone(),
+        parts,
+        outputs,
         model: state.current_model(),
         cwd: scope_paths.workspace,
         env: state.paths.scope_env(
@@ -3215,23 +3296,34 @@ fn render_prompt(trigger: &AgentTrigger) -> String {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TriggerPromptText {
+    latest_message: String,
+    assignment_context: String,
+    turn_input: String,
+}
+
 async fn render_trigger_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     trigger: &AgentTrigger,
-) -> String {
-    let actor_names = actor_display_map_for_prompt(client, state).await;
-    let mut prompt = render_trigger_prompt_with_names(
+) -> TriggerPromptText {
+    let actor_names = actor_display_map_for_prompt(client, state, trigger.scope()).await;
+    let latest_message = render_trigger_prompt_with_names(
         &state.actor_id,
         &state.spec.actor.display_name,
         trigger,
         &actor_names,
     );
-    if let Some(context) = assignment_context_for_prompt(client, trigger).await {
-        prompt.push_str("\n\n");
-        prompt.push_str(&context);
+    let assignment_context = assignment_context_for_prompt(client, trigger)
+        .await
+        .unwrap_or_default();
+    let turn_input = join_prompt_sections([latest_message.clone(), assignment_context.clone()]);
+    TriggerPromptText {
+        latest_message,
+        assignment_context,
+        turn_input,
     }
-    prompt
 }
 
 async fn recent_conversation_context(
@@ -3268,7 +3360,7 @@ async fn recent_conversation_context(
     if messages.is_empty() {
         return String::new();
     }
-    let actor_names = actor_display_map_for_prompt(client, state).await;
+    let actor_names = actor_display_map_for_prompt(client, state, &message.scope).await;
     format_recent_conversation_context(&messages, message, &actor_names)
 }
 
@@ -3401,28 +3493,40 @@ fn join_prompt_sections(sections: impl IntoIterator<Item = String>) -> String {
 async fn actor_display_map_for_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
+    scope: &ScopeRef,
 ) -> HashMap<String, String> {
+    let Some(channel_id) = resolve_channel_for_scope(client, state, scope).await else {
+        return local_actor_display_map(state);
+    };
     match client
-        .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
+        .call::<_, ChannelMembersResult>(
+            method::CHANNEL_MEMBERS,
+            json!({ "channelId": channel_id }),
+        )
         .await
     {
-        Ok(result) => {
-            state.cache_actor_displays(
-                result
-                    .actors
-                    .into_iter()
-                    .map(|actor| (actor.id, actor.display_name)),
-            );
-        }
+        Ok(result) => result
+            .members
+            .into_iter()
+            .map(|actor| (actor.id, actor.display_name))
+            .collect::<HashMap<_, _>>(),
         Err(err) => {
             tracing::debug!(
                 actor = %state.actor_id,
+                channel = %channel_id,
                 %err,
-                "actor/list failed while rendering prompt; using cached actor display names",
+                "channel/members failed while rendering prompt; using local actor display name",
             );
+            local_actor_display_map(state)
         }
     }
-    state.actor_display_snapshot()
+}
+
+fn local_actor_display_map(state: &WorkerState) -> HashMap<String, String> {
+    HashMap::from([(
+        state.actor_id.clone(),
+        state.spec.actor.display_name.clone(),
+    )])
 }
 
 fn render_trigger_prompt_with_names(
@@ -3717,19 +3821,31 @@ fn is_actor_ref_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')
 }
 
-fn actor_identity_manifest(actor_id: &str, display_name: &str) -> String {
+fn actor_context_manifest(actor_id: &str, display_name: &str) -> String {
     let mut actor_names = HashMap::new();
     if !display_name.trim().is_empty() {
         actor_names.insert(actor_id.to_string(), display_name.to_string());
     }
     let label = actor_label_with_fallback(actor_id, display_name, &actor_names);
     format!(
-        "=== System: Loom actor identity ===\n\
+        "=== System: Loom actor context ===\n\
          You are {label}.\n\
-         Treat this as your stable runtime identity. Other @actors in the\n\
+         Treat this as your stable runtime actor context. Other @actors in the\n\
          latest message are routing targets or people being discussed; they\n\
-         are not your identity."
+         are not this actor."
     )
+}
+
+fn agent_instructions_manifest(spec: &AgentSpec) -> String {
+    let Some(instructions) = spec
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return String::new();
+    };
+    format!("=== System: Agent instructions ===\n{instructions}")
 }
 
 #[derive(Debug, Clone)]
@@ -3856,16 +3972,17 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
-/// configure identity / memory fall back to the pre-envelope shape.
+/// configure legacy profile fields / memory fall back to the pre-envelope shape.
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     trigger: &AgentTrigger,
-    user_text: &str,
+    trigger_prompt: &TriggerPromptText,
 ) -> PromptTelemetry {
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
-    let actor_context = actor_identity_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let agent_instructions = agent_instructions_manifest(&state.spec);
     let conversation_context = recent_conversation_context(client, state, trigger).await;
     let members_context = current_scope_members_context(client, state, scope).await;
     let runtime_context = join_prompt_sections([
@@ -3873,7 +3990,7 @@ async fn compose_envelope_prompt(
         members_context,
         conversation_context.clone(),
     ]);
-    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.spec) {
+    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.transport) {
         seed_manifest(&state.actor_id, scope)
     } else {
         String::new()
@@ -3883,21 +4000,26 @@ async fn compose_envelope_prompt(
         .as_deref()
         .map(|channel_id| prompt_template_vars(state, trigger, channel_id))
         .unwrap_or_else(|| minimal_prompt_template_vars(state, trigger));
-    let user_text = apply_prompt_template(
+    let turn_input = apply_prompt_template(
         state.spec.prompt_template.as_ref(),
         &template_vars,
         first_turn,
-        &user_text,
+        &trigger_prompt.turn_input,
     );
 
-    let identity_spec = state.spec.identity.as_ref();
     let memory_spec = state.spec.memory.as_ref();
 
-    if identity_spec.is_none() && memory_spec.is_none() {
+    if memory_spec.is_none() {
         let mut sections = vec![agent_runtime::PromptSection {
             name: "actor_context",
             content: actor_context.clone(),
         }];
+        if !agent_instructions.is_empty() {
+            sections.push(agent_runtime::PromptSection {
+                name: "agent_instructions",
+                content: agent_instructions.clone(),
+            });
+        }
         if !scope_bootstrap.is_empty() {
             sections.push(agent_runtime::PromptSection {
                 name: "scope_bootstrap",
@@ -3910,39 +4032,70 @@ async fn compose_envelope_prompt(
         });
         sections.push(agent_runtime::PromptSection {
             name: "user_message",
-            content: format!("=== User message ===\n{user_text}"),
+            content: format!("=== User message ===\n{turn_input}"),
         });
         let content = sections
             .iter()
             .map(|section| section.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        return apply_trigger_prefix_to_prompt(
+        let mut prompt = apply_trigger_prefix_to_prompt(
             &state.spec,
             prompt_telemetry(content, &sections),
             first_turn,
             trigger_prompt_prefix_from_trigger(trigger),
         );
+        add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
+        return prompt;
     }
 
     let (prompt, sections) =
         agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
             actor_context: &actor_context,
+            agent_instructions: &agent_instructions,
             profile_dir: &state.profile_dir,
-            identity_spec,
             memory_spec,
             channel_id: channel_id.as_deref(),
             thread_context: &conversation_context,
             runtime_context: &runtime_context,
-            user_message: &user_text,
+            user_message: &turn_input,
             scope_bootstrap: &scope_bootstrap,
         });
-    apply_trigger_prefix_to_prompt(
+    let mut prompt = apply_trigger_prefix_to_prompt(
         &state.spec,
         prompt_telemetry(prompt, &sections),
         first_turn,
         trigger_prompt_prefix_from_trigger(trigger),
-    )
+    );
+    add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
+    prompt
+}
+
+fn add_turn_input_prompt_parts(
+    prompt: &mut PromptTelemetry,
+    trigger_prompt: &TriggerPromptText,
+    turn_input: &str,
+) {
+    push_extra_prompt_part(prompt, "latest_message", &trigger_prompt.latest_message);
+    push_extra_prompt_part(
+        prompt,
+        "assignment_context",
+        &trigger_prompt.assignment_context,
+    );
+    push_extra_prompt_part(prompt, "turn_input", turn_input);
+}
+
+fn push_extra_prompt_part(prompt: &mut PromptTelemetry, key: &'static str, content: &str) {
+    if content.trim().is_empty() || prompt.parts.iter().any(|part| part.key == key) {
+        return;
+    }
+    prompt.parts.push(PromptPart {
+        key: key.to_string(),
+        title: prompt_section_title(key).to_string(),
+        content: content.to_string(),
+        rendered_content: content.to_string(),
+        role_hint: PromptRoleHint::User,
+    });
 }
 
 fn apply_trigger_prefix_to_prompt(
@@ -3954,12 +4107,30 @@ fn apply_trigger_prefix_to_prompt(
     let Some(prefix) = trigger_prefix.or_else(|| trigger_prefix_for_turn(spec, first_turn)) else {
         return prompt;
     };
-    if prompt.content.starts_with(prefix) {
+    let has_user_message_part = prompt.parts.iter().any(|part| part.key == "user_message");
+    let already_prefixed = prompt
+        .parts
+        .iter()
+        .any(|part| part.key == "user_message" && part.rendered_content.starts_with(prefix))
+        || (!has_user_message_part && prompt.content.starts_with(prefix));
+    if already_prefixed {
+        ensure_trigger_prefix_prompt_part(&mut prompt, prefix);
         return prompt;
     }
 
-    prompt.content = format!("{prefix}{}", prompt.content);
+    if let Some(part) = prompt
+        .parts
+        .iter_mut()
+        .find(|part| part.key == "user_message")
+    {
+        part.content = format!("{prefix}{}", part.content);
+        part.rendered_content = format!("{prefix}{}", part.rendered_content);
+        prompt.content = rendered_prompt_from_parts(&prompt.parts);
+    } else {
+        prompt.content = format!("{prefix}{}", prompt.content);
+    }
     prompt.stats = prompt_stats(&prompt.content);
+    ensure_trigger_prefix_prompt_part(&mut prompt, prefix);
 
     let stats = prompt_stats(prefix);
     prompt.breakdown.sections.insert(
@@ -3975,6 +4146,27 @@ fn apply_trigger_prefix_to_prompt(
     );
     recalculate_prompt_breakdown_percentages(&mut prompt.breakdown.sections);
     prompt
+}
+
+fn ensure_trigger_prefix_prompt_part(prompt: &mut PromptTelemetry, prefix: &str) {
+    if prefix.trim().is_empty() || prompt.parts.iter().any(|part| part.key == "trigger_prefix") {
+        return;
+    }
+    let index = prompt
+        .parts
+        .iter()
+        .position(|part| part.key == "user_message")
+        .unwrap_or(prompt.parts.len());
+    prompt.parts.insert(
+        index,
+        PromptPart {
+            key: "trigger_prefix".to_string(),
+            title: prompt_section_title("trigger_prefix").to_string(),
+            content: prefix.to_string(),
+            rendered_content: prefix.to_string(),
+            role_hint: PromptRoleHint::User,
+        },
+    );
 }
 
 fn trigger_prompt_prefix_from_trigger(trigger: &AgentTrigger) -> Option<&str> {
@@ -4070,6 +4262,9 @@ fn extend_prompt_template_vars(
     if let Some(trigger) = trigger {
         vars.insert("trigger.id".into(), trigger.id().to_string());
         vars.insert("trigger.actor_id".into(), trigger.actor_id().to_string());
+        if let Some(target) = trigger.reply_target() {
+            vars.insert("reply.target".into(), target);
+        }
     }
     if let Some(template) = state.spec.prompt_template.as_ref() {
         if let Some(active_skill) = template.active_skill.as_deref() {
@@ -4091,6 +4286,11 @@ fn expand_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
 
 fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) -> PromptTelemetry {
     let stats = prompt_stats(&content);
+    let parts = sections
+        .iter()
+        .filter(|section| !section.content.trim().is_empty())
+        .map(prompt_part_from_section)
+        .collect::<Vec<_>>();
     let mut breakdown_sections: Vec<PromptBreakdownSection> = sections
         .iter()
         .filter(|section| !section.content.trim().is_empty())
@@ -4109,10 +4309,75 @@ fn prompt_telemetry(content: String, sections: &[agent_runtime::PromptSection]) 
     recalculate_prompt_breakdown_percentages(&mut breakdown_sections);
     PromptTelemetry {
         content,
+        parts,
         stats,
         breakdown: PromptBreakdown {
             sections: breakdown_sections,
         },
+    }
+}
+
+fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPart {
+    let title = prompt_section_title(section.name).to_string();
+    PromptPart {
+        key: section.name.to_string(),
+        title: title.clone(),
+        content: raw_prompt_part_content(&section.content, &title),
+        rendered_content: section.content.clone(),
+        role_hint: match section.name {
+            "actor_context" | "agent_instructions" | "bootstrap_memory" | "scope_bootstrap" => {
+                PromptRoleHint::System
+            }
+            _ => PromptRoleHint::User,
+        },
+    }
+}
+
+fn raw_prompt_part_content(content: &str, title: &str) -> String {
+    let Some((first_line, rest)) = content.split_once('\n') else {
+        return content.to_string();
+    };
+    if prompt_heading_matches_title(first_line, title) {
+        rest.to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+fn prompt_heading_matches_title(line: &str, title: &str) -> bool {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix("=== ")
+        .and_then(|line| line.strip_suffix(" ==="))
+    else {
+        return false;
+    };
+    let inner = inner.trim();
+    inner == title || inner.starts_with(&format!("{title} "))
+}
+
+fn rendered_prompt_from_parts(parts: &[PromptPart]) -> String {
+    parts
+        .iter()
+        .map(|part| part.rendered_content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn prompt_section_title(name: &str) -> &str {
+    match name {
+        "actor_context" => "System: Loom actor context",
+        "agent_instructions" => "System: Agent instructions",
+        "bootstrap_memory" => "System: Bootstrap memory",
+        "turn_memory" => "Context: Turn memory",
+        "runtime_context" => "Context: Runtime context",
+        "scope_bootstrap" => "System: Loom multi-actor context",
+        "trigger_prefix" => "Trigger prefix",
+        "latest_message" => "Latest Loom message",
+        "assignment_context" => "Loom assignment context",
+        "turn_input" => "Turn input",
+        "user_message" => "User message",
+        other => other,
     }
 }
 
@@ -4138,25 +4403,57 @@ fn prompt_stats(text: &str) -> PromptStats {
 fn prompt_section_label(name: &str) -> &str {
     match name {
         "actor_context" => "Actor Context",
-        "identity" => "Identity",
-        "soul" => "Soul",
+        "agent_instructions" => "Agent Instructions",
         "bootstrap_memory" => "Bootstrap Memory",
         "turn_memory" => "Turn Memory",
         "runtime_context" => "Runtime Context",
         "scope_bootstrap" => "Scope Bootstrap",
+        "trigger_prefix" => "Trigger Prefix",
+        "latest_message" => "Latest Message",
+        "assignment_context" => "Assignment Context",
+        "turn_input" => "Turn Input",
         "user_message" => "Latest Message",
         other => other,
     }
 }
 
-fn command_transport_without_resume(spec: &AgentSpec) -> bool {
-    if spec.transport.kind != "command" {
+fn command_transport_without_resume(transport: &AgentTransport) -> bool {
+    if transport.kind != "command" {
         return false;
     }
-    match spec.transport.session.as_ref() {
-        Some(session) => session.first_run_capture.is_none() || session.resume_args.is_none(),
-        None => true,
+    !command_transport_can_resume(transport)
+}
+
+fn command_transport_can_resume(transport: &AgentTransport) -> bool {
+    let Some(session) = transport.session.as_ref() else {
+        return false;
+    };
+    if session.scope.as_deref().map(str::trim) == Some("turn") {
+        return false;
     }
+    let has_resume_template = session
+        .resume_args
+        .as_ref()
+        .is_some_and(|args| !args.is_empty())
+        || !session.resume_arg_specs.is_empty();
+    if !has_resume_template {
+        return false;
+    }
+    match session.id_source {
+        Some(CommandSessionIdSource::LoomUuid) => true,
+        Some(CommandSessionIdSource::ProviderCapture) => {
+            decoder_has_session_capture(transport.decoder.as_ref())
+                || decoder_has_session_capture(transport.stderr_decoder.as_ref())
+        }
+        None => session.first_run_capture.is_some(),
+    }
+}
+
+fn decoder_has_session_capture(decoder: Option<&proto::methods::ProviderDecoderSpec>) -> bool {
+    decoder
+        .and_then(|decoder| decoder.capture.as_ref())
+        .and_then(|capture| capture.session.as_ref())
+        .is_some()
 }
 
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
@@ -4241,9 +4538,21 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            loom --json request-approval --title \"Approval required\" --reason \"Run the deploy command\"\n\
         Assistant text is internal run transcript only. It is not published to\n\
         the channel or thread. For any visible reply, call\n\
-        `loom --json message send --target ... --text ...`; after that, final\n\
+        `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text ...`\n\
+        when LOOM_REPLY_TARGET is set; after that, final\n\
         assistant text may be empty or a private note. When no visible reply is\n\
         needed, call `loom --json run ignore --reason \"...\"`.\n\
+        If the user or another actor asks you to hand off, wake, route, or\n\
+        notify a specific actor, that routed visible message is required work.\n\
+        A plain notify_only thread message does not wake the target actor. Send\n\
+        a message whose text includes `@actor_id` and whose flags include\n\
+        `--intent request_action --delivery-policy wake_agent`; only call\n\
+        `run ignore` after that message was successfully sent or when no\n\
+        routed visible message is needed.\n\
+        The same rule applies to turn-taking: when your visible message expects\n\
+        a specific actor's next answer, guess, review, or decision, route it to\n\
+        that actor with `@actor_id`, `--intent request_action`, and\n\
+        `--delivery-policy wake_agent`.\n\
         Only send messages when you have actionable content: a requested\n\
         answer, a claimed work unit and result, a material state change, a\n\
         needed question, or a real blocker. Do not send visibility-only\n\
@@ -4323,6 +4632,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         `loom task assign` requires a machine-readable contract. Do not fall back\n\
         to direct actor routing when assignment creation fails; report the\n\
         blocker or fix the contract and retry the assignment.\n\
+        A direct handoff without an explicit `@actor_id` audience and\n\
+        `wake_agent` delivery is only a visible note; it will not start the\n\
+        receiving agent.\n\
+        For games, Q&A, reviews, or any other back-and-forth, each turn that\n\
+        needs the other actor to respond must be a routed wake message to that\n\
+        actor.\n\
          `loom ask-user-question` is for choices or missing input; its JSON\n\
          output is the human's answer to your question, not an approval.\n\
          `loom request-approval` is for approve/reject gates before risky work.\n\
@@ -5204,7 +5519,8 @@ async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Res
 mod tests {
     use super::*;
     use proto::methods::{
-        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentTransport, TriggerSpec,
+        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentProviderRef,
+        ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
@@ -5217,26 +5533,16 @@ mod tests {
                 capabilities: None,
                 _meta: None,
             },
-            transport: AgentTransport {
-                kind: "command".into(),
-                command: "echo".into(),
-                args: Vec::new(),
-                env: std::collections::BTreeMap::new(),
-                auth_method: None,
+            instructions: None,
+            provider_ref: AgentProviderRef {
+                id: "test".into(),
+                mode: Some("print".into()),
                 model: None,
-                model_args: Vec::new(),
-                session: None,
-                output_format: None,
-                prompt_via: proto::methods::PromptVia::default(),
-                timeout_ms: None,
-                idle_timeout_ms: None,
-                interactive: None,
-                provider: None,
+                reasoning_effort: None,
             },
             autostart: false,
             models: None,
             bundle,
-            identity: None,
             memory: None,
             announcement: None,
             trigger: None,
@@ -5478,6 +5784,10 @@ mod tests {
             Some("chan_demo")
         );
         assert_eq!(env.get("LOOM_RUN_ID").map(String::as_str), Some("run_demo"));
+        assert_eq!(
+            env.get("LOOM_REPLY_TARGET").map(String::as_str),
+            Some("#chan_demo")
+        );
         let expected_no_reply_file = root.join("no-reply.json").display().to_string();
         assert_eq!(
             env.get(LOOM_NO_REPLY_FILE_ENV).map(String::as_str),
@@ -6113,8 +6423,8 @@ mod tests {
     }
 
     #[test]
-    fn actor_identity_manifest_names_local_actor_with_display_and_id() {
-        let manifest = actor_identity_manifest("actor_agent_g_1234", "G仔");
+    fn actor_context_manifest_names_local_actor_with_display_and_id() {
+        let manifest = actor_context_manifest("actor_agent_g_1234", "G仔");
 
         assert!(manifest.contains("You are G仔 (@actor_agent_g_1234)."));
         assert!(manifest.contains("Other @actors"));
@@ -6306,18 +6616,66 @@ mod tests {
 
     #[test]
     fn command_transport_without_resume_tracks_session_capability() {
-        let no_session = sample_spec(None);
+        let no_session = test_command_transport();
         assert!(command_transport_without_resume(&no_session));
 
-        let mut resumable = sample_spec(None);
-        resumable.transport.session = Some(proto::methods::CommandSession {
+        let mut loom_uuid = test_command_transport();
+        loom_uuid.session = Some(proto::methods::CommandSession {
+            id_source: Some(CommandSessionIdSource::LoomUuid),
+            scope: None,
+            first_run_capture: None,
+            resume_args: Some(vec!["--session-id".into(), "{session_id}".into()]),
+            resume_arg_specs: Vec::new(),
+        });
+        assert!(!command_transport_without_resume(&loom_uuid));
+
+        let mut resumable = test_command_transport();
+        resumable.session = Some(proto::methods::CommandSession {
+            id_source: None,
+            scope: None,
             first_run_capture: Some("stdout_json:.session_id".into()),
             resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
+            resume_arg_specs: Vec::new(),
         });
         assert!(!command_transport_without_resume(&resumable));
 
-        let mut acp = sample_spec(None);
-        acp.transport.kind = "acp_stdio".into();
+        let mut decoder_capture = test_command_transport();
+        decoder_capture.session = Some(proto::methods::CommandSession {
+            id_source: Some(CommandSessionIdSource::ProviderCapture),
+            scope: None,
+            first_run_capture: None,
+            resume_args: None,
+            resume_arg_specs: vec![
+                proto::methods::ProviderArgSpec::Literal("--resume".into()),
+                proto::methods::ProviderArgSpec::Literal("{session_id}".into()),
+            ],
+        });
+        decoder_capture.decoder = Some(proto::methods::ProviderDecoderSpec {
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(proto::methods::ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        });
+        assert!(!command_transport_without_resume(&decoder_capture));
+
+        let mut stderr_decoder_capture = decoder_capture.clone();
+        stderr_decoder_capture.stderr_decoder = stderr_decoder_capture.decoder.take();
+        assert!(!command_transport_without_resume(&stderr_decoder_capture));
+
+        let mut turn_scoped = loom_uuid.clone();
+        turn_scoped.session.as_mut().unwrap().scope = Some("turn".into());
+        assert!(command_transport_without_resume(&turn_scoped));
+
+        let mut broken_capture = decoder_capture.clone();
+        broken_capture.decoder = None;
+        assert!(command_transport_without_resume(&broken_capture));
+
+        let mut acp = test_command_transport();
+        acp.kind = "acp_stdio".into();
         assert!(!command_transport_without_resume(&acp));
     }
 
@@ -6394,6 +6752,107 @@ mod tests {
     }
 
     #[test]
+    fn turn_input_parts_are_available_without_changing_full_prompt() {
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "=== User message ===\nlatest\n\nassignment".into(),
+        }];
+        let mut prompt = prompt_telemetry(sections[0].content.clone(), &sections);
+        let original = prompt.content.clone();
+        let trigger_prompt = TriggerPromptText {
+            latest_message: "latest".into(),
+            assignment_context: "assignment".into(),
+            turn_input: "latest\n\nassignment".into(),
+        };
+
+        add_turn_input_prompt_parts(&mut prompt, &trigger_prompt, &trigger_prompt.turn_input);
+
+        assert_eq!(prompt.content, original);
+        assert!(prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "latest_message" && part.content == "latest"));
+        assert!(prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "assignment_context" && part.content == "assignment"));
+        assert!(prompt
+            .parts
+            .iter()
+            .any(|part| part.key == "turn_input" && part.content == "latest\n\nassignment"));
+    }
+
+    #[test]
+    fn prompt_parts_are_raw_while_full_prompt_stays_rendered() {
+        let sections = vec![
+            agent_runtime::PromptSection {
+                name: "actor_context",
+                content: "=== System: Loom actor context ===\nYou are Demo.".into(),
+            },
+            agent_runtime::PromptSection {
+                name: "user_message",
+                content: "=== User message ===\nhello".into(),
+            },
+        ];
+
+        let prompt = prompt_telemetry(
+            sections
+                .iter()
+                .map(|section| section.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            &sections,
+        );
+
+        assert!(prompt
+            .content
+            .contains("=== System: Loom actor context ==="));
+        assert!(prompt.content.contains("=== User message ==="));
+        let actor_context = prompt
+            .parts
+            .iter()
+            .find(|part| part.key == "actor_context")
+            .expect("actor context part");
+        assert_eq!(actor_context.content, "You are Demo.");
+        assert_eq!(
+            actor_context.rendered_content,
+            "=== System: Loom actor context ===\nYou are Demo."
+        );
+        let user_message = prompt
+            .parts
+            .iter()
+            .find(|part| part.key == "user_message")
+            .expect("user message part");
+        assert_eq!(user_message.content, "hello");
+        assert_eq!(user_message.rendered_content, "=== User message ===\nhello");
+
+        let default_outputs =
+            agent_runtime::provider::render_prompt_outputs(None, &prompt.parts, &prompt.content)
+                .expect("default provider prompt output");
+        assert_eq!(default_outputs.get("full"), Some(&prompt.content));
+
+        let raw_outputs = agent_runtime::provider::render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
+                outputs: BTreeMap::from([(
+                    "raw".into(),
+                    ProviderPromptOutputSpec {
+                        template: Some("{actor_context}\n\n{user_message}".into()),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &prompt.parts,
+            &prompt.content,
+        )
+        .expect("raw provider prompt output");
+        assert_eq!(
+            raw_outputs.get("raw").map(String::as_str),
+            Some("You are Demo.\n\nhello")
+        );
+    }
+
+    #[test]
     fn trigger_prefix_is_first_in_final_prompt() {
         let mut spec = sample_spec(None);
         spec.trigger = Some(TriggerSpec {
@@ -6410,6 +6869,23 @@ mod tests {
 
         assert!(prompt.content.starts_with("/router\n=== User message ==="));
         assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
+        let user_message = prompt
+            .parts
+            .iter()
+            .find(|part| part.key == "user_message")
+            .expect("user message part");
+        assert_eq!(user_message.content, "/router\n[loom envelope]\nhello");
+        assert_eq!(
+            user_message.rendered_content,
+            "/router\n=== User message ===\n[loom envelope]\nhello"
+        );
+        let keys = prompt
+            .parts
+            .iter()
+            .map(|part| part.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["trigger_prefix", "user_message"]);
+        assert_eq!(prompt.parts[0].content, "/router\n");
     }
 
     #[test]
@@ -6432,6 +6908,61 @@ mod tests {
             .starts_with("/review [loom]\n=== User message ==="));
         assert!(!prompt.content.starts_with("/router\n"));
         assert_eq!(prompt.breakdown.sections[0].key, "trigger_prefix");
+        assert_eq!(
+            prompt
+                .parts
+                .iter()
+                .find(|part| part.key == "trigger_prefix")
+                .map(|part| part.content.as_str()),
+            Some("/review [loom]\n")
+        );
+    }
+
+    #[test]
+    fn trigger_prefix_part_can_be_composed_by_provider_prompt_outputs() {
+        let mut spec = sample_spec(None);
+        spec.trigger = Some(TriggerSpec {
+            trigger_prompt_prefix: "/router\n".into(),
+            apply_on: TriggerPrefixApplyOn::EveryTurn,
+        });
+        let sections = vec![agent_runtime::PromptSection {
+            name: "user_message",
+            content: "=== User message ===\nignored".into(),
+        }];
+        let prompt = apply_trigger_prefix_to_prompt(
+            &spec,
+            prompt_telemetry(sections[0].content.clone(), &sections),
+            false,
+            None,
+        );
+        let mut prompt = prompt;
+        let trigger_prompt = TriggerPromptText {
+            latest_message: "latest".into(),
+            assignment_context: String::new(),
+            turn_input: "latest".into(),
+        };
+        add_turn_input_prompt_parts(&mut prompt, &trigger_prompt, &trigger_prompt.turn_input);
+
+        let outputs = agent_runtime::provider::render_prompt_outputs(
+            Some(&ProviderPromptSpec {
+                workspace_files: Vec::new(),
+                outputs: BTreeMap::from([(
+                    "custom_user".into(),
+                    ProviderPromptOutputSpec {
+                        template: Some("{trigger_prefix}{turn_input}".into()),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            &prompt.parts,
+            &prompt.content,
+        )
+        .expect("render provider prompt outputs");
+
+        assert_eq!(
+            outputs.get("custom_user").map(String::as_str),
+            Some("/router\nlatest")
+        );
     }
 
     #[test]
@@ -6490,6 +7021,44 @@ mod tests {
         assert!(vars
             .get("workspace.dir")
             .is_some_and(|value| value.contains("chan_demo")));
+        assert!(vars
+            .get("agent.configDir")
+            .is_some_and(|value| value.ends_with("agents/actor_demo")));
+        assert!(vars
+            .get("agent.specPath")
+            .is_some_and(|value| value.ends_with("agents/actor_demo/spec.json")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn prompt_template_vars_include_reply_target_for_message() {
+        let root = temp_path("prompt-template-reply-target");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let spec = sample_spec(None);
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            spec,
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+
+        let vars = prompt_template_vars(&state, &AgentTrigger::Message(message), "chan_demo");
+
+        assert_eq!(
+            vars.get("reply.target").map(String::as_str),
+            Some("#chan_demo:msg_root")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6659,7 +7228,8 @@ mod tests {
         std::fs::create_dir_all(&paths.profile).expect("create profile");
         persist_model_state(&paths.profile, "runtime_sonnet").expect("persist model");
         let mut spec = sample_spec(None);
-        spec.transport.kind = "acp_stdio".into();
+        let mut transport = test_command_transport();
+        transport.kind = "acp_stdio".into();
         spec.models = Some(AgentModelSpec {
             default: Some("spec_default".into()),
             choices: vec![AgentModelChoice {
@@ -6669,9 +7239,10 @@ mod tests {
             }],
         });
 
-        let state = WorkerState::new(
+        let state = WorkerState::new_with_transport(
             "actor_demo".into(),
             spec,
+            transport,
             paths.profile.clone(),
             paths,
             "ws://127.0.0.1:0".into(),
@@ -6760,7 +7331,16 @@ mod tests {
     fn missing_scope_error_matches_stale_thread_delivery() {
         let err = anyhow!("rpc `run.open` failed: thread thread_f247db3313b9 (code -32000)");
 
-        assert!(is_missing_scope_error(&err));
+        assert!(is_unreachable_scope_error(&err));
+    }
+
+    #[test]
+    fn inaccessible_scope_error_matches_revoked_channel_delivery() {
+        let err = anyhow!(
+            "rpc `run.open` failed: actor Xnf is not a member of channel chan_5e15c6af7ebd (code -32002)"
+        );
+
+        assert!(is_unreachable_scope_error(&err));
     }
 
     #[test]

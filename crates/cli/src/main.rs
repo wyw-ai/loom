@@ -140,6 +140,16 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentCmd,
     },
+    /// Manage provider manifests used to launch agent CLIs.
+    Provider {
+        #[command(subcommand)]
+        sub: ProviderCmd,
+    },
+    /// Manage daemon machines through server-routed machine commands.
+    Machine {
+        #[command(subcommand)]
+        sub: MachineCmd,
+    },
     /// Inspect actors known to the server.
     Actor {
         #[command(subcommand)]
@@ -1439,6 +1449,88 @@ enum AgentBundleCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ProviderCmd {
+    /// Print a provider manifest example. Built-ins show the official runtime argv and default agent-scoped add-dir.
+    Example {
+        /// Print the built-in Claude Code provider manifest.
+        #[arg(long)]
+        claude: bool,
+        /// Print the built-in Qoder CLI provider manifest.
+        #[arg(long)]
+        qoder: bool,
+        /// Print the built-in GitHub Copilot CLI provider manifest.
+        #[arg(long)]
+        copilot: bool,
+        /// Print the built-in Codex CLI provider manifest.
+        #[arg(long)]
+        codex: bool,
+        /// Print the built-in OpenCode provider manifest.
+        #[arg(long)]
+        opencode: bool,
+    },
+    /// Validate a provider manifest JSON file.
+    Validate { path: PathBuf },
+    /// Add a provider manifest into the current LOOM_CONFIG_DIR.
+    Add {
+        path: PathBuf,
+        /// Overwrite an existing local provider manifest with the same id.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// List built-in and locally installed providers.
+    List,
+    /// Show one resolved provider manifest.
+    Show { provider_id: String },
+    /// Remove a locally installed provider manifest.
+    Remove { provider_id: String },
+    /// Validate and check local command detection for one provider.
+    Doctor { provider_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum MachineCmd {
+    /// List daemon machines visible from the current server.
+    List,
+    /// Manage agents on a daemon-owned machine.
+    Agent {
+        #[command(subcommand)]
+        sub: MachineAgentCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MachineAgentCmd {
+    /// Create an AgentSpec on the target daemon via machine/command.
+    Create {
+        #[arg(long)]
+        machine: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long = "actor-id")]
+        actor_id: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        instructions: Option<String>,
+        #[arg(long = "instructions-file")]
+        instructions_file: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+        #[arg(long = "no-autostart")]
+        no_autostart: bool,
+    },
+    /// Remove an AgentSpec from the target daemon via machine/command.
+    Remove {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -1572,6 +1664,31 @@ async fn main() -> Result<()> {
                     list,
                 } => cmd::spec::bundle_get(actor_id, file, list)?,
             },
+        }
+        return Ok(());
+    }
+
+    if let Cmd::Provider { sub } = args.cmd {
+        match sub {
+            ProviderCmd::Example {
+                claude,
+                qoder,
+                copilot,
+                codex,
+                opencode,
+            } => cmd::provider::example(cmd::provider::ExampleSelection {
+                claude,
+                qoder,
+                copilot,
+                codex,
+                opencode,
+            })?,
+            ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
+            ProviderCmd::Add { path, replace } => cmd::provider::add(path, replace)?,
+            ProviderCmd::List => cmd::provider::list()?,
+            ProviderCmd::Show { provider_id } => cmd::provider::show(provider_id)?,
+            ProviderCmd::Remove { provider_id } => cmd::provider::remove(provider_id)?,
+            ProviderCmd::Doctor { provider_id } => cmd::provider::doctor(provider_id)?,
         }
         return Ok(());
     }
@@ -2386,8 +2503,42 @@ async fn main() -> Result<()> {
             .await?
         }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
+        Cmd::Provider { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
+        Cmd::Machine { sub } => match sub {
+            MachineCmd::List => cmd::machine::list(client).await?,
+            MachineCmd::Agent { sub } => match sub {
+                MachineAgentCmd::Create {
+                    machine,
+                    provider,
+                    actor_id,
+                    name,
+                    instructions,
+                    instructions_file,
+                    model,
+                    reasoning_effort,
+                    no_autostart,
+                } => {
+                    cmd::machine::agent_create(
+                        client,
+                        machine,
+                        provider,
+                        actor_id,
+                        name,
+                        instructions,
+                        instructions_file,
+                        model,
+                        reasoning_effort,
+                        !no_autostart,
+                    )
+                    .await?
+                }
+                MachineAgentCmd::Remove { machine, actor_id } => {
+                    cmd::machine::agent_remove(client, machine, actor_id).await?
+                }
+            },
+        },
         Cmd::Actor { sub } => match sub {
             ActorCmd::List => cmd::actor::list(client).await?,
             ActorCmd::Upsert {
@@ -2986,6 +3137,41 @@ mod tests {
                 assert_eq!(version.as_deref(), Some("v1"));
                 assert_eq!(model.as_deref(), Some("noop"));
                 assert_eq!(tools_json.as_deref(), Some("[]"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_add_accepts_replace_flag() {
+        let args = Args::try_parse_from(["loom", "provider", "add", "demo.json", "--replace"])
+            .expect("parse provider add --replace");
+
+        match args.cmd {
+            Cmd::Provider {
+                sub: ProviderCmd::Add { path, replace },
+            } => {
+                assert_eq!(path, PathBuf::from("demo.json"));
+                assert!(replace);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_example_accepts_builtin_flags() {
+        let args = Args::try_parse_from(["loom", "provider", "example", "--claude", "--opencode"])
+            .expect("parse provider example");
+
+        match args.cmd {
+            Cmd::Provider {
+                sub:
+                    ProviderCmd::Example {
+                        claude, opencode, ..
+                    },
+            } => {
+                assert!(claude);
+                assert!(opencode);
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -10,6 +10,7 @@ import type {
   ComponentType,
   CSSProperties,
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   MouseEvent,
   PointerEvent,
   ReactNode,
@@ -63,6 +64,7 @@ import {
   type MachineAgentProviderInfo,
   type MachineInfo,
   type Message,
+  type MessageMention,
   type Run,
   type ScopeRef,
   type StreamUpdate,
@@ -259,10 +261,6 @@ export function App() {
     name: "Local",
     serverUrl: "ws://127.0.0.1:7878/rpc",
   });
-  const [machineForm, setMachineForm] = useState({
-    name: "Local Host",
-    dataRoot: "",
-  });
   const [agentForm, setAgentForm] = useState<AgentFormState>({
     machineId: "",
     providerId: "",
@@ -332,7 +330,7 @@ export function App() {
       : null;
   const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
   const channelAgentActors = activeChannel
-    ? agentActors.filter((actor) => isChannelMember(activeChannel, actor.id))
+    ? channelMentionAgentActors(activeChannel, actors)
     : [];
   const channelTasks = activeChannel
     ? tasks.filter((task) => task.channelId === activeChannel.id)
@@ -455,14 +453,18 @@ export function App() {
   );
 
   const connectWorkspace = useCallback(
-    async (workspaceId: string, options: { automatic?: boolean } = {}) => {
+    async (
+      workspaceId: string,
+      options: { automatic?: boolean; quiet?: boolean } = {},
+    ): Promise<Workspace | null> => {
       const automatic = options.automatic === true;
+      const quiet = options.quiet === true;
       if (!automatic) {
         autoReconnectRef.current = true;
         reconnectAttemptRef.current = 0;
       }
       clearReconnectTimer();
-      if (!automatic) setBusy(`connect:${workspaceId}`);
+      if (!automatic && !quiet) setBusy(`connect:${workspaceId}`);
       setConnection("connecting");
       setError(automatic ? "Connection lost. Reconnecting..." : null);
       try {
@@ -473,16 +475,20 @@ export function App() {
         setConnection("open");
         reconnectAttemptRef.current = 0;
         await loadWorkspaceData(result.workspace);
-        pushNotice(
-          automatic
-            ? `Reconnected to ${result.workspace.name}`
-            : `Connected to ${result.workspace.name}`,
-        );
+        if (!quiet) {
+          pushNotice(
+            automatic
+              ? `Reconnected to ${result.workspace.name}`
+              : `Connected to ${result.workspace.name}`,
+          );
+        }
+        return result.workspace;
       } catch (err) {
         setConnection("error");
         setError(automatic ? "Connection lost. Reconnecting..." : errorText(err));
+        return null;
       } finally {
-        if (!automatic) setBusy(null);
+        if (!automatic && !quiet) setBusy(null);
       }
     },
     [clearReconnectTimer, loadWorkspaceData, pushNotice],
@@ -1047,26 +1053,6 @@ export function App() {
     }
   }
 
-  async function createMachine() {
-    const name = machineForm.name.trim();
-    if (!name) return;
-    setBusy("machine:create");
-    setError(null);
-    try {
-      const result = await ipc.machineCreate({
-        name,
-        dataRoot: machineForm.dataRoot.trim() || undefined,
-      });
-      applyMachines(result.machines);
-      setMachineForm({ name: "Local Host", dataRoot: "" });
-      pushNotice(`Agent host ${name} added`);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function removeMachine(machineId: string) {
     setBusy(`machine:remove:${machineId}`);
     setError(null);
@@ -1081,25 +1067,25 @@ export function App() {
     }
   }
 
-  async function createAgent() {
+  async function createAgent(): Promise<boolean> {
     const name = agentForm.name.trim();
     const machine = resolveAgentMachine(agentForm, machines);
     const provider = resolveAgentProvider(agentForm, machine);
     if (!machine) {
       setError("Add an agent host before creating an agent.");
-      return;
+      return false;
     }
     if (!machineCanCreateAgent(machine)) {
       setError(`Agent host ${machine.name} is read-only or does not support agent creation.`);
-      return;
+      return false;
     }
     if (!provider) {
       setError(`No agent runtime is available for ${machine.name}.`);
-      return;
+      return false;
     }
     if (!name) {
       setError("Agent name is required.");
-      return;
+      return false;
     }
     setBusy("agent:create");
     setError(null);
@@ -1121,8 +1107,10 @@ export function App() {
         await loadWorkspaceData(workspace);
       }
       pushNotice(`Agent ${name} added`);
+      return true;
     } catch (err) {
       setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -1213,12 +1201,23 @@ export function App() {
 
   async function createChannelWithTitle(rawTitle: string) {
     const title = rawTitle.trim();
-    if (!title || !workspace) return;
+    const currentWorkspace = workspaceRef.current ?? workspace;
+    if (!title) return;
+    if (!currentWorkspace) {
+      setError("Add or select a space before creating a channel.");
+      return;
+    }
     setBusy("channel:create");
     try {
+      let channelWorkspace = currentWorkspace;
+      if (connection !== "open") {
+        const connected = await connectWorkspace(currentWorkspace.id, { quiet: true });
+        if (!connected) return;
+        channelWorkspace = connected;
+      }
       const result = await ipc.channelCreate({
         title,
-        actorId: workspace.actorId,
+        actorId: channelWorkspace.actorId,
       });
       setChannels((current) => sortChannels(upsert(current, result.channel)));
       setActiveChannelId(result.channel.id);
@@ -1282,7 +1281,14 @@ export function App() {
     try {
       const parentMessageId = replyTo?.id;
       const repliedActor = replyTo ? actors[replyTo.authorActorId] : undefined;
-      const mentionedAudience = mentionAudience(body, actors, workspace?.actorId);
+      const mentionableActors = activeChannel
+        ? channelMentionActors(activeChannel, actors)
+        : [];
+      const mentionedAudience = mentionAudience(
+        body,
+        mentionableActors,
+        workspace?.actorId,
+      );
       const replyAudience =
         repliedActor && repliedActor.id !== workspace?.actorId
           ? [{ kind: "actor" as const, id: repliedActor.id }]
@@ -1291,7 +1297,8 @@ export function App() {
       const unavailableAgents = activeChannel
         ? directedTo.filter(
             (audience) =>
-              audience.kind === "actor" && !isChannelMember(activeChannel, audience.id),
+              audience.kind === "actor" &&
+              !isChannelMentionActor(activeChannel, audience.id),
           )
         : [];
       if (unavailableAgents.length > 0) {
@@ -1328,11 +1335,19 @@ export function App() {
     if (!body || !threadMessageTarget) return;
     setBusy("thread:message:send");
     try {
-      const mentionedAudience = mentionAudience(body, actors, workspace?.actorId);
+      const mentionableActors = activeChannel
+        ? channelMentionActors(activeChannel, actors)
+        : [];
+      const mentionedAudience = mentionAudience(
+        body,
+        mentionableActors,
+        workspace?.actorId,
+      );
       const unavailableAgents = activeChannel
         ? mentionedAudience.filter(
             (audience) =>
-              audience.kind === "actor" && !isChannelMember(activeChannel, audience.id),
+              audience.kind === "actor" &&
+              !isChannelMentionActor(activeChannel, audience.id),
           )
         : [];
       if (unavailableAgents.length > 0) {
@@ -1366,7 +1381,11 @@ export function App() {
   async function sendDirectMessage() {
     const body = directDraft.trim();
     if (!body || !activeDirectActor || !activeDirectTarget) return;
-    const directMentions = mentionAudience(body, actors, workspace?.actorId);
+    const directMentions = mentionAudience(
+      body,
+      Object.values(actors),
+      workspace?.actorId,
+    );
     if (directMentions.length > 0) {
       setError("Direct messages do not support @ mentions.");
       return;
@@ -1742,6 +1761,8 @@ export function App() {
           channels={visibleChannels}
           channelGroups={channelGroups}
           connection={connection}
+          hasWorkspace={Boolean(workspace)}
+          workspaceName={workspace?.name ?? null}
           activeChannelId={activeChannelId}
           activeDirectActorId={activeDirectActorId}
           activeThreadId={activeThreadId}
@@ -1970,14 +1991,11 @@ export function App() {
             <ErrorBanner error={error} />
             <SettingsView
               busy={busy}
-              machineForm={machineForm}
-              setMachineForm={setMachineForm}
               agentForm={agentForm}
               setAgentForm={setAgentForm}
               machines={machines}
               targetAgentId={settingsAgentId}
               onCheckMachines={checkMachines}
-              onAddMachine={createMachine}
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
               onUpdateAgent={updateAgent}
@@ -2005,6 +2023,7 @@ export function App() {
             currentActorId={workspace?.actorId ?? null}
             disabled={connection !== "open" || !threadMessageTarget}
             draft={threadDraft}
+            mentionAgents={channelAgentActors}
             machines={machines}
             messages={threadMessages}
             setDraft={setThreadDraft}
@@ -2201,6 +2220,8 @@ function Sidebar({
   channels,
   channelGroups,
   connection,
+  hasWorkspace,
+  workspaceName,
   activeChannelId,
   activeDirectActorId,
   activeThreadId,
@@ -2224,6 +2245,8 @@ function Sidebar({
   channels: Channel[];
   channelGroups: ChannelGroup[];
   connection: ConnectionState;
+  hasWorkspace: boolean;
+  workspaceName: string | null;
   activeChannelId: string | null;
   activeDirectActorId: string | null;
   activeThreadId: string | null;
@@ -2295,7 +2318,7 @@ function Sidebar({
     const title = createTitle.trim();
     if (!title || !createKind) return;
     if (createKind === "channel") {
-      if (connection !== "open") return;
+      if (!hasWorkspace) return;
       onAddChannel(title);
     } else {
       onAddChannelGroup(title);
@@ -2676,9 +2699,14 @@ function Sidebar({
                         placeholder={createKind === "channel" ? "Channel name" : "Section name"}
                         className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                       />
-                      {createKind === "channel" && connection !== "open" && (
+                      {createKind === "channel" && !hasWorkspace && (
                         <div className="text-xs font-medium text-amber-700">
-                          Connect a space before creating a channel.
+                          Add or select a space before creating a channel.
+                        </div>
+                      )}
+                      {createKind === "channel" && hasWorkspace && connection !== "open" && (
+                        <div className="text-xs font-medium text-amber-700">
+                          {`Will connect to ${workspaceName ?? "this space"} before creating.`}
                         </div>
                       )}
                       <div className="flex justify-end gap-2 pt-1">
@@ -2690,10 +2718,12 @@ function Sidebar({
                           size="sm"
                           disabled={
                             !createTitle.trim() ||
-                            (createKind === "channel" && connection !== "open")
+                            (createKind === "channel" && !hasWorkspace)
                           }
                         >
-                          Create
+                          {createKind === "channel" && connection !== "open"
+                            ? "Connect & create"
+                            : "Create"}
                         </Button>
                       </div>
                     </form>
@@ -3257,7 +3287,11 @@ function MessageRow({
             )}
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown actors={actors} body={displayBody} />
+            <MessageMarkdown
+              actors={actors}
+              body={displayBody}
+              mentions={displayBody === message.body ? message.mentions : []}
+            />
           </div>
           {attachments.length > 0 && (
             <AttachmentStack attachments={attachments} />
@@ -3535,6 +3569,59 @@ function WorkflowResultRow({
   );
 }
 
+function MentionMenu({
+  options,
+  selectedIndex,
+  onSelect,
+}: {
+  options: MentionOption[];
+  selectedIndex: number;
+  onSelect: (option: MentionOption) => void;
+}) {
+  return (
+    <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-xl border border-[#dfe3ec] bg-white shadow-soft">
+      <div className="border-b border-[#edf0f5] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+        Mentions
+      </div>
+      <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
+        {options.map((option, index) => (
+          <button
+            key={`${option.kind}:${option.id}`}
+            type="button"
+            className={cn(
+              "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
+              index === selectedIndex
+                ? "bg-[#f1efff] text-[#5843d7]"
+                : "hover:bg-[#f7f8fb]",
+            )}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              onSelect(option);
+            }}
+          >
+            {option.actor ? (
+              <ActorAvatar actor={option.actor} fallback={option.actor.id} small />
+            ) : (
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
+                <Users size={14} />
+              </span>
+            )}
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-medium">{option.title}</span>
+              <span className="block truncate text-xs text-muted-foreground">
+                {option.detail}
+              </span>
+            </span>
+            <span className="font-mono text-xs text-muted-foreground">
+              {option.token}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Composer({
   draft,
   setDraft,
@@ -3617,46 +3704,11 @@ function Composer({
         )}
         <div className="composer-box relative">
           {showMentions && (
-            <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-xl border border-[#dfe3ec] bg-white shadow-soft">
-              <div className="border-b border-[#edf0f5] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-                Mentions
-              </div>
-              <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
-                {mentionOptions.map((option, index) => (
-                  <button
-                    key={`${option.kind}:${option.id}`}
-                    type="button"
-                    className={cn(
-                      "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
-                      index === effectiveMentionIndex
-                        ? "bg-[#f1efff] text-[#5843d7]"
-                        : "hover:bg-[#f7f8fb]",
-                    )}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      chooseMention(option);
-                    }}
-                  >
-                    {option.actor ? (
-                      <ActorAvatar actor={option.actor} fallback={option.actor.id} small />
-                    ) : (
-                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
-                        <Users size={14} />
-                      </span>
-                    )}
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{option.title}</span>
-                      <span className="block truncate text-xs text-muted-foreground">
-                        {option.detail}
-                      </span>
-                    </span>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      {option.token}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
+            <MentionMenu
+              options={mentionOptions}
+              selectedIndex={effectiveMentionIndex}
+              onSelect={chooseMention}
+            />
           )}
           <Textarea
             ref={textareaRef}
@@ -3669,6 +3721,7 @@ function Composer({
             onClick={(event) => syncCaret(event.currentTarget)}
             onKeyUp={(event) => syncCaret(event.currentTarget)}
             onKeyDown={(event) => {
+              if (isComposingKeyEvent(event)) return;
               if (showMentions) {
                 if (event.key === "ArrowDown") {
                   event.preventDefault();
@@ -3695,7 +3748,7 @@ function Composer({
                   return;
                 }
               }
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (shouldSendOnEnter(event)) {
                 event.preventDefault();
                 onSend();
               }
@@ -3725,6 +3778,7 @@ function ThreadPanel({
   currentActorId,
   disabled,
   draft,
+  mentionAgents,
   machines,
   messages,
   setDraft,
@@ -3743,6 +3797,7 @@ function ThreadPanel({
   currentActorId: string | null;
   disabled: boolean;
   draft: string;
+  mentionAgents: Actor[];
   machines: MachineInfo[];
   messages: Message[];
   setDraft: (value: string) => void;
@@ -3889,6 +3944,7 @@ function ThreadPanel({
         setDraft={setDraft}
         disabled={disabled || !thread}
         busy={busy === "thread:message:send"}
+        mentionAgents={mentionAgents}
         onSend={onSend}
       />
     </aside>
@@ -3947,7 +4003,11 @@ function ThreadConversationMessage({
             </span>
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown actors={actors} body={displayBody} />
+            <MessageMarkdown
+              actors={actors}
+              body={displayBody}
+              mentions={displayBody === message.body ? message.mentions : []}
+            />
           </div>
           {pollChoices.length > 0 && (
             <PollCard choices={pollChoices} disabled />
@@ -4007,9 +4067,11 @@ function ThreadConversationMessage({
 function MessageMarkdown({
   actors,
   body,
+  mentions = [],
 }: {
   actors: Record<string, Actor>;
   body: string;
+  mentions?: MessageMention[];
 }) {
   const components: Components = {
     a({ href, children, node: _node, ...props }) {
@@ -4034,7 +4096,10 @@ function MessageMarkdown({
   };
 
   return (
-    <ReactMarkdown remarkPlugins={[actorMentionRemarkPlugin(actors)]} components={components}>
+    <ReactMarkdown
+      remarkPlugins={[actorMentionRemarkPlugin(actors, mentions)]}
+      components={components}
+    >
       {body}
     </ReactMarkdown>
   );
@@ -4090,22 +4155,109 @@ function ThreadComposer({
   setDraft,
   disabled,
   busy,
+  mentionAgents,
   onSend,
 }: {
   draft: string;
   setDraft: (value: string) => void;
   disabled: boolean;
   busy: boolean;
+  mentionAgents: Actor[];
   onSend: () => void;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [caretIndex, setCaretIndex] = useState(draft.length);
+  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
+  const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const activeMention = activeMentionQuery(draft, caretIndex);
+  const mentionKey = activeMention
+    ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`
+    : null;
+  const mentionOptions = activeMention
+    ? mentionCandidates(mentionAgents, activeMention)
+    : [];
+  const showMentions =
+    !disabled &&
+    !busy &&
+    activeMention !== null &&
+    dismissedMentionKey !== mentionKey &&
+    mentionOptions.length > 0;
+  const effectiveMentionIndex = mentionOptions.length
+    ? Math.min(selectedMentionIndex, mentionOptions.length - 1)
+    : 0;
+  const selectedMention = showMentions ? mentionOptions[effectiveMentionIndex] : null;
+
+  useEffect(() => {
+    setSelectedMentionIndex(0);
+  }, [mentionKey]);
+
+  function syncCaret(element: HTMLTextAreaElement) {
+    setCaretIndex(element.selectionStart ?? element.value.length);
+  }
+
+  function chooseMention(option: MentionOption) {
+    const before = draft.slice(0, option.start);
+    const after = draft.slice(option.end).replace(/^\s*/, "");
+    const next = `${before}${option.token} ${after}`;
+    const nextCaret = before.length + option.token.length + 1;
+    setDraft(next);
+    setCaretIndex(nextCaret);
+    setDismissedMentionKey(null);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
   return (
     <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
       <div className="composer-box composer-box-compact relative">
+        {showMentions && (
+          <MentionMenu
+            options={mentionOptions}
+            selectedIndex={effectiveMentionIndex}
+            onSelect={chooseMention}
+          />
+        )}
         <Textarea
+          ref={textareaRef}
           value={draft}
-          onChange={(event) => setDraft(event.target.value)}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            syncCaret(event.currentTarget);
+            setDismissedMentionKey(null);
+          }}
+          onClick={(event) => syncCaret(event.currentTarget)}
+          onKeyUp={(event) => syncCaret(event.currentTarget)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
+            if (isComposingKeyEvent(event)) return;
+            if (showMentions) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setSelectedMentionIndex((index) =>
+                  (index + 1) % mentionOptions.length,
+                );
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setSelectedMentionIndex((index) =>
+                  (index - 1 + mentionOptions.length) % mentionOptions.length,
+                );
+                return;
+              }
+              if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
+                event.preventDefault();
+                chooseMention(selectedMention);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setDismissedMentionKey(mentionKey);
+                return;
+              }
+            }
+            if (shouldSendOnEnter(event)) {
               event.preventDefault();
               onSend();
             }
@@ -4233,6 +4385,9 @@ function ThreadsView({
           currentActorId={currentActorId}
           disabled={disabled}
           draft={threadDraft}
+          mentionAgents={
+            activeChannel ? channelMentionAgentActors(activeChannel, actors) : []
+          }
           machines={machines}
           messages={threadMessages}
           setDraft={setThreadDraft}
@@ -5101,14 +5256,11 @@ function AccountField({
 
 function SettingsView({
   busy,
-  machineForm,
-  setMachineForm,
   agentForm,
   setAgentForm,
   machines,
   targetAgentId,
   onCheckMachines,
-  onAddMachine,
   onRemoveMachine,
   onAddAgent,
   onUpdateAgent,
@@ -5116,23 +5268,22 @@ function SettingsView({
   onOpenLocalPath,
 }: {
   busy: string | null;
-  machineForm: { name: string; dataRoot: string };
-  setMachineForm: (form: { name: string; dataRoot: string }) => void;
   agentForm: AgentFormState;
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
   targetAgentId: string | null;
   onCheckMachines: () => void;
-  onAddMachine: () => void;
   onRemoveMachine: (machineId: string) => void;
-  onAddAgent: () => void;
+  onAddAgent: () => Promise<boolean> | boolean;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
-  const [hostComposerOpen, setHostComposerOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
+  const [createAgentMachineId, setCreateAgentMachineId] = useState<string | null>(null);
+  const [memberCreateMenuOpen, setMemberCreateMenuOpen] = useState(false);
+  const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
   const memberEntries = agentMemberEntries(machines);
   const selectedMemberEntry =
     selectedAgentId === null
@@ -5143,6 +5294,9 @@ function SettingsView({
     machines.find((machine) => machine.id === selectedMachineId) ??
     machines.find((machine) => machine.id === agentForm.machineId) ??
     machines[0];
+  const createAgentMachine = createAgentMachineId
+    ? machines.find((machine) => machine.id === createAgentMachineId) ?? null
+    : null;
 
   useEffect(() => {
     if (machines.length === 0) {
@@ -5171,9 +5325,31 @@ function SettingsView({
     if (!targetAgentId) return;
     const entry = findAgentMemberEntry(machines, targetAgentId);
     setSelectedAgentId(targetAgentId);
-    setHostComposerOpen(false);
     if (entry) setSelectedMachineId(entry.machine.id);
   }, [machines, targetAgentId]);
+
+  useEffect(() => {
+    if (!createAgentMachineId) return;
+    if (!machines.some((machine) => machine.id === createAgentMachineId)) {
+      setCreateAgentMachineId(null);
+    }
+  }, [createAgentMachineId, machines]);
+
+  useEffect(() => {
+    if (!memberCreateMenuOpen) return;
+    const close = (event: globalThis.MouseEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Node &&
+        memberCreateMenuRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setMemberCreateMenuOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [memberCreateMenuOpen]);
 
   function selectMachine(machine: MachineInfo) {
     setSelectedMachineId(machine.id);
@@ -5185,6 +5361,26 @@ function SettingsView({
     setSelectedMachineId(entry.machine.id);
     setSelectedAgentId(entry.agent.spec.actor.id);
     setAgentForm(agentFormForMachine(agentForm, entry.machine));
+  }
+
+  function openCreateAgentDialog(machine?: MachineInfo | null) {
+    const nextMachine =
+      machine ??
+      (selectedMachine && machineCanCreateAgent(selectedMachine)
+        ? selectedMachine
+        : null) ??
+      machines.find(
+        (item) => machineCanCreateAgent(item) && item.providers.length > 0,
+      ) ??
+      machines.find(machineCanCreateAgent) ??
+      selectedMachine ??
+      machines[0];
+    if (!nextMachine) return;
+    setSelectedMachineId(nextMachine.id);
+    setSelectedAgentId(null);
+    setAgentForm(agentFormForMachine(agentForm, nextMachine));
+    setCreateAgentMachineId(nextMachine.id);
+    setMemberCreateMenuOpen(false);
   }
 
   return (
@@ -5200,7 +5396,7 @@ function SettingsView({
                     Hosts
                   </div>
                   <div className="mt-1 text-sm font-bold text-[#111827]">
-                    {machines.length} configured
+                    {machines.length} reported
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -5218,63 +5414,14 @@ function SettingsView({
                       <RefreshCw size={15} />
                     )}
                   </Button>
-                  <Button
-                    variant={hostComposerOpen ? "secondary" : "outline"}
-                    size="icon"
-                    title={hostComposerOpen ? "Close add host" : "Add host"}
-                    onClick={() => setHostComposerOpen((open) => !open)}
-                    className="h-9 w-9 rounded-lg border-[#dfe3ec] bg-white"
-                  >
-                    {hostComposerOpen ? <X size={15} /> : <Plus size={15} />}
-                  </Button>
                 </div>
               </div>
             </div>
-            {hostComposerOpen && (
-              <form
-                className="border-b border-[#edf0f5] bg-white p-4"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  onAddMachine();
-                }}
-              >
-                <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                  <Plus size={13} />
-                  Add Host
-                </div>
-                <div className="space-y-2">
-                  <Input
-                    value={machineForm.name}
-                    onChange={(event) =>
-                      setMachineForm({ ...machineForm, name: event.target.value })
-                    }
-                    placeholder="Host name"
-                    className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                  />
-                  <Input
-                    value={machineForm.dataRoot}
-                    onChange={(event) =>
-                      setMachineForm({ ...machineForm, dataRoot: event.target.value })
-                    }
-                    placeholder="Data root"
-                    className="h-9 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                  />
-                  <Button
-                    type="submit"
-                    className="w-full rounded-lg"
-                    disabled={busy === "machine:create" || !machineForm.name.trim()}
-                  >
-                    <Plus size={15} />
-                    Add Host
-                  </Button>
-                </div>
-              </form>
-            )}
             <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
               <div className="space-y-2">
                 {machines.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                    No hosts configured.
+                    No hosts reported.
                   </div>
                 ) : (
                   machines.map((machine) => (
@@ -5292,7 +5439,46 @@ function SettingsView({
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
                     Members
                   </div>
-                  <span className="count-badge">{memberEntries.length}</span>
+                  <div ref={memberCreateMenuRef} className="relative flex items-center gap-1.5">
+                    <span className="count-badge">{memberEntries.length}</span>
+                    <button
+                      type="button"
+                      className="composer-icon h-7 min-w-9 gap-0.5 rounded-lg border border-[#dfe3ec] bg-white text-[#503ed4]"
+                      title="Add member"
+                      aria-expanded={memberCreateMenuOpen}
+                      onClick={() => setMemberCreateMenuOpen((open) => !open)}
+                    >
+                      <Plus size={13} />
+                      <ChevronDown size={12} />
+                    </button>
+                    {memberCreateMenuOpen && (
+                      <div className="absolute right-0 top-full z-30 mt-2 w-48 rounded-xl border border-[#dfe3ec] bg-white p-1.5 shadow-[0_18px_44px_rgb(16_24_40_/_0.16)]">
+                        <button
+                          type="button"
+                          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm font-semibold text-[#303849] hover:bg-[#f5f3ff]"
+                          onClick={() => openCreateAgentDialog()}
+                        >
+                          <Bot size={15} className="text-[#503ed4]" />
+                          Agent
+                        </button>
+                        <button
+                          type="button"
+                          disabled
+                          className="mt-1 flex w-full cursor-not-allowed items-start gap-2 rounded-lg px-2.5 py-2 text-left opacity-55"
+                        >
+                          <Server size={15} className="mt-0.5 text-[#667085]" />
+                          <span className="min-w-0">
+                            <span className="block text-sm font-semibold text-[#303849]">
+                              Service
+                            </span>
+                            <span className="block text-xs font-medium text-[#667085]">
+                              Coming Soon
+                            </span>
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <div className="space-y-1.5">
                   {memberEntries.length === 0 ? (
@@ -5326,19 +5512,27 @@ function SettingsView({
               <MachineCard
                 machine={selectedMachine}
                 busy={busy}
-                agentForm={agentForm}
-                setAgentForm={setAgentForm}
-                onAddAgent={onAddAgent}
+                onOpenCreateAgent={openCreateAgentDialog}
                 onRemove={onRemoveMachine}
                 onOpenLocalPath={onOpenLocalPath}
                 onRemoveAgent={onRemoveAgent}
               />
             ) : (
-              <EmptyState icon={Server} text="No hosts configured." />
+              <EmptyState icon={Server} text="No hosts reported." />
             )}
           </div>
         </div>
       </div>
+      {createAgentMachine && (
+        <AgentCreateDialog
+          agentForm={agentForm}
+          busy={busy}
+          machine={createAgentMachine}
+          setAgentForm={setAgentForm}
+          onAddAgent={onAddAgent}
+          onClose={() => setCreateAgentMachineId(null)}
+        />
+      )}
     </section>
   );
 }
@@ -5445,47 +5639,20 @@ function MemberListItem({
 function MachineCard({
   machine,
   busy,
-  agentForm,
-  setAgentForm,
-  onAddAgent,
+  onOpenCreateAgent,
   onRemove,
   onOpenLocalPath,
   onRemoveAgent,
 }: {
   machine: MachineInfo;
   busy: string | null;
-  agentForm: AgentFormState;
-  setAgentForm: (form: AgentFormState) => void;
-  onAddAgent: () => void;
+  onOpenCreateAgent: (machine: MachineInfo) => void;
   onRemove: (machineId: string) => void;
   onOpenLocalPath: (path: string) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
-  const selectedProvider = resolveAgentProvider(agentForm, machine);
-  const modelChoices = selectedProvider?.modelChoices ?? [];
   const canCreateAgent = machineCanCreateAgent(machine);
-  const agentReady = Boolean(
-    canCreateAgent && selectedProvider && agentForm.name.trim(),
-  );
-  const createStatusText = !canCreateAgent
-    ? "This host is read-only for the current account."
-    : !selectedProvider
-      ? "No runtime detected for this host."
-      : `${selectedProvider.name} on ${machine.name}`;
-  const [agentComposerOpen, setAgentComposerOpen] = useState(false);
-
-  useEffect(() => {
-    setAgentComposerOpen(false);
-  }, [machine.id]);
-
-  function updateAgentForm(patch: Partial<AgentFormState>) {
-    setAgentForm({
-      ...agentForm,
-      machineId: machine.id,
-      providerId: selectedProvider?.id ?? agentForm.providerId,
-      ...patch,
-    });
-  }
+  const canRemoveMachine = machine.capabilities.includes("machine.remove");
 
   return (
     <div className="min-h-full bg-white">
@@ -5584,12 +5751,12 @@ function MachineCard({
         count={machine.agents.length}
         action={
           <Button
-            onClick={() => setAgentComposerOpen((open) => !open)}
-            disabled={!agentComposerOpen && !canCreateAgent}
+            onClick={() => onOpenCreateAgent(machine)}
+            disabled={!canCreateAgent || machine.providers.length === 0}
             className="rounded-lg"
           >
-            {agentComposerOpen ? <X size={15} /> : <Plus size={15} />}
-            {agentComposerOpen ? "Close" : "Create Agent"}
+            <Plus size={15} />
+            Create Agent
           </Button>
         }
       >
@@ -5610,52 +5777,209 @@ function MachineCard({
             ))
           )}
         </div>
+      </HostDetailSection>
 
-        {agentComposerOpen && (
-          <form
-            className="mt-5 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] p-4 shadow-sm"
-            onSubmit={(event) => {
-              event.preventDefault();
-              onAddAgent();
-            }}
-          >
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]">
-                <Bot size={14} />
-                New Agent
-              </div>
-              <Badge variant={canCreateAgent ? "outline" : "warning"}>
-                {canCreateAgent ? "available" : "read only"}
-              </Badge>
+      <HostDetailSection title="Actions">
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-bold text-[#111827]">Delete Host</div>
+            <div className="mt-1 text-sm text-[#667085]">
+              Permanently remove this host after its agents are deleted.
             </div>
+          </div>
+          {canRemoveMachine ? (
+            <Button
+              variant="destructive"
+              size="sm"
+              title="Remove host"
+              onClick={() => onRemove(machine.id)}
+              disabled={busy === `machine:remove:${machine.id}`}
+              className="rounded-lg"
+            >
+              <Trash2 size={15} />
+              Delete Host
+            </Button>
+          ) : (
+            <Badge variant="warning">managed by server</Badge>
+          )}
+        </div>
+      </HostDetailSection>
+    </div>
+  );
+}
 
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              <select
-                value={selectedProvider?.id ?? ""}
-                onChange={(event) => {
-                  const provider = machine.providers.find(
-                    (item) => item.id === event.target.value,
-                  );
-                  setAgentForm({
-                    ...agentForm,
-                    machineId: machine.id,
-                    providerId: event.target.value,
-                    model: provider?.defaultModel ?? "",
-                  });
-                }}
-                className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-                disabled={machine.providers.length === 0 || !canCreateAgent}
-              >
-                {machine.providers.length === 0 ? (
-                  <option value="">No runtimes</option>
-                ) : (
-                  machine.providers.map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))
-                )}
-              </select>
+const customModelOptionValue = "__loom_custom_model__";
+
+function AgentCreateDialog({
+  agentForm,
+  busy,
+  machine,
+  setAgentForm,
+  onAddAgent,
+  onClose,
+}: {
+  agentForm: AgentFormState;
+  busy: string | null;
+  machine: MachineInfo;
+  setAgentForm: (form: AgentFormState) => void;
+  onAddAgent: () => Promise<boolean> | boolean;
+  onClose: () => void;
+}) {
+  const selectedProvider = resolveAgentProvider(agentForm, machine);
+  const modelChoices = selectedProvider?.modelChoices ?? [];
+  const [customModelActive, setCustomModelActive] = useState(false);
+  const canCreateAgent = machineCanCreateAgent(machine);
+  const creating = busy === "agent:create";
+  const agentReady = Boolean(
+    canCreateAgent && selectedProvider && agentForm.name.trim(),
+  );
+  const modelValue = agentForm.model || selectedProvider?.defaultModel || "";
+  const modelIsKnown =
+    !modelValue || modelChoices.some((choice) => choice.id === modelValue);
+  const showCustomModel =
+    modelChoices.length === 0 || customModelActive || !modelIsKnown;
+  const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
+  const createStatusText = !canCreateAgent
+    ? "This host is read-only for the current account."
+    : !selectedProvider
+      ? "No runtime detected for this host."
+      : `${selectedProvider.name} on ${machine.name}`;
+
+  useEffect(() => {
+    setCustomModelActive(false);
+  }, [selectedProvider?.id]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  function updateAgentForm(patch: Partial<AgentFormState>) {
+    setAgentForm({
+      ...agentForm,
+      machineId: machine.id,
+      providerId: selectedProvider?.id ?? agentForm.providerId,
+      ...patch,
+    });
+  }
+
+  function selectProvider(provider: MachineAgentProviderInfo) {
+    setCustomModelActive(false);
+    setAgentForm({
+      ...agentForm,
+      machineId: machine.id,
+      providerId: provider.id,
+      model: provider.defaultModel || provider.modelChoices[0]?.id || "",
+    });
+  }
+
+  async function submitAgent(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const created = await onAddAgent();
+    if (created) onClose();
+  }
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="agent-create-title"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <form
+        className="flex max-h-[min(760px,calc(100vh-48px))] w-full max-w-3xl flex-col rounded-2xl border border-[#dfe3ec] bg-white shadow-[0_28px_80px_rgb(16_24_40_/_0.22)]"
+        onSubmit={submitAgent}
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-4">
+          <div className="min-w-0">
+            <div
+              id="agent-create-title"
+              className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]"
+            >
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
+                <Bot size={15} />
+              </span>
+              New Agent
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+              <span className="font-semibold text-[#303849]">{machine.name}</span>
+              <span className="text-[#a0a6b3]">/</span>
+              <span>{createStatusText}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant={canCreateAgent ? "outline" : "warning"}>
+              {canCreateAgent ? "available" : "read only"}
+            </Badge>
+            <button
+              type="button"
+              className="composer-icon h-8 min-w-8"
+              title="Close"
+              onClick={onClose}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
+          <div className="space-y-5">
+            <section>
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+                Runtime
+              </div>
+              {machine.providers.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                  No runtimes detected for this host.
+                </div>
+              ) : (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {machine.providers.map((provider) => {
+                    const selected = selectedProvider?.id === provider.id;
+                    const iconKey = agentProviderIconKey(provider.id, provider.name);
+                    return (
+                      <button
+                        key={provider.id}
+                        type="button"
+                        disabled={!canCreateAgent}
+                        className={cn(
+                          "flex min-h-[68px] items-center gap-3 rounded-xl border bg-white px-3 py-3 text-left transition-colors",
+                          selected
+                            ? "border-[#8f82ff] bg-[#f7f5ff] ring-2 ring-[#ece8ff]"
+                            : "border-[#e2e6ef] hover:border-[#c8c1ff]",
+                        )}
+                        onClick={() => selectProvider(provider)}
+                      >
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+                          {iconKey ? (
+                            <AgentProviderIcon iconKey={iconKey} className="h-5 w-5" />
+                          ) : (
+                            <Bot size={18} />
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-bold text-[#111827]">
+                            {provider.name}
+                          </span>
+                          <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                            {provider.defaultModel || `${provider.modelChoices.length} models`}
+                          </span>
+                        </span>
+                        {selected && <Check size={16} className="shrink-0 text-[#503ed4]" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            <section className="grid gap-3 md:grid-cols-2">
               <Input
                 value={agentForm.name}
                 onChange={(event) => updateAgentForm({ name: event.target.value })}
@@ -5670,28 +5994,43 @@ function MachineCard({
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                 disabled={!canCreateAgent}
               />
-              {modelChoices.length > 0 ? (
-                <select
-                  value={agentForm.model || selectedProvider?.defaultModel || ""}
-                  onChange={(event) => updateAgentForm({ model: event.target.value })}
-                  className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-                  disabled={!canCreateAgent}
-                >
-                  {modelChoices.map((choice) => (
-                    <option key={choice.id} value={choice.id}>
-                      {choice.label}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <Input
-                  value={agentForm.model}
-                  onChange={(event) => updateAgentForm({ model: event.target.value })}
-                  placeholder="Model"
-                  className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                  disabled={!canCreateAgent}
-                />
-              )}
+              <div className="space-y-2">
+                {modelChoices.length > 0 ? (
+                  <select
+                    value={modelSelectValue}
+                    onChange={(event) => {
+                      if (event.target.value === customModelOptionValue) {
+                        setCustomModelActive(true);
+                        updateAgentForm({
+                          model: modelIsKnown ? "" : agentForm.model,
+                        });
+                        return;
+                      }
+                      setCustomModelActive(false);
+                      updateAgentForm({ model: event.target.value });
+                    }}
+                    className="h-10 w-full rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
+                    disabled={!canCreateAgent}
+                  >
+                    <option value="">Default model</option>
+                    {modelChoices.map((choice) => (
+                      <option key={choice.id} value={choice.id}>
+                        {choice.label || choice.id}
+                      </option>
+                    ))}
+                    <option value={customModelOptionValue}>Custom...</option>
+                  </select>
+                ) : null}
+                {showCustomModel && (
+                  <Input
+                    value={agentForm.model}
+                    onChange={(event) => updateAgentForm({ model: event.target.value })}
+                    placeholder="Custom model"
+                    className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canCreateAgent}
+                  />
+                )}
+              </div>
               <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
                 <input
                   type="checkbox"
@@ -5707,58 +6046,33 @@ function MachineCard({
                 value={agentForm.description}
                 onChange={(event) => updateAgentForm({ description: event.target.value })}
                 placeholder="Agent instructions"
-                className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2 xl:col-span-4"
+                className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                 disabled={!canCreateAgent}
               />
-            </div>
-
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs font-medium text-[#667085]">
-                {createStatusText}
-              </div>
-              <Button
-                type="submit"
-                disabled={busy === "agent:create" || !agentReady}
-                className="rounded-lg"
-              >
-                {busy === "agent:create" ? (
-                  <Loader2 className="animate-spin" size={15} />
-                ) : (
-                  <Plus size={15} />
-                )}
-                Create Agent
-              </Button>
-            </div>
-          </form>
-        )}
-      </HostDetailSection>
-
-      <HostDetailSection title="Actions">
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
-          <div className="min-w-0">
-            <div className="text-sm font-bold text-[#111827]">Delete Host</div>
-            <div className="mt-1 text-sm text-[#667085]">
-              Permanently remove this host after its agents are deleted.
-            </div>
+            </section>
           </div>
-          {!machine.readOnly ? (
-            <Button
-              variant="destructive"
-              size="sm"
-              title="Remove host"
-              onClick={() => onRemove(machine.id)}
-              disabled={busy === `machine:remove:${machine.id}`}
-              className="rounded-lg"
-            >
-              <Trash2 size={15} />
-              Delete Host
-            </Button>
-          ) : (
-            <Badge variant="warning">read only</Badge>
-          )}
         </div>
-      </HostDetailSection>
-    </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
+          <div className="text-xs font-medium text-[#667085]">
+            {createStatusText}
+          </div>
+          <Button
+            type="submit"
+            disabled={creating || !agentReady}
+            className="rounded-lg"
+          >
+            {creating ? (
+              <Loader2 className="animate-spin" size={15} />
+            ) : (
+              <Plus size={15} />
+            )}
+            Create Agent
+          </Button>
+        </div>
+      </form>
+    </div>,
+    document.body,
   );
 }
 
@@ -5977,8 +6291,6 @@ function AgentMemberDetail({
           <HostInfoRow label="Host">{machine.name}</HostInfoRow>
           <HostInfoRow label="Actor ID" mono>{actor.id}</HostInfoRow>
           <HostInfoRow label="Profile Path" mono>{agent.profilePath || "Not set"}</HostInfoRow>
-          <HostInfoRow label="Identity Path" mono>{agent.identityPath || "Not set"}</HostInfoRow>
-          <HostInfoRow label="Soul Path" mono>{agent.soulPath || "Not set"}</HostInfoRow>
         </div>
       </HostDetailSection>
 
@@ -7283,16 +7595,17 @@ function agentDisplayName(agent: MachineInfo["agents"][number]) {
 }
 
 function agentModelValue(agent: MachineInfo["agents"][number]) {
-  return agent.spec.model ?? agent.spec.models?.default ?? "";
+  return agent.spec.providerRef.model ?? agent.spec.models?.default ?? "";
 }
 
 function agentDescriptionValue(agent: MachineInfo["agents"][number]) {
-  return agent.spec.identity?.description ?? "";
+  if (agent.spec.instructions) return agent.spec.instructions;
+  const value = agent.spec.actor._meta?.description;
+  return typeof value === "string" ? value : "";
 }
 
 function agentReasoningEffort(agent: MachineInfo["agents"][number]) {
-  const value = agent.spec.actor._meta?.reasoningEffort;
-  return typeof value === "string" ? value : "";
+  return agent.spec.providerRef.reasoningEffort ?? "";
 }
 
 function agentProviderId(agent: MachineInfo["agents"][number]) {
@@ -7311,6 +7624,10 @@ function providerForAgent(
   const providerId = preferredProviderId || agentProviderId(agent);
   const preferred = machine.providers.find((provider) => provider.id === providerId);
   if (preferred) return preferred;
+  const providerRef = machine.providers.find(
+    (provider) => provider.id === agent.spec.providerRef.id,
+  );
+  if (providerRef) return providerRef;
   const model = agentModelValue(agent);
   return (
     machine.providers.find(
@@ -7491,12 +7808,16 @@ type MarkdownNode = {
 
 const actorMentionUrlPrefix = "https://loom.local/actors/";
 const actorMentionPattern =
-  /@((?:actor_(?:agent|human|service)_|actor_)[A-Za-z0-9_:-]+)/g;
+  /@([^\s,.;:!?()[\]{}<>"'`]+)/g;
 
-function actorMentionRemarkPlugin(actors: Record<string, Actor>) {
+function actorMentionRemarkPlugin(
+  actors: Record<string, Actor>,
+  mentions: MessageMention[] = [],
+) {
+  const explicitActorMentions = actorMentionLookup(mentions);
   return function transformActorMentions() {
     return (tree: MarkdownNode) => {
-      transformMarkdownTextMentions(tree, actors);
+      transformMarkdownTextMentions(tree, actors, explicitActorMentions);
     };
   };
 }
@@ -7504,6 +7825,7 @@ function actorMentionRemarkPlugin(actors: Record<string, Actor>) {
 function transformMarkdownTextMentions(
   node: MarkdownNode,
   actors: Record<string, Actor>,
+  explicitActorMentions: Map<string, string>,
 ) {
   if (node.type === "link" || node.type === "linkReference") return;
   if (!node.children) return;
@@ -7511,20 +7833,21 @@ function transformMarkdownTextMentions(
   for (let index = 0; index < node.children.length; index += 1) {
     const child = node.children[index];
     if (child.type === "text" && typeof child.value === "string") {
-      const replacement = actorMentionNodes(child.value, actors);
+      const replacement = actorMentionNodes(child.value, actors, explicitActorMentions);
       if (replacement) {
         node.children.splice(index, 1, ...replacement);
         index += replacement.length - 1;
       }
       continue;
     }
-    transformMarkdownTextMentions(child, actors);
+    transformMarkdownTextMentions(child, actors, explicitActorMentions);
   }
 }
 
 function actorMentionNodes(
   value: string,
   actors: Record<string, Actor>,
+  explicitActorMentions: Map<string, string>,
 ): MarkdownNode[] | null {
   const nodes: MarkdownNode[] = [];
   let lastIndex = 0;
@@ -7532,7 +7855,9 @@ function actorMentionNodes(
   actorMentionPattern.lastIndex = 0;
 
   for (const match of value.matchAll(actorMentionPattern)) {
-    const actorId = match[1];
+    const token = match[1];
+    const actorId = actorIdForMentionToken(token, actors, explicitActorMentions);
+    if (!actorId) continue;
     const actor = actors[actorId];
     if (!actor || match.index === undefined) continue;
 
@@ -7554,6 +7879,39 @@ function actorMentionNodes(
     nodes.push({ type: "text", value: value.slice(lastIndex) });
   }
   return nodes;
+}
+
+function actorMentionLookup(mentions: MessageMention[]) {
+  const lookup = new Map<string, string>();
+  for (const mention of mentions) {
+    if (mention.kind !== "actor") continue;
+    const display = mention.display.trim();
+    if (!display) continue;
+    lookup.set(normalizeMentionToken(display), mention.actorOrGroupId);
+  }
+  return lookup;
+}
+
+function actorIdForMentionToken(
+  token: string,
+  actors: Record<string, Actor>,
+  explicitActorMentions: Map<string, string>,
+) {
+  const key = normalizeMentionToken(token);
+  if (key === "all" || key === "agents" || key === "humans") return null;
+  const explicitActorId = explicitActorMentions.get(key);
+  if (explicitActorId) return explicitActorId;
+  return Object.values(actors).find((actor) => {
+    return (
+      normalizeMentionToken(actor.id) === key ||
+      normalizeMentionToken(displayName(actor)) === key ||
+      normalizeMentionToken(shortActorAlias(actor.id)) === key
+    );
+  })?.id ?? null;
+}
+
+function normalizeMentionToken(value: string) {
+  return value.trim().replace(/^@+/, "").toLowerCase();
 }
 
 function actorMentionUrl(actorId: string) {
@@ -7796,13 +8154,20 @@ function machineCanCreateAgent(machine: MachineInfo) {
   );
 }
 
+function isComposingKeyEvent(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+  return event.nativeEvent.isComposing || event.keyCode === 229;
+}
+
+function shouldSendOnEnter(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+  return event.key === "Enter" && !event.shiftKey && !isComposingKeyEvent(event);
+}
+
 function mentionAudience(
   body: string,
-  actors: Record<string, Actor>,
+  mentionableActors: Actor[],
   selfActorId?: string,
 ): AudienceRef[] {
   const audience: AudienceRef[] = [];
-  const actorList = Object.values(actors);
   for (const rawToken of mentionTokens(body)) {
     const key = rawToken.toLowerCase();
     if (key === "all") {
@@ -7817,7 +8182,7 @@ function mentionAudience(
       audience.push({ kind: "humans", id: "humans", display: "@humans" });
       continue;
     }
-    const actor = actorList.find((candidate) => {
+    const actor = mentionableActors.find((candidate) => {
       if (candidate.id === selfActorId) return false;
       return (
         candidate.id.toLowerCase() === key ||
@@ -7997,8 +8362,20 @@ function directPeerForMessage(message: Message, currentActorId: string | null) {
   return targetActorId;
 }
 
-function isChannelMember(channel: Channel, actorId: string) {
-  return channel.visibility === "public" || channel.members.includes(actorId);
+function channelMentionActors(channel: Channel, actors: Record<string, Actor>) {
+  return channel.members
+    .map((actorId) => actors[actorId])
+    .filter((actor): actor is Actor => Boolean(actor) && actor.kind !== "service");
+}
+
+function channelMentionAgentActors(channel: Channel, actors: Record<string, Actor>) {
+  return channelMentionActors(channel, actors).filter(
+    (actor) => actor.kind === "agent",
+  );
+}
+
+function isChannelMentionActor(channel: Channel, actorId: string) {
+  return channel.members.includes(actorId);
 }
 
 function isExplicitChannelMember(channel: Channel, actorId: string) {

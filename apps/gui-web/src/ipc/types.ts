@@ -211,8 +211,11 @@ export interface AgentModelSpec {
   choices: AgentModelChoice[];
 }
 
-export interface AgentIdentitySpec {
-  description?: string | null;
+export interface AgentProviderRef {
+  id: string;
+  mode?: string | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
 }
 
 export interface MachineAgentProviderInfo {
@@ -228,9 +231,9 @@ export interface MachineAgentProviderInfo {
 
 export interface AgentSpec {
   actor: Actor;
+  instructions?: string | null;
+  providerRef: AgentProviderRef;
   models?: AgentModelSpec | null;
-  identity?: AgentIdentitySpec | null;
-  model?: string | null;
   autostart?: boolean | null;
   _meta?: Record<string, unknown>;
 }
@@ -244,8 +247,6 @@ export interface AgentInfo {
 
 export interface MachineAgentInfo extends AgentInfo {
   profilePath: string;
-  identityPath: string;
-  soulPath: string;
 }
 
 export interface MachineInfo {

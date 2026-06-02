@@ -2,14 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use serde::Deserialize;
 use uuid::Uuid;
 
 use agent_runtime::memory::{
     JsonlMemoryStore, MemoryQuery, MemoryRecord, MemorySource, MemoryStore,
 };
 
-use crate::config;
 use crate::render;
 
 pub fn query(
@@ -170,9 +168,6 @@ fn resolve_profile_dir(actor_id: &str) -> PathBuf {
     if let Ok(path) = std::env::var("LOOM_MEMORY_PROFILE_DIR") {
         return PathBuf::from(path);
     }
-    if let Some(path) = resolve_desktop_machine_profile_dir(actor_id) {
-        return path;
-    }
     let mut candidates = vec![actor_id.to_string()];
     if let Some(stripped) = actor_id.strip_prefix("actor_") {
         candidates.push(stripped.to_string());
@@ -193,71 +188,6 @@ fn resolve_profile_dir(actor_id: &str) -> PathBuf {
         .join("agents")
         .join(actor_id)
         .join("profile")
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct MemoryDesktopConfig {
-    active: Option<String>,
-    #[serde(default)]
-    machines: Vec<MemoryMachineConfig>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MemoryMachineConfig {
-    workspace_id: Option<String>,
-    data_root: Option<String>,
-    #[serde(default)]
-    agents: Vec<MemoryMachineAgent>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MemoryMachineAgent {
-    actor_id: String,
-}
-
-fn resolve_desktop_machine_profile_dir(actor_id: &str) -> Option<PathBuf> {
-    let path = config::config_dir().join("desktop.toml");
-    let text = std::fs::read_to_string(path).ok()?;
-    let cfg: MemoryDesktopConfig = toml::from_str(&text).ok()?;
-    let has_actor = |machine: &MemoryMachineConfig| {
-        machine
-            .agents
-            .iter()
-            .any(|agent| agent.actor_id == actor_id)
-    };
-    let selected = cfg
-        .active
-        .as_deref()
-        .and_then(|active| {
-            cfg.machines.iter().find(|machine| {
-                machine.workspace_id.as_deref() == Some(active) && has_actor(machine)
-            })
-        })
-        .or_else(|| cfg.machines.iter().find(|machine| has_actor(machine)))?;
-    let data_root = selected.data_root.as_deref()?.trim();
-    if data_root.is_empty() {
-        return None;
-    }
-    Some(
-        expand_home(data_root)
-            .join("agents")
-            .join(actor_id)
-            .join("profile"),
-    )
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    if path == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
 }
 
 fn validate_status(status: &str) -> Result<()> {

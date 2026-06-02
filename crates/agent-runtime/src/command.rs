@@ -12,10 +12,8 @@
 //!   * `output_format`: `Text`, `NdjsonLines`, `ClaudeStreamJson`,
 //!     `CopilotJson`, `CodexStreamJson`, `OpencodeJson`.
 //!   * `prompt_via`: `Args`, `Stdin`, `Env`.
-//!   * `first_run_capture`: `stdout_json:<path>`,
-//!     `stdout_json_any:<path>|<path>`, `file:<path>`. The `stderr_regex:` form
-//!     is recognised but returns an unimplemented error so it is obvious in logs
-//!     (rather than silently swallowed).
+//!   * `decoder.capture.session` for provider-owned session ids. Legacy
+//!     `first_run_capture` remains available to direct command transports.
 //!   * Session bookkeeping: written to disk, read back on next prompt; signature
 //!     mismatch invalidates and forces a first-run path.
 //!
@@ -33,13 +31,18 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use proto::methods::{CommandOutputFormat, PromptVia};
+use proto::methods::{
+    CommandOutputFormat, CommandSessionIdSource, PromptVia, ProviderArgSpec,
+    ProviderDecoderEmitSpec, ProviderDecoderSpec, ProviderJsonConditionSpec,
+    ProviderJsonlTextReducerSpec, ProviderPromptSpec,
+};
 use proto::types::ScopeRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use crate::provider::ProviderRuntimeEvent;
 use crate::usage::extract_token_usage_from_text;
 
 #[cfg(unix)]
@@ -102,14 +105,23 @@ pub struct CommandConfig {
     pub command: String,
     /// First-run argv (template — `{prompt}` may appear when `prompt_via=args`).
     pub args: Vec<String>,
+    /// Provider-manifest argv template preserving conditional fragments.
+    pub arg_specs: Vec<ProviderArgSpec>,
     pub env: BTreeMap<String, String>,
     /// Argv template appended when the prompt selects a model. `{model}` is
     /// expanded only after a non-empty selected model exists.
     pub model_args: Vec<String>,
+    pub session_id_source: Option<CommandSessionIdSource>,
+    pub session_scope: Option<String>,
     pub first_run_capture: Option<String>,
     pub resume_args: Option<Vec<String>>,
+    pub resume_arg_specs: Vec<ProviderArgSpec>,
     pub output_format: CommandOutputFormat,
+    pub decoder: Option<ProviderDecoderSpec>,
+    pub stderr_decoder: Option<ProviderDecoderSpec>,
     pub prompt_via: PromptVia,
+    pub prompt: Option<ProviderPromptSpec>,
+    pub stdin_template: Option<String>,
     /// Where to keep `<actor>/<scope_id>.json` session bookkeeping files. The
     /// adapter creates subdirs lazily on first write.
     pub sessions_dir: PathBuf,
@@ -117,8 +129,9 @@ pub struct CommandConfig {
     pub timeout_ms: Option<u64>,
     /// Optional per-turn stdout idle timeout in milliseconds.
     pub idle_timeout_ms: Option<u64>,
-    /// Hash of `command` + `args` template (pre-expansion) — when the spec
-    /// changes the saved sessions are invalidated.
+    /// Hash of provider command/session templates before per-turn runtime
+    /// values are expanded. When the spec changes, saved sessions are
+    /// invalidated.
     pub command_signature: String,
 }
 
@@ -133,26 +146,69 @@ impl CommandConfig {
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(command.as_bytes());
-        for a in &args {
-            hasher.update(b"\x00");
-            hasher.update(a.as_bytes());
+        if spec.arg_specs.is_empty() {
+            for a in &args {
+                hasher.update(b"\x00arg\x00");
+                hasher.update(a.as_bytes());
+            }
+        } else {
+            hasher.update(b"\x00arg_specs\x00");
+            if let Ok(json) = serde_json::to_vec(&spec.arg_specs) {
+                hasher.update(json);
+            }
         }
         for a in &spec.model_args {
             hasher.update(b"\x00model_arg\x00");
             hasher.update(a.as_bytes());
         }
-        let command_signature = format!("sha256:{}", hex::encode(hasher.finalize()));
         let session = spec.session.clone();
+        if let Some(session) = session.as_ref() {
+            let scope = session
+                .scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .unwrap_or("actor_scope");
+            if scope != "actor_scope" {
+                hasher.update(b"\x00session_scope\x00");
+                hasher.update(scope.as_bytes());
+            }
+            if session.resume_arg_specs.is_empty() {
+                if let Some(args) = session.resume_args.as_ref() {
+                    for a in args {
+                        hasher.update(b"\x00resume_arg\x00");
+                        hasher.update(a.as_bytes());
+                    }
+                }
+            } else {
+                hasher.update(b"\x00resume_arg_specs\x00");
+                if let Ok(json) = serde_json::to_vec(&session.resume_arg_specs) {
+                    hasher.update(json);
+                }
+            }
+        }
+        let command_signature = format!("sha256:{}", hex::encode(hasher.finalize()));
         Self {
             actor_id,
             command,
             args,
+            arg_specs: spec.arg_specs.clone(),
             env,
             model_args: spec.model_args.clone(),
+            session_id_source: session.as_ref().and_then(|s| s.id_source),
+            session_scope: session.as_ref().and_then(|s| s.scope.clone()),
             first_run_capture: session.as_ref().and_then(|s| s.first_run_capture.clone()),
             resume_args: session.as_ref().and_then(|s| s.resume_args.clone()),
+            resume_arg_specs: session
+                .as_ref()
+                .map(|s| s.resume_arg_specs.clone())
+                .unwrap_or_default(),
             output_format: spec.output_format.unwrap_or_default(),
+            decoder: spec.decoder.clone(),
+            stderr_decoder: spec.stderr_decoder.clone(),
             prompt_via: spec.prompt_via,
+            prompt: spec.prompt.clone(),
+            stdin_template: spec.stdin.clone(),
             sessions_dir,
             timeout_ms: spec.timeout_ms,
             idle_timeout_ms: spec.idle_timeout_ms,
@@ -387,15 +443,41 @@ fn run_prompt(
     // First-run vs resume: if a usable session is on disk AND the spec supports
     // resume, build the argv from `resume_args`; otherwise build the first-run
     // argv from `args`.
-    let (argv, is_first_run) = match (resume_session_id.as_deref(), cfg.resume_args.as_ref()) {
-        (Some(sid), Some(template)) => (
-            expand_argv(template, &cfg, &prompt, Some(sid), &content),
-            false,
-        ),
-        _ => (expand_first_run_argv(&cfg, &prompt, &content), true),
+    let first_run_session_id = if resume_session_id.is_none()
+        && matches!(
+            cfg.session_id_source,
+            Some(CommandSessionIdSource::LoomUuid)
+        ) {
+        Some(uuid::Uuid::new_v4().to_string())
+    } else {
+        None
     };
 
-    let result = spawn_and_collect(&cfg, &prompt, &argv, &sender, &slot);
+    let (argv, is_first_run) = match resume_session_id.as_deref() {
+        Some(sid) if !cfg.resume_arg_specs.is_empty() => (
+            expand_arg_specs(&cfg.resume_arg_specs, &cfg, &prompt, Some(sid), &content),
+            false,
+        ),
+        Some(sid) if cfg.resume_args.is_some() => (
+            expand_argv(
+                cfg.resume_args.as_deref().unwrap_or_default(),
+                &cfg,
+                &prompt,
+                Some(sid),
+                &content,
+            ),
+            false,
+        ),
+        _ => (
+            expand_first_run_argv(&cfg, &prompt, first_run_session_id.as_deref(), &content),
+            true,
+        ),
+    };
+
+    let active_session_id = resume_session_id
+        .as_deref()
+        .or(first_run_session_id.as_deref());
+    let result = spawn_and_collect(&cfg, &prompt, &argv, active_session_id, &sender, &slot);
     let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
@@ -418,8 +500,24 @@ fn run_prompt(
         let _ = delete_session(&cfg, &scope);
         tracing::info!(actor = %cfg.actor_id, scope = %scope.id,
             "command transport: dropped stale session and retrying first-run prompt");
-        let first_run_argv = expand_first_run_argv(&cfg, &prompt, &content);
-        outcome = match spawn_and_collect(&cfg, &prompt, &first_run_argv, &sender, &slot) {
+        let retry_session_id = if matches!(
+            cfg.session_id_source,
+            Some(CommandSessionIdSource::LoomUuid)
+        ) {
+            Some(uuid::Uuid::new_v4().to_string())
+        } else {
+            None
+        };
+        let first_run_argv =
+            expand_first_run_argv(&cfg, &prompt, retry_session_id.as_deref(), &content);
+        outcome = match spawn_and_collect(
+            &cfg,
+            &prompt,
+            &first_run_argv,
+            retry_session_id.as_deref(),
+            &sender,
+            &slot,
+        ) {
             Ok(o) => o,
             Err(e) => {
                 let _ = sender.send(AdapterEvent::Error {
@@ -436,11 +534,28 @@ fn run_prompt(
             }
         };
         retried_as_first_run = true;
+        if outcome.exit_code == 0 {
+            if let Some(sid) = retry_session_id.as_deref() {
+                if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
+                    tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
+                }
+            }
+        }
     }
 
     // First-run capture: try once, save to disk on success.
     if (is_first_run || retried_as_first_run) && outcome.exit_code == 0 {
-        if let Some(rule) = cfg.first_run_capture.as_ref() {
+        if let Some(sid) = first_run_session_id.as_deref() {
+            if let Err(e) = save_session(&cfg, &scope, sid, &command_signature) {
+                tracing::warn!(actor = %cfg.actor_id, %e, "failed to save generated command session");
+            }
+        } else if let Some(sid) = capture_configured_decoder_session_event(&cfg, &outcome)
+            .and_then(ProviderRuntimeEvent::into_session_id)
+        {
+            if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
+                tracing::warn!(actor = %cfg.actor_id, %e, "failed to save decoder-captured command session");
+            }
+        } else if let Some(rule) = cfg.first_run_capture.as_ref() {
             match capture_session_id(rule, &outcome, &cfg, &prompt) {
                 Ok(Some(sid)) => {
                     if let Err(e) = save_session(&cfg, &scope, &sid, &command_signature) {
@@ -502,6 +617,7 @@ fn spawn_and_collect(
     cfg: &CommandConfig,
     prompt: &AdapterPrompt,
     argv: &[String],
+    session_id: Option<&str>,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     slot: &Arc<Mutex<InFlight>>,
 ) -> Result<SpawnOutcome, String> {
@@ -513,7 +629,7 @@ fn spawn_and_collect(
         )
     })?;
     let mut cmd = Command::new(&cfg.command);
-    let stdin = if matches!(cfg.prompt_via, PromptVia::Stdin) {
+    let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -523,7 +639,7 @@ fn spawn_and_collect(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in expanded_env(cfg, prompt) {
+    for (k, v) in expanded_env(cfg, prompt, session_id) {
         cmd.env(k, v);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
@@ -546,10 +662,15 @@ fn spawn_and_collect(
         }
     }
 
-    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+    if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         if let Some(mut stdin) = child.stdin.take() {
+            let stdin_body = cfg
+                .stdin_template
+                .as_ref()
+                .map(|template| expand_template(template, cfg, prompt, session_id, &prompt.content))
+                .unwrap_or_else(|| prompt.content.clone());
             stdin
-                .write_all(prompt.content.as_bytes())
+                .write_all(stdin_body.as_bytes())
                 .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
         }
     }
@@ -597,6 +718,7 @@ fn spawn_and_collect(
     let mut collected_stdout = String::new();
     let mut collected_stderr = String::new();
     let mut emitted_text = false;
+    let mut emitted_finish = false;
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
@@ -614,18 +736,17 @@ fn spawn_and_collect(
     loop {
         while let Ok(output) = output_rx.try_recv() {
             last_output_at = Instant::now();
-            match output {
-                ProcessOutput::Stdout(line) => {
-                    emitted_text |=
-                        collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
-                }
-                ProcessOutput::Stderr(line) => {
-                    collected_stderr.push_str(&line);
-                    if early_runtime_error.is_none() {
-                        early_runtime_error = extract_runtime_error_from_text(&line);
-                    }
-                }
-            }
+            let events = collect_process_output(
+                cfg,
+                prompt,
+                sender,
+                output,
+                &mut collected_stdout,
+                &mut collected_stderr,
+                &mut early_runtime_error,
+            );
+            emitted_text |= events.emitted_text;
+            emitted_finish |= events.emitted_finish;
         }
         if early_runtime_error.is_some() {
             if force_kill_child(child.id()).is_err() {
@@ -683,18 +804,17 @@ fn spawn_and_collect(
         match output_rx.recv_timeout(wait_for) {
             Ok(output) => {
                 last_output_at = Instant::now();
-                match output {
-                    ProcessOutput::Stdout(line) => {
-                        emitted_text |=
-                            collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
-                    }
-                    ProcessOutput::Stderr(line) => {
-                        collected_stderr.push_str(&line);
-                        if early_runtime_error.is_none() {
-                            early_runtime_error = extract_runtime_error_from_text(&line);
-                        }
-                    }
-                }
+                let events = collect_process_output(
+                    cfg,
+                    prompt,
+                    sender,
+                    output,
+                    &mut collected_stdout,
+                    &mut collected_stderr,
+                    &mut early_runtime_error,
+                );
+                emitted_text |= events.emitted_text;
+                emitted_finish |= events.emitted_finish;
                 if early_runtime_error.is_some() {
                     if force_kill_child(child.id()).is_err() {
                         let _ = child.kill();
@@ -718,13 +838,17 @@ fn spawn_and_collect(
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
     for output in output_rx.try_iter() {
-        match output {
-            ProcessOutput::Stdout(line) => {
-                emitted_text |=
-                    collect_stdout_line(cfg, prompt, sender, &line, &mut collected_stdout);
-            }
-            ProcessOutput::Stderr(line) => collected_stderr.push_str(&line),
-        }
+        let events = collect_process_output(
+            cfg,
+            prompt,
+            sender,
+            output,
+            &mut collected_stdout,
+            &mut collected_stderr,
+            &mut early_runtime_error,
+        );
+        emitted_text |= events.emitted_text;
+        emitted_finish |= events.emitted_finish;
     }
     let exit_code = exit.code().unwrap_or(-1);
     // Snapshot + clear the cancel flag now that the child is reaped, before
@@ -771,63 +895,71 @@ fn spawn_and_collect(
         format!("exited with code {exit_code}")
     };
 
-    match cfg.output_format {
-        CommandOutputFormat::Text => {
-            if !collected_stdout.is_empty() {
+    if let Some(event) =
+        configured_decoder_final_text_event(cfg, &collected_stdout, &collected_stderr)
+    {
+        let _ = emit_provider_runtime_event(event, &prompt.scope, sender);
+    } else {
+        match cfg.output_format {
+            CommandOutputFormat::Text => {
+                if !collected_stdout.is_empty() {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content: collected_stdout.clone(),
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::CopilotJson => {
+                if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content,
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::OpencodeJson => {
+                if let Some(content) = extract_opencode_json_final_text(&collected_stdout) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content,
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::CodexStreamJson if !emitted_text => {
+                if let Some(content) = extract_codex_json_final_text(&collected_stdout) {
+                    let _ = sender.send(AdapterEvent::Text {
+                        scope: Some(prompt.scope.clone()),
+                        content,
+                        is_partial: false,
+                    });
+                }
+            }
+            CommandOutputFormat::CodexStreamJson => {}
+            _ => {
+                // Force a buffer flush downstream by emitting an empty
+                // is_partial=false Text frame; the runtime's `take_text_buffer`
+                // will turn whatever was accumulated into a single content.add.
                 let _ = sender.send(AdapterEvent::Text {
                     scope: Some(prompt.scope.clone()),
-                    content: collected_stdout.clone(),
+                    content: String::new(),
                     is_partial: false,
                 });
             }
-        }
-        CommandOutputFormat::CopilotJson => {
-            if let Some(content) = extract_copilot_json_final_text(&collected_stdout) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(prompt.scope.clone()),
-                    content,
-                    is_partial: false,
-                });
-            }
-        }
-        CommandOutputFormat::OpencodeJson => {
-            if let Some(content) = extract_opencode_json_final_text(&collected_stdout) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(prompt.scope.clone()),
-                    content,
-                    is_partial: false,
-                });
-            }
-        }
-        CommandOutputFormat::CodexStreamJson if !emitted_text => {
-            if let Some(content) = extract_codex_json_final_text(&collected_stdout) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(prompt.scope.clone()),
-                    content,
-                    is_partial: false,
-                });
-            }
-        }
-        CommandOutputFormat::CodexStreamJson => {}
-        _ => {
-            // Force a buffer flush downstream by emitting an empty
-            // is_partial=false Text frame; the runtime's `take_text_buffer`
-            // will turn whatever was accumulated into a single content.add.
-            let _ = sender.send(AdapterEvent::Text {
-                scope: Some(prompt.scope.clone()),
-                content: String::new(),
-                is_partial: false,
-            });
         }
     }
     let usage = extract_token_usage_from_text(&collected_stdout)
         .or_else(|| extract_token_usage_from_text(&collected_stderr));
-    let _ = sender.send(AdapterEvent::Finished {
-        scope: Some(prompt.scope.clone()),
-        success,
-        summary,
-        usage,
-    });
+    if !emitted_finish || !success {
+        let _ = sender.send(AdapterEvent::Finished {
+            scope: Some(prompt.scope.clone()),
+            success,
+            summary,
+            usage,
+        });
+    }
 
     Ok(SpawnOutcome {
         exit_code,
@@ -850,22 +982,93 @@ fn collect_stdout_line(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     line: &str,
     collected_stdout: &mut String,
-) -> bool {
+) -> OutputLineEvents {
     collected_stdout.push_str(line);
     let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
-    match cfg.output_format {
-        CommandOutputFormat::NdjsonLines => {
-            translate_ndjson_line(parsed_line, &prompt.scope, sender)
+    if let Some(decoder) = cfg.decoder.as_ref() {
+        return collect_provider_decoder_line(decoder, parsed_line, &prompt.scope, sender);
+    }
+    collect_legacy_output_line(cfg.output_format, parsed_line, &prompt.scope, sender)
+}
+
+fn collect_process_output(
+    cfg: &CommandConfig,
+    prompt: &AdapterPrompt,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+    output: ProcessOutput,
+    collected_stdout: &mut String,
+    collected_stderr: &mut String,
+    early_runtime_error: &mut Option<String>,
+) -> OutputLineEvents {
+    match output {
+        ProcessOutput::Stdout(line) => {
+            collect_stdout_line(cfg, prompt, sender, &line, collected_stdout)
         }
-        CommandOutputFormat::ClaudeStreamJson => {
-            translate_claude_stream_line(parsed_line, &prompt.scope, sender)
+        ProcessOutput::Stderr(line) => {
+            collected_stderr.push_str(&line);
+            if early_runtime_error.is_none() {
+                *early_runtime_error = extract_runtime_error_from_text(&line);
+            }
+            let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
+            cfg.stderr_decoder
+                .as_ref()
+                .map(|decoder| {
+                    collect_provider_decoder_line(decoder, parsed_line, &prompt.scope, sender)
+                })
+                .unwrap_or_default()
         }
-        CommandOutputFormat::CodexStreamJson => {
-            translate_codex_event_line(parsed_line, &prompt.scope, sender)
-        }
+    }
+}
+
+fn collect_legacy_output_line(
+    output_format: CommandOutputFormat,
+    parsed_line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    match output_format {
+        CommandOutputFormat::NdjsonLines => OutputLineEvents {
+            emitted_text: translate_ndjson_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        CommandOutputFormat::ClaudeStreamJson => OutputLineEvents {
+            emitted_text: translate_claude_stream_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        CommandOutputFormat::CodexStreamJson => OutputLineEvents {
+            emitted_text: translate_codex_event_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
         CommandOutputFormat::Text
         | CommandOutputFormat::CopilotJson
-        | CommandOutputFormat::OpencodeJson => false,
+        | CommandOutputFormat::OpencodeJson => OutputLineEvents::default(),
+    }
+}
+
+fn collect_provider_decoder_line(
+    decoder: &ProviderDecoderSpec,
+    parsed_line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    if !decoder.events.is_empty() {
+        return translate_decoder_event_line(Some(decoder), parsed_line, scope, sender)
+            .unwrap_or_default();
+    }
+    match (decoder.format.as_str(), decoder.name.as_deref()) {
+        ("builtin", Some("claude_stream_json" | "qoder_stream_json")) => OutputLineEvents {
+            emitted_text: translate_claude_stream_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        ("builtin", Some("codex_stream_json")) => OutputLineEvents {
+            emitted_text: translate_codex_event_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        ("builtin", Some("ndjson_lines")) => OutputLineEvents {
+            emitted_text: translate_ndjson_line(parsed_line, scope, sender),
+            emitted_finish: false,
+        },
+        _ => OutputLineEvents::default(),
     }
 }
 
@@ -967,6 +1170,7 @@ fn runtime_error_from_json(value: &Value) -> Option<String> {
             "/error/code",
             "/properties/error/type",
             "/properties/error/code",
+            "/data/errorType",
             "/data/errorCode",
             "/data/code",
             "/code",
@@ -1121,28 +1325,225 @@ fn balanced_json_object_prefix(input: &str) -> Option<&str> {
     None
 }
 
-// ---------------- output_format translators ----------------
+// ---------------- provider and legacy output translators ----------------
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputLineEvents {
+    emitted_text: bool,
+    emitted_finish: bool,
+}
+
+fn emit_provider_runtime_events(
+    events: impl IntoIterator<Item = ProviderRuntimeEvent>,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    let mut emitted = OutputLineEvents::default();
+    for event in events {
+        let next = emit_provider_runtime_event(event, scope, sender);
+        emitted.emitted_text |= next.emitted_text;
+        emitted.emitted_finish |= next.emitted_finish;
+    }
+    emitted
+}
+
+fn emit_provider_runtime_event(
+    event: ProviderRuntimeEvent,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> OutputLineEvents {
+    match event {
+        ProviderRuntimeEvent::Text {
+            content,
+            is_partial,
+        } => {
+            let _ = sender.send(AdapterEvent::Text {
+                scope: Some(scope.clone()),
+                content,
+                is_partial,
+            });
+            OutputLineEvents {
+                emitted_text: true,
+                emitted_finish: false,
+            }
+        }
+        ProviderRuntimeEvent::ToolUse { tool_name, input } => {
+            let _ = sender.send(AdapterEvent::ToolUse {
+                scope: Some(scope.clone()),
+                tool_name,
+                input,
+            });
+            OutputLineEvents::default()
+        }
+        ProviderRuntimeEvent::Status { status } => {
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(scope.clone()),
+                status,
+            });
+            OutputLineEvents::default()
+        }
+        ProviderRuntimeEvent::Error { message } => {
+            let _ = sender.send(AdapterEvent::Error {
+                scope: Some(scope.clone()),
+                message,
+            });
+            OutputLineEvents::default()
+        }
+        ProviderRuntimeEvent::Finished { success, summary } => {
+            let _ = sender.send(AdapterEvent::Finished {
+                scope: Some(scope.clone()),
+                success,
+                summary,
+                usage: None,
+            });
+            OutputLineEvents {
+                emitted_text: false,
+                emitted_finish: true,
+            }
+        }
+        ProviderRuntimeEvent::Session { .. } => OutputLineEvents::default(),
+    }
+}
+
+fn translate_decoder_event_line(
+    decoder: Option<&ProviderDecoderSpec>,
+    line: &str,
+    scope: &ScopeRef,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+) -> Option<OutputLineEvents> {
+    let decoder = decoder?;
+    if decoder.events.is_empty() {
+        return None;
+    }
+    let events = decode_decoder_event_line(decoder, line)?;
+    Some(emit_provider_runtime_events(events, scope, sender))
+}
+
+fn decode_decoder_event_line(
+    decoder: &ProviderDecoderSpec,
+    line: &str,
+) -> Option<Vec<ProviderRuntimeEvent>> {
+    if decoder.events.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    let mut decoded = Vec::new();
+    for event in &decoder.events {
+        if !event
+            .when
+            .as_ref()
+            .map(|condition| json_condition_matches(&v, condition))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if let Some(event) = decode_decoder_emit(&event.emit, &v) {
+            decoded.push(event);
+        }
+    }
+    Some(decoded)
+}
+
+fn decode_decoder_emit(
+    emit: &ProviderDecoderEmitSpec,
+    root: &Value,
+) -> Option<ProviderRuntimeEvent> {
+    match emit.emit_type.as_str() {
+        "text" => {
+            let content = emit
+                .text
+                .as_deref()
+                .and_then(|template| decoder_template_value(root, template))?;
+            Some(ProviderRuntimeEvent::Text {
+                content,
+                is_partial: emit.partial.unwrap_or(true),
+            })
+        }
+        "tool_use" | "toolUse" | "tool" => {
+            let tool_name = emit
+                .tool_name
+                .as_deref()
+                .and_then(|template| decoder_template_value(root, template))
+                .unwrap_or_default();
+            let input = emit
+                .input
+                .as_deref()
+                .and_then(|template| decoder_template_json_value(root, template))
+                .unwrap_or(Value::Null);
+            Some(ProviderRuntimeEvent::ToolUse { tool_name, input })
+        }
+        "status" => emit
+            .status
+            .as_deref()
+            .or(emit.text.as_deref())
+            .and_then(|template| decoder_template_value(root, template))
+            .map(|status| ProviderRuntimeEvent::Status { status }),
+        "error" => {
+            let message = emit
+                .message
+                .as_deref()
+                .or(emit.text.as_deref())
+                .and_then(|template| decoder_template_value(root, template))
+                .unwrap_or_else(|| "provider error frame".into());
+            Some(ProviderRuntimeEvent::Error { message })
+        }
+        "finish" | "finished" => {
+            let summary = emit
+                .summary
+                .as_deref()
+                .or(emit.message.as_deref())
+                .and_then(|template| decoder_template_value(root, template))
+                .unwrap_or_default();
+            Some(ProviderRuntimeEvent::Finished {
+                success: emit.success.unwrap_or(true),
+                summary,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn decoder_template_value(root: &Value, template: &str) -> Option<String> {
+    if template.starts_with('$') || template.starts_with('.') {
+        json_path_lookup(root, template)
+    } else {
+        Some(template.to_string())
+    }
+}
+
+fn decoder_template_json_value(root: &Value, template: &str) -> Option<Value> {
+    if template.starts_with('$') || template.starts_with('.') {
+        json_path_lookup_value(root, template).cloned()
+    } else {
+        serde_json::from_str(template)
+            .ok()
+            .or_else(|| Some(Value::String(template.to_string())))
+    }
+}
 
 fn translate_ndjson_line(
     line: &str,
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> bool {
+    let events = decode_ndjson_line_events(line);
+    emit_provider_runtime_events(events, scope, sender).emitted_text
+}
+
+fn decode_ndjson_line_events(line: &str) -> Vec<ProviderRuntimeEvent> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     let kind = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let mut emitted_text = false;
+    let mut events = Vec::new();
     match kind {
         "text" => {
             if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                let _ = sender.send(AdapterEvent::Text {
-                    scope: Some(scope.clone()),
+                events.push(ProviderRuntimeEvent::Text {
                     content: t.to_string(),
                     is_partial: true,
                 });
-                emitted_text = true;
             }
         }
         "tool" => {
@@ -1152,16 +1553,14 @@ fn translate_ndjson_line(
                 .unwrap_or("")
                 .to_string();
             let input = v.get("input").cloned().unwrap_or(Value::Null);
-            let _ = sender.send(AdapterEvent::ToolUse {
-                scope: Some(scope.clone()),
+            events.push(ProviderRuntimeEvent::ToolUse {
                 tool_name: name,
                 input,
             });
         }
         "status" => {
             if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
-                let _ = sender.send(AdapterEvent::StatusChange {
-                    scope: Some(scope.clone()),
+                events.push(ProviderRuntimeEvent::Status {
                     status: s.to_string(),
                 });
             }
@@ -1172,16 +1571,13 @@ fn translate_ndjson_line(
                 .and_then(|x| x.as_str())
                 .unwrap_or("ndjson error frame")
                 .to_string();
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: msg,
-            });
+            events.push(ProviderRuntimeEvent::Error { message: msg });
         }
         // "done" and unknown kinds: caller handles the final flush + Finished
         // outside the per-line loop, so nothing to do here.
         _ => {}
     }
-    emitted_text
+    events
 }
 
 fn translate_claude_stream_line(
@@ -1189,12 +1585,17 @@ fn translate_claude_stream_line(
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> bool {
+    let events = decode_claude_stream_line_events(line);
+    emit_provider_runtime_events(events, scope, sender).emitted_text
+}
+
+fn decode_claude_stream_line_events(line: &str) -> Vec<ProviderRuntimeEvent> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     let outer = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let mut emitted_text = false;
+    let mut events = Vec::new();
     match outer {
         "assistant" => {
             let blocks = v
@@ -1207,12 +1608,10 @@ fn translate_claude_stream_line(
                 match kind {
                     "text" => {
                         if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
-                            let _ = sender.send(AdapterEvent::Text {
-                                scope: Some(scope.clone()),
+                            events.push(ProviderRuntimeEvent::Text {
                                 content: t.to_string(),
                                 is_partial: false,
                             });
-                            emitted_text = true;
                         }
                     }
                     "tool_use" => {
@@ -1222,8 +1621,7 @@ fn translate_claude_stream_line(
                             .unwrap_or("")
                             .to_string();
                         let input = b.get("input").cloned().unwrap_or(Value::Null);
-                        let _ = sender.send(AdapterEvent::ToolUse {
-                            scope: Some(scope.clone()),
+                        events.push(ProviderRuntimeEvent::ToolUse {
                             tool_name: name,
                             input,
                         });
@@ -1237,7 +1635,7 @@ fn translate_claude_stream_line(
         "user" | "system" | "result" => {}
         _ => {}
     }
-    emitted_text
+    events
 }
 
 fn translate_codex_event_line(
@@ -1245,11 +1643,16 @@ fn translate_codex_event_line(
     scope: &ScopeRef,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> bool {
+    let events = decode_codex_event_line_events(line);
+    emit_provider_runtime_events(events, scope, sender).emitted_text
+}
+
+fn decode_codex_event_line_events(line: &str) -> Vec<ProviderRuntimeEvent> {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
-    let mut emitted_text = false;
+    let mut events = Vec::new();
     if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
         match t {
             "task_complete" | "task.completed" => {
@@ -1264,22 +1667,18 @@ fn translate_codex_event_line(
                 .or_else(|| codex_content_text(v.get("last_agent_message")?))
                 .and_then(non_blank)
                 {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
+                    events.push(ProviderRuntimeEvent::Text {
                         content: text,
                         is_partial: false,
                     });
-                    emitted_text = true;
                 }
             }
             "agent_message" | "agent.message" => {
                 if let Some(text) = codex_message_event_text(&v).and_then(non_blank) {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
+                    events.push(ProviderRuntimeEvent::Text {
                         content: text,
                         is_partial: false,
                     });
-                    emitted_text = true;
                 }
             }
             "item_completed" | "item.completed" | "raw_response_item" | "raw.response_item" => {
@@ -1288,12 +1687,10 @@ fn translate_codex_event_line(
                     .and_then(codex_response_item_text)
                     .and_then(non_blank)
                 {
-                    let _ = sender.send(AdapterEvent::Text {
-                        scope: Some(scope.clone()),
+                    events.push(ProviderRuntimeEvent::Text {
                         content: text,
                         is_partial: false,
                     });
-                    emitted_text = true;
                 }
             }
             "tool_call" => {
@@ -1303,8 +1700,7 @@ fn translate_codex_event_line(
                     .unwrap_or("")
                     .to_string();
                 let input = v.get("arguments").cloned().unwrap_or(Value::Null);
-                let _ = sender.send(AdapterEvent::ToolUse {
-                    scope: Some(scope.clone()),
+                events.push(ProviderRuntimeEvent::ToolUse {
                     tool_name: name,
                     input,
                 });
@@ -1313,15 +1709,12 @@ fn translate_codex_event_line(
                 let message =
                     string_at_paths(&v, &["/message", "/error/message", "/error", "/details"])
                         .unwrap_or_else(|| "codex stream error".into());
-                let _ = sender.send(AdapterEvent::Error {
-                    scope: Some(scope.clone()),
-                    message,
-                });
+                events.push(ProviderRuntimeEvent::Error { message });
             }
             _ => {}
         }
     }
-    emitted_text
+    events
 }
 
 fn extract_codex_json_final_text(stdout: &str) -> Option<String> {
@@ -1580,6 +1973,221 @@ fn upsert_part_text(parts: &mut Vec<(String, String)>, id: String, text: String)
     parts.push((id, text));
 }
 
+fn extract_decoder_final_text(
+    decoder: Option<&ProviderDecoderSpec>,
+    stdout: &str,
+) -> Option<String> {
+    let decoder = decoder?;
+    let reducer = decoder
+        .reduce
+        .as_ref()
+        .and_then(|reduce| reduce.final_text.as_ref())?;
+    reduce_text_with_fallback(decoder.format.as_str(), stdout, reducer)
+}
+
+fn extract_configured_decoder_final_text(
+    cfg: &CommandConfig,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    extract_decoder_final_text(cfg.decoder.as_ref(), stdout)
+        .or_else(|| extract_decoder_final_text(cfg.stderr_decoder.as_ref(), stderr))
+}
+
+fn configured_decoder_final_text_event(
+    cfg: &CommandConfig,
+    stdout: &str,
+    stderr: &str,
+) -> Option<ProviderRuntimeEvent> {
+    extract_configured_decoder_final_text(cfg, stdout, stderr).map(|content| {
+        ProviderRuntimeEvent::Text {
+            content,
+            is_partial: false,
+        }
+    })
+}
+
+fn capture_decoder_session_id(
+    decoder: Option<&ProviderDecoderSpec>,
+    stdout: &str,
+) -> Option<String> {
+    let decoder = decoder?;
+    let reducer = decoder
+        .capture
+        .as_ref()
+        .and_then(|capture| capture.session.as_ref())?;
+    reduce_text_with_fallback(decoder.format.as_str(), stdout, reducer)
+}
+
+fn capture_configured_decoder_session_id(
+    cfg: &CommandConfig,
+    outcome: &SpawnOutcome,
+) -> Option<String> {
+    capture_decoder_session_id(cfg.decoder.as_ref(), &outcome.stdout)
+        .or_else(|| capture_decoder_session_id(cfg.stderr_decoder.as_ref(), &outcome.stderr))
+}
+
+fn capture_configured_decoder_session_event(
+    cfg: &CommandConfig,
+    outcome: &SpawnOutcome,
+) -> Option<ProviderRuntimeEvent> {
+    capture_configured_decoder_session_id(cfg, outcome)
+        .map(|session_id| ProviderRuntimeEvent::Session { session_id })
+}
+
+fn reduce_text_with_fallback(
+    format: &str,
+    stdout: &str,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Option<String> {
+    reduce_text(format, stdout, reducer).or_else(|| {
+        reducer
+            .fallback
+            .as_deref()
+            .and_then(|fallback| reduce_text_with_fallback(format, stdout, fallback))
+    })
+}
+
+fn reduce_text(
+    format: &str,
+    stdout: &str,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Option<String> {
+    if format.trim() == "json" {
+        let root = serde_json::from_str::<Value>(stdout).ok()?;
+        return reduce_json_values(std::iter::once(root), reducer);
+    }
+    reduce_jsonl_text(stdout, reducer)
+}
+
+fn reduce_jsonl_text(stdout: &str, reducer: &ProviderJsonlTextReducerSpec) -> Option<String> {
+    reduce_json_values(
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
+        reducer,
+    )
+}
+
+fn reduce_json_values(
+    values: impl IntoIterator<Item = Value>,
+    reducer: &ProviderJsonlTextReducerSpec,
+) -> Option<String> {
+    let mode = reducer.mode.trim();
+    let path = reducer.path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let mut last: Option<String> = None;
+    let mut concat = String::new();
+    for v in values {
+        if !reducer
+            .when
+            .as_ref()
+            .map(|condition| json_condition_matches(&v, condition))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        for text in json_path_lookup_strings(&v, path) {
+            match mode {
+                "firstNonEmpty" | "first_non_empty" => {
+                    if let Some(text) = non_blank(text) {
+                        return Some(text);
+                    }
+                }
+                "concat" | "joinText" | "join_text" => concat.push_str(&text),
+                _ => {
+                    if let Some(text) = non_blank(text) {
+                        last = Some(text);
+                    }
+                }
+            }
+        }
+    }
+    match mode {
+        "concat" | "joinText" | "join_text" => non_blank(concat),
+        _ => last,
+    }
+}
+
+fn json_condition_matches(root: &Value, condition: &ProviderJsonConditionSpec) -> bool {
+    if !condition
+        .all
+        .iter()
+        .all(|item| json_condition_matches(root, item))
+    {
+        return false;
+    }
+    if !condition.any.is_empty()
+        && !condition
+            .any
+            .iter()
+            .any(|item| json_condition_matches(root, item))
+    {
+        return false;
+    }
+    if condition
+        .not
+        .as_deref()
+        .is_some_and(|item| json_condition_matches(root, item))
+    {
+        return false;
+    }
+    let actual = condition
+        .path
+        .as_deref()
+        .and_then(|path| json_path_lookup_value(root, path));
+    if let Some(expected) = condition.exists {
+        if actual.is_some() != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = condition.absent_or_null {
+        let absent_or_null = actual.is_none_or(Value::is_null);
+        if absent_or_null != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = condition.not_empty {
+        let not_empty = actual.is_some_and(value_not_empty);
+        if not_empty != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = condition.equals.as_ref() {
+        if actual != Some(expected) {
+            return false;
+        }
+    }
+    if let Some(unexpected) = condition.not_equals.as_ref() {
+        if actual == Some(unexpected) {
+            return false;
+        }
+    }
+    if let Some(values) = condition.in_values.as_ref() {
+        if !actual.is_some_and(|actual| values.iter().any(|value| value == actual)) {
+            return false;
+        }
+    }
+    if let Some(values) = condition.not_in.as_ref() {
+        if actual.is_some_and(|actual| values.iter().any(|value| value == actual)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn value_not_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        _ => true,
+    }
+}
+
 fn copilot_message_phase_is_hidden(v: &Value) -> bool {
     let Some(phase) = v.pointer("/data/phase").and_then(Value::as_str) else {
         return false;
@@ -1629,14 +2237,29 @@ struct SessionRecord {
     command_signature: String,
 }
 
-fn session_path(cfg: &CommandConfig, scope: &ScopeRef) -> PathBuf {
+fn session_path(cfg: &CommandConfig, scope: &ScopeRef) -> Option<PathBuf> {
+    match session_scope(cfg) {
+        "turn" => return None,
+        "actor" => return Some(cfg.sessions_dir.join(&cfg.actor_id).join("actor.json")),
+        _ => {}
+    }
     let kind = match scope.kind {
         proto::types::ScopeKind::Thread => "thread",
         proto::types::ScopeKind::Channel => "channel",
     };
-    cfg.sessions_dir
-        .join(&cfg.actor_id)
-        .join(format!("{kind}-{}.json", scope.id))
+    Some(
+        cfg.sessions_dir
+            .join(&cfg.actor_id)
+            .join(format!("{kind}-{}.json", scope.id)),
+    )
+}
+
+fn session_scope(cfg: &CommandConfig) -> &str {
+    cfg.session_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or("actor_scope")
 }
 
 fn scope_label(scope: &ScopeRef) -> String {
@@ -1647,18 +2270,18 @@ fn scope_label(scope: &ScopeRef) -> String {
     format!("{kind}:{}", scope.id)
 }
 
-fn session_lock_path(cfg: &CommandConfig, scope: &ScopeRef) -> PathBuf {
-    let path = session_path(cfg, scope);
+fn session_lock_path(cfg: &CommandConfig, scope: &ScopeRef) -> Option<PathBuf> {
+    let path = session_path(cfg, scope)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("session.json");
-    path.with_file_name(format!("{file_name}.lock"))
+    Some(path.with_file_name(format!("{file_name}.lock")))
 }
 
 #[cfg(unix)]
 struct SessionLockGuard {
-    file: std::fs::File,
+    file: Option<std::fs::File>,
 }
 
 #[cfg(not(unix))]
@@ -1666,7 +2289,10 @@ struct SessionLockGuard;
 
 #[cfg(unix)]
 fn acquire_session_lock(cfg: &CommandConfig, scope: &ScopeRef) -> Result<SessionLockGuard, String> {
-    acquire_lock_file(&session_lock_path(cfg, scope))
+    let Some(path) = session_lock_path(cfg, scope) else {
+        return Ok(SessionLockGuard { file: None });
+    };
+    acquire_lock_file(&path)
 }
 
 #[cfg(unix)]
@@ -1701,7 +2327,7 @@ fn acquire_lock_file(path: &Path) -> Result<SessionLockGuard, String> {
         ));
     }
 
-    Ok(SessionLockGuard { file })
+    Ok(SessionLockGuard { file: Some(file) })
 }
 
 #[cfg(not(unix))]
@@ -1715,12 +2341,14 @@ fn acquire_session_lock(
 #[cfg(unix)]
 impl Drop for SessionLockGuard {
     fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        if let Some(file) = self.file.as_ref() {
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
 fn load_session(cfg: &CommandConfig, scope: &ScopeRef) -> Option<SessionRecord> {
-    let path = session_path(cfg, scope);
+    let path = session_path(cfg, scope)?;
     let text = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -1731,7 +2359,9 @@ fn save_session(
     session_id: &str,
     command_signature: &str,
 ) -> std::io::Result<()> {
-    let path = session_path(cfg, scope);
+    let Some(path) = session_path(cfg, scope) else {
+        return Ok(());
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1752,18 +2382,37 @@ fn save_session(
 }
 
 fn command_signature_for_prompt(cfg: &CommandConfig, request: &AdapterPrompt) -> String {
-    let Some(model) = request.model.as_ref().filter(|m| !m.trim().is_empty()) else {
+    let model = request
+        .model
+        .as_ref()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty());
+    let reasoning_effort = request
+        .template_vars
+        .get("reasoningEffort")
+        .or_else(|| request.template_vars.get("reasoning_effort"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if model.is_none() && reasoning_effort.is_none() {
         return cfg.command_signature.clone();
     };
     let mut hasher = Sha256::new();
     hasher.update(cfg.command_signature.as_bytes());
-    hasher.update(b"\x00model\x00");
-    hasher.update(model.trim().as_bytes());
+    if let Some(model) = model {
+        hasher.update(b"\x00model\x00");
+        hasher.update(model.as_bytes());
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        hasher.update(b"\x00reasoning_effort\x00");
+        hasher.update(reasoning_effort.as_bytes());
+    }
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn delete_session(cfg: &CommandConfig, scope: &ScopeRef) -> std::io::Result<()> {
-    let path = session_path(cfg, scope);
+    let Some(path) = session_path(cfg, scope) else {
+        return Ok(());
+    };
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -1795,6 +2444,12 @@ fn capture_session_id(
     prompt: &AdapterPrompt,
 ) -> Result<Option<String>, String> {
     if let Some(path) = rule.strip_prefix("stdout_json:") {
+        return Ok(extract_json_path(&outcome.stdout, path));
+    }
+    if let Some(path) = rule
+        .strip_prefix("stdout_jsonl:last(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
         return Ok(extract_json_path(&outcome.stdout, path));
     }
     if let Some(paths) = rule.strip_prefix("stdout_json_any:") {
@@ -1859,32 +2514,69 @@ fn extract_json_path_any(stdout: &str, paths: &[&str]) -> Option<String> {
     found
 }
 
-/// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`. No filters,
-/// pipes, or functions.
+/// Tiny jq-style accessor: only `.field.sub`, `.items[3].id`,
+/// `.items[*].id`. No filters, pipes, or functions.
 fn json_path_lookup(root: &Value, path: &str) -> Option<String> {
-    let path = path.strip_prefix('.').unwrap_or(path);
-    let mut cur = root;
-    for raw in path.split('.') {
-        if raw.is_empty() {
-            continue;
-        }
-        // Parse `name[3]` → key + indices.
-        let (key, indices) = parse_segment(raw);
-        if !key.is_empty() {
-            cur = cur.get(key)?;
-        }
-        for idx in indices {
-            cur = cur.get(idx)?;
-        }
-    }
-    match cur {
+    json_path_lookup_strings(root, path).into_iter().next()
+}
+
+fn json_path_lookup_strings(root: &Value, path: &str) -> Vec<String> {
+    json_path_lookup_values(root, path)
+        .into_iter()
+        .filter_map(json_value_to_string)
+        .collect()
+}
+
+fn json_value_to_string(value: &Value) -> Option<String> {
+    match value {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
 }
 
-fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
+fn json_path_lookup_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    json_path_lookup_values(root, path).into_iter().next()
+}
+
+fn json_path_lookup_values<'a>(root: &'a Value, path: &str) -> Vec<&'a Value> {
+    let path = path
+        .strip_prefix("$.")
+        .or_else(|| path.strip_prefix('.'))
+        .unwrap_or(path);
+    let mut current = vec![root];
+    for raw in path.split('.') {
+        if raw.is_empty() {
+            continue;
+        }
+        // Parse `name[3]` → key + indices.
+        let (key, indices) = parse_segment(raw);
+        let mut next = Vec::new();
+        for value in current {
+            let Some(value) = (if key.is_empty() {
+                Some(value)
+            } else {
+                value.get(key)
+            }) else {
+                continue;
+            };
+            push_indexed_values(value, &indices, &mut next);
+        }
+        current = next;
+        if current.is_empty() {
+            break;
+        }
+    }
+    current
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonPathIndex {
+    Index(usize),
+    Wildcard,
+}
+
+fn parse_segment(seg: &str) -> (&str, Vec<JsonPathIndex>) {
     let mut indices = Vec::new();
     let key_end = seg.find('[').unwrap_or(seg.len());
     let key = &seg[..key_end];
@@ -1894,12 +2586,36 @@ fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
             Some(c) if c > open => c,
             _ => break,
         };
-        if let Ok(n) = rest[open + 1..close].parse::<usize>() {
-            indices.push(n);
+        let index = &rest[open + 1..close];
+        if index == "*" {
+            indices.push(JsonPathIndex::Wildcard);
+        } else if let Ok(n) = index.parse::<usize>() {
+            indices.push(JsonPathIndex::Index(n));
         }
         rest = &rest[close + 1..];
     }
     (key, indices)
+}
+
+fn push_indexed_values<'a>(value: &'a Value, indices: &[JsonPathIndex], out: &mut Vec<&'a Value>) {
+    let Some((first, rest)) = indices.split_first() else {
+        out.push(value);
+        return;
+    };
+    match first {
+        JsonPathIndex::Index(idx) => {
+            if let Some(value) = value.get(*idx) {
+                push_indexed_values(value, rest, out);
+            }
+        }
+        JsonPathIndex::Wildcard => {
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    push_indexed_values(item, rest, out);
+                }
+            }
+        }
+    }
 }
 
 // ---------------- argv & template expansion ----------------
@@ -1907,50 +2623,25 @@ fn parse_segment(seg: &str) -> (&str, Vec<usize>) {
 fn expand_first_run_argv(
     cfg: &CommandConfig,
     request: &AdapterPrompt,
-    prompt: &str,
-) -> Vec<String> {
-    let mut argv: Vec<String> = cfg
-        .args
-        .iter()
-        .map(|a| expand_template(a, cfg, request, None, prompt))
-        .collect();
-    if matches!(cfg.prompt_via, PromptVia::Args) {
-        let already = cfg.args.iter().any(|a| a.contains("{prompt}"));
-        if !already {
-            if let Some(pos) = prompt_flag_without_value(&argv) {
-                let mut model_args = Vec::new();
-                append_model_args(&mut model_args, cfg, request, None, prompt);
-                let model_len = model_args.len();
-                argv.splice(pos..pos, model_args);
-                argv.insert(pos + model_len + 1, prompt.to_string());
-                return argv;
-            }
-        }
-    }
-    append_model_args(&mut argv, cfg, request, None, prompt);
-    if matches!(cfg.prompt_via, PromptVia::Args) {
-        // Only append when the template didn't already place {prompt} itself.
-        let already = argv.iter().any(|a| a == prompt);
-        if !already {
-            argv.push(prompt.to_string());
-        }
-    }
-    argv
-}
-
-fn expand_argv(
-    template: &[String],
-    cfg: &CommandConfig,
-    request: &AdapterPrompt,
     session_id: Option<&str>,
     prompt: &str,
 ) -> Vec<String> {
-    let mut argv: Vec<String> = template
+    if !cfg.arg_specs.is_empty() {
+        return expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
+    }
+    let mut argv: Vec<String> = cfg
+        .args
         .iter()
         .map(|a| expand_template(a, cfg, request, session_id, prompt))
         .collect();
+    if let Some(pos) = prompt_ref_insert_pos(&cfg.args, &argv) {
+        let mut model_args = Vec::new();
+        append_model_args(&mut model_args, cfg, request, session_id, prompt);
+        argv.splice(pos..pos, model_args);
+        return argv;
+    }
     if matches!(cfg.prompt_via, PromptVia::Args) {
-        let already = template.iter().any(|a| a.contains("{prompt}"));
+        let already = cfg.args.iter().any(|a| contains_prompt_ref(a));
         if !already {
             if let Some(pos) = prompt_flag_without_value(&argv) {
                 let mut model_args = Vec::new();
@@ -1964,7 +2655,101 @@ fn expand_argv(
     }
     append_model_args(&mut argv, cfg, request, session_id, prompt);
     if matches!(cfg.prompt_via, PromptVia::Args) {
-        let already = template.iter().any(|a| a.contains("{prompt}"));
+        // Only append when the template didn't already place {prompt} itself.
+        let already =
+            cfg.args.iter().any(|a| contains_prompt_ref(a)) || argv.iter().any(|a| a == prompt);
+        if !already {
+            argv.push(prompt.to_string());
+        }
+    }
+    argv
+}
+
+fn expand_arg_specs(
+    specs: &[ProviderArgSpec],
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    append_arg_specs(&mut out, specs, cfg, request, session_id, prompt);
+    out
+}
+
+fn append_arg_specs(
+    out: &mut Vec<String>,
+    specs: &[ProviderArgSpec],
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) {
+    for spec in specs {
+        match spec {
+            ProviderArgSpec::Literal(value) => {
+                out.push(expand_template(value, cfg, request, session_id, prompt));
+            }
+            ProviderArgSpec::Conditional(spec) => {
+                if arg_condition_matches(&spec.when, request) {
+                    append_arg_specs(out, &spec.args, cfg, request, session_id, prompt);
+                }
+            }
+        }
+    }
+}
+
+fn arg_condition_matches(when: &str, request: &AdapterPrompt) -> bool {
+    let when = when.trim();
+    if when == "model" {
+        return active_model(request).is_some();
+    }
+    if matches!(when, "reasoningEffort" | "reasoning_effort") {
+        return request
+            .template_vars
+            .get("reasoningEffort")
+            .or_else(|| request.template_vars.get("reasoning_effort"))
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    request
+        .template_vars
+        .get(when)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn expand_argv(
+    template: &[String],
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = template
+        .iter()
+        .map(|a| expand_template(a, cfg, request, session_id, prompt))
+        .collect();
+    if let Some(pos) = prompt_ref_insert_pos(template, &argv) {
+        let mut model_args = Vec::new();
+        append_model_args(&mut model_args, cfg, request, session_id, prompt);
+        argv.splice(pos..pos, model_args);
+        return argv;
+    }
+    if matches!(cfg.prompt_via, PromptVia::Args) {
+        let already = template.iter().any(|a| contains_prompt_ref(a));
+        if !already {
+            if let Some(pos) = prompt_flag_without_value(&argv) {
+                let mut model_args = Vec::new();
+                append_model_args(&mut model_args, cfg, request, session_id, prompt);
+                let model_len = model_args.len();
+                argv.splice(pos..pos, model_args);
+                argv.insert(pos + model_len + 1, prompt.to_string());
+                return argv;
+            }
+        }
+    }
+    append_model_args(&mut argv, cfg, request, session_id, prompt);
+    if matches!(cfg.prompt_via, PromptVia::Args) {
+        let already = template.iter().any(|a| contains_prompt_ref(a));
         if !already {
             argv.push(prompt.to_string());
         }
@@ -1976,6 +2761,24 @@ fn prompt_flag_without_value(argv: &[String]) -> Option<usize> {
     argv.iter()
         .rposition(|arg| matches!(arg.as_str(), "-p" | "--prompt"))
         .filter(|pos| *pos + 1 == argv.len())
+}
+
+fn contains_prompt_ref(input: &str) -> bool {
+    input.contains("{prompt") || input.contains("{loom_envelope}")
+}
+
+fn prompt_ref_insert_pos(template: &[String], argv: &[String]) -> Option<usize> {
+    let pos = template.iter().position(|arg| contains_prompt_ref(arg))?;
+    if pos > 0
+        && matches!(
+            argv[pos - 1].as_str(),
+            "-p" | "--prompt" | "--append-system-prompt" | "--system-prompt"
+        )
+    {
+        Some(pos - 1)
+    } else {
+        Some(pos)
+    }
 }
 
 fn expand_template(
@@ -1994,9 +2797,30 @@ fn expand_template(
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{model}", active_model(request).as_deref().unwrap_or(""))
-        .replace("{prompt}", prompt);
+        .replace("{prompt}", prompt)
+        .replace(
+            "{prompt.full}",
+            request
+                .outputs
+                .get("full")
+                .map(String::as_str)
+                .unwrap_or(prompt),
+        )
+        .replace(
+            "{loom_envelope}",
+            request
+                .outputs
+                .get("full")
+                .map(String::as_str)
+                .unwrap_or(prompt),
+        );
     if let Some(sid) = session_id {
-        out = out.replace("{session_id}", sid);
+        out = out
+            .replace("{session_id}", sid)
+            .replace("{session.id}", sid);
+    }
+    for (name, value) in &request.outputs {
+        out = out.replace(&format!("{{prompt.{name}}}"), value);
     }
     for (key, value) in &request.template_vars {
         out = out.replace(&format!("{{{key}}}"), value);
@@ -2030,11 +2854,20 @@ fn append_model_args(
     );
 }
 
-fn expanded_env(cfg: &CommandConfig, request: &AdapterPrompt) -> BTreeMap<String, String> {
+fn expanded_env(
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = cfg
         .env
         .iter()
-        .map(|(k, v)| (k.clone(), expand_template(v, cfg, request, None, "")))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                expand_template(v, cfg, request, session_id, &request.content),
+            )
+        })
         .collect();
     for (k, v) in &request.env {
         env.entry(k.clone()).or_insert_with(|| v.clone());
@@ -2053,6 +2886,8 @@ fn _arc_keepalive(_: Arc<CommandAdapter>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::methods::ProviderConditionalArgSpec;
+    use proto::methods::{ProviderDecoderEventSpec, ProviderJsonlReduceSpec};
     use proto::types::ScopeKind;
 
     fn cfg() -> CommandConfig {
@@ -2060,12 +2895,20 @@ mod tests {
             actor_id: "actor_demo".into(),
             command: "echo".into(),
             args: vec!["-n".into()],
+            arg_specs: Vec::new(),
             env: BTreeMap::new(),
             model_args: Vec::new(),
+            session_id_source: None,
+            session_scope: None,
             first_run_capture: None,
             resume_args: None,
+            resume_arg_specs: Vec::new(),
             output_format: CommandOutputFormat::Text,
+            decoder: None,
+            stderr_decoder: None,
             prompt_via: PromptVia::Args,
+            prompt: None,
+            stdin_template: None,
             sessions_dir: PathBuf::from("/tmp/loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
@@ -2091,6 +2934,8 @@ mod tests {
         AdapterPrompt {
             scope: scope(),
             content: content.into(),
+            parts: Vec::new(),
+            outputs: BTreeMap::from([("full".into(), content.into())]),
             model: None,
             cwd: PathBuf::from("/tmp"),
             env: BTreeMap::new(),
@@ -2114,6 +2959,19 @@ mod tests {
 
         assert_ne!(model_a, cfg.command_signature);
         assert_ne!(model_a, model_b);
+
+        request.model = None;
+        request
+            .template_vars
+            .insert("reasoningEffort".into(), "high".into());
+        let high = command_signature_for_prompt(&cfg, &request);
+        request
+            .template_vars
+            .insert("reasoningEffort".into(), "low".into());
+        let low = command_signature_for_prompt(&cfg, &request);
+
+        assert_ne!(high, cfg.command_signature);
+        assert_ne!(high, low);
     }
 
     #[test]
@@ -2123,7 +2981,7 @@ mod tests {
         let mut request = prompt("hello");
         request.model = Some("model_a".into());
 
-        let argv = expand_first_run_argv(&cfg, &request, "hello");
+        let argv = expand_first_run_argv(&cfg, &request, None, "hello");
 
         assert_eq!(
             argv,
@@ -2144,7 +3002,7 @@ mod tests {
         let mut request = prompt("hello");
         request.model = Some("model_a".into());
 
-        let argv = expand_first_run_argv(&cfg, &request, "hello");
+        let argv = expand_first_run_argv(&cfg, &request, None, "hello");
 
         assert_eq!(
             argv,
@@ -2163,9 +3021,78 @@ mod tests {
         let mut cfg = cfg();
         cfg.model_args = vec!["--model".into(), "{model}".into()];
 
-        let argv = expand_first_run_argv(&cfg, &prompt("hello"), "hello");
+        let argv = expand_first_run_argv(&cfg, &prompt("hello"), None, "hello");
 
         assert_eq!(argv, vec!["-n".to_string(), "hello".to_string()]);
+    }
+
+    #[test]
+    fn provider_arg_specs_expand_conditionals_in_manifest_order() {
+        let mut cfg = cfg();
+        cfg.args = vec!["legacy".into()];
+        cfg.model_args = vec!["--legacy-model".into(), "{model}".into()];
+        cfg.arg_specs = vec![
+            ProviderArgSpec::Literal("run".into()),
+            ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
+                when: "model".into(),
+                args: vec![
+                    ProviderArgSpec::Literal("--model".into()),
+                    ProviderArgSpec::Literal("{model}".into()),
+                ],
+            }),
+            ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
+                when: "reasoningEffort".into(),
+                args: vec![
+                    ProviderArgSpec::Literal("--effort".into()),
+                    ProviderArgSpec::Literal("{reasoningEffort}".into()),
+                ],
+            }),
+            ProviderArgSpec::Literal("{prompt.full}".into()),
+        ];
+        let mut request = prompt("fallback prompt");
+        request.model = Some("model_a".into());
+        request
+            .template_vars
+            .insert("reasoningEffort".into(), "high".into());
+        request
+            .outputs
+            .insert("full".into(), "rendered full prompt".into());
+
+        let argv = expand_first_run_argv(&cfg, &request, None, "fallback prompt");
+
+        assert_eq!(
+            argv,
+            vec![
+                "run".to_string(),
+                "--model".to_string(),
+                "model_a".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "rendered full prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_arg_specs_omit_false_conditionals_without_implicit_prompt_append() {
+        let mut cfg = cfg();
+        cfg.arg_specs = vec![
+            ProviderArgSpec::Literal("run".into()),
+            ProviderArgSpec::Conditional(ProviderConditionalArgSpec {
+                when: "model".into(),
+                args: vec![
+                    ProviderArgSpec::Literal("--model".into()),
+                    ProviderArgSpec::Literal("{model}".into()),
+                ],
+            }),
+            ProviderArgSpec::Literal("{prompt.full}".into()),
+        ];
+        let mut request = prompt("fallback prompt");
+        request.outputs.insert("full".into(), "full".into());
+
+        let argv = expand_first_run_argv(&cfg, &request, None, "fallback prompt");
+
+        assert_eq!(argv, vec!["run".to_string(), "full".to_string()]);
     }
 
     #[test]
@@ -2182,9 +3109,326 @@ mod tests {
     }
 
     #[test]
+    fn json_path_wildcard_returns_values_in_order() {
+        let v: Value =
+            serde_json::from_str(r#"{"items":[{"id":"first"},{"id":"second"}]}"#).unwrap();
+        assert_eq!(
+            json_path_lookup_strings(&v, "$.items[*].id"),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(json_path_lookup(&v, "$.items[*].id"), Some("first".into()));
+    }
+
+    #[test]
     fn json_path_missing_returns_none() {
         let v: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
         assert!(json_path_lookup(&v, ".b").is_none());
+    }
+
+    #[test]
+    fn provider_jsonl_events_emit_text_status_tool_error_and_finish() {
+        let decoder = ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: vec![
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("text".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "text".into(),
+                        text: Some("$.text".into()),
+                        partial: Some(false),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("status".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "status".into(),
+                        status: Some("$.status".into()),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("tool".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "tool_use".into(),
+                        tool_name: Some("$.name".into()),
+                        input: Some("$.input".into()),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("error".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "error".into(),
+                        message: Some("$.message".into()),
+                        ..Default::default()
+                    },
+                },
+                ProviderDecoderEventSpec {
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        equals: Some(Value::String("done".into())),
+                        ..Default::default()
+                    }),
+                    emit: ProviderDecoderEmitSpec {
+                        emit_type: "finish".into(),
+                        success: Some(true),
+                        summary: Some("$.summary".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+            reduce: None,
+            capture: None,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let scope = scope();
+
+        let text = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"text","text":"hello"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("text events");
+        let status = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"status","status":"working"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("status events");
+        let tool = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"tool","name":"shell","input":{"cmd":"ls"}}"#,
+            &scope,
+            &tx,
+        )
+        .expect("tool events");
+        let error = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"error","message":"bad"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("error events");
+        let finish = translate_decoder_event_line(
+            Some(&decoder),
+            r#"{"type":"done","summary":"ok"}"#,
+            &scope,
+            &tx,
+        )
+        .expect("finish events");
+
+        assert!(text.emitted_text);
+        assert!(!status.emitted_text && !tool.emitted_text && !error.emitted_text);
+        assert!(finish.emitted_finish);
+
+        let mut rx = rx;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            &events[0],
+            AdapterEvent::Text {
+                content,
+                is_partial: false,
+                ..
+            } if content == "hello"
+        ));
+        assert!(matches!(
+            &events[1],
+            AdapterEvent::StatusChange { status, .. } if status == "working"
+        ));
+        assert!(matches!(
+            &events[2],
+            AdapterEvent::ToolUse {
+                tool_name,
+                input,
+                ..
+            } if tool_name == "shell" && input.pointer("/cmd").and_then(Value::as_str) == Some("ls")
+        ));
+        assert!(matches!(
+            &events[3],
+            AdapterEvent::Error { message, .. } if message == "bad"
+        ));
+        assert!(matches!(
+            &events[4],
+            AdapterEvent::Finished {
+                success: true,
+                summary,
+                ..
+            } if summary == "ok"
+        ));
+    }
+
+    #[test]
+    fn provider_decoder_line_decodes_runtime_event_before_adapter_mapping() {
+        let decoder = ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: vec![ProviderDecoderEventSpec {
+                when: Some(ProviderJsonConditionSpec {
+                    path: Some("$.type".into()),
+                    equals: Some(Value::String("text".into())),
+                    ..Default::default()
+                }),
+                emit: ProviderDecoderEmitSpec {
+                    emit_type: "text".into(),
+                    text: Some("$.text".into()),
+                    partial: Some(false),
+                    ..Default::default()
+                },
+            }],
+            reduce: None,
+            capture: None,
+        };
+
+        let events =
+            decode_decoder_event_line(&decoder, r#"{"type":"text","text":"runtime event"}"#)
+                .expect("runtime events");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::Text {
+                content,
+                is_partial: false,
+            } if content == "runtime event"
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitted = emit_provider_runtime_events(events, &scope(), &tx);
+        assert!(emitted.emitted_text);
+        assert!(matches!(
+            rx.try_recv().expect("adapter event"),
+            AdapterEvent::Text { content, is_partial: false, .. } if content == "runtime event"
+        ));
+    }
+
+    #[test]
+    fn builtin_claude_decoder_produces_runtime_events_before_adapter_mapping() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"},{"type":"tool_use","name":"shell","input":{"cmd":"pwd"}}]}}"#;
+
+        let events = decode_claude_stream_line_events(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::Text {
+                content,
+                is_partial: false,
+            } if content == "hello"
+        ));
+        assert!(matches!(
+            &events[1],
+            ProviderRuntimeEvent::ToolUse { tool_name, input }
+                if tool_name == "shell" && input.pointer("/cmd").and_then(Value::as_str) == Some("pwd")
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitted = emit_provider_runtime_events(events, &scope(), &tx);
+        assert!(emitted.emitted_text);
+        assert!(matches!(
+            rx.try_recv().expect("text event"),
+            AdapterEvent::Text { content, is_partial: false, .. } if content == "hello"
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("tool event"),
+            AdapterEvent::ToolUse { tool_name, input, .. }
+                if tool_name == "shell" && input.pointer("/cmd").and_then(Value::as_str) == Some("pwd")
+        ));
+    }
+
+    #[test]
+    fn provider_builtin_decoder_streams_without_legacy_output_format() {
+        let mut cfg = cfg();
+        cfg.output_format = CommandOutputFormat::Text;
+        cfg.decoder = Some(ProviderDecoderSpec {
+            format: "builtin".into(),
+            name: Some("claude_stream_json".into()),
+            events: Vec::new(),
+            reduce: None,
+            capture: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut collected = String::new();
+
+        let events = collect_stdout_line(
+            &cfg,
+            &prompt("ignored"),
+            &tx,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"from decoder"}]}}"#,
+            &mut collected,
+        );
+
+        assert!(events.emitted_text);
+        match rx.try_recv().expect("text event") {
+            AdapterEvent::Text {
+                content,
+                is_partial,
+                ..
+            } => {
+                assert_eq!(content, "from decoder");
+                assert!(!is_partial);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_decoder_without_events_does_not_fall_back_to_legacy_ndjson() {
+        let mut cfg = cfg();
+        cfg.output_format = CommandOutputFormat::NdjsonLines;
+        cfg.decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: Some(ProviderJsonlReduceSpec {
+                final_text: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.text".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+            capture: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut collected = String::new();
+
+        let events = collect_stdout_line(
+            &cfg,
+            &prompt("ignored"),
+            &tx,
+            r#"{"type":"text","text":"legacy ndjson would stream this"}"#,
+            &mut collected,
+        );
+
+        assert!(!events.emitted_text);
+        assert!(rx.try_recv().is_err());
+        assert!(collected.contains("legacy ndjson would stream this"));
+        assert_eq!(
+            extract_configured_decoder_final_text(&cfg, &collected, ""),
+            Some("legacy ndjson would stream this".into())
+        );
     }
 
     #[test]
@@ -2198,12 +3442,35 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_id_any_path_picks_last_matching_line() {
-        let stdout = "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"copilot_sid\"}}\n\
-                      {\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"opencode_sid\"}}\n";
+    fn decoder_capture_session_picks_last_matching_jsonl_value() {
+        let decoder = ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    when: Some(ProviderJsonConditionSpec {
+                        path: Some("$.type".into()),
+                        in_values: Some(vec![
+                            Value::String("system".into()),
+                            Value::String("result".into()),
+                        ]),
+                        ..Default::default()
+                    }),
+                    fallback: None,
+                }),
+            }),
+        };
+        let stdout = "{\"type\":\"debug\",\"session_id\":\"ignored\"}\n\
+                      {\"type\":\"system\",\"session_id\":\"first\"}\n\
+                      {\"type\":\"result\",\"session_id\":\"second\"}\n";
+
         assert_eq!(
-            extract_json_path_any(stdout, &[".data.sessionId", ".properties.sessionID"]),
-            Some("opencode_sid".into())
+            capture_decoder_session_id(Some(&decoder), stdout),
+            Some("second".into())
         );
     }
 
@@ -2257,220 +3524,110 @@ mod tests {
     }
 
     #[test]
-    fn opencode_json_final_text_picks_message_updated_parts() {
-        let stdout = r#"{"type":"message.updated","properties":{"info":{"sessionID":"s1","role":"user","parts":[{"type":"text","text":"Question"}]}}}
-{"type":"message.updated","properties":{"info":{"sessionID":"s1","role":"assistant","parts":[{"type":"text","text":"Final"},{"type":"text","text":" answer\n"}]}}}
+    fn provider_jsonl_reducer_matches_copilot_final_text_rules() {
+        let decoder = crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "copilot")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("copilot decoder");
+        let stdout = r#"{"agentId":"sub_1","type":"assistant.message","data":{"messageId":"m1","content":"Sub-agent detail"}}
+{"type":"assistant.message","data":{"messageId":"m2","phase":"thinking","content":"Private reasoning"}}
+{"type":"assistant.message","data":{"messageId":"m3","content":"Root answer"}}
 "#;
 
         assert_eq!(
-            extract_opencode_json_final_text(stdout),
-            Some("Final answer".into())
+            extract_decoder_final_text(Some(&decoder), stdout),
+            Some("Root answer".into())
         );
     }
 
     #[test]
-    fn opencode_json_final_text_falls_back_to_latest_part_updates() {
-        let stdout = r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","type":"text","text":"draft"}}}
-{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p1","type":"text","text":"Final"}}}
-{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p2","type":"text","text":" answer\n"}}}
+    fn provider_jsonl_reducer_uses_fallback_delta_text() {
+        let decoder = crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "copilot")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("copilot decoder");
+        let stdout = r#"{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"hello"}}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":" world"}}
 "#;
 
         assert_eq!(
-            extract_opencode_json_final_text(stdout),
-            Some("Final answer".into())
+            extract_decoder_final_text(Some(&decoder), stdout),
+            Some("hello world".into())
         );
     }
 
     #[test]
-    fn runtime_error_from_response_body_includes_actionable_details() {
-        let stdout = serde_json::json!({
-            "statusCode": 429,
-            "responseHeaders": { "retry-after": "59140" },
-            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
-        })
-        .to_string();
+    fn provider_jsonl_reducer_concats_wildcard_values() {
+        let reducer = ProviderJsonlTextReducerSpec {
+            mode: "concat".into(),
+            path: "$.items[*].text".into(),
+            when: None,
+            fallback: None,
+        };
+        let stdout = r#"{"items":[{"text":"hello "},{"text":"world"}]}"#;
 
-        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
-
-        assert!(summary.contains("429"));
-        assert!(summary.contains("FreeUsageLimitError"));
-        assert!(summary.contains("Rate limit exceeded"));
-        assert!(summary.contains("retry-after: 59140s"));
-    }
-
-    #[test]
-    fn runtime_error_from_embedded_log_error_includes_actionable_details() {
-        let error = serde_json::json!({
-            "error": {
-                "name": "AI_APICallError",
-                "statusCode": 429,
-                "responseHeaders": { "retry-after": "57108" },
-                "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
-            }
-        });
-        let stderr = format!("ERROR service=llm error={error} stream error\n");
-
-        let summary = extract_runtime_error_from_text(&stderr).expect("runtime error summary");
-
-        assert!(summary.contains("429"));
-        assert!(summary.contains("FreeUsageLimitError"));
-        assert!(summary.contains("Rate limit exceeded"));
-        assert!(summary.contains("retry-after: 57108s"));
-    }
-
-    #[test]
-    fn runtime_error_from_claude_result_includes_model_error_details() {
-        let stdout = serde_json::json!({
-            "type": "result",
-            "subtype": "success",
-            "is_error": true,
-            "api_error_status": 404,
-            "result": "There's an issue with the selected model (claude-sonnet-4.6). It may not exist or you may not have access to it.",
-            "error": "model_not_found"
-        })
-        .to_string();
-
-        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
-
-        assert!(summary.contains("404"));
-        assert!(summary.contains("model_not_found"));
-        assert!(summary.contains("selected model"));
-    }
-
-    #[test]
-    fn runtime_error_from_copilot_session_error_includes_quota_details() {
-        let stdout = serde_json::json!({
-            "type": "session.error",
-            "data": {
-                "errorType": "quota",
-                "errorCode": "quota_exceeded",
-                "message": "You have no quota (Request ID: req_123)",
-                "statusCode": 402
-            }
-        })
-        .to_string();
-
-        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
-
-        assert!(summary.contains("402"));
-        assert!(summary.contains("quota_exceeded"));
-        assert!(summary.contains("You have no quota"));
-    }
-
-    #[test]
-    fn runtime_error_from_copilot_model_failure_parses_error_message_json() {
-        let stdout = serde_json::json!({
-            "type": "model.call_failure",
-            "data": {
-                "model": "gpt-5.5",
-                "statusCode": 402,
-                "errorMessage": "{\"message\":\"You have no quota\",\"code\":\"quota_exceeded\"}"
-            }
-        })
-        .to_string();
-
-        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
-
-        assert!(summary.contains("402"));
-        assert!(summary.contains("quota_exceeded"));
-        assert!(summary.contains("You have no quota"));
-        assert!(!summary.contains("{\"message\""));
-    }
-
-    #[test]
-    fn failed_command_summary_prefers_runtime_error_over_raw_json() {
-        let error_line = serde_json::json!({
-            "statusCode": 429,
-            "responseHeaders": { "retry-after": "59140" },
-            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
-        })
-        .to_string();
-        let mut cfg = cfg();
-        cfg.command = "sh".into();
-        cfg.args = vec!["-c".into(), "printf '%s\n' \"$ERROR_JSON\"; exit 1".into()];
-        cfg.env.insert("ERROR_JSON".into(), error_line);
-        cfg.output_format = CommandOutputFormat::OpencodeJson;
-        cfg.prompt_via = PromptVia::Stdin;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let slot = Arc::new(Mutex::new(InFlight::default()));
-
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
-
-        assert_ne!(outcome.exit_code, 0);
-        let mut summary = None;
-        while let Ok(event) = rx.try_recv() {
-            if let AdapterEvent::Finished {
-                success,
-                summary: value,
-                ..
-            } = event
-            {
-                assert!(!success);
-                summary = Some(value);
-                break;
-            }
-        }
-        let summary = summary.expect("missing Finished event");
-        assert!(summary.contains("429"));
-        assert!(summary.contains("FreeUsageLimitError"));
-        assert!(summary.contains("Rate limit exceeded"));
-        assert!(summary.contains("retry-after: 59140s"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stderr_runtime_error_terminates_hung_command_without_idle_timeout() {
-        let error_line = serde_json::json!({
-            "error": {
-                "name": "AI_APICallError",
-                "statusCode": 429,
-                "responseHeaders": { "retry-after": "57108" },
-                "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
-            }
-        })
-        .to_string();
-        let mut cfg = cfg();
-        cfg.command = "sh".into();
-        cfg.args = vec![
-            "-c".into(),
-            "printf 'ERROR service=llm error=%s stream error\n' \"$ERROR_JSON\" >&2; exec sleep 30"
-                .into(),
-        ];
-        cfg.env.insert("ERROR_JSON".into(), error_line);
-        cfg.output_format = CommandOutputFormat::OpencodeJson;
-        cfg.prompt_via = PromptVia::Stdin;
-        cfg.idle_timeout_ms = Some(5_000);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let slot = Arc::new(Mutex::new(InFlight::default()));
-
-        let started = std::time::Instant::now();
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
-
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "runtime error should terminate before idle timeout"
+        assert_eq!(
+            reduce_text_with_fallback("jsonl", stdout, &reducer),
+            Some("hello world".into())
         );
-        assert_ne!(outcome.exit_code, 0);
-        let mut summary = None;
-        while let Ok(event) = rx.try_recv() {
-            if let AdapterEvent::Finished {
-                success,
-                summary: value,
-                ..
-            } = event
-            {
-                assert!(!success);
-                summary = Some(value);
-                break;
-            }
-        }
-        let summary = summary.expect("missing Finished event");
-        assert!(summary.contains("429"));
-        assert!(summary.contains("FreeUsageLimitError"));
-        assert!(summary.contains("Rate limit exceeded"));
-        assert!(summary.contains("retry-after: 57108s"));
+    }
+
+    #[test]
+    fn provider_json_decoder_reads_pretty_json_final_text() {
+        let decoder = ProviderDecoderSpec {
+            format: "json".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: Some(ProviderJsonlReduceSpec {
+                final_text: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.result.message".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+            capture: None,
+        };
+        let stdout = r#"{
+  "result": {
+    "message": "JSON answer"
+  }
+}"#;
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&decoder), stdout),
+            Some("JSON answer".into())
+        );
+    }
+
+    #[test]
+    fn provider_json_decoder_captures_session_from_pretty_json() {
+        let decoder = ProviderDecoderSpec {
+            format: "json".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.meta.session_id".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+        };
+        let stdout = r#"{
+  "meta": {
+    "session_id": "sid_json"
+  }
+}"#;
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&decoder), stdout),
+            Some("sid_json".into())
+        );
     }
 
     #[test]
@@ -2594,8 +3751,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(InFlight::default()));
 
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert_eq!(outcome.exit_code, 0);
         let mut messages = Vec::new();
@@ -2631,7 +3788,7 @@ mod tests {
     fn first_run_argv_appends_prompt_when_args_mode() {
         let cfg = cfg();
         let request = prompt("what time is it");
-        let argv = expand_first_run_argv(&cfg, &request, "what time is it");
+        let argv = expand_first_run_argv(&cfg, &request, None, "what time is it");
         assert_eq!(argv, vec!["-n", "what time is it"]);
     }
 
@@ -2640,7 +3797,7 @@ mod tests {
         let mut cfg = cfg();
         cfg.args = vec!["--input".into(), "{prompt}".into()];
         let request = prompt("hi");
-        let argv = expand_first_run_argv(&cfg, &request, "hi");
+        let argv = expand_first_run_argv(&cfg, &request, None, "hi");
         assert_eq!(argv, vec!["--input", "hi"]);
     }
 
@@ -2655,8 +3812,8 @@ mod tests {
         cfg.prompt_via = PromptVia::Args;
         let (tx, _rx) = mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(InFlight::default()));
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert_eq!(outcome.stdout.trim(), "stdin-closed");
     }
@@ -2673,8 +3830,8 @@ mod tests {
         let slot = Arc::new(Mutex::new(InFlight::default()));
 
         let started = std::time::Instant::now();
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -2704,13 +3861,13 @@ mod tests {
         cfg.command = "sh".into();
         cfg.args = vec!["-c".into(), "echo started; sleep 30".into()];
         cfg.prompt_via = PromptVia::Stdin;
-        cfg.idle_timeout_ms = Some(100);
+        cfg.idle_timeout_ms = Some(500);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let slot = Arc::new(Mutex::new(InFlight::default()));
 
         let started = std::time::Instant::now();
-        let outcome =
-            spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, &tx, &slot).expect("spawn sh");
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -2726,7 +3883,7 @@ mod tests {
             } = event
             {
                 assert!(!success);
-                assert_eq!(summary, "idle timed out after 100ms");
+                assert_eq!(summary, "idle timed out after 500ms");
                 got_idle_timeout = true;
                 break;
             }
@@ -2775,12 +3932,37 @@ mod tests {
     #[test]
     fn session_path_distinguishes_thread_and_channel() {
         let cfg = cfg();
-        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same"));
-        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "same"));
+        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same")).unwrap();
+        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "same")).unwrap();
 
         assert_ne!(thread, channel);
         assert!(thread.ends_with("thread-same.json"));
         assert!(channel.ends_with("channel-same.json"));
+    }
+
+    #[test]
+    fn session_scope_actor_reuses_one_path_across_scopes() {
+        let mut cfg = cfg();
+        cfg.session_scope = Some("actor".into());
+        let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "thread-a")).unwrap();
+        let channel = session_path(&cfg, &named_scope(ScopeKind::Channel, "channel-b")).unwrap();
+
+        assert_eq!(thread, channel);
+        assert!(thread.ends_with("actor.json"));
+    }
+
+    #[test]
+    fn session_scope_turn_does_not_persist() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.session_scope = Some("turn".into());
+        let scope = named_scope(ScopeKind::Channel, "chan");
+
+        assert!(session_path(&cfg, &scope).is_none());
+        save_session(&cfg, &scope, "sid", "sig").unwrap();
+        assert!(load_session(&cfg, &scope).is_none());
+        assert!(!root.exists());
     }
 
     #[test]
@@ -2799,6 +3981,156 @@ mod tests {
         assert_eq!(second.scope.kind, ScopeKind::Channel);
         assert_eq!(second.created_at, first.created_at);
         assert!(second.last_used_at > first.last_used_at);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_prompt_saves_decoder_captured_provider_session() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sid_decoder\"}'".into(),
+        ];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.session_id_source = Some(CommandSessionIdSource::ProviderCapture);
+        cfg.resume_args = Some(vec![
+            "--resume".into(),
+            "{session_id}".into(),
+            "{prompt}".into(),
+        ]);
+        cfg.decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), prompt("ignored"), tx, slot).expect("run prompt");
+
+        let saved = load_session(&cfg, &scope()).expect("saved session");
+        assert_eq!(saved.session_id, "sid_decoder");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_prompt_saves_stderr_decoder_captured_provider_session() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sid_stderr\"}' >&2".into(),
+        ];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.session_id_source = Some(CommandSessionIdSource::ProviderCapture);
+        cfg.resume_args = Some(vec![
+            "--resume".into(),
+            "{session_id}".into(),
+            "{prompt}".into(),
+        ]);
+        cfg.stderr_decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: None,
+            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
+                session: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.session_id".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), prompt("ignored"), tx, slot).expect("run prompt");
+
+        let saved = load_session(&cfg, &scope()).expect("saved session");
+        assert_eq!(saved.session_id, "sid_stderr");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stderr_decoder_final_text_is_emitted() {
+        let mut cfg = cfg();
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' '{\"text\":\"from stderr\"}' >&2".into(),
+        ];
+        cfg.stderr_decoder = Some(ProviderDecoderSpec {
+            format: "jsonl".into(),
+            name: None,
+            events: Vec::new(),
+            reduce: Some(ProviderJsonlReduceSpec {
+                final_text: Some(ProviderJsonlTextReducerSpec {
+                    mode: "lastNonEmpty".into(),
+                    path: "$.text".into(),
+                    when: None,
+                    fallback: None,
+                }),
+            }),
+            capture: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot).expect("spawn sh");
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Text { content, .. } = event {
+                texts.push(content);
+            }
+        }
+        assert_eq!(texts, vec!["from stderr"]);
+    }
+
+    #[test]
+    fn run_prompt_resumes_with_arg_specs_without_legacy_resume_args() {
+        let mut cfg = cfg();
+        let root = std::env::temp_dir().join(format!("loom-command-{}", uuid::Uuid::new_v4()));
+        cfg.sessions_dir = root.join("sessions");
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec!["-c".into(), "printf '%s\\n' first-run".into()];
+        cfg.resume_args = None;
+        cfg.resume_arg_specs = vec![
+            ProviderArgSpec::Literal("-c".into()),
+            ProviderArgSpec::Literal("printf '%s\\n' \"$1\"".into()),
+            ProviderArgSpec::Literal("resume".into()),
+            ProviderArgSpec::Literal("{session_id}".into()),
+        ];
+        let request = prompt("ignored");
+        let signature = command_signature_for_prompt(&cfg, &request);
+        save_session(&cfg, &request.scope, "sid_arg_specs", &signature).expect("save session");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        run_prompt(cfg.clone(), request, tx, slot).expect("run prompt");
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Text { content, .. } = event {
+                texts.push(content);
+            }
+        }
+        assert_eq!(texts, vec!["sid_arg_specs\n"]);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2850,6 +4182,34 @@ mod tests {
     }
 
     #[test]
+    fn template_expands_provider_runtime_aliases_from_request_vars() {
+        let cfg = cfg();
+        let mut request = prompt("hello");
+        request
+            .template_vars
+            .insert("loom.server".into(), "ws://server/rpc".into());
+        request
+            .template_vars
+            .insert("loom.run.id".into(), "run_1".into());
+        request
+            .template_vars
+            .insert("loom.trigger.actor".into(), "actor_human".into());
+        request
+            .template_vars
+            .insert("paths.cwd".into(), "/tmp/workspace".into());
+
+        let out = expand_template(
+            "{loom.server}|{loom.run.id}|{loom.trigger.actor}|{paths.cwd}",
+            &cfg,
+            &request,
+            None,
+            "",
+        );
+
+        assert_eq!(out, "ws://server/rpc|run_1|actor_human|/tmp/workspace");
+    }
+
+    #[test]
     fn expanded_env_keeps_spec_values_and_adds_request_defaults() {
         let mut cfg = cfg();
         cfg.env.insert("LOOM_SERVER".into(), "ws://spec".into());
@@ -2866,7 +4226,7 @@ mod tests {
             .template_vars
             .insert("agent.workspace".into(), "/tmp/channel/workspace".into());
 
-        let env = expanded_env(&cfg, &request);
+        let env = expanded_env(&cfg, &request, None);
 
         assert_eq!(
             env.get("LOOM_SERVER").map(String::as_str),
@@ -2879,6 +4239,28 @@ mod tests {
         assert_eq!(
             env.get("AGENTX_CHANNEL_ID").map(String::as_str),
             Some("channel_1")
+        );
+    }
+
+    #[test]
+    fn expanded_env_expands_prompt_outputs_and_session_id() {
+        let mut cfg = cfg();
+        cfg.env.insert("SESSION_ID".into(), "{session.id}".into());
+        cfg.env.insert("LEGACY_PROMPT".into(), "{prompt}".into());
+        cfg.env.insert("USER_PROMPT".into(), "{prompt.user}".into());
+        let mut request = prompt("full prompt");
+        request.outputs.insert("user".into(), "user prompt".into());
+
+        let env = expanded_env(&cfg, &request, Some("sid_123"));
+
+        assert_eq!(env.get("SESSION_ID").map(String::as_str), Some("sid_123"));
+        assert_eq!(
+            env.get("LEGACY_PROMPT").map(String::as_str),
+            Some("full prompt")
+        );
+        assert_eq!(
+            env.get("USER_PROMPT").map(String::as_str),
+            Some("user prompt")
         );
     }
 

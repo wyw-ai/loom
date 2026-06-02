@@ -100,6 +100,31 @@ export interface Message {
   metadata: Record<string, unknown>;
 }
 
+export type ArtifactKind = "file" | "directory";
+
+export interface Artifact {
+  id: string;
+  uri: string;
+  kind: ArtifactKind;
+  name: string;
+  mediaType: string;
+  size: number;
+  checksum: string;
+  createdBy: string;
+  createdAt: string;
+  _meta?: Record<string, unknown>;
+}
+
+export interface ArtifactReadResult {
+  artifactId: string;
+  mediaType: string;
+  offset: number;
+  truncated: boolean;
+  nextOffset?: number;
+  content: string;
+  bytes?: number[];
+}
+
 export type RunStatus =
   | "queued"
   | "preparing_context"

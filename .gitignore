@@ -11,6 +11,7 @@
 __pycache__/
 /docs/*
 !/docs/README.md
+!/docs/gui-actor-provider-management-design.md
 !/docs/loom-refactor-plan.md
 !/docs/am-loom-bridge.md
 !/docs/protocol/

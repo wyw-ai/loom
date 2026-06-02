@@ -235,6 +235,7 @@ export interface AgentSpec {
   providerRef: AgentProviderRef;
   models?: AgentModelSpec | null;
   autostart?: boolean | null;
+  promptAssembly?: Record<string, unknown> | null;
   _meta?: Record<string, unknown>;
 }
 
@@ -247,6 +248,55 @@ export interface AgentInfo {
 
 export interface MachineAgentInfo extends AgentInfo {
   profilePath: string;
+}
+
+export type AgentFileRoot = "profile" | "scopeWorkspace" | "scope-workspace";
+
+export interface AgentFileEntry {
+  path: string;
+  bytes: number;
+  modified?: string | null;
+}
+
+export interface AgentFileListResult {
+  root: string;
+  prefix: string;
+  files: AgentFileEntry[];
+}
+
+export interface AgentFileReadResult {
+  root: string;
+  path: string;
+  content: string;
+}
+
+export interface AgentFileWriteResult {
+  root: string;
+  path: string;
+  bytes: number;
+}
+
+export interface AgentPromptPreviewPart {
+  key: string;
+  title: string;
+  source: string;
+  bytes: number;
+  empty: boolean;
+  missing: boolean;
+  content: string;
+}
+
+export interface AgentPromptPreviewResult {
+  actorId: string;
+  scope: Record<string, unknown>;
+  parts: AgentPromptPreviewPart[];
+  outputs: {
+    system: string;
+    user: string;
+    full: string;
+  };
+  bindings: Record<string, unknown>;
+  warnings: string[];
 }
 
 export interface MachineInfo {

@@ -98,8 +98,6 @@ fn main() {
             ipc::actor_delete,
             ipc::agent_list,
             ipc::agent_create,
-            ipc::agent_profile_file_read,
-            ipc::agent_profile_file_write,
             ipc::agent_update,
             ipc::agent_remove,
             ipc::machine_list,

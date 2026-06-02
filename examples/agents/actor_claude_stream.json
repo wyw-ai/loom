@@ -1,49 +1,14 @@
 {
-  "provider": {
-    "id": "claude_stream",
-    "displayName": "Claude Code Stream"
+  "actor": {
+    "id": "actor_claude_stream",
+    "kind": "agent",
+    "displayName": "Claude Stream"
   },
-  "transport": {
-    "kind": "command",
-    "command": "claude",
-    "args": [
-      "--permission-mode",
-      "bypassPermissions",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "-p"
-    ],
-    "env": {},
-    "model": "claude-sonnet-4.6",
-    "modelArgs": [
-      "--model",
-      "{model}"
-    ],
-    "session": {
-      "firstRunCapture": "stdout_json:.session_id",
-      "resumeArgs": [
-        "--permission-mode",
-        "bypassPermissions",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--resume",
-        "{session_id}",
-        "-p"
-      ]
-    },
-    "outputFormat": "claude_stream_json",
-    "promptVia": "args",
-    "timeoutMs": 3600000,
-    "idleTimeoutMs": 60000
+  "instructions": "Use Loom message commands for visible replies and handoffs. Keep work scoped to the current channel or thread.",
+  "providerRef": {
+    "id": "claude",
+    "mode": "print",
+    "model": "sonnet"
   },
-  "actors": [
-    {
-      "id": "actor_claude_stream",
-      "displayName": "Claude Stream",
-      "capabilities": {}
-    }
-  ],
   "autostart": false
 }

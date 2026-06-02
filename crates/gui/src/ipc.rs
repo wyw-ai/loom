@@ -13,10 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_runtime::discovery::{
-    apply_provider_overrides, detect_agent_cli_providers, normalize_model_id_for_provider,
-    provider_specs_from_agent_definitions, AgentDefinition, DetectedAgentProvider,
-};
+use agent_runtime::discovery::DetectedAgentProvider;
 use proto::methods::method;
 use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec};
 use serde::{Deserialize, Serialize};
@@ -24,8 +21,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config::{
-    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount,
-    MachineAgentConfig, MachineConfig, Workspace,
+    self, account_display_name, apply_account_identity, DesktopConfig, HumanAccount, Workspace,
 };
 use crate::forward;
 use crate::state::AppState;
@@ -47,7 +43,7 @@ pub struct SaveWorkspacesArgs {
 #[tauri::command]
 pub async fn workspaces_save(args: SaveWorkspacesArgs) -> Result<DesktopConfig, String> {
     config::save(&args.config).map_err(|e| e.to_string())?;
-    Ok(config::load_or_init().map_err(|e| e.to_string())?)
+    config::load_or_init().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -145,8 +141,6 @@ pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, Stri
         display_name,
     };
     cfg.workspaces.push(ws);
-    cfg.machines
-        .push(config::default_machine_for_workspace(&id, Some(&actor_id)));
     if args.activate {
         cfg.active = Some(id);
     }
@@ -196,8 +190,6 @@ pub struct WorkspaceIdArgs {
 pub async fn workspace_remove(args: WorkspaceIdArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
     cfg.workspaces.retain(|w| w.id != args.id);
-    cfg.machines
-        .retain(|machine| machine.workspace_id.as_deref() != Some(args.id.as_str()));
     if cfg.active.as_deref() == Some(args.id.as_str()) {
         cfg.active = cfg.workspaces.first().map(|w| w.id.clone());
     }
@@ -264,8 +256,11 @@ pub async fn connect(
     state.set(Some(client)).await;
     let _ = app.emit("loom://connection", forward::ConnectionEvent::Open);
 
-    // Persist the chosen workspace as active.
-    let _ = set_active_workspace(WorkspaceIdArgs { id: ws.id.clone() }).await;
+    // Persist the chosen workspace as active and refresh the daemon's
+    // server profile. Daemon runtime config is maintained by daemon startup,
+    // not by GUI host discovery.
+    cfg.active = Some(ws.id.clone());
+    config::save(&cfg).map_err(stringify)?;
 
     Ok(json!({ "workspace": ws, "open": open }))
 }
@@ -900,24 +895,9 @@ pub async fn actor_delete(state: State<'_, AppState>, params: Value) -> Result<V
 // ---- local agent / machine management -------------------------------------
 
 #[tauri::command]
-pub async fn agent_list() -> Result<AgentListResult, String> {
+pub async fn agent_list(state: State<'_, AppState>) -> Result<AgentListResult, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
-    let server_url = active_server_url(&cfg);
-    let mut agents = Vec::new();
-    for machine in cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
-    {
-        agents.extend(
-            machine_info(machine, server_url)
-                .map_err(stringify)?
-                .agents
-                .into_iter()
-                .map(|agent| agent.info),
-        );
-    }
-    Ok(AgentListResult { agents })
+    agent_list_from_daemon_inventory(&cfg, state.try_client().await).await
 }
 
 #[derive(Deserialize)]
@@ -963,32 +943,30 @@ pub async fn agent_remove(
     state: State<'_, AppState>,
     args: AgentRemoveArgs,
 ) -> Result<AgentListResult, String> {
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
-    let mut removed = false;
-    for machine in cfg.machines.iter_mut().filter(|machine| {
-        config::machine_belongs_to_workspace_and_owner(
-            machine,
-            active_workspace_id.as_deref(),
-            active_owner_actor_id.as_deref(),
-        )
-    }) {
-        let before = machine.agents.len();
-        machine
-            .agents
-            .retain(|agent| agent.actor_id != args.actor_id);
-        removed |= machine.agents.len() != before;
-    }
-    if !removed {
-        return Err(format!(
-            "daemon-configured agent not found: {}",
-            args.actor_id
-        ));
-    }
-    config::save(&cfg).map_err(stringify)?;
-    delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
-    agent_list().await
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let client = state
+        .try_client()
+        .await
+        .ok_or_else(|| "connect to the workspace before managing agents".to_string())?;
+    let machine = server_machine_for_agent(&cfg, Some(client), &args.actor_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "agent `{}` is not present in daemon inventory; start the daemon before editing it",
+                args.actor_id
+            )
+        })?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &machine.id,
+        json!({
+            "op": "agent.remove",
+            "actorId": args.actor_id,
+        }),
+    )
+    .await?;
+    agent_list_from_daemon_inventory(&cfg, state.try_client().await).await
 }
 
 #[derive(Deserialize)]
@@ -1019,60 +997,55 @@ pub async fn agent_update(
     args: AgentUpdateArgs,
 ) -> Result<AgentInfo, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
-    if let Some(machine_id) = args
+    let client = state
+        .try_client()
+        .await
+        .ok_or_else(|| "connect to the workspace before managing agents".to_string())?;
+    let target_machine_id = if let Some(machine_id) = args
         .machine_id
         .as_deref()
         .map(str::trim)
         .filter(|machine_id| !machine_id.is_empty())
     {
-        if server_machine_by_id(&cfg, state.try_client().await, machine_id)
+        server_machine_by_id(&cfg, Some(client.clone()), machine_id)
             .await
-            .is_some()
-        {
-            let actor_id = args.actor_id.clone();
-            let output = run_remote_machine_command(
-                &state,
-                &cfg,
-                machine_id,
-                json!({
-                    "op": "agent.update",
-                    "actorId": actor_id,
-                    "displayName": args.display_name,
-                    "description": args.description,
-                    "providerId": args.provider_id,
-                    "model": args.model,
-                    "reasoningEffort": args.reasoning_effort,
-                    "autostart": args.autostart,
-                    "avatarUrl": args.avatar_url,
-                }),
-            )
-            .await?;
-            drop(output);
-            let remote = server_machine_by_id(&cfg, state.try_client().await, machine_id)
-                .await
-                .ok_or_else(|| {
-                    format!("machine inventory disappeared after update: {machine_id}")
-                })?;
-            let info = remote
-                .agents
-                .into_iter()
-                .find(|agent| agent.info.spec.actor.id == actor_id)
-                .map(|agent| agent.info)
-                .ok_or_else(|| {
-                    format!("updated agent not found in remote inventory: {}", actor_id)
-                })?;
-            upsert_agent_actor_to_server(state.try_client().await, &info).await;
-            return Ok(info);
-        }
-    }
-    if let Some(info) = update_machine_agent_in_config(&args).map_err(stringify)? {
-        upsert_agent_actor_to_server(state.try_client().await, &info).await;
-        return Ok(info);
-    }
-    Err(format!(
-        "daemon-configured agent not found: {}",
-        args.actor_id
-    ))
+            .ok_or_else(|| {
+                format!(
+                    "machine `{machine_id}` is not present in daemon inventory; start the daemon before editing agents"
+                )
+            })?
+            .id
+    } else {
+        server_machine_for_agent(&cfg, Some(client), &args.actor_id)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "agent `{}` is not present in daemon inventory; start the daemon before editing it",
+                    args.actor_id
+                )
+            })?
+            .id
+    };
+    let actor_id = args.actor_id.clone();
+    let output = run_remote_machine_command(
+        &state,
+        &cfg,
+        &target_machine_id,
+        json!({
+            "op": "agent.update",
+            "actorId": actor_id,
+            "displayName": args.display_name,
+            "description": args.description,
+            "providerId": args.provider_id,
+            "model": args.model,
+            "reasoningEffort": args.reasoning_effort,
+            "autostart": args.autostart,
+            "avatarUrl": args.avatar_url,
+        }),
+    )
+    .await?;
+    agent_info_from_machine_command_output(output)
+        .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1110,8 +1083,6 @@ pub struct MachineAgentInfo {
     #[serde(flatten)]
     pub info: AgentInfo,
     pub profile_path: String,
-    pub identity_path: String,
-    pub soul_path: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1173,175 +1144,14 @@ pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentProfileFileReadArgs {
-    pub machine_id: String,
-    pub actor_id: String,
-    pub file: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProfileFileWriteArgs {
-    pub machine_id: String,
-    pub actor_id: String,
-    pub file: String,
-    pub text: String,
-    #[serde(default)]
-    pub base_sha256: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProfileFileResult {
-    pub path: String,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-}
-
-#[tauri::command]
-pub async fn agent_profile_file_read(
-    state: State<'_, AppState>,
-    args: AgentProfileFileReadArgs,
-) -> Result<AgentProfileFileResult, String> {
-    let cfg = config::load_or_init().map_err(stringify)?;
-    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
-        .await
-        .is_some()
-    {
-        let output = run_remote_machine_command(
-            &state,
-            &cfg,
-            &args.machine_id,
-            json!({
-                "op": "agent.profile.read",
-                "actorId": args.actor_id,
-                "file": args.file,
-            }),
-        )
-        .await?;
-        return profile_file_result_from_output(output);
-    }
-    match resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file) {
-        Ok(path) => {
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            Ok(AgentProfileFileResult {
-                path: config::home_path_expr(&path),
-                text,
-                sha256: None,
-            })
-        }
-        Err(local_err) => Err(stringify(local_err)),
-    }
-}
-
-#[tauri::command]
-pub async fn agent_profile_file_write(
-    state: State<'_, AppState>,
-    args: AgentProfileFileWriteArgs,
-) -> Result<AgentProfileFileResult, String> {
-    let cfg = config::load_or_init().map_err(stringify)?;
-    if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
-        .await
-        .is_some()
-    {
-        let output = run_remote_machine_command(
-            &state,
-            &cfg,
-            &args.machine_id,
-            json!({
-                "op": "agent.profile.write",
-                "actorId": args.actor_id,
-                "file": args.file,
-                "text": args.text,
-                "baseSha256": args.base_sha256,
-            }),
-        )
-        .await?;
-        return profile_file_result_from_output(output);
-    }
-    match resolve_machine_agent_profile_file(&args.machine_id, &args.actor_id, &args.file) {
-        Ok(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create directory {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&path, &args.text)
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
-            Ok(AgentProfileFileResult {
-                path: config::home_path_expr(&path),
-                text: args.text,
-                sha256: None,
-            })
-        }
-        Err(local_err) => Err(stringify(local_err)),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineCreateArgs {
-    pub name: String,
-    #[serde(default)]
-    pub data_root: String,
-}
+pub struct MachineCreateArgs {}
 
 #[tauri::command]
 pub async fn machine_create(
-    state: State<'_, AppState>,
-    args: MachineCreateArgs,
+    _state: State<'_, AppState>,
+    _args: MachineCreateArgs,
 ) -> Result<MachineListResult, String> {
-    let name = args.name.trim();
-    if name.is_empty() {
-        return Err("machine name is required".into());
-    }
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let owner_actor_id = config::active_owner_actor_id(&cfg);
-    let workspace_dir = workspace_id
-        .as_deref()
-        .map(slugify)
-        .unwrap_or_else(|| "unassigned".into());
-    let machine_id = config::generate_machine_id();
-    let dir_slug = format!(
-        "{}_{}",
-        slugify(name),
-        machine_id.trim_start_matches("machine_")
-    );
-    let data_root_key = owner_actor_id
-        .as_deref()
-        .map(|owner| format!("{}/{}", slugify(owner), dir_slug))
-        .unwrap_or_else(|| dir_slug.clone());
-    let (data_root_expr, data_root) = machine_path_input(
-        args.data_root.trim(),
-        config::machine_data_root_expr(&workspace_dir, &data_root_key),
-    )
-    .map_err(stringify)?;
-    std::fs::create_dir_all(&data_root)
-        .map_err(|e| format!("create data root {}: {e}", data_root.display()))?;
-
-    cfg.machines.push(MachineConfig {
-        workspace_id,
-        owner_actor_id,
-        id: machine_id,
-        name: name.to_string(),
-        kind: "local".into(),
-        data_root: data_root_expr,
-        providers: Vec::new(),
-        agents: Vec::new(),
-    });
-    config::save(&cfg).map_err(stringify)?;
-    machines_from_config(&cfg, state.try_client().await).await
-}
-
-fn machine_path_input(input: &str, default_expr: String) -> anyhow::Result<(String, PathBuf)> {
-    let raw = if input.is_empty() {
-        default_expr
-    } else {
-        input.to_string()
-    };
-    let path = normalize_local_path(config::expand_home(&raw))?;
-    Ok((config::home_path_expr(&path), path))
+    Err("hosts are daemon-owned; start loom-daemon and let it publish inventory to the connected server".into())
 }
 
 #[derive(Deserialize)]
@@ -1352,49 +1162,13 @@ pub struct MachineRemoveArgs {
 
 #[tauri::command]
 pub async fn machine_remove(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     args: MachineRemoveArgs,
 ) -> Result<MachineListResult, String> {
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let active_machine_count = cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, &cfg))
-        .count();
-    if active_machine_count <= 1 {
-        return Err("last machine cannot be removed".into());
-    }
-    let before = cfg.machines.len();
-    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
-    let server_url = active_server_url(&cfg).to_string();
-    let actor_ids = cfg
-        .machines
-        .iter()
-        .find(|machine| {
-            machine.id == args.machine_id
-                && config::machine_belongs_to_workspace_and_owner(
-                    machine,
-                    active_workspace_id.as_deref(),
-                    active_owner_actor_id.as_deref(),
-                )
-        })
-        .map(|machine| actor_ids_for_machine(machine, &server_url))
-        .unwrap_or_default();
-    cfg.machines.retain(|machine| {
-        machine.id != args.machine_id
-            || !config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    });
-    if cfg.machines.len() == before {
-        return Err(format!("unknown machine id: {}", args.machine_id));
-    }
-    config::save(&cfg).map_err(stringify)?;
-    delete_actors_from_server(state.try_client().await, &actor_ids).await;
-    machines_from_config(&cfg, state.try_client().await).await
+    Err(format!(
+        "host `{}` is daemon-owned; stop or reconfigure the daemon instead of deleting it from GUI local state",
+        args.machine_id
+    ))
 }
 #[tauri::command]
 pub async fn machine_agent_create(
@@ -1414,9 +1188,7 @@ pub async fn machine_agent_create(
     if name.is_empty() {
         return Err("agent name is required".into());
     }
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
+    let cfg = config::load_or_init().map_err(stringify)?;
     let actor_id = actor_id_from_input(&args.actor_id, name, &machine_id).map_err(stringify)?;
     if server_machine_by_id(&cfg, state.try_client().await, &machine_id)
         .await
@@ -1442,61 +1214,9 @@ pub async fn machine_agent_create(
         drop(output);
         return machines_from_config(&cfg, state.try_client().await).await;
     }
-    let maybe_machine_index = cfg.machines.iter().position(|machine| {
-        machine.id == machine_id
-            && config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    });
-    let Some(machine_index) = maybe_machine_index else {
-        return Err(format!("unknown machine id: {machine_id}"));
-    };
-    if cfg.machines[machine_index]
-        .agents
-        .iter()
-        .any(|agent| agent.actor_id == actor_id)
-    {
-        return Err(format!("agent actor already exists: {actor_id}"));
-    }
-    let providers = detect_agent_cli_providers();
-    if !providers
-        .iter()
-        .any(|provider| provider.id == args.provider_id)
-    {
-        return Err(format!(
-            "provider `{}` is not available on PATH for daemon mode",
-            args.provider_id
-        ));
-    }
-    let actor_id_for_upsert = actor_id.clone();
-    cfg.machines[machine_index].agents.push(MachineAgentConfig {
-        provider_id: args.provider_id.clone(),
-        actor_id,
-        name: name.to_string(),
-        description: args.description.trim().to_string(),
-        model: normalize_model_id_for_provider(&args.provider_id, &args.model),
-        reasoning_effort: args.reasoning_effort.trim().to_string(),
-        autostart: args.autostart,
-        avatar_url: args.avatar_url.trim().to_string(),
-    });
-    config::save(&cfg).map_err(stringify)?;
-    if let Some(client) = state.try_client().await {
-        let _ = client
-            .call_raw(
-                method::ACTOR_UPSERT,
-                Some(json!({
-                    "actor": {
-                        "id": actor_id_for_upsert,
-                        "kind": "agent",
-                        "displayName": name,
-                    }
-                })),
-            )
-            .await;
-    }
-    machines_from_config(&cfg, state.try_client().await).await
+    Err(format!(
+        "machine `{machine_id}` is not present in daemon inventory; start the daemon before creating agents"
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1511,9 +1231,7 @@ pub async fn machine_agent_remove(
     state: State<'_, AppState>,
     args: MachineAgentRemoveArgs,
 ) -> Result<MachineListResult, String> {
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
+    let cfg = config::load_or_init().map_err(stringify)?;
     if server_machine_by_id(&cfg, state.try_client().await, &args.machine_id)
         .await
         .is_some()
@@ -1531,30 +1249,10 @@ pub async fn machine_agent_remove(
         drop(output);
         return machines_from_config(&cfg, state.try_client().await).await;
     }
-    let maybe_machine = cfg.machines.iter_mut().find(|machine| {
-        machine.id == args.machine_id
-            && config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    });
-    let Some(machine) = maybe_machine else {
-        return Err(format!("unknown machine id: {}", args.machine_id));
-    };
-    let before = machine.agents.len();
-    machine
-        .agents
-        .retain(|agent| agent.actor_id != args.actor_id);
-    if machine.agents.len() == before {
-        return Err(format!(
-            "daemon-configured agent not found: {}",
-            args.actor_id
-        ));
-    }
-    config::save(&cfg).map_err(stringify)?;
-    delete_actors_from_server(state.try_client().await, &[args.actor_id]).await;
-    machines_from_config(&cfg, state.try_client().await).await
+    Err(format!(
+        "machine `{}` is not present in daemon inventory; start the daemon before removing agents",
+        args.machine_id
+    ))
 }
 
 async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[String]) {
@@ -1581,52 +1279,6 @@ async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[Str
     }
 }
 
-async fn upsert_agent_actor_to_server(client: Option<Arc<Client>>, info: &AgentInfo) {
-    let Some(client) = client else {
-        return;
-    };
-    if let Err(err) = client
-        .call_raw(
-            method::ACTOR_UPSERT,
-            Some(json!({
-                "actor": &info.spec.actor,
-            })),
-        )
-        .await
-    {
-        tracing::warn!(
-            actor_id = %info.spec.actor.id,
-            %err,
-            "failed to upsert updated agent actor to server"
-        );
-    }
-}
-
-fn actor_ids_for_machine(machine: &MachineConfig, server_url: &str) -> Vec<String> {
-    let mut actor_ids = vec![machine_connection_actor_id(machine)];
-    actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
-    match machine_info(machine, server_url) {
-        Ok(info) => {
-            actor_ids.extend(
-                info.agents
-                    .into_iter()
-                    .map(|agent| agent.info.spec.actor.id),
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                machine_id = %machine.id,
-                %err,
-                "failed to read machine agents while deleting machine; falling back to config agents"
-            );
-            actor_ids.extend(machine.agents.iter().map(|agent| agent.actor_id.clone()));
-        }
-    }
-    actor_ids.sort();
-    actor_ids.dedup();
-    actor_ids
-}
-
 fn stringify(e: anyhow::Error) -> String {
     deep_stringify(e)
 }
@@ -1645,16 +1297,9 @@ async fn machines_from_config(
     client: Option<Arc<Client>>,
 ) -> Result<MachineListResult, String> {
     let server_url = active_server_url(cfg);
-
-    let mut machines = Vec::new();
-    for machine in cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
-    {
-        machines.push(machine_info(machine, server_url).map_err(stringify)?);
-    }
-    let mut result = MachineListResult { machines };
+    let mut result = MachineListResult {
+        machines: Vec::new(),
+    };
     merge_server_machine_inventory(&mut result, cfg, client.as_ref(), server_url).await;
     apply_connection_status(&mut result, client).await;
     Ok(result)
@@ -1676,7 +1321,8 @@ struct RemoteMachineMeta {
     data_root: String,
     config_dir: String,
     providers: Vec<DetectedAgentProvider>,
-    agents: Vec<MachineAgentConfig>,
+    #[serde(default, rename = "agentSpecs")]
+    agent_specs: Vec<AgentSpec>,
     capabilities: Vec<String>,
     revision: u64,
     observed_at: String,
@@ -1700,7 +1346,7 @@ async fn merge_server_machine_inventory(
     for actor in actors {
         if let Some(meta) = remote_machine_meta_from_actor(actor) {
             if is_legacy_remote_machine_inventory(&meta) {
-                cleanup_legacy_remote_machine_inventory(client, actor, &meta).await;
+                cleanup_legacy_remote_machine_inventory(client, actor).await;
                 continue;
             }
         }
@@ -1713,9 +1359,7 @@ async fn merge_server_machine_inventory(
 
 fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, machine: MachineInfo) {
     if let Some(existing) = machines.iter_mut().find(|m| m.id == machine.id) {
-        if existing.source == "local_config"
-            || machine.inventory_revision >= existing.inventory_revision
-        {
+        if machine.inventory_revision >= existing.inventory_revision {
             *existing = machine;
         }
     } else {
@@ -1736,6 +1380,50 @@ async fn server_machine_by_id(
         .iter()
         .filter_map(|actor| server_machine_info_from_actor(actor, cfg, server_url))
         .find(|machine| machine.id == machine_id)
+}
+
+async fn server_machine_for_agent(
+    cfg: &DesktopConfig,
+    client: Option<Arc<Client>>,
+    actor_id: &str,
+) -> Option<MachineInfo> {
+    let client = client?;
+    let server_url = active_server_url(cfg);
+    let value = client.call_raw(method::ACTOR_LIST, None).await.ok()?;
+    let actors = value.get("actors").and_then(Value::as_array)?;
+    actors
+        .iter()
+        .filter_map(|actor| server_machine_info_from_actor(actor, cfg, server_url))
+        .find(|machine| {
+            machine
+                .agents
+                .iter()
+                .any(|agent| agent.info.spec.actor.id == actor_id)
+        })
+}
+
+async fn agent_list_from_daemon_inventory(
+    cfg: &DesktopConfig,
+    client: Option<Arc<Client>>,
+) -> Result<AgentListResult, String> {
+    let machines = machines_from_config(cfg, client).await?;
+    Ok(AgentListResult {
+        agents: machines
+            .machines
+            .into_iter()
+            .flat_map(|machine| machine.agents.into_iter().map(|agent| agent.info))
+            .collect(),
+    })
+}
+
+fn agent_info_from_machine_command_output(output: Value) -> Option<AgentInfo> {
+    let spec: AgentSpec = serde_json::from_value(output.get("agentSpec")?.clone()).ok()?;
+    Some(AgentInfo {
+        spec,
+        status: "registered".into(),
+        pid: None,
+        session_id: None,
+    })
 }
 
 async fn run_remote_machine_command(
@@ -1800,26 +1488,8 @@ async fn run_remote_machine_command(
 fn is_mutating_machine_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "agent.create" | "agent.update" | "agent.remove" | "agent.profile.write"
+        "agent.create" | "agent.update" | "agent.remove" | "provider.add" | "provider.remove"
     )
-}
-
-fn profile_file_result_from_output(output: Value) -> Result<AgentProfileFileResult, String> {
-    let path = output
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "remote profile result missing path".to_string())?
-        .to_string();
-    let text = output
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "remote profile result missing text".to_string())?
-        .to_string();
-    let sha256 = output
-        .get("sha256")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    Ok(AgentProfileFileResult { path, text, sha256 })
 }
 
 fn server_machine_info_from_actor(
@@ -1844,37 +1514,28 @@ fn server_machine_info_from_actor(
         .iter()
         .map(detected_provider_summary)
         .collect::<Vec<_>>();
+    let agent_specs = meta.agent_specs.clone();
     for provider in &mut providers {
-        provider.actor_count += meta
-            .agents
+        provider.actor_count += agent_specs
             .iter()
-            .filter(|agent| agent.provider_id == provider.id)
+            .filter(|spec| spec.provider_ref.id.as_str() == provider.id.as_str())
             .count();
     }
-    let machine_agent_defs = meta
-        .agents
-        .iter()
-        .map(machine_agent_definition)
-        .collect::<Vec<_>>();
-    let agents: Vec<MachineAgentInfo> =
-        provider_specs_from_agent_definitions(&meta.providers, &machine_agent_defs)
-            .into_iter()
-            .flat_map(|provider| provider.into_agent_specs())
-            .map(|spec| {
-                let paths = agent_profile_paths(&data_root, &spec);
-                MachineAgentInfo {
-                    info: AgentInfo {
-                        spec,
-                        status: "registered".into(),
-                        pid: None,
-                        session_id: None,
-                    },
-                    profile_path: paths.profile.display().to_string(),
-                    identity_path: paths.identity.display().to_string(),
-                    soul_path: paths.soul.display().to_string(),
-                }
-            })
-            .collect();
+    let agents: Vec<MachineAgentInfo> = agent_specs
+        .into_iter()
+        .map(|spec| {
+            let profile_path = agent_profile_path(&data_root, &spec);
+            MachineAgentInfo {
+                info: AgentInfo {
+                    spec,
+                    status: "registered".into(),
+                    pid: None,
+                    session_id: None,
+                },
+                profile_path: profile_path.display().to_string(),
+            }
+        })
+        .collect();
     let setup_status = if providers.is_empty() {
         "noCli"
     } else if agents.is_empty() {
@@ -1882,7 +1543,14 @@ fn server_machine_info_from_actor(
     } else {
         "configured"
     };
-    let (serve_command, setup_script) = daemon_start_commands(&data_root, server_url, &machine_id);
+    let config_dir = PathBuf::from(&meta.config_dir);
+    let (serve_command, setup_script) = daemon_start_commands(
+        &data_root,
+        Some(&config_dir),
+        server_url,
+        &machine_id,
+        &name,
+    );
 
     let can_command = remote_machine_belongs_to_active_owner(&meta, cfg)
         && meta
@@ -1953,31 +1621,12 @@ fn is_legacy_remote_machine_inventory(meta: &RemoteMachineMeta) -> bool {
         && meta.machine_id.contains("_actor_human_")
 }
 
-async fn cleanup_legacy_remote_machine_inventory(
-    client: &Arc<Client>,
-    actor: &Value,
-    meta: &RemoteMachineMeta,
-) {
+async fn cleanup_legacy_remote_machine_inventory(client: &Arc<Client>, actor: &Value) {
     let mut actor_ids = Vec::new();
     if let Some(actor_id) = actor.get("id").and_then(Value::as_str) {
         actor_ids.push(actor_id.to_string());
     }
-    actor_ids.extend(
-        meta.agents
-            .iter()
-            .map(|agent| agent.actor_id.clone())
-            .filter(|actor_id| !is_supported_remote_actor_id(actor_id)),
-    );
     delete_actors_from_server(Some(client.clone()), &actor_ids).await;
-}
-
-fn is_supported_remote_actor_id(actor_id: &str) -> bool {
-    let trimmed = actor_id.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 64
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
 }
 
 async fn temporary_machine_check_client(cfg: &DesktopConfig) -> Option<Arc<Client>> {
@@ -2068,12 +1717,7 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
 }
 
 fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
-    let mut allowed_agents = cfg
-        .machines
-        .iter()
-        .filter(|machine| config::machine_belongs_to_active_workspace(machine, cfg))
-        .flat_map(|machine| machine.agents.iter().map(|agent| agent.actor_id.clone()))
-        .collect::<HashSet<_>>();
+    let mut allowed_agents = HashSet::new();
 
     if let Some(actors) = value.get("actors").and_then(Value::as_array) {
         for actor in actors {
@@ -2085,7 +1729,7 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
             {
                 continue;
             }
-            allowed_agents.extend(meta.agents.iter().map(|agent| agent.actor_id.clone()));
+            allowed_agents.extend(meta.agent_specs.iter().map(|spec| spec.actor.id.clone()));
         }
     }
 
@@ -2110,168 +1754,11 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
     value
 }
 
-fn machine_info(machine: &MachineConfig, server_url: &str) -> anyhow::Result<MachineInfo> {
-    let data_root = if machine.data_root.trim().is_empty() {
-        config::default_agent_data_root()
-    } else {
-        config::expand_home(&machine.data_root)
-    };
-    let detected_providers =
-        apply_provider_overrides(detect_agent_cli_providers(), &machine.providers);
-    let mut providers = detected_providers
-        .iter()
-        .map(detected_provider_summary)
-        .collect::<Vec<_>>();
-    for provider in &mut providers {
-        provider.actor_count += machine
-            .agents
-            .iter()
-            .filter(|agent| agent.provider_id == provider.id)
-            .count();
-    }
-    let machine_agent_defs = machine
-        .agents
-        .iter()
-        .map(machine_agent_definition)
-        .collect::<Vec<_>>();
-    let provider_specs =
-        provider_specs_from_agent_definitions(&detected_providers, &machine_agent_defs);
-    let agents: Vec<MachineAgentInfo> = provider_specs
-        .into_iter()
-        .flat_map(|provider| provider.into_agent_specs())
-        .map(|spec| {
-            let paths = agent_profile_paths(&data_root, &spec);
-            MachineAgentInfo {
-                info: AgentInfo {
-                    spec,
-                    status: "registered".into(),
-                    pid: None,
-                    session_id: None,
-                },
-                profile_path: config::home_path_expr(&paths.profile),
-                identity_path: config::home_path_expr(&paths.identity),
-                soul_path: config::home_path_expr(&paths.soul),
-            }
-        })
-        .collect();
-    let setup_status = if providers.is_empty() {
-        "noCli"
-    } else if agents.is_empty() {
-        "ready"
-    } else {
-        "configured"
-    };
-    let connection_actor_id = machine_connection_actor_id(machine);
-    let (serve_command, setup_script) = daemon_start_commands(&data_root, server_url, &machine.id);
-
-    Ok(MachineInfo {
-        workspace_id: machine.workspace_id.clone(),
-        owner_actor_id: machine.owner_actor_id.clone(),
-        id: machine.id.clone(),
-        name: machine.name.clone(),
-        kind: machine.kind.clone(),
-        source: "local_config".into(),
-        read_only: false,
-        can_command: false,
-        can_open_local_path: true,
-        capabilities: vec![
-            "inventory.read".into(),
-            "agent.create".into(),
-            "agent.remove".into(),
-            "profile.write".into(),
-            "machine.remove".into(),
-        ],
-        inventory_revision: 0,
-        inventory_observed_at: None,
-        status: setup_status.into(),
-        setup_status: setup_status.into(),
-        connection_status: "notConnected".into(),
-        connection_actor_id,
-        data_root: config::home_path_expr(&data_root),
-        config_dir: config::home_path_expr(&config::config_dir()),
-        agent_count: agents.len(),
-        online_agent_count: 0,
-        providers,
-        agents,
-        serve_command,
-        setup_script,
-    })
-}
-
-struct AgentProfilePaths {
-    profile: PathBuf,
-    identity: PathBuf,
-    soul: PathBuf,
-}
-
-fn agent_profile_paths(data_root: &Path, spec: &AgentSpec) -> AgentProfilePaths {
-    let profile = data_root
+fn agent_profile_path(data_root: &Path, spec: &AgentSpec) -> PathBuf {
+    data_root
         .join("agents")
         .join(&spec.actor.id)
-        .join("profile");
-    let identity_file = spec
-        .identity
-        .as_ref()
-        .map(|identity| identity.files.identity.as_str())
-        .unwrap_or("identity.md");
-    let soul_file = spec
-        .identity
-        .as_ref()
-        .map(|identity| identity.files.soul.as_str())
-        .unwrap_or("soul.md");
-    AgentProfilePaths {
-        identity: resolve_profile_path(&profile, identity_file),
-        soul: resolve_profile_path(&profile, soul_file),
-        profile,
-    }
-}
-
-fn resolve_profile_path(profile: &Path, value: &str) -> PathBuf {
-    let path = Path::new(value);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        profile.join(path)
-    }
-}
-
-fn resolve_machine_agent_profile_file(
-    machine_id: &str,
-    actor_id: &str,
-    file: &str,
-) -> anyhow::Result<PathBuf> {
-    let cfg = config::load_or_init()?;
-    let machine = cfg
-        .machines
-        .iter()
-        .find(|machine| {
-            machine.id == machine_id && config::machine_belongs_to_active_workspace(machine, &cfg)
-        })
-        .ok_or_else(|| anyhow::anyhow!("unknown machine id: {machine_id}"))?;
-    let agent = machine
-        .agents
-        .iter()
-        .find(|agent| agent.actor_id == actor_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown agent actor id: {actor_id}"))?;
-    let file_name = match file.trim() {
-        "identity" => "identity.md",
-        "soul" => "soul.md",
-        other => return Err(anyhow::anyhow!("unknown profile file: {other}")),
-    };
-    let data_root = if machine.data_root.trim().is_empty() {
-        config::default_agent_data_root()
-    } else {
-        config::expand_home(&machine.data_root)
-    };
-    Ok(data_root
-        .join("agents")
-        .join(&agent.actor_id)
         .join("profile")
-        .join(file_name))
-}
-
-fn machine_connection_actor_id(machine: &MachineConfig) -> String {
-    format!("actor_service_{}", machine.id)
 }
 
 fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
@@ -2343,25 +1830,56 @@ fn shell_path_arg(path: &Path) -> String {
     shell_arg(&path.display().to_string())
 }
 
-fn daemon_start_commands(data_root: &Path, server_url: &str, machine_id: &str) -> (String, String) {
+fn daemon_start_commands(
+    data_root: &Path,
+    config_dir: Option<&Path>,
+    server_url: &str,
+    machine_id: &str,
+    machine_name: &str,
+) -> (String, String) {
     let data_root_arg = shell_path_arg(data_root);
+    let config_dir_arg = config_dir.map(shell_path_arg);
     let daemon_bin = preferred_daemon_binary()
         .map(|path| shell_path_arg(&path))
         .unwrap_or_else(|| "loom-daemon".into());
-    let serve_command = format!(
-        "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {}",
-        data_root_arg,
-        daemon_bin,
-        shell_arg(server_url),
-        shell_arg(machine_id),
-    );
+    let serve_command = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
+        format!(
+            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
+            config_dir_arg,
+            data_root_arg,
+            daemon_bin,
+            shell_arg(server_url),
+            shell_arg(machine_id),
+            shell_arg(machine_name),
+        )
+    } else {
+        format!(
+            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
+            data_root_arg,
+            daemon_bin,
+            shell_arg(server_url),
+            shell_arg(machine_id),
+            shell_arg(machine_name),
+        )
+    };
+    let mkdir_args = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
+        format!("{} {}", shell_path_arg(data_root), config_dir_arg)
+    } else {
+        shell_path_arg(data_root)
+    };
+    let config_export = config_dir_arg
+        .as_ref()
+        .map(|config_dir_arg| format!("export LOOM_CONFIG_DIR={config_dir_arg}\n"))
+        .unwrap_or_default();
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\nexport LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {}\n",
-        shell_path_arg(data_root),
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {} --machine-name {}\n",
+        mkdir_args,
+        config_export,
         shell_path_arg(data_root),
         daemon_bin,
         shell_arg(server_url),
         shell_arg(machine_id),
+        shell_arg(machine_name),
     );
     (serve_command, setup_script)
 }
@@ -2437,89 +1955,6 @@ fn detected_provider_summary(provider: &DetectedAgentProvider) -> MachineAgentPr
     }
 }
 
-fn machine_agent_definition(agent: &MachineAgentConfig) -> AgentDefinition {
-    AgentDefinition {
-        provider_id: agent.provider_id.clone(),
-        actor_id: agent.actor_id.clone(),
-        display_name: agent.name.clone(),
-        description: non_empty(agent.description.trim()),
-        model: non_empty(&normalize_model_id_for_provider(
-            &agent.provider_id,
-            &agent.model,
-        )),
-        reasoning_effort: non_empty(agent.reasoning_effort.trim()),
-        autostart: agent.autostart,
-        avatar_url: non_empty(agent.avatar_url.trim()),
-    }
-}
-
-fn update_machine_agent_in_config(args: &AgentUpdateArgs) -> anyhow::Result<Option<AgentInfo>> {
-    let Some(machine_id) = args
-        .machine_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|machine_id| !machine_id.is_empty())
-    else {
-        return Ok(None);
-    };
-
-    let mut cfg = config::load_or_init()?;
-    let active_workspace_id = config::active_workspace_id(&cfg).map(ToString::to_string);
-    let active_owner_actor_id = config::active_owner_actor_id(&cfg);
-    let Some(machine_index) = cfg.machines.iter().position(|machine| {
-        machine.id == machine_id
-            && config::machine_belongs_to_workspace_and_owner(
-                machine,
-                active_workspace_id.as_deref(),
-                active_owner_actor_id.as_deref(),
-            )
-    }) else {
-        return Ok(None);
-    };
-    let Some(agent_index) = cfg.machines[machine_index]
-        .agents
-        .iter()
-        .position(|agent| agent.actor_id == args.actor_id)
-    else {
-        return Ok(None);
-    };
-
-    {
-        let agent = &mut cfg.machines[machine_index].agents[agent_index];
-        if let Some(provider_id) = args.provider_id.as_deref() {
-            agent.provider_id = provider_id.trim().to_string();
-        }
-        if let Some(display_name) = args.display_name.as_deref() {
-            agent.name = display_name.trim().to_string();
-        }
-        if let Some(description) = args.description.as_deref() {
-            agent.description = description.trim().to_string();
-        }
-        if let Some(model) = args.model.as_deref() {
-            agent.model = normalize_model_id_for_provider(&agent.provider_id, model);
-        }
-        agent.model = normalize_model_id_for_provider(&agent.provider_id, &agent.model);
-        if let Some(reasoning_effort) = args.reasoning_effort.as_deref() {
-            agent.reasoning_effort = reasoning_effort.trim().to_string();
-        }
-        if let Some(autostart) = args.autostart {
-            agent.autostart = autostart;
-        }
-        if let Some(avatar_url) = args.avatar_url.as_deref() {
-            agent.avatar_url = avatar_url.trim().to_string();
-        }
-    }
-
-    config::save(&cfg)?;
-    let server_url = active_server_url(&cfg).to_string();
-    let machine = machine_info(&cfg.machines[machine_index], &server_url)?;
-    Ok(machine
-        .agents
-        .into_iter()
-        .find(|agent| agent.info.spec.actor.id == args.actor_id)
-        .map(|agent| agent.info))
-}
-
 fn actor_id_from_input(
     value: &str,
     display_name: &str,
@@ -2575,14 +2010,6 @@ fn truncate_slug(value: &str, max_len: usize) -> String {
     value.chars().take(max_len).collect()
 }
 
-fn non_empty(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 fn slugify(value: &str) -> String {
     let mut out = String::new();
     let mut last_sep = false;
@@ -2617,28 +2044,6 @@ mod tests {
             actor_id: String::new(),
             avatar_url: String::new(),
         })
-    }
-
-    fn test_machine(id: &str, owner_actor_id: Option<&str>, agent_actor_id: &str) -> MachineConfig {
-        MachineConfig {
-            workspace_id: Some("default".into()),
-            owner_actor_id: owner_actor_id.map(ToString::to_string),
-            id: id.into(),
-            name: id.into(),
-            kind: "local".into(),
-            data_root: "~/.agentx".into(),
-            providers: Vec::new(),
-            agents: vec![MachineAgentConfig {
-                provider_id: "codex".into(),
-                actor_id: agent_actor_id.into(),
-                name: agent_actor_id.into(),
-                description: String::new(),
-                model: String::new(),
-                reasoning_effort: String::new(),
-                autostart: false,
-                avatar_url: String::new(),
-            }],
-        }
     }
 
     #[test]
@@ -2695,25 +2100,31 @@ mod tests {
 
     #[test]
     fn daemon_start_command_uses_daemon_binary() {
+        let custom_url = "ws://custom.test/rpc";
         let (serve_command, setup_script) = daemon_start_commands(
             Path::new("/tmp/loom data"),
-            "ws://127.0.0.1:7878/rpc",
+            Some(Path::new("/tmp/loom config")),
+            custom_url,
             "machine_test",
+            "CanfengMac",
         );
 
-        assert!(
-            serve_command.contains("--server ws://127.0.0.1:7878/rpc --machine-id machine_test")
-        );
+        assert!(serve_command.contains(&format!(
+            "--server {custom_url} --machine-id machine_test --machine-name CanfengMac"
+        )));
+        assert!(serve_command.starts_with("LOOM_CONFIG_DIR="));
+        assert!(serve_command.contains("LOOM_AGENT_DATA_ROOT="));
         assert!(!serve_command.contains(" daemon --machine-id "));
+        assert!(setup_script.contains("export LOOM_CONFIG_DIR="));
         assert!(setup_script.contains("LOOM_DAEMON_BIN"));
-        assert!(setup_script.contains(
-            "exec \"$LOOM_DAEMON_BIN\" --server ws://127.0.0.1:7878/rpc --machine-id machine_test"
-        ));
+        assert!(setup_script.contains(&format!(
+            "exec \"$LOOM_DAEMON_BIN\" --server {custom_url} --machine-id machine_test --machine-name CanfengMac"
+        )));
         assert!(!setup_script.contains(" daemon --machine-id "));
     }
 
     #[test]
-    fn actor_list_filter_hides_agents_from_other_machine_owners() {
+    fn actor_list_filter_ignores_agents_without_daemon_inventory() {
         let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
@@ -2725,10 +2136,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![
-                test_machine("mine", Some(account.actor_id.as_str()), "actor_agent_mine"),
-                test_machine("other", Some("actor_human_other"), "actor_agent_other"),
-            ],
         };
         let value = json!({
             "actors": [
@@ -2747,7 +2154,7 @@ mod tests {
             .filter_map(|actor| actor["id"].as_str())
             .collect::<Vec<_>>();
 
-        assert!(actor_ids.contains(&"actor_agent_mine"));
+        assert!(!actor_ids.contains(&"actor_agent_mine"));
         assert!(!actor_ids.contains(&"actor_agent_other"));
         assert!(actor_ids.contains(&"actor_service_other"));
     }
@@ -2761,12 +2168,8 @@ mod tests {
                 id: "default".into(),
                 name: "Local".into(),
                 server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: String::new(),
-                display_name: String::new(),
-            }],
-            machines: vec![MachineConfig {
-                agents: Vec::new(),
-                ..test_machine("machine_remote", Some("actor_human_88084"), "unused")
+                actor_id: "actor_human_88084".into(),
+                display_name: "actor_human_88084".into(),
             }],
         };
         let value = json!({
@@ -2798,11 +2201,17 @@ mod tests {
                             "defaultModel": "gpt-5.5",
                             "modelChoices": []
                         }],
-                        "agents": [{
-                            "providerId": "codex",
-                            "actorId": "actor_remote_agent",
-                            "name": "Remote Agent",
-                            "model": "gpt-5.5",
+                        "agentSpecs": [{
+                            "actor": {
+                                "id": "actor_remote_agent",
+                                "kind": "agent",
+                                "displayName": "Remote Agent"
+                            },
+                            "providerRef": {
+                                "id": "codex",
+                                "mode": "print",
+                                "model": "gpt-5.5"
+                            },
                             "autostart": true
                         }]
                     }
@@ -2837,7 +2246,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_remote",
@@ -2863,14 +2271,20 @@ mod tests {
                     "command": "/usr/bin/claude",
                     "transportKind": "command",
                     "args": ["-p"],
-                    "defaultModel": "claude-sonnet-4-6",
+                    "defaultModel": "claude-sonnet-4.6",
                     "modelChoices": []
                 }],
-                "agents": [{
-                    "providerId": "claude",
-                    "actorId": "actor_remote_agent",
-                    "name": "Remote Agent",
-                    "model": "claude-sonnet-4-6",
+                "agentSpecs": [{
+                    "actor": {
+                        "id": "actor_remote_agent",
+                        "kind": "agent",
+                        "displayName": "Remote Agent"
+                    },
+                    "providerRef": {
+                        "id": "claude",
+                        "mode": "print",
+                        "model": "claude-sonnet-4.6"
+                    },
                     "autostart": true
                 }]
             }
@@ -2919,7 +2333,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_remote",
@@ -2940,7 +2353,7 @@ mod tests {
                 "configDir": "/home/canfeng/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
-                "agents": []
+                "agentSpecs": []
             }
         });
 
@@ -2965,7 +2378,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_other",
@@ -2986,7 +2398,7 @@ mod tests {
                 "configDir": "/home/other/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
-                "agents": []
+                "agentSpecs": []
             }
         });
 
@@ -2999,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn server_machine_inventory_replaces_local_stub_with_same_id() {
+    fn server_machine_inventory_replaces_older_snapshot_with_same_id() {
         let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
@@ -3011,7 +2423,6 @@ mod tests {
                 actor_id: account.actor_id.clone(),
                 display_name: account_display_name(&account),
             }],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_remote",
@@ -3037,26 +2448,31 @@ mod tests {
                     "command": "/usr/bin/claude",
                     "transportKind": "command",
                     "args": ["-p"],
-                    "defaultModel": "claude-sonnet-4-6",
+                    "defaultModel": "claude-sonnet-4.6",
                     "modelChoices": []
                 }],
-                "agents": [{
-                    "providerId": "claude",
-                    "actorId": "actor_remote_agent",
-                    "name": "Remote Agent",
-                    "model": "claude-sonnet-4-6",
+                "agentSpecs": [{
+                    "actor": {
+                        "id": "actor_remote_agent",
+                        "kind": "agent",
+                        "displayName": "Remote Agent"
+                    },
+                    "providerRef": {
+                        "id": "claude",
+                        "mode": "print",
+                        "model": "claude-sonnet-4.6"
+                    },
                     "autostart": true
                 }]
             }
         });
         let server_machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
             .expect("server machine");
-        let mut local_stub = server_machine.clone();
-        local_stub.source = "local_config".into();
-        local_stub.inventory_revision = 0;
-        local_stub.agents.clear();
-        local_stub.agent_count = 0;
-        let mut machines = vec![local_stub];
+        let mut older_snapshot = server_machine.clone();
+        older_snapshot.inventory_revision = 0;
+        older_snapshot.agents.clear();
+        older_snapshot.agent_count = 0;
+        let mut machines = vec![older_snapshot];
 
         upsert_server_machine_info(&mut machines, server_machine);
 
@@ -3076,7 +2492,6 @@ mod tests {
             active: Some("default".into()),
             account: Some(account.clone()),
             workspaces: vec![],
-            machines: vec![],
         };
         let actor = json!({
             "id": "actor_service_machine_abbb0e0b_actor_human_local_ws_abbb0e0b",

@@ -12,7 +12,7 @@ use crate::render;
 
 pub async fn send(
     client: Arc<Client>,
-    _actor_id: String,
+    actor_id: String,
     target: Option<String>,
     to: Option<String>,
     private_to: Vec<String>,
@@ -62,6 +62,15 @@ pub async fn send(
     }
     if let Some(delivery_policy) = delivery_policy {
         params["deliveryPolicy"] = serde_json::to_value(delivery_policy)?;
+    }
+    if let Some(reply_actor_id) = inferred_reply_audience(
+        &target,
+        &actor_id,
+        &body,
+        delivery_policy,
+        std::env::var("LOOM_TRIGGER_ACTOR").ok().as_deref(),
+    ) {
+        params["audience"] = json!([{ "kind": "actor", "id": reply_actor_id }]);
     }
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
@@ -278,12 +287,64 @@ fn parse_message_intent(raw: Option<String>) -> Result<Option<MessageIntent>> {
             "invalid --intent; expected chat, ask, request_action, assign_task, status_update, review, or notify"
         })
     })
-    .transpose()
+        .transpose()
+}
+
+fn inferred_reply_audience<'a>(
+    target: &str,
+    actor_id: &str,
+    body: &str,
+    delivery_policy: Option<DeliveryPolicy>,
+    trigger_actor: Option<&'a str>,
+) -> Option<&'a str> {
+    if delivery_policy != Some(DeliveryPolicy::WakeAgent) {
+        return None;
+    }
+    if !target.trim().starts_with('#') || !target.contains(':') {
+        return None;
+    }
+    if body.contains('@') {
+        return None;
+    }
+    let trigger_actor = trigger_actor
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| *value != actor_id)
+        .filter(|value| value.starts_with("actor_"))?;
+    Some(trigger_actor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn infers_thread_wake_reply_audience_from_trigger_actor() {
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_maker",
+                "偏小，继续猜。",
+                Some(DeliveryPolicy::WakeAgent),
+                Some("actor_agent_guesser"),
+            ),
+            Some("actor_agent_guesser")
+        );
+    }
+
+    #[test]
+    fn explicit_mentions_disable_reply_audience_inference() {
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_maker",
+                "@actor_agent_guesser 偏小，继续猜。",
+                Some(DeliveryPolicy::WakeAgent),
+                Some("actor_agent_guesser"),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn message_ask_params_wake_single_actor() {

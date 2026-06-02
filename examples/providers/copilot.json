@@ -1,0 +1,226 @@
+{
+  "detect": {
+    "candidates": [
+      "copilot",
+      "copilotcli"
+    ]
+  },
+  "displayName": "GitHub Copilot CLI",
+  "id": "copilot",
+  "models": {
+    "choices": [
+      {
+        "id": "gpt-5.5",
+        "label": "GPT-5.5"
+      },
+      {
+        "id": "gpt-5.4",
+        "label": "GPT-5.4"
+      },
+      {
+        "id": "gpt-5.3-codex",
+        "label": "GPT-5.3 Codex"
+      },
+      {
+        "id": "gpt-5.2-codex",
+        "label": "GPT-5.2 Codex"
+      },
+      {
+        "id": "gpt-5.2",
+        "label": "GPT-5.2"
+      },
+      {
+        "id": "gpt-5.1",
+        "label": "GPT-5.1"
+      },
+      {
+        "id": "gpt-5.4-mini",
+        "label": "GPT-5.4 Mini"
+      },
+      {
+        "id": "gpt-5-mini",
+        "label": "GPT-5 Mini"
+      },
+      {
+        "id": "gpt-4.1",
+        "label": "GPT-4.1"
+      },
+      {
+        "id": "claude-sonnet-4.6",
+        "label": "Claude Sonnet 4.6"
+      },
+      {
+        "id": "claude-sonnet-4.5",
+        "label": "Claude Sonnet 4.5"
+      },
+      {
+        "id": "claude-haiku-4.5",
+        "label": "Claude Haiku 4.5"
+      },
+      {
+        "id": "claude-opus-4.7",
+        "label": "Claude Opus 4.7"
+      },
+      {
+        "id": "claude-opus-4.6",
+        "label": "Claude Opus 4.6"
+      },
+      {
+        "id": "claude-opus-4.6-fast",
+        "label": "Claude Opus 4.6 Fast"
+      },
+      {
+        "id": "claude-opus-4.5",
+        "label": "Claude Opus 4.5"
+      },
+      {
+        "id": "claude-sonnet-4",
+        "label": "Claude Sonnet 4"
+      }
+    ],
+    "default": "gpt-5.5"
+  },
+  "modes": {
+    "print": {
+      "args": [
+        "--add-dir",
+        "{agent.configDir}",
+        "--yolo",
+        "--output-format",
+        "json",
+        "--stream",
+        "off",
+        "--resume",
+        "{session.id}",
+        {
+          "args": [
+            "--model",
+            "{model}"
+          ],
+          "when": "model"
+        },
+        {
+          "args": [
+            "--effort",
+            "{reasoningEffort}"
+          ],
+          "when": "reasoningEffort"
+        },
+        "-p",
+        "{prompt.full}"
+      ],
+      "command": "{bin}",
+      "prompt": {
+        "outputs": {
+          "full": {
+            "include": [],
+            "preset": "loom_full",
+            "required": []
+          }
+        }
+      },
+      "session": {
+        "idSource": "loom_uuid",
+        "resumeArgs": [
+          "--add-dir",
+          "{agent.configDir}",
+          "--yolo",
+          "--output-format",
+          "json",
+          "--stream",
+          "off",
+          "--resume",
+          "{session.id}",
+          {
+            "args": [
+              "--model",
+              "{model}"
+            ],
+            "when": "model"
+          },
+          {
+            "args": [
+              "--effort",
+              "{reasoningEffort}"
+            ],
+            "when": "reasoningEffort"
+          },
+          "-p",
+          "{prompt.full}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "events": [],
+        "format": "jsonl",
+        "reduce": {
+          "finalText": {
+            "fallback": {
+              "mode": "concat",
+              "path": "$.data.deltaContent",
+              "when": {
+                "all": [
+                  {
+                    "all": [],
+                    "any": [],
+                    "equals": "assistant.message_delta",
+                    "path": "$.type"
+                  },
+                  {
+                    "absentOrNull": true,
+                    "all": [],
+                    "any": [],
+                    "path": "$.agentId"
+                  },
+                  {
+                    "absentOrNull": true,
+                    "all": [],
+                    "any": [],
+                    "path": "$.data.parentToolCallId"
+                  }
+                ],
+                "any": []
+              }
+            },
+            "mode": "lastNonEmpty",
+            "path": "$.data.content",
+            "when": {
+              "all": [
+                {
+                  "all": [],
+                  "any": [],
+                  "equals": "assistant.message",
+                  "path": "$.type"
+                },
+                {
+                  "absentOrNull": true,
+                  "all": [],
+                  "any": [],
+                  "path": "$.agentId"
+                },
+                {
+                  "absentOrNull": true,
+                  "all": [],
+                  "any": [],
+                  "path": "$.data.parentToolCallId"
+                },
+                {
+                  "all": [],
+                  "any": [],
+                  "notIn": [
+                    "thinking",
+                    "reasoning"
+                  ],
+                  "path": "$.data.phase"
+                }
+              ],
+              "any": []
+            }
+          }
+        }
+      },
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

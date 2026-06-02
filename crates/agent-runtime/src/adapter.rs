@@ -77,10 +77,32 @@ pub trait Adapter: Send + Sync {
 pub struct AdapterPrompt {
     pub scope: ScopeRef,
     pub content: String,
+    pub parts: Vec<PromptPart>,
+    pub outputs: BTreeMap<String, String>,
     pub model: Option<String>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub template_vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptPart {
+    pub key: String,
+    pub title: String,
+    /// Provider-facing body without the Loom section title. Provider manifests
+    /// decide whether to render `title` via `renderTitle`.
+    pub content: String,
+    /// Legacy/full-prompt body as it appeared in the composed Loom envelope.
+    /// This lets callers preserve the old envelope string while exposing raw
+    /// parts to provider prompt rendering.
+    pub rendered_content: String,
+    pub role_hint: PromptRoleHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRoleHint {
+    System,
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

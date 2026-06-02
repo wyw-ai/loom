@@ -1,0 +1,190 @@
+{
+  "detect": {
+    "candidates": [
+      "claude"
+    ]
+  },
+  "displayName": "Claude Code",
+  "id": "claude",
+  "models": {
+    "choices": [
+      {
+        "id": "sonnet",
+        "label": "Sonnet"
+      },
+      {
+        "id": "opus",
+        "label": "Opus"
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "label": "Claude Sonnet 4.6"
+      },
+      {
+        "id": "claude-opus-4-7",
+        "label": "Claude Opus 4.7"
+      },
+      {
+        "id": "claude-haiku-4-5",
+        "label": "Claude Haiku 4.5"
+      }
+    ],
+    "default": "sonnet"
+  },
+  "modes": {
+    "nonprint": {
+      "args": [
+        "--add-dir",
+        "{agent.configDir}"
+      ],
+      "command": "{bin}",
+      "interactive": {
+        "completion": {
+          "detect": "sentinel",
+          "idleTimeoutMs": 60000,
+          "maxTurnMs": 3600000,
+          "stripSentinel": true
+        },
+        "kill": {
+          "onCancel": {
+            "action": "sigterm",
+            "fallback": "sigkill",
+            "graceMs": 1000
+          },
+          "onComplete": {
+            "action": "sigterm",
+            "fallback": "sigkill",
+            "graceMs": 3000
+          },
+          "onTimeout": {
+            "action": "sigkill"
+          }
+        },
+        "output": {
+          "stderr": "trace",
+          "streamPartial": true,
+          "stripAnsi": true
+        },
+        "prompt": {
+          "completionContract": {
+            "instruction": "When your final user-visible answer is complete, output __LOOM_DONE__ on a line by itself. Do not output anything after it.",
+            "sentinel": "__LOOM_DONE__"
+          },
+          "template": "{loom_envelope}"
+        },
+        "session": {
+          "idStrategy": "loom_uuid_per_scope",
+          "newArgs": [
+            "--permission-mode",
+            "bypassPermissions",
+            "{prompt}",
+            "--session-id",
+            "{session_id}"
+          ],
+          "onMissing": "create",
+          "onResumeFailed": "fail",
+          "onSignatureChanged": "create",
+          "resumeArgs": [
+            "--permission-mode",
+            "bypassPermissions",
+            "{prompt}",
+            "--resume",
+            "{session_id}"
+          ]
+        }
+      },
+      "modelArgs": [
+        "--model",
+        "{model}"
+      ],
+      "provider": {
+        "kind": "claude",
+        "settings": {
+          "mode": "global"
+        }
+      },
+      "stdout": {
+        "events": [],
+        "format": "text"
+      },
+      "transport": "interactive_command"
+    },
+    "print": {
+      "args": [
+        "--add-dir",
+        "{agent.configDir}",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "{session.id}",
+        {
+          "args": [
+            "--model",
+            "{model}"
+          ],
+          "when": "model"
+        },
+        "--append-system-prompt",
+        "{prompt.system}",
+        "-p",
+        "{prompt.user}"
+      ],
+      "command": "{bin}",
+      "prompt": {
+        "outputs": {
+          "full": {
+            "include": [],
+            "preset": "loom_full",
+            "required": []
+          },
+          "system": {
+            "include": [],
+            "preset": "loom_system",
+            "required": []
+          },
+          "user": {
+            "include": [],
+            "preset": "loom_turn",
+            "required": []
+          }
+        }
+      },
+      "session": {
+        "idSource": "loom_uuid",
+        "resumeArgs": [
+          "--add-dir",
+          "{agent.configDir}",
+          "--permission-mode",
+          "bypassPermissions",
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--resume",
+          "{session.id}",
+          {
+            "args": [
+              "--model",
+              "{model}"
+            ],
+            "when": "model"
+          },
+          "--append-system-prompt",
+          "{prompt.system}",
+          "-p",
+          "{prompt.user}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "events": [],
+        "format": "builtin",
+        "name": "claude_stream_json"
+      },
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

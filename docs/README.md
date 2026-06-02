@@ -12,6 +12,7 @@
 - [command-transport-v0.md](./command-transport-v0.md) —— Command Transport 协议规范（已落地）
 - [interactive-command-agent-transport-design.md](./interactive-command-agent-transport-design.md) —— interactive command transport 设计
 - [gui-desktop-design.md](./gui-desktop-design.md) —— Loom Desktop GUI 设计与设计 token 来源
+- [gui-actor-provider-management-design.md](./gui-actor-provider-management-design.md) —— GUI 中 actor / provider / host runtime 维护的目标架构、现状差距与落地路线
 - [protocol/task-workflow.md](./protocol/task-workflow.md) —— channel 顶层消息上的 task / assignment 闭环模型和 CLI/RPC 用法
 - [protocol/agent-coordination-workflow.md](./protocol/agent-coordination-workflow.md) —— 多 agent “开工前 claim，发送前 rebase”的协作协议
 

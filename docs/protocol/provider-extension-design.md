@@ -16,8 +16,8 @@ Provider manifest 时忽略 Loom 原有能力。
 | daemon machine 配置 | 只保存 daemon 自己上线和运行所需的宿主信息 | daemon 拥有本机 provider registry、AgentSpec、profile/memory 与运行状态；GUI/server 不直接写 daemon 私有配置。 |
 | GUI 本地 machine/agent 配置 | 删除运行时意义 | GUI 只保存人类客户端偏好和 server 连接选择；agent/provider 列表来自 server 上的 daemon inventory，修改必须变成 machine command。 |
 | machine-level provider override | 收敛为 daemon-local ProviderManifest variant | 如果某台 host 需要特殊 command/args/env，用该 daemon 的 `{loom.configDir}/providers/<id>.json` + `extends` 表达。 |
-| prompt 拼装 | 从单一 envelope 改成结构化 prompt parts | Loom 仍负责生成 actor context、Loom 规则、current state、message/task context；Provider 只决定这些 parts 怎么映射到 system/user/full。 |
-| agent workspace `.loom` prompt 文件 | 新增可选输入源 | ProviderManifest 可以声明它支持读取当前 agent workspace 下 `.loom/<path>` 的哪些文件；daemon composer 读取后转成普通 prompt part，仍由 `prompt.outputs` 决定是否注入 system/user/full。 |
+| prompt 拼装 | 从单一 envelope 改成结构化 prompt parts | Loom 仍负责生成 actor context、Loom 规则、current state、message/task context；AgentSpec.promptAssembly 决定这些 parts 怎么映射到 system/user/full。 |
+| agent profile/workspace prompt 文件 | 新增 agent-owned 输入源 | AgentSpec.promptAssembly 声明读取 profile、scope workspace 或 bundle 中的哪些文件；ProviderManifest 不读取这些文件，也不决定 include 顺序。 |
 | handoff/task 触发语义 | 不改变 | `trigger_prefix`、`promptTemplate`、latest message、assignment context 仍由 Loom composer 产生；manifest 不能自己改写业务语义。 |
 | run trace 与 GUI 可见消息 | 不改变 | Provider stdout 仍进 run trace；GUI 可见消息仍来自 agent 显式 `loom message send`，或部署显式开启的 auto-publish。 |
 | AdapterEvent 边界 | 不改变 | `Text/ToolUse/Status/Finished/Error/ActionRequest` 仍是 adapter 到 Loom runtime 的公共事件；Provider session 捕获是 Provider runtime 内部事件，不扩展 GUI message 语义。 |
@@ -51,16 +51,17 @@ Provider 的契约应该显式表达两个点：
    文本、工具、状态、错误和完成事件再映射成现有 AdapterEvent。
 
 这里的“prompt”不应该只是一个已经拼死的单一大字符串。Loom 应该先
-产出一组结构化 prompt parts，再由 Provider 决定这些 parts 如何组合、哪些进入
-system prompt、哪些进入 user prompt、是否插入分隔符、顺序如何排列。
+产出一组结构化 prompt parts，再由 AgentSpec 的 `promptAssembly` 决定这些 parts
+如何组合、哪些进入 system prompt、哪些进入 user prompt、是否插入分隔符、顺序如何排列。
 
 ## Loom 顶层边界
 
 Loom 仍然拥有 prompt 内容生成逻辑。ProviderManifest 不负责自己生成 actor metadata、
-memory、handoff 或 assignment 内容。daemon 会先生成一组结构化 prompt parts，
-例如 actor context、Loom 规则、当前时间、最近消息、
-最新 handoff/task message 等。Provider 负责决定这些 parts 的顺序、拼接方式，
-以及它们映射到 Provider 的 system/user prompt、argv、stdin 或 env 中哪个位置。
+memory、handoff 或 assignment 内容，也不负责决定 agent prompt parts 的 include 顺序。
+daemon 会先生成一组结构化 prompt parts，例如 actor context、Loom 规则、当前时间、
+最近消息、最新 handoff/task message 等。AgentSpec.promptAssembly 负责把这些 parts
+渲染成 `prompt.system`、`prompt.user`、`prompt.full` 等输出；ProviderManifest 只负责
+声明这些输出如何进入 Provider 的 argv、stdin、env 或 interactive prompt template。
 
 Provider stdout 默认仍然只进入 run trace。Provider 结果是否成为 GUI 可见消息，
 应继续由 Loom 策略决定：默认必须由 agent 显式调用 `loom message send`；只有
@@ -111,27 +112,6 @@ inventory 的是目标 daemon。即使 GUI 和 daemon 在同一台机器，也�
     "print": {
       "transport": "command",
       "command": "{bin}",
-      "prompt": {
-        "workspaceFiles": [
-          {
-            "key": "persona",
-            "path": "persona.md",
-            "title": "System: Provider persona",
-            "roleHint": "system",
-            "optional": true,
-            "maxBytes": 32768
-          }
-        ],
-        "outputs": {
-          "system": {
-            "join": "\n\n",
-            "include": ["actor_context", "agent_instructions", "workspace_file.persona", "scope_bootstrap"]
-          },
-          "user": {
-            "preset": "loom_turn"
-          }
-        }
-      },
       "args": [
         "--add-dir", "{agent.configDir}",
         "--permission-mode", "bypassPermissions",
@@ -162,15 +142,10 @@ inventory 的是目标 daemon。即使 GUI 和 daemon 在同一台机器，也�
 }
 ```
 
-关键点是 `modes.print.args` 表达完整 argv 模板，同时 `modes.print.prompt.outputs`
-表达 prompt parts 的组合方式。manifest 可以把 `{prompt.system}`、
-`{prompt.user}`、`{prompt.full}` 或任意命名 prompt 输出放在任意位置，因此 Loom
-不再需要对 `-p`、末尾追加 prompt、stdin 或 env prompt 做 provider 特殊逻辑。
-`prompt.workspaceFiles` 是可选能力：Provider 可以声明自己认识哪些
-`{paths.cwd}/.loom/<path>` 文件。daemon composer 在每个 turn 渲染 prompt 前读取这些
-文件，把存在的文件转成 `workspace_file.<key>` prompt part，然后仍然交给
-`prompt.outputs` 的 `include` / `template` / `preset` 组合。Provider 不能借这个机制
-任意读 workspace 文件；它只能读取 manifest 明确声明且通过校验的 `.loom` 相对路径。
+关键点是 `modes.print.args` 表达完整 argv 模板。manifest 可以把 `{prompt.system}`、
+`{prompt.user}`、`{prompt.full}` 放在任意位置，因此 Loom 不再需要对 `-p`、末尾追加
+prompt、stdin 或 env prompt 做 provider 特殊逻辑。prompt parts 的组合方式不在
+ProviderManifest 中维护，而由具体 AgentSpec 的 `promptAssembly` 维护。
 
 `models` 只描述 UI 和默认模型选择；模型是否进入 CLI 参数，也由 mode 的
 `args`/`env`/`stdin` 模板显式决定。也就是说，`--model {model}` 不应该藏在
@@ -217,7 +192,7 @@ Loom prompt composer 应输出结构化 parts，而不是只输出一个字符�
 ```text
 actor_context       Loom 注入的 actor id/displayName 和当前 actor 上下文
 agent_instructions  AgentSpec 的静态 instructions，属于 system-side prompt part
-workspace_file.*    ProviderManifest 声明的 agent workspace `.loom` 文件内容
+file.*              AgentSpec.promptAssembly 声明的 profile / scope workspace prompt 文件内容
 trigger_prefix      AgentSpec triggerPromptPrefix
 bootstrap_memory    长期/启动 memory
 scope_bootstrap     Loom CLI、协作规则、当前 scope 等首轮规则
@@ -235,19 +210,20 @@ agent 的静态行为说明属于 `AgentSpec.instructions`，展示名、头像�
 identity/soul 文件如需保留，只能由显式迁移工具转换成新的 metadata 或 memory，runtime
 不再把它们作为默认 prompt part 读取。
 
-但 Provider 可以显式声明自己的 workspace prompt 文件。这个能力用于兼容“某个
-Provider/agent 生态希望在 workspace 里维护 persona、policy、soul、identity、
-project note 等文件”的场景，同时不把这些名字做成 Loom 标准字段。
+Agent Prompt Assembly 可以显式声明自己的 profile、scope workspace 或 bundle prompt
+文件。这个能力用于兼容“某个 agent 希望维护 persona、policy、project note 等文件”的
+场景，同时不把这些名字做成 Loom 标准字段，也不让 ProviderManifest 接管 agent 个性。
 
-建议 schema 放在 mode 的 `prompt.workspaceFiles` 下：
+建议 schema 放在 `AgentSpec.promptAssembly` 下：
 
 ```json
 {
-  "prompt": {
-    "workspaceFiles": [
+  "promptAssembly": {
+    "files": [
       {
         "key": "persona",
-        "path": "persona.md",
+        "root": "profile",
+        "path": "prompts/persona.md",
         "title": "System: Persona",
         "roleHint": "system",
         "optional": true,
@@ -255,7 +231,8 @@ project note 等文件”的场景，同时不把这些名字做成 Loom 标准�
       },
       {
         "key": "operating_rules",
-        "path": "rules/operating.md",
+        "root": "scopeWorkspace",
+        "path": ".loom/rules/operating.md",
         "title": "System: Operating rules",
         "roleHint": "system",
         "optional": true,
@@ -265,14 +242,14 @@ project note 等文件”的场景，同时不把这些名字做成 Loom 标准�
     "outputs": {
       "system": {
         "join": "\n\n",
-        "include": [
-          "actor_context",
-          "agent_instructions",
-          "workspace_file.persona",
-          "workspace_file.operating_rules",
-          "scope_bootstrap"
-        ]
-      },
+          "include": [
+            "actor_context",
+            "agent_instructions",
+            "file.persona",
+            "file.operating_rules",
+            "scope_bootstrap"
+          ]
+        },
       "user": {
         "preset": "loom_turn"
       }
@@ -283,17 +260,18 @@ project note 等文件”的场景，同时不把这些名字做成 Loom 标准�
 
 运行时规则：
 
-- daemon 在 resolve 出 Provider mode 后、渲染 `prompt.outputs` 前，读取当前 turn 的
-  agent workspace 下 `{paths.cwd}/.loom/<path>`。
-- 每个声明项生成一个普通 prompt part，key 固定为 `workspace_file.<key>`。Provider
-  后续用 `include` 或 `template` 引用它，例如 `{workspace_file.persona}`。
+- daemon 在启动 worker 和 preview 时使用同一套 Agent Prompt Assembly renderer。
+- 每个声明项生成一个普通 prompt part，key 固定为 `file.<key>`。Assembly
+  后续用 `include` 或 `template` 引用它，例如 `{file.persona}`。
+- `root=profile` 读取当前 agent 的长期 profile 目录；`root=scopeWorkspace` 读取当前
+  channel/thread 工作目录；`root=bundle` 读取已安装 bundle 中的只读 prompt 文件。
 - `optional` 默认是 `true`。文件不存在且 `optional=true` 时该 part 自动跳过；
   `optional=false` 时本轮启动失败并给出配置错误。
 - `maxBytes` 默认是 `32768`，只限制单个声明文件的 UTF-8 文本内容。
-- 读取内容作为 raw content；标题来自 manifest 的 `title`，是否渲染标题仍由
+- 读取内容作为 raw content；标题来自 assembly 的 `title`，是否渲染标题仍由
   `renderTitle` 控制。
 - `roleHint` 默认是 `system`，也只是默认建议。文件是否进入 system/user/full 仍由当前
-  Provider 的 `prompt.outputs` 决定。
+  Agent Prompt Assembly 的 outputs 决定。
 
 第一版只支持显式声明的相对文件路径，不支持随意扫描所有文件进入 prompt。原因是
 prompt 文件会影响模型行为和 token 成本，必须可校验、可解释、顺序稳定。后续如确实
@@ -315,7 +293,7 @@ prompt 文件会影响模型行为和 token 成本，必须可校验、可解释
 决定，避免 Provider 模板里再手写一次标题导致重复。composer 输出 raw content +
 metadata。
 
-Provider manifest 可以把这些 parts 组合成任意命名 prompt 输出。输出支持三种写法：
+Agent Prompt Assembly 可以把这些 parts 组合成命名 prompt 输出。输出支持三种写法：
 
 - `preset`：使用 Loom 内置默认组合，减少每个 Provider 重复维护 part 列表。
 - `include` / `join`：结构化拼接，适合按 part 顺序组合。
@@ -323,7 +301,7 @@ Provider manifest 可以把这些 parts 组合成任意命名 prompt 输出。�
 
 ```json
 {
-  "prompt": {
+  "promptAssembly": {
     "outputs": {
       "system": {
         "preset": "loom_system"
@@ -348,15 +326,16 @@ loom_turn    turn_memory + runtime_context + user_message，承载每轮动态�
 loom_full    loom_system + loom_turn，等价于当前单字符串 envelope 的语义
 ```
 
-preset 不是黑盒。Provider 可以改用 `include` 或 `template` 完全控制顺序；未来 Loom
-新增 part 时，只需要更新 preset，旧 Provider 不会被迫修改 manifest。
-`workspace_file.*` 不应被自动塞进内置 preset；Provider 既然声明了文件槽位，就必须在
-对应 output 里显式 `include` 或用 `template` 引用，避免 workspace 文件因为默认组合
-意外改变模型行为。
+preset 不是黑盒。AgentSpec 可以改用 `include` 或 `template` 完全控制顺序；未来 Loom
+新增 part 时，只需要更新 preset，旧 agent 不会被迫修改 spec。
+`file.*` 不应被自动塞进内置 preset；AgentSpec 既然声明了文件槽位，就必须在对应
+output 里显式 `include` 或用 `template` 引用，避免 prompt 文件因为默认组合意外改变
+模型行为。
 
-如果 manifest 没有声明 `prompt.outputs`，Loom 应自动提供默认输出：
-`full = loom_full`。这样最小自定义 Provider 可以直接引用 `{prompt.full}`。只要
-manifest 显式引用了不存在的 `{prompt.<name>}`，校验就应该失败。
+如果 AgentSpec 没有声明 `promptAssembly.outputs`，Loom 应自动提供默认输出：
+`system = loom_system`、`user = loom_turn`、`full = loom_full`。这样最小自定义 Provider
+可以直接引用 `{prompt.full}`。只要 ProviderManifest 显式引用了不存在的
+`{prompt.<name>}`，校验就应该失败。
 
 `template` 中可以直接引用原子 part：
 
@@ -386,8 +365,8 @@ manifest 显式引用了不存在的 `{prompt.<name>}`，校验就应该失败�
   缺失时报错，应在输出或变量上声明 `required`。
 - `renderTitle` 可以决定是否保留 part 标题，例如 `always`、`never`、`auto`。
 - `required` 可声明某个 part 缺失时启动失败，默认缺失就跳过。
-- `roleHint` 只是 Loom 默认建议，最终 system/user/assistant 映射由 Provider
-  manifest 决定。
+- `roleHint` 只是 Loom 默认建议，最终 system/user/full 映射由 Agent Prompt Assembly
+  决定。
 - `user_message` 是 turn 输入。配置新 Provider 时优先使用 `loom_turn` preset；
   只有在 Provider 明确要接管 turn 文本包装时，才直接引用 `latest_message`、
   `assignment_context`、`turn_input` 或 `trigger_prefix`。
@@ -402,7 +381,7 @@ Provider 的 argv/env/stdin 模板应支持这些运行时变量：
 
 ```text
 {bin}                  检测到的可执行文件路径
-{prompt.<name>}        prompt.outputs 生成的命名 prompt，例如 system/user/full
+{prompt.<name>}        Agent Prompt Assembly 生成的命名 prompt，例如 system/user/full
 {loom.configDir}       目标 daemon 的配置目录；按 host/machine 隔离，不随 GUI 当前 server 切换
 {agent.configDir}      当前 agent 自己的配置目录，通常为 {loom.configDir}/agents/<actor_id>
 {agent.specPath}       当前 agent 的 spec.json，通常为 {agent.configDir}/spec.json
@@ -998,10 +977,10 @@ AgentSpec / spec.json
 | session 策略 | ProviderManifest | `loom_uuid`、`provider_capture`、resumeArgs 都是 Provider 接入规则。 |
 | model choices | ProviderManifest | Provider 给 UI 默认菜单；agent 只记录选中的 model。 |
 | selected model / reasoning effort | AgentSpec 或运行时选择 | 这是具体 agent 的偏好，Provider 只定义如何映射到 argv/env。 |
-| prompt parts 如何进 system/user/full | ProviderManifest | 这是 Provider 接入形态。 |
-| `prompt.workspaceFiles` 声明 | ProviderManifest | Provider 声明它支持读取当前 agent workspace `.loom` 下哪些文件，并把它们命名为 `workspace_file.*` parts。 |
+| prompt parts 如何进 system/user/full | AgentSpec.promptAssembly | 这是具体 agent 的行为组装规则，不是 Provider 接入规则。 |
+| `promptAssembly.files` 声明 | AgentSpec | Agent 声明它读取 profile / scope workspace / bundle 中哪些 prompt 文件，并把它们命名为 `file.*` parts。 |
 | `.loom/<path>` prompt 文件内容 | agent workspace | 文件内容属于当前 agent workspace，由 daemon 在运行时读取；GUI/server 不保存副本，AgentSpec 不复制内容。 |
-| instructions | AgentSpec | 这是具体 agent 的静态行为说明，进入 `agent_instructions` prompt part，并由 ProviderManifest 决定是否落到 system prompt。 |
+| instructions | AgentSpec | 这是具体 agent 的静态行为说明，进入 `agent_instructions` prompt part，并由 Agent Prompt Assembly 决定是否落到 system prompt。 |
 | promptTemplate / trigger_prefix | AgentSpec | 这是具体 agent 的触发语义和任务包装。 |
 | metadata / description | AgentSpec | 这是 actor 的 UI 与调度元信息，不参与 Provider 启动规则。 |
 | memory policy | AgentSpec | 这是具体 agent 是否注入 memory 的策略；memory 内容和索引属于 daemon profile/dataRoot。 |
@@ -1170,8 +1149,6 @@ Provider variant，用 `extends` 继承已有 Provider，再覆盖 mode：
 | `env.unset` | 从 provider env 删除指定 key |
 | `args.append` / `args.prepend` | 在 provider args 前后追加；元素使用同一套 argv item schema，适合安全小改动 |
 | `args.replace` | 整体替换 args；元素使用同一套 argv item schema |
-| `prompt.outputs` | 按 output name 替换或新增；不影响未提到的输出 |
-| `prompt.workspaceFiles` | 整体替换；避免 base provider 和 variant 对同一个 `workspace_file.<key>` 产生冲突 |
 | `stdin` | 覆盖 stdin 模板 |
 | `stdout` / `stderr` parser | 整体替换 |
 | `session` | 整体替换 |
@@ -1194,9 +1171,9 @@ Provider variant，用 `extends` 继承已有 Provider，再覆盖 mode：
 }
 ```
 
-规则是：**运行适配差异和 workspace prompt 文件槽位声明进 ProviderManifest；单个
-actor 的 instructions、metadata、记忆策略、触发和模型偏好进 AgentSpec；workspace
-`.loom` prompt 文件内容跟随 agent workspace；短期进程状态进 runtime state。**
+规则是：**运行适配差异进 ProviderManifest；单个 actor 的 instructions、metadata、
+记忆策略、触发、模型偏好和 promptAssembly 进 AgentSpec；profile / workspace prompt
+文件内容跟随 agent profile 或 scope workspace；短期进程状态进 runtime state。**
 
 ## 安全与校验
 
@@ -1204,14 +1181,14 @@ Provider manifest 使用前必须校验：
 
 - `id` 必须稳定、小写、唯一。
 - schema 必须严格；未知字段必须失败。这个规则同样适用于 `extends` patch 的
-  顶层、mode、args/env/prompt patch 结构，避免 typo 被 merge 阶段静默吞掉。
+  顶层、mode、args/env patch 结构，避免 typo 被 merge 阶段静默吞掉。
 - `command` 必须来自 `detect.candidates` 的解析结果，或者是显式路径。
 - 模板只能引用已知变量，除非开启显式 allow unknown。
-- `prompt.workspaceFiles` 只能声明 `.loom` 下的相对路径；禁止绝对路径、`..`、
-  空路径、控制字符、反斜杠路径分隔符、软链接和平台相关路径逃逸。`key` 必须稳定、
-  小写、唯一，并且只能生成 `workspace_file.<key>` 这一类 prompt part。
-- workspace prompt 文件必须限制大小，第一版建议每个文件默认上限 32 KiB；超限应失败
-  或按 manifest 明确声明的策略截断，不能静默把大文件塞进 prompt。
+- AgentSpec.promptAssembly.files 只能声明 profile、scopeWorkspace 或 bundle 下的相对路径；
+  禁止绝对路径、`..`、空路径、控制字符、反斜杠路径分隔符、软链接和平台相关路径逃逸。
+  `key` 必须稳定、小写、唯一，并且只能生成 `file.<key>` 这一类 prompt part。
+- prompt 文件必须限制大小，第一版建议每个文件默认上限 32 KiB；超限应失败或按
+  AgentSpec 明确声明的策略截断，不能静默把大文件塞进 prompt。
 - command mode 下至少一个 `{prompt.<name>}` 必须出现在
   args/stdin/env 中；如果同一个组合输出被多处引用，必须显式声明允许重复发送。
   ACP mode 例外。
@@ -1236,12 +1213,12 @@ backend API。
 loom provider example
 ```
 
-输出一个详细的通用 ProviderManifest 示例说明，包含配置流程、字段解释、
-`prompt.workspaceFiles` 行为说明，以及一段可复制的 JSON 模板。JSON 模板必须是当前
-schema 可直接 `validate` 的内容，不包含只存在于文档假设里的字段。它展示最小必要
-边界：`detect.candidates`、`modes.print.command/args`、`prompt.workspaceFiles`、
-`prompt.outputs`、stdout parser 和 provider 级 models。默认模板会声明一个可选的
-`.loom/persona.md`，并示范如何用 `workspace_file.persona` 注入到命名 prompt 输出中。
+输出一个详细的通用 ProviderManifest 示例说明，包含配置流程、字段解释，以及一段可复制的
+JSON 模板。JSON 模板必须是当前 schema 可直接 `validate` 的内容，不包含只存在于文档假设里
+的字段。它展示最小必要边界：`detect.candidates`、`modes.print.command/args`、
+stdout parser、provider 级 models，以及如何把 `{prompt.full}` 或 `{prompt.system}` /
+`{prompt.user}` 传给 provider CLI。agent prompt 文件和 include 顺序由 AgentSpec.promptAssembly
+示例另行说明。
 如果调用者需要机器可读的裸 JSON，应使用：
 
 ```bash
@@ -1330,8 +1307,9 @@ local Provider 互不污染。`loom provider list` 在 daemon/CLI 本机执行�
   让 GUI 把 `machines[].agents[]`、provider override 当成可编辑事实源。
 - Provider command/args/env/parser/session 不写在 AgentSpec 里；这些进入目标 daemon 的
   ProviderManifest。host-specific 差异用 daemon-local provider variant 表达。
-- Provider 支持的 workspace prompt 文件只在 ProviderManifest 里声明槽位；具体
-  `.loom/<path>` 文件内容属于当前 agent workspace，server/GUI 不保存、不合并、不反写。
+- Agent 支持的 prompt 文件只在 AgentSpec.promptAssembly 里声明槽位；具体
+  profile / `.loom/<path>` 文件内容属于当前 agent profile 或 scope workspace，
+  server 不保存、不合并，GUI 只能通过 daemon command 读写。
 - 运行期 session id、进程状态和 run 缓存只写 runtime state，不写任何 spec。
 - run trace 和 GUI 可见 message 的边界不变：Provider stdout 进入 run trace；GUI
   可见消息仍来自 agent 显式 `loom message send` 或 Loom 的 auto-publish 策略。
@@ -1353,11 +1331,10 @@ local Provider 互不污染。`loom provider list` 在 daemon/CLI 本机执行�
    `ProviderRuntimePlan` 类型，以及校验测试。
 5. 把内置 Claude/Qoder/Copilot/Codex Provider 编码成 manifest resource，并让 discovery
    从 manifest resolve provider，而不是 match provider id。
-6. 实现 prompt parts composer 和 `prompt.outputs` 渲染，输出 `{prompt.system}`、
+6. 实现 prompt parts composer 和 AgentSpec.promptAssembly 渲染，输出 `{prompt.system}`、
    `{prompt.user}`、`{prompt.full}` 等命名 prompt。
-7. 实现 `prompt.workspaceFiles`：按 ProviderManifest 声明读取当前 agent workspace
-   `.loom` 下的文件，生成 `workspace_file.*` prompt parts，再进入同一套
-   `prompt.outputs` 渲染链路。
+7. 实现 `promptAssembly.files`：按 AgentSpec 声明读取 profile / scope workspace / bundle
+   下的文件，生成 `file.*` prompt parts，再进入同一套 Agent Prompt Assembly 渲染链路。
 8. 实现 argv/env/stdin 模板展开、条件 args、`loom_uuid` / `provider_capture` session
    策略，并让 decoder 产出的 `ProviderRuntimeEvent::Session` 写入 runtime session
    store。

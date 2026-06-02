@@ -2,7 +2,12 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
+  AgentFileListResult,
+  AgentFileReadResult,
+  AgentFileRoot,
+  AgentFileWriteResult,
   AgentInfo,
+  AgentPromptPreviewResult,
   Actor,
   AudienceRef,
   Channel,
@@ -333,6 +338,8 @@ export async function machineAgentCreate(args: {
   actorId?: string;
   name: string;
   description?: string;
+  instructions?: string;
+  promptAssembly?: Record<string, unknown>;
   model?: string;
   reasoningEffort?: string;
   autostart?: boolean;
@@ -346,6 +353,8 @@ export async function agentUpdate(args: {
   actorId: string;
   displayName?: string;
   description?: string;
+  instructions?: string;
+  promptAssembly?: Record<string, unknown> | null;
   providerId?: string;
   model?: string;
   reasoningEffort?: string;
@@ -353,6 +362,67 @@ export async function agentUpdate(args: {
   avatarUrl?: string;
 }): Promise<AgentInfo> {
   return invoke("agent_update", { args });
+}
+
+export async function agentPromptPreview(args: {
+  machineId: string;
+  actorId: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+  sampleMessage?: string;
+  promptAssembly?: Record<string, unknown>;
+}): Promise<AgentPromptPreviewResult> {
+  return invoke("agent_prompt_preview", { args });
+}
+
+export async function agentFileList(args: {
+  machineId: string;
+  actorId: string;
+  root: AgentFileRoot;
+  prefix?: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+}): Promise<AgentFileListResult> {
+  return invoke("agent_file_list", { args });
+}
+
+export async function agentFileRead(args: {
+  machineId: string;
+  actorId: string;
+  root: AgentFileRoot;
+  path: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+  maxBytes?: number;
+}): Promise<AgentFileReadResult> {
+  return invoke("agent_file_read", { args });
+}
+
+export async function agentFileWrite(args: {
+  machineId: string;
+  actorId: string;
+  root: AgentFileRoot;
+  path: string;
+  content: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+}): Promise<AgentFileWriteResult> {
+  return invoke("agent_file_write", { args });
+}
+
+export async function providerAdd(args: {
+  machineId: string;
+  manifest: Record<string, unknown>;
+  replace?: boolean;
+}): Promise<unknown> {
+  return invoke("provider_add", { args });
+}
+
+export async function providerRemove(args: {
+  machineId: string;
+  providerId: string;
+}): Promise<unknown> {
+  return invoke("provider_remove", { args });
 }
 
 export async function machineAgentRemove(params: {

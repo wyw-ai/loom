@@ -5,6 +5,8 @@ import type {
   AgentInfo,
   Actor,
   AudienceRef,
+  Artifact,
+  ArtifactReadResult,
   Channel,
   DesktopConfig,
   DeliveryPolicy,
@@ -267,6 +269,27 @@ export async function deliveryAck(params: {
   sourceId: string;
 }): Promise<unknown> {
   return invoke("delivery_ack", { params });
+}
+
+export async function artifactGet(params: {
+  artifactId?: string;
+  artifactUri?: string;
+}): Promise<{ artifact: Artifact }> {
+  return invoke("artifact_get", { params });
+}
+
+export async function artifactRead(params: {
+  artifactId: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<ArtifactReadResult> {
+  return invoke("artifact_read", {
+    params: {
+      artifactId: params.artifactId,
+      offset: params.offset ?? 0,
+      maxBytes: params.maxBytes ?? 65536,
+    },
+  });
 }
 
 export async function taskList(params?: {

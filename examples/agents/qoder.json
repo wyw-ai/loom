@@ -1,23 +1,14 @@
 {
-  "provider": {
+  "actor": {
+    "id": "actor_qoder",
+    "kind": "agent",
+    "displayName": "Qoder"
+  },
+  "instructions": "Use Loom message commands for visible replies and handoffs. Keep work scoped to the current channel or thread.",
+  "providerRef": {
     "id": "qoder",
-    "displayName": "Qoder ACP"
+    "mode": "print",
+    "model": "auto"
   },
-  "transport": {
-    "kind": "acp_stdio",
-    "command": "npx",
-    "args": [
-      "-y",
-      "@qoder-ai/qodercli@0.1.48",
-      "--acp"
-    ],
-    "env": {}
-  },
-  "actors": [
-    {
-      "id": "actor_qoder",
-      "displayName": "Qoder",
-      "capabilities": {}
-    }
-  ]
+  "autostart": false
 }

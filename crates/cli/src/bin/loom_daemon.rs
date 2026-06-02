@@ -13,6 +13,9 @@ struct Args {
     /// workspace's first machine.
     #[arg(long = "machine-id", env = "LOOM_MACHINE_ID")]
     machine_id: Option<String>,
+    /// Human-readable daemon host name stored in daemon.toml.
+    #[arg(long = "machine-name", env = "LOOM_MACHINE_NAME")]
+    machine_name: Option<String>,
     /// Override the daemon data root. Defaults to the machine data root.
     #[arg(long = "data-root", env = "LOOM_AGENT_DATA_ROOT")]
     data_root: Option<PathBuf>,
@@ -48,9 +51,9 @@ struct Args {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
-    let cfg = loom_cli::config::resolve(args.server.clone(), None, None)?;
     loom_cli::cmd::daemon::run(
         args.machine_id,
+        args.machine_name,
         args.data_root,
         args.allow_actors,
         args.list_providers,
@@ -59,7 +62,7 @@ async fn main() -> Result<()> {
         args.no_services,
         args.socket,
         args.no_ipc,
-        cfg.server_url,
+        args.server,
     )
     .await
 }
@@ -88,6 +91,8 @@ mod tests {
             "machine_a",
             "--data-root",
             "/tmp/loom-daemon-test",
+            "--machine-name",
+            "Test Mac",
             "--allow-actors",
             "actor_a,actor_b",
             "--services",
@@ -103,6 +108,7 @@ mod tests {
 
         assert_eq!(args.server.as_deref(), Some("ws://127.0.0.1:9/rpc"));
         assert_eq!(args.machine_id.as_deref(), Some("machine_a"));
+        assert_eq!(args.machine_name.as_deref(), Some("Test Mac"));
         assert_eq!(
             args.data_root.as_deref(),
             Some(std::path::Path::new("/tmp/loom-daemon-test"))

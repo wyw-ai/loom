@@ -833,6 +833,14 @@ mod tests {
             .store
             .create_channel("private delivery".into(), None)
             .expect("channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_alice")
+            .expect("grant alice");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_bob")
+            .expect("grant bob");
         let scope = ScopeRef {
             kind: ScopeKind::Channel,
             id: channel.id.clone(),
@@ -899,6 +907,14 @@ mod tests {
             .store
             .create_channel("tasks".into(), None)
             .expect("channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_human")
+            .expect("grant human");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_agent")
+            .expect("grant agent");
         let source = state
             .store
             .append_message(

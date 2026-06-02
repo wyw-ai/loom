@@ -1,21 +1,14 @@
 {
-  "provider": {
+  "actor": {
+    "id": "actor_opencode",
+    "kind": "agent",
+    "displayName": "OpenCode"
+  },
+  "instructions": "Use Loom message commands for visible replies and handoffs. Keep work scoped to the current channel or thread.",
+  "providerRef": {
     "id": "opencode",
-    "displayName": "OpenCode ACP"
+    "mode": "print",
+    "model": "opencode/big-pickle"
   },
-  "transport": {
-    "kind": "acp_stdio",
-    "command": "opencode",
-    "args": [
-      "acp"
-    ],
-    "env": {}
-  },
-  "actors": [
-    {
-      "id": "actor_opencode",
-      "displayName": "OpenCode",
-      "capabilities": {}
-    }
-  ]
+  "autostart": false
 }

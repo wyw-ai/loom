@@ -1835,6 +1835,11 @@ pub struct AgentTransport {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Provider-manifest argv template preserving conditional arg fragments.
+    /// When present, command runtime expands this instead of the legacy
+    /// string-only `args` + `modelArgs` bridge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "argSpecs")]
+    pub arg_specs: Vec<ProviderArgSpec>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1862,10 +1867,30 @@ pub struct AgentTransport {
         rename = "outputFormat"
     )]
     pub output_format: Option<CommandOutputFormat>,
+    /// Full provider decoder spec retained after ProviderManifest resolution.
+    /// `outputFormat` is the legacy adapter selector; decoder carries
+    /// manifest-driven reducers such as JSONL finalText extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder: Option<ProviderDecoderSpec>,
+    /// Optional stderr provider decoder retained after ProviderManifest
+    /// resolution. This lets provider-owned stderr protocols emit trace events
+    /// or capture sessions without overloading stdout semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "stderr")]
+    pub stderr_decoder: Option<ProviderDecoderSpec>,
     /// How the prompt text is delivered to the subprocess. Defaults to `args`
     /// (appended after `args` as the final argv token).
     #[serde(default, rename = "promptVia")]
     pub prompt_via: PromptVia,
+    /// Provider-owned prompt rendering rules. When present, the runtime first
+    /// composes Loom prompt parts, renders these named outputs, and then
+    /// exposes them to argv/env/stdin templates as `{prompt.<name>}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ProviderPromptSpec>,
+    /// Optional stdin template for command transports. This is the manifest
+    /// driven replacement for `promptVia = stdin`; it can reference any runtime
+    /// variable including `{prompt.full}` or `{prompt.user}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
     /// Optional hard timeout for one command-transport turn. When exceeded the
     /// daemon cancels the subprocess and fails the turn so later triggers can
     /// drain instead of being stranded behind a hung CLI.
@@ -1889,6 +1914,56 @@ pub struct AgentTransport {
     pub provider: Option<InteractiveProviderSpec>,
 }
 
+impl Default for AgentTransport {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            arg_specs: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            auth_method: None,
+            model: None,
+            model_args: Vec::new(),
+            session: None,
+            output_format: None,
+            decoder: None,
+            stderr_decoder: None,
+            prompt_via: PromptVia::default(),
+            prompt: None,
+            stdin: None,
+            timeout_ms: None,
+            idle_timeout_ms: None,
+            interactive: None,
+            provider: None,
+        }
+    }
+}
+
+impl AgentTransport {
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_empty()
+            && self.command.is_empty()
+            && self.args.is_empty()
+            && self.arg_specs.is_empty()
+            && self.env.is_empty()
+            && self.auth_method.is_none()
+            && self.model.is_none()
+            && self.model_args.is_empty()
+            && self.session.is_none()
+            && self.output_format.is_none()
+            && self.decoder.is_none()
+            && self.stderr_decoder.is_none()
+            && self.prompt_via == PromptVia::default()
+            && self.prompt.is_none()
+            && self.stdin.is_none()
+            && self.timeout_ms.is_none()
+            && self.idle_timeout_ms.is_none()
+            && self.interactive.is_none()
+            && self.provider.is_none()
+    }
+}
+
 /// Bookkeeping rules for `transport.kind = "command"`. Both fields together let
 /// the adapter resume an existing session (`first_run_capture` extracts a
 /// session id from the very first invocation; `resume_args` is the argv
@@ -1896,6 +1971,14 @@ pub struct AgentTransport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSession {
+    /// How Loom obtains the session id before launching a command. `loom_uuid`
+    /// means Loom generates and stores a stable UUID for the actor/scope.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idSource")]
+    pub id_source: Option<CommandSessionIdSource>,
+    /// Session reuse boundary. Defaults to `actor_scope`, matching the legacy
+    /// command transport behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// DSL: `stdout_json:<jq-style-path>`, `stdout_json_any:<path>|<path>`,
     /// `stderr_regex:<re>`, `file:<path>`. `None` means this CLI does not
     /// expose a resumable session.
@@ -1905,6 +1988,331 @@ pub struct CommandSession {
     /// `{prompt}`. `None` means resume is not supported (each call is a first run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_args: Option<Vec<String>>,
+    /// Provider-manifest resume argv template preserving conditional arg
+    /// fragments. When present, command runtime expands this instead of
+    /// string-only `resumeArgs`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "resumeArgSpecs"
+    )]
+    pub resume_arg_specs: Vec<ProviderArgSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSessionIdSource {
+    LoomUuid,
+    ProviderCapture,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderManifest {
+    #[serde(default = "default_provider_schema_version")]
+    pub schema_version: u32,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub detect: ProviderDetectSpec,
+    #[serde(default)]
+    pub modes: std::collections::BTreeMap<String, ProviderModeSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelSpec>,
+}
+
+fn default_provider_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDetectSpec {
+    #[serde(default)]
+    pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderModeSpec {
+    #[serde(default = "default_provider_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<ProviderArgSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "modelArgs")]
+    pub model_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ProviderPromptSpec>,
+    #[serde(default)]
+    pub stdout: ProviderDecoderSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<ProviderDecoderSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ProviderSessionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "idleTimeoutMs"
+    )]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<InteractiveCommandSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<InteractiveProviderSpec>,
+}
+
+fn default_provider_transport() -> String {
+    "command".into()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ProviderArgSpec {
+    Literal(String),
+    Conditional(ProviderConditionalArgSpec),
+}
+
+impl<'de> Deserialize<'de> for ProviderArgSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(value) => Ok(Self::Literal(value)),
+            serde_json::Value::Object(_) => ProviderConditionalArgSpec::deserialize(value)
+                .map(Self::Conditional)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "provider arg must be a string or conditional object",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConditionalArgSpec {
+    pub when: String,
+    #[serde(default)]
+    pub args: Vec<ProviderArgSpec>,
+}
+
+impl Default for ProviderArgSpec {
+    fn default() -> Self {
+        Self::Literal(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderPromptSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_files: Vec<ProviderWorkspaceFileSpec>,
+    #[serde(default)]
+    pub outputs: std::collections::BTreeMap<String, ProviderPromptOutputSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderWorkspaceFileSpec {
+    pub key: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "roleHint")]
+    pub role_hint: Option<ProviderPromptRoleHint>,
+    #[serde(default = "default_provider_workspace_file_optional")]
+    pub optional: bool,
+    #[serde(default = "default_provider_workspace_file_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_provider_workspace_file_optional() -> bool {
+    true
+}
+
+fn default_provider_workspace_file_max_bytes() -> u64 {
+    32 * 1024
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderPromptOutputSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "renderTitle"
+    )]
+    pub render_title: Option<ProviderRenderTitle>,
+    #[serde(default)]
+    pub required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRenderTitle {
+    Always,
+    Never,
+    #[default]
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPromptRoleHint {
+    System,
+    User,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDecoderSpec {
+    #[serde(default = "default_provider_decoder_format")]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub events: Vec<ProviderDecoderEventSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce: Option<ProviderJsonlReduceSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<ProviderDecoderCaptureSpec>,
+}
+
+fn default_provider_decoder_format() -> String {
+    "text".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDecoderEventSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<ProviderJsonConditionSpec>,
+    #[serde(default)]
+    pub emit: ProviderDecoderEmitSpec,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDecoderCaptureSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ProviderJsonlTextReducerSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDecoderEmitSpec {
+    #[serde(default, rename = "type")]
+    pub emit_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "toolName")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderJsonlReduceSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "finalText")]
+    pub final_text: Option<ProviderJsonlTextReducerSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderJsonlTextReducerSpec {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<ProviderJsonConditionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<ProviderJsonlTextReducerSpec>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderJsonConditionSpec {
+    #[serde(default)]
+    pub all: Vec<ProviderJsonConditionSpec>,
+    #[serde(default)]
+    pub any: Vec<ProviderJsonConditionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not: Option<Box<ProviderJsonConditionSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "notEquals")]
+    pub not_equals: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "absentOrNull"
+    )]
+    pub absent_or_null: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "notEmpty")]
+    pub not_empty: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "in")]
+    pub in_values: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "notIn")]
+    pub not_in: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderSessionSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idSource")]
+    pub id_source: Option<ProviderSessionIdSource>,
+    #[serde(default)]
+    pub resume_args: Vec<ProviderArgSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSessionIdSource {
+    LoomUuid,
+    ProviderCapture,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2230,7 +2638,15 @@ pub enum PromptVia {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
-    pub transport: AgentTransport,
+    /// Static instructions for this agent actor. Loom injects these as a
+    /// system-side prompt part so providers with a native system prompt can
+    /// keep this content stable across turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Provider-catalog based runtime selection. The host resolves this into a
+    /// runtime transport plan before starting the worker.
+    #[serde(rename = "providerRef")]
+    pub provider_ref: AgentProviderRef,
     #[serde(default)]
     pub autostart: bool,
     /// Optional model menu for this actor. Loom treats these as runtime-level
@@ -2244,12 +2660,6 @@ pub struct AgentSpec {
     /// template variables / env injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<AgentBundleSpec>,
-    /// Optional per-actor persona configuration. When present, the runtime
-    /// loads the referenced markdown files from `{agent.profile}` and injects
-    /// them as labeled prompt sections on **every** turn. Absent means "no
-    /// persona injection" and preserves pre-persona behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<IdentitySpec>,
     /// Optional per-actor memory configuration. Defines where records live
     /// under `{agent.profile}/memory/`, how they are selected each turn, and
     /// how they reach the agent (prompt section and/or MCP bridge).
@@ -2279,6 +2689,18 @@ pub struct AgentSpec {
         rename = "promptTemplate"
     )]
     pub prompt_template: Option<PromptTemplateSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProviderRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.
@@ -2329,162 +2751,6 @@ pub struct PromptTemplateSpec {
     /// constants the spec author wants without polluting global names.
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
-}
-
-/// On-disk provider spec. A provider is one installed agent CLI/runtime
-/// (Claude Code, Codex, Qoder, ...). It may expose multiple runtime actors,
-/// each with its own identity, model, memory, profile, and workspace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProviderSpec {
-    pub provider: AgentProviderInfo,
-    pub transport: AgentTransport,
-    #[serde(default)]
-    pub defaults: AgentActorDefaults,
-    pub actors: Vec<AgentActorSpec>,
-}
-
-impl AgentProviderSpec {
-    pub fn into_agent_specs(self) -> Vec<AgentSpec> {
-        let AgentProviderSpec {
-            provider: _,
-            transport,
-            defaults,
-            actors,
-        } = self;
-        actors
-            .into_iter()
-            .map(|actor| {
-                let mut actor_models = actor.models.or_else(|| defaults.models.clone());
-                if let Some(model) = actor
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                {
-                    actor_models
-                        .get_or_insert_with(AgentModelSpec::default)
-                        .default = Some(model.to_string());
-                }
-                let display_name = actor
-                    .display_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(&actor.id)
-                    .to_string();
-                AgentSpec {
-                    actor: Actor {
-                        id: actor.id,
-                        kind: ActorKind::Agent,
-                        display_name,
-                        capabilities: actor.capabilities,
-                        _meta: actor.meta,
-                    },
-                    transport: actor.transport.unwrap_or_else(|| transport.clone()),
-                    autostart: actor.autostart.unwrap_or(defaults.autostart),
-                    models: actor_models,
-                    bundle: actor.bundle.or_else(|| defaults.bundle.clone()),
-                    identity: merge_identity(defaults.identity.as_ref(), actor.identity),
-                    memory: actor.memory.or_else(|| defaults.memory.clone()),
-                    announcement: actor.announcement.or_else(|| defaults.announcement.clone()),
-                    trigger: None,
-                    prompt_template: None,
-                }
-            })
-            .collect()
-    }
-}
-
-fn merge_identity(
-    base: Option<&IdentitySpec>,
-    actor: Option<IdentitySpec>,
-) -> Option<IdentitySpec> {
-    match (base.cloned(), actor) {
-        (None, None) => None,
-        (Some(base), None) => Some(base),
-        (None, Some(actor)) => Some(actor),
-        (Some(base), Some(actor)) => Some(IdentitySpec {
-            files: if actor.files == IdentityFiles::default() {
-                base.files
-            } else {
-                actor.files
-            },
-            description: actor.description.or(base.description),
-            scaffold: merge_identity_scaffold(base.scaffold, actor.scaffold),
-        }),
-    }
-}
-
-fn merge_identity_scaffold(
-    base: Option<IdentityScaffoldSpec>,
-    actor: Option<IdentityScaffoldSpec>,
-) -> Option<IdentityScaffoldSpec> {
-    match (base, actor) {
-        (None, None) => None,
-        (Some(base), None) => Some(base),
-        (None, Some(actor)) => Some(actor),
-        (Some(base), Some(actor)) => Some(IdentityScaffoldSpec {
-            identity: actor.identity.or(base.identity),
-            soul: actor.soul.or(base.soul),
-        }),
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentProviderInfo {
-    pub id: String,
-    #[serde(default)]
-    pub display_name: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentActorDefaults {
-    #[serde(default)]
-    pub autostart: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<AgentModelSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle: Option<AgentBundleSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<IdentitySpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<MemorySpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub announcement: Option<AnnouncementSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentActorSpec {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
-    pub meta: Option<Meta>,
-    /// Optional transport override for this actor. Omit to share the provider
-    /// transport, which is the common "same CLI, multiple actors" path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport: Option<AgentTransport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub autostart: Option<bool>,
-    /// Shorthand for setting `models.default` on this actor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<AgentModelSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle: Option<AgentBundleSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<IdentitySpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<MemorySpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub announcement: Option<AnnouncementSpec>,
 }
 
 // ---- models ----
@@ -2577,63 +2843,6 @@ pub enum BundleInstallMode {
     #[default]
     Copy,
     Symlink,
-}
-
-// ---- identity ----
-
-/// Persona config: which markdown files under `{agent.profile}` carry the
-/// agent's role definition (identity) and operating style (soul).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentitySpec {
-    #[serde(default)]
-    pub files: IdentityFiles,
-    /// Optional short role description used when scaffolding a missing
-    /// identity file. Existing files are never overwritten.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Optional first-run file contents for `identity.md` / `soul.md`.
-    /// Existing files still win, so operators can edit profiles safely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scaffold: Option<IdentityScaffoldSpec>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityScaffoldSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub soul: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityFiles {
-    /// Markdown path relative to `{agent.profile}` (or absolute). Default
-    /// `identity.md`.
-    #[serde(default = "default_identity_file")]
-    pub identity: String,
-    /// Markdown path relative to `{agent.profile}` (or absolute). Default
-    /// `soul.md`.
-    #[serde(default = "default_soul_file")]
-    pub soul: String,
-}
-
-impl Default for IdentityFiles {
-    fn default() -> Self {
-        Self {
-            identity: default_identity_file(),
-            soul: default_soul_file(),
-        }
-    }
-}
-
-fn default_identity_file() -> String {
-    "identity.md".into()
-}
-fn default_soul_file() -> String {
-    "soul.md".into()
 }
 
 // ---- memory ----
@@ -3009,87 +3218,6 @@ pub mod stream_kind {
     /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
     /// channel. Carries `{ channelId, actorId }`.
     pub const CHANNEL_REVOKED: &str = "channel.revoked";
-}
-
-#[cfg(test)]
-mod agent_provider_spec_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn provider_spec_expands_shared_transport_with_actor_overrides() {
-        let provider: AgentProviderSpec = serde_json::from_value(json!({
-            "provider": { "id": "codex", "displayName": "Codex" },
-            "transport": { "kind": "acp_stdio", "command": "npx", "args": ["-y", "codex-acp"] },
-            "defaults": {
-                "models": {
-                    "choices": [
-                        { "id": "gpt-5.5", "label": "GPT-5.5" },
-                        { "id": "gpt-5.4-mini", "label": "GPT-5.4 Mini" }
-                    ]
-                },
-                "identity": {
-                    "scaffold": { "soul": "# Shared style" }
-                }
-            },
-            "actors": [
-                {
-                    "id": "actor_codex_architect",
-                    "displayName": "Codex Architect",
-                    "model": "gpt-5.5",
-                    "identity": {
-                        "description": "System design reviewer",
-                        "scaffold": { "identity": "# Architect" }
-                    }
-                },
-                {
-                    "id": "actor_codex_fast",
-                    "displayName": "Codex Fast",
-                    "model": "gpt-5.4-mini"
-                }
-            ]
-        }))
-        .expect("parse provider spec");
-
-        let specs = provider.into_agent_specs();
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].actor.id, "actor_codex_architect");
-        assert_eq!(specs[0].actor.display_name, "Codex Architect");
-        assert!(matches!(specs[0].actor.kind, ActorKind::Agent));
-        assert_eq!(specs[1].actor.id, "actor_codex_fast");
-        assert_eq!(specs[0].transport.args, specs[1].transport.args);
-        assert_eq!(
-            specs[0].models.as_ref().and_then(|m| m.default.as_deref()),
-            Some("gpt-5.5")
-        );
-        assert_eq!(
-            specs[1].models.as_ref().and_then(|m| m.default.as_deref()),
-            Some("gpt-5.4-mini")
-        );
-        assert_eq!(
-            specs[0]
-                .identity
-                .as_ref()
-                .and_then(|i| i.description.as_deref()),
-            Some("System design reviewer")
-        );
-        assert_eq!(
-            specs[0]
-                .identity
-                .as_ref()
-                .and_then(|i| i.scaffold.as_ref())
-                .and_then(|s| s.soul.as_deref()),
-            Some("# Shared style")
-        );
-        assert_eq!(
-            specs[1]
-                .identity
-                .as_ref()
-                .and_then(|i| i.scaffold.as_ref())
-                .and_then(|s| s.soul.as_deref()),
-            Some("# Shared style")
-        );
-    }
 }
 
 #[cfg(test)]

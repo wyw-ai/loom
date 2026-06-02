@@ -1,120 +1,46 @@
-# Legacy Agent provider spec 样例
+# AgentSpec 样例
 
-这些文件保留为旧版 provider spec schema 参考。当前运行路径只保留
-`loom-daemon`：daemon 从 `~/.loom-apps/desktop.toml` 的 machine agent 配置自动合成
-runtime spec，不再加载这个目录。
+这里的 JSON 只描述“一个具体 agent 是谁，以及它选择哪个 provider”。它们不再
+包含 `command`、`args`、`env`、stdout parser、session/resume 规则，也不再使用旧的
+`provider + transport + actors[]` 混合结构。
 
-| 文件 | 命令 | 备注 |
+运行适配规则属于 `ProviderManifest`，示例见
+[`../providers`](../providers)。如果需要新增 CLI、改参数、改解析方式，先添加或覆盖
+provider manifest，再让 agent 的 `providerRef.id` 指向它。
+
+当前样例：
+
+| 文件 | providerRef | 说明 |
 | --- | --- | --- |
-| [`actor_claude_stream.json`](actor_claude_stream.json) | `claude -p --output-format stream-json` | Claude Code command 模式；通过 `stdout_json:.session_id` 记录 session，后续使用 `--resume {session_id}` |
-| [`actor_claude_nonprint.json`](actor_claude_nonprint.json) | `claude` | Claude Code `interactive_command` 非 `--print` 模式；依赖 sentinel 判断完成并在完成后关闭 provider 进程 |
-| [`actor_codex.json`](actor_codex.json) | `npx -y @zed-industries/codex-acp` | Zed 维护的 Codex ACP 包 |
-| [`actor_opencode.json`](actor_opencode.json) | `opencode acp` | 需要本机已装 `opencode` CLI |
-| [`actor_qoder.json`](actor_qoder.json) | `npx -y @qoder-ai/qodercli@0.1.48 --acp` | Qoder ACP 模式；与 Zed registry 当前版本对齐 |
+| [`actor_claude_stream.json`](actor_claude_stream.json) | `claude` / `print` | Claude Code `-p --output-format stream-json` 模式，system/user prompt 由 provider manifest 拆分注入 |
+| [`actor_claude_nonprint.json`](actor_claude_nonprint.json) | `claude` / `nonprint` | Claude Code 普通交互模式，用 sentinel 判断完成 |
+| [`codex.json`](codex.json) | `codex` / `print` | Codex CLI agent |
+| [`copilot.json`](copilot.json) | `copilot` / `print` | GitHub Copilot CLI agent |
+| [`opencode.json`](opencode.json) | `opencode` / `print` | OpenCode agent |
+| [`qoder.json`](qoder.json) | `qoder` / `print` | Qoder CLI agent |
 
-Qoder 的旧 provider spec 需要跟 Zed registry 使用的 ACP 包版本保持一致。Zed 当前配置
-为 `@qoder-ai/qodercli@0.1.48`；如果 Loom 仍使用旧版
-`@qoder-ai/qodercli@0.1.36`，可能会出现 Zed ACP 可用但 Loom ACP 仍提示
-`Authentication required` 并重新打开浏览器登录的情况。
-
-Qoder 会根据客户端声明的 terminal auth 能力返回登录命令。Loom 会优先执行
-Qoder 返回的 `_meta.terminal-auth` 命令；如果登录态失效，按日志提示重新
-登录后重试。
-
-每份旧 provider spec 的 `env` 都留空了。如果你的网络环境需要走代理，自己加
-`http_proxy` / `https_proxy` / `all_proxy` 即可，例如：
+最小 AgentSpec 形态：
 
 ```json
-"env": {
-  "http_proxy": "http://127.0.0.1:7897",
-  "https_proxy": "http://127.0.0.1:7897",
-  "all_proxy": "socks5://127.0.0.1:7897"
-}
-```
-
-如果一个 agent runtime 支持在 ACP `session/new` 中指定模型，可以在
-`defaults.models` 或 actor 自己的 `models` 里声明模型菜单。之后在聊天框发送
-`@actor_id /models`，Loom 会弹出选择卡片，
-并把选择结果保存到该 actor 的 profile，下次创建 ACP session 时带上选中的
-`model`：
-
-```json
-"defaults": {
-  "models": {
-    "default": "provider/model-id",
-    "choices": [
-      { "id": "provider/model-id", "label": "Default model" },
-      { "id": "provider/fast-model-id", "label": "Fast model" }
-    ]
-  }
-}
-```
-
-command / interactive_command runtime 可以通过 `transport.modelArgs` 声明 CLI
-模型参数模板。内置 daemon provider 已经按各 CLI 填好 `["--model", "{model}"]`；
-手写 spec 时可显式设置：
-
-```json
-"transport": {
-  "kind": "command",
-  "command": "codex",
-  "args": ["exec", "--json"],
-  "modelArgs": ["--model", "{model}"]
-}
-```
-
-同一个 provider / CLI 可以在一份 JSON 里声明多个 actor，避免为同一套
-`transport` 复制多份 spec。`defaults` 作为默认值，`actors[]` 里的 `identity`、
-`model`、`models` 等字段按 actor 覆盖：
-
-```jsonc
 {
-  "provider": { "id": "qoder", "displayName": "Qoder ACP" },
-  "transport": {
-    "kind": "acp_stdio",
-    "command": "npx",
-    "args": ["-y", "@qoder-ai/qodercli@0.1.48", "--acp"],
-    "env": {}
+  "actor": {
+    "id": "actor_claude",
+    "kind": "agent",
+    "displayName": "Claude"
   },
-  "actors": [
-    {
-      "id": "actor_qoder_reviewer",
-      "displayName": "Qoder Reviewer",
-      "model": "provider/model-strong",
-      "identity": {
-        "description": "Code review actor",
-        "scaffold": {
-          "identity": "# Qoder Reviewer\n\n- Role: review changes and call out risks."
-        }
-      }
-    },
-    {
-      "id": "actor_qoder_builder",
-      "displayName": "Qoder Builder",
-      "model": "provider/model-fast",
-      "identity": {
-        "description": "Implementation actor",
-        "scaffold": {
-          "identity": "# Qoder Builder\n\n- Role: implement scoped changes."
-        }
-      }
-    }
-  ]
+  "instructions": "Agent-specific static instructions.",
+  "providerRef": {
+    "id": "claude",
+    "mode": "print",
+    "model": "sonnet"
+  },
+  "autostart": false
 }
 ```
 
-`cwd` / `env` 里可以用的模板变量（`{agent.workspace}` 等）见根目录 README
-「配置 agent」一节。Command transport（`claude -p` 这种一次性 CLI）的写法
-见 [`docs/command-transport-v0.md`](../../docs/command-transport-v0.md)。
+`instructions` 是这个 agent 自己的静态行为说明。Loom 会把它作为
+`agent_instructions` prompt part 交给 provider manifest 的 prompt 组装规则；provider
+决定它最终进入 system prompt、user prompt，还是完整 prompt。
 
-优先使用 `actor_claude_stream.json` 这种 `claude -p --output-format stream-json`
-command 模式。`actor_claude_nonprint.json` 使用 Claude Code 的普通交互模式，
-不带 `--print`，主要保留为旧 sentinel 方案参考。
-如果你需要指定独立的 Claude settings 文件，可以把 `provider.settings` 改成：
-
-```json
-"settings": {
-  "mode": "custom",
-  "path": "/path/to/settings.json"
-}
-```
+`providerRef.model` 和 `providerRef.reasoningEffort` 是具体 agent 的偏好。provider
+manifest 负责声明这些值如何映射成 CLI 参数，例如 `--model {model}`。

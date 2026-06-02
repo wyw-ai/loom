@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
-use proto::types::{AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, MessageIntent};
+use proto::types::{
+    AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, Message, MessageIntent,
+};
 use serde_json::{json, Value};
 
 use crate::client::Client;
@@ -425,6 +427,7 @@ pub async fn read(
     target: String,
     limit: u32,
     before: Option<String>,
+    include_private: bool,
 ) -> Result<()> {
     let mut params = json!({
         "target": target,
@@ -433,7 +436,11 @@ pub async fn read(
     if let Some(before) = before {
         params["beforeMessageId"] = json!(before);
     }
-    let res: MessageListResult = client.call(method::MESSAGE_LIST, params).await?;
+    let mut res: MessageListResult = client.call(method::MESSAGE_LIST, params).await?;
+    if !include_private {
+        res.messages
+            .retain(|message| !is_same_scope_private(message));
+    }
     if render::is_json() {
         render::print_json(&res);
         return Ok(());
@@ -445,6 +452,64 @@ pub async fn read(
         println!("(no messages)");
     }
     Ok(())
+}
+
+fn is_same_scope_private(message: &Message) -> bool {
+    message
+        .metadata
+        .get("private")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || message
+            .metadata
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("private"))
+        || message.metadata.contains_key("privateTo")
+        || message.metadata.contains_key("privateActorIds")
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use proto::types::{MessageKind, ScopeKind, ScopeRef};
+
+    fn sample_read_message() -> Message {
+        Message {
+            id: "msg_1".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_1".into(),
+            },
+            target: "#chan_1:msg_root".into(),
+            author_actor_id: "actor_agent_a".into(),
+            created_at: chrono::Utc::now(),
+            kind: MessageKind::Agent,
+            body: "hello".into(),
+            mentions: Vec::new(),
+            audience: Vec::new(),
+            intent: MessageIntent::Chat,
+            delivery_policy: DeliveryPolicy::NotifyOnly,
+            parent_message_id: None,
+            thread_root_message_id: Some("msg_root".into()),
+            task_id: None,
+            attachments: Vec::new(),
+            reactions: Vec::new(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn same_scope_private_detection_catches_private_to_metadata() {
+        let mut message = sample_read_message();
+        assert!(!is_same_scope_private(&message));
+
+        message
+            .metadata
+            .insert("privateTo".into(), json!(["actor_agent_b"]));
+
+        assert!(is_same_scope_private(&message));
+    }
 }
 
 pub async fn reaction_toggle(

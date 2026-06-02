@@ -89,11 +89,15 @@ impl RunSlotGuard {
 
 impl Drop for RunSlotGuard {
     fn drop(&mut self) {
-        let mut state = self.slot.lock();
-        state.pid = None;
-        state.cancel_requested = false;
-        state.running = false;
+        release_run_slot(&self.slot);
     }
+}
+
+fn release_run_slot(slot: &Arc<Mutex<InFlight>>) {
+    let mut state = slot.lock();
+    state.pid = None;
+    state.cancel_requested = false;
+    state.running = false;
 }
 
 /// Snapshot of the bits of `AgentTransport` the command adapter cares about.
@@ -419,6 +423,7 @@ fn run_prompt(
         Ok(lock) => lock,
         Err(e) => {
             let message = format!("command adapter session lock error: {e}");
+            release_run_slot(&slot);
             let _ = sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: message.clone(),
@@ -481,6 +486,7 @@ fn run_prompt(
     let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
+            release_run_slot(&slot);
             let _ = sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: format!("command adapter spawn error: {e}"),
@@ -520,6 +526,7 @@ fn run_prompt(
         ) {
             Ok(o) => o,
             Err(e) => {
+                release_run_slot(&slot);
                 let _ = sender.send(AdapterEvent::Error {
                     scope: Some(scope.clone()),
                     message: format!("command adapter retry spawn error: {e}"),
@@ -952,6 +959,7 @@ fn spawn_and_collect(
     }
     let usage = extract_token_usage_from_text(&collected_stdout)
         .or_else(|| extract_token_usage_from_text(&collected_stderr));
+    release_run_slot(slot);
     if !emitted_finish || !success {
         let _ = sender.send(AdapterEvent::Finished {
             scope: Some(prompt.scope.clone()),
@@ -1170,8 +1178,8 @@ fn runtime_error_from_json(value: &Value) -> Option<String> {
             "/error/code",
             "/properties/error/type",
             "/properties/error/code",
-            "/data/errorType",
             "/data/errorCode",
+            "/data/errorType",
             "/data/code",
             "/code",
             "/error",
@@ -3628,6 +3636,222 @@ mod tests {
             capture_decoder_session_id(Some(&decoder), stdout),
             Some("sid_json".into())
         );
+    }
+
+    #[test]
+    fn runtime_error_from_response_body_includes_actionable_details() {
+        let stdout = serde_json::json!({
+            "statusCode": 429,
+            "responseHeaders": { "retry-after": "59140" },
+            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 59140s"));
+    }
+
+    #[test]
+    fn runtime_error_from_embedded_log_error_includes_actionable_details() {
+        let error = serde_json::json!({
+            "error": {
+                "name": "AI_APICallError",
+                "statusCode": 429,
+                "responseHeaders": { "retry-after": "57108" },
+                "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+            }
+        });
+        let stderr = format!("ERROR service=llm error={error} stream error\n");
+
+        let summary = extract_runtime_error_from_text(&stderr).expect("runtime error summary");
+
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 57108s"));
+    }
+
+    #[test]
+    fn runtime_error_from_claude_result_includes_model_error_details() {
+        let stdout = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "api_error_status": 404,
+            "result": "There's an issue with the selected model (claude-sonnet-4.6). It may not exist or you may not have access to it.",
+            "error": "model_not_found"
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("404"));
+        assert!(summary.contains("model_not_found"));
+        assert!(summary.contains("selected model"));
+    }
+
+    #[test]
+    fn runtime_error_from_copilot_session_error_includes_quota_details() {
+        let stdout = serde_json::json!({
+            "type": "session.error",
+            "data": {
+                "errorType": "quota",
+                "errorCode": "quota_exceeded",
+                "message": "You have no quota (Request ID: req_123)",
+                "statusCode": 402
+            }
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("402"));
+        assert!(summary.contains("quota_exceeded"));
+        assert!(summary.contains("You have no quota"));
+    }
+
+    #[test]
+    fn runtime_error_from_copilot_model_failure_parses_error_message_json() {
+        let stdout = serde_json::json!({
+            "type": "model.call_failure",
+            "data": {
+                "model": "gpt-5.5",
+                "statusCode": 402,
+                "errorMessage": "{\"message\":\"You have no quota\",\"code\":\"quota_exceeded\"}"
+            }
+        })
+        .to_string();
+
+        let summary = extract_runtime_error_from_text(&stdout).expect("runtime error summary");
+
+        assert!(summary.contains("402"));
+        assert!(summary.contains("quota_exceeded"));
+        assert!(summary.contains("You have no quota"));
+        assert!(!summary.contains("{\"message\""));
+    }
+
+    #[test]
+    fn failed_command_summary_prefers_runtime_error_over_raw_json() {
+        let error_line = serde_json::json!({
+            "statusCode": 429,
+            "responseHeaders": { "retry-after": "59140" },
+            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+        })
+        .to_string();
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "printf '%s\n' \"$ERROR_JSON\"; exit 1".into()];
+        cfg.env.insert("ERROR_JSON".into(), error_line);
+        cfg.output_format = CommandOutputFormat::OpencodeJson;
+        cfg.prompt_via = PromptVia::Stdin;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert_ne!(outcome.exit_code, 0);
+        let mut summary = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success,
+                summary: value,
+                ..
+            } = event
+            {
+                assert!(!success);
+                summary = Some(value);
+                break;
+            }
+        }
+        let summary = summary.expect("missing Finished event");
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 59140s"));
+    }
+
+    #[test]
+    fn spawn_and_collect_releases_slot_before_finished_dispatch() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "printf 'done\\n'".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let request = prompt("ignored");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+        let _guard = RunSlotGuard::acquire(slot.clone(), &request.scope).expect("acquire slot");
+
+        spawn_and_collect(&cfg, &request, &cfg.args, None, &tx, &slot).expect("spawn sh");
+
+        assert!(
+            !slot.lock().running,
+            "Finished may dispatch the next prompt before RunSlotGuard drops"
+        );
+        assert!(rx.try_recv().is_ok(), "expected a text event");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Finished { success: true, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_runtime_error_terminates_hung_command_without_idle_timeout() {
+        let error_line = serde_json::json!({
+            "error": {
+                "name": "AI_APICallError",
+                "statusCode": 429,
+                "responseHeaders": { "retry-after": "57108" },
+                "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+            }
+        })
+        .to_string();
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf 'ERROR service=llm error=%s stream error\n' \"$ERROR_JSON\" >&2; exec sleep 30"
+                .into(),
+        ];
+        cfg.env.insert("ERROR_JSON".into(), error_line);
+        cfg.output_format = CommandOutputFormat::OpencodeJson;
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.idle_timeout_ms = Some(5_000);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let started = std::time::Instant::now();
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "runtime error should terminate before idle timeout"
+        );
+        assert_ne!(outcome.exit_code, 0);
+        let mut summary = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success,
+                summary: value,
+                ..
+            } = event
+            {
+                assert!(!success);
+                summary = Some(value);
+                break;
+            }
+        }
+        let summary = summary.expect("missing Finished event");
+        assert!(summary.contains("429"));
+        assert!(summary.contains("FreeUsageLimitError"));
+        assert!(summary.contains("Rate limit exceeded"));
+        assert!(summary.contains("retry-after: 57108s"));
     }
 
     #[test]

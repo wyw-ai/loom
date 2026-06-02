@@ -1068,6 +1068,9 @@ enum MessageCmd {
         limit: u32,
         #[arg(long)]
         before: Option<String>,
+        /// Include same-scope private messages visible to this actor.
+        #[arg(long = "include-private")]
+        include_private: bool,
     },
     /// Search visible message text.
     Search {
@@ -1977,7 +1980,11 @@ async fn main() -> Result<()> {
                 target,
                 limit,
                 before,
-            } => cmd::message::read(client, cfg.actor_id, target, limit, before).await?,
+                include_private,
+            } => {
+                cmd::message::read(client, cfg.actor_id, target, limit, before, include_private)
+                    .await?
+            }
             MessageCmd::Search {
                 query,
                 target,
@@ -2836,6 +2843,35 @@ mod tests {
                 assert_eq!(to, None);
                 assert_eq!(private_to, vec!["@actor_player"]);
                 assert_eq!(text.as_deref(), Some("your role is seer"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_read_accepts_include_private() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "message",
+            "read",
+            "--target",
+            "#chan_123:msg_root",
+            "--include-private",
+        ])
+        .expect("parse message read");
+
+        match args.cmd {
+            Cmd::Message {
+                sub:
+                    MessageCmd::Read {
+                        target,
+                        include_private,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, "#chan_123:msg_root");
+                assert!(include_private);
             }
             other => panic!("unexpected command: {other:?}"),
         }

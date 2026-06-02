@@ -1207,6 +1207,57 @@ fn reply_target_for_message(message: &Message) -> String {
     }
 }
 
+fn turn_key_for_trigger(trigger: &AgentTrigger) -> String {
+    match trigger {
+        AgentTrigger::Message(message) => turn_key_for_message(message),
+        AgentTrigger::Event(event) => format!(
+            "scope:{}:{}",
+            scope_kind_name(event.scope.kind),
+            event.scope.id
+        ),
+    }
+}
+
+fn turn_key_for_message(message: &Message) -> String {
+    if message.target.starts_with("dm:") {
+        return message.target.clone();
+    }
+    if let Some((channel_id, root_message_id)) = thread_target_parts(&message.target) {
+        return format!("thread-root:{channel_id}:{root_message_id}");
+    }
+    if let Some(root_message_id) = message.thread_root_message_id.as_deref() {
+        return format!(
+            "thread-root:{}:{root_message_id}",
+            channel_id_from_target(&message.target).unwrap_or_else(|| message.scope.id.clone())
+        );
+    }
+    match message.scope.kind {
+        ScopeKind::Channel => format!("thread-root:{}:{}", message.scope.id, message.id),
+        ScopeKind::Thread => format!("scope:thread:{}", message.scope.id),
+    }
+}
+
+fn thread_target_parts(target: &str) -> Option<(String, String)> {
+    let raw = target.strip_prefix('#')?;
+    let (channel_id, root_message_id) = raw.split_once(':')?;
+    if channel_id.is_empty() || root_message_id.is_empty() {
+        return None;
+    }
+    Some((channel_id.to_string(), root_message_id.to_string()))
+}
+
+fn channel_id_from_target(target: &str) -> Option<String> {
+    target
+        .strip_prefix('#')
+        .map(|raw| {
+            raw.split_once(':')
+                .map(|(channel, _)| channel)
+                .unwrap_or(raw)
+        })
+        .filter(|channel| !channel.is_empty())
+        .map(ToString::to_string)
+}
+
 struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
@@ -1221,13 +1272,16 @@ struct WorkerState {
     paths: AgentPaths,
     agent_server_url: String,
     agent_config_version_id: String,
-    /// In-flight turn per scope. A worker may own one adapter instance, but
-    /// scope/session state is isolated below the adapter boundary, so only
-    /// prompts in the same scope block each other.
+    /// In-flight turn per scope. Adapter events are scoped only by scope id, so
+    /// translation still uses scope as the active-turn lookup key.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
-    /// Per-scope queues of triggers received while that scope is busy. Human
-    /// triggers are kept ahead of service callbacks within the same scope so
-    /// stale automation cannot starve an explicit user request.
+    /// Root/thread-family keys that are busy. This prevents a channel root turn
+    /// and its derived task thread from running concurrently for the same actor.
+    busy_turn_keys: Mutex<HashMap<String, String>>,
+    /// Per-root/thread-family queues of triggers received while that
+    /// conversation is busy. Human triggers are kept ahead of service callbacks
+    /// within the same family so stale automation cannot starve an explicit
+    /// user request.
     pending_triggers: Mutex<HashMap<String, VecDeque<AgentTrigger>>>,
     /// Per-turn streaming text buffer. Token/chunk streams are buffered until
     /// the adapter reports a message boundary; complete assistant messages are
@@ -1264,6 +1318,7 @@ struct ActiveTurn {
     /// moves to Run.
     id: String,
     run_id: String,
+    turn_key: String,
     scope: ScopeRef,
     trigger_source_id: String,
     trigger_is_message: bool,
@@ -1423,6 +1478,7 @@ impl WorkerState {
             agent_server_url,
             agent_config_version_id,
             active_turns: Mutex::new(HashMap::new()),
+            busy_turn_keys: Mutex::new(HashMap::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
@@ -1444,6 +1500,10 @@ impl WorkerState {
     }
 
     fn set_turn(&self, turn: ActiveTurn) {
+        self.busy_turn_keys
+            .lock()
+            .expect("busy_turn_keys poisoned")
+            .insert(turn.turn_key.clone(), turn.scope.id.clone());
         self.active_turns
             .lock()
             .expect("active_turns poisoned")
@@ -1468,27 +1528,32 @@ impl WorkerState {
     }
 
     /// Drop the active turn for `scope_id` and pop the next queued trigger for
-    /// that same scope (if any).
+    /// that same root/thread-family key (if any).
     fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
         let mut active = self.active_turns.lock().expect("active_turns poisoned");
-        active.remove(scope_id);
+        let turn_key = active.remove(scope_id).map(|turn| turn.turn_key);
         drop(active);
+        let turn_key = turn_key?;
+        self.busy_turn_keys
+            .lock()
+            .expect("busy_turn_keys poisoned")
+            .remove(&turn_key);
         let mut pending = self.pending_triggers.lock().expect("pending poisoned");
-        let next = match pending.get_mut(scope_id) {
+        let next = match pending.get_mut(&turn_key) {
             Some(queue) => queue.pop_front(),
             None => None,
         };
         if pending
-            .get(scope_id)
+            .get(&turn_key)
             .map(|queue| queue.is_empty())
             .unwrap_or(false)
         {
-            pending.remove(scope_id);
+            pending.remove(&turn_key);
         }
         next
     }
 
-    fn enqueue(&self, scope_id: &str, trigger: AgentTrigger) {
+    fn enqueue(&self, turn_key: &str, trigger: AgentTrigger) {
         let mut pending = self.pending_triggers.lock().expect("pending poisoned");
         if pending
             .values()
@@ -1496,7 +1561,7 @@ impl WorkerState {
         {
             return;
         }
-        let queue = pending.entry(scope_id.to_string()).or_default();
+        let queue = pending.entry(turn_key.to_string()).or_default();
         if is_priority_trigger(&trigger) {
             let insert_at = queue
                 .iter()
@@ -1523,6 +1588,13 @@ impl WorkerState {
             .expect("active_turns poisoned")
             .values()
             .any(|turn| turn.trigger_source_id == source_id)
+    }
+
+    fn is_turn_key_busy(&self, turn_key: &str) -> bool {
+        self.busy_turn_keys
+            .lock()
+            .expect("busy_turn_keys poisoned")
+            .contains_key(turn_key)
     }
 
     fn push_text(&self, turn_id: &str, chunk: &str) {
@@ -2398,6 +2470,7 @@ fn is_message_for_us_with_delivery(
         AudienceKind::Actor => {
             audience.id == actor_id
                 && (message.delivery_policy == DeliveryPolicy::WakeAgent
+                    || (actor_inbox_delivery && message.delivery_policy != DeliveryPolicy::Silent)
                     || message.metadata.get("kind").and_then(Value::as_str)
                         == Some("action.request"))
         }
@@ -2408,7 +2481,7 @@ fn is_message_for_us_with_delivery(
     }) {
         return true;
     }
-    actor_inbox_delivery && message_counts_as_actor_inbox_attention(message, actor_id)
+    actor_inbox_delivery && message_counts_as_actor_inbox_attention(message)
 }
 
 fn is_actor_inbox_delivery_for(params: &Value, actor_id: &str) -> bool {
@@ -2455,15 +2528,8 @@ fn run_requests_no_reply(run: &Run) -> bool {
             .is_some_and(|value| value == "none" || value == "ignore")
 }
 
-fn message_counts_as_actor_inbox_attention(message: &Message, actor_id: &str) -> bool {
+fn message_counts_as_actor_inbox_attention(message: &Message) -> bool {
     if message.delivery_policy == DeliveryPolicy::Silent {
-        return false;
-    }
-    if message
-        .audience
-        .iter()
-        .any(|audience| audience.kind == AudienceKind::Actor && audience.id == actor_id)
-    {
         return false;
     }
     if message.scope.kind == ScopeKind::Thread {
@@ -3057,11 +3123,12 @@ async fn handle_trigger(
     trigger: AgentTrigger,
 ) -> Result<TriggerOutcome> {
     let trigger = trigger.clone();
-    // Scope FIFO: the same actor can handle independent scopes concurrently,
-    // but prompts in one thread/channel remain ordered.
-    if state.current_turn(&trigger.scope().id).is_some() {
-        let scope_id = trigger.scope().id.clone();
-        state.enqueue(&scope_id, trigger);
+    // Scope FIFO plus root-thread-family FIFO: the same actor can handle
+    // independent conversations concurrently, but a channel root turn and its
+    // derived thread remain ordered.
+    let turn_key = turn_key_for_trigger(&trigger);
+    if state.current_turn(&trigger.scope().id).is_some() || state.is_turn_key_busy(&turn_key) {
+        state.enqueue(&turn_key, trigger);
         return Ok(TriggerOutcome::Queued);
     }
     dispatch_trigger(client, state, adapter, trigger)
@@ -3081,6 +3148,7 @@ async fn dispatch_trigger(
     mut trigger: AgentTrigger,
 ) -> Result<AgentTrigger> {
     loop {
+        let turn_key = turn_key_for_trigger(&trigger);
         subscribe_scope(client, state, trigger.scope()).await;
         let run_res: RunOpenResult = client
             .call(
@@ -3104,6 +3172,7 @@ async fn dispatch_trigger(
         let active = ActiveTurn {
             id: run_res.run.id.clone(),
             run_id: run_res.run.id.clone(),
+            turn_key: turn_key.clone(),
             scope: trigger.scope().clone(),
             trigger_source_id: trigger.id().to_string(),
             trigger_is_message: trigger.is_message(),
@@ -4519,15 +4588,16 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
          so commands like:\n\
            loom --json inbox list --no-ack\n\
-           loom --json inbox list --state all --no-ack\n\
            \"$LOOM_CLI\" --json inbox list --no-ack\n\
            loom --json channel members \"$LOOM_CHANNEL_ID\"\n\
            loom --json message read --target '#<channel_id>:<root_message_id>'\n\
+           # message read is the public transcript by default; add --include-private only when private messages addressed to you are required.\n\
            loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
            loom --json message ask @actor_id --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"please continue\"\n\
-          loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
-          loom --json message send --to <actor_id> --text \"global DM in a separate channel\"\n\
+           loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
+           loom --json message send --to <actor_id> --text \"global DM in a separate channel\"\n\
            loom --json message react <message_id> ✅\n\
+           # Do not use inbox list --state all during a scoped turn unless explicitly auditing history; it can mix old cross-channel deliveries into the current task.\n\
            loom --json run ignore --reason \"not directed at me\"\n\
            loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"\n\
            loom --json task complete <task_id> --result \"short outcome summary\"\n\
@@ -4611,6 +4681,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         itself. Use exact actor ids with `message ask`, --private-to for hidden\n\
         same-scope prompts, and plain `message send` only for summaries that\n\
         require no one to act.\n\
+        A literal @actor_id mention is an explicit routed delivery and may wake\n\
+        that actor; when merely referring to someone, use their display name\n\
+        without @ or send with --delivery-policy silent.\n\
         Hidden or private information must stay private even when the current\n\
         conversation is public to the channel. This includes hidden roles or\n\
         states, secrets, credentials, private votes/actions,\n\
@@ -5608,6 +5681,7 @@ mod tests {
         ActiveTurn {
             id: "turn_failure".into(),
             run_id: "run_failure".into(),
+            turn_key: "thread-root:chan_failure:msg_failure".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Channel,
                 id: "chan_failure".into(),
@@ -5744,6 +5818,7 @@ mod tests {
         let active = ActiveTurn {
             id: "turn_demo".into(),
             run_id: "run_demo".into(),
+            turn_key: "thread-root:chan_demo:msg_trigger".into(),
             scope: scope.clone(),
             trigger_source_id: "msg_trigger".into(),
             trigger_is_message: true,
@@ -5899,6 +5974,39 @@ mod tests {
     }
 
     #[test]
+    fn turn_key_groups_channel_root_with_derived_thread() {
+        let root = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        let reply = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+
+        assert_eq!(
+            turn_key_for_message(&root),
+            "thread-root:chan_demo:msg_root"
+        );
+        assert_eq!(
+            turn_key_for_message(&reply),
+            "thread-root:chan_demo:msg_root"
+        );
+    }
+
+    #[test]
     fn all_wake_message_is_deliverable_to_agent_worker() {
         let mut message = sample_message(
             "msg_all",
@@ -6006,7 +6114,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_notify_only_actor_inbox_delivery_still_does_not_wake_agent_worker() {
+    fn explicit_notify_only_actor_inbox_delivery_wakes_agent_worker() {
         let mut message = sample_message(
             "msg_notify",
             ScopeRef {
@@ -6024,6 +6132,29 @@ mod tests {
             display: None,
         }];
         message.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        assert!(is_inbox_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn explicit_silent_actor_inbox_delivery_does_not_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_silent",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::Silent;
 
         assert!(!is_inbox_message_for_us(&message, "actor_agent_echo"));
     }
@@ -6129,6 +6260,7 @@ mod tests {
         let active = ActiveTurn {
             id: "turn_demo".into(),
             run_id: "run_demo".into(),
+            turn_key: "thread-root:chan_demo:msg_root".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
@@ -6179,6 +6311,7 @@ mod tests {
         let active = ActiveTurn {
             id: "turn_demo".into(),
             run_id: "run_demo".into(),
+            turn_key: "thread-root:chan_demo:msg_root".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
@@ -7099,6 +7232,7 @@ mod tests {
         state.set_turn(ActiveTurn {
             id: "turn_1".into(),
             run_id: "run_1".into(),
+            turn_key: "thread-root:chan_demo:msg_1".into(),
             scope: scope.clone(),
             trigger_source_id: "msg_1".into(),
             trigger_is_message: true,
@@ -7372,7 +7506,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_state_queues_triggers_per_scope_only() {
+    fn worker_state_queues_triggers_by_turn_key() {
         let root = temp_path("scope-queue");
         let paths = AgentPaths::new(&root, "actor_demo");
         let state = WorkerState::new(
@@ -7389,6 +7523,7 @@ mod tests {
         state.set_turn(ActiveTurn {
             id: "turn_channel".into(),
             run_id: "run_channel".into(),
+            turn_key: "thread-root:chan_triage:msg_root".into(),
             scope: active_scope.clone(),
             trigger_source_id: "msg_root".into(),
             trigger_is_message: true,
@@ -7431,11 +7566,11 @@ mod tests {
         assert!(state.current_turn(&active_scope.id).is_some());
         assert!(state.current_turn(&queued_thread.scope.id).is_none());
         state.enqueue(
-            &queued_channel.scope.id,
+            "thread-root:chan_triage:msg_root",
             AgentTrigger::Event(queued_channel.clone()),
         );
         state.enqueue(
-            &queued_thread.scope.id,
+            "scope:thread:thread_task",
             AgentTrigger::Event(queued_thread.clone()),
         );
         assert!(state.has_pending_source(&queued_channel.id));
@@ -7448,12 +7583,7 @@ mod tests {
         );
         assert!(state.current_turn(&active_scope.id).is_none());
         assert!(state.clear_turn(&active_scope.id).is_none());
-        assert_eq!(
-            state
-                .clear_turn(&queued_thread.scope.id)
-                .map(|trigger| trigger.id().to_string()),
-            Some(queued_thread.id)
-        );
+        assert!(state.has_pending_source(&queued_thread.id));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -7475,6 +7605,7 @@ mod tests {
         state.set_turn(ActiveTurn {
             id: "turn_busy".into(),
             run_id: "run_busy".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
             trigger_source_id: "msg_busy".into(),
             trigger_is_message: true,
@@ -7524,29 +7655,86 @@ mod tests {
             _meta: None,
         };
 
-        state.enqueue(&service.scope.id, AgentTrigger::Event(service.clone()));
-        state.enqueue(&human_one.scope.id, AgentTrigger::Event(human_one.clone()));
-        state.enqueue(&human_two.scope.id, AgentTrigger::Event(human_two.clone()));
-        state.enqueue(&human_one.scope.id, AgentTrigger::Event(human_one.clone()));
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(service.clone()),
+        );
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(human_one.clone()),
+        );
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(human_two.clone()),
+        );
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(human_one.clone()),
+        );
 
         assert_eq!(
             state
                 .clear_turn(&active_scope.id)
                 .map(|trigger| trigger.id().to_string()),
-            Some(human_one.id)
+            Some(human_one.id.clone())
         );
+        state.set_turn(ActiveTurn {
+            id: "turn_human_one".into(),
+            run_id: "run_human_one".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
+            scope: active_scope.clone(),
+            trigger_source_id: human_one.id.clone(),
+            trigger_is_message: false,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_123".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
         assert_eq!(
             state
                 .clear_turn(&active_scope.id)
                 .map(|trigger| trigger.id().to_string()),
-            Some(human_two.id)
+            Some(human_two.id.clone())
         );
+        state.set_turn(ActiveTurn {
+            id: "turn_human_two".into(),
+            run_id: "run_human_two".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
+            scope: active_scope.clone(),
+            trigger_source_id: human_two.id.clone(),
+            trigger_is_message: false,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_123".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
         assert_eq!(
             state
                 .clear_turn(&active_scope.id)
                 .map(|trigger| trigger.id().to_string()),
-            Some(service.id)
+            Some(service.id.clone())
         );
+        state.set_turn(ActiveTurn {
+            id: "turn_service".into(),
+            run_id: "run_service".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
+            scope: active_scope.clone(),
+            trigger_source_id: service.id.clone(),
+            trigger_is_message: false,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "mr-watcher".into(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
         assert!(state.clear_turn(&active_scope.id).is_none());
         std::fs::remove_dir_all(root).ok();
     }

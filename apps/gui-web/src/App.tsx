@@ -217,7 +217,7 @@ const avatarLibraryUrls = Array.from(
   { length: avatarCount },
   (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
 );
-const localServerCommand = "loom-server --bind 127.0.0.1:7878";
+const localServerCommand = "loom-server --bind 0.0.0.0:7878";
 const localServerUrl = "ws://127.0.0.1:7878/rpc";
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 const defaultNewPromptFilePath = "prompts/new.md";
@@ -490,11 +490,11 @@ export function App() {
     if (navigator.clipboard?.writeText) {
       void navigator.clipboard
         .writeText(localServerCommand)
-        .then(() => pushNotice("Local server command copied"))
-        .catch(() => pushNotice("Open Spaces after starting the local server"));
+        .then(() => pushNotice("Server command copied"))
+        .catch(() => pushNotice("Open Spaces after starting the server"));
       return;
     }
-    pushNotice("Open Spaces after starting the local server");
+    pushNotice("Open Spaces after starting the server");
   }, [pushNotice]);
 
   const clearReconnectTimer = useCallback(() => {
@@ -8781,7 +8781,10 @@ function NoSpaceConnectionGuide({
     <div className="mt-4 space-y-3">
       <div className="rounded-lg border border-[#dfe3ec] bg-white px-3 py-2 text-left">
         <div className="text-xs font-semibold uppercase tracking-wide text-[#667085]">
-          Start on this machine
+          Make a machine the server
+        </div>
+        <div className="mt-1 text-xs font-medium text-[#667085]">
+          Run this on the machine that should host Loom.
         </div>
         <code className="mt-1 block truncate font-mono text-xs font-semibold text-[#303849]">
           {localServerCommand}
@@ -8793,7 +8796,7 @@ function NoSpaceConnectionGuide({
         className="rounded-lg"
       >
         <Server size={14} />
-        Use Local Server
+        Prepare Space Connection
       </Button>
     </div>
   );

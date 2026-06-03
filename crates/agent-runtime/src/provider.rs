@@ -1962,18 +1962,6 @@ fn runtime_plan_from_manifest(
     Ok(plan)
 }
 
-fn runtime_mode(
-    command: &str,
-    args: Vec<ProviderArgSpec>,
-    prompt: ProviderPromptSpec,
-    stdout_name: &str,
-    session: Option<ProviderSessionSpec>,
-) -> ProviderModeSpec {
-    let mut mode = mode(command, args, prompt, stdout_name, session);
-    mode.prompt = None;
-    mode
-}
-
 fn expand_static_arg_specs(specs: &[ProviderArgSpec], bin: &Path) -> Vec<ProviderArgSpec> {
     specs
         .iter()
@@ -2082,6 +2070,7 @@ fn command_exists(path: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
 fn base_prompt() -> ProviderPromptSpec {
     ProviderPromptSpec {
         workspace_files: Vec::new(),
@@ -2111,23 +2100,9 @@ fn base_prompt() -> ProviderPromptSpec {
     }
 }
 
-fn full_prompt() -> ProviderPromptSpec {
-    ProviderPromptSpec {
-        workspace_files: Vec::new(),
-        outputs: BTreeMap::from([(
-            "full".into(),
-            ProviderPromptOutputSpec {
-                preset: Some("loom_full".into()),
-                ..Default::default()
-            },
-        )]),
-    }
-}
-
 fn mode(
     command: &str,
     args: Vec<ProviderArgSpec>,
-    _prompt: ProviderPromptSpec,
     stdout_name: &str,
     session: Option<ProviderSessionSpec>,
 ) -> ProviderModeSpec {
@@ -2420,10 +2395,9 @@ fn claude_manifest() -> ProviderManifest {
         BTreeMap::from([
             (
                 "print".into(),
-                runtime_mode(
+                mode(
                     "{bin}",
                     first_args,
-                    base_prompt(),
                     "claude_stream_json",
                     Some(session),
                 ),
@@ -2485,10 +2459,9 @@ fn qoder_manifest() -> ProviderManifest {
         "Qoder CLI",
         &["qodercli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = runtime_mode(
+            let mut mode = mode(
                 "{bin}",
                 first_args,
-                base_prompt(),
                 "claude_stream_json",
                 Some(session),
             );
@@ -2534,10 +2507,9 @@ fn copilot_manifest() -> ProviderManifest {
         "GitHub Copilot CLI",
         &["copilot", "copilotcli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = runtime_mode(
+            let mut mode = mode(
                 "{bin}",
                 args,
-                full_prompt(),
                 "copilot_jsonl_final_text",
                 Some(session),
             );
@@ -2595,10 +2567,9 @@ fn codex_manifest() -> ProviderManifest {
         when("model", vec![lit("--model"), lit("{model}")]),
         lit("{prompt.full}"),
     ];
-    let mut mode = runtime_mode(
+    let mut mode = mode(
         "{bin}",
         first_args,
-        full_prompt(),
         "codex_stream_json",
         Some(ProviderSessionSpec {
             id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -2651,10 +2622,9 @@ fn opencode_manifest() -> ProviderManifest {
         ),
         lit("{prompt.full}"),
     ];
-    let mut mode = runtime_mode(
+    let mut mode = mode(
         "{bin}",
         first_args,
-        full_prompt(),
         "text",
         Some(ProviderSessionSpec {
             id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -2997,7 +2967,7 @@ mod tests {
             &["no-prompt"],
             BTreeMap::from([(
                 "print".into(),
-                mode("{bin}", vec![lit("run")], full_prompt(), "text", None),
+                mode("{bin}", vec![lit("run")], "text", None),
             )]),
             &[],
         );
@@ -3017,7 +2987,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3040,7 +3009,6 @@ mod tests {
                 mode(
                     "other-agent",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3066,7 +3034,6 @@ mod tests {
                 mode(
                     "candidate-agent",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3084,7 +3051,6 @@ mod tests {
                 mode(
                     "/opt/loom/providers/agent",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3105,7 +3071,6 @@ mod tests {
                 mode(
                     "{loom.configDir}/provider",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3131,7 +3096,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}"), lit("{unknown.var}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3157,7 +3121,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("--extra"), lit("{prompt.extra}")],
-                    ProviderPromptSpec::default(),
                     "text",
                     None,
                 ),
@@ -3177,7 +3140,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3477,7 +3439,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     Some(ProviderSessionSpec {
                         id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -3505,7 +3466,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             Some(ProviderSessionSpec {
                 id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -3542,7 +3502,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     Some(ProviderSessionSpec {
                         id_source: Some(ProviderSessionIdSource::LoomUuid),
@@ -3570,7 +3529,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3593,7 +3551,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3624,7 +3581,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3655,7 +3611,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3685,7 +3640,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3948,7 +3902,6 @@ mod tests {
                 when("model", vec![lit("--model-bin"), lit("{bin}")]),
                 lit("{prompt.full}"),
             ],
-            full_prompt(),
             "text",
             Some(ProviderSessionSpec {
                 id_source: Some(ProviderSessionIdSource::LoomUuid),

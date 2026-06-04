@@ -5,8 +5,8 @@ Each job ticks on a 5-field UTC schedule, fetches a body (`command` or
 `http`), and writes one Loom event into the configured scope — optionally
 with a `directed_to` relation so an agent picks it up.
 
-> 状态：S3 plugin。第一个真正用 §6.2 长进程 trait 的 service。短进程
-> handler（`am`）走 `loom service am-handler`，scheduler 不走那条路。
+> 状态：S3 plugin。第一个真正用 §6.2 长进程 trait 的 service。一次性
+> handler 和 webhook-style connector 应走独立入口，scheduler 不走那条路。
 
 ## 1. ServiceSpec
 
@@ -30,8 +30,8 @@ with a `directed_to` relation so an agent picks it up.
         "schedule": "*/10 * * * *",
         "source": {
           "kind": "command",
-          "command": "a1",
-          "args": ["ci", "run", "list", "--json"]
+          "command": "scripts/check-ci",
+          "args": ["--json"]
         },
         "scope": {
           "kind": "thread",

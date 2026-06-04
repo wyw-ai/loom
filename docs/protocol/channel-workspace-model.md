@@ -2,7 +2,7 @@
 
 ## Background
 
-Joi originally treated `channels/<channel-id>/workspace/` as the default live working directory for every agent in the channel. That kept permissions symmetric, but it also let one agent's scratch files affect another agent's reasoning. A partially written file could be mistaken for shared truth.
+Earlier Loom prototypes treated `channels/<channel-id>/workspace/` as the default live working directory for every agent in the channel. That kept permissions symmetric, but it also let one agent's scratch files affect another agent's reasoning. A partially written file could be mistaken for shared truth.
 
 The fix is to keep a shared channel namespace while separating private scratch state from published shared state.
 
@@ -20,7 +20,7 @@ The channel directory is a shared namespace, not a single live workspace.
 - `channel root`: shared container for channel-scoped state
 - `agent workspace`: private default working directory for one agent inside the channel
 - `shared`: channel-scoped published files and artifacts
-- `attachments` / `threads/<thread-id>/context`: existing published context managed by Joi
+- `attachments` / `threads/<thread-id>/context`: existing published context managed by Loom
 
 Directory layout:
 
@@ -48,7 +48,7 @@ Default agent `cwd` is now:
 ~/.agentx/channels/<channel-id>/agents/<agent-id>/workspace
 ```
 
-The cwd is not configurable in `AgentTransport`; Joi computes it from the
+The cwd is not configurable in `AgentTransport`; Loom computes it from the
 current channel and actor for every dispatch.
 
 Supported templates:

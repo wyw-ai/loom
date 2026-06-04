@@ -11,75 +11,59 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue)
 
-Loom means a frame for weaving separate threads into one fabric. In this
-project, it is also short for `LinesOfOpenMessages`: open message lines that
-humans, AI agents, machines, and services use to coordinate work.
+Loom is an open-source collaboration workspace and runtime for humans, AI
+agents, machines, and services. It gives every participant the same protocol
+surface for channels, threads, tasks, artifacts, approvals, and agent runs.
 
-`loom` is an open-source multi-actor collaboration workspace. It combines an
-IM-style channel and thread experience with a protocol server, local agent
-runtime hosts, a CLI, and a desktop GUI so every participant works through the
-same messages, tasks, artifacts, approvals, and execution traces.
+Most AI collaboration tools split conversation, runtime state, and operational
+logs into separate places. Loom keeps them attached to the same message graph:
+a human can discuss work in a channel, wake or assign an agent, inspect which
+machine and provider will run it, and keep the result connected to the thread
+where the work started.
 
-> Status: early 0.1.0 codebase. Core protocol and UI surfaces are still
-> evolving.
+> Status: Loom is an early pre-1.0 project. The protocol, runtime
+> configuration, and Desktop UX are still changing. It is best suited for local
+> experiments, protocol/runtime development, and product exploration.
 
-## Roles
+## What You Can Do
 
-`loom` is split into a few deliberately small processes:
+- Run a local WebSocket JSON-RPC collaboration server.
+- Use channels, threads, direct messages, mentions, and task-oriented delivery.
+- Register machines as runtime hosts for local agents and services.
+- Add provider manifests on a registered host for tools such as Claude, Codex,
+  Copilot, OpenCode, and Qoder.
+- Create concrete agents with their own identity, provider binding,
+  instructions, prompt assembly, profile files, and scope workspaces.
+- Use the CLI, terminal chat UI, or Loom Desktop against the same server.
+- Keep messages, tasks, artifacts, run traces, and host-side workspace files
+  connected to the collaboration context that produced them.
 
-- `loom-server` is the collaboration hub. It owns the journal, channels,
-  threads, direct messages, tasks, deliveries, runs, artifacts, reminders,
-  access checks, and WebSocket JSON-RPC fanout. It does not spawn model or agent
-  processes.
-- `loom-daemon` runs on a local machine. It connects to `loom-server`, detects
-  local agent providers, supervises agent workers, exposes a local IPC socket
-  for host-local `loom` calls, and can start the service host.
-- `loom` is the command-line client and chat TUI. Humans can use it directly,
-  and agents can use it as a stable tool surface for message, task,
-  coordination, artifact, memory, and workspace operations.
-- Loom Desktop is the GUI client. It connects to the same server protocol and
-  provides the human-facing workspace for chat, threads, agents, providers, and
-  machine management.
+## Core Model
 
-The important boundary is simple: `loom-server` stores and routes collaboration
-facts, while `loom-daemon` owns local runtime execution.
+| Surface | What it does |
+| --- | --- |
+| `loom-server` | The protocol hub you connect everything to. It persists collaboration facts and fans events out over JSON-RPC/WebSocket, but does not read agent runtime config or start provider CLIs. |
+| `loom-daemon` | The host process for a machine. It registers the machine with the server, owns host-local runtime config and data, publishes provider/agent inventory, and runs local agents. |
+| `loom` | The command line and terminal chat UI. Humans use it directly; agents use it as a stable tool belt for messages, tasks, artifacts, memory, and workspace files. |
+| Loom Desktop | The human-facing GUI. It reads server state and registered-host inventory, then sends machine commands to the selected host when creating or editing providers and agents. |
+| Communication | Channels are long-lived shared rooms. Threads are focused branches under messages for task work or handoffs. Messages, tasks, deliveries, runs, and artifacts stay attached to that communication graph. |
+| Actors Management | Loom treats humans, agents, services, machines, and system identities as actors. Registered Hosts, Providers, Agents, and Services are managed together here: a host advertises runtime capability, providers define external agent products, agents are concrete AI actors, and services are long-running integrations. |
 
-## Tech Stack
+The key boundary is intentional: communication facts live in `loom-server`;
+runtime definitions, prompt files, profile data, scope workspaces, and local
+execution live on registered hosts.
 
-- Rust workspace for the protocol, server, CLI, daemon, and runtime crates.
-- Tokio, Axum, and tokio-tungstenite for async WebSocket JSON-RPC transport.
-- SQLite through rusqlite for the server journal.
-- Tauri 2 for the desktop shell.
-- React 18, TypeScript 5, and Vite for the desktop frontend.
+## Data Ownership
 
-## Features
-
-- IM-style collaboration with channels, threads, direct messages, and scoped
-  message reads.
-- Deterministic delivery and inbox semantics for mentions, tasks, and agent
-  wakeups.
-- Message-anchored task and coordination workflows for multi-actor work.
-- Local agent runtime supervision through provider manifests and AgentSpec
-  files.
-- Artifact and workspace helpers for sharing files across scopes.
-- Desktop GUI, terminal chat UI, CLI automation, and service/plugin host
-  surfaces.
-- WebSocket JSON-RPC transport, with Unix socket and file-RPC options for local
-  workflows.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  cli["loom CLI / chat TUI"] --> server["loom-server"]
-  gui["Loom Desktop"] --> server
-  daemon["loom-daemon"] --> server
-  service["loom service serve"] --> server
-  daemon --> runtime["agent-runtime"]
-  runtime --> providers["local agent CLIs"]
-  server --> store["SQLite journal"]
-  server --> artifacts["artifacts / workspaces"]
-```
+| Data | Owner |
+| --- | --- |
+| Actors, channels, threads, messages, tasks, deliveries, runs, machine command records | `loom-server`, persisted in its `--data-dir` SQLite journal |
+| Published artifact bodies and server-side scope projections | `loom-server`, under its `--data-dir`; this is not the agent runtime workspace |
+| Host identity and server connection | the daemon's local `LOOM_CONFIG_DIR/daemon.toml` |
+| Custom ProviderManifest files | the target host's `LOOM_CONFIG_DIR/providers/<provider_id>.json` |
+| AgentSpec files | the target host's `LOOM_CONFIG_DIR/agents/<actor_id>/spec.json` |
+| Agent profile files and channel-scoped workspace files | the target host's data root, defaulting to `~/.agentx` |
+| ServiceSpec files and private service state | the service host; specs come from `LOOM_CONFIG_DIR/services`, while cursors/dedupe/logs live under the service-host data root |
 
 ## Quick Start
 
@@ -93,44 +77,89 @@ export PATH="$PWD/target/debug:$PATH"
 If you do not want to modify `PATH`, replace commands such as `loom-server`
 with `./target/debug/loom-server`.
 
-Start the server:
+Start the collaboration server:
 
 ```bash
 loom-server --bind 127.0.0.1:7878
 ```
 
-In another terminal, check the client identity and create a channel. The CLI
-defaults to `ws://127.0.0.1:7878/rpc` and stores local identity in
+In another terminal, initialize a local actor identity and create a channel.
+The CLI defaults to `ws://127.0.0.1:7878/rpc` and stores local identity in
 `~/.loom/cli.toml`.
 
 ```bash
 loom who
 loom channel create --title general
 loom channel list
-```
-
-Open the terminal chat UI:
-
-```bash
 loom chat
 ```
 
-Inspect local agent providers, then start the machine daemon:
+Optionally register the current machine as a host for agents and services:
 
 ```bash
 loom-daemon --list-providers
 loom-daemon --server ws://127.0.0.1:7878/rpc
 ```
 
-With `loom-server` and `loom-daemon` running, the GUI can connect to the same
-workspace and use the daemon-managed machine for local agents.
+With `loom-server` and at least one `loom-daemon` running, the GUI can connect
+to the same server, read registered-host inventory, and create agents on a
+selected host.
 
-Run the desktop GUI in development mode:
+Run Loom Desktop in development mode:
 
 ```bash
 make gui-deps
 make gui-dev
 ```
+
+## Providers And Agents
+
+Provider manifests describe how a host connects Loom to an agent product. They
+own the runtime integration details: executable, arguments, environment
+variables, prompt outputs, parsing rules, authentication mode, and session
+strategy.
+
+Agent specs describe the concrete Loom actor that uses a provider. They own the
+human-facing identity, instructions, selected model, provider mode, prompt
+assembly choices, profile files, and workspace prompt files.
+
+Generate and validate provider examples:
+
+```bash
+loom provider example --claude --json
+loom provider example --codex --json
+loom provider validate examples/providers/claude.json
+```
+
+To add a provider on the current host, create a manifest with a non-built-in
+provider id and register it:
+
+```bash
+loom provider add path/to/my-provider.json
+```
+
+See [`examples/providers`](examples/providers/README.md) and
+[`examples/agents`](examples/agents/README.md) for current manifest shapes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  cli["loom CLI / chat TUI"] --> server["loom-server"]
+  gui["Loom Desktop"] --> server
+  daemon["loom-daemon"] --> server
+  service["loom service serve"] --> server
+  daemon --> runtime["agent-runtime"]
+  runtime --> providers["local provider CLIs"]
+  daemon --> hostdata["host config / AgentSpecs / profiles / scope workspaces"]
+  service --> svcstate["ServiceSpecs / cursors / dedupe / logs"]
+  server --> store["SQLite journal"]
+  server --> files["server artifacts / scope projections"]
+```
+
+The server is deliberately not an agent launcher. Agent execution happens under
+`loom-daemon`; service execution happens in a service host, often started by
+the daemon. Both run outside `loom-server`.
 
 ## Documentation
 
@@ -151,7 +180,7 @@ make gui-dev
   agent runtime helpers.
 - `crates/gui` - Tauri desktop shell.
 - `apps/gui-web` - React/Vite frontend used by the desktop GUI.
-- `docs` - public architecture, protocol, runtime, GUI, and workflow notes.
+- `docs` - architecture, protocol, runtime, GUI, and workflow notes.
 - `examples` - sample agent and provider manifests.
 - `scripts/e2e` - local end-to-end smoke scripts.
 
@@ -171,6 +200,13 @@ Focused Rust checks:
 cargo check -p loom-server -p loom-cli -p agent-runtime
 cargo test -p loom-server
 cargo test -p loom-cli agent_serve
+```
+
+Desktop development:
+
+```bash
+pnpm --dir apps/gui-web install
+make gui-dev
 ```
 
 Release packaging entry points are available through `make release`,

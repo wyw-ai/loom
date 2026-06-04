@@ -19,8 +19,8 @@
 
 这份文档对应的语义层定义，见：
 
-- [open-multi-actor-collaboration-research.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/open-multi-actor-collaboration-research.md)
-- [open-multi-actor-collaboration-protocol-v0.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/open-multi-actor-collaboration-protocol-v0.md)
+- [open-multi-actor-collaboration-research.md](./open-multi-actor-collaboration-research.md)
+- [open-multi-actor-collaboration-protocol-v0.md](./open-multi-actor-collaboration-protocol-v0.md)
 
 ## 2. 设计目标
 

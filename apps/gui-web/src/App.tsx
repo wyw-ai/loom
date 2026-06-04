@@ -19,6 +19,7 @@ import type {
 import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import {
+  ArrowLeft,
   Bell,
   Bot,
   Check,
@@ -32,6 +33,7 @@ import {
   HardDrive,
   Home,
   Lock,
+  ListChecks,
   Loader2,
   LogOut,
   MessageCircle,
@@ -185,6 +187,18 @@ type AgentSettingsDraft = {
 type AgentMemberEntry = {
   machine: MachineInfo;
   agent: MachineInfo["agents"][number];
+};
+type ProviderAvailabilityGroup = {
+  key: string;
+  id: string;
+  name: string;
+  transportKind: string;
+  actorCount: number;
+  defaultModels: string[];
+  hosts: Array<{
+    machine: MachineInfo;
+    provider: MachineAgentProviderInfo;
+  }>;
 };
 type ActorWorkspaceSection = "agents" | "hosts" | "services";
 type AgentDetailTab = "profile" | "prompt" | "settings";
@@ -1225,10 +1239,10 @@ export function App() {
     }
   }
 
-  async function createAgent(): Promise<boolean> {
-    const name = agentForm.name.trim();
-    const machine = resolveAgentMachine(agentForm, machines);
-    const provider = resolveAgentProvider(agentForm, machine);
+  async function createAgent(form: AgentFormState = agentForm): Promise<boolean> {
+    const name = form.name.trim();
+    const machine = resolveAgentMachine(form, machines);
+    const provider = resolveAgentProvider(form, machine);
     if (!machine) {
       setError("Register a host before creating an agent.");
       return false;
@@ -1251,13 +1265,13 @@ export function App() {
       const result = await ipc.machineAgentCreate({
         machineId: machine.id,
         providerId: provider.id,
-        actorId: agentForm.actorId.trim() || undefined,
+        actorId: form.actorId.trim() || undefined,
         name,
-        description: agentForm.description.trim(),
-        instructions: agentForm.instructions.trim(),
+        description: form.description.trim(),
+        instructions: form.instructions.trim(),
         promptAssembly: defaultAgentPromptAssembly,
-        model: agentForm.model.trim() || provider.defaultModel || "",
-        autostart: agentForm.autostart,
+        model: form.model.trim() || provider.defaultModel || "",
+        autostart: form.autostart,
       });
       applyMachines(result.machines);
       setAgentForm((current) =>
@@ -5454,7 +5468,7 @@ function SettingsView({
     dataRoot?: string;
   }) => Promise<MachineInfo | null> | MachineInfo | null;
   onRemoveMachine: (machineId: string) => void;
-  onAddAgent: () => Promise<boolean> | boolean;
+  onAddAgent: (form: AgentFormState) => Promise<boolean> | boolean;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
@@ -5588,6 +5602,19 @@ function SettingsView({
     setMemberCreateMenuOpen(false);
   }
 
+  function selectCreateAgentMachine(machineId: string) {
+    const nextMachine = machines.find((machine) => machine.id === machineId) ?? null;
+    if (!nextMachine) return;
+    setSelectedMachineId(nextMachine.id);
+    setCreateAgentMachineId(nextMachine.id);
+    setAgentForm(agentFormForMachine(agentForm, nextMachine));
+  }
+
+  function showAgentRoster() {
+    setActiveSection("agents");
+    setSelectedAgentId(null);
+  }
+
   function openRegisterHostDialog() {
     setActiveSection("hosts");
     setSelectedAgentId(null);
@@ -5604,11 +5631,7 @@ function SettingsView({
   function selectSection(section: ActorWorkspaceSection) {
     setActiveSection(section);
     if (section === "agents") {
-      setSelectedAgentId((current) =>
-        current && memberEntries.some((entry) => entry.agent.spec.actor.id === current)
-          ? current
-          : null,
-      );
+      setSelectedAgentId(null);
       return;
     }
     if (section === "hosts") {
@@ -5624,6 +5647,7 @@ function SettingsView({
         <AgentMemberDetail
           entry={selectedMemberEntry}
           busy={busy}
+          onBack={showAgentRoster}
           onUpdateAgent={onUpdateAgent}
           onRemoveAgent={onRemoveAgent}
         />
@@ -5810,6 +5834,28 @@ function SettingsView({
                   </div>
                 </div>
                 <div className="space-y-1.5">
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors",
+                      selectedAgentId === null
+                        ? "border-[#bdb7ff] bg-[#f6f4ff] shadow-sm"
+                        : "border-transparent bg-transparent hover:border-[#dfe3ec] hover:bg-white",
+                    )}
+                    onClick={showAgentRoster}
+                  >
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+                      <ListChecks size={15} />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-bold text-[#111827]">
+                        All Agents
+                      </span>
+                      <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                        {memberEntries.length} registered
+                      </span>
+                    </span>
+                  </button>
                   {memberEntries.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
                       <div>No agents registered.</div>
@@ -5862,7 +5908,9 @@ function SettingsView({
           agentForm={agentForm}
           busy={busy}
           machine={createAgentMachine}
+          machines={machines}
           setAgentForm={setAgentForm}
+          onSelectMachine={selectCreateAgentMachine}
           onAddAgent={onAddAgent}
           onClose={() => setCreateAgentMachineId(null)}
         />
@@ -6314,9 +6362,7 @@ function AgentRosterOverview({
   onSelectAgent: (entry: AgentMemberEntry) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
-  const providerRows = machines.flatMap((machine) =>
-    machine.providers.map((provider) => ({ machine, provider })),
-  );
+  const providerGroups = providerAvailabilityGroups(machines);
   const hostRows = machines.map((machine) => ({
     machine,
     canCreate: machineCanCreateAgent(machine) && machine.providers.length > 0,
@@ -6335,7 +6381,7 @@ function AgentRosterOverview({
               <span className="text-[#a0a6b3]">/</span>
               <span>{onlineAgents} online</span>
               <span className="text-[#a0a6b3]">/</span>
-              <span>{providerRows.length} providers</span>
+              <span>{providerGroups.length} provider types</span>
             </div>
           </div>
           <Button
@@ -6379,95 +6425,98 @@ function AgentRosterOverview({
         </div>
       </HostDetailSection>
 
-      <section className="border-b border-[#dfe3ec] px-6 py-5 lg:px-8">
-        <div className="space-y-4">
-          <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                  Provider Library
-                </div>
-                <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
-                  {providerRows.length}
-                </span>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onOpenProviderAdd}
-                disabled={machines.length === 0}
-                className="h-8 rounded-lg border-[#dfe3ec] bg-white"
-              >
-                <Plus size={14} />
-                Add
-              </Button>
-            </div>
-            <div className="max-h-52 space-y-1.5 overflow-y-auto soft-scrollbar">
-              {providerRows.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-white p-3 text-sm text-[#667085]">
-                  No providers detected.
-                </div>
-              ) : (
-                <div className="grid gap-2 lg:grid-cols-2 2xl:grid-cols-3">
-                  {providerRows.map(({ machine, provider }) => (
-                    <ProviderLibraryRow
-                      key={`${machine.id}:${provider.id}`}
-                      machine={machine}
-                      provider={provider}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-
+      <HostDetailSection
+        title="Create Readiness"
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onOpenProviderAdd}
+            disabled={machines.length === 0}
+            className="h-8 rounded-lg border-[#dfe3ec] bg-white"
+          >
+            <Plus size={14} />
+            Add Provider
+          </Button>
+        }
+      >
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-white p-3">
             <div className="mb-3 flex items-center gap-2">
-              <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                Host Readiness
+              <div className="flex items-center gap-2">
+                <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                  Hosts
+                </div>
+                <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
+                  {hostRows.length}
+                </span>
               </div>
-              <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
-                {hostRows.length}
-              </span>
             </div>
-            <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+            <div className="grid gap-2">
               {hostRows.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
                   No registered hosts.
                 </div>
               ) : (
-                hostRows.map(({ machine, canCreate }) => (
-                  <button
-                    key={machine.id}
-                    type="button"
-                    className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-3 py-3 text-left transition-colors hover:border-[#c8c1ff] hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
-                    onClick={() => onOpenCreateAgent(machine)}
-                    disabled={!canCreate}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={cn(
-                          "h-2 w-2 shrink-0 rounded-full",
-                          statusDotClass(machine.connectionStatus),
-                        )}
-                      />
-                      <span className="min-w-0 flex-1 truncate text-sm font-bold text-[#111827]">
-                        {machine.name}
-                      </span>
-                      <Badge variant={canCreate ? "outline" : "warning"}>
-                        {canCreate ? "ready" : "blocked"}
-                      </Badge>
-                    </div>
-                    <div className="mt-2 truncate text-xs text-[#667085]">
-                      {machine.providers.length} providers / {machine.onlineAgentCount}/{machine.agentCount} online
-                    </div>
-                  </button>
+                hostRows.map(({ machine, canCreate }) => {
+                  const reason = !machineCanCreateAgent(machine)
+                    ? "read only"
+                    : machine.providers.length === 0
+                      ? "no runtime"
+                      : "ready";
+                  return (
+                    <button
+                      key={machine.id}
+                      type="button"
+                      className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-3 py-3 text-left transition-colors hover:border-[#c8c1ff] hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => onOpenCreateAgent(machine)}
+                      disabled={!canCreate}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "h-2 w-2 shrink-0 rounded-full",
+                            statusDotClass(machine.connectionStatus),
+                          )}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-sm font-bold text-[#111827]">
+                          {machine.name}
+                        </span>
+                        <Badge variant={canCreate ? "outline" : "warning"}>{reason}</Badge>
+                      </div>
+                      <div className="mt-2 truncate text-xs text-[#667085]">
+                        {machine.providers.length} providers / {machine.onlineAgentCount}/{machine.agentCount} online
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                Provider Availability
+              </div>
+              <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
+                {providerGroups.length}
+              </span>
+            </div>
+            <div className="max-h-60 space-y-2 overflow-y-auto soft-scrollbar">
+              {providerGroups.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-white p-3 text-sm text-[#667085]">
+                  No providers detected.
+                </div>
+              ) : (
+                providerGroups.map((group) => (
+                  <ProviderAvailabilityRow key={group.key} group={group} />
                 ))
               )}
             </div>
           </div>
         </div>
-      </section>
+      </HostDetailSection>
     </div>
   );
 }
@@ -6537,17 +6586,18 @@ function AgentRosterRow({
   );
 }
 
-function ProviderLibraryRow({
-  machine,
-  provider,
-}: {
-  machine: MachineInfo;
-  provider: MachineAgentProviderInfo;
-}) {
-  const iconKey = agentProviderIconKey(provider.id, provider.name);
+function ProviderAvailabilityRow({ group }: { group: ProviderAvailabilityGroup }) {
+  const iconKey = agentProviderIconKey(group.id, group.name);
+  const hostNames = group.hosts.map(({ machine }) => machine.name);
+  const modelLabel =
+    group.defaultModels.length === 0
+      ? "default model"
+      : group.defaultModels.length === 1
+        ? group.defaultModels[0]
+        : `${group.defaultModels.length} model defaults`;
 
   return (
-    <div className="grid min-h-[52px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border border-[#edf0f5] bg-white px-3 py-2">
+    <div className="grid min-h-[58px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border border-[#edf0f5] bg-white px-3 py-2.5">
       <div className="flex min-w-0 items-center gap-2.5">
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
           {iconKey ? (
@@ -6558,21 +6608,21 @@ function ProviderLibraryRow({
         </span>
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-bold text-[#111827]">
-            {provider.name}
+            {group.name}
           </div>
           <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-[#667085]">
-            <span className="shrink-0">{machine.name}</span>
+            <span className="min-w-0 truncate">{hostNames.join(", ")}</span>
             <span className="shrink-0 text-[#a0a6b3]">/</span>
             <span className="min-w-0 truncate font-mono">
-              {provider.defaultModel || "default model"}
+              {modelLabel}
             </span>
           </div>
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
-        <Badge variant="outline">{provider.transportKind}</Badge>
-        {provider.actorCount > 0 && (
-          <Badge variant="secondary">{provider.actorCount} agents</Badge>
+        <Badge variant="outline">{group.hosts.length} hosts</Badge>
+        {group.actorCount > 0 && (
+          <Badge variant="secondary">{group.actorCount} agents</Badge>
         )}
       </div>
     </div>
@@ -6768,40 +6818,61 @@ function AgentCreateDialog({
   agentForm,
   busy,
   machine,
+  machines,
   setAgentForm,
+  onSelectMachine,
   onAddAgent,
   onClose,
 }: {
   agentForm: AgentFormState;
   busy: string | null;
   machine: MachineInfo;
+  machines: MachineInfo[];
   setAgentForm: (form: AgentFormState) => void;
-  onAddAgent: () => Promise<boolean> | boolean;
+  onSelectMachine: (machineId: string) => void;
+  onAddAgent: (form: AgentFormState) => Promise<boolean> | boolean;
   onClose: () => void;
 }) {
-  const selectedProvider = resolveAgentProvider(agentForm, machine);
+  const [draft, setDraft] = useState<AgentFormState>(() =>
+    agentFormForMachine(agentForm, machine),
+  );
+  const selectedProvider = resolveAgentProvider(draft, machine);
   const modelChoices = selectedProvider?.modelChoices ?? [];
   const [customModelActive, setCustomModelActive] = useState(false);
   const canCreateAgent = machineCanCreateAgent(machine);
   const creating = busy === "agent:create";
   const agentReady = Boolean(
-    canCreateAgent && selectedProvider && agentForm.name.trim(),
+    canCreateAgent && selectedProvider && draft.name.trim(),
   );
-  const modelValue = agentForm.model || selectedProvider?.defaultModel || "";
+  const modelValue = draft.model || selectedProvider?.defaultModel || "";
   const modelIsKnown =
     !modelValue || modelChoices.some((choice) => choice.id === modelValue);
   const showCustomModel =
     modelChoices.length === 0 || customModelActive || !modelIsKnown;
   const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
+  const writableHosts = machines.filter(machineCanCreateAgent);
+  const readyHosts = machines.filter(
+    (item) => machineCanCreateAgent(item) && item.providers.length > 0,
+  );
   const createStatusText = !canCreateAgent
     ? "This host is read-only for the current account."
     : !selectedProvider
       ? "No runtime detected for this host."
       : `${selectedProvider.name} on ${machine.name}`;
+  const createStatusBadge = !canCreateAgent
+    ? "read only"
+    : selectedProvider
+      ? "ready"
+      : "no runtime";
 
   useEffect(() => {
+    setDraft((current) => agentFormForMachine(current, machine));
     setCustomModelActive(false);
-  }, [selectedProvider?.id]);
+  }, [machine.id]);
+
+  useEffect(() => {
+    setAgentForm(draft);
+  }, [draft, setAgentForm]);
 
   useEffect(() => {
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -6812,27 +6883,35 @@ function AgentCreateDialog({
   }, [onClose]);
 
   function updateAgentForm(patch: Partial<AgentFormState>) {
-    setAgentForm({
-      ...agentForm,
+    setDraft((current) => ({
+      ...current,
       machineId: machine.id,
-      providerId: selectedProvider?.id ?? agentForm.providerId,
+      providerId: selectedProvider?.id ?? current.providerId,
       ...patch,
-    });
+    }));
   }
 
   function selectProvider(provider: MachineAgentProviderInfo) {
     setCustomModelActive(false);
-    setAgentForm({
-      ...agentForm,
+    setDraft((current) => ({
+      ...current,
       machineId: machine.id,
       providerId: provider.id,
       model: provider.defaultModel || provider.modelChoices[0]?.id || "",
-    });
+    }));
+  }
+
+  function selectMachine(machineId: string) {
+    const nextMachine = machines.find((item) => item.id === machineId);
+    if (!nextMachine) return;
+    setDraft((current) => agentFormForMachine(current, nextMachine));
+    setCustomModelActive(false);
+    onSelectMachine(nextMachine.id);
   }
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const created = await onAddAgent();
+    const created = await onAddAgent(draft);
     if (created) onClose();
   }
 
@@ -6868,8 +6947,8 @@ function AgentCreateDialog({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Badge variant={canCreateAgent ? "outline" : "warning"}>
-              {canCreateAgent ? "available" : "read only"}
+            <Badge variant={canCreateAgent && selectedProvider ? "outline" : "warning"}>
+              {createStatusBadge}
             </Badge>
             <button
               type="button"
@@ -6884,6 +6963,60 @@ function AgentCreateDialog({
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
           <div className="space-y-5">
+            <section>
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+                Host
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {machines.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                    Register a host before creating agents.
+                  </div>
+                ) : (
+                  machines.map((item) => {
+                    const selected = item.id === machine.id;
+                    const ready = machineCanCreateAgent(item) && item.providers.length > 0;
+                    const blockedReason = !machineCanCreateAgent(item)
+                      ? "Read only"
+                      : item.providers.length === 0
+                        ? "No runtime"
+                        : "";
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={cn(
+                          "flex min-h-[62px] items-center gap-3 rounded-xl border bg-white px-3 py-3 text-left transition-colors",
+                          selected
+                            ? "border-[#8f82ff] bg-[#f7f5ff] ring-2 ring-[#ece8ff]"
+                            : "border-[#e2e6ef] hover:border-[#c8c1ff]",
+                        )}
+                        onClick={() => selectMachine(item.id)}
+                      >
+                        <span
+                          className={cn(
+                            "h-2.5 w-2.5 shrink-0 rounded-full",
+                            statusDotClass(item.connectionStatus),
+                          )}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-bold text-[#111827]">
+                            {item.name}
+                          </span>
+                          <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                            {item.providers.length} runtimes / {item.onlineAgentCount}/{item.agentCount} online
+                          </span>
+                        </span>
+                        <Badge variant={ready ? "outline" : "warning"}>
+                          {ready ? "ready" : blockedReason}
+                        </Badge>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </section>
+
             <section>
               <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
                 Runtime
@@ -6935,14 +7068,14 @@ function AgentCreateDialog({
 
             <section className="grid gap-3 md:grid-cols-2">
               <Input
-                value={agentForm.name}
+                value={draft.name}
                 onChange={(event) => updateAgentForm({ name: event.target.value })}
                 placeholder="Agent name"
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                 disabled={!canCreateAgent}
               />
               <Input
-                value={agentForm.actorId}
+                value={draft.actorId}
                 onChange={(event) => updateAgentForm({ actorId: event.target.value })}
                 placeholder="Actor id (optional)"
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
@@ -6956,7 +7089,7 @@ function AgentCreateDialog({
                       if (event.target.value === customModelOptionValue) {
                         setCustomModelActive(true);
                         updateAgentForm({
-                          model: modelIsKnown ? "" : agentForm.model,
+                          model: modelIsKnown ? "" : draft.model,
                         });
                         return;
                       }
@@ -6976,7 +7109,7 @@ function AgentCreateDialog({
                 ) : null}
                 {showCustomModel && (
                   <Input
-                    value={agentForm.model}
+                    value={draft.model}
                     onChange={(event) => updateAgentForm({ model: event.target.value })}
                     placeholder="Custom model"
                     className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
@@ -6987,7 +7120,7 @@ function AgentCreateDialog({
               <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
                 <input
                   type="checkbox"
-                  checked={agentForm.autostart}
+                  checked={draft.autostart}
                   onChange={(event) =>
                     updateAgentForm({ autostart: event.target.checked })
                   }
@@ -6996,14 +7129,14 @@ function AgentCreateDialog({
                 Autostart
               </label>
               <Input
-                value={agentForm.description}
+                value={draft.description}
                 onChange={(event) => updateAgentForm({ description: event.target.value })}
                 placeholder="Description"
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                 disabled={!canCreateAgent}
               />
               <Textarea
-                value={agentForm.instructions}
+                value={draft.instructions}
                 onChange={(event) => updateAgentForm({ instructions: event.target.value })}
                 placeholder="Agent instructions"
                 className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
@@ -7015,7 +7148,7 @@ function AgentCreateDialog({
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
           <div className="text-xs font-medium text-[#667085]">
-            {createStatusText}
+            {readyHosts.length} ready hosts / {writableHosts.length} writable
           </div>
           <Button
             type="submit"
@@ -7039,11 +7172,13 @@ function AgentCreateDialog({
 function AgentMemberDetail({
   entry,
   busy,
+  onBack,
   onUpdateAgent,
   onRemoveAgent,
 }: {
   entry: AgentMemberEntry;
   busy: string | null;
+  onBack: () => void;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
@@ -7101,6 +7236,15 @@ function AgentMemberDetail({
   return (
     <div className="min-h-full bg-white">
       <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onBack}
+          className="mb-4 rounded-lg px-2 text-[#596174] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+        >
+          <ArrowLeft size={15} />
+          All Agents
+        </Button>
         <div className="flex flex-wrap items-start justify-between gap-6">
           <div className="flex min-w-0 items-start gap-4">
             <img
@@ -9288,6 +9432,40 @@ function flattenThreads(
 function agentMemberEntries(machines: MachineInfo[]): AgentMemberEntry[] {
   return machines.flatMap((machine) =>
     machine.agents.map((agent) => ({ machine, agent })),
+  );
+}
+
+function providerAvailabilityGroups(machines: MachineInfo[]): ProviderAvailabilityGroup[] {
+  const groups = new Map<string, ProviderAvailabilityGroup>();
+  for (const machine of machines) {
+    for (const provider of machine.providers) {
+      const key = `${provider.id}:${provider.transportKind}`;
+      const current =
+        groups.get(key) ??
+        {
+          key,
+          id: provider.id,
+          name: provider.name || provider.id,
+          transportKind: provider.transportKind,
+          actorCount: 0,
+          defaultModels: [],
+          hosts: [],
+        };
+      current.actorCount += provider.actorCount;
+      if (
+        provider.defaultModel &&
+        !current.defaultModels.includes(provider.defaultModel)
+      ) {
+        current.defaultModels.push(provider.defaultModel);
+      }
+      current.hosts.push({ machine, provider });
+      groups.set(key, current);
+    }
+  }
+  return Array.from(groups.values()).sort((a, b) =>
+    a.name.localeCompare(b.name) ||
+    a.transportKind.localeCompare(b.transportKind) ||
+    a.id.localeCompare(b.id),
   );
 }
 

@@ -927,8 +927,8 @@ providerRef、model 等声明；真正写入由目标 daemon 完成：
 ```json
 {
   "actor": {
-    "id": "actor_joi",
-    "displayName": "Joi"
+    "id": "actor_assistant",
+    "displayName": "Assistant"
   },
   "instructions": "Reply concisely and report completed work.",
   "providerRef": {

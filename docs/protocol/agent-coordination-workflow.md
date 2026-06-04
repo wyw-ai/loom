@@ -1,6 +1,6 @@
 # Agent Coordination Workflow
 
-本协议定义 Loom/Joi 多 agent 在 channel / thread / task 上协作时的最小硬约束。
+本协议定义 Loom 多 agent 在 channel / thread / task 上协作时的最小硬约束。
 目标不是把聊天系统改成 Git，而是借用 Git 的两个关键思想：
 
 - 开工前先获得 work owner。
@@ -12,7 +12,7 @@
 
 ## 1. 核心模型
 
-| 协作概念 | Loom/Joi 原语 | 语义 |
+| 协作概念 | Loom 原语 | 语义 |
 | --- | --- | --- |
 | 主干事实流 | channel | 只承载顶层请求、短答和必要索引 |
 | 工作锚点 | 顶层 channel message | task 的唯一 source message |

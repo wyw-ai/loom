@@ -374,7 +374,7 @@ v0 定义一组最小可互操作事件类型。实现可以扩展，但不得�
 
 协议操作只定义语义，不绑定具体传输。它可以通过 WebSocket、SSE + HTTP、stdio、QUIC 或其他双向流承载。
 
-完整的 interface contract、notification 结构和 binding 约束，见 [open-multi-actor-collaboration-schema-v0.md](/Users/bojun.cbj/Workspace/gitlab.alibaba-inc.com/bojun.cbj/joi-apps/docs/protocol/open-multi-actor-collaboration-schema-v0.md)。
+完整的 interface contract、notification 结构和 binding 约束，见 [open-multi-actor-collaboration-schema-v0.md](./open-multi-actor-collaboration-schema-v0.md)。
 
 ### 10.1 `connection/open`
 

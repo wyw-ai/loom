@@ -5006,9 +5006,14 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          several times, so first read the latest thread/task state and, if it is\n\
          already done, do not repeat it. Before starting a discussion or voting\n\
          phase, decide how it ends — an ordered round where each participant\n\
-         speaks once, a fixed number of replies, or a deadline — and drive it:\n\
-         wake the next participant, have each one wake you back when done so you\n\
-         can wake the next, and never wait for organic silence. After each state\n\
+         speaks once, a fixed number of replies, or a deadline — and drive it.\n\
+         Do NOT assume a participant will wake you back after their turn: when you\n\
+         hand off to the next speaker/voter with `message ask @id`, in the SAME\n\
+         turn also schedule a short self-reminder\n\
+         (`loom --json reminder schedule --title \"next speaker\" --delay-seconds\n\
+         90`) so you are re-woken to read the latest thread and advance to the\n\
+         next participant even if the current one never wakes you. Never wait for\n\
+         organic silence. After each state\n\
          update, wake the exact\n\
          actor(s) who must act next. When you need several private responses\n\
          before continuing (hidden actions, votes), send each with\n\

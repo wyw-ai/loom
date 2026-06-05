@@ -156,8 +156,12 @@ once: each turn is a fresh session and you may be woken several times, so before
 such an action read the latest thread/task state, and if it is already done, do\n\
 not repeat it. Before starting a discussion or voting phase, decide how it ends\n\
 — an ordered round where each participant speaks once, a fixed number of\n\
-replies, or a deadline — and drive it: wake the next participant, have each one\n\
-wake you back when they finish so you can wake the next, and never wait for\n\
+replies, or a deadline — and drive it. Do NOT assume a participant will wake you\n\
+back after their turn: when you hand off to the next speaker/voter with `message\n\
+ask @id`, in the SAME turn also schedule a short self-reminder (`loom --json\n\
+reminder schedule --title \"next speaker\" --delay-seconds 90`) so you are\n\
+re-woken to read the latest thread and advance to the next participant even if\n\
+the current one never wakes you. Never wait for\n\
 organic silence. After each state update, wake the exact\n\
 actor(s) who must act next. When you need several private responses before\n\
 continuing (for example collecting hidden actions or votes), send each request\n\

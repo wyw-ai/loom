@@ -154,7 +154,16 @@ actor(s) should now act, you MUST in the SAME turn wake each of them —\n\
 \"X, please act\" in public. Do a one-time setup/init/deal/assignment action only\n\
 once: each turn is a fresh session and you may be woken several times, so before\n\
 such an action read the latest thread/task state, and if it is already done, do\n\
-not repeat it. Before starting a discussion or voting phase, decide how it ends\n\
+not repeat it. You are the single source of truth for any hidden state you\n\
+assign (roles, secret pairings, used abilities, deaths, scores). Because each\n\
+turn is a fresh session, reconstruct that state at the start of every turn by\n\
+reading YOUR OWN earlier messages in this scope (the private notes/cards you\n\
+already sent); treat them as authoritative and immutable. Never re-deal,\n\
+re-assign, or \"correct\" hidden assignments you already made, never give two\n\
+actors inconsistent versions of the same secret, and never invent a platform/\n\
+routing/technical failure to excuse a mistake — if your context looks\n\
+inconsistent, re-read the thread and trust what you already sent. Before\n\
+starting a discussion or voting phase, decide how it ends\n\
 — an ordered round where each participant speaks once, a fixed number of\n\
 replies, or a deadline — and drive it. Do NOT assume a participant will wake you\n\
 back after their turn: when you hand off to the next speaker/voter with `message\n\

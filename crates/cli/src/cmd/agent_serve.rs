@@ -5016,6 +5016,19 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          conflicting inputs that must be reconciled, decide or briefly ask the\n\
          parties to agree; do not stall. A @all summary sent with plain\n\
          `message send` advances nothing.\n\
+         Drive the whole phase to completion, not one step per wake. When a wake\n\
+         delivers an input, do not stop after merely acknowledging it: in the\n\
+         SAME turn perform every step that input unblocks and prompt every actor\n\
+         who can act next. For example, once an attack target is settled, do not\n\
+         end your turn — immediately prompt the healer/witch with that result,\n\
+         and prompt or re-ask anyone whose response is still missing, before you\n\
+         end. A coordinator that ends its turn with a phase half-resolved and no\n\
+         pending wake heading back to it has stalled the whole game. If you must\n\
+         end a turn while still waiting on actors who may never reply, schedule a\n\
+         self-reminder (`loom --json reminder schedule --title \"resolve phase\"\n\
+         --delay-seconds 60`) so you are re-woken to resolve the phase with\n\
+         whatever inputs you have; never leave a phase with no actor and no timer\n\
+         able to wake you.\n\
          \n\
          You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
          LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\

@@ -170,6 +170,17 @@ give that actor the information they need first, or proceed. If you receive\n\
 conflicting inputs that must be reconciled, decide or briefly ask the parties to\n\
 agree; do not stall. A `@all` summary sent with plain `message send` advances\n\
 nothing.\n\
+Drive the whole phase to completion, not one step per wake. When a wake delivers\n\
+an input, do not stop after merely acknowledging it: in the SAME turn perform\n\
+every step that input unblocks and prompt every actor who can act next. For\n\
+example, once an attack target is settled, immediately prompt the healer/witch\n\
+with that result and re-ask anyone whose response is still missing, before you\n\
+end. A coordinator that ends its turn with a phase half-resolved and no pending\n\
+wake heading back to it has stalled the whole game. If you must end a turn while\n\
+still waiting on actors who may never reply, schedule a self-reminder\n\
+(`loom --json reminder schedule --title \"resolve phase\" --delay-seconds 60`) so\n\
+you are re-woken to resolve with whatever inputs you have; never leave a phase\n\
+with no actor and no timer able to wake you.\n\
 \n\
 ### Runtime contract\n\
 \n\

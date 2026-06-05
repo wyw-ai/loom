@@ -233,6 +233,7 @@ const avatarLibraryUrls = Array.from(
 );
 const localServerCommand = "loom-server --bind 0.0.0.0:7878";
 const localServerUrl = "ws://127.0.0.1:7878/rpc";
+const machineStatusPollIntervalMs = 5_000;
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 const defaultNewPromptFilePath = "prompts/new.md";
 const defaultSystemPromptTemplate = [
@@ -419,6 +420,7 @@ export function App() {
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
+  const activeWorkspaceId = workspace?.id ?? null;
   const visibleChannels = channels.filter((channel) => !isDirectChannel(channel));
   const activeChannel =
     visibleChannels.find((channel) => channel.id === activeChannelId) ?? null;
@@ -658,10 +660,12 @@ export function App() {
         autoReconnectRef.current = true;
         setConnection("closed");
         setError("Connection lost. Reconnecting...");
+        void loadMachines(true).catch(() => {});
       } else {
         if (workspaceRef.current) autoReconnectRef.current = true;
         reconnectAttemptRef.current = 0;
         setConnection("open");
+        void loadMachines(true).catch(() => {});
       }
     }).then((off) => {
       unlistenConnection = off;
@@ -671,11 +675,18 @@ export function App() {
       unlistenStream?.();
       unlistenConnection?.();
     };
-  }, [loadConfig]);
+  }, [loadConfig, loadMachines]);
 
   useEffect(() => {
     workspaceRef.current = workspace;
   }, [workspace]);
+
+  useEffect(() => {
+    if (!activeWorkspaceId || connection !== "idle") return;
+    autoReconnectRef.current = true;
+    reconnectAttemptRef.current = 0;
+    void connectWorkspace(activeWorkspaceId, { automatic: true, quiet: true });
+  }, [activeWorkspaceId, connectWorkspace, connection]);
 
   useEffect(() => {
     activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
@@ -744,6 +755,26 @@ export function App() {
       }
     };
   }, [connectWorkspace, connection, workspace]);
+
+  useEffect(() => {
+    if (connection !== "open") return;
+
+    const refreshMachines = () => {
+      void loadMachines(true).catch(() => {});
+    };
+    refreshMachines();
+
+    const interval = window.setInterval(refreshMachines, machineStatusPollIntervalMs);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") refreshMachines();
+    };
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [connection, loadMachines]);
 
   useEffect(() => {
     if (!activeChannel || connection !== "open") return;

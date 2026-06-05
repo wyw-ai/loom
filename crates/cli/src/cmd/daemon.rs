@@ -1290,26 +1290,26 @@ fn load_prompt_assembly_files(
             .min(AGENT_FILE_MAX_BYTES);
         let root_dir = agent_file_root(actor_id, root, command, data_root)?;
         let relative = validated_relative_path(path, "path")?;
-        let full_path = root_dir.join(&relative);
+        let source = format!("{root}:{}", relative.display());
         match read_safe_text_file(&root_dir, &relative, max_bytes) {
             Ok(content) => {
                 parts.push(prompt_preview_part(
                     &format!("file.{key}"),
                     file.get("title").and_then(Value::as_str).unwrap_or(key),
-                    &format!("{root}:{}", relative.display()),
+                    &source,
                     content,
                     false,
                 ));
             }
             Err(err) if optional => {
+                let _ = err;
                 warnings.push(format!(
-                    "optional prompt file `{}` is missing or unreadable: {err:#}",
-                    full_path.display()
+                    "optional prompt file `{source}` is missing or unreadable"
                 ));
                 parts.push(prompt_preview_part(
                     &format!("file.{key}"),
                     file.get("title").and_then(Value::as_str).unwrap_or(key),
-                    &format!("{root}:{}", relative.display()),
+                    &source,
                     String::new(),
                     true,
                 ));
@@ -1325,7 +1325,7 @@ fn render_prompt_assembly_outputs(
     parts: &[Value],
     warnings: &mut Vec<String>,
 ) -> Value {
-    let part_map = parts
+    let mut part_map = parts
         .iter()
         .filter_map(|part| {
             Some((
@@ -1337,6 +1337,16 @@ fn render_prompt_assembly_outputs(
             ))
         })
         .collect::<BTreeMap<_, _>>();
+    if let Some(vars) = assembly
+        .and_then(|value| value.get("vars"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in vars {
+            if let Some(value) = value.as_str() {
+                part_map.insert(format!("var.{key}"), value.to_string());
+            }
+        }
+    }
     let outputs = assembly
         .and_then(|value| value.get("outputs"))
         .and_then(Value::as_object);
@@ -2180,6 +2190,7 @@ fn trimmed_non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn machine(id: &str, owner: Option<&str>) -> MachineConfig {
         MachineConfig {
@@ -2190,6 +2201,14 @@ mod tests {
             kind: default_machine_kind(),
             data_root: String::new(),
         }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("loom-daemon-{name}-{nanos}"))
     }
 
     #[test]
@@ -2419,6 +2438,60 @@ mod tests {
                 .any(|warning| warning.contains("profile_prompt_files")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn prompt_preview_understands_prompt_assembly_vars() {
+        let assembly = json!({
+            "vars": {
+                "style": "concise"
+            },
+            "outputs": {
+                "system": { "template": "{var.style}" },
+                "user": { "template": "" },
+                "full": { "include": ["prompt.system", "prompt.user"] }
+            }
+        });
+        let mut warnings = Vec::new();
+
+        let outputs = render_prompt_assembly_outputs(Some(&assembly), &[], &mut warnings);
+
+        assert_eq!(outputs["system"], json!("concise"));
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("var.style")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_preview_warning_redacts_absolute_prompt_file_path() {
+        let data_root = temp_path("prompt-preview-redaction");
+        let actor_id = "actor_agent_demo";
+        let command = json!({});
+        let assembly = json!({
+            "files": [{
+                "key": "persona",
+                "root": "profile",
+                "path": "prompts/persona.md",
+                "optional": true
+            }]
+        });
+        let mut warnings = Vec::new();
+
+        let parts = load_prompt_assembly_files(
+            actor_id,
+            Some(&assembly),
+            &command,
+            &data_root,
+            &mut warnings,
+        )
+        .expect("load prompt assembly files");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["source"], json!("profile:prompts/persona.md"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("profile:prompts/persona.md"));
+        assert!(!warnings[0].contains(&data_root.display().to_string()));
     }
 
     #[test]

@@ -162,8 +162,13 @@ organic silence. After each state update, wake the exact\n\
 actor(s) who must act next. When you need several private responses before\n\
 continuing (for example collecting hidden actions or votes), send each request\n\
 with `loom --json message send --private-to @actor_id`, then end your turn; each\n\
-responder must wake you back, and you advance the phase only after all required\n\
-responses have arrived. A `@all` summary sent with plain `message send` advances\n\
+responder must wake you back, and you advance the phase once all required\n\
+responses have arrived OR you have given non-responders a bounded chance (a\n\
+deadline or one re-ask) and then resolved with the inputs you have. Do not\n\
+deadlock: never block on a response that itself depends on your next action —\n\
+give that actor the information they need first, or proceed. If you receive\n\
+conflicting inputs that must be reconciled, decide or briefly ask the parties to\n\
+agree; do not stall. A `@all` summary sent with plain `message send` advances\n\
 nothing.\n\
 \n\
 ### Runtime contract\n\
@@ -407,6 +412,11 @@ Ask yourself: who must act next? Wake exactly those actor(s) with `message ask`\
 request someone needs in order to proceed, wake them back. If nobody must act,\n\
 use `run ignore` or a plain no-wake `message send`. A turn that expects a\n\
 response but wakes no one stalls the whole flow.\n\
+If THIS turn was triggered by a request for YOU to act (answer, choose, vote,\n\
+take your turn, submit a hidden/night action), you must have actually SENT that\n\
+action as a message before ending — publicly, or with `message send\n\
+--private-to @asker_id` for a hidden one. Unsent reasoning does nothing; an\n\
+actor that is asked to act but sends no message stalls the flow.\n\
 \n\
 Use `loom --help` and `loom <subcommand> --help` for the full surface.\n\
 {END_MARKER}"

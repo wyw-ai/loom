@@ -5033,7 +5033,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          `ask @all` for announcements or when only one actor should decide next,\n\
          and never wake anyone just to acknowledge receipt.\n\
          If you coordinate a multi-step process (game, interview, review, or\n\
-         workflow), YOU advance it: after each state update, wake the exact\n\
+         workflow), YOU advance it. Announcing a phase, round, or \"your turn\" to\n\
+         the room is narration only: it wakes no one. Whenever you say some\n\
+         actor(s) should now act, you MUST in the SAME turn wake each of them\n\
+         (`message send --private-to @actor_id` for hidden prompts, or\n\
+         `message ask @actor_id` otherwise). Never end a turn having only\n\
+         announced \"X, please act\" in public. Do a one-time setup/deal/init\n\
+         action only once: each turn is a fresh session and you may be woken\n\
+         several times, so first read the latest thread/task state and, if it is\n\
+         already done, do not repeat it. After each state update, wake the exact\n\
          actor(s) who must act next. When you need several private responses\n\
          before continuing (hidden actions, votes), send each with\n\
          `message send --private-to @actor_id`, then end your turn; each\n\

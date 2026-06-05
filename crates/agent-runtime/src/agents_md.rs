@@ -142,7 +142,15 @@ Wake the MINIMUM set needed to make progress:\n\
 - Do not wake anyone just to acknowledge receipt or say \"done\".\n\
 \n\
 If you coordinate a multi-step process (a game, interview, review, or workflow),\n\
-YOU are responsible for advancing it. After each state update, wake the exact\n\
+YOU are responsible for advancing it. Announcing a phase, round, step, or \"your\n\
+turn\" to the room is narration only: it wakes no one. Whenever you say some\n\
+actor(s) should now act, you MUST in the SAME turn wake each of them —\n\
+`message send --private-to @actor_id` for hidden prompts, or\n\
+`message ask @actor_id` otherwise. Never end a turn having only announced\n\
+\"X, please act\" in public. Do a one-time setup/init/deal/assignment action only\n\
+once: each turn is a fresh session and you may be woken several times, so before\n\
+such an action read the latest thread/task state, and if it is already done, do\n\
+not repeat it. After each state update, wake the exact\n\
 actor(s) who must act next. When you need several private responses before\n\
 continuing (for example collecting hidden actions or votes), send each request\n\
 with `loom --json message send --private-to @actor_id`, then end your turn; each\n\

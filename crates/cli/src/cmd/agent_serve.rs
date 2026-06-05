@@ -25,7 +25,7 @@ use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
     AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
-    BundleInstallMode, ChannelMembersResult, CommandSessionIdSource, InboxListResult,
+    BundleInstallMode, ChannelMembersResult, InboxListResult,
     MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
     RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
@@ -1236,9 +1236,6 @@ struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
     spec: AgentSpec,
-    /// Runtime-only provider resolution. This is intentionally separate from
-    /// AgentSpec so providerRef resolution does not rewrite on-disk spec data.
-    transport: AgentTransport,
     /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
     /// here so prompt-envelope code can read legacy profile fields and memory without
     /// threading `paths` through every call.
@@ -1442,7 +1439,6 @@ impl WorkerState {
         Self {
             actor_id,
             spec,
-            transport,
             profile_dir,
             paths,
             agent_server_url,
@@ -4445,11 +4441,7 @@ async fn compose_envelope_prompt(
         conversation_context.clone(),
     ]);
     let profile_prompt_files = load_profile_prompt_files_section(&state.profile_dir);
-    let scope_bootstrap = if first_turn || command_transport_without_resume(&state.transport) {
-        seed_manifest(&state.actor_id, scope)
-    } else {
-        String::new()
-    };
+    let scope_bootstrap = seed_manifest(&state.actor_id, scope);
     let channel_id = resolve_channel_for_scope(client, state, scope).await;
     let template_vars = channel_id
         .as_deref()
@@ -4908,45 +4900,6 @@ fn prompt_section_label(name: &str) -> &str {
     }
 }
 
-fn command_transport_without_resume(transport: &AgentTransport) -> bool {
-    if transport.kind != "command" {
-        return false;
-    }
-    !command_transport_can_resume(transport)
-}
-
-fn command_transport_can_resume(transport: &AgentTransport) -> bool {
-    let Some(session) = transport.session.as_ref() else {
-        return false;
-    };
-    if session.scope.as_deref().map(str::trim) == Some("turn") {
-        return false;
-    }
-    let has_resume_template = session
-        .resume_args
-        .as_ref()
-        .is_some_and(|args| !args.is_empty())
-        || !session.resume_arg_specs.is_empty();
-    if !has_resume_template {
-        return false;
-    }
-    match session.id_source {
-        Some(CommandSessionIdSource::LoomUuid) => true,
-        Some(CommandSessionIdSource::ProviderCapture) => {
-            decoder_has_session_capture(transport.decoder.as_ref())
-                || decoder_has_session_capture(transport.stderr_decoder.as_ref())
-        }
-        None => session.first_run_capture.is_some(),
-    }
-}
-
-fn decoder_has_session_capture(decoder: Option<&proto::methods::ProviderDecoderSpec>) -> bool {
-    decoder
-        .and_then(|decoder| decoder.capture.as_ref())
-        .and_then(|capture| capture.session.as_ref())
-        .is_some()
-}
-
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
 /// channel. Thread scopes need a one-time `thread/list` sweep; the result is
 /// cached on `WorkerState` so we don't hit the server per turn. Archived
@@ -5000,7 +4953,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         ScopeKind::Channel => "channel",
     };
     format!(
-        "=== System: Loom multi-actor context (auto-injected on session start) ===\n\
+        "=== System: Loom multi-actor operating rules (applies to every turn) ===\n\
          You are an agent driven by `loom-daemon`.\n\
          Identity:\n\
            actor id      = {actor_id}\n\
@@ -5026,12 +4979,17 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"   (no wake)\n\
            nothing to say:\n\
              loom --json run ignore --reason \"...\"\n\
-         Wake the MINIMUM set needed to make progress. If your message contains a\n\
-         question, instruction, vote request, or \"your turn\", it MUST wake its\n\
-         target(s). Prefer exact ids `@actor_a @actor_b` over `@all`; use `@all`\n\
-         only when every agent in scope is truly eligible to act right now. Never\n\
-         `ask @all` for announcements or when only one actor should decide next,\n\
-         and never wake anyone just to acknowledge receipt.\n\
+         Announcement vs call-for-response (the #1 thing agents get wrong): use\n\
+         notify-only `message send` ONLY for pure information that nobody must\n\
+         act on. A message asking anyone to discuss, answer, vote, choose, take a\n\
+         turn, or continue the workflow is a CALL FOR ACTION, not an\n\
+         announcement, and MUST wake its target(s). Treat \"please discuss\",\n\
+         \"please vote\", \"your turn\", \"choose X\", \"开始发言\", \"请投票\", \"轮到你\"\n\
+         as wake requests, never as announcements. Wake the smallest eligible\n\
+         set. For structured phases prefer ordered turns: wake exactly the next\n\
+         actor with `message ask @id`, wait for the reply, then wake the next;\n\
+         use `message ask @all` only for free-form discussion where simultaneous\n\
+         replies are fine. Do not wake anyone merely to acknowledge receipt.\n\
          If you coordinate a multi-step process (game, interview, review, or\n\
          workflow), YOU advance it. Announcing a phase, round, or \"your turn\" to\n\
          the room is narration only: it wakes no one. Whenever you say some\n\
@@ -5041,13 +4999,23 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          announced \"X, please act\" in public. Do a one-time setup/deal/init\n\
          action only once: each turn is a fresh session and you may be woken\n\
          several times, so first read the latest thread/task state and, if it is\n\
-         already done, do not repeat it. After each state update, wake the exact\n\
+         already done, do not repeat it. Before starting a discussion or voting\n\
+         phase, decide how it ends — an ordered round where each participant\n\
+         speaks once, a fixed number of replies, or a deadline — and drive it:\n\
+         wake the next participant, have each one wake you back when done so you\n\
+         can wake the next, and never wait for organic silence. After each state\n\
+         update, wake the exact\n\
          actor(s) who must act next. When you need several private responses\n\
          before continuing (hidden actions, votes), send each with\n\
          `message send --private-to @actor_id`, then end your turn; each\n\
-         responder must wake you back, and you advance the phase only after all\n\
-         required responses arrive. A @all summary sent with plain `message send`\n\
-         advances nothing.\n\
+         responder must wake you back, and you advance the phase once all\n\
+         required responses arrive OR you gave non-responders a bounded chance (a\n\
+         deadline or one re-ask) and resolved with the inputs you have. Do not\n\
+         deadlock: never block on a response that itself depends on your next\n\
+         action — give that actor what they need first, or proceed. If you get\n\
+         conflicting inputs that must be reconciled, decide or briefly ask the\n\
+         parties to agree; do not stall. A @all summary sent with plain\n\
+         `message send` advances nothing.\n\
          \n\
          You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
          LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
@@ -5155,6 +5123,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         workflows with private phases, never put an actor name beside a hidden\n\
         state, secret, or private action prompt in public; send the private\n\
         instruction to that actor privately.\n\
+        Whether your own reply is public or private depends on what you were\n\
+        asked, not on who you are: if you were prompted privately for a hidden\n\
+        role, secret action, target, or vote, reply ONLY to the asker with\n\
+        `message send --private-to @asker_id` (it wakes them) and never post that\n\
+        into the public thread. If you are asked to take part in public\n\
+        discussion, speak in the thread, but never reveal your hidden role,\n\
+        secret team, private reasoning, or night actions there.\n\
         Turn handoffs count as action requests. If you are replying to a\n\
         directed turn and your message completes your step but requires a\n\
         coordinator, DM, caller, or next actor to continue (for example\n\
@@ -5201,7 +5176,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          prompts). If you are answering a request someone needs in order to\n\
          proceed, wake them back. If nobody must act, use `run ignore` or a plain\n\
          no-wake `message send`. A turn that expects a response but wakes no one\n\
-         stalls the whole flow.\n\
+         stalls the whole flow. If THIS turn was triggered by a request for YOU to\n\
+         act (answer, choose, vote, take your turn, submit a hidden/night action),\n\
+         you must have actually SENT that action as a message before ending —\n\
+         publicly, or with `message send --private-to @asker_id` for a hidden one.\n\
+         Unsent reasoning does nothing; an actor asked to act that sends no\n\
+         message stalls the flow.\n\
          ",
         actor_id = actor_id,
         scope_kind = scope_kind,
@@ -7330,71 +7310,6 @@ mod tests {
 
         trigger.payload["_meta"]["assignmentStatus"] = json!("completed");
         assert_eq!(assignment_id_for_start(&AgentTrigger::Event(trigger)), None);
-    }
-
-    #[test]
-    fn command_transport_without_resume_tracks_session_capability() {
-        let no_session = test_command_transport();
-        assert!(command_transport_without_resume(&no_session));
-
-        let mut loom_uuid = test_command_transport();
-        loom_uuid.session = Some(proto::methods::CommandSession {
-            id_source: Some(CommandSessionIdSource::LoomUuid),
-            scope: None,
-            first_run_capture: None,
-            resume_args: Some(vec!["--session-id".into(), "{session_id}".into()]),
-            resume_arg_specs: Vec::new(),
-        });
-        assert!(!command_transport_without_resume(&loom_uuid));
-
-        let mut resumable = test_command_transport();
-        resumable.session = Some(proto::methods::CommandSession {
-            id_source: None,
-            scope: None,
-            first_run_capture: Some("stdout_json:.session_id".into()),
-            resume_args: Some(vec!["--resume".into(), "{session_id}".into(), "-p".into()]),
-            resume_arg_specs: Vec::new(),
-        });
-        assert!(!command_transport_without_resume(&resumable));
-
-        let mut decoder_capture = test_command_transport();
-        decoder_capture.session = Some(proto::methods::CommandSession {
-            id_source: Some(CommandSessionIdSource::ProviderCapture),
-            scope: None,
-            first_run_capture: None,
-            resume_args: None,
-            resume_arg_specs: vec![
-                proto::methods::ProviderArgSpec::Literal("--resume".into()),
-                proto::methods::ProviderArgSpec::Literal("{session_id}".into()),
-            ],
-        });
-        decoder_capture.decoder = Some(proto::methods::ProviderDecoderSpec {
-            capture: Some(proto::methods::ProviderDecoderCaptureSpec {
-                session: Some(proto::methods::ProviderJsonlTextReducerSpec {
-                    mode: "lastNonEmpty".into(),
-                    path: "$.session_id".into(),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        });
-        assert!(!command_transport_without_resume(&decoder_capture));
-
-        let mut stderr_decoder_capture = decoder_capture.clone();
-        stderr_decoder_capture.stderr_decoder = stderr_decoder_capture.decoder.take();
-        assert!(!command_transport_without_resume(&stderr_decoder_capture));
-
-        let mut turn_scoped = loom_uuid.clone();
-        turn_scoped.session.as_mut().unwrap().scope = Some("turn".into());
-        assert!(command_transport_without_resume(&turn_scoped));
-
-        let mut broken_capture = decoder_capture.clone();
-        broken_capture.decoder = None;
-        assert!(command_transport_without_resume(&broken_capture));
-
-        let mut acp = test_command_transport();
-        acp.kind = "acp_stdio".into();
-        assert!(!command_transport_without_resume(&acp));
     }
 
     #[test]

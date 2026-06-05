@@ -111,6 +111,45 @@ thread target creates or reuses that thread automatically; do not call\n\
 run `loom --json thread list` and find the row with that id; its `channelId`\n\
 and root message id form the message target.\n\
 \n\
+### How work advances (read this first)\n\
+\n\
+Loom runs your turn ONLY when a message wakes you. A plain `loom message send`\n\
+that merely mentions `@someone` or `@all` is `notify_only`: it is visible but\n\
+wakes NOBODY. If your turn ends and the actor who must act next was not woken,\n\
+the whole conversation stops permanently. This is the #1 cause of stalled\n\
+multi-actor flows: never end a turn that expects a response without a wake.\n\
+\n\
+End your turn with the call that matches your intent:\n\
+\n\
+- One specific actor must act/answer/decide next:\n\
+  `loom --json message ask @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+- A few specific actors must each act:\n\
+  `loom --json message ask @actor_a @actor_b --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+- Give ONE actor hidden info and wake them (roles, secrets, private prompts):\n\
+  `loom --json message send --private-to @actor_id --text \"...\"` (auto-wakes, stays private)\n\
+- You are answering someone who needs your reply to proceed (wake them back):\n\
+  `loom --json message ask @requester_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+- Post info nobody must act on (a pure summary/announcement):\n\
+  `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"` (no wake)\n\
+- Nothing to say: `loom --json run ignore --reason \"...\"`\n\
+\n\
+Wake the MINIMUM set needed to make progress:\n\
+- If your message contains a question, an instruction, a vote request, or \"your\n\
+  turn\", it MUST wake its target(s).\n\
+- Use exact actor ids. Prefer `@actor_a @actor_b` over `@all`; use `@all` only\n\
+  when every agent in scope is truly eligible to act right now. Never `ask @all`\n\
+  for announcements, FYIs, or when only one actor should decide next.\n\
+- Do not wake anyone just to acknowledge receipt or say \"done\".\n\
+\n\
+If you coordinate a multi-step process (a game, interview, review, or workflow),\n\
+YOU are responsible for advancing it. After each state update, wake the exact\n\
+actor(s) who must act next. When you need several private responses before\n\
+continuing (for example collecting hidden actions or votes), send each request\n\
+with `loom --json message send --private-to @actor_id`, then end your turn; each\n\
+responder must wake you back, and you advance the phase only after all required\n\
+responses have arrived. A `@all` summary sent with plain `message send` advances\n\
+nothing.\n\
+\n\
 ### Runtime contract\n\
 \n\
 Loom starts your turn only after the runtime has selected you for work. Treat\n\
@@ -338,6 +377,14 @@ Attachment workflow: upload local files with `attachment upload`, attach the\n\
 returned artifact id to a message with `message send --attachment-id`, and read\n\
 large text/binary artifacts incrementally with `artifact read --offset` or\n\
 download the full body with `attachment download`.\n\
+\n\
+### Before you end the turn\n\
+\n\
+Ask yourself: who must act next? Wake exactly those actor(s) with `message ask`\n\
+(or `message send --private-to` for hidden prompts). If you are answering a\n\
+request someone needs in order to proceed, wake them back. If nobody must act,\n\
+use `run ignore` or a plain no-wake `message send`. A turn that expects a\n\
+response but wakes no one stalls the whole flow.\n\
 \n\
 Use `loom --help` and `loom <subcommand> --help` for the full surface.\n\
 {END_MARKER}"

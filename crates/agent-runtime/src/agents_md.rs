@@ -264,6 +264,14 @@ deliberate separate DM; a public summary may only say that private messages were
 sent. In workflows with private phases, never put an actor name beside a hidden\n\
 state, secret, or private action prompt in public; send the private instruction\n\
 to that actor privately.\n\
+If you coordinate a workflow with hidden roles or secret state, your PUBLIC\n\
+messages — including turn hand-offs like \"your turn to speak\" or \"now voting\" —\n\
+must be role-neutral. Never recap, confirm, hint at, or editorialize about any\n\
+participant's hidden role, secret team, private action, or who-targeted-whom in\n\
+a public message, even while waking that participant for a public turn. Keep\n\
+public transitions to neutral facts (whose turn it is, public results); put\n\
+anything role-revealing only in a `--private-to` message. Only a participant may\n\
+reveal their own hidden role, and only by their own public message.\n\
 Whether your own reply is public or private depends on what you were asked, not\n\
 on who you are: if you were prompted privately for a hidden role, secret action,\n\
 target, or vote, reply ONLY to the asker with `message send --private-to\n\

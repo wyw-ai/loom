@@ -348,7 +348,9 @@ export function App() {
         directScopesByActorId[activeDirectActor.id] ??
         null
       : null;
-  const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
+  const memberCandidates = uniqueActorsById(
+    actorList.filter((actor) => actor.kind !== "service"),
+  );
   const channelAgentActors = activeChannel
     ? channelMentionAgentActors(activeChannel, actors)
     : [];
@@ -7379,7 +7381,8 @@ function MutedLine({ children }: { children: ReactNode }) {
 }
 
 function Avatar({ account }: { account: HumanAccount }) {
-  const src = account.avatarUrl || avatarUrlForSeed(account.actorId || accountName(account));
+  const actor = accountToActor(account);
+  const src = actorAvatarUrl(actor, account.actorId || accountName(account));
   return (
     <img
       alt=""
@@ -8041,6 +8044,15 @@ function accountToActor(account: HumanAccount): Actor {
     displayName: accountName(account),
     _meta: { avatarUrl: account.avatarUrl },
   };
+}
+
+function uniqueActorsById(actors: Actor[]) {
+  const seen = new Set<string>();
+  return actors.filter((actor) => {
+    if (seen.has(actor.id)) return false;
+    seen.add(actor.id);
+    return true;
+  });
 }
 
 function accountName(account: HumanAccount) {

@@ -3815,6 +3815,10 @@ fn trigger_target_ids(trigger: &AgentTrigger) -> Vec<String> {
     let mut targets = Vec::new();
     match trigger {
         AgentTrigger::Message(message) => {
+            let private_actor_ids = private_actor_ids_for_prompt(&message.metadata);
+            if !private_actor_ids.is_empty() {
+                return private_actor_ids;
+            }
             for audience in &message.audience {
                 if audience.kind == AudienceKind::Actor && seen.insert(audience.id.clone()) {
                     targets.push(audience.id.clone());
@@ -4592,6 +4596,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            loom --json channel members \"$LOOM_CHANNEL_ID\"\n\
            loom --json message read --target '#<channel_id>:<root_message_id>'\n\
            # message read is the public transcript by default; add --include-private only when private messages addressed to you are required.\n\
+           loom --json message send --thread <thread_id> --text \"thread reply\"\n\
            loom --json message send --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"rebased delta\"\n\
            loom --json message ask @actor_id --target '#<channel_id>:<root_message_id>' --if-latest <message_id> --text \"please continue\"\n\
            loom --json message send --private-to <actor_id> --text \"same-scope private note\"\n\
@@ -4609,7 +4614,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         Assistant text is internal run transcript only. It is not published to\n\
         the channel or thread. For any visible reply, call\n\
         `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text ...`\n\
-        when LOOM_REPLY_TARGET is set; after that, final\n\
+        when LOOM_REPLY_TARGET is set, or `loom --json message send --thread\n\
+        \"$LOOM_SCOPE_ID\" --text ...` when LOOM_SCOPE_KIND=thread. Do not use\n\
+        `--target \"#$LOOM_CHANNEL_ID\"` for ordinary thread replies; that posts\n\
+        into the channel common area. After sending the visible reply, final\n\
         assistant text may be empty or a private note. When no visible reply is\n\
         needed, call `loom --json run ignore --reason \"...\"`.\n\
         If the user or another actor asks you to hand off, wake, route, or\n\
@@ -6416,6 +6424,7 @@ mod tests {
         let mut actor_names = HashMap::new();
         actor_names.insert("actor_agent_coordinator".into(), "Coordinator".into());
         actor_names.insert("actor_agent_recipient".into(), "Recipient".into());
+        actor_names.insert("actor_human_local".into(), "Human".into());
         let mut message = sample_message(
             "msg_private",
             ScopeRef {
@@ -6432,6 +6441,11 @@ mod tests {
         message
             .metadata
             .insert("privateTo".into(), json!(["actor_agent_recipient"]));
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_human_local".into(),
+            display: None,
+        }];
         mark_actor_inbox_delivery(&mut message, "actor_agent_recipient");
 
         let prompt = render_trigger_prompt_with_names(
@@ -6442,6 +6456,9 @@ mod tests {
         );
 
         assert!(prompt.contains("Visibility: private to Recipient (@actor_agent_recipient)"));
+        assert!(prompt.contains("Route target(s): Recipient (@actor_agent_recipient)"));
+        assert!(!prompt.contains("Route target(s): Human (@actor_human_local)"));
+        assert!(!prompt.contains("visible route -> Human"));
         assert!(prompt.contains("Visible message:"));
     }
 

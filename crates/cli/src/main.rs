@@ -1024,8 +1024,11 @@ enum MessageCmd {
         /// Destination target, for example #chan_123, #chan_123:msg_456, or dm:@actor_id.
         #[arg(long)]
         target: Option<String>,
-        /// Direct-message recipient. Equivalent to --target dm:@<actor>.
+        /// Destination thread id. Resolves to #channel:root-message before sending.
         #[arg(long, conflicts_with = "target")]
+        thread: Option<String>,
+        /// Direct-message recipient. Equivalent to --target dm:@<actor>.
+        #[arg(long, conflicts_with_all = ["target", "thread"])]
         to: Option<String>,
         /// Same-scope private recipient. The message remains in the current channel/thread scope.
         #[arg(long = "private-to")]
@@ -1052,6 +1055,9 @@ enum MessageCmd {
         /// Destination target, for example #chan_123 or #chan_123:msg_456.
         #[arg(long)]
         target: Option<String>,
+        /// Destination thread id. Resolves to #channel:root-message before asking.
+        #[arg(long, conflicts_with = "target")]
+        thread: Option<String>,
         #[arg(long)]
         text: Option<String>,
         /// Only send if this is still the latest message in the target scope.
@@ -1063,7 +1069,10 @@ enum MessageCmd {
     /// Read messages from #channel, #channel:root-message, or dm:@actor.
     Read {
         #[arg(long)]
-        target: String,
+        target: Option<String>,
+        /// Thread id to read. Resolves to #channel:root-message.
+        #[arg(long, conflicts_with = "target")]
+        thread: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
         #[arg(long)]
@@ -1936,6 +1945,7 @@ async fn main() -> Result<()> {
         Cmd::Message { sub } => match sub {
             MessageCmd::Send {
                 target,
+                thread,
                 to,
                 private_to,
                 text,
@@ -1948,6 +1958,7 @@ async fn main() -> Result<()> {
                     client,
                     cfg.actor_id,
                     target,
+                    thread,
                     to,
                     private_to,
                     text,
@@ -1961,6 +1972,7 @@ async fn main() -> Result<()> {
             MessageCmd::Ask {
                 recipients,
                 target,
+                thread,
                 text,
                 if_latest,
                 attachment_ids,
@@ -1969,6 +1981,7 @@ async fn main() -> Result<()> {
                     client,
                     cfg.actor_id,
                     target,
+                    thread,
                     recipients,
                     text,
                     if_latest,
@@ -1978,12 +1991,21 @@ async fn main() -> Result<()> {
             }
             MessageCmd::Read {
                 target,
+                thread,
                 limit,
                 before,
                 include_private,
             } => {
-                cmd::message::read(client, cfg.actor_id, target, limit, before, include_private)
-                    .await?
+                cmd::message::read(
+                    client,
+                    cfg.actor_id,
+                    target,
+                    thread,
+                    limit,
+                    before,
+                    include_private,
+                )
+                .await?
             }
             MessageCmd::Search {
                 query,
@@ -2815,6 +2837,38 @@ mod tests {
     }
 
     #[test]
+    fn message_send_accepts_thread_destination() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "message",
+            "send",
+            "--thread",
+            "thread_abc",
+            "--text",
+            "reply in thread",
+        ])
+        .expect("parse message send");
+
+        match args.cmd {
+            Cmd::Message {
+                sub:
+                    MessageCmd::Send {
+                        target,
+                        thread,
+                        text,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(thread.as_deref(), Some("thread_abc"));
+                assert_eq!(text.as_deref(), Some("reply in thread"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn message_send_accepts_same_scope_private_recipient() {
         let args = Args::try_parse_from([
             "loom",
@@ -2870,7 +2924,7 @@ mod tests {
                         ..
                     },
             } => {
-                assert_eq!(target, "#chan_123:msg_root");
+                assert_eq!(target.as_deref(), Some("#chan_123:msg_root"));
                 assert!(include_private);
             }
             other => panic!("unexpected command: {other:?}"),

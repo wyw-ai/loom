@@ -3599,14 +3599,19 @@ fn join_non_empty<'a>(values: impl IntoIterator<Item = &'a str>, join: &str) -> 
 
 fn validate_agent_prompt_file_key(key: &str) -> Result<&str> {
     let key = key.trim();
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    {
+    if !is_agent_prompt_file_key(key) {
         return Err(anyhow!("invalid agent prompt file key `{key}`"));
     }
     Ok(key)
+}
+
+fn is_agent_prompt_file_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
 fn agent_prompt_file_root<'a>(
@@ -7072,6 +7077,24 @@ mod tests {
         assert_eq!(parts[0].content, "profile persona");
         assert_eq!(parts[1].key, "file.rules");
         assert_eq!(parts[1].role_hint, PromptRoleHint::User);
+    }
+
+    #[test]
+    fn agent_prompt_file_keys_match_workspace_key_rules() {
+        for key in ["persona", "persona_1", "1persona", "persona-role"] {
+            assert!(validate_agent_prompt_file_key(key).is_ok(), "{key}");
+        }
+
+        for key in [
+            "",
+            "Persona",
+            "persona.md",
+            "_persona",
+            "-persona",
+            "persona.role",
+        ] {
+            assert!(validate_agent_prompt_file_key(key).is_err(), "{key}");
+        }
     }
 
     #[test]

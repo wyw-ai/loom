@@ -5123,6 +5123,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
         workflows with private phases, never put an actor name beside a hidden\n\
         state, secret, or private action prompt in public; send the private\n\
         instruction to that actor privately.\n\
+        If you coordinate a workflow with hidden roles or secret state, your\n\
+        PUBLIC messages — including turn hand-offs like \"your turn to speak\" or\n\
+        \"now voting\" — must be role-neutral. Never recap, confirm, hint at, or\n\
+        editorialize about any participant's hidden role, secret team, private\n\
+        action, or who-targeted-whom in a public message, even while waking that\n\
+        participant for a public turn. Keep public transitions to neutral facts\n\
+        (whose turn it is, public results); put anything role-revealing only in a\n\
+        `--private-to` message. Only a participant may choose to reveal their own\n\
+        hidden role, and only by their own public message.\n\
         Whether your own reply is public or private depends on what you were\n\
         asked, not on who you are: if you were prompted privately for a hidden\n\
         role, secret action, target, or vote, reply ONLY to the asker with\n\

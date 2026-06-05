@@ -5004,7 +5004,17 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          announced \"X, please act\" in public. Do a one-time setup/deal/init\n\
          action only once: each turn is a fresh session and you may be woken\n\
          several times, so first read the latest thread/task state and, if it is\n\
-         already done, do not repeat it. Before starting a discussion or voting\n\
+         already done, do not repeat it. You are the single source of truth for\n\
+         any hidden state you assign (roles, secret pairings, used abilities,\n\
+         deaths, scores). Because each turn is a fresh session, reconstruct that\n\
+         state at the start of every turn by reading YOUR OWN earlier messages in\n\
+         this scope (the private notes/cards you already sent); treat them as\n\
+         authoritative and immutable. Never re-deal, re-assign, or \"correct\"\n\
+         hidden assignments you already made, never give two actors inconsistent\n\
+         versions of the same secret, and never invent a platform/routing/\n\
+         technical failure to excuse a mistake — if your context looks\n\
+         inconsistent, re-read the thread and trust what you already sent. Before\n\
+         starting a discussion or voting\n\
          phase, decide how it ends — an ordered round where each participant\n\
          speaks once, a fixed number of replies, or a deadline — and drive it.\n\
          Do NOT assume a participant will wake you back after their turn: when you\n\

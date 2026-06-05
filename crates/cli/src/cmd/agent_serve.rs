@@ -3269,6 +3269,20 @@ async fn build_adapter_prompt(
 const AGENT_PROMPT_FILE_MAX_BYTES: u64 = 128 * 1024;
 const PROFILE_PROMPTS_DIR: &str = "prompts";
 const PROFILE_PROMPT_FILES_PART_KEY: &str = "profile_prompt_files";
+const BUILTIN_AGENT_PROMPT_PART_KEYS: &[&str] = &[
+    "actor_context",
+    "agent_instructions",
+    "bootstrap_memory",
+    "scope_bootstrap",
+    PROFILE_PROMPT_FILES_PART_KEY,
+    "turn_memory",
+    "runtime_context",
+    "assignment_context",
+    "user_message",
+    "latest_message",
+    "turn_input",
+    "trigger_prefix",
+];
 
 fn load_profile_prompt_files_section(profile_dir: &Path) -> String {
     let prompts_dir = profile_dir.join(PROFILE_PROMPTS_DIR);
@@ -3417,6 +3431,9 @@ fn render_agent_prompt_outputs(
         .iter()
         .map(|part| (part.key.clone(), part.rendered_content.clone()))
         .collect::<BTreeMap<_, _>>();
+    for key in BUILTIN_AGENT_PROMPT_PART_KEYS {
+        values.entry((*key).to_string()).or_default();
+    }
     if let Some(assembly) = assembly {
         for (key, value) in &assembly.vars {
             values.insert(format!("var.{key}"), value.clone());
@@ -7432,6 +7449,84 @@ mod tests {
             .parts
             .iter()
             .any(|part| part.key == "turn_input" && part.content == "latest\n\nassignment"));
+    }
+
+    #[test]
+    fn agent_prompt_templates_accept_empty_builtin_parts() {
+        let assembly = AgentPromptAssemblySpec {
+            outputs: BTreeMap::from([
+                (
+                    "system".into(),
+                    AgentPromptOutputSpec {
+                        template: Some(
+                            "{actor_context}\n{agent_instructions}\n{bootstrap_memory}\n{scope_bootstrap}\n{profile_prompt_files}"
+                                .into(),
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "user".into(),
+                    AgentPromptOutputSpec {
+                        template: Some(
+                            "{turn_memory}\n{runtime_context}\n{assignment_context}\n{user_message}"
+                                .into(),
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "full".into(),
+                    AgentPromptOutputSpec {
+                        include: vec!["prompt.system".into(), "prompt.user".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let parts = vec![
+            PromptPart {
+                key: "actor_context".into(),
+                title: "Actor".into(),
+                content: "Actor: Demo".into(),
+                rendered_content: "Actor: Demo".into(),
+                role_hint: PromptRoleHint::System,
+            },
+            PromptPart {
+                key: "scope_bootstrap".into(),
+                title: "Scope".into(),
+                content: "Scope: channel demo".into(),
+                rendered_content: "Scope: channel demo".into(),
+                role_hint: PromptRoleHint::System,
+            },
+            PromptPart {
+                key: "runtime_context".into(),
+                title: "Runtime".into(),
+                content: "Runtime context".into(),
+                rendered_content: "Runtime context".into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "user_message".into(),
+                title: "User".into(),
+                content: "hello".into(),
+                rendered_content: "hello".into(),
+                role_hint: PromptRoleHint::User,
+            },
+        ];
+
+        let outputs =
+            render_agent_prompt_outputs(Some(&assembly), &parts, "legacy full").expect("outputs");
+
+        assert_eq!(
+            outputs.get("system").map(String::as_str),
+            Some("Actor: Demo\n\n\nScope: channel demo\n")
+        );
+        assert_eq!(
+            outputs.get("user").map(String::as_str),
+            Some("\nRuntime context\n\nhello")
+        );
     }
 
     #[test]

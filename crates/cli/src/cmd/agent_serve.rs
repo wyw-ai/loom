@@ -5006,6 +5006,41 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            actor id      = {actor_id}\n\
            current scope = {scope_kind}:{scope_id}\n\
          \n\
+         === How work advances (read this first) ===\n\
+         Loom runs your turn ONLY when a message wakes you. A plain\n\
+         `loom message send` that merely mentions @someone or @all is\n\
+         `notify_only`: it is visible but wakes NOBODY. If your turn ends and the\n\
+         actor who must act next was not woken, the whole conversation stops\n\
+         permanently. This is the #1 cause of stalled multi-actor flows: never\n\
+         end a turn that expects a response without a wake.\n\
+         End your turn with the call that matches your intent:\n\
+           one specific actor must act next:\n\
+             loom --json message ask @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"\n\
+           a few specific actors must each act:\n\
+             loom --json message ask @actor_a @actor_b --target \"$LOOM_REPLY_TARGET\" --text \"...\"\n\
+           give ONE actor hidden info and wake them (roles, secrets, prompts):\n\
+             loom --json message send --private-to @actor_id --text \"...\"   (auto-wakes, stays private)\n\
+           answering someone who needs your reply to proceed (wake them back):\n\
+             loom --json message ask @requester_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"\n\
+           info nobody must act on (a pure summary/announcement):\n\
+             loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"   (no wake)\n\
+           nothing to say:\n\
+             loom --json run ignore --reason \"...\"\n\
+         Wake the MINIMUM set needed to make progress. If your message contains a\n\
+         question, instruction, vote request, or \"your turn\", it MUST wake its\n\
+         target(s). Prefer exact ids `@actor_a @actor_b` over `@all`; use `@all`\n\
+         only when every agent in scope is truly eligible to act right now. Never\n\
+         `ask @all` for announcements or when only one actor should decide next,\n\
+         and never wake anyone just to acknowledge receipt.\n\
+         If you coordinate a multi-step process (game, interview, review, or\n\
+         workflow), YOU advance it: after each state update, wake the exact\n\
+         actor(s) who must act next. When you need several private responses\n\
+         before continuing (hidden actions, votes), send each with\n\
+         `message send --private-to @actor_id`, then end your turn; each\n\
+         responder must wake you back, and you advance the phase only after all\n\
+         required responses arrive. A @all summary sent with plain `message send`\n\
+         advances nothing.\n\
+         \n\
          You can shell out to the `loom` CLI for server access. The daemon prepends the CLI directory to PATH and also sets LOOM_CLI to the absolute CLI path when it can resolve one. LOOM_SERVER,\n\
          LOOM_CLI, LOOM_DAEMON_SOCKET, LOOM_ACTOR, LOOM_SCOPE_ID, LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_RUN_ID, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR, and LOOM_NO_REPLY_FILE are already injected into your env,\n\
          so commands like:\n\
@@ -5153,6 +5188,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Use `--json` for machine-readable output and `loom <subcommand> --help`\n\
          for the full surface. Only the message after the marker line is the new\n\
          user input.\n\
+         Before you end the turn, ask: who must act next? Wake exactly those\n\
+         actor(s) with `message ask` (or `message send --private-to` for hidden\n\
+         prompts). If you are answering a request someone needs in order to\n\
+         proceed, wake them back. If nobody must act, use `run ignore` or a plain\n\
+         no-wake `message send`. A turn that expects a response but wakes no one\n\
+         stalls the whole flow.\n\
          ",
         actor_id = actor_id,
         scope_kind = scope_kind,

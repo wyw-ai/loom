@@ -4977,6 +4977,12 @@ async fn resolve_channel_for_scope(
 ///     clear instructions work better.
 ///   * Do NOT over-condense. Richness that improves game/coordination quality
 ///     is worth the tokens; remove only true redundancy, never whole sections.
+///   * Keep it DOMAIN-NEUTRAL. This is a UNIVERSAL collaboration prompt, not a
+///     werewolf/game prompt. Never bake in any specific activity's vocabulary
+///     (roles like "wolf/witch", "night/kill", domain jargon). Werewolf is only
+///     a stress test of the generic prompt; examples must stay generic
+///     (participants, hidden/sensitive info, ordered rounds, async replies) so
+///     one prompt drives any high-collaboration activity.
 /// Keep this manifest well-structured and example-driven; if you add a new
 /// behavioral fix, prefer adding/adjusting an <example> over appending prose.
 fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
@@ -5042,7 +5048,7 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              slip — just continue from the real state.\n\
            - Advance the activity in the same turn. Announcing a phase to the room wakes no one; in the same\n\
              turn, wake the exact actor(s) who act next, and carry out every step a new input unblocks before\n\
-             you end (for example, once a night target is locked, immediately move to the next role).\n\
+             you end (for example, once one participant's input is in, immediately prompt whoever is next).\n\
            - Collect replies patiently. Participants are slow — a woken actor may take a minute or more to\n\
              answer. When a timer or reminder wakes you, the replies you are waiting for are NOT in your\n\
              prompt: run `loom --json inbox list --no-ack` and read the thread to gather everything submitted\n\
@@ -5064,48 +5070,56 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          \n\
          <privacy>\n\
          Keep hidden information hidden, even though the channel is shared. A secret includes not just the\n\
-         fact itself but the PROMPT that asks a secret-role holder to act. So:\n\
-           - Prompt each secret-role holder individually with `--private-to @id`. Never post one public\n\
-             message that addresses secret roles or names their role or teammates — e.g. publicly writing\n\
-             \"wolves, your teammate is X, choose a kill\" exposes the wolves, and even \"it is the wolves' turn\"\n\
-             leaks if it identifies who acts. Public phase text must be role-neutral.\n\
-           - In any public message, never state, confirm, or hint at any participant's hidden role, team,\n\
-             secret action, or who-targeted-whom — including the role of someone just eliminated. Announce\n\
-             only neutral public facts (whose turn it is, that someone died, vote tallies).\n\
+         fact itself but the PROMPT that asks a holder of hidden/sensitive state to act on it. So:\n\
+           - Prompt each holder of hidden state individually with `--private-to @id`. Never post one public\n\
+             message that is addressed to those holders or that names their hidden status or counterparts —\n\
+             e.g. publicly writing \"you two who share secret S, decide together\" exposes them, and even\n\
+             \"those with hidden state, it's your turn\" leaks if it identifies who acts. Public phase text\n\
+             must be neutral about hidden state.\n\
+           - In any public message, never state, confirm, or hint at any participant's hidden state,\n\
+             grouping, secret action, or who-did-what-to-whom — including the hidden state of someone who has\n\
+             just exited. Announce only neutral public facts (whose turn it is, that an outcome occurred,\n\
+             tallies).\n\
            - Your own replies follow the same test: answer a private/secret prompt only to the asker via\n\
-             `--private-to`; in public discussion you may speak, but do not reveal your own hidden role,\n\
-             team, or secret reasoning. Only a participant may reveal their own role, and only in their own\n\
-             public message — never the coordinator on their behalf.\n\
+             `--private-to`; in public discussion you may speak, but do not reveal your own hidden state,\n\
+             grouping, or secret reasoning. Only a participant may disclose their own hidden state, and only\n\
+             in their own public message — never the coordinator on their behalf.\n\
          </privacy>\n\
          \n\
          <examples>\n\
-         <example caption=\"Hand off the next speaker in an ordered round (coordinator)\">\n\
-         After reading the thread you see player A just finished. Wake the next speaker AND set a safety\n\
-         timer so the round still advances if they go quiet:\n\
-           loom --json message ask @player_b --target \"$LOOM_REPLY_TARGET\" --text \"轮到你发言了，请说说你的看法。\"\n\
+         <example caption=\"Run an ordered round, hand off to the next participant with a safety timer\">\n\
+         You coordinate a round where each participant contributes in turn. After reading the thread you\n\
+         see participant A just finished. Wake the next one AND set a timer so the round still advances if\n\
+         they go quiet:\n\
+           loom --json message ask @participant_b --target \"$LOOM_REPLY_TARGET\" --text \"It's your turn — please share your input now.\"\n\
            loom --json reminder schedule --title recheck --delay-seconds 180\n\
          </example>\n\
-         <example caption=\"Deal a hidden role — private, once, no public leak\">\n\
-           loom --json message send --private-to @player_c --text \"你的身份是狼人。你的狼队友是 @player_d。夜晚你们私下商量击杀目标。\"\n\
-         Then prompt each other secret role the same way. The public channel only ever sees neutral text like\n\
-         \"天黑了，请相关角色私聊我行动\"; it never names a role or teammate.\n\
+         <example caption=\"Give one participant private/sensitive information — privately, once\">\n\
+         When a participant must receive confidential information only they should see (a private\n\
+         assignment, a secret, a credential), send it to them alone; the public channel never carries it:\n\
+           loom --json message send --private-to @participant_c --text \"<their private assignment / secret here>\"\n\
+         If several participants each need their own private piece, send each separately. Any public note\n\
+         stays neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's\n\
+         secret.\n\
          </example>\n\
-         <example caption=\"Collect night actions, then resolve — read the inbox first\">\n\
-         A timer wakes you for the night. The wolves' reply is not in your prompt, so gather it:\n\
+         <example caption=\"Collect several async replies before proceeding — read the inbox first\">\n\
+         A timer wakes you to tally responses you requested. The replies are NOT in your prompt, so gather\n\
+         them from the server before concluding:\n\
            loom --json inbox list --no-ack\n\
            loom --json message read --target \"$LOOM_REPLY_TARGET\"\n\
-         If their kill target arrived, continue: privately tell the witch the night result and ask her\n\
-         choice. If it truly has not arrived after a generous wait, re-ask once; only then resolve by rule.\n\
+         If every required reply has arrived, proceed to the next step. If some are missing, re-ask those\n\
+         participants once and set another recheck reminder; only treat someone as absent after a generous\n\
+         wait, and resolve by your activity's rule — never by answering for them.\n\
          </example>\n\
-         <example caption=\"You were asked to act — send the action, do not just think it\">\n\
-         You are privately asked to choose a check target. End the turn by actually sending it back to the\n\
-         asker, privately:\n\
-           loom --json message send --private-to @dm_actor_id --text \"我查验 @player_e。\"\n\
+         <example caption=\"You were asked to act — actually send the action, do not just think it\">\n\
+         You were privately asked to make a choice or submit a decision. End the turn by sending it back to\n\
+         the asker the same way it was asked (privately, since it was private):\n\
+           loom --json message send --private-to @asker_actor_id --text \"My choice is X.\"\n\
          </example>\n\
          <example caption=\"You only received information — stay silent\">\n\
-         You receive a private role card \"你的身份是村民\". You were not asked to do anything yet, so do not\n\
-         reply \"收到\". Just remember it and end the turn:\n\
-           loom --json run ignore --reason \"收到身份信息，暂无需行动\"\n\
+         You receive a private note that just informs you of something (an assignment, an FYI) and asks for\n\
+         nothing yet. Do not reply \"got it\". Just remember it and end the turn:\n\
+           loom --json run ignore --reason \"Received the information; no action needed yet.\"\n\
          </example>\n\
          </examples>\n\
          \n\
@@ -6881,7 +6895,7 @@ mod tests {
         assert!(manifest.contains("<examples>"));
         assert!(manifest.contains("loom --json message ask @id"));
         assert!(manifest.contains("wakes NOBODY"));
-        assert!(manifest.contains("role-neutral"));
+        assert!(manifest.contains("neutral about hidden state"));
         assert!(manifest.contains("inbox list --no-ack"));
         assert!(manifest.contains("Rebuild state first"));
         assert!(manifest.contains("reminder schedule"));

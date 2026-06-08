@@ -5187,6 +5187,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          nothing yet. Do not reply \"got it\". Just remember it and end the turn:\n\
            loom --json run ignore --reason \"Received the information; no action needed yet.\"\n\
          </example>\n\
+         <example caption=\"Announce a public outcome WITHOUT revealing anyone's hidden state\">\n\
+         A participant has exited (eliminated, voted out, removed). Announce only the neutral public fact —\n\
+         who exited and what happens next — and never disclose their hidden role/group/secret, even though\n\
+         they are now out. Correct:\n\
+           loom --json message ask @next_actor --target \"$LOOM_REPLY_TARGET\" --text \"P has been voted out and leaves the round. We continue — @next_actor, it's your turn.\"\n\
+         Wrong (leaks hidden state, helps one side): a public message saying \"P has been voted out — P was\n\
+         a <hidden role>\". A participant's hidden state stays hidden after they exit unless your activity's\n\
+         rules explicitly make it public.\n\
+         </example>\n\
          </examples>\n\
          \n\
          <cli>\n\

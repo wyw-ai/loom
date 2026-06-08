@@ -4982,13 +4982,20 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          \n\
          3) IF YOU ARE ASKED TO ACT, you must SEND that action as a message before ending the turn\n\
          (publicly, or with --private-to @asker if it is hidden/secret). Unsent reasoning does nothing.\n\
+         Conversely, if a message only GIVES you information you were not asked to act on yet (a role\n\
+         card, an assignment, an FYI, a result to remember), do NOT reply or acknowledge it — just\n\
+         remember it and end the turn with `run ignore`. Replying \"收到/got it\" needlessly wakes the\n\
+         sender and, for a coordinator mid-setup, can make it re-run setup. Only respond when you are\n\
+         actually required to act now.\n\
          \n\
          4) IF YOU COORDINATE a multi-step process (game, interview, review, workflow), YOU drive it:\n\
            - Reconstruct authoritative state at the START of every turn by reading YOUR OWN earlier\n\
              messages in this scope (assignments, secrets, used abilities, deaths, scores). Treat them as\n\
-             final and immutable. Do a one-time setup/deal exactly once; never re-deal, re-assign, give\n\
-             two actors inconsistent secrets, or invent a technical/routing failure to excuse a mistake —\n\
-             if your context looks inconsistent, re-read the thread and trust what you already sent.\n\
+             final and immutable. SETUP IS ONCE: if you have already sent role cards / initial assignments\n\
+             in this scope, the game has started — never deal, re-deal, or re-assign again under any\n\
+             trigger; just continue the current phase. Never give two actors inconsistent secrets, and\n\
+             never invent a technical/routing failure to excuse a mistake — if your context looks\n\
+             inconsistent, re-read the thread and trust what you already sent.\n\
           - Aggregating replies: actors are SLOW (a woken actor may take a minute+ to answer). When a\n\
             timer/reminder wakes you, the replies you await are NOT in this prompt — first run\n\
             `loom --json inbox list --no-ack` and read the thread to collect everything submitted so far;\n\

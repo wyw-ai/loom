@@ -5512,6 +5512,7 @@ function SettingsView({
   const [providerAddOpen, setProviderAddOpen] = useState(false);
   const [memberCreateMenuOpen, setMemberCreateMenuOpen] = useState(false);
   const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
+  const handledTargetAgentIdRef = useRef<string | null>(null);
   const memberEntries = agentMemberEntries(machines);
   const onlineAgents = memberEntries.filter((entry) => entry.agent.status === "online").length;
   const canCreateAgentFromAnyHost = machines.some(
@@ -5568,12 +5569,20 @@ function SettingsView({
   }, [memberEntries, selectedAgentId]);
 
   useEffect(() => {
-    if (!targetAgentId) return;
+    if (!targetAgentId) {
+      handledTargetAgentIdRef.current = null;
+      return;
+    }
     const entry = findAgentMemberEntry(machines, targetAgentId);
-    setActiveSection("agents");
-    setSelectedAgentId(targetAgentId);
-    if (entry) setSelectedMachineId(entry.machine.id);
-  }, [machines, targetAgentId]);
+    if (handledTargetAgentIdRef.current !== targetAgentId) {
+      handledTargetAgentIdRef.current = targetAgentId;
+      setActiveSection("agents");
+      setSelectedAgentId(targetAgentId);
+    }
+    if (entry && selectedAgentId === targetAgentId) {
+      setSelectedMachineId(entry.machine.id);
+    }
+  }, [machines, selectedAgentId, targetAgentId]);
 
   useEffect(() => {
     if (!createAgentMachineId) return;
@@ -7215,10 +7224,12 @@ function AgentMemberDetail({
 }) {
   const { machine, agent } = entry;
   const actor = agent.spec.actor;
+  const agentDetailKey = `${machine.id}:${actor.id}`;
   const [draft, setDraft] = useState<AgentSettingsDraft>(() =>
     agentSettingsDraft(machine, agent),
   );
   const [activeTab, setActiveTab] = useState<AgentDetailTab>("profile");
+  const handledAgentDetailKeyRef = useRef(agentDetailKey);
   const selectedProvider = providerForAgent(machine, agent, draft.providerId);
   const modelChoices =
     selectedProvider?.modelChoices.length
@@ -7238,12 +7249,14 @@ function AgentMemberDetail({
   ];
 
   useEffect(() => {
+    if (handledAgentDetailKeyRef.current === agentDetailKey) return;
+    handledAgentDetailKeyRef.current = agentDetailKey;
     setDraft(agentSettingsDraft(machine, agent));
-  }, [machine.id, agent]);
+  }, [agentDetailKey, machine, agent]);
 
   useEffect(() => {
     setActiveTab("profile");
-  }, [machine.id, actor.id]);
+  }, [agentDetailKey]);
 
   function updateDraft(patch: Partial<AgentSettingsDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -7535,6 +7548,7 @@ function AgentPromptStudio({
   canEdit: boolean;
 }) {
   const actorId = agent.spec.actor.id;
+  const promptStudioKey = `${machine.id}:${actorId}`;
   const [sampleMessage, setSampleMessage] = useState(
     "This is preview placeholder text. In a real request, this will be replaced by the actual handoff content.",
   );
@@ -7550,6 +7564,7 @@ function AgentPromptStudio({
   const [promptBusy, setPromptBusy] = useState<"files" | "read" | "write" | "preview" | null>(null);
   const [assemblySaving, setAssemblySaving] = useState(false);
   const [promptError, setPromptError] = useState<string | null>(null);
+  const handledPromptStudioKeyRef = useRef(promptStudioKey);
   const canPreview = machine.canCommand && machine.capabilities.includes("agent.prompt.preview");
   const canReadFiles = machine.canCommand && machine.capabilities.includes("agent.file.read");
   const canWriteFiles = canEdit && machine.capabilities.includes("agent.file.write");
@@ -7571,6 +7586,8 @@ function AgentPromptStudio({
       : null;
 
   useEffect(() => {
+    if (handledPromptStudioKeyRef.current === promptStudioKey) return;
+    handledPromptStudioKeyRef.current = promptStudioKey;
     setPreview(null);
     setFiles([]);
     setFilePath("");
@@ -7579,7 +7596,7 @@ function AgentPromptStudio({
     setPromptTemplates(promptTemplatesFromAssembly(agent.spec.promptAssembly));
     setSelectedVariableKey("profile_prompt_files");
     setPromptError(null);
-  }, [machine.id, actorId, agent.spec.promptAssembly]);
+  }, [promptStudioKey, agent.spec.promptAssembly]);
 
   useEffect(() => {
     if (!canReadFiles) return;

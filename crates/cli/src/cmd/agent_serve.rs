@@ -1247,6 +1247,15 @@ struct WorkerState {
     /// scope/session state is isolated below the adapter boundary, so only
     /// prompts in the same scope block each other.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
+    /// Per-scope serialization gate. A scope id is present here from the moment a
+    /// turn is *reserved* (before the async `run.open`/prompt-compose work that
+    /// precedes `set_turn`) until the turn finishes with no queued successor.
+    /// This is the single source of truth for "is this scope busy?" and is what
+    /// makes begin-or-enqueue atomic across the two concurrent worker tasks
+    /// (the notification/inbox loop and the adapter-event/Finished loop), which
+    /// otherwise race the `active_turns` check-then-set window and dispatch
+    /// several overlapping turns into the same scope.
+    scope_busy: Mutex<HashSet<String>>,
     /// Per-scope queues of triggers received while that scope is busy. Human
     /// triggers are kept ahead of service callbacks within the same scope so
     /// stale automation cannot starve an explicit user request.
@@ -1444,6 +1453,7 @@ impl WorkerState {
             agent_server_url,
             agent_config_version_id,
             active_turns: Mutex::new(HashMap::new()),
+            scope_busy: Mutex::new(HashSet::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
@@ -1489,7 +1499,8 @@ impl WorkerState {
     }
 
     /// Drop the active turn for `scope_id` and pop the next queued trigger for
-    /// that same scope (if any).
+    /// that same scope (if any). Test-only; production uses `finish_and_next`.
+    #[cfg(test)]
     fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
         let mut active = self.active_turns.lock().expect("active_turns poisoned");
         active.remove(scope_id);
@@ -1509,8 +1520,17 @@ impl WorkerState {
         next
     }
 
+    #[cfg(test)]
     fn enqueue(&self, scope_id: &str, trigger: AgentTrigger) {
         let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        Self::enqueue_locked(&mut pending, scope_id, trigger);
+    }
+
+    fn enqueue_locked(
+        pending: &mut HashMap<String, VecDeque<AgentTrigger>>,
+        scope_id: &str,
+        trigger: AgentTrigger,
+    ) {
         if pending
             .values()
             .any(|queue| queue.iter().any(|queued| queued.id() == trigger.id()))
@@ -1528,6 +1548,51 @@ impl WorkerState {
         } else {
             queue.push_back(trigger);
         }
+    }
+
+    /// Atomically decide whether to dispatch `trigger` now or queue it. Returns
+    /// `true` if the caller acquired the scope and must dispatch; `false` if the
+    /// scope was already busy and the trigger was enqueued. The `scope_busy`
+    /// lock is held across the whole check-or-enqueue so it cannot interleave
+    /// with [`Self::finish_and_next`] running on the other worker task — which
+    /// is what previously let a burst of wakes spawn several overlapping turns
+    /// for the same scope.
+    fn begin_or_enqueue(&self, scope_id: &str, trigger: AgentTrigger) -> bool {
+        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
+        if busy.contains(scope_id) {
+            let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+            Self::enqueue_locked(&mut pending, scope_id, trigger);
+            false
+        } else {
+            busy.insert(scope_id.to_string());
+            true
+        }
+    }
+
+    /// Finish the active turn for `scope_id`: drop its metadata, then atomically
+    /// either hand back the next queued trigger for the same scope (the scope
+    /// stays reserved so the successor dispatches without re-racing the gate) or,
+    /// if the queue is empty, release the scope. Locks `scope_busy` before
+    /// `pending`, matching [`Self::begin_or_enqueue`], so the empty-check and the
+    /// release are atomic with a concurrent begin-or-enqueue.
+    fn finish_and_next(&self, scope_id: &str) -> Option<AgentTrigger> {
+        self.active_turns
+            .lock()
+            .expect("active_turns poisoned")
+            .remove(scope_id);
+        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
+        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        if let Some(queue) = pending.get_mut(scope_id) {
+            let next = queue.pop_front();
+            if queue.is_empty() {
+                pending.remove(scope_id);
+            }
+            if next.is_some() {
+                return next;
+            }
+        }
+        busy.remove(scope_id);
+        None
     }
 
     fn has_pending_source(&self, source_id: &str) -> bool {
@@ -3079,10 +3144,11 @@ async fn handle_trigger(
 ) -> Result<TriggerOutcome> {
     let trigger = trigger.clone();
     // Scope FIFO: the same actor can handle independent scopes concurrently,
-    // but prompts in one thread/channel remain ordered.
-    if state.current_turn(&trigger.scope().id).is_some() {
-        let scope_id = trigger.scope().id.clone();
-        state.enqueue(&scope_id, trigger);
+    // but prompts in one thread/channel remain ordered. `begin_or_enqueue`
+    // reserves the scope atomically before the async dispatch work so a burst
+    // of wakes cannot race the gate and spawn overlapping turns.
+    let scope_id = trigger.scope().id.clone();
+    if !state.begin_or_enqueue(&scope_id, trigger.clone()) {
         return Ok(TriggerOutcome::Queued);
     }
     dispatch_trigger(client, state, adapter, trigger)
@@ -3174,7 +3240,7 @@ async fn dispatch_trigger(
                     );
                 }
                 let scope_id = trigger.scope().id.clone();
-                match state.clear_turn(&scope_id) {
+                match state.finish_and_next(&scope_id) {
                     Some(next) => {
                         tracing::warn!(
                             actor = %state.actor_id,
@@ -5387,13 +5453,13 @@ async fn translate_one(
                 );
             }
             // Drop the active slot for this scope and pick up the next queued
-            // trigger (if any). Clear unconditionally — if close_turn failed
-            // server-side we still need to free the slot, otherwise the queue
-            // is stranded forever.
+            // trigger (if any). `finish_and_next` releases the scope atomically
+            // when the queue is empty, or hands back the successor while keeping
+            // the scope reserved so it dispatches without re-racing the gate.
             let scope_id = scope
                 .map(|s| s.id)
                 .unwrap_or_else(|| active.scope.id.clone());
-            let next_trigger = state.clear_turn(&scope_id);
+            let next_trigger = state.finish_and_next(&scope_id);
             if let Some(next) = next_trigger {
                 match dispatch_trigger(client, state, adapter, next).await {
                     Ok(_) => {}
@@ -8224,6 +8290,70 @@ mod tests {
             Some(service.id)
         );
         assert!(state.clear_turn(&active_scope.id).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn begin_or_enqueue_serializes_one_turn_per_scope_and_drains_in_order() {
+        let root = temp_path("scope-begin-or-enqueue");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_serialize".into(),
+        };
+        let mk = |id: &str| {
+            AgentTrigger::Event(Event {
+                id: id.into(),
+                kind: "content.add".into(),
+                actor_id: "actor_demo".into(),
+                scope: scope.clone(),
+                turn_id: None,
+                seq: 1,
+                occurred_at: Utc::now(),
+                payload: json!({ "text": "x" }),
+                relations: Vec::new(),
+                _meta: None,
+            })
+        };
+
+        // First trigger acquires the scope and must dispatch.
+        assert!(state.begin_or_enqueue(&scope.id, mk("evt_a")));
+        // A burst of further triggers while busy must all enqueue, never dispatch.
+        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_b")));
+        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_c")));
+        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_d")));
+
+        // Finishing hands back the queued triggers in FIFO order, keeping the
+        // scope reserved across each successor.
+        assert_eq!(
+            state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
+            Some("evt_b".to_string())
+        );
+        // While draining, the scope is still busy, so a new wake enqueues at the back.
+        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_e")));
+        assert_eq!(
+            state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
+            Some("evt_c".to_string())
+        );
+        assert_eq!(
+            state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
+            Some("evt_d".to_string())
+        );
+        assert_eq!(
+            state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
+            Some("evt_e".to_string())
+        );
+        // Queue empty now: finishing releases the scope.
+        assert!(state.finish_and_next(&scope.id).is_none());
+        // Released scope can be acquired again.
+        assert!(state.begin_or_enqueue(&scope.id, mk("evt_f")));
         std::fs::remove_dir_all(root).ok();
     }
 }

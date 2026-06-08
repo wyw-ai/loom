@@ -5115,6 +5115,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            - Advance the activity in the same turn. Announcing a phase to the room wakes no one; in the same\n\
              turn, wake the exact actor(s) who act next, and carry out every step a new input unblocks before\n\
              you end (for example, once one participant's input is in, immediately prompt whoever is next).\n\
+           - In an ordered round (each participant acts once in sequence), YOU own every hand-off; do not\n\
+             rely on a participant to pass the turn. Each time you are woken for the round (by a response or\n\
+             by your re-check timer), first read the thread and list who has ALREADY acted this round, then\n\
+             prompt the FIRST participant in the order who has not yet acted — and only that one. Never\n\
+             re-prompt or re-time-out someone whose contribution is already in the thread; if you are unsure\n\
+             whether they acted, re-read before prompting. When everyone in the order has acted, close the\n\
+             round and move to the next phase. (A participant who finishes may simply stop; they should not\n\
+             try to name or wake the next actor — that is your job, so competing hand-offs do not desync the\n\
+             round.)\n\
            - Collect replies patiently. Participants are slow — a woken actor may take a minute or more to\n\
              answer. When a timer or reminder wakes you, the replies you are waiting for are NOT in your\n\
              prompt: run `loom --json inbox list --no-ack` and read the thread to gather everything submitted\n\
@@ -5153,12 +5162,17 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          </privacy>\n\
          \n\
          <examples>\n\
-         <example caption=\"Run an ordered round, hand off to the next participant with a safety timer\">\n\
-         You coordinate a round where each participant contributes in turn. After reading the thread you\n\
-         see participant A just finished. Wake the next one AND set a timer so the round still advances if\n\
-         they go quiet:\n\
-           loom --json message ask @participant_b --target \"$LOOM_REPLY_TARGET\" --text \"It's your turn — please share your input now.\"\n\
+         <example caption=\"Run an ordered round — resume by finding who has not yet acted\">\n\
+         You coordinate a round where participants act once each in a set order. You are woken (by a reply or\n\
+         your re-check timer). FIRST read the thread to see who has already acted this round, then prompt the\n\
+         next one in order who has NOT — and only that one — with a safety timer so the round still advances:\n\
+           loom --json message read --target \"$LOOM_REPLY_TARGET\"\n\
+           loom --json message ask @next_unacted --target \"$LOOM_REPLY_TARGET\" --text \"It's your turn — please share your input now.\"\n\
            loom --json reminder schedule --title recheck --delay-seconds 180\n\
+         Do not prompt anyone whose contribution is already in the thread (re-prompting an actor who already\n\
+         spoke desyncs and stalls the round). When everyone in the order has acted, close the round and start\n\
+         the next phase. If you are a PARTICIPANT who just finished your turn, simply stop — do not announce\n\
+         or wake the next actor; the coordinator drives the order.\n\
          </example>\n\
          <example caption=\"Give one participant private/sensitive information — privately, once\">\n\
          When a participant must receive confidential information only they should see (a private\n\

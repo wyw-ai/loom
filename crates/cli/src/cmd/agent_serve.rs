@@ -4989,29 +4989,35 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              final and immutable. Do a one-time setup/deal exactly once; never re-deal, re-assign, give\n\
              two actors inconsistent secrets, or invent a technical/routing failure to excuse a mistake —\n\
              if your context looks inconsistent, re-read the thread and trust what you already sent.\n\
-           - Announcing a phase to the room wakes no one. In the SAME turn, wake the exact actor(s) who\n\
-             act next, and perform every step a new input unblocks (e.g. once a target is settled,\n\
-             immediately prompt the next role) before ending.\n\
-           - For an ordered round (each participant speaks/votes once) decide up front how it ends and do\n\
-             not rely on participants waking you back: when you hand off with `message ask @id`, also\n\
-             schedule a self-reminder (loom --json reminder schedule --title next --delay-seconds 90) so a\n\
-             timer re-wakes you to advance even if they stay silent. Never wait for organic silence; give\n\
-             non-responders a deadline and proceed with the inputs you have.\n\
-           - Never deadlock (don't block on a response that needs your next action first) and never end a\n\
-             turn with a phase half-resolved and no actor and no timer able to wake you. Reconcile\n\
-             conflicting inputs by deciding or briefly asking the parties to agree.\n\
-           - Single-owner: claim the source message before substantive work; if another owner exists,\n\
-             don't start a competing plan. Call `loom --json task complete <id> --result ...` once when\n\
-             acceptance is met.\n\
+          - Aggregating replies: actors are SLOW (a woken actor may take a minute+ to answer). When a\n\
+            timer/reminder wakes you, the replies you await are NOT in this prompt — first run\n\
+            `loom --json inbox list --no-ack` and read the thread to collect everything submitted so far;\n\
+            a reply you had not read is NOT a missing one, so never declare a timeout or 'no response'\n\
+            without checking. Wait generously and re-ask once before treating anyone as absent.\n\
+          - Never act for a participant or decide a hidden role's secret action on their behalf. If a\n\
+            required actor is genuinely absent after a generous wait, resolve by the game's rule (e.g. no\n\
+            action that phase), never by secretly playing their role and announcing a result.\n\
+          - Post each phase transition and each prompt ONCE. If you are woken again for a phase you have\n\
+            already started, read the new replies and continue from there — do not re-post the same\n\
+            prompt or re-announce a result you already gave; never publish two contradictory results.\n\
+          - Drive it: announcing to the room wakes no one; in the SAME turn wake the exact actor(s) who\n\
+            act next and do every step a new input unblocks. Do not deadlock or end with a phase\n\
+            half-resolved and nothing able to wake you — if still waiting, schedule a re-check reminder\n\
+            (`loom --json reminder schedule --title recheck --delay-seconds 180`).\n\
+          - Single-owner: claim the source message before substantive work; if another owner exists,\n\
+            don't start a competing plan. Call `loom --json task complete <id> --result ...` once when\n\
+            acceptance is met.\n\
          \n\
-         5) PRIVACY. Hidden info (roles, secrets, private votes/actions, credentials, personal data) goes\n\
-         ONLY via `message send --private-to @id` in this scope; a public message may only say a private\n\
-         note was sent. Your PUBLIC messages — including turn hand-offs — must be role-neutral: never\n\
-         recap, confirm, or hint at any participant's hidden role, team, private action, or who-targeted-\n\
-         whom. Whether YOUR reply is public or private depends on what you were asked: a private/secret\n\
-         prompt -> reply only to the asker with --private-to; a public-discussion prompt -> speak\n\
-         publicly but never reveal your own hidden role/team/reasoning. Only a participant may reveal\n\
-         their own role, by their own public message.\n\
+         5) PRIVACY & SECRET PROMPTS. Anything tied to a hidden role or secret state — the secret itself\n\
+         AND the prompt that asks a secret-role holder to take their action — is private. Prompt each such\n\
+         holder individually with `message send --private-to @id`. NEVER post one public message that is\n\
+         addressed to secret-role holders or that names their role or teammates: \"wolves, your teammate is\n\
+         X, choose a kill\" on the public channel is a catastrophic leak, and even \"it is the wolves' turn\"\n\
+         is a leak if it identifies who acts. Public messages must be role-neutral: never state, confirm,\n\
+         or hint at any participant's hidden role, team, action, or target — including an eliminated\n\
+         player's role. Your own reply follows the prompt: answer a private/secret prompt ONLY to the\n\
+         asker via --private-to; in public discussion speak but never reveal your own hidden role, team,\n\
+         or secret reasoning. Only a participant may reveal their own role, by their own public message.\n\
          \n\
          GRAMMAR: targets are `#<channel_id>` (channel) and `#<channel_id>:<root_message_id>` (thread);\n\
          sending to a thread target creates/reuses it. `--private-to @id` stays in this scope and wakes;\n\
@@ -6785,10 +6791,10 @@ mod tests {
         assert!(manifest.contains("Single-owner"));
         assert!(manifest.contains("PRIVACY"));
         assert!(manifest.contains("hidden role"));
-        assert!(manifest.contains("credentials"));
         assert!(manifest.contains("must be role-neutral"));
+        assert!(manifest.contains("secret-role holders"));
         assert!(manifest.contains("Reconstruct"));
-        assert!(manifest.contains("self-reminder"));
+        assert!(manifest.contains("reminder schedule"));
     }
 
     #[test]

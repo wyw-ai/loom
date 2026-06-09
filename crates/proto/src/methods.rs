@@ -2190,6 +2190,67 @@ pub enum ProviderPromptRoleHint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPromptAssemblySpec {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vars: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<AgentPromptFileSpec>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub outputs: std::collections::BTreeMap<String, AgentPromptOutputSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPromptFileSpec {
+    pub key: String,
+    pub root: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "roleHint")]
+    pub role_hint: Option<AgentPromptRoleHint>,
+    #[serde(default = "default_agent_prompt_file_optional")]
+    pub optional: bool,
+    #[serde(default = "default_agent_prompt_file_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_agent_prompt_file_optional() -> bool {
+    true
+}
+
+fn default_agent_prompt_file_max_bytes() -> u64 {
+    32 * 1024
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptRoleHint {
+    System,
+    User,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPromptOutputSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(default)]
+    pub required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDecoderSpec {
     #[serde(default = "default_provider_decoder_format")]
     pub format: String,
@@ -2678,6 +2739,16 @@ pub struct AgentSpec {
     /// `/delivery` or `/discovery`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TriggerSpec>,
+    /// Optional per-agent prompt assembly. This is the agent-owned rule that
+    /// turns Loom prompt parts and controlled profile/workspace files into the
+    /// named outputs providers consume through `{prompt.system}`,
+    /// `{prompt.user}`, and `{prompt.full}`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "promptAssembly"
+    )]
+    pub prompt_assembly: Option<AgentPromptAssemblySpec>,
     /// Optional per-actor prompt template (design §5). Wraps the trigger
     /// event content with `everyTurnPrefix`, `firstTurnPrefix` (first
     /// turn per scope only), and `everyTurnSuffix` lines, with template

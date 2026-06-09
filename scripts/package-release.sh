@@ -189,7 +189,7 @@ package_gui_dmg() {
 
   local stage_dir tmp_dmg dmg_dir dmg
   stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/loom-gui-dmg.XXXXXX")"
-  tmp_dmg="$(mktemp "${TMPDIR:-/tmp}/loom-gui-dmg-output.XXXXXX")"
+  tmp_dmg="$(mktemp "${TMPDIR:-/tmp}/loom-gui-dmg-output.XXXXXX").dmg"
   rm -f "$tmp_dmg"
   if command -v ditto >/dev/null 2>&1; then
     ditto "$app" "$stage_dir/Loom Desktop.app"

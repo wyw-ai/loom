@@ -5080,13 +5080,20 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          if the message that WOKE you was sent to you privately (via `--private-to`), your reply is secret too:\n\
          reply with `--private-to` (include at least `$LOOM_TRIGGER_ACTOR`, the actor who woke you, plus any\n\
          co-recipients you are coordinating with) — never to `$LOOM_REPLY_TARGET`, which would expose it.\n\
-         These are the delivery choices and when to use each:\n\
+         These are the delivery choices and when to use each. Two independent things matter: WHO IS WOKEN\n\
+         (whose turn runs next) and WHO CAN SEE the message (visibility). `@mentions`/`ask` control only who is\n\
+         woken; they do NOT restrict visibility. Visibility is public UNLESS you use `--private-to`. So a\n\
+         message sent to `$LOOM_REPLY_TARGET` is readable by EVERYONE in the activity even if it @mentions or\n\
+         `ask`s only a few — naming hidden actors there exposes them to all.\n\
            - `loom --json message ask @id [@id2] --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
-               Wakes those specific actors. Use when one or a few named actors must act/answer/decide next.\n\
+               Wakes those specific actors AND is publicly visible to everyone. Use only when what you ask is\n\
+               public (an open turn, a public question). NEVER use it to wake a hidden individual/sub-group or\n\
+               to say anything secret — the audience controls waking, not secrecy, so this leaks.\n\
            - `loom --json message send --private-to @id [--private-to @id2 ...] --text \"...\"`\n\
-               Wakes those recipients, and the message is visible ONLY to you and them. Use for any\n\
-               secret/hidden content (a role, a private prompt, a result meant for one actor). Pass several\n\
-               --private-to in one message to wake a hidden sub-group privately in a space only they can see.\n\
+               Wakes those recipients AND is visible ONLY to you and them. This is the ONLY way to wake someone\n\
+               privately. Use it for ALL secret/hidden content (a role, a private prompt, a hidden action) and\n\
+               to convene/prompt a hidden sub-group: pass several --private-to in one message to wake them all\n\
+               in a space only they can see. To wake hidden actors, always reach for this, never `ask`.\n\
            - `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
                Posts to everyone but wakes NOBODY (notify_only). Use ONLY for pure information that needs no\n\
                response — a public summary or announcement nobody must act on.\n\
@@ -5208,7 +5215,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              that participant with `--private-to`, never into a shared message.\n\
            - To make a hidden SUB-GROUP coordinate (two or more participants who share hidden state and must\n\
              decide together), keep the whole interaction in a private space — never convene or name them in\n\
-             the shared channel. Two ways: (a) send one message carrying a `--private-to` for EACH member\n\
+             the shared channel. To WAKE them you MUST use `message send --private-to` (which wakes AND hides);\n\
+             do NOT use `message ask ... --target $LOOM_REPLY_TARGET`, because `ask` on the shared thread is\n\
+             publicly readable and would expose exactly who the members are even though it woke only them. Two\n\
+             ways: (a) send one message carrying a `--private-to` for EACH member\n\
              (it wakes them all and only they see it), and let them reply within that same private audience;\n\
              or (b) for sustained back-and-forth, `loom --json channel create --title \"...\"` (private by\n\
              default) and `channel invite` only those members, then run their coordination there. Collect\n\
@@ -5283,12 +5293,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          stays neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's\n\
          secret.\n\
          </example>\n\
-         <example caption=\"Make a hidden sub-group decide together — privately, never in the shared channel\">\n\
+         <example caption=\"Wake a hidden sub-group — with --private-to, NEVER ask on the shared thread\">\n\
          Several participants share hidden state and must coordinate a joint hidden decision. Convening them in\n\
-         the shared channel would expose who they are, so keep it entirely private. Wake them together in a\n\
-         space only they can see by giving one message a --private-to for each member, and ask them to reply\n\
-         within that same private audience:\n\
+         the shared channel would expose who they are. The trap: you need to WAKE several actors, so you reach\n\
+         for `message ask` — but `ask --target $LOOM_REPLY_TARGET` is publicly readable, so it would name the\n\
+         whole hidden group to everyone even though it only woke them. Instead WAKE them with `--private-to`\n\
+         (which wakes AND hides), giving one message a --private-to for each member, and have them reply within\n\
+         that same private audience:\n\
            loom --json message send --private-to @member_1 --private-to @member_2 --target \"$LOOM_REPLY_TARGET\" --text \"You share <hidden state>. Decide your joint action together; reply only with --private-to to this same group, not to the public thread — only you can see this.\"\n\
+         Wrong (exposes the whole group to everyone): `loom --json message ask @member_1 @member_2 --target \"$LOOM_REPLY_TARGET\" --text \"you two, decide your hidden move\"`.\n\
          (For longer back-and-forth, instead `loom --json channel create --title \"...\"` — private by default —\n\
          and `channel invite` only these members, then coordinate there.) Collect their decision privately and\n\
          resolve it; the shared channel later shows only the neutral outcome, never their identities or plan.\n\
@@ -5348,7 +5361,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          latest message and pass `--if-latest <message_id>` so you rebase on current state. For who is present,\n\
          use the injected channel-members section or `loom --json channel members \"$LOOM_CHANNEL_ID\"`, not\n\
          `loom actor list` (global and stale). `message ask` is the same as a `message send` carrying an\n\
-         explicit @id audience with `--intent request_action --delivery-policy wake_agent`. Use\n\
+         explicit @id audience with `--intent request_action --delivery-policy wake_agent`; that audience sets\n\
+         who is WOKEN, not who can see it, so a `message ask` on `$LOOM_REPLY_TARGET` is still public — for a\n\
+         hidden recipient use `--private-to` (it wakes too). Use\n\
          `loom --json ask-user-question` to get a choice/input from the human, and `loom --json request-approval`\n\
          for an approve/reject gate. Run `loom <command> --help` for anything else. Only the text after this\n\
          line is the new user input.\n\

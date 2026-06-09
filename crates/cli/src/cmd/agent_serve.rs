@@ -5115,13 +5115,22 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          it forward. Each turn starts a fresh session, so you carry no memory between turns except what is on\n\
          the server — work from these habits:\n\
            - Rebuild state first. At the start of every coordinating turn, read your own earlier messages in\n\
-             this scope to recover the authoritative state (who has which secret role, abilities used, who is\n\
-             out, scores, whose turn it is). Treat what you already sent as final and correct.\n\
-           - Set up exactly once. If you have already dealt roles or made initial assignments in this scope,\n\
-             the activity has started: never deal, re-deal, or reassign again under any later trigger. If\n\
-             something looks inconsistent, re-read the thread and trust what you already sent; never tell two\n\
-             actors different versions of a secret, and never invent a \"system/routing error\" to paper over a\n\
-             slip — just continue from the real state.\n\
+             this scope — including the private ones you sent — to recover the authoritative state (who has\n\
+             which secret role/team, abilities used, who is out, scores, whose turn it is). The hidden state of\n\
+             record is what you privately assigned: to recall a participant's secret role or which sub-group\n\
+             they belong to, re-read the private message where you assigned it and treat that as final. Never\n\
+             re-derive, guess, or change a participant's role/team from later public discussion, and when you\n\
+             act on a hidden sub-group its members are EXACTLY those you privately assigned to it — re-read\n\
+             those assignments so you never include the wrong person.\n\
+           - Set up exactly once, and never restart. If you have already dealt roles or made initial\n\
+             assignments in this scope, the activity has started: never deal, re-deal, reassign, or open a\n\
+             \"new round/new game\" again under any later trigger. Even if you discover you made a real mistake,\n\
+             or you suspect a technical, duplicate, or \"parallel\" error, do NOT terminate, reset, or re-deal,\n\
+             and do NOT post a \"system error\"/\"starting over\" announcement — the authoritative state lives on\n\
+             the server, so re-read it, trust what you already established, and continue forward, correcting\n\
+             your own course quietly from here. Never tell two actors different versions of a secret. Tearing\n\
+             down and restarting an activity that is already underway is never the answer and only makes it\n\
+             worse.\n\
            - Advance the activity in the same turn. A public announcement (a result, a new phase) wakes no\n\
              one — so after you announce, send a SEPARATE `message ask` to wake the exact actor(s) who act\n\
              next, including the first actor of the phase you just opened; naming them inside the announcement\n\
@@ -5140,8 +5149,8 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              recheck timer. Never re-prompt, skip, or time-out anyone whose contribution is already in the\n\
              thread; if unsure whether they acted, re-read before prompting. When everyone in the order has\n\
              acted, close the round and move to the next phase. (A participant who finishes may simply stop;\n\
-             they should not name or wake the next actor — that is your job, so competing hand-offs do not\n\
-             desync the round.)\n\
+             they should not name or wake the next actor, post a phase announcement, or restate the progress\n\
+             ledger — only the coordinator does that, so competing hand-offs do not desync the round.)\n\
            - A simultaneous step is the opposite of an ordered round: when everyone acts at once (a vote, a\n\
              simultaneous submission), announce the prompt ONCE, wake all the actors together in a single `ask`\n\
              that lists them, and set one recheck timer. On each later wake, GATHER what has arrived (`inbox\n\

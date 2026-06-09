@@ -446,7 +446,10 @@ export function App() {
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
   const agentActorIdsKey = agentActors.map((actor) => actor.id).join("|");
   const activeDirectActor =
-    agentActors.find((actor) => actor.id === activeDirectActorId) ?? null;
+    agentActors.find((actor) => actor.id === activeDirectActorId) ??
+    (activeDirectActorId
+      ? findAgentMemberEntry(machines, activeDirectActorId)?.agent.spec.actor ?? null
+      : null);
   const activeDirectTarget = activeDirectActor
     ? directMessageTarget(activeDirectActor.id)
     : null;
@@ -473,6 +476,9 @@ export function App() {
   const openAgentSettings = useCallback((actorId: string) => {
     setSettingsAgentId(actorId);
     setView("settings");
+  }, []);
+  const consumeSettingsAgentTarget = useCallback(() => {
+    setSettingsAgentId(null);
   }, []);
 
   const applyConfig = useCallback((next: DesktopConfig) => {
@@ -723,11 +729,7 @@ export function App() {
 
   useEffect(() => {
     if (view !== "direct") return;
-    setActiveDirectActorId((current) =>
-      current && agentActors.some((actor) => actor.id === current)
-        ? current
-        : agentActors[0]?.id ?? null,
-    );
+    setActiveDirectActorId((current) => current ?? agentActors[0]?.id ?? null);
   }, [agentActorIdsKey, view]);
 
   useEffect(() => {
@@ -2206,6 +2208,7 @@ export function App() {
               setAgentForm={setAgentForm}
               machines={machines}
               targetAgentId={settingsAgentId}
+              onConsumeTargetAgent={consumeSettingsAgentTarget}
               onCheckMachines={checkMachines}
               onCreateMachine={createMachine}
               onRemoveMachine={removeMachine}
@@ -5480,6 +5483,7 @@ function SettingsView({
   setAgentForm,
   machines,
   targetAgentId,
+  onConsumeTargetAgent,
   onCheckMachines,
   onCreateMachine,
   onRemoveMachine,
@@ -5493,6 +5497,7 @@ function SettingsView({
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
   targetAgentId: string | null;
+  onConsumeTargetAgent: () => void;
   onCheckMachines: () => void;
   onCreateMachine: (args: {
     name: string;
@@ -5578,11 +5583,12 @@ function SettingsView({
       handledTargetAgentIdRef.current = targetAgentId;
       setActiveSection("agents");
       setSelectedAgentId(targetAgentId);
+      onConsumeTargetAgent();
     }
     if (entry && selectedAgentId === targetAgentId) {
       setSelectedMachineId(entry.machine.id);
     }
-  }, [machines, selectedAgentId, targetAgentId]);
+  }, [machines, onConsumeTargetAgent, selectedAgentId, targetAgentId]);
 
   useEffect(() => {
     if (!createAgentMachineId) return;

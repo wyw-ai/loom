@@ -5096,7 +5096,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Match your reply to what the latest message actually asks of you:\n\
            - It asks you to act (answer, choose, vote, take your turn, submit a hidden action): you must\n\
              actually SEND that action as a message before the turn ends — publicly if it is public, or with\n\
-             `--private-to @asker` if it is secret. Reasoning you do not send accomplishes nothing.\n\
+             `--private-to` if it is secret. When the prompt that reached you is private (it came --private-to\n\
+             you, e.g. to coordinate with hidden teammates or submit a hidden action), keep your ENTIRE reply\n\
+             in that same private audience: send it `--private-to` the same recipients, never to the shared\n\
+             channel — even if public news arrived at the same moment and you feel the urge to react in the\n\
+             open. Reasoning you do not send accomplishes nothing.\n\
            - It only gives you information you were not asked to act on (a role card, an assignment, an FYI,\n\
              a result to remember): simply remember it and end with `run ignore`. Do NOT reply \"got it\" /\n\
              \"收到\" — a needless acknowledgement wakes the sender, and for a coordinator mid-setup it can\n\
@@ -5138,6 +5142,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              acted, close the round and move to the next phase. (A participant who finishes may simply stop;\n\
              they should not name or wake the next actor — that is your job, so competing hand-offs do not\n\
              desync the round.)\n\
+           - A simultaneous step is the opposite of an ordered round: when everyone acts at once (a vote, a\n\
+             simultaneous submission), announce the prompt ONCE, wake all the actors together in a single `ask`\n\
+             that lists them, and set one recheck timer. On each later wake, GATHER what has arrived (`inbox\n\
+             list --no-ack`, read the thread) and either tally once everyone has acted or keep waiting — do not\n\
+             re-post the prompt on each wake, which floods the channel with duplicates.\n\
            - Collect replies patiently. Participants are slow — a woken actor may take a minute or more to\n\
              answer. When a timer or reminder wakes you, the replies you are waiting for are NOT in your\n\
              prompt: run `loom --json inbox list --no-ack` and read the thread to gather everything submitted\n\
@@ -5185,10 +5194,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              cause or source behind an outcome, or any count derived from hidden attributes (e.g. how many of a\n\
              hidden type remain) — neither for active participants nor for ones who have just exited. Report\n\
              that a participant is out; do not report how, by whom, or what they secretly were.\n\
-           - Your own replies follow the same test: answer a private/secret prompt only to the asker via\n\
-             `--private-to`; in public discussion you may speak, but do not reveal your own hidden state,\n\
-             grouping, or secret reasoning. Only a participant may disclose their own hidden state, and only\n\
-             in their own public message — never the coordinator on their behalf.\n\
+           - As a participant you are bound by this too: never reveal your own hidden role/allegiance, your\n\
+             secret teammates, or your secret reasoning in a shared message — not proactively and not while\n\
+             reacting to public news; a single such slip usually decides the activity against your own side.\n\
+             Answer any private/secret prompt only within its private audience via `--private-to` (to the same\n\
+             recipients), and coordinate with hidden teammates only there, never in the shared channel. In open\n\
+             discussion you may argue, claim, or bluff; only you may disclose your own hidden state, by your own\n\
+             choice in your own public message — never the coordinator on your behalf.\n\
          </privacy>\n\
          \n\
          <examples>\n\
@@ -5243,10 +5255,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          participants once and set another recheck reminder; only treat someone as absent after a generous\n\
          wait, and resolve by your activity's rule — never by answering for them.\n\
          </example>\n\
-         <example caption=\"You were asked to act — actually send the action, do not just think it\">\n\
-         You were privately asked to make a choice or submit a decision. End the turn by sending it back to\n\
-         the asker the same way it was asked (privately, since it was private):\n\
-           loom --json message send --private-to @asker_actor_id --text \"My choice is X.\"\n\
+         <example caption=\"You were asked privately — keep your whole reply private, do not leak to the room\">\n\
+         You were privately woken to make a hidden choice or to coordinate with your hidden teammates. End the\n\
+         turn by sending your reply inside the SAME private audience (the asker, plus any teammates it\n\
+         included), never to the shared channel — even if public news just arrived and you want to react:\n\
+           loom --json message send --private-to @asker_actor_id [--private-to @teammate_id] --text \"My choice is X.\"\n\
+         Posting your hidden coordination, your role, or your allegiance in the shared channel exposes your\n\
+         side and usually loses the activity for you.\n\
          </example>\n\
          <example caption=\"You only received information — stay silent\">\n\
          You receive a private note that just informs you of something (an assignment, an FYI) and asks for\n\

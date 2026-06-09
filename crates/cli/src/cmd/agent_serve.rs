@@ -5188,7 +5188,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          side is unfairly advantaged — so this holds even while you are resuming, recapping, or summarizing, and\n\
          even for participants who have already exited. A secret includes not just the fact itself but the\n\
          PROMPT that asks a holder of hidden/sensitive state to act on it. So:\n\
-           - Prompt each holder of hidden state individually with `--private-to @id`. Never post one public\n\
+           - Prompt each holder of hidden state individually with `--private-to @id` — every such prompt, in\n\
+             every phase, including a single solo role acting alone (do not solicit one role's hidden action in\n\
+             the shared channel just because only one actor is involved). Never post one public\n\
              message that is addressed to those holders or that names their hidden status or counterparts —\n\
              e.g. publicly writing \"you two who share secret S, decide together\" exposes them, and even\n\
              \"those with hidden state, it's your turn\" leaks if it identifies who acts. Public phase text\n\
@@ -5208,6 +5210,14 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              cause or source behind an outcome, or any count derived from hidden attributes (e.g. how many of a\n\
              hidden type remain) — neither for active participants nor for ones who have just exited. Report\n\
              that a participant is out; do not report how, by whom, or what they secretly were.\n\
+           - When a participant is eliminated or exits, announce ONLY that they are out (and whose turn is\n\
+             next); do NOT reveal the hidden role/allegiance they held, and do not attach a hidden role to any\n\
+             still-active participant (for example in a survivor roster). Their hidden state was game-relevant\n\
+             and stays hidden. Do this even if the activity's genre or your own past experience has a customary\n\
+             \"flip the card on death\" habit: a familiar convention is NOT permission — reveal an exited or\n\
+             active participant's hidden state only if the human running THIS activity explicitly instructed\n\
+             public reveal, never because the genre usually does it. When unsure, keep it hidden. (After the\n\
+             whole activity has ended, a full recap of everyone's role is fine.)\n\
            - As a participant you are bound by this too: never reveal your own hidden role/allegiance, your\n\
              secret teammates, or your secret reasoning in a shared message — not proactively and not while\n\
              reacting to public news; a single such slip usually decides the activity against your own side.\n\
@@ -5290,11 +5300,14 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          they are now out. Correct:\n\
            loom --json message ask @next_actor --target \"$LOOM_REPLY_TARGET\" --text \"P has been voted out and leaves the round. We continue — @next_actor, it's your turn.\"\n\
          Wrong (each leaks hidden state and helps one side): \"P has been voted out — P was a <hidden role>\";\n\
-         \"P was removed by <other participant>'s secret action\"; \"<N> of the hidden type remain\"; or telling\n\
-         a participant in the shared channel \"last phase you used your <secret ability> on Q\". A participant's\n\
-         hidden role, the cause behind an outcome, and counts of hidden types all stay hidden after they exit\n\
-         unless your activity's rules explicitly make them public; anything about a participant's own secret\n\
-         action goes to them with `--private-to`.\n\
+         \"P has fallen; flipping their card: <hidden role>\"; \"P was removed by <other participant>'s secret\n\
+         action\"; \"<N> of the hidden type remain\"; a survivor roster that tags anyone with a hidden role; or\n\
+         telling a participant in the shared channel \"last phase you used your <secret ability> on Q\". Do not\n\
+         reveal an exited participant's role even if the genre customarily \"flips the card\" on death — only an\n\
+         explicit instruction for THIS activity authorizes that. A participant's hidden role, the cause behind\n\
+         an outcome, and counts of hidden types all stay hidden while the activity continues; anything about a\n\
+         participant's own secret action goes to them with `--private-to`. (Once the whole activity is over, a\n\
+         full role recap is fine.)\n\
          </example>\n\
          </examples>\n\
          \n\

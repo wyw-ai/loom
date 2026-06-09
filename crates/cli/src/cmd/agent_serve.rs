@@ -5349,6 +5349,18 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          participant's own secret action goes to them with `--private-to`. (Once the whole activity is over, a\n\
          full role-and-cause recap is fine.)\n\
          </example>\n\
+         <example caption=\"Resolve a phase where SEVERAL outcomes happened — list who is out, not why\">\n\
+         A phase resolves with multiple results at once (several participants out, from different hidden\n\
+         causes). The pull to narrate each cause is strongest here — resist it. Combine the hidden inputs\n\
+         privately, then post ONE public result that lists only who is out and what is next, with NO per-victim\n\
+         cause and NO mention of which hidden role or side acted. Correct:\n\
+           loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"This phase, P and Q did not make it through — both are out. <R remaining participants>. We continue to <next phase>.\"\n\
+           loom --json message ask @first_next --target \"$LOOM_REPLY_TARGET\" --text \"<wake the first actor of the next phase>\"\n\
+         Wrong (narrates the hidden causes/actors): \"P was killed by the <faction> and Q was struck by the\n\
+         <hidden role>'s power\" — even when the two outcomes had different hidden causes, you say only that each\n\
+         is out, never which cause hit whom. Resolve the result correctly once from your private inputs and\n\
+         announce it a single time; do not post one version then a contradictory one.\n\
+         </example>\n\
          </examples>\n\
          \n\
          <cli>\n\

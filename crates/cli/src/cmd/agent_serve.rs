@@ -5123,19 +5123,27 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              is not enough. Carry out every step a new input unblocks before you end (once one participant's\n\
              input is in, immediately wake whoever is next).\n\
            - In an ordered round (each participant acts once in sequence), YOU own every hand-off; do not\n\
-             rely on a participant to pass the turn. Each time you are woken for the round (by a response or\n\
-             by your re-check timer), first read the thread and list who has ALREADY acted this round, then\n\
-             prompt the FIRST participant in the order who has not yet acted — and only that one. Never\n\
-             re-prompt or re-time-out someone whose contribution is already in the thread; if you are unsure\n\
-             whether they acted, re-read before prompting. When everyone in the order has acted, close the\n\
-             round and move to the next phase. (A participant who finishes may simply stop; they should not\n\
-             try to name or wake the next actor — that is your job, so competing hand-offs do not desync the\n\
-             round.)\n\
+             rely on a participant to pass the turn. Each wake is a fresh session with no memory, so never\n\
+             prompt from memory or from only the message that woke you (a timer wake in particular does not\n\
+             carry the participants' messages). Every time you are woken for the round, do these in order:\n\
+             (1) read the thread (`message read`) and your own most recent progress line; (2) from the actual\n\
+             messages, mark which participants in the order have ALREADY posted their contribution this round —\n\
+             count any substantive message from them as their contribution, even if loosely phrased; (3) prompt\n\
+             the FIRST participant in the order who has NOT, and only that one, and in that prompt restate an\n\
+             explicit progress ledger (e.g. \"done: A, B; up now: C; remaining: D, E\") so your latest message\n\
+             always holds the authoritative state and the next wake can recover it in one read; (4) set one\n\
+             recheck timer. Never re-prompt, skip, or time-out anyone whose contribution is already in the\n\
+             thread; if unsure whether they acted, re-read before prompting. When everyone in the order has\n\
+             acted, close the round and move to the next phase. (A participant who finishes may simply stop;\n\
+             they should not name or wake the next actor — that is your job, so competing hand-offs do not\n\
+             desync the round.)\n\
            - Collect replies patiently. Participants are slow — a woken actor may take a minute or more to\n\
              answer. When a timer or reminder wakes you, the replies you are waiting for are NOT in your\n\
              prompt: run `loom --json inbox list --no-ack` and read the thread to gather everything submitted\n\
-             so far. A reply you simply had not read yet is not a missing one, so never declare someone timed\n\
-             out without checking, and re-ask once before treating anyone as absent.\n\
+             so far. A recheck timer firing only means \"come back and continue\"; it is never by itself evidence\n\
+             that anyone is absent or has timed out. A reply you simply had not read yet is not a missing one,\n\
+             so never declare someone timed out without checking, and re-ask once before treating anyone as\n\
+             absent.\n\
            - Never play someone else. Do not decide a participant's secret action for them. If an actor is\n\
              truly unreachable after a generous wait, resolve by the activity's rule (e.g. that role simply\n\
              does nothing this phase), never by secretly acting in their place and announcing a result.\n\
@@ -5186,17 +5194,19 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          If you post only the announcement and stop, nobody is woken and the activity stalls — the most common\n\
          failure at a phase boundary.\n\
          </example>\n\
-         <example caption=\"Run an ordered round — resume by finding who has not yet acted\">\n\
+         <example caption=\"Run an ordered round — reconstruct progress, then prompt the next with a ledger\">\n\
          You coordinate a round where participants act once each in a set order. You are woken (by a reply or\n\
-         your re-check timer). FIRST read the thread to see who has already acted this round, then prompt the\n\
-         next one in order who has NOT — and only that one — with a safety timer so the round still advances:\n\
+         your recheck timer). Do NOT prompt from memory: FIRST read the thread and your own last progress line\n\
+         to see who has already acted this round, then prompt the next one in order who has NOT — and only that\n\
+         one — restating the ledger so the authoritative state lives in your latest message, with a safety timer:\n\
            loom --json message read --target \"$LOOM_REPLY_TARGET\"\n\
-           loom --json message ask @next_unacted --target \"$LOOM_REPLY_TARGET\" --text \"It's your turn — please share your input now.\"\n\
+           loom --json message ask @next_unacted --target \"$LOOM_REPLY_TARGET\" --text \"Done: A, B. You're up now, @next_unacted — please share your input. Remaining after you: D, E.\"\n\
            loom --json reminder schedule --title recheck --delay-seconds 180\n\
-         Do not prompt anyone whose contribution is already in the thread (re-prompting an actor who already\n\
-         spoke desyncs and stalls the round). When everyone in the order has acted, close the round and start\n\
-         the next phase. If you are a PARTICIPANT who just finished your turn, simply stop — do not announce\n\
-         or wake the next actor; the coordinator drives the order.\n\
+         Do not prompt, skip, or time-out anyone whose contribution is already in the thread (re-prompting an\n\
+         actor who already spoke desyncs and stalls the round); a recheck timer firing is not a timeout. When\n\
+         everyone in the order has acted, close the round and start the next phase. If you are a PARTICIPANT who\n\
+         just finished your turn, simply stop — do not announce or wake the next actor; the coordinator drives\n\
+         the order.\n\
          </example>\n\
          <example caption=\"Give one participant private/sensitive information — privately, once\">\n\
          When a participant must receive confidential information only they should see (a private\n\

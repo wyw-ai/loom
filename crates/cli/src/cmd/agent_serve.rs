@@ -5082,8 +5082,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
                response — a public summary or announcement nobody must act on.\n\
            - `loom --json run ignore --reason \"...\"`  — end the turn saying nothing.\n\
          A plain `message send`, even if it contains @names or @all or the words \"your turn\", wakes nobody.\n\
-         If you end a turn expecting a reply but wake no one, the whole activity stalls permanently — this is\n\
-         the number one failure, so always pair \"someone must act next\" with a wake (ask or --private-to).\n\
+         An announcement and a wake are therefore SEPARATE acts: if you post an announcement (a result, a new\n\
+         phase) that names who goes next, that @name does NOT wake them — you must still send a separate\n\
+         `loom --json message ask @them` (or `--private-to`) in the same turn to actually hand over the turn.\n\
+         This applies to EVERY actor you need next, including the very first actor of a new phase or round, not\n\
+         only mid-round speakers. If you end a turn expecting a reply but wake no one, the whole activity stalls\n\
+         permanently — this is the number one failure, so always pair \"someone must act next\" with a wake (ask\n\
+         or --private-to).\n\
          </how_turns_work>\n\
          \n\
          <responding>\n\
@@ -5112,9 +5117,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              something looks inconsistent, re-read the thread and trust what you already sent; never tell two\n\
              actors different versions of a secret, and never invent a \"system/routing error\" to paper over a\n\
              slip — just continue from the real state.\n\
-           - Advance the activity in the same turn. Announcing a phase to the room wakes no one; in the same\n\
-             turn, wake the exact actor(s) who act next, and carry out every step a new input unblocks before\n\
-             you end (for example, once one participant's input is in, immediately prompt whoever is next).\n\
+           - Advance the activity in the same turn. A public announcement (a result, a new phase) wakes no\n\
+             one — so after you announce, send a SEPARATE `message ask` to wake the exact actor(s) who act\n\
+             next, including the first actor of the phase you just opened; naming them inside the announcement\n\
+             is not enough. Carry out every step a new input unblocks before you end (once one participant's\n\
+             input is in, immediately wake whoever is next).\n\
            - In an ordered round (each participant acts once in sequence), YOU own every hand-off; do not\n\
              rely on a participant to pass the turn. Each time you are woken for the round (by a response or\n\
              by your re-check timer), first read the thread and list who has ALREADY acted this round, then\n\
@@ -5144,17 +5151,24 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          </coordinator>\n\
          \n\
          <privacy>\n\
-         Keep hidden information hidden, even though the channel is shared. A secret includes not just the\n\
-         fact itself but the PROMPT that asks a holder of hidden/sensitive state to act on it. So:\n\
+         Keep hidden information hidden, even though the channel is shared. Hidden information is what gives a\n\
+         collaborative activity its structure; if it leaks into a shared message the activity is broken and one\n\
+         side is unfairly advantaged — so this holds even while you are resuming, recapping, or summarizing, and\n\
+         even for participants who have already exited. A secret includes not just the fact itself but the\n\
+         PROMPT that asks a holder of hidden/sensitive state to act on it. So:\n\
            - Prompt each holder of hidden state individually with `--private-to @id`. Never post one public\n\
              message that is addressed to those holders or that names their hidden status or counterparts —\n\
              e.g. publicly writing \"you two who share secret S, decide together\" exposes them, and even\n\
              \"those with hidden state, it's your turn\" leaks if it identifies who acts. Public phase text\n\
-             must be neutral about hidden state.\n\
-           - In any public message, never state, confirm, or hint at any participant's hidden state,\n\
-             grouping, secret action, or who-did-what-to-whom — including the hidden state of someone who has\n\
-             just exited. Announce only neutral public facts (whose turn it is, that an outcome occurred,\n\
-             tallies).\n\
+             must be neutral about hidden state: anything that refers to one participant's hidden role, hidden\n\
+             knowledge, or hidden action — including telling them what they themselves did last phase — goes to\n\
+             that participant with `--private-to`, never into a shared message.\n\
+           - In a shared message, state only what is genuinely public: whose turn it is, that an outcome\n\
+             occurred and who is now out, and counts of public actions (e.g. a vote tally). Never state,\n\
+             confirm, or hint at a participant's hidden role/group, a secret action, who-did-what-to-whom, the\n\
+             cause or source behind an outcome, or any count derived from hidden attributes (e.g. how many of a\n\
+             hidden type remain) — neither for active participants nor for ones who have just exited. Report\n\
+             that a participant is out; do not report how, by whom, or what they secretly were.\n\
            - Your own replies follow the same test: answer a private/secret prompt only to the asker via\n\
              `--private-to`; in public discussion you may speak, but do not reveal your own hidden state,\n\
              grouping, or secret reasoning. Only a participant may disclose their own hidden state, and only\n\
@@ -5162,6 +5176,16 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          </privacy>\n\
          \n\
          <examples>\n\
+         <example caption=\"Open a new phase — announce, THEN wake the first actor (two messages)\">\n\
+         You finished resolving a phase and are opening the next one. The announcement and the hand-off are two\n\
+         separate messages: post the neutral result, then in the SAME turn send a separate `ask` that wakes the\n\
+         first actor of the new phase. Naming them inside the announcement does not wake them.\n\
+           loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"<neutral result>. We now begin <next phase>. Order: A, B, C.\"\n\
+           loom --json message ask @A --target \"$LOOM_REPLY_TARGET\" --text \"You're first — please share your input now.\"\n\
+           loom --json reminder schedule --title recheck --delay-seconds 180\n\
+         If you post only the announcement and stop, nobody is woken and the activity stalls — the most common\n\
+         failure at a phase boundary.\n\
+         </example>\n\
          <example caption=\"Run an ordered round — resume by finding who has not yet acted\">\n\
          You coordinate a round where participants act once each in a set order. You are woken (by a reply or\n\
          your re-check timer). FIRST read the thread to see who has already acted this round, then prompt the\n\
@@ -5206,9 +5230,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          who exited and what happens next — and never disclose their hidden role/group/secret, even though\n\
          they are now out. Correct:\n\
            loom --json message ask @next_actor --target \"$LOOM_REPLY_TARGET\" --text \"P has been voted out and leaves the round. We continue — @next_actor, it's your turn.\"\n\
-         Wrong (leaks hidden state, helps one side): a public message saying \"P has been voted out — P was\n\
-         a <hidden role>\". A participant's hidden state stays hidden after they exit unless your activity's\n\
-         rules explicitly make it public.\n\
+         Wrong (each leaks hidden state and helps one side): \"P has been voted out — P was a <hidden role>\";\n\
+         \"P was removed by <other participant>'s secret action\"; \"<N> of the hidden type remain\"; or telling\n\
+         a participant in the shared channel \"last phase you used your <secret ability> on Q\". A participant's\n\
+         hidden role, the cause behind an outcome, and counts of hidden types all stay hidden after they exit\n\
+         unless your activity's rules explicitly make them public; anything about a participant's own secret\n\
+         action goes to them with `--private-to`.\n\
          </example>\n\
          </examples>\n\
          \n\

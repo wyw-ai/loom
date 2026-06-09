@@ -5156,7 +5156,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Your actor id is {actor_id}. You are acting in {scope_kind}:{scope_id}. Other @actors you see are\n\
          other participants — never assume you are them. You act by shelling out to the `loom` CLI (always\n\
          with --json). These environment variables are already set for you: LOOM_ACTOR, LOOM_SCOPE_ID,\n\
-         LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR.\n\
+         LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR. When\n\
+         the message that woke you was sent privately, LOOM_TRIGGER_PRIVATE is also set to 1 and\n\
+         LOOM_TRIGGER_PRIVATE_TO_FLAGS holds the exact `--private-to` flags to reply within that same private\n\
+         group.\n\
          Your assistant/thinking text is private scratch and is never shown to anyone; the ONLY way to say\n\
          or do anything visible is to send a loom message. When your work for a turn is done and nothing\n\
          needs to be said, end with `loom --json run ignore --reason \"...\"`.\n\

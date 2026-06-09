@@ -14,10 +14,12 @@ import type {
   MouseEvent,
   PointerEvent,
   ReactNode,
+  SelectHTMLAttributes,
 } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import {
+  ArrowLeft,
   Bell,
   Bot,
   Check,
@@ -31,6 +33,7 @@ import {
   HardDrive,
   Home,
   Lock,
+  ListChecks,
   Loader2,
   LogOut,
   MessageCircle,
@@ -42,6 +45,7 @@ import {
   Search,
   Send,
   Server,
+  Settings,
   Smile,
   Split,
   Trash2,
@@ -56,6 +60,9 @@ import {
   scopeKey,
   threadTarget,
   type Actor,
+  type AgentFileEntry,
+  type AgentPromptPreviewPart,
+  type AgentPromptPreviewResult,
   type AudienceRef,
   type Channel,
   type DesktopConfig,
@@ -151,6 +158,7 @@ type AgentFormState = {
   actorId: string;
   name: string;
   description: string;
+  instructions: string;
   model: string;
   autostart: boolean;
 };
@@ -159,6 +167,7 @@ type AgentUpdatePatch = {
   actorId: string;
   displayName: string;
   description: string;
+  instructions: string;
   providerId?: string;
   model: string;
   reasoningEffort: string;
@@ -168,6 +177,7 @@ type AgentUpdatePatch = {
 type AgentSettingsDraft = {
   displayName: string;
   description: string;
+  instructions: string;
   providerId: string;
   model: string;
   reasoningEffort: string;
@@ -177,6 +187,27 @@ type AgentSettingsDraft = {
 type AgentMemberEntry = {
   machine: MachineInfo;
   agent: MachineInfo["agents"][number];
+};
+type ProviderAvailabilityGroup = {
+  key: string;
+  id: string;
+  name: string;
+  transportKind: string;
+  actorCount: number;
+  defaultModels: string[];
+  hosts: Array<{
+    machine: MachineInfo;
+    provider: MachineAgentProviderInfo;
+  }>;
+};
+type ActorWorkspaceSection = "agents" | "hosts" | "services";
+type AgentDetailTab = "profile" | "prompt" | "settings";
+type PromptTemplateDraft = {
+  system: string;
+  user: string;
+};
+type PromptAssemblyBuildOptions = {
+  includeAllFiles?: boolean;
 };
 type ChannelMemberPresence = {
   online: boolean;
@@ -200,7 +231,102 @@ const avatarLibraryUrls = Array.from(
   { length: avatarCount },
   (_, index) => `/avatars/avatar-${String(index + 1).padStart(2, "0")}.png`,
 );
+const localServerCommand = "loom-server --bind 0.0.0.0:7878";
+const localServerUrl = "ws://127.0.0.1:7878/rpc";
+const machineStatusPollIntervalMs = 5_000;
 const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
+const defaultNewPromptFilePath = "prompts/new.md";
+const defaultSystemPromptTemplate = [
+  "{actor_context}",
+  "{agent_instructions}",
+  "{bootstrap_memory}",
+  "{scope_bootstrap}",
+  "{profile_prompt_files}",
+].join("\n\n");
+const defaultUserPromptTemplate = [
+  "{turn_memory}",
+  "{runtime_context}",
+  "{assignment_context}",
+  "{user_message}",
+].join("\n\n");
+const promptPresetParts: Record<string, string[]> = {
+  loom_system: [
+    "actor_context",
+    "agent_instructions",
+    "bootstrap_memory",
+    "scope_bootstrap",
+    "profile_prompt_files",
+  ],
+  loom_turn: ["turn_memory", "runtime_context", "assignment_context", "user_message"],
+  loom_full: [
+    "actor_context",
+    "agent_instructions",
+    "bootstrap_memory",
+    "scope_bootstrap",
+    "profile_prompt_files",
+    "turn_memory",
+    "runtime_context",
+    "assignment_context",
+    "user_message",
+  ],
+};
+const promptVariableOptions = [
+  { key: "actor_context", label: "Actor" },
+  { key: "agent_instructions", label: "Instructions" },
+  { key: "bootstrap_memory", label: "Long memory" },
+  { key: "scope_bootstrap", label: "Scope" },
+  { key: "profile_prompt_files", label: "Profile prompt files" },
+  { key: "turn_memory", label: "Turn memory" },
+  { key: "runtime_context", label: "Runtime" },
+  { key: "assignment_context", label: "Assignment" },
+  { key: "user_message", label: "Message" },
+] as const;
+const defaultAgentPromptAssembly: Record<string, unknown> = {
+  outputs: {
+    system: {
+      template: defaultSystemPromptTemplate,
+    },
+    user: {
+      template: defaultUserPromptTemplate,
+    },
+    full: {
+      include: ["prompt.system", "prompt.user"],
+    },
+  },
+};
+const defaultProviderManifestText = JSON.stringify(
+  {
+    schemaVersion: 1,
+    id: "my_provider",
+    displayName: "My Provider",
+    detect: {
+      candidates: ["my-agent"],
+    },
+    modes: {
+      print: {
+        transport: "command",
+        command: "{bin}",
+        args: [
+          "run",
+          {
+            when: "model",
+            args: ["--model", "{model}"],
+          },
+          "{prompt.full}",
+        ],
+        stdout: {
+          format: "text",
+        },
+      },
+    },
+    models: {
+      default: "default",
+      choices: [{ id: "default", label: "Default" }],
+    },
+  },
+  null,
+  2,
+);
 const ungroupedChannelGroupId = "__ungrouped";
 const channelContextMenuWidthPx = 44 * 4;
 const channelContextMenuItemHeightPx = 36;
@@ -259,14 +385,15 @@ export function App() {
   const [directScopesByActorId, setDirectScopesByActorId] = useState<Record<string, ScopeRef>>({});
   const [workspaceForm, setWorkspaceForm] = useState({
     name: "Local",
-    serverUrl: "ws://127.0.0.1:7878/rpc",
+    serverUrl: localServerUrl,
   });
   const [agentForm, setAgentForm] = useState<AgentFormState>({
     machineId: "",
     providerId: "",
     actorId: "",
     name: "Echo",
-    description: "Reply concisely and report completed work.",
+    description: "",
+    instructions: "Reply concisely and report completed work.",
     model: "",
     autostart: true,
   });
@@ -293,6 +420,7 @@ export function App() {
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
+  const activeWorkspaceId = workspace?.id ?? null;
   const visibleChannels = channels.filter((channel) => !isDirectChannel(channel));
   const activeChannel =
     visibleChannels.find((channel) => channel.id === activeChannelId) ?? null;
@@ -318,7 +446,10 @@ export function App() {
   const agentActors = actorList.filter((actor) => actor.kind === "agent");
   const agentActorIdsKey = agentActors.map((actor) => actor.id).join("|");
   const activeDirectActor =
-    agentActors.find((actor) => actor.id === activeDirectActorId) ?? null;
+    agentActors.find((actor) => actor.id === activeDirectActorId) ??
+    (activeDirectActorId
+      ? findAgentMemberEntry(machines, activeDirectActorId)?.agent.spec.actor ?? null
+      : null);
   const activeDirectTarget = activeDirectActor
     ? directMessageTarget(activeDirectActor.id)
     : null;
@@ -346,6 +477,9 @@ export function App() {
     setSettingsAgentId(actorId);
     setView("settings");
   }, []);
+  const consumeSettingsAgentTarget = useCallback(() => {
+    setSettingsAgentId(null);
+  }, []);
 
   const applyConfig = useCallback((next: DesktopConfig) => {
     setConfig(next);
@@ -371,6 +505,19 @@ export function App() {
     setNotice(text);
     window.setTimeout(() => setNotice(null), 3200);
   }, []);
+
+  const prepareLocalServerSpace = useCallback(() => {
+    setWorkspaceForm({ name: "Local", serverUrl: localServerUrl });
+    setView("spaces");
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard
+        .writeText(localServerCommand)
+        .then(() => pushNotice("Server command copied"))
+        .catch(() => pushNotice("Open Spaces after starting the server"));
+      return;
+    }
+    pushNotice("Open Spaces after starting the server");
+  }, [pushNotice]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current !== null) {
@@ -519,10 +666,12 @@ export function App() {
         autoReconnectRef.current = true;
         setConnection("closed");
         setError("Connection lost. Reconnecting...");
+        void loadMachines(true).catch(() => {});
       } else {
         if (workspaceRef.current) autoReconnectRef.current = true;
         reconnectAttemptRef.current = 0;
         setConnection("open");
+        void loadMachines(true).catch(() => {});
       }
     }).then((off) => {
       unlistenConnection = off;
@@ -532,11 +681,18 @@ export function App() {
       unlistenStream?.();
       unlistenConnection?.();
     };
-  }, [loadConfig]);
+  }, [loadConfig, loadMachines]);
 
   useEffect(() => {
     workspaceRef.current = workspace;
   }, [workspace]);
+
+  useEffect(() => {
+    if (!activeWorkspaceId || connection !== "idle") return;
+    autoReconnectRef.current = true;
+    reconnectAttemptRef.current = 0;
+    void connectWorkspace(activeWorkspaceId, { automatic: true, quiet: true });
+  }, [activeWorkspaceId, connectWorkspace, connection]);
 
   useEffect(() => {
     activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
@@ -573,11 +729,7 @@ export function App() {
 
   useEffect(() => {
     if (view !== "direct") return;
-    setActiveDirectActorId((current) =>
-      current && agentActors.some((actor) => actor.id === current)
-        ? current
-        : agentActors[0]?.id ?? null,
-    );
+    setActiveDirectActorId((current) => current ?? agentActors[0]?.id ?? null);
   }, [agentActorIdsKey, view]);
 
   useEffect(() => {
@@ -605,6 +757,26 @@ export function App() {
       }
     };
   }, [connectWorkspace, connection, workspace]);
+
+  useEffect(() => {
+    if (connection !== "open") return;
+
+    const refreshMachines = () => {
+      void loadMachines(true).catch(() => {});
+    };
+    refreshMachines();
+
+    const interval = window.setInterval(refreshMachines, machineStatusPollIntervalMs);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") refreshMachines();
+    };
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [connection, loadMachines]);
 
   useEffect(() => {
     if (!activeChannel || connection !== "open") return;
@@ -1045,9 +1217,42 @@ export function App() {
     setError(null);
     try {
       await loadMachines(true);
-      pushNotice("Agent host status refreshed");
+      pushNotice("Registered hosts refreshed");
     } catch (err) {
       setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function createMachine(args: {
+    name: string;
+    dataRoot?: string;
+  }): Promise<MachineInfo | null> {
+    const name = args.name.trim();
+    if (!name) {
+      setError("Host name is required.");
+      return null;
+    }
+    setBusy("machine:create");
+    setError(null);
+    try {
+      const result = await ipc.machineCreate({
+        name,
+        dataRoot: args.dataRoot?.trim() || undefined,
+      });
+      applyMachines(result.machines);
+      pushNotice(`Host ${name} registration prepared`);
+      return (
+        result.machines.find(
+          (machine) => machine.source === "local_registration" && machine.name === name,
+        ) ??
+        result.machines.find((machine) => machine.name === name) ??
+        null
+      );
+    } catch (err) {
+      setError(errorText(err));
+      return null;
     } finally {
       setBusy(null);
     }
@@ -1059,7 +1264,7 @@ export function App() {
     try {
       const result = await ipc.machineRemove(machineId);
       applyMachines(result.machines);
-      pushNotice("Agent host removed");
+      pushNotice("Registered host removed");
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1067,16 +1272,16 @@ export function App() {
     }
   }
 
-  async function createAgent(): Promise<boolean> {
-    const name = agentForm.name.trim();
-    const machine = resolveAgentMachine(agentForm, machines);
-    const provider = resolveAgentProvider(agentForm, machine);
+  async function createAgent(form: AgentFormState = agentForm): Promise<boolean> {
+    const name = form.name.trim();
+    const machine = resolveAgentMachine(form, machines);
+    const provider = resolveAgentProvider(form, machine);
     if (!machine) {
-      setError("Add an agent host before creating an agent.");
+      setError("Register a host before creating an agent.");
       return false;
     }
     if (!machineCanCreateAgent(machine)) {
-      setError(`Agent host ${machine.name} is read-only or does not support agent creation.`);
+      setError(`Host ${machine.name} is read-only or does not support agent creation.`);
       return false;
     }
     if (!provider) {
@@ -1093,11 +1298,13 @@ export function App() {
       const result = await ipc.machineAgentCreate({
         machineId: machine.id,
         providerId: provider.id,
-        actorId: agentForm.actorId.trim() || undefined,
+        actorId: form.actorId.trim() || undefined,
         name,
-        description: agentForm.description.trim(),
-        model: agentForm.model.trim() || provider.defaultModel || "",
-        autostart: agentForm.autostart,
+        description: form.description.trim(),
+        instructions: form.instructions.trim(),
+        promptAssembly: defaultAgentPromptAssembly,
+        model: form.model.trim() || provider.defaultModel || "",
+        autostart: form.autostart,
       });
       applyMachines(result.machines);
       setAgentForm((current) =>
@@ -1142,6 +1349,7 @@ export function App() {
         actorId: patch.actorId,
         displayName: patch.displayName.trim(),
         description: patch.description.trim(),
+        instructions: patch.instructions.trim(),
         providerId: patch.providerId,
         model: patch.model.trim(),
         reasoningEffort: patch.reasoningEffort.trim(),
@@ -1835,6 +2043,11 @@ export function App() {
               channelThreads={channelThreads}
               threadStatsById={threadStatsById}
               emptyText={chatEmpty}
+              emptyAction={
+                connection === "open" ? null : (
+                  <NoSpaceConnectionGuide onUseLocalServer={prepareLocalServerSpace} />
+                )
+              }
               onReply={setReplyTo}
               onStartThread={startThread}
               onToggleReaction={toggleMessageReaction}
@@ -1995,7 +2208,9 @@ export function App() {
               setAgentForm={setAgentForm}
               machines={machines}
               targetAgentId={settingsAgentId}
+              onConsumeTargetAgent={consumeSettingsAgentTarget}
               onCheckMachines={checkMachines}
+              onCreateMachine={createMachine}
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
               onUpdateAgent={updateAgent}
@@ -2291,7 +2506,7 @@ function Sidebar({
     { id: "threads" as const, label: "Threads", icon: MessageSquare },
     { id: "inbox" as const, label: "Inbox", icon: Bell },
     { id: "tasks" as const, label: "Tasks", icon: Check },
-    { id: "settings" as const, label: "Hosts", icon: Server },
+    { id: "settings" as const, label: "Actors", icon: Server },
   ];
   const closeCreateMenu = () => {
     setCreateMenuOpen(false);
@@ -3102,6 +3317,7 @@ function MessageFeed({
   channelThreads,
   threadStatsById,
   emptyText,
+  emptyAction,
   onReply,
   onStartThread,
   onToggleReaction,
@@ -3120,6 +3336,7 @@ function MessageFeed({
   channelThreads: Thread[];
   threadStatsById: Record<string, ThreadActivityStats>;
   emptyText: string;
+  emptyAction?: ReactNode;
   onReply: (message: Message) => void;
   onStartThread: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
@@ -3145,8 +3362,9 @@ function MessageFeed({
   if (visibleMessages.length === 0) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
-        <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-8 py-10 text-center">
-          {emptyText}
+        <div className="w-full max-w-lg rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-8 py-10 text-center">
+          <div className="text-sm font-semibold text-[#667085]">{emptyText}</div>
+          {emptyAction}
         </div>
       </div>
     );
@@ -5090,7 +5308,12 @@ function SpacesView({
           <SettingsSection title="Saved Spaces" detail="The side rail uses this list for switching.">
             <div className="space-y-2">
               {workspaces.length === 0 ? (
-                <MutedLine>No spaces configured.</MutedLine>
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                  <div>No spaces configured.</div>
+                  <code className="mt-2 block rounded-lg border border-[#dfe3ec] bg-white px-3 py-2 font-mono text-xs font-semibold text-[#303849]">
+                    {localServerCommand}
+                  </code>
+                </div>
               ) : (
                 workspaces.map((item) => {
                   const selected = item.id === workspace?.id;
@@ -5260,7 +5483,9 @@ function SettingsView({
   setAgentForm,
   machines,
   targetAgentId,
+  onConsumeTargetAgent,
   onCheckMachines,
+  onCreateMachine,
   onRemoveMachine,
   onAddAgent,
   onUpdateAgent,
@@ -5272,19 +5497,46 @@ function SettingsView({
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
   targetAgentId: string | null;
+  onConsumeTargetAgent: () => void;
   onCheckMachines: () => void;
+  onCreateMachine: (args: {
+    name: string;
+    dataRoot?: string;
+  }) => Promise<MachineInfo | null> | MachineInfo | null;
   onRemoveMachine: (machineId: string) => void;
-  onAddAgent: () => Promise<boolean> | boolean;
+  onAddAgent: (form: AgentFormState) => Promise<boolean> | boolean;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
+  const [activeSection, setActiveSection] = useState<ActorWorkspaceSection>("hosts");
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
   const [createAgentMachineId, setCreateAgentMachineId] = useState<string | null>(null);
+  const [hostRegisterOpen, setHostRegisterOpen] = useState(false);
+  const [providerAddOpen, setProviderAddOpen] = useState(false);
   const [memberCreateMenuOpen, setMemberCreateMenuOpen] = useState(false);
   const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
+  const handledTargetAgentIdRef = useRef<string | null>(null);
   const memberEntries = agentMemberEntries(machines);
+  const onlineAgents = memberEntries.filter((entry) => entry.agent.status === "online").length;
+  const canCreateAgentFromAnyHost = machines.some(
+    (machine) => machineCanCreateAgent(machine) && machine.providers.length > 0,
+  );
+  const providerCount = machines.reduce(
+    (count, machine) => count + machine.providers.length,
+    0,
+  );
+  const workspaceSections: Array<{
+    id: ActorWorkspaceSection;
+    label: string;
+    count: number;
+    icon: ComponentType<{ size?: string | number; className?: string }>;
+  }> = [
+    { id: "hosts", label: "Registered Hosts", count: machines.length, icon: Server },
+    { id: "agents", label: "Agents", count: memberEntries.length, icon: Bot },
+    { id: "services", label: "Services", count: 0, icon: Split },
+  ];
   const selectedMemberEntry =
     selectedAgentId === null
       ? null
@@ -5322,11 +5574,21 @@ function SettingsView({
   }, [memberEntries, selectedAgentId]);
 
   useEffect(() => {
-    if (!targetAgentId) return;
+    if (!targetAgentId) {
+      handledTargetAgentIdRef.current = null;
+      return;
+    }
     const entry = findAgentMemberEntry(machines, targetAgentId);
-    setSelectedAgentId(targetAgentId);
-    if (entry) setSelectedMachineId(entry.machine.id);
-  }, [machines, targetAgentId]);
+    if (handledTargetAgentIdRef.current !== targetAgentId) {
+      handledTargetAgentIdRef.current = targetAgentId;
+      setActiveSection("agents");
+      setSelectedAgentId(targetAgentId);
+      onConsumeTargetAgent();
+    }
+    if (entry && selectedAgentId === targetAgentId) {
+      setSelectedMachineId(entry.machine.id);
+    }
+  }, [machines, onConsumeTargetAgent, selectedAgentId, targetAgentId]);
 
   useEffect(() => {
     if (!createAgentMachineId) return;
@@ -5352,12 +5614,14 @@ function SettingsView({
   }, [memberCreateMenuOpen]);
 
   function selectMachine(machine: MachineInfo) {
+    setActiveSection("hosts");
     setSelectedMachineId(machine.id);
     setSelectedAgentId(null);
     setAgentForm(agentFormForMachine(agentForm, machine));
   }
 
   function selectAgent(entry: AgentMemberEntry) {
+    setActiveSection("agents");
     setSelectedMachineId(entry.machine.id);
     setSelectedAgentId(entry.agent.spec.actor.id);
     setAgentForm(agentFormForMachine(agentForm, entry.machine));
@@ -5376,6 +5640,7 @@ function SettingsView({
       selectedMachine ??
       machines[0];
     if (!nextMachine) return;
+    setActiveSection("agents");
     setSelectedMachineId(nextMachine.id);
     setSelectedAgentId(null);
     setAgentForm(agentFormForMachine(agentForm, nextMachine));
@@ -5383,68 +5648,202 @@ function SettingsView({
     setMemberCreateMenuOpen(false);
   }
 
+  function selectCreateAgentMachine(machineId: string) {
+    const nextMachine = machines.find((machine) => machine.id === machineId) ?? null;
+    if (!nextMachine) return;
+    setSelectedMachineId(nextMachine.id);
+    setCreateAgentMachineId(nextMachine.id);
+    setAgentForm(agentFormForMachine(agentForm, nextMachine));
+  }
+
+  function showAgentRoster() {
+    setActiveSection("agents");
+    setSelectedAgentId(null);
+  }
+
+  function openRegisterHostDialog() {
+    setActiveSection("hosts");
+    setSelectedAgentId(null);
+    setHostRegisterOpen(true);
+  }
+
+  function hostRegistered(machine: MachineInfo) {
+    setActiveSection("hosts");
+    setSelectedMachineId(machine.id);
+    setSelectedAgentId(null);
+    setAgentForm(agentFormForMachine(agentForm, machine));
+  }
+
+  function selectSection(section: ActorWorkspaceSection) {
+    setActiveSection(section);
+    if (section === "agents") {
+      setSelectedAgentId(null);
+      return;
+    }
+    if (section === "hosts") {
+      setSelectedAgentId(null);
+      return;
+    }
+    setSelectedAgentId(null);
+  }
+
+  const detailContent =
+    activeSection === "agents" ? (
+      selectedMemberEntry ? (
+        <AgentMemberDetail
+          entry={selectedMemberEntry}
+          busy={busy}
+          onBack={showAgentRoster}
+          onUpdateAgent={onUpdateAgent}
+          onRemoveAgent={onRemoveAgent}
+        />
+      ) : (
+        <AgentRosterOverview
+          machines={machines}
+          entries={memberEntries}
+          busy={busy}
+          onOpenCreateAgent={openCreateAgentDialog}
+          onOpenProviderAdd={() => setProviderAddOpen(true)}
+          onSelectAgent={selectAgent}
+          onRemoveAgent={onRemoveAgent}
+        />
+      )
+    ) : activeSection === "hosts" ? (
+      selectedMachine ? (
+        <MachineCard
+          machine={selectedMachine}
+          busy={busy}
+          onRemove={onRemoveMachine}
+          onOpenLocalPath={onOpenLocalPath}
+        />
+      ) : (
+        <RegisteredHostsEmpty
+          busy={busy}
+          onOpenRegisterHost={openRegisterHostDialog}
+        />
+      )
+    ) : (
+      <ServiceRosterOverview />
+    );
+
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <PageHeader title="Hosts" detail="Workspace-bound runtimes and agents" />
+      <PageHeader
+        title="Actors"
+        detail={`${onlineAgents}/${memberEntries.length} agents online / ${machines.length} hosts / ${providerCount} providers`}
+      />
       <div className="min-h-0 flex-1 overflow-hidden bg-white">
         <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(208px,224px)_minmax(0,1fr)]">
           <aside className="flex min-h-0 flex-col border-r border-[#e2e6ef] bg-[#fbfbfd]">
             <div className="border-b border-[#edf0f5] p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                    Hosts
-                  </div>
-                  <div className="mt-1 text-sm font-bold text-[#111827]">
-                    {machines.length} reported
-                  </div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0 text-sm font-bold text-[#111827]">
+                  Actor Manage
                 </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    title="Refresh hosts"
-                    onClick={onCheckMachines}
-                    disabled={busy === "machine:check"}
-                    className="h-9 w-9 rounded-lg border-[#dfe3ec] bg-white"
-                  >
-                    {busy === "machine:check" ? (
-                      <Loader2 className="animate-spin" size={15} />
-                    ) : (
-                      <RefreshCw size={15} />
-                    )}
-                  </Button>
-                </div>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  title="Refresh hosts"
+                  onClick={onCheckMachines}
+                  disabled={busy === "machine:check"}
+                  className="h-8 w-8 rounded-lg border-[#dfe3ec] bg-white"
+                >
+                  {busy === "machine:check" ? (
+                    <Loader2 className="animate-spin" size={15} />
+                  ) : (
+                    <RefreshCw size={15} />
+                  )}
+                </Button>
+              </div>
+              <div className="mt-3 space-y-1">
+                {workspaceSections.map((section) => {
+                  const Icon = section.icon;
+                  const selected = activeSection === section.id;
+                  return (
+                    <button
+                      key={section.id}
+                      type="button"
+                      className={cn(
+                        "flex h-9 w-full items-center gap-2 rounded-lg border px-2.5 text-left text-sm font-semibold transition-colors",
+                        selected
+                          ? "border-[#bdb7ff] bg-white text-[#503ed4] shadow-sm"
+                          : "border-transparent text-[#596174] hover:border-[#dfe3ec] hover:bg-white",
+                      )}
+                      onClick={() => selectSection(section.id)}
+                    >
+                      <Icon size={15} className="shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">{section.label}</span>
+                      <span className="count-badge">{section.count}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
-              <div className="space-y-2">
-                {machines.length === 0 ? (
-                  <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                    No hosts reported.
+              {activeSection === "hosts" && (
+                <div className="space-y-2">
+                  <div className="mb-2 flex items-center justify-between px-1">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                      Registered Hosts
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="count-badge">{machines.length}</span>
+                      <button
+                        type="button"
+                        className="composer-icon h-7 min-w-7 rounded-lg border border-[#dfe3ec] bg-white text-[#503ed4]"
+                        title="Register host"
+                        onClick={openRegisterHostDialog}
+                        disabled={busy === "machine:create"}
+                      >
+                        {busy === "machine:create" ? (
+                          <Loader2 className="animate-spin" size={13} />
+                        ) : (
+                          <Plus size={13} />
+                        )}
+                      </button>
+                    </div>
                   </div>
-                ) : (
-                  machines.map((machine) => (
-                    <HostListItem
-                      key={machine.id}
-                      machine={machine}
-                      selected={selectedMachine?.id === machine.id}
-                      onSelect={() => selectMachine(machine)}
-                    />
-                  ))
-                )}
-              </div>
-              <div className="mt-5 border-t border-[#edf0f5] pt-4">
+                  {machines.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
+                      <div>No registered hosts.</div>
+                      <Button
+                        size="sm"
+                        className="mt-3 rounded-lg"
+                        onClick={openRegisterHostDialog}
+                        disabled={busy === "machine:create"}
+                      >
+                        {busy === "machine:create" ? (
+                          <Loader2 className="animate-spin" size={14} />
+                        ) : (
+                          <Plus size={14} />
+                        )}
+                        Register Host
+                      </Button>
+                    </div>
+                  ) : (
+                    machines.map((machine) => (
+                      <HostListItem
+                        key={machine.id}
+                        machine={machine}
+                        selected={selectedMachine?.id === machine.id}
+                        onSelect={() => selectMachine(machine)}
+                      />
+                    ))
+                  )}
+                </div>
+              )}
+              {activeSection === "agents" && (
+                <div>
                 <div className="mb-2 flex items-center justify-between px-1">
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                    Members
+                    Agents
                   </div>
                   <div ref={memberCreateMenuRef} className="relative flex items-center gap-1.5">
                     <span className="count-badge">{memberEntries.length}</span>
                     <button
                       type="button"
                       className="composer-icon h-7 min-w-9 gap-0.5 rounded-lg border border-[#dfe3ec] bg-white text-[#503ed4]"
-                      title="Add member"
+                      title="Add actor"
                       aria-expanded={memberCreateMenuOpen}
                       onClick={() => setMemberCreateMenuOpen((open) => !open)}
                     >
@@ -5456,10 +5855,10 @@ function SettingsView({
                         <button
                           type="button"
                           className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm font-semibold text-[#303849] hover:bg-[#f5f3ff]"
-                          onClick={() => openCreateAgentDialog()}
-                        >
-                          <Bot size={15} className="text-[#503ed4]" />
-                          Agent
+                        onClick={() => openCreateAgentDialog()}
+                      >
+                        <Bot size={15} className="text-[#503ed4]" />
+                        Agent
                         </button>
                         <button
                           type="button"
@@ -5481,9 +5880,40 @@ function SettingsView({
                   </div>
                 </div>
                 <div className="space-y-1.5">
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors",
+                      selectedAgentId === null
+                        ? "border-[#bdb7ff] bg-[#f6f4ff] shadow-sm"
+                        : "border-transparent bg-transparent hover:border-[#dfe3ec] hover:bg-white",
+                    )}
+                    onClick={showAgentRoster}
+                  >
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+                      <ListChecks size={15} />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-bold text-[#111827]">
+                        All Agents
+                      </span>
+                      <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                        {memberEntries.length} registered
+                      </span>
+                    </span>
+                  </button>
                   {memberEntries.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
-                      No agents configured.
+                      <div>No agents registered.</div>
+                      <Button
+                        size="sm"
+                        className="mt-3 rounded-lg"
+                        onClick={() => openCreateAgentDialog()}
+                        disabled={!canCreateAgentFromAnyHost}
+                      >
+                        <Plus size={14} />
+                        Create Agent
+                      </Button>
                     </div>
                   ) : (
                     memberEntries.map((entry) => (
@@ -5497,29 +5927,25 @@ function SettingsView({
                   )}
                 </div>
               </div>
+              )}
+              {activeSection === "services" && (
+                <div>
+                <div className="mb-2 flex items-center justify-between px-1">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                    Services
+                  </div>
+                  <span className="count-badge">0</span>
+                </div>
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
+                  No services registered.
+                </div>
+              </div>
+              )}
             </div>
           </aside>
 
           <div className="min-h-0 overflow-y-auto bg-white soft-scrollbar">
-            {selectedMemberEntry ? (
-              <AgentMemberDetail
-                entry={selectedMemberEntry}
-                busy={busy}
-                onUpdateAgent={onUpdateAgent}
-                onRemoveAgent={onRemoveAgent}
-              />
-            ) : selectedMachine ? (
-              <MachineCard
-                machine={selectedMachine}
-                busy={busy}
-                onOpenCreateAgent={openCreateAgentDialog}
-                onRemove={onRemoveMachine}
-                onOpenLocalPath={onOpenLocalPath}
-                onRemoveAgent={onRemoveAgent}
-              />
-            ) : (
-              <EmptyState icon={Server} text="No hosts reported." />
-            )}
+            {detailContent}
           </div>
         </div>
       </div>
@@ -5528,9 +5954,27 @@ function SettingsView({
           agentForm={agentForm}
           busy={busy}
           machine={createAgentMachine}
+          machines={machines}
           setAgentForm={setAgentForm}
+          onSelectMachine={selectCreateAgentMachine}
           onAddAgent={onAddAgent}
           onClose={() => setCreateAgentMachineId(null)}
+        />
+      )}
+      {providerAddOpen && (
+        <ProviderAddDialog
+          machines={machines}
+          preferredMachineId={selectedMachine?.id ?? null}
+          onCheckMachines={onCheckMachines}
+          onClose={() => setProviderAddOpen(false)}
+        />
+      )}
+      {hostRegisterOpen && (
+        <HostRegisterDialog
+          busy={busy}
+          onCreateMachine={onCreateMachine}
+          onCreated={hostRegistered}
+          onClose={() => setHostRegisterOpen(false)}
         />
       )}
     </section>
@@ -5559,6 +6003,170 @@ function SettingsSection({
       </div>
       {children}
     </section>
+  );
+}
+
+function RegisteredHostsEmpty({
+  busy,
+  onOpenRegisterHost,
+}: {
+  busy: string | null;
+  onOpenRegisterHost: () => void;
+}) {
+  return (
+    <div className="flex min-h-full items-center justify-center bg-white px-6 py-10">
+      <div className="w-full max-w-xl rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-6 text-center">
+        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-[#f1efff] text-[#503ed4]">
+          <Server size={22} />
+        </div>
+        <h2 className="mt-4 text-lg font-bold text-[#111827]">Register a Host</h2>
+        <p className="mt-2 text-sm leading-6 text-[#667085]">
+          Prepare a daemon registration for this space, then start the generated command so
+          the host can publish its runtime inventory.
+        </p>
+        <Button
+          className="mt-5 rounded-lg"
+          onClick={onOpenRegisterHost}
+          disabled={busy === "machine:create"}
+        >
+          {busy === "machine:create" ? (
+            <Loader2 className="animate-spin" size={15} />
+          ) : (
+            <Plus size={15} />
+          )}
+          Register Host
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function HostRegisterDialog({
+  busy,
+  onCreateMachine,
+  onCreated,
+  onClose,
+}: {
+  busy: string | null;
+  onCreateMachine: (args: {
+    name: string;
+    dataRoot?: string;
+  }) => Promise<MachineInfo | null> | MachineInfo | null;
+  onCreated: (machine: MachineInfo) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("Local Host");
+  const [dataRoot, setDataRoot] = useState("");
+  const creating = busy === "machine:create";
+  const canSubmit = Boolean(name.trim()) && !creating;
+
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape" && !creating) onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [creating, onClose]);
+
+  async function submitHost(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!canSubmit) return;
+    const machine = await onCreateMachine({
+      name,
+      dataRoot: dataRoot.trim() || undefined,
+    });
+    if (!machine) return;
+    onCreated(machine);
+    onClose();
+  }
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="host-register-title"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !creating) onClose();
+      }}
+    >
+      <form
+        className="flex w-full max-w-xl flex-col rounded-2xl border border-[#dfe3ec] bg-white shadow-[0_28px_80px_rgb(16_24_40_/_0.22)]"
+        onSubmit={submitHost}
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-4">
+          <div className="min-w-0">
+            <div
+              id="host-register-title"
+              className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]"
+            >
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
+                <Server size={15} />
+              </span>
+              Register Host
+            </div>
+            <div className="mt-2 text-sm text-[#667085]">
+              Create a daemon launch profile for the active space.
+            </div>
+          </div>
+          <button
+            type="button"
+            className="composer-icon h-8 min-w-8"
+            title="Close"
+            onClick={onClose}
+            disabled={creating}
+          >
+            <X size={15} />
+          </button>
+        </div>
+
+        <div className="space-y-4 p-5">
+          <label className="block">
+            <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+              Display Name
+            </span>
+            <Input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              className="mt-2"
+              placeholder="Local Host"
+              autoFocus
+            />
+          </label>
+          <label className="block">
+            <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+              Data Root
+            </span>
+            <Input
+              value={dataRoot}
+              onChange={(event) => setDataRoot(event.target.value)}
+              className="mt-2 font-mono text-xs"
+              placeholder="Use Loom default"
+            />
+            <span className="mt-2 block text-xs leading-5 text-[#667085]">
+              Leave empty unless this host should store agent profiles under a specific path.
+            </span>
+          </label>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-[#edf0f5] px-5 py-4">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={onClose}
+            disabled={creating}
+            className="rounded-lg border-[#dfe3ec] bg-white"
+          >
+            Cancel
+          </Button>
+          <Button type="submit" disabled={!canSubmit} className="rounded-lg">
+            {creating ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}
+            Prepare Host
+          </Button>
+        </div>
+      </form>
+    </div>,
+    document.body,
   );
 }
 
@@ -5639,20 +6247,16 @@ function MemberListItem({
 function MachineCard({
   machine,
   busy,
-  onOpenCreateAgent,
   onRemove,
   onOpenLocalPath,
-  onRemoveAgent,
 }: {
   machine: MachineInfo;
   busy: string | null;
-  onOpenCreateAgent: (machine: MachineInfo) => void;
   onRemove: (machineId: string) => void;
   onOpenLocalPath: (path: string) => void;
-  onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
-  const canCreateAgent = machineCanCreateAgent(machine);
   const canRemoveMachine = machine.capabilities.includes("machine.remove");
+  const isLocalRegistration = machine.source === "local_registration";
 
   return (
     <div className="min-h-full bg-white">
@@ -5746,32 +6350,120 @@ function MachineCard({
         </div>
       </HostDetailSection>
 
-      <HostDetailSection
-        title="Agents on this Host"
-        count={machine.agents.length}
-        action={
+      <HostDetailSection title="Actions">
+        {isLocalRegistration ? (
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+            <div className="min-w-0">
+              <div className="text-sm font-bold text-[#111827]">Start Host</div>
+              <div className="mt-1 text-sm text-[#667085]">
+                Run the serve command above, then refresh hosts after the daemon connects.
+              </div>
+            </div>
+            <Badge variant="warning">pending daemon</Badge>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+            <div className="min-w-0">
+              <div className="text-sm font-bold text-[#111827]">Delete Host</div>
+              <div className="mt-1 text-sm text-[#667085]">
+                Permanently remove this host after its agents are deleted.
+              </div>
+            </div>
+            {canRemoveMachine ? (
+              <Button
+                variant="destructive"
+                size="sm"
+                title="Remove host"
+                onClick={() => onRemove(machine.id)}
+                disabled={busy === `machine:remove:${machine.id}`}
+                className="rounded-lg"
+              >
+                <Trash2 size={15} />
+                Delete Host
+              </Button>
+            ) : (
+              <Badge variant="warning">managed by server</Badge>
+            )}
+          </div>
+        )}
+      </HostDetailSection>
+    </div>
+  );
+}
+
+function AgentRosterOverview({
+  machines,
+  entries,
+  busy,
+  onOpenCreateAgent,
+  onOpenProviderAdd,
+  onSelectAgent,
+  onRemoveAgent,
+}: {
+  machines: MachineInfo[];
+  entries: AgentMemberEntry[];
+  busy: string | null;
+  onOpenCreateAgent: (machine?: MachineInfo | null) => void;
+  onOpenProviderAdd: () => void;
+  onSelectAgent: (entry: AgentMemberEntry) => void;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+}) {
+  const providerGroups = providerAvailabilityGroups(machines);
+  const hostRows = machines.map((machine) => ({
+    machine,
+    canCreate: machineCanCreateAgent(machine) && machine.providers.length > 0,
+  }));
+  const canCreateAgent = hostRows.some((row) => row.canCreate);
+  const onlineAgents = entries.filter((entry) => entry.agent.status === "online").length;
+
+  return (
+    <div className="min-h-full bg-white">
+      <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <div className="flex flex-wrap items-start justify-between gap-6">
+          <div className="min-w-0">
+            <h2 className="text-xl font-bold text-[#111827]">Agents</h2>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+              <span>{entries.length} registered</span>
+              <span className="text-[#a0a6b3]">/</span>
+              <span>{onlineAgents} online</span>
+              <span className="text-[#a0a6b3]">/</span>
+              <span>{providerGroups.length} provider types</span>
+            </div>
+          </div>
           <Button
-            onClick={() => onOpenCreateAgent(machine)}
-            disabled={!canCreateAgent || machine.providers.length === 0}
+            onClick={() => onOpenCreateAgent()}
+            disabled={!canCreateAgent}
             className="rounded-lg"
           >
             <Plus size={15} />
             Create Agent
           </Button>
-        }
-      >
+        </div>
+      </section>
+
+      <HostDetailSection title="Agent Roster" count={entries.length}>
         <div className="space-y-2">
-          {machine.agents.length === 0 ? (
+          {entries.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-              No agents on this host.
+              <div>No agents registered.</div>
+              <Button
+                size="sm"
+                className="mt-3 rounded-lg"
+                onClick={() => onOpenCreateAgent()}
+                disabled={!canCreateAgent}
+              >
+                <Plus size={14} />
+                Create Agent
+              </Button>
             </div>
           ) : (
-            machine.agents.map((agent) => (
-              <HostAgentRow
-                key={agent.spec.actor.id}
-                agent={agent}
-                machine={machine}
+            entries.map((entry) => (
+              <AgentRosterRow
+                key={`${entry.machine.id}:${entry.agent.spec.actor.id}`}
+                entry={entry}
+                selected={false}
                 busy={busy}
+                onSelect={() => onSelectAgent(entry)}
                 onRemoveAgent={onRemoveAgent}
               />
             ))
@@ -5779,29 +6471,387 @@ function MachineCard({
         </div>
       </HostDetailSection>
 
-      <HostDetailSection title="Actions">
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
-          <div className="min-w-0">
-            <div className="text-sm font-bold text-[#111827]">Delete Host</div>
-            <div className="mt-1 text-sm text-[#667085]">
-              Permanently remove this host after its agents are deleted.
+      <HostDetailSection
+        title="Create Readiness"
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onOpenProviderAdd}
+            disabled={machines.length === 0}
+            className="h-8 rounded-lg border-[#dfe3ec] bg-white"
+          >
+            <Plus size={14} />
+            Add Provider
+          </Button>
+        }
+      >
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-white p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <div className="flex items-center gap-2">
+                <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                  Hosts
+                </div>
+                <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
+                  {hostRows.length}
+                </span>
+              </div>
+            </div>
+            <div className="grid gap-2">
+              {hostRows.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                  No registered hosts.
+                </div>
+              ) : (
+                hostRows.map(({ machine, canCreate }) => {
+                  const reason = !machineCanCreateAgent(machine)
+                    ? "read only"
+                    : machine.providers.length === 0
+                      ? "no runtime"
+                      : "ready";
+                  return (
+                    <button
+                      key={machine.id}
+                      type="button"
+                      className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-3 py-3 text-left transition-colors hover:border-[#c8c1ff] hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => onOpenCreateAgent(machine)}
+                      disabled={!canCreate}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "h-2 w-2 shrink-0 rounded-full",
+                            statusDotClass(machine.connectionStatus),
+                          )}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-sm font-bold text-[#111827]">
+                          {machine.name}
+                        </span>
+                        <Badge variant={canCreate ? "outline" : "warning"}>{reason}</Badge>
+                      </div>
+                      <div className="mt-2 truncate text-xs text-[#667085]">
+                        {machine.providers.length} providers / {machine.onlineAgentCount}/{machine.agentCount} online
+                      </div>
+                    </button>
+                  );
+                })
+              )}
             </div>
           </div>
-          {canRemoveMachine ? (
-            <Button
-              variant="destructive"
-              size="sm"
-              title="Remove host"
-              onClick={() => onRemove(machine.id)}
-              disabled={busy === `machine:remove:${machine.id}`}
-              className="rounded-lg"
-            >
-              <Trash2 size={15} />
-              Delete Host
-            </Button>
+
+          <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                Provider Availability
+              </div>
+              <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
+                {providerGroups.length}
+              </span>
+            </div>
+            <div className="max-h-60 space-y-2 overflow-y-auto soft-scrollbar">
+              {providerGroups.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-white p-3 text-sm text-[#667085]">
+                  No providers detected.
+                </div>
+              ) : (
+                providerGroups.map((group) => (
+                  <ProviderAvailabilityRow key={group.key} group={group} />
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      </HostDetailSection>
+    </div>
+  );
+}
+
+function AgentRosterRow({
+  entry,
+  selected,
+  busy,
+  onSelect,
+  onRemoveAgent,
+}: {
+  entry: AgentMemberEntry;
+  selected: boolean;
+  busy: string | null;
+  onSelect: () => void;
+  onRemoveAgent: (machineId: string, actorId: string) => void;
+}) {
+  const actor = entry.agent.spec.actor;
+  const provider = providerForAgent(entry.machine, entry.agent);
+
+  return (
+    <div
+      className={cn(
+        "grid min-h-[66px] grid-cols-[minmax(0,1fr)_auto] items-center gap-4 rounded-xl border px-4 py-3",
+        selected
+          ? "border-[#bdb7ff] bg-[#f6f4ff]"
+          : "border-[#edf0f5] bg-[#fbfbfd]",
+      )}
+    >
+      <button
+        type="button"
+        className="flex min-w-0 items-center gap-3 text-left"
+        onClick={onSelect}
+      >
+        <ActorAvatar actor={actor} fallback={actor.id} small />
+        <span className="min-w-0">
+          <span className="block truncate text-sm font-bold text-[#111827]">
+            {agentDisplayName(entry.agent)}
+          </span>
+          <span className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-[#667085]">
+            <span>{entry.machine.name}</span>
+            <span className="text-[#a0a6b3]">/</span>
+            <span>{provider?.name ?? entry.agent.spec.providerRef.id}</span>
+            <span className="text-[#a0a6b3]">/</span>
+            <span className="font-mono">{agentModelValue(entry.agent) || "default"}</span>
+          </span>
+        </span>
+      </button>
+      <div className="flex items-center gap-2">
+        <Badge variant={entry.agent.status === "online" ? "success" : "outline"}>
+          {entry.agent.status}
+        </Badge>
+        {!entry.machine.readOnly && (
+          <Button
+            variant="ghost"
+            size="icon"
+            title="Remove agent"
+            onClick={() => onRemoveAgent(entry.machine.id, actor.id)}
+            disabled={busy === `agent:remove:${actor.id}`}
+            className="rounded-lg"
+          >
+            <Trash2 size={15} />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProviderAvailabilityRow({ group }: { group: ProviderAvailabilityGroup }) {
+  const iconKey = agentProviderIconKey(group.id, group.name);
+  const hostNames = group.hosts.map(({ machine }) => machine.name);
+  const modelLabel =
+    group.defaultModels.length === 0
+      ? "default model"
+      : group.defaultModels.length === 1
+        ? group.defaultModels[0]
+        : `${group.defaultModels.length} model defaults`;
+
+  return (
+    <div className="grid min-h-[58px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border border-[#edf0f5] bg-white px-3 py-2.5">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+          {iconKey ? (
+            <AgentProviderIcon iconKey={iconKey} className="h-4 w-4" />
           ) : (
-            <Badge variant="warning">managed by server</Badge>
+            <Bot size={15} />
           )}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-bold text-[#111827]">
+            {group.name}
+          </div>
+          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-[#667085]">
+            <span className="min-w-0 truncate">{hostNames.join(", ")}</span>
+            <span className="shrink-0 text-[#a0a6b3]">/</span>
+            <span className="min-w-0 truncate font-mono">
+              {modelLabel}
+            </span>
+          </div>
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <Badge variant="outline">{group.hosts.length} hosts</Badge>
+        {group.actorCount > 0 && (
+          <Badge variant="secondary">{group.actorCount} agents</Badge>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProviderAddDialog({
+  machines,
+  preferredMachineId,
+  onCheckMachines,
+  onClose,
+}: {
+  machines: MachineInfo[];
+  preferredMachineId: string | null;
+  onCheckMachines: () => void;
+  onClose: () => void;
+}) {
+  const writableMachines = machines.filter(
+    (machine) =>
+      machine.canCommand &&
+      !machine.readOnly &&
+      machine.capabilities.includes("provider.add"),
+  );
+  const initialMachine =
+    writableMachines.find((machine) => machine.id === preferredMachineId) ??
+    writableMachines[0] ??
+    machines.find((machine) => machine.id === preferredMachineId) ??
+    machines[0];
+  const [machineId, setMachineId] = useState(initialMachine?.id ?? "");
+  const [manifestText, setManifestText] = useState(defaultProviderManifestText);
+  const [replace, setReplace] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selectedMachine = machines.find((machine) => machine.id === machineId);
+  const canSubmit =
+    Boolean(selectedMachine?.capabilities.includes("provider.add")) &&
+    Boolean(selectedMachine?.canCommand) &&
+    !selectedMachine?.readOnly &&
+    manifestText.trim().length > 0;
+
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  async function submitProvider(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedMachine || !canSubmit) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const parsed = JSON.parse(manifestText) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("manifest must be a JSON object");
+      }
+      await ipc.providerAdd({
+        machineId: selectedMachine.id,
+        manifest: parsed as Record<string, unknown>,
+        replace,
+      });
+      onCheckMachines();
+      onClose();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="provider-add-title"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <form
+        className="flex max-h-[min(760px,calc(100vh-48px))] w-full max-w-3xl flex-col rounded-2xl border border-[#dfe3ec] bg-white shadow-[0_28px_80px_rgb(16_24_40_/_0.22)]"
+        onSubmit={submitProvider}
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-4">
+          <div className="min-w-0">
+            <div
+              id="provider-add-title"
+              className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#596174]"
+            >
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
+                <Bot size={15} />
+              </span>
+              Add Provider
+            </div>
+            <div className="mt-2 text-sm text-[#667085]">
+              {selectedMachine?.name ?? "No host selected"}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="composer-icon h-8 min-w-8"
+            title="Close"
+            onClick={onClose}
+          >
+            <X size={15} />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
+          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+            <StyledSelect
+              value={machineId}
+              onChange={(event) => setMachineId(event.target.value)}
+            >
+              {machines.length === 0 ? (
+                <option value="">No registered hosts</option>
+              ) : (
+                machines.map((machine) => (
+                  <option key={machine.id} value={machine.id}>
+                    {machine.name}
+                  </option>
+                ))
+              )}
+            </StyledSelect>
+            <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+              <input
+                type="checkbox"
+                checked={replace}
+                onChange={(event) => setReplace(event.target.checked)}
+              />
+              Replace
+            </label>
+          </div>
+          <Textarea
+            value={manifestText}
+            onChange={(event) => setManifestText(event.target.value)}
+            className="mt-3 min-h-[360px] rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+            spellCheck={false}
+          />
+          {error && (
+            <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+              {error}
+            </div>
+          )}
+          {selectedMachine && !canSubmit && (
+            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+              This host cannot write provider manifests.
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
+          <div className="text-xs font-medium text-[#667085]">
+            {selectedMachine?.configDir || "No config directory"}
+          </div>
+          <Button
+            type="submit"
+            disabled={saving || !canSubmit}
+            className="rounded-lg"
+          >
+            {saving ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}
+            Add Provider
+          </Button>
+        </div>
+      </form>
+    </div>,
+    document.body,
+  );
+}
+
+function ServiceRosterOverview() {
+  return (
+    <div className="min-h-full bg-white">
+      <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <h2 className="text-xl font-bold text-[#111827]">Services</h2>
+        <div className="mt-2 text-sm text-[#667085]">0 registered</div>
+      </section>
+      <HostDetailSection title="Service Roster" count={0}>
+        <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+          No services registered.
         </div>
       </HostDetailSection>
     </div>
@@ -5814,40 +6864,61 @@ function AgentCreateDialog({
   agentForm,
   busy,
   machine,
+  machines,
   setAgentForm,
+  onSelectMachine,
   onAddAgent,
   onClose,
 }: {
   agentForm: AgentFormState;
   busy: string | null;
   machine: MachineInfo;
+  machines: MachineInfo[];
   setAgentForm: (form: AgentFormState) => void;
-  onAddAgent: () => Promise<boolean> | boolean;
+  onSelectMachine: (machineId: string) => void;
+  onAddAgent: (form: AgentFormState) => Promise<boolean> | boolean;
   onClose: () => void;
 }) {
-  const selectedProvider = resolveAgentProvider(agentForm, machine);
+  const [draft, setDraft] = useState<AgentFormState>(() =>
+    agentFormForMachine(agentForm, machine),
+  );
+  const selectedProvider = resolveAgentProvider(draft, machine);
   const modelChoices = selectedProvider?.modelChoices ?? [];
   const [customModelActive, setCustomModelActive] = useState(false);
   const canCreateAgent = machineCanCreateAgent(machine);
   const creating = busy === "agent:create";
   const agentReady = Boolean(
-    canCreateAgent && selectedProvider && agentForm.name.trim(),
+    canCreateAgent && selectedProvider && draft.name.trim(),
   );
-  const modelValue = agentForm.model || selectedProvider?.defaultModel || "";
+  const modelValue = draft.model || selectedProvider?.defaultModel || "";
   const modelIsKnown =
     !modelValue || modelChoices.some((choice) => choice.id === modelValue);
   const showCustomModel =
     modelChoices.length === 0 || customModelActive || !modelIsKnown;
   const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
+  const writableHosts = machines.filter(machineCanCreateAgent);
+  const readyHosts = machines.filter(
+    (item) => machineCanCreateAgent(item) && item.providers.length > 0,
+  );
   const createStatusText = !canCreateAgent
     ? "This host is read-only for the current account."
     : !selectedProvider
       ? "No runtime detected for this host."
       : `${selectedProvider.name} on ${machine.name}`;
+  const createStatusBadge = !canCreateAgent
+    ? "read only"
+    : selectedProvider
+      ? "ready"
+      : "no runtime";
 
   useEffect(() => {
+    setDraft((current) => agentFormForMachine(current, machine));
     setCustomModelActive(false);
-  }, [selectedProvider?.id]);
+  }, [machine.id]);
+
+  useEffect(() => {
+    setAgentForm(draft);
+  }, [draft, setAgentForm]);
 
   useEffect(() => {
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -5858,27 +6929,35 @@ function AgentCreateDialog({
   }, [onClose]);
 
   function updateAgentForm(patch: Partial<AgentFormState>) {
-    setAgentForm({
-      ...agentForm,
+    setDraft((current) => ({
+      ...current,
       machineId: machine.id,
-      providerId: selectedProvider?.id ?? agentForm.providerId,
+      providerId: selectedProvider?.id ?? current.providerId,
       ...patch,
-    });
+    }));
   }
 
   function selectProvider(provider: MachineAgentProviderInfo) {
     setCustomModelActive(false);
-    setAgentForm({
-      ...agentForm,
+    setDraft((current) => ({
+      ...current,
       machineId: machine.id,
       providerId: provider.id,
       model: provider.defaultModel || provider.modelChoices[0]?.id || "",
-    });
+    }));
+  }
+
+  function selectMachine(machineId: string) {
+    const nextMachine = machines.find((item) => item.id === machineId);
+    if (!nextMachine) return;
+    setDraft((current) => agentFormForMachine(current, nextMachine));
+    setCustomModelActive(false);
+    onSelectMachine(nextMachine.id);
   }
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const created = await onAddAgent();
+    const created = await onAddAgent(draft);
     if (created) onClose();
   }
 
@@ -5914,8 +6993,8 @@ function AgentCreateDialog({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Badge variant={canCreateAgent ? "outline" : "warning"}>
-              {canCreateAgent ? "available" : "read only"}
+            <Badge variant={canCreateAgent && selectedProvider ? "outline" : "warning"}>
+              {createStatusBadge}
             </Badge>
             <button
               type="button"
@@ -5930,6 +7009,60 @@ function AgentCreateDialog({
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5 soft-scrollbar">
           <div className="space-y-5">
+            <section>
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+                Host
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {machines.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                    Register a host before creating agents.
+                  </div>
+                ) : (
+                  machines.map((item) => {
+                    const selected = item.id === machine.id;
+                    const ready = machineCanCreateAgent(item) && item.providers.length > 0;
+                    const blockedReason = !machineCanCreateAgent(item)
+                      ? "Read only"
+                      : item.providers.length === 0
+                        ? "No runtime"
+                        : "";
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={cn(
+                          "flex min-h-[62px] items-center gap-3 rounded-xl border bg-white px-3 py-3 text-left transition-colors",
+                          selected
+                            ? "border-[#8f82ff] bg-[#f7f5ff] ring-2 ring-[#ece8ff]"
+                            : "border-[#e2e6ef] hover:border-[#c8c1ff]",
+                        )}
+                        onClick={() => selectMachine(item.id)}
+                      >
+                        <span
+                          className={cn(
+                            "h-2.5 w-2.5 shrink-0 rounded-full",
+                            statusDotClass(item.connectionStatus),
+                          )}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-bold text-[#111827]">
+                            {item.name}
+                          </span>
+                          <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                            {item.providers.length} runtimes / {item.onlineAgentCount}/{item.agentCount} online
+                          </span>
+                        </span>
+                        <Badge variant={ready ? "outline" : "warning"}>
+                          {ready ? "ready" : blockedReason}
+                        </Badge>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </section>
+
             <section>
               <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
                 Runtime
@@ -5981,14 +7114,14 @@ function AgentCreateDialog({
 
             <section className="grid gap-3 md:grid-cols-2">
               <Input
-                value={agentForm.name}
+                value={draft.name}
                 onChange={(event) => updateAgentForm({ name: event.target.value })}
                 placeholder="Agent name"
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                 disabled={!canCreateAgent}
               />
               <Input
-                value={agentForm.actorId}
+                value={draft.actorId}
                 onChange={(event) => updateAgentForm({ actorId: event.target.value })}
                 placeholder="Actor id (optional)"
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
@@ -5996,20 +7129,19 @@ function AgentCreateDialog({
               />
               <div className="space-y-2">
                 {modelChoices.length > 0 ? (
-                  <select
+                  <StyledSelect
                     value={modelSelectValue}
                     onChange={(event) => {
                       if (event.target.value === customModelOptionValue) {
                         setCustomModelActive(true);
                         updateAgentForm({
-                          model: modelIsKnown ? "" : agentForm.model,
+                          model: modelIsKnown ? "" : draft.model,
                         });
                         return;
                       }
                       setCustomModelActive(false);
                       updateAgentForm({ model: event.target.value });
                     }}
-                    className="h-10 w-full rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
                     disabled={!canCreateAgent}
                   >
                     <option value="">Default model</option>
@@ -6019,11 +7151,11 @@ function AgentCreateDialog({
                       </option>
                     ))}
                     <option value={customModelOptionValue}>Custom...</option>
-                  </select>
+                  </StyledSelect>
                 ) : null}
                 {showCustomModel && (
                   <Input
-                    value={agentForm.model}
+                    value={draft.model}
                     onChange={(event) => updateAgentForm({ model: event.target.value })}
                     placeholder="Custom model"
                     className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
@@ -6034,7 +7166,7 @@ function AgentCreateDialog({
               <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
                 <input
                   type="checkbox"
-                  checked={agentForm.autostart}
+                  checked={draft.autostart}
                   onChange={(event) =>
                     updateAgentForm({ autostart: event.target.checked })
                   }
@@ -6042,9 +7174,16 @@ function AgentCreateDialog({
                 />
                 Autostart
               </label>
-              <Textarea
-                value={agentForm.description}
+              <Input
+                value={draft.description}
                 onChange={(event) => updateAgentForm({ description: event.target.value })}
+                placeholder="Description"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
+                disabled={!canCreateAgent}
+              />
+              <Textarea
+                value={draft.instructions}
+                onChange={(event) => updateAgentForm({ instructions: event.target.value })}
                 placeholder="Agent instructions"
                 className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                 disabled={!canCreateAgent}
@@ -6055,7 +7194,7 @@ function AgentCreateDialog({
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
           <div className="text-xs font-medium text-[#667085]">
-            {createStatusText}
+            {readyHosts.length} ready hosts / {writableHosts.length} writable
           </div>
           <Button
             type="submit"
@@ -6079,19 +7218,24 @@ function AgentCreateDialog({
 function AgentMemberDetail({
   entry,
   busy,
+  onBack,
   onUpdateAgent,
   onRemoveAgent,
 }: {
   entry: AgentMemberEntry;
   busy: string | null;
+  onBack: () => void;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
   const { machine, agent } = entry;
   const actor = agent.spec.actor;
+  const agentDetailKey = `${machine.id}:${actor.id}`;
   const [draft, setDraft] = useState<AgentSettingsDraft>(() =>
     agentSettingsDraft(machine, agent),
   );
+  const [activeTab, setActiveTab] = useState<AgentDetailTab>("profile");
+  const handledAgentDetailKeyRef = useRef(agentDetailKey);
   const selectedProvider = providerForAgent(machine, agent, draft.providerId);
   const modelChoices =
     selectedProvider?.modelChoices.length
@@ -6100,10 +7244,25 @@ function AgentMemberDetail({
   const saving = busy === `agent:update:${actor.id}`;
   const removing = busy === `agent:remove:${actor.id}`;
   const canEdit = !machine.readOnly;
+  const detailTabs: Array<{
+    id: AgentDetailTab;
+    label: string;
+    icon: ComponentType<{ size?: string | number; className?: string }>;
+  }> = [
+    { id: "profile", label: "Profile", icon: Bot },
+    { id: "prompt", label: "Prompt Studio", icon: FileText },
+    { id: "settings", label: "Settings", icon: Settings },
+  ];
 
   useEffect(() => {
+    if (handledAgentDetailKeyRef.current === agentDetailKey) return;
+    handledAgentDetailKeyRef.current = agentDetailKey;
     setDraft(agentSettingsDraft(machine, agent));
-  }, [machine.id, agent]);
+  }, [agentDetailKey, machine, agent]);
+
+  useEffect(() => {
+    setActiveTab("profile");
+  }, [agentDetailKey]);
 
   function updateDraft(patch: Partial<AgentSettingsDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -6115,6 +7274,7 @@ function AgentMemberDetail({
       actorId: actor.id,
       displayName: draft.displayName,
       description: draft.description,
+      instructions: draft.instructions,
       providerId: draft.providerId || undefined,
       model: draft.model,
       reasoningEffort: draft.reasoningEffort,
@@ -6126,6 +7286,15 @@ function AgentMemberDetail({
   return (
     <div className="min-h-full bg-white">
       <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onBack}
+          className="mb-4 rounded-lg px-2 text-[#596174] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+        >
+          <ArrowLeft size={15} />
+          All Agents
+        </Button>
         <div className="flex flex-wrap items-start justify-between gap-6">
           <div className="flex min-w-0 items-start gap-4">
             <img
@@ -6163,162 +7332,203 @@ function AgentMemberDetail({
         </div>
       </section>
 
-      <HostDetailSection title="Profile">
-        <div className="grid gap-5 xl:grid-cols-[minmax(260px,0.42fr)_minmax(0,1fr)]">
-          <div className="min-w-0">
-            <div className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-              Avatar Library
-            </div>
-            <div className="grid max-h-64 grid-cols-[repeat(auto-fill,minmax(38px,1fr))] gap-2 overflow-y-auto rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3 soft-scrollbar">
-              {avatarLibraryUrls.map((url) => (
-                <button
-                  key={url}
-                  type="button"
-                  title={url.split("/").pop() ?? "Avatar"}
+      <div className="border-b border-[#dfe3ec] bg-[#fbfbfd] px-6 pt-4 lg:px-8">
+        <div className="flex flex-wrap gap-2">
+          {detailTabs.map((tab) => {
+            const Icon = tab.icon;
+            const selected = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                className={cn(
+                  "flex h-10 items-center gap-2 rounded-t-lg border border-b-0 px-3 text-sm font-semibold transition-colors",
+                  selected
+                    ? "border-[#dfe3ec] bg-white text-[#503ed4]"
+                    : "border-transparent text-[#596174] hover:border-[#dfe3ec] hover:bg-white",
+                )}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                <Icon size={15} />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {activeTab === "profile" && (
+        <>
+          <HostDetailSection title="Profile">
+            <div className="grid gap-5 xl:grid-cols-[minmax(260px,0.42fr)_minmax(0,1fr)]">
+              <div className="min-w-0">
+                <div className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+                  Avatar Library
+                </div>
+                <div className="grid max-h-64 grid-cols-[repeat(auto-fill,minmax(38px,1fr))] gap-2 overflow-y-auto rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3 soft-scrollbar">
+                  {avatarLibraryUrls.map((url) => (
+                    <button
+                      key={url}
+                      type="button"
+                      title={url.split("/").pop() ?? "Avatar"}
+                      disabled={!canEdit}
+                      className={cn(
+                        "flex aspect-square items-center justify-center rounded-lg border bg-white p-1 transition-colors",
+                        draft.avatarUrl === url
+                          ? "border-[#8f82ff] ring-2 ring-[#e4e0ff]"
+                          : "border-[#edf0f5] hover:border-[#c8c1ff]",
+                      )}
+                      onClick={() => updateDraft({ avatarUrl: url })}
+                    >
+                      <img alt="" src={url} className="h-full w-full rounded-md object-cover" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid content-start gap-3 md:grid-cols-2">
+                <Input
+                  value={draft.displayName}
+                  onChange={(event) => updateDraft({ displayName: event.target.value })}
+                  placeholder="Display name"
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                   disabled={!canEdit}
-                  className={cn(
-                    "flex aspect-square items-center justify-center rounded-lg border bg-white p-1 transition-colors",
-                    draft.avatarUrl === url
-                      ? "border-[#8f82ff] ring-2 ring-[#e4e0ff]"
-                      : "border-[#edf0f5] hover:border-[#c8c1ff]",
-                  )}
-                  onClick={() => updateDraft({ avatarUrl: url })}
+                />
+                <Input
+                  value={actor.id}
+                  readOnly
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-[#fbfbfd] font-mono text-xs shadow-none"
+                />
+                <Textarea
+                  value={draft.description}
+                  onChange={(event) => updateDraft({ description: event.target.value })}
+                  placeholder="Description"
+                  className="min-h-20 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
+                  disabled={!canEdit}
+                />
+                <Textarea
+                  value={draft.instructions}
+                  onChange={(event) => updateDraft({ instructions: event.target.value })}
+                  placeholder="Agent instructions"
+                  className="min-h-32 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
+                  disabled={!canEdit}
+                />
+              </div>
+            </div>
+          </HostDetailSection>
+
+          <HostDetailSection title="Runtime Configuration">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <StyledSelect
+                value={selectedProvider?.id ?? draft.providerId}
+                onChange={(event) => {
+                  const provider = machine.providers.find(
+                    (item) => item.id === event.target.value,
+                  );
+                  updateDraft({
+                    providerId: event.target.value,
+                    model: provider?.defaultModel ?? draft.model,
+                  });
+                }}
+                disabled={!canEdit || machine.providers.length === 0}
+              >
+                {machine.providers.length === 0 ? (
+                  <option value="">No runtimes</option>
+                ) : (
+                  machine.providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))
+                )}
+              </StyledSelect>
+              {modelChoices.length > 0 ? (
+                <StyledSelect
+                  value={draft.model}
+                  onChange={(event) => updateDraft({ model: event.target.value })}
+                  disabled={!canEdit}
                 >
-                  <img alt="" src={url} className="h-full w-full rounded-md object-cover" />
-                </button>
-              ))}
+                  {modelChoices.map((choice) => (
+                    <option key={choice.id} value={choice.id}>
+                      {choice.label || choice.id}
+                    </option>
+                  ))}
+                </StyledSelect>
+              ) : (
+                <Input
+                  value={draft.model}
+                  onChange={(event) => updateDraft({ model: event.target.value })}
+                  placeholder="Model"
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                  disabled={!canEdit}
+                />
+              )}
+              <StyledSelect
+                value={draft.reasoningEffort}
+                onChange={(event) => updateDraft({ reasoningEffort: event.target.value })}
+                disabled={!canEdit}
+              >
+                {reasoningEffortChoices.map((choice) => (
+                  <option key={choice || "default"} value={choice}>
+                    {choice ? capitalize(choice) : "Default reasoning"}
+                  </option>
+                ))}
+              </StyledSelect>
+              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+                <input
+                  type="checkbox"
+                  checked={draft.autostart}
+                  onChange={(event) => updateDraft({ autostart: event.target.checked })}
+                  disabled={!canEdit}
+                />
+                Autostart
+              </label>
             </div>
-          </div>
+          </HostDetailSection>
+        </>
+      )}
 
-          <div className="grid content-start gap-3 md:grid-cols-2">
-            <Input
-              value={draft.displayName}
-              onChange={(event) => updateDraft({ displayName: event.target.value })}
-              placeholder="Display name"
-              className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-              disabled={!canEdit}
-            />
-            <Input
-              value={actor.id}
-              readOnly
-              className="h-10 rounded-lg border-[#dfe3ec] bg-[#fbfbfd] font-mono text-xs shadow-none"
-            />
-            <Textarea
-              value={draft.description}
-              onChange={(event) => updateDraft({ description: event.target.value })}
-              placeholder="Agent instructions"
-              className="min-h-32 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
-              disabled={!canEdit}
-            />
-          </div>
-        </div>
-      </HostDetailSection>
+      {activeTab === "prompt" && (
+        <AgentPromptStudio machine={machine} agent={agent} canEdit={canEdit} />
+      )}
 
-      <HostDetailSection title="Runtime Configuration">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-          <select
-            value={selectedProvider?.id ?? draft.providerId}
-            onChange={(event) => {
-              const provider = machine.providers.find(
-                (item) => item.id === event.target.value,
-              );
-              updateDraft({
-                providerId: event.target.value,
-                model: provider?.defaultModel ?? draft.model,
-              });
-            }}
-            className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-            disabled={!canEdit || machine.providers.length === 0}
-          >
-            {machine.providers.length === 0 ? (
-              <option value="">No runtimes</option>
-            ) : (
-              machine.providers.map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.name}
-                </option>
-              ))
-            )}
-          </select>
-          {modelChoices.length > 0 ? (
-            <select
-              value={draft.model}
-              onChange={(event) => updateDraft({ model: event.target.value })}
-              className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-              disabled={!canEdit}
-            >
-              {modelChoices.map((choice) => (
-                <option key={choice.id} value={choice.id}>
-                  {choice.label || choice.id}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <Input
-              value={draft.model}
-              onChange={(event) => updateDraft({ model: event.target.value })}
-              placeholder="Model"
-              className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-              disabled={!canEdit}
-            />
-          )}
-          <select
-            value={draft.reasoningEffort}
-            onChange={(event) => updateDraft({ reasoningEffort: event.target.value })}
-            className="h-10 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm"
-            disabled={!canEdit}
-          >
-            {reasoningEffortChoices.map((choice) => (
-              <option key={choice || "default"} value={choice}>
-                {choice ? capitalize(choice) : "Default reasoning"}
-              </option>
-            ))}
-          </select>
-          <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
-            <input
-              type="checkbox"
-              checked={draft.autostart}
-              onChange={(event) => updateDraft({ autostart: event.target.checked })}
-              disabled={!canEdit}
-            />
-            Autostart
-          </label>
-        </div>
-      </HostDetailSection>
-
-      <HostDetailSection title="Info">
-        <div className="divide-y divide-[#edf0f5]">
-          <HostInfoRow label="Host">{machine.name}</HostInfoRow>
-          <HostInfoRow label="Actor ID" mono>{actor.id}</HostInfoRow>
-          <HostInfoRow label="Profile Path" mono>{agent.profilePath || "Not set"}</HostInfoRow>
-        </div>
-      </HostDetailSection>
-
-      <HostDetailSection title="Actions">
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
-          <div className="min-w-0">
-            <div className="text-sm font-bold text-[#111827]">Remove Agent</div>
-            <div className="mt-1 text-sm text-[#667085]">
-              Remove this member from {machine.name}.
+      {activeTab === "settings" && (
+        <>
+          <HostDetailSection title="Info">
+            <div className="divide-y divide-[#edf0f5]">
+              <HostInfoRow label="Host">{machine.name}</HostInfoRow>
+              <HostInfoRow label="Actor ID" mono>{actor.id}</HostInfoRow>
+              <HostInfoRow label="Profile Path" mono>{agent.profilePath || "Not set"}</HostInfoRow>
             </div>
-          </div>
-          {!machine.readOnly ? (
-            <Button
-              variant="destructive"
-              size="sm"
-              title="Remove agent"
-              onClick={() => onRemoveAgent(machine.id, actor.id)}
-              disabled={removing}
-              className="rounded-lg"
-            >
-              {removing ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
-              Remove Agent
-            </Button>
-          ) : (
-            <Badge variant="warning">read only</Badge>
-          )}
-        </div>
-      </HostDetailSection>
+          </HostDetailSection>
+
+          <HostDetailSection title="Actions">
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-sm font-bold text-[#111827]">Remove Agent</div>
+                <div className="mt-1 text-sm text-[#667085]">
+                  Remove this member from {machine.name}.
+                </div>
+              </div>
+              {!machine.readOnly ? (
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  title="Remove agent"
+                  onClick={() => onRemoveAgent(machine.id, actor.id)}
+                  disabled={removing}
+                  className="rounded-lg"
+                >
+                  {removing ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
+                  Remove Agent
+                </Button>
+              ) : (
+                <Badge variant="warning">read only</Badge>
+              )}
+            </div>
+          </HostDetailSection>
+        </>
+      )}
     </div>
   );
 }
@@ -6330,6 +7540,716 @@ function HostMetric({ label, value }: { label: string; value: number }) {
         {label}
       </div>
       <div className="mt-1 text-xl font-bold text-[#111827]">{value}</div>
+    </div>
+  );
+}
+
+function AgentPromptStudio({
+  machine,
+  agent,
+  canEdit,
+}: {
+  machine: MachineInfo;
+  agent: MachineInfo["agents"][number];
+  canEdit: boolean;
+}) {
+  const actorId = agent.spec.actor.id;
+  const promptStudioKey = `${machine.id}:${actorId}`;
+  const [sampleMessage, setSampleMessage] = useState(
+    "This is preview placeholder text. In a real request, this will be replaced by the actual handoff content.",
+  );
+  const [preview, setPreview] = useState<AgentPromptPreviewResult | null>(null);
+  const [files, setFiles] = useState<AgentFileEntry[]>([]);
+  const [filePath, setFilePath] = useState("");
+  const [fileContent, setFileContent] = useState("");
+  const [fileDirty, setFileDirty] = useState(false);
+  const [promptTemplates, setPromptTemplates] = useState<PromptTemplateDraft>(() =>
+    promptTemplatesFromAssembly(agent.spec.promptAssembly),
+  );
+  const [selectedVariableKey, setSelectedVariableKey] = useState("profile_prompt_files");
+  const [promptBusy, setPromptBusy] = useState<"files" | "read" | "write" | "preview" | null>(null);
+  const [assemblySaving, setAssemblySaving] = useState(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
+  const handledPromptStudioKeyRef = useRef(promptStudioKey);
+  const canPreview = machine.canCommand && machine.capabilities.includes("agent.prompt.preview");
+  const canReadFiles = machine.canCommand && machine.capabilities.includes("agent.file.read");
+  const canWriteFiles = canEdit && machine.capabilities.includes("agent.file.write");
+  const canSaveAssembly = canEdit && machine.capabilities.includes("agent.update");
+  const selectedFile = files.find((file) => file.path === filePath) ?? null;
+  const fileVariables = files.map((file) => ({
+    key: `file.${promptFileKey(file.path)}`,
+    label: file.path,
+  }));
+  const variableItems = [...promptVariableOptions, ...fileVariables];
+  const selectedVariable =
+    variableItems.find((item) => item.key === selectedVariableKey) ??
+    variableItems.find((item) => item.key === "profile_prompt_files") ??
+    variableItems[0] ??
+    null;
+  const selectedVariablePart =
+    selectedVariable && preview
+      ? preview.parts.find((part) => part.key === selectedVariable.key) ?? null
+      : null;
+
+  useEffect(() => {
+    if (handledPromptStudioKeyRef.current === promptStudioKey) return;
+    handledPromptStudioKeyRef.current = promptStudioKey;
+    setPreview(null);
+    setFiles([]);
+    setFilePath("");
+    setFileContent("");
+    setFileDirty(false);
+    setPromptTemplates(promptTemplatesFromAssembly(agent.spec.promptAssembly));
+    setSelectedVariableKey("profile_prompt_files");
+    setPromptError(null);
+  }, [promptStudioKey, agent.spec.promptAssembly]);
+
+  useEffect(() => {
+    if (!canReadFiles) return;
+    void refreshPromptFiles();
+  }, [machine.id, actorId, canReadFiles]);
+
+  function updatePromptTemplate(target: keyof PromptTemplateDraft, value: string) {
+    setPromptTemplates((current) => ({ ...current, [target]: value }));
+  }
+
+  function resetPromptTemplates() {
+    setPromptTemplates({
+      system: defaultSystemPromptTemplate,
+      user: defaultUserPromptTemplate,
+    });
+    setPreview(null);
+  }
+
+  function startNewPromptFile() {
+    setFilePath(defaultNewPromptFilePath);
+    setFileContent("");
+    setFileDirty(false);
+    setPromptError(null);
+  }
+
+  async function refreshPromptFiles() {
+    if (!canReadFiles) return;
+    setPromptBusy("files");
+    setPromptError(null);
+    try {
+      const result = await ipc.agentFileList({
+        machineId: machine.id,
+        actorId,
+        root: "profile",
+        prefix: "prompts",
+      });
+      setFiles(result.files);
+      if (filePath && !result.files.some((file) => file.path === filePath)) {
+        setFilePath("");
+        setFileContent("");
+        setFileDirty(false);
+      }
+    } catch (err) {
+      setPromptError(errorText(err));
+    } finally {
+      setPromptBusy(null);
+    }
+  }
+
+  async function openPromptFile(path = filePath) {
+    const nextPath = path.trim();
+    if (!nextPath || !canReadFiles) return;
+    setPromptBusy("read");
+    setPromptError(null);
+    try {
+      const result = await ipc.agentFileRead({
+        machineId: machine.id,
+        actorId,
+        root: "profile",
+        path: nextPath,
+      });
+      setFilePath(result.path);
+      setFileContent(result.content);
+      setFileDirty(false);
+    } catch (err) {
+      setFilePath(nextPath);
+      setFileContent("");
+      setFileDirty(false);
+      setPromptError(errorText(err));
+    } finally {
+      setPromptBusy(null);
+    }
+  }
+
+  async function savePromptFile() {
+    const nextPath = filePath.trim();
+    if (!nextPath || !canWriteFiles) return;
+    setPromptBusy("write");
+    setPromptError(null);
+    try {
+      await ipc.agentFileWrite({
+        machineId: machine.id,
+        actorId,
+        root: "profile",
+        path: nextPath,
+        content: fileContent,
+      });
+      setFilePath(nextPath);
+      setFileDirty(false);
+      await refreshPromptFiles();
+    } catch (err) {
+      setPromptError(errorText(err));
+    } finally {
+      setPromptBusy(null);
+    }
+  }
+
+  async function refreshPreview() {
+    if (!canPreview) return;
+    setPromptBusy("preview");
+    setPromptError(null);
+    try {
+      const promptAssembly = promptAssemblyFromTemplates(promptTemplates, files, {
+        includeAllFiles: true,
+      });
+      const result = await ipc.agentPromptPreview({
+        machineId: machine.id,
+        actorId,
+        sampleMessage,
+        promptAssembly,
+      });
+      setPreview(result);
+    } catch (err) {
+      setPromptError(errorText(err));
+    } finally {
+      setPromptBusy(null);
+    }
+  }
+
+  async function savePromptAssembly() {
+    if (!canSaveAssembly) return;
+    setAssemblySaving(true);
+    setPromptError(null);
+    try {
+      const promptAssembly = promptAssemblyFromTemplates(promptTemplates, files);
+      await ipc.agentUpdate({
+        machineId: machine.id,
+        actorId,
+        promptAssembly,
+      });
+    } catch (err) {
+      setPromptError(errorText(err));
+    } finally {
+      setAssemblySaving(false);
+    }
+  }
+
+  return (
+    <HostDetailSection
+      title="Prompt Studio"
+      action={
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={savePromptAssembly}
+            disabled={!canSaveAssembly || assemblySaving}
+            className="rounded-lg border-[#dfe3ec] bg-white"
+          >
+            {assemblySaving ? (
+              <Loader2 className="animate-spin" size={15} />
+            ) : (
+              <Check size={15} />
+            )}
+            Save Assembly
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-5">
+        <div className="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_360px]">
+          <section className="min-w-0 rounded-xl border border-[#edf0f5] bg-white p-4">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-bold text-[#111827]">Prompt Templates</div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={resetPromptTemplates}
+                disabled={!canSaveAssembly}
+                className="h-8 rounded-lg border-[#dfe3ec] bg-white"
+              >
+                Reset Default
+              </Button>
+            </div>
+            <div className="grid gap-3 xl:grid-cols-2">
+              <label className="block min-w-0">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                  System Prompt
+                </span>
+                <Textarea
+                  value={promptTemplates.system}
+                  onChange={(event) => updatePromptTemplate("system", event.target.value)}
+                  className="mt-2 min-h-56 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                  disabled={!canSaveAssembly}
+                />
+              </label>
+              <label className="block min-w-0">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                  User Prompt
+                </span>
+                <Textarea
+                  value={promptTemplates.user}
+                  onChange={(event) => updatePromptTemplate("user", event.target.value)}
+                  className="mt-2 min-h-56 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                  disabled={!canSaveAssembly}
+                />
+              </label>
+            </div>
+          </section>
+
+          <section className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-4">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="text-sm font-bold text-[#111827]">Variables</div>
+              <Badge variant={preview ? "secondary" : "outline"}>
+                {preview ? "preview" : "no preview"}
+              </Badge>
+            </div>
+            <div className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto pr-1 soft-scrollbar">
+              {variableItems.map((item) => {
+                const selected = selectedVariable?.key === item.key;
+                const part = preview?.parts.find((previewPart) => previewPart.key === item.key);
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    className={cn(
+                      "rounded-md border px-2 py-1 font-mono text-[11px] font-semibold transition-colors",
+                      selected
+                        ? "border-[#8f82ff] bg-white text-[#503ed4] ring-2 ring-[#e4e0ff]"
+                        : "border-[#dfe3ec] bg-white text-[#596174] hover:border-[#bdb7ff] hover:text-[#503ed4]",
+                    )}
+                    title={part ? `${item.label} / ${part.bytes} bytes` : item.label}
+                    onClick={() => setSelectedVariableKey(item.key)}
+                  >
+                    {`{${item.key}}`}
+                  </button>
+                );
+              })}
+            </div>
+            <PromptVariableInspector
+              variable={selectedVariable}
+              part={selectedVariablePart}
+              previewReady={Boolean(preview)}
+            />
+          </section>
+        </div>
+
+        <section className="rounded-xl border border-[#edf0f5] bg-white p-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm font-bold text-[#111827]">Profile Prompt Files</div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={refreshPromptFiles}
+                disabled={!canReadFiles || promptBusy === "files"}
+                className="rounded-lg border-[#dfe3ec] bg-white"
+              >
+                {promptBusy === "files" ? (
+                  <Loader2 className="animate-spin" size={15} />
+                ) : (
+                  <Folder size={15} />
+                )}
+                Refresh
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={startNewPromptFile}
+                disabled={!canWriteFiles}
+                className="rounded-lg border-[#dfe3ec] bg-white"
+              >
+                <Plus size={15} />
+                New
+              </Button>
+            </div>
+          </div>
+          <div className="grid gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
+            <div className="min-w-0">
+              {files.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-3 py-4 text-sm text-[#667085]">
+                  No prompt files in this profile.
+                </div>
+              ) : (
+                <div className="max-h-72 space-y-1 overflow-y-auto rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-2 soft-scrollbar">
+                  {files.map((file) => (
+                    <button
+                      key={file.path}
+                      type="button"
+                      className={cn(
+                        "grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors",
+                        filePath === file.path
+                          ? "bg-white text-[#503ed4] shadow-sm"
+                          : "text-[#596174] hover:bg-white",
+                      )}
+                      onClick={() => {
+                        setFilePath(file.path);
+                        void openPromptFile(file.path);
+                      }}
+                    >
+                      <span className="truncate font-mono">{file.path}</span>
+                      <span className="text-[#9aa1ae]">{file.bytes}b</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="min-w-0 space-y-3">
+              <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+                <Input
+                  value={filePath}
+                  onChange={(event) => setFilePath(event.target.value)}
+                  placeholder="prompts/example.md"
+                  className="h-9 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                  disabled={!canReadFiles && !canWriteFiles}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void openPromptFile()}
+                  disabled={!canReadFiles || promptBusy === "read" || !filePath.trim()}
+                  className="rounded-lg border-[#dfe3ec] bg-white"
+                >
+                  {promptBusy === "read" ? (
+                    <Loader2 className="animate-spin" size={15} />
+                  ) : (
+                    <FileText size={15} />
+                  )}
+                  Open
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={savePromptFile}
+                  disabled={!canWriteFiles || promptBusy === "write" || !filePath.trim() || !fileDirty}
+                  className="rounded-lg"
+                >
+                  {promptBusy === "write" ? (
+                    <Loader2 className="animate-spin" size={15} />
+                  ) : (
+                    <Check size={15} />
+                  )}
+                  Save
+                </Button>
+              </div>
+              <div className="min-w-0 truncate text-xs text-[#667085]">
+                {selectedFile ? `${selectedFile.bytes} bytes` : filePath ? "New file" : "No file selected"}
+              </div>
+              <Textarea
+                value={fileContent}
+                onChange={(event) => {
+                  setFileContent(event.target.value);
+                  setFileDirty(true);
+                }}
+                placeholder="Prompt file content"
+                className="min-h-64 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                disabled={!canReadFiles && !canWriteFiles}
+                readOnly={!canWriteFiles}
+              />
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-[#edf0f5] bg-white p-4">
+          <div className="mb-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+            <label className="block min-w-0">
+              <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                Preview Message
+              </span>
+              <Textarea
+                value={sampleMessage}
+                onChange={(event) => setSampleMessage(event.target.value)}
+                placeholder="Preview-only text. Real requests replace this with the actual handoff."
+                className="mt-2 min-h-20 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canPreview}
+              />
+            </label>
+            <div className="flex items-end">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={refreshPreview}
+                disabled={!canPreview || promptBusy === "preview"}
+                className="rounded-lg border-[#dfe3ec] bg-white"
+              >
+                {promptBusy === "preview" ? (
+                  <Loader2 className="animate-spin" size={15} />
+                ) : (
+                  <RefreshCw size={15} />
+                )}
+                Preview
+              </Button>
+            </div>
+          </div>
+          {promptError && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+              {promptError}
+            </div>
+          )}
+          {!canPreview && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+              Prompt preview is not available on this host.
+            </div>
+          )}
+          {preview && (
+            <>
+              <div className="grid gap-3 xl:grid-cols-3">
+                <PromptOutputPreview title="System" content={preview.outputs.system} />
+                <PromptOutputPreview title="User" content={preview.outputs.user} />
+                <PromptOutputPreview title="Full" content={preview.outputs.full} />
+              </div>
+              <details className="rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2">
+                <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-[#667085]">
+                  Provider Binding
+                </summary>
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-2 font-mono text-xs text-[#485063] soft-scrollbar">
+                  {JSON.stringify(preview.bindings, null, 2)}
+                </pre>
+              </details>
+              {preview.warnings.length > 0 && (
+                <div className="whitespace-pre-line rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+                  {preview.warnings.join("\n")}
+                </div>
+              )}
+            </>
+          )}
+        </section>
+      </div>
+    </HostDetailSection>
+  );
+}
+
+function promptTemplatesFromAssembly(
+  assembly?: Record<string, unknown> | null,
+): PromptTemplateDraft {
+  if (!assembly || isLegacyDefaultPromptAssembly(assembly)) {
+    return {
+      system: defaultSystemPromptTemplate,
+      user: defaultUserPromptTemplate,
+    };
+  }
+  const outputs = objectRecord(assembly.outputs);
+  return {
+    system: promptOutputTemplate(outputs?.system, defaultSystemPromptTemplate),
+    user: promptOutputTemplate(outputs?.user, defaultUserPromptTemplate),
+  };
+}
+
+function promptOutputTemplate(value: unknown, fallback: string): string {
+  const output = objectRecord(value);
+  if (!output) return fallback;
+  if (typeof output.template === "string") return output.template;
+  const include = stringArray(output.include);
+  if (include.length > 0) {
+    return include.map((key) => `{${key}}`).join("\n\n");
+  }
+  const preset = typeof output.preset === "string" ? output.preset : "";
+  const presetParts = promptPresetParts[preset];
+  if (presetParts) {
+    return presetParts.map((key) => `{${key}}`).join("\n\n");
+  }
+  return fallback;
+}
+
+function promptAssemblyFromTemplates(
+  templates: PromptTemplateDraft,
+  files: AgentFileEntry[],
+  options: PromptAssemblyBuildOptions = {},
+): Record<string, unknown> {
+  const referencedFileKeys = promptTemplateVariables(`${templates.system}\n${templates.user}`)
+    .filter((key) => key.startsWith("file."))
+    .map((key) => key.slice("file.".length));
+  const fileSpecs = files
+    .filter(
+      (file) =>
+        options.includeAllFiles || referencedFileKeys.includes(promptFileKey(file.path)),
+    )
+    .map((file) => ({
+      key: promptFileKey(file.path),
+      title: promptFileTitle(file.path),
+      root: "profile",
+      path: file.path,
+      optional: true,
+    }));
+  return {
+    ...(fileSpecs.length > 0 ? { files: fileSpecs } : {}),
+    outputs: {
+      system: {
+        template: templates.system.trim() || defaultSystemPromptTemplate,
+      },
+      user: {
+        template: templates.user.trim() || defaultUserPromptTemplate,
+      },
+      full: {
+        include: ["prompt.system", "prompt.user"],
+      },
+    },
+  };
+}
+
+function promptTemplateVariables(template: string) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const match of template.matchAll(/\{([^{}]+)\}/g)) {
+    const key = match[1]?.trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
+function isLegacyDefaultPromptAssembly(assembly: Record<string, unknown>) {
+  const files = Array.isArray(assembly.files) ? assembly.files : [];
+  const hasLegacySystemFile = files.some((file) => {
+    const item = objectRecord(file);
+    return item?.key === "profile_system" && item.path === "prompts/system.md";
+  });
+  const hasLegacyUserFile = files.some((file) => {
+    const item = objectRecord(file);
+    return item?.key === "profile_user" && item.path === "prompts/user.md";
+  });
+  if (!hasLegacySystemFile || !hasLegacyUserFile) return false;
+
+  const outputs = objectRecord(assembly.outputs);
+  const system = objectRecord(outputs?.system);
+  const user = objectRecord(outputs?.user);
+  return (
+    stringArray(system?.include).includes("file.profile_system") &&
+    stringArray(user?.include).includes("file.profile_user")
+  );
+}
+
+function promptFileKey(path: string) {
+  const normalized = path
+    .trim()
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .join(".")
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[_ .-]+|[_ .-]+$/g, "");
+  return normalized || "profile_prompt";
+}
+
+function promptFileTitle(path: string) {
+  return path
+    .trim()
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .pop() || path;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function PromptOutputPreview({
+  title,
+  content,
+}: {
+  title: string;
+  content: string;
+}) {
+  return (
+    <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3">
+      <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
+        {title}
+      </div>
+      <pre className="max-h-56 min-h-32 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-white p-3 font-mono text-xs leading-5 text-[#303849] soft-scrollbar">
+        {content || "-"}
+      </pre>
+    </div>
+  );
+}
+
+function PromptVariableInspector({
+  variable,
+  part,
+  previewReady,
+}: {
+  variable: { key: string; label: string } | null;
+  part: AgentPromptPreviewPart | null;
+  previewReady: boolean;
+}) {
+  if (!variable) {
+    return (
+      <div className="mt-3 rounded-lg border border-dashed border-[#dfe3ec] bg-white p-3 text-sm text-[#667085]">
+        No variable selected.
+      </div>
+    );
+  }
+  const content = part?.content ?? "";
+  const meta = !previewReady
+    ? "preview required"
+    : part
+      ? `${part.source} / ${part.bytes}b`
+      : "not rendered";
+  const body = !previewReady
+    ? "Run Preview to inspect this variable."
+    : part
+      ? content || "empty"
+      : "Run Preview again to include the latest profile prompt files.";
+
+  return (
+    <div className="mt-3 rounded-lg border border-[#dfe3ec] bg-white">
+      <div className="flex min-h-10 flex-wrap items-center justify-between gap-2 border-b border-[#edf0f5] px-3 py-2">
+        <div className="min-w-0">
+          <div className="truncate font-mono text-xs font-bold text-[#111827]">
+            {`{${variable.key}}`}
+          </div>
+          <div className="mt-0.5 truncate text-[11px] font-medium text-[#667085]">
+            {variable.label}
+          </div>
+        </div>
+        <span className="rounded-md bg-[#f2f4f7] px-2 py-1 font-mono text-[11px] font-semibold text-[#667085]">
+          {meta}
+        </span>
+      </div>
+      <pre className="max-h-64 min-h-36 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-xs leading-5 text-[#303849] soft-scrollbar">
+        {body}
+      </pre>
+    </div>
+  );
+}
+
+function StyledSelect({
+  className,
+  disabled,
+  children,
+  ...props
+}: SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <div className={cn("relative min-w-0", disabled && "opacity-75")}>
+      <select
+        {...props}
+        disabled={disabled}
+        className={cn(
+          "h-10 w-full appearance-none rounded-lg border border-[#dfe3ec] bg-white px-3 pr-9 text-sm font-medium text-[#303849] shadow-none outline-none transition-colors",
+          "hover:border-[#c8c1ff] focus:border-[#8f82ff] focus:ring-2 focus:ring-[#ece8ff]",
+          "disabled:cursor-not-allowed disabled:bg-[#f6f7fb] disabled:text-[#9aa1ae]",
+          className,
+        )}
+      >
+        {children}
+      </select>
+      <ChevronDown
+        size={15}
+        className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[#667085]"
+      />
     </div>
   );
 }
@@ -6397,57 +8317,6 @@ function HostInfoRow({
         )}
       >
         {children}
-      </div>
-    </div>
-  );
-}
-
-function HostAgentRow({
-  agent,
-  machine,
-  busy,
-  onRemoveAgent,
-}: {
-  agent: MachineInfo["agents"][number];
-  machine: MachineInfo;
-  busy: string | null;
-  onRemoveAgent: (machineId: string, actorId: string) => void;
-}) {
-  const actor = agent.spec.actor;
-
-  return (
-    <div className="grid min-h-[62px] grid-cols-[minmax(0,1fr)_auto] items-center gap-4 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-4 py-3">
-      <div className="flex min-w-0 items-center gap-3">
-        <ActorAvatar actor={actor} fallback={actor.id} small />
-        <div className="min-w-0">
-          <div className="truncate text-sm font-bold text-[#111827]">
-            {actor.displayName || actor.id}
-          </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-[#667085]">
-            <span className="font-mono">
-              {agentModelValue(agent) || shortActorAlias(actor.id)}
-            </span>
-            <span className="text-[#a0a6b3]">/</span>
-            <span>{agent.spec.autostart ? "autostart" : "manual"}</span>
-          </div>
-        </div>
-      </div>
-      <div className="flex items-center gap-3">
-        <Badge variant={agent.status === "online" ? "success" : "outline"}>
-          {agent.status}
-        </Badge>
-        {!machine.readOnly && (
-          <Button
-            variant="ghost"
-            size="icon"
-            title="Remove agent"
-            onClick={() => onRemoveAgent(machine.id, actor.id)}
-            disabled={busy === `agent:remove:${actor.id}`}
-            className="rounded-lg"
-          >
-            <Trash2 size={15} />
-          </Button>
-        )}
       </div>
     </div>
   );
@@ -7101,6 +8970,36 @@ function EmptyState({
   );
 }
 
+function NoSpaceConnectionGuide({
+  onUseLocalServer,
+}: {
+  onUseLocalServer: () => void;
+}) {
+  return (
+    <div className="mt-4 space-y-3">
+      <div className="rounded-lg border border-[#dfe3ec] bg-white px-3 py-2 text-left">
+        <div className="text-xs font-semibold uppercase tracking-wide text-[#667085]">
+          Make a machine the server
+        </div>
+        <div className="mt-1 text-xs font-medium text-[#667085]">
+          Run this on the machine that should host Loom.
+        </div>
+        <code className="mt-1 block truncate font-mono text-xs font-semibold text-[#303849]">
+          {localServerCommand}
+        </code>
+      </div>
+      <Button
+        size="sm"
+        onClick={onUseLocalServer}
+        className="rounded-lg"
+      >
+        <Server size={14} />
+        Prepare Space Connection
+      </Button>
+    </div>
+  );
+}
+
 function MutedLine({ children }: { children: ReactNode }) {
   return <div className="text-sm text-muted-foreground">{children}</div>;
 }
@@ -7590,6 +9489,40 @@ function agentMemberEntries(machines: MachineInfo[]): AgentMemberEntry[] {
   );
 }
 
+function providerAvailabilityGroups(machines: MachineInfo[]): ProviderAvailabilityGroup[] {
+  const groups = new Map<string, ProviderAvailabilityGroup>();
+  for (const machine of machines) {
+    for (const provider of machine.providers) {
+      const key = `${provider.id}:${provider.transportKind}`;
+      const current =
+        groups.get(key) ??
+        {
+          key,
+          id: provider.id,
+          name: provider.name || provider.id,
+          transportKind: provider.transportKind,
+          actorCount: 0,
+          defaultModels: [],
+          hosts: [],
+        };
+      current.actorCount += provider.actorCount;
+      if (
+        provider.defaultModel &&
+        !current.defaultModels.includes(provider.defaultModel)
+      ) {
+        current.defaultModels.push(provider.defaultModel);
+      }
+      current.hosts.push({ machine, provider });
+      groups.set(key, current);
+    }
+  }
+  return Array.from(groups.values()).sort((a, b) =>
+    a.name.localeCompare(b.name) ||
+    a.transportKind.localeCompare(b.transportKind) ||
+    a.id.localeCompare(b.id),
+  );
+}
+
 function agentDisplayName(agent: MachineInfo["agents"][number]) {
   return displayName(agent.spec.actor);
 }
@@ -7599,9 +9532,12 @@ function agentModelValue(agent: MachineInfo["agents"][number]) {
 }
 
 function agentDescriptionValue(agent: MachineInfo["agents"][number]) {
-  if (agent.spec.instructions) return agent.spec.instructions;
   const value = agent.spec.actor._meta?.description;
   return typeof value === "string" ? value : "";
+}
+
+function agentInstructionsValue(agent: MachineInfo["agents"][number]) {
+  return agent.spec.instructions ?? "";
 }
 
 function agentReasoningEffort(agent: MachineInfo["agents"][number]) {
@@ -7649,6 +9585,7 @@ function agentSettingsDraft(
   return {
     displayName: agentDisplayName(agent),
     description: agentDescriptionValue(agent),
+    instructions: agentInstructionsValue(agent),
     providerId: providerId ?? provider?.id ?? "",
     model: agentModelValue(agent) || provider?.defaultModel || "",
     reasoningEffort: agentReasoningEffort(agent),

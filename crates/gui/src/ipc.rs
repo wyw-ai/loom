@@ -912,6 +912,10 @@ pub struct AgentCreateArgs {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub prompt_assembly: Option<Value>,
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub reasoning_effort: String,
@@ -980,6 +984,8 @@ pub struct AgentUpdateArgs {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -989,6 +995,8 @@ pub struct AgentUpdateArgs {
     pub autostart: Option<bool>,
     #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub prompt_assembly: Option<Value>,
 }
 
 #[tauri::command]
@@ -1027,25 +1035,228 @@ pub async fn agent_update(
             .id
     };
     let actor_id = args.actor_id.clone();
-    let output = run_remote_machine_command(
-        &state,
-        &cfg,
-        &target_machine_id,
-        json!({
-            "op": "agent.update",
-            "actorId": actor_id,
-            "displayName": args.display_name,
-            "description": args.description,
-            "providerId": args.provider_id,
-            "model": args.model,
-            "reasoningEffort": args.reasoning_effort,
-            "autostart": args.autostart,
-            "avatarUrl": args.avatar_url,
-        }),
-    )
-    .await?;
+    let mut command = json!({
+        "op": "agent.update",
+        "actorId": actor_id,
+        "displayName": args.display_name,
+        "description": args.description,
+        "instructions": args.instructions,
+        "providerId": args.provider_id,
+        "model": args.model,
+        "reasoningEffort": args.reasoning_effort,
+        "autostart": args.autostart,
+        "avatarUrl": args.avatar_url,
+    });
+    if let Some(prompt_assembly) = args.prompt_assembly {
+        command["promptAssembly"] = prompt_assembly;
+    }
+    let output = run_remote_machine_command(&state, &cfg, &target_machine_id, command).await?;
     agent_info_from_machine_command_output(output)
         .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPromptPreviewArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<Value>,
+    #[serde(default)]
+    pub sample_message: Option<String>,
+    #[serde(default)]
+    pub prompt_assembly: Option<Value>,
+}
+
+#[tauri::command]
+pub async fn agent_prompt_preview(
+    state: State<'_, AppState>,
+    args: AgentPromptPreviewArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    let mut command = json!({
+        "op": "agent.prompt.preview",
+        "actorId": args.actor_id,
+        "channelId": args.channel_id,
+        "scope": args.scope,
+        "sampleMessage": args.sample_message,
+    });
+    if let Some(prompt_assembly) = args.prompt_assembly {
+        command["promptAssembly"] = prompt_assembly;
+    }
+    run_remote_machine_command(&state, &cfg, &args.machine_id, command).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFileListArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub root: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<Value>,
+}
+
+#[tauri::command]
+pub async fn agent_file_list(
+    state: State<'_, AppState>,
+    args: AgentFileListArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &args.machine_id,
+        json!({
+            "op": "agent.file.list",
+            "actorId": args.actor_id,
+            "root": args.root,
+            "prefix": args.prefix,
+            "channelId": args.channel_id,
+            "scope": args.scope,
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFileReadArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub root: String,
+    pub path: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<Value>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn agent_file_read(
+    state: State<'_, AppState>,
+    args: AgentFileReadArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &args.machine_id,
+        json!({
+            "op": "agent.file.read",
+            "actorId": args.actor_id,
+            "root": args.root,
+            "path": args.path,
+            "channelId": args.channel_id,
+            "scope": args.scope,
+            "maxBytes": args.max_bytes,
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFileWriteArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub root: String,
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<Value>,
+}
+
+#[tauri::command]
+pub async fn agent_file_write(
+    state: State<'_, AppState>,
+    args: AgentFileWriteArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &args.machine_id,
+        json!({
+            "op": "agent.file.write",
+            "actorId": args.actor_id,
+            "root": args.root,
+            "path": args.path,
+            "content": args.content,
+            "channelId": args.channel_id,
+            "scope": args.scope,
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAddArgs {
+    pub machine_id: String,
+    pub manifest: Value,
+    #[serde(default)]
+    pub replace: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn provider_add(
+    state: State<'_, AppState>,
+    args: ProviderAddArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &args.machine_id,
+        json!({
+            "op": "provider.add",
+            "manifest": args.manifest,
+            "replace": args.replace.unwrap_or(false),
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRemoveArgs {
+    pub machine_id: String,
+    pub provider_id: String,
+}
+
+#[tauri::command]
+pub async fn provider_remove(
+    state: State<'_, AppState>,
+    args: ProviderRemoveArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &args.machine_id,
+        json!({
+            "op": "provider.remove",
+            "providerId": args.provider_id,
+        }),
+    )
+    .await
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1144,14 +1355,26 @@ pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MachineCreateArgs {}
+pub struct MachineCreateArgs {
+    pub name: String,
+    #[serde(default)]
+    pub data_root: Option<String>,
+}
 
 #[tauri::command]
 pub async fn machine_create(
-    _state: State<'_, AppState>,
-    _args: MachineCreateArgs,
+    state: State<'_, AppState>,
+    args: MachineCreateArgs,
 ) -> Result<MachineListResult, String> {
-    Err("hosts are daemon-owned; start loom-daemon and let it publish inventory to the connected server".into())
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err("host name is required".into());
+    }
+    let machine = pending_machine_registration(&cfg, name, args.data_root)?;
+    let mut result = machines_from_config(&cfg, state.try_client().await).await?;
+    upsert_server_machine_info(&mut result.machines, machine);
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -1204,6 +1427,8 @@ pub async fn machine_agent_create(
                 "actorId": actor_id,
                 "name": name,
                 "description": args.description,
+                "instructions": args.instructions,
+                "promptAssembly": args.prompt_assembly,
                 "model": args.model,
                 "reasoningEffort": args.reasoning_effort,
                 "autostart": args.autostart,
@@ -1253,6 +1478,25 @@ pub async fn machine_agent_remove(
         "machine `{}` is not present in daemon inventory; start the daemon before removing agents",
         args.machine_id
     ))
+}
+
+async fn ensure_server_machine_present(
+    cfg: &DesktopConfig,
+    state: &State<'_, AppState>,
+    machine_id: &str,
+) -> Result<(), String> {
+    let machine_id = machine_id.trim();
+    if machine_id.is_empty() {
+        return Err("machine id is required".into());
+    }
+    server_machine_by_id(cfg, state.try_client().await, machine_id)
+        .await
+        .map(|_| ())
+        .ok_or_else(|| {
+            format!(
+                "machine `{machine_id}` is not present in daemon inventory; start the daemon before managing agents"
+            )
+        })
 }
 
 async fn delete_actors_from_server(client: Option<Arc<Client>>, actor_ids: &[String]) {
@@ -1488,7 +1732,12 @@ async fn run_remote_machine_command(
 fn is_mutating_machine_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "agent.create" | "agent.update" | "agent.remove" | "provider.add" | "provider.remove"
+        "agent.create"
+            | "agent.update"
+            | "agent.remove"
+            | "agent.file.write"
+            | "provider.add"
+            | "provider.remove"
     )
 }
 
@@ -1645,6 +1894,76 @@ fn active_server_url(cfg: &DesktopConfig) -> &str {
         .unwrap_or("ws://127.0.0.1:7878/rpc")
 }
 
+fn pending_machine_registration(
+    cfg: &DesktopConfig,
+    name: &str,
+    data_root: Option<String>,
+) -> Result<MachineInfo, String> {
+    const MACHINE_ID_SUFFIX_LEN: usize = 8;
+    const MAX_MACHINE_ID_LEN: usize = 64;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let slug = slugify(name);
+    let slug = if slug == "agent" { "host".into() } else { slug };
+    let max_slug_len = MAX_MACHINE_ID_LEN - "machine_".len() - 1 - MACHINE_ID_SUFFIX_LEN;
+    let machine_id = format!(
+        "machine_{}_{}",
+        truncate_slug(&slug, max_slug_len),
+        &suffix[..MACHINE_ID_SUFFIX_LEN],
+    );
+    let data_root = data_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| normalize_local_path(config::expand_home(value)).map_err(stringify))
+        .transpose()?
+        .unwrap_or_else(|| default_machine_data_root(&machine_id));
+    let config_dir = config::config_dir()
+        .join("daemon-configs")
+        .join(&machine_id);
+    std::fs::create_dir_all(&data_root)
+        .map_err(|e| format!("create data root {}: {e}", data_root.display()))?;
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| format!("create config directory {}: {e}", config_dir.display()))?;
+    let server_url = active_server_url(cfg);
+    let (serve_command, setup_script) =
+        daemon_start_commands(&data_root, Some(&config_dir), server_url, &machine_id, name);
+
+    Ok(MachineInfo {
+        workspace_id: config::active_workspace_id(cfg).map(str::to_string),
+        owner_actor_id: cfg.account.as_ref().map(|account| account.actor_id.clone()),
+        id: machine_id,
+        name: name.to_string(),
+        kind: "local".into(),
+        source: "local_registration".into(),
+        read_only: true,
+        can_command: false,
+        can_open_local_path: true,
+        capabilities: vec!["machine.register".into()],
+        inventory_revision: 0,
+        inventory_observed_at: None,
+        status: "pending".into(),
+        setup_status: "pending".into(),
+        connection_status: "notConnected".into(),
+        connection_actor_id: String::new(),
+        data_root: data_root.display().to_string(),
+        config_dir: config_dir.display().to_string(),
+        agent_count: 0,
+        online_agent_count: 0,
+        providers: Vec::new(),
+        agents: Vec::new(),
+        serve_command,
+        setup_script,
+    })
+}
+
+fn default_machine_data_root(machine_id: &str) -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(config::config_dir)
+        .join("loom")
+        .join("hosts")
+        .join(machine_id)
+}
+
 async fn apply_connection_status(result: &mut MachineListResult, client: Option<Arc<Client>>) {
     let Some(client) = client else {
         for machine in &mut result.machines {
@@ -1664,6 +1983,7 @@ async fn apply_connection_status(result: &mut MachineListResult, client: Option<
                     .map(|agent| agent.info.spec.actor.id.clone()),
             )
         })
+        .filter(|actor_id| !actor_id.is_empty())
         .collect();
     if actor_ids.is_empty() {
         for machine in &mut result.machines {

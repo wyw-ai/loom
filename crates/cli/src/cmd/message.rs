@@ -63,19 +63,32 @@ pub async fn send(
     if let Some(delivery_policy) = delivery_policy {
         params["deliveryPolicy"] = serde_json::to_value(delivery_policy)?;
     }
-    if let Some(reply_actor_id) = inferred_reply_audience(
+    let trigger_actor = std::env::var("LOOM_TRIGGER_ACTOR").ok();
+    let inferred_reply = inferred_reply_audience(
         &target,
         &actor_id,
         &body,
         delivery_policy,
-        std::env::var("LOOM_TRIGGER_ACTOR").ok().as_deref(),
-    ) {
+        trigger_actor.as_deref(),
+    );
+    if let Some(reply_actor_id) = inferred_reply.as_ref() {
         params["audience"] = json!([{ "kind": "actor", "id": reply_actor_id }]);
     }
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
     let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
+    let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
+    let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
+    if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
+        eprintln!(
+            "loom: warning: this message is notify_only and will wake nobody, but its \
+             text looks like a call for others to act (discuss/vote/answer/your turn). \
+             If you expect a response, send it with `loom message ask @actor_id ...` \
+             (or `--private-to @actor_id` for a hidden prompt). A notify_only \
+             call-for-action wakes no one and is the #1 cause of stalled multi-actor flows."
+        );
+    }
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -106,6 +119,43 @@ pub async fn ask(
         println!("message {}", res.message.id);
     }
     Ok(())
+}
+
+/// Best-effort, non-blocking heuristic: does this body read like a request for
+/// other actors to act (discuss, vote, answer, take a turn)? Used only to print
+/// a stderr nudge when such a message is sent notify_only (wakes nobody).
+fn looks_like_call_for_action(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const CUES: &[&str] = &[
+        "please discuss",
+        "please vote",
+        "please respond",
+        "please answer",
+        "please reply",
+        "please choose",
+        "please decide",
+        "please share",
+        "your turn",
+        "take a turn",
+        "cast your vote",
+        "start the discussion",
+        "open the floor",
+        "请发言",
+        "开始发言",
+        "请讨论",
+        "请投票",
+        "请回复",
+        "请回答",
+        "请选择",
+        "请决定",
+        "轮到",
+        "到你了",
+        "大家发言",
+        "各位发言",
+        "投票开始",
+        "开始投票",
+    ];
+    CUES.iter().any(|cue| lower.contains(cue))
 }
 
 fn read_message_body(text: Option<String>) -> Result<String> {
@@ -317,6 +367,15 @@ fn inferred_reply_audience<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_for_action_heuristic_flags_group_prompts_not_plain_info() {
+        assert!(looks_like_call_for_action("🔔 各位玩家，请开始发言讨论"));
+        assert!(looks_like_call_for_action("Okay everyone, please vote now"));
+        assert!(looks_like_call_for_action("轮到你了，发表你的看法"));
+        assert!(!looks_like_call_for_action("天亮了，昨晚是平安夜，无人死亡。"));
+        assert!(!looks_like_call_for_action("Game over. Villagers win."));
+    }
 
     #[test]
     fn infers_thread_wake_reply_audience_from_trigger_actor() {

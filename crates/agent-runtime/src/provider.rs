@@ -293,6 +293,12 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
                 manifest.id
             ));
         }
+        if mode.prompt.is_some() {
+            return Err(format!(
+                "provider `{}` mode `{mode_name}` must not declare prompt; configure AgentSpec.promptAssembly instead",
+                manifest.id
+            ));
+        }
         validate_mode_command(manifest, mode_name, mode)?;
         validate_decoder_spec(manifest, mode_name, "stdout", &mode.stdout)?;
         if let Some(stderr) = mode.stderr.as_ref() {
@@ -845,7 +851,6 @@ fn apply_mode_patch(base_mode: &mut Value, patch_mode: &Value) -> Result<(), Str
             "args",
             "env",
             "stdin",
-            "prompt",
             "stdout",
             "stderr",
             "session",
@@ -874,9 +879,6 @@ fn apply_mode_patch(base_mode: &mut Value, patch_mode: &Value) -> Result<(), Str
     }
     if let Some(env_patch) = patch.get("env") {
         apply_env_patch(base, env_patch)?;
-    }
-    if let Some(prompt_patch) = patch.get("prompt") {
-        apply_prompt_patch(base, prompt_patch)?;
     }
     Ok(())
 }
@@ -958,41 +960,6 @@ fn apply_env_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), S
         }
     }
     base.insert("env".into(), Value::Object(env));
-    Ok(())
-}
-
-fn apply_prompt_patch(base: &mut Map<String, Value>, patch: &Value) -> Result<(), String> {
-    let obj = patch
-        .as_object()
-        .ok_or_else(|| "prompt patch must be an object".to_string())?;
-    if obj.is_empty() {
-        return Ok(());
-    }
-    reject_unknown_keys(obj, &["outputs", "workspaceFiles"], "prompt patch")?;
-    let prompt = base
-        .entry("prompt")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| "base prompt must be an object".to_string())?;
-    if let Some(workspace_files) = obj.get("workspaceFiles") {
-        if !workspace_files.is_array() {
-            return Err("prompt.workspaceFiles must be an array".into());
-        }
-        prompt.insert("workspaceFiles".into(), workspace_files.clone());
-    }
-    if let Some(outputs_patch) = obj.get("outputs") {
-        let outputs = prompt
-            .entry("outputs")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| "base prompt.outputs must be an object".to_string())?;
-        for (name, output) in outputs_patch
-            .as_object()
-            .ok_or_else(|| "prompt.outputs must be an object".to_string())?
-        {
-            outputs.insert(name.clone(), output.clone());
-        }
-    }
     Ok(())
 }
 
@@ -1099,11 +1066,8 @@ fn string_args_have_prompt_reference(args: &[String]) -> bool {
         .any(|value| template_placeholders(value).any(|name| is_prompt_delivery_var(&name)))
 }
 
-fn prompt_output_names(prompt: Option<&ProviderPromptSpec>) -> HashSet<String> {
-    prompt
-        .filter(|prompt| !prompt.outputs.is_empty())
-        .map(|prompt| prompt.outputs.keys().cloned().collect())
-        .unwrap_or_else(|| HashSet::from(["full".into()]))
+fn prompt_output_names(_prompt: Option<&ProviderPromptSpec>) -> HashSet<String> {
+    HashSet::from(["system".into(), "user".into(), "full".into()])
 }
 
 fn validate_session_spec(
@@ -1986,7 +1950,7 @@ fn runtime_plan_from_manifest(
         }),
         decoder: Some(mode.stdout.clone()),
         stderr_decoder: mode.stderr.clone(),
-        prompt: mode.prompt.clone(),
+        prompt: None,
         stdin,
         timeout_ms: mode.timeout_ms,
         idle_timeout_ms: mode.idle_timeout_ms,
@@ -2106,6 +2070,7 @@ fn command_exists(path: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
 fn base_prompt() -> ProviderPromptSpec {
     ProviderPromptSpec {
         workspace_files: Vec::new(),
@@ -2135,23 +2100,9 @@ fn base_prompt() -> ProviderPromptSpec {
     }
 }
 
-fn full_prompt() -> ProviderPromptSpec {
-    ProviderPromptSpec {
-        workspace_files: Vec::new(),
-        outputs: BTreeMap::from([(
-            "full".into(),
-            ProviderPromptOutputSpec {
-                preset: Some("loom_full".into()),
-                ..Default::default()
-            },
-        )]),
-    }
-}
-
 fn mode(
     command: &str,
     args: Vec<ProviderArgSpec>,
-    prompt: ProviderPromptSpec,
     stdout_name: &str,
     session: Option<ProviderSessionSpec>,
 ) -> ProviderModeSpec {
@@ -2162,7 +2113,7 @@ fn mode(
         model_args: Vec::new(),
         env: BTreeMap::new(),
         stdin: None,
-        prompt: Some(prompt),
+        prompt: None,
         stdout: ProviderDecoderSpec {
             format: "builtin".into(),
             name: Some(stdout_name.into()),
@@ -2447,7 +2398,6 @@ fn claude_manifest() -> ProviderManifest {
                 mode(
                     "{bin}",
                     first_args,
-                    base_prompt(),
                     "claude_stream_json",
                     Some(session),
                 ),
@@ -2512,7 +2462,6 @@ fn qoder_manifest() -> ProviderManifest {
             let mut mode = mode(
                 "{bin}",
                 first_args,
-                base_prompt(),
                 "claude_stream_json",
                 Some(session),
             );
@@ -2561,7 +2510,6 @@ fn copilot_manifest() -> ProviderManifest {
             let mut mode = mode(
                 "{bin}",
                 args,
-                full_prompt(),
                 "copilot_jsonl_final_text",
                 Some(session),
             );
@@ -2622,7 +2570,6 @@ fn codex_manifest() -> ProviderManifest {
     let mut mode = mode(
         "{bin}",
         first_args,
-        full_prompt(),
         "codex_stream_json",
         Some(ProviderSessionSpec {
             id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -2678,7 +2625,6 @@ fn opencode_manifest() -> ProviderManifest {
     let mut mode = mode(
         "{bin}",
         first_args,
-        full_prompt(),
         "text",
         Some(ProviderSessionSpec {
             id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -3021,7 +2967,7 @@ mod tests {
             &["no-prompt"],
             BTreeMap::from([(
                 "print".into(),
-                mode("{bin}", vec![lit("run")], full_prompt(), "text", None),
+                mode("{bin}", vec![lit("run")], "text", None),
             )]),
             &[],
         );
@@ -3041,7 +2987,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3064,7 +3009,6 @@ mod tests {
                 mode(
                     "other-agent",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3090,7 +3034,6 @@ mod tests {
                 mode(
                     "candidate-agent",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3108,7 +3051,6 @@ mod tests {
                 mode(
                     "/opt/loom/providers/agent",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3129,7 +3071,6 @@ mod tests {
                 mode(
                     "{loom.configDir}/provider",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3155,7 +3096,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}"), lit("{unknown.var}")],
-                    full_prompt(),
                     "text",
                     None,
                 ),
@@ -3180,8 +3120,7 @@ mod tests {
                 "print".into(),
                 mode(
                     "{bin}",
-                    vec![lit("--system"), lit("{prompt.system}")],
-                    ProviderPromptSpec::default(),
+                    vec![lit("--extra"), lit("{prompt.extra}")],
                     "text",
                     None,
                 ),
@@ -3191,157 +3130,42 @@ mod tests {
 
         let err = validate_manifest(&manifest).expect_err("unknown prompt output should fail");
         assert!(
-            err.contains("references unknown prompt output `system`"),
+            err.contains("references unknown prompt output `extra`"),
             "{err}"
         );
     }
 
     #[test]
-    fn manifest_validation_rejects_unknown_prompt_part_reference() {
-        let manifest = manifest(
-            "bad_part",
-            "Bad Part",
-            &["bad-part"],
-            BTreeMap::from([(
-                "print".into(),
-                mode(
-                    "{bin}",
-                    vec![lit("{prompt.full}")],
-                    ProviderPromptSpec {
-                        workspace_files: Vec::new(),
-                        outputs: BTreeMap::from([(
-                            "full".into(),
-                            ProviderPromptOutputSpec {
-                                include: vec!["actor_context".into(), "identity".into()],
-                                ..Default::default()
-                            },
-                        )]),
-                    },
-                    "text",
-                    None,
-                ),
+    fn manifest_validation_rejects_provider_owned_prompt() {
+        let mut provider_mode = mode(
+            "{bin}",
+            vec![lit("{prompt.full}")],
+            "text",
+            None,
+        );
+        provider_mode.prompt = Some(ProviderPromptSpec {
+            workspace_files: Vec::new(),
+            outputs: BTreeMap::from([(
+                "full".into(),
+                ProviderPromptOutputSpec {
+                    preset: Some("loom_full".into()),
+                    ..Default::default()
+                },
             )]),
+        });
+        let manifest = manifest(
+            "provider_prompt",
+            "Provider Prompt",
+            &["provider-prompt"],
+            BTreeMap::from([("print".into(), provider_mode)]),
             &[],
         );
 
-        let err = validate_manifest(&manifest).expect_err("unknown part should fail");
-        assert!(err.contains("unknown prompt part `identity`"), "{err}");
-    }
-
-    #[test]
-    fn manifest_validation_accepts_declared_workspace_prompt_part() {
-        let manifest = manifest(
-            "workspace_part",
-            "Workspace Part",
-            &["workspace-part"],
-            BTreeMap::from([(
-                "print".into(),
-                mode(
-                    "{bin}",
-                    vec![lit("{prompt.full}")],
-                    ProviderPromptSpec {
-                        workspace_files: vec![ProviderWorkspaceFileSpec {
-                            key: "persona".into(),
-                            path: "persona.md".into(),
-                            title: Some("System: Persona".into()),
-                            role_hint: Some(ProviderPromptRoleHint::System),
-                            optional: true,
-                            max_bytes: 32768,
-                        }],
-                        outputs: BTreeMap::from([(
-                            "full".into(),
-                            ProviderPromptOutputSpec {
-                                include: vec![
-                                    "actor_context".into(),
-                                    "workspace_file.persona".into(),
-                                    "user_message".into(),
-                                ],
-                                ..Default::default()
-                            },
-                        )]),
-                    },
-                    "text",
-                    None,
-                ),
-            )]),
-            &[],
-        );
-
-        validate_manifest(&manifest).expect("declared workspace prompt part should pass");
-    }
-
-    #[test]
-    fn manifest_validation_rejects_undeclared_workspace_prompt_part_reference() {
-        let manifest = manifest(
-            "undeclared_workspace_part",
-            "Undeclared Workspace Part",
-            &["undeclared-workspace-part"],
-            BTreeMap::from([(
-                "print".into(),
-                mode(
-                    "{bin}",
-                    vec![lit("{prompt.full}")],
-                    ProviderPromptSpec {
-                        workspace_files: Vec::new(),
-                        outputs: BTreeMap::from([(
-                            "full".into(),
-                            ProviderPromptOutputSpec {
-                                include: vec!["workspace_file.persona".into()],
-                                ..Default::default()
-                            },
-                        )]),
-                    },
-                    "text",
-                    None,
-                ),
-            )]),
-            &[],
-        );
-
-        let err = validate_manifest(&manifest).expect_err("undeclared workspace part should fail");
+        let err = validate_manifest(&manifest).expect_err("provider prompt should fail");
         assert!(
-            err.contains("unknown prompt part `workspace_file.persona`"),
+            err.contains("must not declare prompt; configure AgentSpec.promptAssembly instead"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn manifest_validation_rejects_workspace_prompt_file_path_escape() {
-        let manifest = manifest(
-            "bad_workspace_file",
-            "Bad Workspace File",
-            &["bad-workspace-file"],
-            BTreeMap::from([(
-                "print".into(),
-                mode(
-                    "{bin}",
-                    vec![lit("{prompt.full}")],
-                    ProviderPromptSpec {
-                        workspace_files: vec![ProviderWorkspaceFileSpec {
-                            key: "persona".into(),
-                            path: "../persona.md".into(),
-                            title: None,
-                            role_hint: None,
-                            optional: true,
-                            max_bytes: 32768,
-                        }],
-                        outputs: BTreeMap::from([(
-                            "full".into(),
-                            ProviderPromptOutputSpec {
-                                include: vec!["workspace_file.persona".into()],
-                                ..Default::default()
-                            },
-                        )]),
-                    },
-                    "text",
-                    None,
-                ),
-            )]),
-            &[],
-        );
-
-        let err = validate_manifest(&manifest).expect_err("path escape should fail");
-        assert!(err.contains("path must not contain `..`"), "{err}");
     }
 
     #[test]
@@ -3615,7 +3439,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     Some(ProviderSessionSpec {
                         id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -3643,7 +3466,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             Some(ProviderSessionSpec {
                 id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -3680,7 +3502,6 @@ mod tests {
                 mode(
                     "{bin}",
                     vec![lit("{prompt.full}")],
-                    full_prompt(),
                     "text",
                     Some(ProviderSessionSpec {
                         id_source: Some(ProviderSessionIdSource::LoomUuid),
@@ -3708,7 +3529,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3731,7 +3551,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3762,7 +3581,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3793,7 +3611,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -3823,7 +3640,6 @@ mod tests {
         let mut provider_mode = mode(
             "{bin}",
             vec![lit("{prompt.full}")],
-            full_prompt(),
             "text",
             None,
         );
@@ -4086,7 +3902,6 @@ mod tests {
                 when("model", vec![lit("--model-bin"), lit("{bin}")]),
                 lit("{prompt.full}"),
             ],
-            full_prompt(),
             "text",
             Some(ProviderSessionSpec {
                 id_source: Some(ProviderSessionIdSource::LoomUuid),
@@ -4193,13 +4008,12 @@ mod tests {
               "displayName": "Demo",
               "detect": { "candidates": ["demo-agent"] },
               "modes": {
-                "print": {
-                  "transport": "command",
-                  "command": "{bin}",
-                  "prompt": { "outputs": { "full": { "preset": "loom_full" } } },
-                  "args": ["run", "{prompt.full}"],
-                  "stdout": { "format": "text" }
-                }
+	                "print": {
+	                  "transport": "command",
+	                  "command": "{bin}",
+	                  "args": ["run", "{prompt.full}"],
+	                  "stdout": { "format": "text" }
+	                }
               }
             }"#,
         )
@@ -4209,7 +4023,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_provider_mode_patch_merges_args_env_and_prompt_outputs() {
+    fn extended_provider_mode_patch_merges_args_env_and_runtime_settings() {
         let config = temp_dir("extends");
         let providers = providers_dir(&config);
         std::fs::create_dir_all(&providers).expect("providers dir");
@@ -4227,16 +4041,11 @@ mod tests {
                     "unset": ["LOOM_NO_DAEMON"],
                     "merge": { "EXTRA_FLAG": "1" }
                   },
-                  "args": {
-                    "prepend": ["--prepended"],
-                    "append": ["--max-budget-usd", "5"]
-                  },
-                  "prompt": {
-                    "outputs": {
-                      "diagnostic": { "template": "{actor_context}" }
-                    }
-                  }
-                }
+	                  "args": {
+	                    "prepend": ["--prepended"],
+	                    "append": ["--max-budget-usd", "5"]
+	                  }
+	                }
               }
             }"#,
         )
@@ -4257,9 +4066,16 @@ mod tests {
                 && matches!(&items[1], ProviderArgSpec::Literal(value) if value == "5")));
         assert_eq!(mode.env.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(!mode.env.contains_key("LOOM_NO_DAEMON"));
-        let outputs = &mode.prompt.as_ref().expect("prompt").outputs;
-        assert!(outputs.contains_key("full"));
-        assert!(outputs.contains_key("diagnostic"));
+        assert!(mode.prompt.is_none());
+        let plan = registry
+            .resolve_runtime_plan(&AgentProviderRef {
+                id: "codex_budgeted".into(),
+                mode: Some("print".into()),
+                model: None,
+                reasoning_effort: None,
+            })
+            .expect("runtime plan");
+        assert!(plan.prompt.is_none());
         assert_eq!(
             mode.stdout.name.as_deref(),
             Some("codex_stream_json"),
@@ -4312,10 +4128,10 @@ mod tests {
         );
 
         let prompt_err = provider_registry_load_error(
-            "extends-unknown-prompt",
+            "extends-prompt-field",
             r#"{
               "schemaVersion": 1,
-              "id": "codex_unknown_prompt",
+              "id": "codex_prompt_field",
               "extends": "codex",
               "modes": {
                 "print": {
@@ -4328,7 +4144,7 @@ mod tests {
             }"#,
         );
         assert!(
-            prompt_err.contains("prompt patch contains unknown field `join`"),
+            prompt_err.contains("provider mode patch contains unknown field `prompt`"),
             "{prompt_err}"
         );
 
@@ -4378,16 +4194,16 @@ mod tests {
         );
 
         let prompt_err = provider_registry_load_error(
-            "extends-prompt-shorthand",
+            "extends-prompt-unsupported",
             r#"{
               "schemaVersion": 1,
-              "id": "codex_prompt_shorthand",
+              "id": "codex_prompt_unsupported",
               "extends": "codex",
               "modes": { "print": { "prompt": { "outputsWrong": {} } } }
             }"#,
         );
         assert!(
-            prompt_err.contains("prompt patch contains unknown field `outputsWrong`"),
+            prompt_err.contains("provider mode patch contains unknown field `prompt`"),
             "{prompt_err}"
         );
     }

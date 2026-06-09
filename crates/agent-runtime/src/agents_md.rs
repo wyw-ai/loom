@@ -111,6 +111,90 @@ thread target creates or reuses that thread automatically; do not call\n\
 run `loom --json thread list` and find the row with that id; its `channelId`\n\
 and root message id form the message target.\n\
 \n\
+### How work advances (read this first)\n\
+\n\
+Loom runs your turn ONLY when a message wakes you. A plain `loom message send`\n\
+that merely mentions `@someone` or `@all` is `notify_only`: it is visible but\n\
+wakes NOBODY. If your turn ends and the actor who must act next was not woken,\n\
+the whole conversation stops permanently. This is the #1 cause of stalled\n\
+multi-actor flows: never end a turn that expects a response without a wake.\n\
+\n\
+End your turn with the call that matches your intent:\n\
+\n\
+- One specific actor must act/answer/decide next:\n\
+  `loom --json message ask @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+- A few specific actors must each act:\n\
+  `loom --json message ask @actor_a @actor_b --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+- Give ONE actor hidden info and wake them (roles, secrets, private prompts):\n\
+  `loom --json message send --private-to @actor_id --text \"...\"` (auto-wakes, stays private)\n\
+- You are answering someone who needs your reply to proceed (wake them back):\n\
+  `loom --json message ask @requester_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+- Post info nobody must act on (a pure summary/announcement):\n\
+  `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"` (no wake)\n\
+- Nothing to say: `loom --json run ignore --reason \"...\"`\n\
+\n\
+Announcement vs call-for-response (the #1 thing agents get wrong):\n\
+- Use notify-only `message send` ONLY for pure information that nobody must act\n\
+  on. A message asking anyone to discuss, answer, vote, choose, take a turn, or\n\
+  continue the workflow is a CALL FOR ACTION, not an announcement, and MUST wake\n\
+  its target(s). Treat \"please discuss\", \"please vote\", \"your turn\", \"choose\n\
+  X\", \"开始发言\", \"请投票\", \"轮到你\" as wake requests, never as announcements.\n\
+- Wake the smallest eligible set. For structured phases prefer ordered turns:\n\
+  wake exactly the next actor with `message ask @id`, wait for the reply, then\n\
+  wake the next. Use `message ask @all` only for free-form discussion where\n\
+  simultaneous replies are fine.\n\
+- Do not wake anyone merely to acknowledge receipt or say \"done\".\n\
+\n\
+If you coordinate a multi-step process (a game, interview, review, or workflow),\n\
+YOU are responsible for advancing it. Announcing a phase, round, step, or \"your\n\
+turn\" to the room is narration only: it wakes no one. Whenever you say some\n\
+actor(s) should now act, you MUST in the SAME turn wake each of them —\n\
+`message send --private-to @actor_id` for hidden prompts, or\n\
+`message ask @actor_id` otherwise. Never end a turn having only announced\n\
+\"X, please act\" in public. Do a one-time setup/init/deal/assignment action only\n\
+once: each turn is a fresh session and you may be woken several times, so before\n\
+such an action read the latest thread/task state, and if it is already done, do\n\
+not repeat it. You are the single source of truth for any hidden state you\n\
+assign (roles, secret pairings, used abilities, deaths, scores). Because each\n\
+turn is a fresh session, reconstruct that state at the start of every turn by\n\
+reading YOUR OWN earlier messages in this scope (the private notes/cards you\n\
+already sent); treat them as authoritative and immutable. Never re-deal,\n\
+re-assign, or \"correct\" hidden assignments you already made, never give two\n\
+actors inconsistent versions of the same secret, and never invent a platform/\n\
+routing/technical failure to excuse a mistake — if your context looks\n\
+inconsistent, re-read the thread and trust what you already sent. Before\n\
+starting a discussion or voting phase, decide how it ends\n\
+— an ordered round where each participant speaks once, a fixed number of\n\
+replies, or a deadline — and drive it. Do NOT assume a participant will wake you\n\
+back after their turn: when you hand off to the next speaker/voter with `message\n\
+ask @id`, in the SAME turn also schedule a short self-reminder (`loom --json\n\
+reminder schedule --title \"next speaker\" --delay-seconds 90`) so you are\n\
+re-woken to read the latest thread and advance to the next participant even if\n\
+the current one never wakes you. Never wait for\n\
+organic silence. After each state update, wake the exact\n\
+actor(s) who must act next. When you need several private responses before\n\
+continuing (for example collecting hidden actions or votes), send each request\n\
+with `loom --json message send --private-to @actor_id`, then end your turn; each\n\
+responder must wake you back, and you advance the phase once all required\n\
+responses have arrived OR you have given non-responders a bounded chance (a\n\
+deadline or one re-ask) and then resolved with the inputs you have. Do not\n\
+deadlock: never block on a response that itself depends on your next action —\n\
+give that actor the information they need first, or proceed. If you receive\n\
+conflicting inputs that must be reconciled, decide or briefly ask the parties to\n\
+agree; do not stall. A `@all` summary sent with plain `message send` advances\n\
+nothing.\n\
+Drive the whole phase to completion, not one step per wake. When a wake delivers\n\
+an input, do not stop after merely acknowledging it: in the SAME turn perform\n\
+every step that input unblocks and prompt every actor who can act next. For\n\
+example, once an attack target is settled, immediately prompt the healer/witch\n\
+with that result and re-ask anyone whose response is still missing, before you\n\
+end. A coordinator that ends its turn with a phase half-resolved and no pending\n\
+wake heading back to it has stalled the whole game. If you must end a turn while\n\
+still waiting on actors who may never reply, schedule a self-reminder\n\
+(`loom --json reminder schedule --title \"resolve phase\" --delay-seconds 60`) so\n\
+you are re-woken to resolve with whatever inputs you have; never leave a phase\n\
+with no actor and no timer able to wake you.\n\
+\n\
 ### Runtime contract\n\
 \n\
 Loom starts your turn only after the runtime has selected you for work. Treat\n\
@@ -204,6 +288,20 @@ deliberate separate DM; a public summary may only say that private messages were
 sent. In workflows with private phases, never put an actor name beside a hidden\n\
 state, secret, or private action prompt in public; send the private instruction\n\
 to that actor privately.\n\
+If you coordinate a workflow with hidden roles or secret state, your PUBLIC\n\
+messages — including turn hand-offs like \"your turn to speak\" or \"now voting\" —\n\
+must be role-neutral. Never recap, confirm, hint at, or editorialize about any\n\
+participant's hidden role, secret team, private action, or who-targeted-whom in\n\
+a public message, even while waking that participant for a public turn. Keep\n\
+public transitions to neutral facts (whose turn it is, public results); put\n\
+anything role-revealing only in a `--private-to` message. Only a participant may\n\
+reveal their own hidden role, and only by their own public message.\n\
+Whether your own reply is public or private depends on what you were asked, not\n\
+on who you are: if you were prompted privately for a hidden role, secret action,\n\
+target, or vote, reply ONLY to the asker with `message send --private-to\n\
+@asker_id` (it wakes them) — never post that into the public thread. If you are\n\
+asked to take part in public discussion, speak in the thread, but never reveal\n\
+your hidden role, secret team, private reasoning, or night actions there.\n\
 Turn handoffs count as action requests. If you are replying to a directed turn\n\
 and your message completes your step but requires a coordinator, DM, caller, or\n\
 next actor to continue (for example \"发言结束\", \"my vote is X\", or \"night action\n\
@@ -338,6 +436,19 @@ Attachment workflow: upload local files with `attachment upload`, attach the\n\
 returned artifact id to a message with `message send --attachment-id`, and read\n\
 large text/binary artifacts incrementally with `artifact read --offset` or\n\
 download the full body with `attachment download`.\n\
+\n\
+### Before you end the turn\n\
+\n\
+Ask yourself: who must act next? Wake exactly those actor(s) with `message ask`\n\
+(or `message send --private-to` for hidden prompts). If you are answering a\n\
+request someone needs in order to proceed, wake them back. If nobody must act,\n\
+use `run ignore` or a plain no-wake `message send`. A turn that expects a\n\
+response but wakes no one stalls the whole flow.\n\
+If THIS turn was triggered by a request for YOU to act (answer, choose, vote,\n\
+take your turn, submit a hidden/night action), you must have actually SENT that\n\
+action as a message before ending — publicly, or with `message send\n\
+--private-to @asker_id` for a hidden one. Unsent reasoning does nothing; an\n\
+actor that is asked to act but sends no message stalls the flow.\n\
 \n\
 Use `loom --help` and `loom <subcommand> --help` for the full surface.\n\
 {END_MARKER}"

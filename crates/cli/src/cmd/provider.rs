@@ -122,6 +122,7 @@ pub fn show(provider_id: String) -> Result<()> {
 }
 
 pub fn remove(provider_id: String) -> Result<()> {
+    validate_provider_id_for_path(&provider_id)?;
     let path = providers_dir(&config::config_dir()).join(format!("{provider_id}.json"));
     if !path.exists() {
         return Err(anyhow!(
@@ -135,6 +136,28 @@ pub fn remove(provider_id: String) -> Result<()> {
         render::print_json(&json!({ "ok": true, "removed": provider_id }));
     } else {
         println!("removed provider {provider_id}");
+    }
+    Ok(())
+}
+
+fn validate_provider_id_for_path(provider_id: &str) -> Result<()> {
+    proto::path_component::validate_path_component(provider_id, "provider_id")
+        .map_err(|err| anyhow!(err))?;
+    let mut chars = provider_id.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("provider id is required"));
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(anyhow!(
+            "provider id `{provider_id}` must start with a lowercase ascii letter or digit"
+        ));
+    }
+    if chars.any(|ch| {
+        !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.'))
+    }) {
+        return Err(anyhow!(
+            "provider id `{provider_id}` may only contain lowercase ascii letters, digits, `_`, `-`, or `.`"
+        ));
     }
     Ok(())
 }
@@ -262,9 +285,8 @@ What to edit first:
 
 Prompt flow in this template:
   - Loom first composes standard prompt parts such as actor_context, agent_instructions, scope_bootstrap, runtime_context, and user_message.
-  - prompt.workspaceFiles declares optional files under the current agent workspace's .loom directory.
-  - The example reads .loom/persona.md when present and exposes it as the prompt part "workspace_file.persona".
-  - prompt.outputs.full joins the selected parts in the declared order.
+  - AgentSpec.promptAssembly decides how those parts and agent-owned prompt files become prompt.system, prompt.user, and prompt.full.
+  - ProviderManifest only declares how the provider CLI receives those rendered prompt outputs.
   - args finally passes "{{prompt.full}}" to the provider CLI.
 
 Common runtime path variables:
@@ -272,12 +294,10 @@ Common runtime path variables:
   - {{agent.specPath}} points at that agent's spec.json.
   - {{loom.configDir}} remains available for advanced providers that intentionally need daemon-level config, but built-in providers avoid exposing it by default.
 
-Workspace file rules:
-  - path is relative to the current agent workspace's .loom directory.
-  - optional=true means a missing file is skipped.
-  - optional=false makes the turn fail when the file is missing.
-  - maxBytes limits the single file size.
-  - The file only affects the provider if prompt.outputs references "workspace_file.<key>".
+Prompt delivery variables:
+  - {{prompt.system}}, {{prompt.user}}, and {{prompt.full}} are rendered by AgentSpec.promptAssembly.
+  - ProviderManifest should not declare agent profile or workspace prompt files.
+  - Keep provider fields focused on command, args, env, stdin, stdout, session, model, and detection.
 
 Provider-specific examples:
   loom provider example --claude
@@ -322,33 +342,6 @@ fn standard_provider_example() -> Value {
             "print": {
                 "transport": "command",
                 "command": "{bin}",
-                "prompt": {
-                    "workspaceFiles": [
-                        {
-                            "key": "persona",
-                            "path": "persona.md",
-                            "title": "System: Provider persona",
-                            "roleHint": "system",
-                            "optional": true,
-                            "maxBytes": 32768
-                        }
-                    ],
-                    "outputs": {
-                        "full": {
-                            "join": "\n\n",
-                            "include": [
-                                "actor_context",
-                                "agent_instructions",
-                                "workspace_file.persona",
-                                "bootstrap_memory",
-                                "scope_bootstrap",
-                                "turn_memory",
-                                "runtime_context",
-                                "user_message"
-                            ]
-                        }
-                    }
-                },
                 "args": [
                     "run",
                     {
@@ -692,14 +685,7 @@ mod tests {
             .expect("example manifest");
 
         assert_eq!(manifest.id, "my_provider");
-        assert_eq!(
-            manifest.modes["print"]
-                .prompt
-                .as_ref()
-                .and_then(|prompt| prompt.workspace_files.first())
-                .map(|file| file.key.as_str()),
-            Some("persona")
-        );
+        assert!(manifest.modes["print"].prompt.is_none());
         assert!(manifest.modes["print"]
             .args
             .iter()
@@ -708,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_provider_example_text_explains_workspace_files_and_contains_json() {
+    fn standard_provider_example_text_explains_agent_prompt_assembly_and_contains_json() {
         let text =
             standard_provider_example_text(&standard_provider_example()).expect("example text");
 
@@ -716,10 +702,29 @@ mod tests {
         assert!(text.contains("loom --json provider example"));
         assert!(text.contains("agent.configDir"));
         assert!(text.contains("loom.configDir"));
-        assert!(text.contains(".loom/persona.md"));
-        assert!(text.contains("workspace_file.persona"));
+        assert!(text.contains("AgentSpec.promptAssembly"));
+        assert!(text.contains("prompt.full"));
         assert!(text.contains("```json"));
-        assert!(text.contains("\"workspaceFiles\""));
+        assert!(!text.contains("\"workspaceFiles\""));
+    }
+
+    #[test]
+    fn provider_remove_rejects_unsafe_provider_ids() {
+        for provider_id in [
+            "../daemon",
+            "provider/slash",
+            ".hidden",
+            "foo..bar",
+            "Claude",
+        ] {
+            assert!(
+                validate_provider_id_for_path(provider_id).is_err(),
+                "{provider_id}"
+            );
+        }
+
+        assert!(validate_provider_id_for_path("claude.local").is_ok());
+        assert!(validate_provider_id_for_path("my-provider_1").is_ok());
     }
 
     #[test]

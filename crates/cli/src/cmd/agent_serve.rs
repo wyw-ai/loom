@@ -5108,10 +5108,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              `--private-to` if it is secret. When the prompt that reached you is private (it came --private-to\n\
              you, e.g. to coordinate with hidden teammates or submit a hidden action), keep your ENTIRE reply\n\
              in that same private audience: send it `--private-to` the actor who woke you (`$LOOM_TRIGGER_ACTOR`)\n\
-             plus any co-recipients the prompt included, and do NOT send it to `$LOOM_REPLY_TARGET` — that\n\
-             target is the public thread and would broadcast your secret to everyone — even if public news\n\
-             arrived at the same moment and you feel the urge to react in the open. Reasoning you do not send\n\
-             accomplishes nothing.\n\
+             plus exactly the other recipients the prompt already included (your hidden group), and do NOT send\n\
+             it to `$LOOM_REPLY_TARGET` — that target is the public thread and would broadcast your secret to\n\
+             everyone. Put ONLY your own group in that audience: never add anyone else, and in particular never\n\
+             add the person your hidden action concerns or targets — naming them in your text (e.g. proposing to\n\
+             act on them) does NOT mean adding them as a recipient, and including them would hand them your\n\
+             secret. Reasoning you do not send accomplishes nothing.\n\
            - It only gives you information you were not asked to act on (a role card, an assignment, an FYI,\n\
              a result to remember): simply remember it and end with `run ignore`. Do NOT reply \"got it\" /\n\
              \"收到\" — a needless acknowledgement wakes the sender, and for a coordinator mid-setup it can\n\
@@ -5229,10 +5231,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              secret teammates, or your secret reasoning in a shared message — not proactively and not while\n\
              reacting to public news; a single such slip usually decides the activity against your own side.\n\
              Answer any private/secret prompt only within its private audience: reply `--private-to` the actor\n\
-             who woke you (`$LOOM_TRIGGER_ACTOR`) plus any co-recipients, and NOT to `$LOOM_REPLY_TARGET` (the\n\
-             public thread). Coordinate with hidden teammates only in that private audience, never in the shared\n\
-             channel. In open discussion you may argue, claim, or bluff; only you may disclose your own hidden\n\
-             state, by your own choice in your own public message — never the coordinator on your behalf.\n\
+             who woke you (`$LOOM_TRIGGER_ACTOR`) plus exactly the prompt's other recipients (your hidden\n\
+             group), and NOT to `$LOOM_REPLY_TARGET` (the public thread). The audience is who may SEE the\n\
+             message — your own group only — not who it is ABOUT: never add the participant your hidden action\n\
+             targets or discusses, or you hand them the secret. Coordinate with hidden teammates only in that\n\
+             private audience, never in the shared channel. In open discussion you may argue, claim, or bluff;\n\
+             only you may disclose your own hidden state, by your own choice in your own public message — never\n\
+             the coordinator on your behalf.\n\
          </privacy>\n\
          \n\
          <examples>\n\
@@ -5289,14 +5294,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          participants once and set another recheck reminder; only treat someone as absent after a generous\n\
          wait, and resolve by your activity's rule — never by answering for them.\n\
          </example>\n\
-         <example caption=\"You were asked privately — keep your whole reply private, do not leak to the room\">\n\
+         <example caption=\"You were asked privately — reply to your group only, never include the target\">\n\
          You were privately woken to make a hidden choice or to coordinate with your hidden teammates. End the\n\
-         turn by sending your reply inside the SAME private audience — the actor who woke you plus any teammates\n\
-         the prompt included — and NOT to `$LOOM_REPLY_TARGET`, even if public news just arrived and you want to\n\
-         react:\n\
-           loom --json message send --private-to $LOOM_TRIGGER_ACTOR [--private-to @teammate_id] --text \"My choice is X.\"\n\
-         `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination, role, or allegiance there\n\
-         exposes your side and usually loses the activity for you. Use `--private-to` for anything secret.\n\
+         turn by sending your reply to the SAME private group — the actor who woke you plus the teammates the\n\
+         prompt included — and NOT to `$LOOM_REPLY_TARGET`:\n\
+           loom --json message send --private-to $LOOM_TRIGGER_ACTOR [--private-to @teammate_id] --text \"My choice is to act on @target.\"\n\
+         The audience is who may SEE this (your group), not who it is about: even though your text names\n\
+         @target, do NOT add @target to `--private-to` — that would reveal your group and plan to the very\n\
+         person you are acting on. `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination,\n\
+         role, or allegiance there (or to the target) exposes your side and usually loses the activity for you.\n\
          </example>\n\
          <example caption=\"You only received information — stay silent\">\n\
          You receive a private note that just informs you of something (an assignment, an FYI) and asks for\n\

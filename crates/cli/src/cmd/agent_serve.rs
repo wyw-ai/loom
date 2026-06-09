@@ -940,6 +940,20 @@ impl AgentPaths {
                 active.trigger_source_id.clone(),
             );
             env.insert("LOOM_TRIGGER_ACTOR".into(), active.trigger_actor.clone());
+            if !active.trigger_private_to.is_empty() {
+                env.insert("LOOM_TRIGGER_PRIVATE".into(), "1".into());
+                env.insert(
+                    "LOOM_TRIGGER_PRIVATE_TO".into(),
+                    active.trigger_private_to.join(" "),
+                );
+                let flags = active
+                    .trigger_private_to
+                    .iter()
+                    .map(|id| format!("--private-to @{id}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                env.insert("LOOM_TRIGGER_PRIVATE_TO_FLAGS".into(), flags);
+            }
             if let Some(reply_target) = active.reply_target.as_ref() {
                 env.insert("LOOM_REPLY_TARGET".into(), reply_target.clone());
             }
@@ -1232,6 +1246,75 @@ fn reply_target_for_message(message: &Message) -> String {
     }
 }
 
+/// When the triggering message was sent privately (to a restricted same-scope
+/// audience via `--private-to`), returns the actor ids the woken agent should
+/// reply to so its reply stays inside that same private group: the author who
+/// woke it plus the other private recipients, excluding the woken agent itself.
+/// Returns empty when the trigger was a normal public message, so callers can
+/// treat empty as "reply publicly as usual". This lets the daemon hand the agent
+/// a ready-made correct private audience instead of relying on it to reconstruct
+/// one from memory (the historical source of accidental public leaks of secret
+/// replies).
+fn trigger_private_reply_actor_ids(message: &Message, self_actor_id: &str) -> Vec<String> {
+    let is_private_flag = message
+        .metadata
+        .get("private")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || message
+            .metadata
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("private"));
+
+    let mut raw: Vec<String> = Vec::new();
+    let mut has_private_to = false;
+    for key in ["privateTo", "privateActorIds"] {
+        if let Some(value) = message.metadata.get(key) {
+            has_private_to = true;
+            collect_private_to_ids(value, &mut raw);
+        }
+    }
+    if !is_private_flag && !has_private_to {
+        return Vec::new();
+    }
+    // The author woke us; include them so the reply goes back to the asker too.
+    raw.push(message.author_actor_id.clone());
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in raw {
+        let id = id.trim().trim_start_matches('@').trim().to_string();
+        if id.is_empty() || id == self_actor_id {
+            continue;
+        }
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+fn collect_private_to_ids(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_private_to_ids(value, out);
+            }
+        }
+        Value::String(raw) => {
+            for part in raw.split(',') {
+                let part = part.trim().trim_start_matches('@').trim();
+                if !part.is_empty() {
+                    out.push(part.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+
 struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
@@ -1304,6 +1387,11 @@ struct ActiveTurn {
     /// Actor that triggered the current turn — needed when emitting a
     /// `action.request` so we can hand the choice back to them.
     trigger_actor: String,
+    /// When the triggering message was private, the actor ids this agent should
+    /// reply privately to (author + co-recipients, minus self). Empty for a
+    /// normal public trigger. Surfaced to the model as $LOOM_TRIGGER_PRIVATE and
+    /// $LOOM_TRIGGER_PRIVATE_TO_FLAGS so a private reply stays private by default.
+    trigger_private_to: Vec<String>,
     /// Local side-channel used by `loom run ignore` so the model can end a
     /// turn without posting a visible final answer.
     no_reply_file: Option<PathBuf>,
@@ -3198,6 +3286,12 @@ async fn dispatch_trigger(
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
             trigger_actor: trigger.actor_id().to_string(),
+            trigger_private_to: match &trigger {
+                AgentTrigger::Message(message) => {
+                    trigger_private_reply_actor_ids(message, &state.actor_id)
+                }
+                AgentTrigger::Event(_) => Vec::new(),
+            },
             no_reply_file,
             no_reply_requested: false,
             cancel_requested: false,
@@ -5114,13 +5208,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              actually SEND that action as a message before the turn ends — publicly if it is public, or with\n\
              `--private-to` if it is secret. When the prompt that reached you is private (it came --private-to\n\
              you, e.g. to coordinate with hidden teammates or submit a hidden action), keep your ENTIRE reply\n\
-             in that same private audience: send it `--private-to` the actor who woke you (`$LOOM_TRIGGER_ACTOR`)\n\
-             plus exactly the other recipients the prompt already included (your hidden group), and do NOT send\n\
-             it to `$LOOM_REPLY_TARGET` — that target is the public thread and would broadcast your secret to\n\
-             everyone. Put ONLY your own group in that audience: never add anyone else, and in particular never\n\
-             add the person your hidden action concerns or targets — naming them in your text (e.g. proposing to\n\
-             act on them) does NOT mean adding them as a recipient, and including them would hand them your\n\
-             secret. Reasoning you do not send accomplishes nothing.\n\
+             in that same private audience. The daemon hands you that audience ready-made: when you were woken\n\
+             privately, `$LOOM_TRIGGER_PRIVATE` is set to 1 and `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` already expands\n\
+             to the exact `--private-to @id` flags for the author plus your co-recipients (and not yourself) —\n\
+             drop it straight into your send: `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text\n\
+             \"...\"`. Do NOT send a private reply to `$LOOM_REPLY_TARGET` — that target is the public thread and\n\
+             would broadcast your secret to everyone. Put ONLY your own group in that audience: never add anyone\n\
+             else, and in particular never add the person your hidden action concerns or targets — naming them\n\
+             in your text (e.g. proposing to act on them) does NOT mean adding them as a recipient, and\n\
+             including them would hand them your secret. Reasoning you do not send accomplishes nothing.\n\
            - It only gives you information you were not asked to act on (a role card, an assignment, an FYI,\n\
              a result to remember): simply remember it and end with `run ignore`. Do NOT reply \"got it\" /\n\
              \"收到\" — a needless acknowledgement wakes the sender, and for a coordinator mid-setup it can\n\
@@ -5248,9 +5344,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
            - As a participant you are bound by this too: never reveal your own hidden role/allegiance, your\n\
              secret teammates, or your secret reasoning in a shared message — not proactively and not while\n\
              reacting to public news; a single such slip usually decides the activity against your own side.\n\
-             Answer any private/secret prompt only within its private audience: reply `--private-to` the actor\n\
-             who woke you (`$LOOM_TRIGGER_ACTOR`) plus exactly the prompt's other recipients (your hidden\n\
-             group), and NOT to `$LOOM_REPLY_TARGET` (the public thread). The audience is who may SEE the\n\
+             Answer any private/secret prompt only within its private audience: reply with\n\
+             `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` (the daemon-provided `--private-to` flags for the author plus your\n\
+             co-recipients) — or equivalently `--private-to` the actor who woke you plus the prompt's other\n\
+             recipients — and NOT to `$LOOM_REPLY_TARGET` (the public thread). The audience is who may SEE the\n\
              message — your own group only — not who it is ABOUT: never add the participant your hidden action\n\
              targets or discusses, or you hand them the secret. Coordinate with hidden teammates only in that\n\
              private audience, never in the shared channel. In open discussion you may argue, claim, or bluff;\n\
@@ -5315,11 +5412,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          participants once and set another recheck reminder; only treat someone as absent after a generous\n\
          wait, and resolve by your activity's rule — never by answering for them.\n\
          </example>\n\
-         <example caption=\"You were asked privately — reply to your group only, never include the target\">\n\
-         You were privately woken to make a hidden choice or to coordinate with your hidden teammates. End the\n\
-         turn by sending your reply to the SAME private group — the actor who woke you plus the teammates the\n\
-         prompt included — and NOT to `$LOOM_REPLY_TARGET`:\n\
-           loom --json message send --private-to $LOOM_TRIGGER_ACTOR [--private-to @teammate_id] --text \"My choice is to act on @target.\"\n\
+         <example caption=\"You were asked privately — reply with the ready-made private flags\">\n\
+         You were privately woken to make a hidden choice or to coordinate with your hidden teammates. The\n\
+         daemon set `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` to the exact `--private-to` flags for your group (author +\n\
+         co-recipients, never you). Reply by dropping those flags straight in — NOT to `$LOOM_REPLY_TARGET`:\n\
+           loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"My choice is to act on @target.\"\n\
          The audience is who may SEE this (your group), not who it is about: even though your text names\n\
          @target, do NOT add @target to `--private-to` — that would reveal your group and plan to the very\n\
          person you are acting on. `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination,\n\
@@ -6298,6 +6395,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trigger_private_reply_audience_targets_group_minus_self() {
+        let mut message = sample_message(
+            "msg_secret",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_game".into(),
+            },
+            "#chan_game",
+            None,
+            None,
+        );
+        message.author_actor_id = "actor_dm".into();
+        message
+            .metadata
+            .insert("private".into(), serde_json::json!(true));
+        message.metadata.insert(
+            "privateTo".into(),
+            serde_json::json!(["actor_wolf_a", "@actor_wolf_b", "actor_self"]),
+        );
+
+        // A privately-woken agent replies to the author plus co-recipients, never itself.
+        let audience = trigger_private_reply_actor_ids(&message, "actor_self");
+        assert!(
+            audience.contains(&"actor_dm".to_string()),
+            "includes the author who woke us"
+        );
+        assert!(audience.contains(&"actor_wolf_a".to_string()));
+        assert!(
+            audience.contains(&"actor_wolf_b".to_string()),
+            "normalizes a leading @"
+        );
+        assert!(
+            !audience.contains(&"actor_self".to_string()),
+            "never includes the woken agent itself (it would re-wake/echo)"
+        );
+
+        // A normal public message yields no private audience, so callers reply publicly.
+        let public = sample_message(
+            "msg_pub",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_game".into(),
+            },
+            "#chan_game",
+            None,
+            None,
+        );
+        assert!(trigger_private_reply_actor_ids(&public, "actor_self").is_empty());
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -6338,6 +6486,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: trigger_actor.into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
@@ -6520,6 +6669,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "human_alice".into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: Some(root.join("no-reply.json")),
             no_reply_requested: false,
             cancel_requested: false,
@@ -6908,6 +7058,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_agent_qzz".into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
@@ -6958,6 +7109,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human_boyd".into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: Some(marker),
             no_reply_requested: false,
             cancel_requested: false,
@@ -8027,6 +8179,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
@@ -8317,6 +8470,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "actor_human".into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
@@ -8403,6 +8557,7 @@ mod tests {
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
             trigger_actor: "mr-watcher".into(),
+            trigger_private_to: Vec::new(),
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,

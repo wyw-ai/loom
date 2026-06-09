@@ -5074,9 +5074,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          woken. These are the delivery choices and when to use each:\n\
            - `loom --json message ask @id [@id2] --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
                Wakes those specific actors. Use when one or a few named actors must act/answer/decide next.\n\
-           - `loom --json message send --private-to @id --text \"...\"`\n\
-               Wakes @id, and the message is visible ONLY to you and @id. Use for any secret/hidden content\n\
-               (a role, a private prompt, a result meant for one actor).\n\
+           - `loom --json message send --private-to @id [--private-to @id2 ...] --text \"...\"`\n\
+               Wakes those recipients, and the message is visible ONLY to you and them. Use for any\n\
+               secret/hidden content (a role, a private prompt, a result meant for one actor). Pass several\n\
+               --private-to in one message to wake a hidden sub-group privately in a space only they can see.\n\
            - `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
                Posts to everyone but wakes NOBODY (notify_only). Use ONLY for pure information that needs no\n\
                response — a public summary or announcement nobody must act on.\n\
@@ -5171,6 +5172,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              must be neutral about hidden state: anything that refers to one participant's hidden role, hidden\n\
              knowledge, or hidden action — including telling them what they themselves did last phase — goes to\n\
              that participant with `--private-to`, never into a shared message.\n\
+           - To make a hidden SUB-GROUP coordinate (two or more participants who share hidden state and must\n\
+             decide together), keep the whole interaction in a private space — never convene or name them in\n\
+             the shared channel. Two ways: (a) send one message carrying a `--private-to` for EACH member\n\
+             (it wakes them all and only they see it), and let them reply within that same private audience;\n\
+             or (b) for sustained back-and-forth, `loom --json channel create --title \"...\"` (private by\n\
+             default) and `channel invite` only those members, then run their coordination there. Collect\n\
+             their decision privately and resolve it; the shared channel shows only the neutral outcome.\n\
            - In a shared message, state only what is genuinely public: whose turn it is, that an outcome\n\
              occurred and who is now out, and counts of public actions (e.g. a vote tally). Never state,\n\
              confirm, or hint at a participant's hidden role/group, a secret action, who-did-what-to-whom, the\n\
@@ -5215,6 +5223,16 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          If several participants each need their own private piece, send each separately. Any public note\n\
          stays neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's\n\
          secret.\n\
+         </example>\n\
+         <example caption=\"Make a hidden sub-group decide together — privately, never in the shared channel\">\n\
+         Several participants share hidden state and must coordinate a joint hidden decision. Convening them in\n\
+         the shared channel would expose who they are, so keep it entirely private. Wake them together in a\n\
+         space only they can see by giving one message a --private-to for each member, and ask them to reply\n\
+         within that same private audience:\n\
+           loom --json message send --private-to @member_1 --private-to @member_2 --target \"$LOOM_REPLY_TARGET\" --text \"You share <hidden state>. Decide your joint action together and reply here; only you can see this.\"\n\
+         (For longer back-and-forth, instead `loom --json channel create --title \"...\"` — private by default —\n\
+         and `channel invite` only these members, then coordinate there.) Collect their decision privately and\n\
+         resolve it; the shared channel later shows only the neutral outcome, never their identities or plan.\n\
          </example>\n\
          <example caption=\"Collect several async replies before proceeding — read the inbox first\">\n\
          A timer wakes you to tally responses you requested. The replies are NOT in your prompt, so gather\n\

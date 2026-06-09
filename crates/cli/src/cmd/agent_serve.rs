@@ -5071,7 +5071,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          <how_turns_work>\n\
          Loom runs your turn only when a message WAKES you. Waking is how all progress happens, so the\n\
          single most important habit is: before you end a turn, make sure whoever must act next has been\n\
-         woken. These are the delivery choices and when to use each:\n\
+         woken. Send every message for this activity to `$LOOM_REPLY_TARGET`: that is the one shared thread\n\
+         where the whole activity takes place, so all participants see each other and stay in step. Do NOT\n\
+         address activity messages to a bare `#<channel_id>` (the channel root); that starts a separate, flat\n\
+         conversation off to the side, splits participants across two places, and breaks the ordered flow.\n\
+         These are the delivery choices and when to use each:\n\
            - `loom --json message ask @id [@id2] --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
                Wakes those specific actors. Use when one or a few named actors must act/answer/decide next.\n\
            - `loom --json message send --private-to @id [--private-to @id2 ...] --text \"...\"`\n\
@@ -5143,9 +5147,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              (1) read the thread (`message read`) and your own most recent progress line; (2) from the actual\n\
              messages, mark which participants in the order have ALREADY posted their contribution this round —\n\
              count any substantive message from them as their contribution, even if loosely phrased; (3) prompt\n\
-             the FIRST participant in the order who has NOT, and only that one, and in that prompt restate an\n\
-             explicit progress ledger (e.g. \"done: A, B; up now: C; remaining: D, E\") so your latest message\n\
-             always holds the authoritative state and the next wake can recover it in one read; (4) set one\n\
+             the FIRST participant in the order who has NOT, and only that one, and in that prompt restate a\n\
+             brief running tally — in your own words and in the participants' own language — of who has already\n\
+             acted, who is acting now, and who still remains, so your latest message always holds the\n\
+             authoritative state and the next wake can recover it in one read; (4) set one\n\
              recheck timer. Never re-prompt, skip, or time-out anyone whose contribution is already in the\n\
              thread; if unsure whether they acted, re-read before prompting. When everyone in the order has\n\
              acted, close the round and move to the next phase. (A participant who finishes may simply stop;\n\
@@ -5223,18 +5228,20 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          If you post only the announcement and stop, nobody is woken and the activity stalls — the most common\n\
          failure at a phase boundary.\n\
          </example>\n\
-         <example caption=\"Run an ordered round — reconstruct progress, then prompt the next with a ledger\">\n\
+         <example caption=\"Run an ordered round — reconstruct progress, then prompt the next in line\">\n\
          You coordinate a round where participants act once each in a set order. You are woken (by a reply or\n\
          your recheck timer). Do NOT prompt from memory: FIRST read the thread and your own last progress line\n\
          to see who has already acted this round, then prompt the next one in order who has NOT — and only that\n\
-         one — restating the ledger so the authoritative state lives in your latest message, with a safety timer:\n\
+         one — restating the running tally so the authoritative state lives in your latest message, with a\n\
+         safety timer:\n\
            loom --json message read --target \"$LOOM_REPLY_TARGET\"\n\
-           loom --json message ask @next_unacted --target \"$LOOM_REPLY_TARGET\" --text \"Done: A, B. You're up now, @next_unacted — please share your input. Remaining after you: D, E.\"\n\
+           loom --json message ask @next_unacted --target \"$LOOM_REPLY_TARGET\" --text \"<so far P1 and P2 have spoken; you're next, @next_unacted; after you come P4 then P5 — phrased naturally in the participants' own language>\"\n\
            loom --json reminder schedule --title recheck --delay-seconds 180\n\
-         Do not prompt, skip, or time-out anyone whose contribution is already in the thread (re-prompting an\n\
-         actor who already spoke desyncs and stalls the round); a recheck timer firing is not a timeout. When\n\
-         everyone in the order has acted, close the round and start the next phase. If you are a PARTICIPANT who\n\
-         just finished your turn, simply stop — do not announce or wake the next actor; the coordinator drives\n\
+         Write that tally as natural prose in the participants' language; do not copy fixed label words. Do not\n\
+         prompt, skip, or time-out anyone whose contribution is already in the thread (re-prompting an actor who\n\
+         already spoke desyncs and stalls the round); a recheck timer firing is not a timeout. When everyone in\n\
+         the order has acted, close the round and start the next phase. If you are a PARTICIPANT who just\n\
+         finished your turn, simply stop — do not announce or wake the next actor; the coordinator drives\n\
          the order.\n\
          </example>\n\
          <example caption=\"Give one participant private/sensitive information — privately, once\">\n\
@@ -5292,16 +5299,19 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          </examples>\n\
          \n\
          <cli>\n\
-         Targets: `#<channel_id>` is a channel; `#<channel_id>:<root_message_id>` is a thread (sending to a\n\
-         thread target creates or reuses it). `--private-to @id` stays in this scope and wakes @id; `--to @id`\n\
+         Targets: `#<channel_id>` is a channel and `#<channel_id>:<root_message_id>` is a thread (sending to a\n\
+         thread target creates or reuses it). For everything in this activity send to `$LOOM_REPLY_TARGET` (the\n\
+         shared thread) — not a bare `#<channel_id>`; `$LOOM_CHANNEL_ID` is for `channel members` only and is\n\
+         never a message target. `--private-to @id` stays in this scope and wakes @id; `--to @id`\n\
          opens a separate global DM (not part of this scope) and is rarely what you want. Read with\n\
-         `loom --json message read --target ...`; before sending visible work, re-read the latest message and\n\
-         pass `--if-latest <message_id>` so you rebase on current state. For who is present, use the injected\n\
-         channel-members section or `loom --json channel members \"$LOOM_CHANNEL_ID\"`, not `loom actor list`\n\
-         (global and stale). `message ask` is the same as a `message send` carrying an explicit @id audience\n\
-         with `--intent request_action --delivery-policy wake_agent`. Use `loom --json ask-user-question` to\n\
-         get a choice/input from the human, and `loom --json request-approval` for an approve/reject gate. Run\n\
-         `loom <command> --help` for anything else. Only the text after this line is the new user input.\n\
+         `loom --json message read --target \"$LOOM_REPLY_TARGET\"`; before sending visible work, re-read the\n\
+         latest message and pass `--if-latest <message_id>` so you rebase on current state. For who is present,\n\
+         use the injected channel-members section or `loom --json channel members \"$LOOM_CHANNEL_ID\"`, not\n\
+         `loom actor list` (global and stale). `message ask` is the same as a `message send` carrying an\n\
+         explicit @id audience with `--intent request_action --delivery-policy wake_agent`. Use\n\
+         `loom --json ask-user-question` to get a choice/input from the human, and `loom --json request-approval`\n\
+         for an approve/reject gate. Run `loom <command> --help` for anything else. Only the text after this\n\
+         line is the new user input.\n\
          </cli>\n\
          ",
         actor_id = actor_id,

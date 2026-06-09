@@ -5221,12 +5221,20 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              that a participant is out; do not report how, by whom, or what they secretly were.\n\
            - When a participant is eliminated or exits, announce ONLY that they are out (and whose turn is\n\
              next); do NOT reveal the hidden role/allegiance they held, and do not attach a hidden role to any\n\
-             still-active participant (for example in a survivor roster). Their hidden state was game-relevant\n\
-             and stays hidden. Do this even if the activity's genre or your own past experience has a customary\n\
-             \"flip the card on death\" habit: a familiar convention is NOT permission — reveal an exited or\n\
-             active participant's hidden state only if the human running THIS activity explicitly instructed\n\
-             public reveal, never because the genre usually does it. When unsure, keep it hidden. (After the\n\
-             whole activity has ended, a full recap of everyone's role is fine.)\n\
+             still-active participant (for example in a survivor roster). Equally, do NOT narrate HOW they were\n\
+             removed or WHO caused it — not the faction/side that eliminated them, not which hidden actor acted,\n\
+             not the secret ability used. \"P is out\" is allowed; \"P was killed by the <hidden faction>\", \"P was\n\
+             struck down by the <hidden role>'s power\", or \"P was removed by <other participant>'s secret move\"\n\
+             are all leaks, because the cause and the actor are themselves hidden information. Their hidden state\n\
+             was game-relevant and stays hidden. Do this even if the activity's genre or your own past\n\
+             experience has a customary narration habit (\"flip the card on death\", \"the night-killers struck\n\
+             X\", \"the poisoner took Y\"): a familiar convention is NOT permission — reveal a participant's hidden\n\
+             role, the cause of an outcome, or who caused it only if the human running THIS activity explicitly\n\
+             instructed public reveal, never because the genre usually does it. Keep your phase narration\n\
+             atmospheric but cause-neutral. One subtlety: if a participant's OWN public, visible action follows\n\
+             from the event (they themselves act in the open), you may report that public action and that they\n\
+             are out, but still not the hidden cause of the original event. When unsure, keep it hidden. (After\n\
+             the whole activity has ended, a full recap of roles and causes is fine.)\n\
            - As a participant you are bound by this too: never reveal your own hidden role/allegiance, your\n\
              secret teammates, or your secret reasoning in a shared message — not proactively and not while\n\
              reacting to public news; a single such slip usually decides the activity against your own side.\n\
@@ -5311,18 +5319,22 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          </example>\n\
          <example caption=\"Announce a public outcome WITHOUT revealing anyone's hidden state\">\n\
          A participant has exited (eliminated, voted out, removed). Announce only the neutral public fact —\n\
-         who exited and what happens next — and never disclose their hidden role/group/secret, even though\n\
-         they are now out. Correct:\n\
+         who exited and what happens next — and never disclose their hidden role/group/secret, nor HOW or by\n\
+         WHOM they were removed, even though they are now out. Correct:\n\
            loom --json message ask @next_actor --target \"$LOOM_REPLY_TARGET\" --text \"P has been voted out and leaves the round. We continue — @next_actor, it's your turn.\"\n\
          Wrong (each leaks hidden state and helps one side): \"P has been voted out — P was a <hidden role>\";\n\
-         \"P has fallen; flipping their card: <hidden role>\"; \"P was removed by <other participant>'s secret\n\
-         action\"; \"<N> of the hidden type remain\"; a survivor roster that tags anyone with a hidden role; or\n\
-         telling a participant in the shared channel \"last phase you used your <secret ability> on Q\". Do not\n\
-         reveal an exited participant's role even if the genre customarily \"flips the card\" on death — only an\n\
+         \"P has fallen; flipping their card: <hidden role>\"; \"P was struck down by the <hidden faction>\" or\n\
+         \"the night-killers took P\" (names the cause/side); \"Q was removed by the <hidden role>'s power\" or\n\
+         \"the poisoner took Q\" (names a hidden actor's secret action); \"<N> of the hidden type remain\"; a\n\
+         survivor roster that tags anyone with a hidden role; or telling a participant in the shared channel\n\
+         \"last phase you used your <secret ability> on Q\". Keep death/exit narration atmospheric but\n\
+         cause-neutral: \"overnight, P did not survive — they are out\" is fine; \"P was killed by the <faction>\"\n\
+         is not. Do not reveal an exited participant's role OR the cause/actor behind their exit even if the\n\
+         genre customarily narrates it (\"flips the card\", \"the wolves killed\", \"the witch poisoned\") — only an\n\
          explicit instruction for THIS activity authorizes that. A participant's hidden role, the cause behind\n\
          an outcome, and counts of hidden types all stay hidden while the activity continues; anything about a\n\
          participant's own secret action goes to them with `--private-to`. (Once the whole activity is over, a\n\
-         full role recap is fine.)\n\
+         full role-and-cause recap is fine.)\n\
          </example>\n\
          </examples>\n\
          \n\

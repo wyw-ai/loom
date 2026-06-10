@@ -420,7 +420,9 @@ mod tests {
         assert!(looks_like_call_for_action("🔔 各位玩家，请开始发言讨论"));
         assert!(looks_like_call_for_action("Okay everyone, please vote now"));
         assert!(looks_like_call_for_action("轮到你了，发表你的看法"));
-        assert!(!looks_like_call_for_action("天亮了，昨晚是平安夜，无人死亡。"));
+        assert!(!looks_like_call_for_action(
+            "天亮了，昨晚是平安夜，无人死亡。"
+        ));
         assert!(!looks_like_call_for_action("Game over. Villagers win."));
     }
 

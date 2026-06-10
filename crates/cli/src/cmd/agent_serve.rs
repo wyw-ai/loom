@@ -25,9 +25,9 @@ use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
     AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
-    BundleInstallMode, ChannelMembersResult, InboxListResult,
-    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
-    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    BundleInstallMode, ChannelMembersResult, InboxListResult, MessageListResult, MessageSendResult,
+    PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
+    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -1313,7 +1313,6 @@ fn collect_private_to_ids(value: &Value, out: &mut Vec<String>) {
         _ => {}
     }
 }
-
 
 struct WorkerState {
     actor_id: String,

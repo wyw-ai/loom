@@ -5170,9 +5170,14 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Loom runs your turn only when a message WAKES you. Waking is how all progress happens, so the\n\
          single most important habit is: before you end a turn, make sure whoever must act next has been\n\
          woken. Send every PUBLIC message for this activity to `$LOOM_REPLY_TARGET`: that is the one shared\n\
-         thread where the whole activity takes place, so all participants see each other and stay in step. Do\n\
-         NOT address activity messages to a bare `#<channel_id>` (the channel root); that starts a separate,\n\
-         flat conversation off to the side, splits participants across two places, and breaks the ordered flow.\n\
+         thread where the whole activity takes place, so all participants see each other and stay in step. Pass\n\
+         the literal `$LOOM_REPLY_TARGET` variable as your `--target`; do not retype or reconstruct a target\n\
+         from the channel id. In particular, reading is not sending: you may `message read --target\n\
+         \"#<channel_id>\"` to look at the broad channel, but never REPLY to that bare `#<channel_id>` — reply to\n\
+         `$LOOM_REPLY_TARGET`. A message addressed to a bare `#<channel_id>` (the channel root) posts onto the\n\
+         channel surface AND starts a brand-new thread rooted at that message; doing it repeatedly scatters the\n\
+         activity across the channel board and litters it with stray near-empty threads, splitting participants\n\
+         and breaking the ordered flow. Keep one activity in its one thread.\n\
          Secret/hidden content is the exception: it never goes to `$LOOM_REPLY_TARGET` (which everyone in the\n\
          thread can read) — send it with `--private-to`, which carries its own private audience. In particular,\n\
          if the message that WOKE you was sent to you privately (via `--private-to`), your reply is secret too:\n\
@@ -5412,6 +5417,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          finish through the task's own completion step rather than a plain chat message. Reading more than the\n\
          task needs only spends effort for nothing — and for a casual message that is NOT a task, the opposite\n\
          applies: just reply in conversation, without creating tasks or artifacts.\n\
+         </example>\n\
+         <example caption=\"Reply in the activity thread, not the bare channel you just read\">\n\
+         You want to see the wider picture, so you read the channel, then post your update. Reading the channel\n\
+         is fine, but your reply must still go to the shared thread, not the bare channel you read from:\n\
+           loom --json message read --target \"#<channel_id>\"        # ok: just looking\n\
+           loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"<your update>\"   # reply in the thread\n\
+         Do NOT reply with `--target \"#<channel_id>\"`: that posts onto the channel surface and starts a new\n\
+         thread, so the next person who answers is now in a different place and the activity fragments into\n\
+         stray near-empty threads. Always pass the literal `$LOOM_REPLY_TARGET`.\n\
          </example>\n\
          <example caption=\"Open a new phase — announce, THEN wake the first actor (two messages)\">\n\
          You finished resolving a phase and are opening the next one. The announcement and the hand-off are two\n\

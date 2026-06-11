@@ -258,14 +258,14 @@ async fn resolve_send_target(
                 Ok(format!("dm:@{to}"))
             }
         }
-        (None, None, true) => infer_current_scope_target(client).await,
+        (None, None, true) => infer_current_scope_target(client, true).await,
         (Some(_), Some(_), _) => bail!("use either --target or --to, not both"),
         (None, Some(_), true) => unreachable!("--to/--private-to conflict checked earlier"),
         _ => bail!("missing destination: pass --target or --to"),
     }
 }
 
-async fn infer_current_scope_target(client: &Client) -> Result<String> {
+async fn infer_current_scope_target(client: &Client, scope_private: bool) -> Result<String> {
     if let Some(target) = std::env::var("LOOM_REPLY_TARGET")
         .ok()
         .map(|value| value.trim().to_string())
@@ -284,7 +284,7 @@ async fn infer_current_scope_target(client: &Client) -> Result<String> {
         .filter(|value| !value.is_empty())
         .context("missing destination: pass --target or run inside a Loom agent turn")?;
     match scope_kind.as_str() {
-        "channel" => Ok(format!("#{scope_id}")),
+        "channel" => current_channel_scope_target(&scope_id, scope_private),
         "thread" => {
             let mut params = json!({});
             if let Some(channel_id) = std::env::var("LOOM_CHANNEL_ID")
@@ -304,6 +304,15 @@ async fn infer_current_scope_target(client: &Client) -> Result<String> {
         }
         _ => bail!("missing destination: unsupported LOOM_SCOPE_KIND `{scope_kind}`"),
     }
+}
+
+fn current_channel_scope_target(scope_id: &str, scope_private: bool) -> Result<String> {
+    if scope_private {
+        bail!(
+            "missing destination: same-scope private delivery from a channel turn would target the bare channel and create a new thread; pass --target \"$LOOM_REPLY_TARGET\" or an explicit #channel:root target, or pass --target #channel if a new root is intentional"
+        );
+    }
+    Ok(format!("#{scope_id}"))
 }
 
 fn normalize_actor_ids(raw_values: Vec<String>) -> Result<Vec<String>> {
@@ -440,6 +449,16 @@ mod tests {
         // No active thread (e.g. the channel itself is the reply target) -> no warning.
         assert!(channel_fragmentation_warning_inner("#chan_x", false, Some("#chan_x")).is_none());
         assert!(channel_fragmentation_warning_inner("#chan_x", false, None).is_none());
+    }
+
+    #[test]
+    fn channel_scope_private_delivery_requires_explicit_target() {
+        let error = current_channel_scope_target("chan_demo", true).unwrap_err();
+        assert!(error.to_string().contains("explicit #channel:root"));
+        assert_eq!(
+            current_channel_scope_target("chan_demo", false).unwrap(),
+            "#chan_demo"
+        );
     }
 
     #[test]

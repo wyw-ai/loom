@@ -13,6 +13,7 @@ __pycache__/
 !/docs/README.md
 !/docs/gui-actor-provider-management-design.md
 !/docs/loom-refactor-plan.md
+!/docs/loop-engineering.md
 !/docs/am-loom-bridge.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md

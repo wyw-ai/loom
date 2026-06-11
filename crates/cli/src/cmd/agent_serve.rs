@@ -1222,12 +1222,44 @@ impl AgentTrigger {
     fn reply_target(&self) -> Option<String> {
         match self {
             AgentTrigger::Message(message) => Some(reply_target_for_message(message)),
-            AgentTrigger::Event(_) => None,
+            AgentTrigger::Event(_) => self
+                .meta_value("loomReplyTarget")
+                .or_else(|| self.meta_value("replyTarget"))
+                .and_then(Value::as_str)
+                .and_then(normalize_reply_target),
         }
     }
 
     fn is_message(&self) -> bool {
         matches!(self, AgentTrigger::Message(_))
+    }
+}
+
+async fn reply_target_for_trigger(
+    client: &Arc<Client>,
+    actor_id: &str,
+    trigger: &AgentTrigger,
+) -> Option<String> {
+    if let Some(target) = trigger.reply_target() {
+        return Some(target);
+    }
+    if !matches!(trigger, AgentTrigger::Event(_))
+        || !matches!(trigger.scope().kind, ScopeKind::Thread)
+    {
+        return None;
+    }
+    match message_target_for_scope(client, trigger.scope()).await {
+        Ok(target) => Some(target),
+        Err(e) => {
+            tracing::warn!(
+                actor = %actor_id,
+                trigger = %trigger.id(),
+                scope = %trigger.scope().id,
+                %e,
+                "failed to derive thread reply target for event trigger"
+            );
+            None
+        }
     }
 }
 
@@ -1243,6 +1275,18 @@ fn reply_target_for_message(message: &Message) -> String {
             format!("#{}:{}", message.scope.id, message.id)
         }
         ScopeKind::Channel => message.target.clone(),
+    }
+}
+
+fn normalize_reply_target(raw: &str) -> Option<String> {
+    let target = raw.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if target.starts_with('#') || target.starts_with("dm:") {
+        Some(target.to_string())
+    } else {
+        None
     }
 }
 
@@ -3275,13 +3319,14 @@ async fn dispatch_trigger(
         let prompt = compose_envelope_prompt(client, state, &trigger, &turn_input).await;
         let no_reply_file =
             no_reply_file_for_turn(client, state, trigger.scope(), &run_res.run.id).await;
+        let reply_target = reply_target_for_trigger(client, &state.actor_id, &trigger).await;
         let active = ActiveTurn {
             id: run_res.run.id.clone(),
             run_id: run_res.run.id.clone(),
             scope: trigger.scope().clone(),
             trigger_source_id: trigger.id().to_string(),
             trigger_is_message: trigger.is_message(),
-            reply_target: trigger.reply_target(),
+            reply_target,
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
             trigger_actor: trigger.actor_id().to_string(),
@@ -5183,10 +5228,15 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          reply with `--private-to` (include at least `$LOOM_TRIGGER_ACTOR`, the actor who woke you, plus any\n\
          co-recipients you are coordinating with) — never to `$LOOM_REPLY_TARGET`, which would expose it.\n\
          These are the delivery choices and when to use each. Two independent things matter: WHO IS WOKEN\n\
-         (whose turn runs next) and WHO CAN SEE the message (visibility). `@mentions`/`ask` control only who is\n\
-         woken; they do NOT restrict visibility. Visibility is public UNLESS you use `--private-to`. So a\n\
-         message sent to `$LOOM_REPLY_TARGET` is readable by EVERYONE in the activity even if it @mentions or\n\
-         `ask`s only a few — naming hidden actors there exposes them to all.\n\
+         (whose turn runs next) and WHO CAN SEE the message (visibility). Treat `@id` in message text as an\n\
+         addressable participant reference, not as a harmless label: use it only when that actor is being\n\
+         directly addressed or intentionally woken/associated with the message. When a private message to A is\n\
+         ABOUT B (for example asking A to evaluate, choose, act on, report about, or remember B), write B's\n\
+         plain display name or a neutral description without `@`. The person or item a message is ABOUT is not\n\
+         automatically part of the message audience. `@mentions`/`ask` control only who is woken; they do NOT\n\
+         restrict visibility. Visibility is public UNLESS you use `--private-to`. So a message sent to\n\
+         `$LOOM_REPLY_TARGET` is readable by EVERYONE in the activity even if it @mentions or `ask`s only a few\n\
+         — naming hidden actors there exposes them to all.\n\
            - `loom --json message ask @id [@id2] --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
                Wakes those specific actors AND is publicly visible to everyone. Use only when what you ask is\n\
                public (an open turn, a public question). NEVER use it to wake a hidden individual/sub-group or\n\
@@ -5222,9 +5272,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              drop it straight into your send: `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text\n\
              \"...\"`. Do NOT send a private reply to `$LOOM_REPLY_TARGET` — that target is the public thread and\n\
              would broadcast your secret to everyone. Put ONLY your own group in that audience: never add anyone\n\
-             else, and in particular never add the person your hidden action concerns or targets — naming them\n\
-             in your text (e.g. proposing to act on them) does NOT mean adding them as a recipient, and\n\
-             including them would hand them your secret. Reasoning you do not send accomplishes nothing.\n\
+             else, and in particular never add the person your hidden action concerns or targets. When you need\n\
+             to mention that subject in the text, use their plain display name or a neutral description, not an\n\
+             `@id`; the subject is what the private message is ABOUT, not who may see it. Including them as a\n\
+             recipient, or writing them as an addressed @mention, can hand them your secret. Reasoning you do not\n\
+             send accomplishes nothing.\n\
            - It only gives you information you were not asked to act on (a role card, an assignment, an FYI,\n\
              a result to remember): simply remember it and end with `run ignore`. Do NOT reply \"got it\" /\n\
              \"收到\" — a needless acknowledgement wakes the sender, and for a coordinator mid-setup it can\n\
@@ -5390,8 +5442,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` (the daemon-provided `--private-to` flags for the author plus your\n\
              co-recipients) — or equivalently `--private-to` the actor who woke you plus the prompt's other\n\
              recipients — and NOT to `$LOOM_REPLY_TARGET` (the public thread). The audience is who may SEE the\n\
-             message — your own group only — not who it is ABOUT: never add the participant your hidden action\n\
-             targets or discusses, or you hand them the secret. Coordinate with hidden teammates only in that\n\
+             message — your own group only — not who it is ABOUT: never add or @mention the participant your\n\
+             hidden action targets or discusses; refer to that subject by plain display name or neutral\n\
+             description instead, or you hand them the secret. Coordinate with hidden teammates only in that\n\
              private audience, never in the shared channel. In open discussion you may argue, claim, or bluff;\n\
              only you may disclose your own hidden state, by your own choice in your own public message — never\n\
              the coordinator on your behalf.\n\
@@ -5456,9 +5509,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          When a participant must receive confidential information only they should see (a private\n\
          assignment, a secret, a credential), send it to them alone; the public channel never carries it:\n\
            loom --json message send --private-to @participant_c --text \"<their private assignment / secret here>\"\n\
-         If several participants each need their own private piece, send each separately. Any public note\n\
-         stays neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's\n\
-         secret.\n\
+         If the private note is about another participant, task, option, or target, keep the audience and subject\n\
+         separate. Address only the recipient with `--private-to`; name the subject in plain text without `@`:\n\
+           loom --json message send --private-to @participant_c --text \"Please evaluate Participant B and send me the result privately.\"\n\
+         Wrong: `loom --json message send --private-to @participant_c --text \"Please evaluate @participant_b ...\"`\n\
+         because @participant_b is not being addressed and should not be attached to the private message. If\n\
+         several participants each need their own private piece, send each separately. Any public note stays\n\
+         neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's secret.\n\
          </example>\n\
          <example caption=\"Wake a hidden sub-group — with --private-to, NEVER ask on the shared thread\">\n\
          Several participants share hidden state and must coordinate a joint hidden decision. Convening them in\n\
@@ -5486,11 +5543,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          You were privately woken to make a hidden choice or to coordinate with your hidden teammates. The\n\
          daemon set `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` to the exact `--private-to` flags for your group (author +\n\
          co-recipients, never you). Reply by dropping those flags straight in — NOT to `$LOOM_REPLY_TARGET`:\n\
-           loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"My choice is to act on @target.\"\n\
-         The audience is who may SEE this (your group), not who it is about: even though your text names\n\
-         @target, do NOT add @target to `--private-to` — that would reveal your group and plan to the very\n\
-         person you are acting on. `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination,\n\
-         role, or allegiance there (or to the target) exposes your side and usually loses the activity for you.\n\
+           loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"My choice is to act on Target Name.\"\n\
+         The audience is who may SEE this (your group), not who it is about. The target/subject is not being\n\
+         addressed, so write the target's plain display name or description without `@`, and do NOT add that\n\
+         target to `--private-to` — that would reveal your group and plan to the very person you are acting on.\n\
+         `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination, role, or allegiance there\n\
+         (or to the target) exposes your side and usually loses the activity for you.\n\
          </example>\n\
          <example caption=\"You only received information — stay silent\">\n\
          You receive a private note that just informs you of something (an assignment, an FYI) and asks for\n\
@@ -5905,33 +5963,34 @@ async fn flush_failure_text(
     meta: Option<Meta>,
 ) -> Result<()> {
     let notice = failure_notice_for_turn(actor_id, active, text);
-    if active.trigger_is_message {
-        if let Some(target) = active.reply_target.as_deref() {
-            let parent_message_id =
-                parent_message_id_for_reply_target(&active.trigger_source_id, target);
-            return send_agent_message(
-                client,
-                target,
-                notice.body,
-                parent_message_id,
-                notice.audience_actor_id,
-                notice.intent,
-                notice.delivery_policy,
-                meta.unwrap_or_default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                tracing::warn!(
-                    actor = %actor_id,
-                    turn = %active.id,
-                    scope = %active.scope.id,
-                    %e,
-                    "failure message.send failed"
-                );
-                e
-            });
-        }
+    if let Some(target) = active.reply_target.as_deref() {
+        let parent_message_id = parent_message_id_for_reply_target(
+            &active.trigger_source_id,
+            target,
+            active.trigger_is_message,
+        );
+        return send_agent_message(
+            client,
+            target,
+            notice.body,
+            parent_message_id,
+            notice.audience_actor_id,
+            notice.intent,
+            notice.delivery_policy,
+            meta.unwrap_or_default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!(
+                actor = %actor_id,
+                turn = %active.id,
+                scope = %active.scope.id,
+                %e,
+                "failure message.send failed"
+            );
+            e
+        });
     }
     send_scope_message(
         client,
@@ -5959,7 +6018,14 @@ async fn flush_failure_text(
     })
 }
 
-fn parent_message_id_for_reply_target(trigger_source_id: &str, target: &str) -> Option<String> {
+fn parent_message_id_for_reply_target(
+    trigger_source_id: &str,
+    target: &str,
+    trigger_is_message: bool,
+) -> Option<String> {
+    if !trigger_is_message {
+        return None;
+    }
     let root_message_id = target.strip_prefix('#').and_then(|raw| raw.split_once(':'));
     if root_message_id.is_some_and(|(_, root_message_id)| root_message_id == trigger_source_id) {
         None
@@ -6122,7 +6188,8 @@ async fn append_run_started_ack(
         metadata
     };
     let result = if let Some(target) = active.reply_target.as_deref() {
-        let parent_message_id = parent_message_id_for_reply_target(trigger.id(), target);
+        let parent_message_id =
+            parent_message_id_for_reply_target(trigger.id(), target, trigger.is_message());
         send_agent_message(
             client,
             target,
@@ -6337,33 +6404,34 @@ async fn flush_text(
     text: String,
     meta: Option<Meta>,
 ) -> Result<()> {
-    if active.trigger_is_message {
-        if let Some(target) = active.reply_target.as_deref() {
-            let parent_message_id =
-                parent_message_id_for_reply_target(&active.trigger_source_id, target);
-            return send_agent_message(
-                client,
-                target,
-                text,
-                parent_message_id,
-                Some(active.trigger_actor.clone()),
-                MessageIntent::Chat,
-                DeliveryPolicy::NotifyOnly,
-                meta.unwrap_or_default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                tracing::warn!(
-                    actor = %actor_id,
-                    turn = %active.id,
-                    scope = %active.scope.id,
-                    %e,
-                    "message.send failed"
-                );
-                e
-            });
-        }
+    if let Some(target) = active.reply_target.as_deref() {
+        let parent_message_id = parent_message_id_for_reply_target(
+            &active.trigger_source_id,
+            target,
+            active.trigger_is_message,
+        );
+        return send_agent_message(
+            client,
+            target,
+            text,
+            parent_message_id,
+            Some(active.trigger_actor.clone()),
+            MessageIntent::Chat,
+            DeliveryPolicy::NotifyOnly,
+            meta.unwrap_or_default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!(
+                actor = %actor_id,
+                turn = %active.id,
+                scope = %active.scope.id,
+                %e,
+                "message.send failed"
+            );
+            e
+        });
     }
     send_scope_message(
         client,
@@ -6464,6 +6532,21 @@ mod tests {
             attachments: Vec::new(),
             reactions: Vec::new(),
             metadata: Meta::default(),
+        }
+    }
+
+    fn sample_event(id: &str, scope: ScopeRef) -> Event {
+        Event {
+            id: id.into(),
+            kind: "reminder.fire".into(),
+            actor_id: "actor_agent_dm".into(),
+            scope,
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({}),
+            relations: Vec::new(),
+            _meta: None,
         }
     }
 
@@ -6874,18 +6957,59 @@ mod tests {
     }
 
     #[test]
+    fn event_reply_target_comes_from_meta() {
+        let mut event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+        );
+        event._meta = Some(Meta::from([(
+            "loomReplyTarget".into(),
+            json!("#chan_demo:msg_root"),
+        )]));
+
+        assert_eq!(
+            AgentTrigger::Event(event).reply_target().as_deref(),
+            Some("#chan_demo:msg_root")
+        );
+    }
+
+    #[test]
+    fn event_reply_target_ignores_invalid_meta() {
+        let mut event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+        );
+        event._meta = Some(Meta::from([(
+            "loomReplyTarget".into(),
+            json!("thread_demo"),
+        )]));
+
+        assert_eq!(AgentTrigger::Event(event).reply_target(), None);
+    }
+
+    #[test]
     fn thread_root_reply_target_omits_invalid_channel_parent() {
         assert_eq!(
-            parent_message_id_for_reply_target("msg_root", "#chan_demo:msg_root"),
+            parent_message_id_for_reply_target("msg_root", "#chan_demo:msg_root", true),
             None
         );
         assert_eq!(
-            parent_message_id_for_reply_target("msg_reply", "#chan_demo:msg_root"),
+            parent_message_id_for_reply_target("msg_reply", "#chan_demo:msg_root", true),
             Some("msg_reply".into())
         );
         assert_eq!(
-            parent_message_id_for_reply_target("msg_channel", "#chan_demo"),
+            parent_message_id_for_reply_target("msg_channel", "#chan_demo", true),
             Some("msg_channel".into())
+        );
+        assert_eq!(
+            parent_message_id_for_reply_target("evt_reminder", "#chan_demo:msg_root", false),
+            None
         );
     }
 
@@ -7347,6 +7471,23 @@ mod tests {
         assert!(manifest.contains("message send --private-to @id"));
         assert!(manifest.contains("stays in this scope and wakes @id"));
         assert!(manifest.contains("opens a separate global DM"));
+    }
+
+    #[test]
+    fn seed_manifest_keeps_private_subjects_out_of_addressing_mentions() {
+        let manifest = seed_manifest(
+            "actor_agent_dm",
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_private_workflow".into(),
+            },
+        );
+
+        assert!(manifest.contains("private message to A is"));
+        assert!(manifest.contains("plain display name or a neutral description without `@`"));
+        assert!(manifest.contains("Please evaluate Participant B"));
+        assert!(manifest.contains("My choice is to act on Target Name."));
+        assert!(!manifest.contains("My choice is to act on @target."));
     }
 
     #[test]

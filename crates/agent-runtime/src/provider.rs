@@ -2395,12 +2395,7 @@ fn claude_manifest() -> ProviderManifest {
         BTreeMap::from([
             (
                 "print".into(),
-                mode(
-                    "{bin}",
-                    first_args,
-                    "claude_stream_json",
-                    Some(session),
-                ),
+                mode("{bin}", first_args, "claude_stream_json", Some(session)),
             ),
             ("nonprint".into(), nonprint_mode),
         ]),
@@ -2459,12 +2454,7 @@ fn qoder_manifest() -> ProviderManifest {
         "Qoder CLI",
         &["qodercli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = mode(
-                "{bin}",
-                first_args,
-                "claude_stream_json",
-                Some(session),
-            );
+            let mut mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
             mode.stdout.capture = Some(session_capture("$.session_id"));
             mode
         })]),
@@ -2507,12 +2497,7 @@ fn copilot_manifest() -> ProviderManifest {
         "GitHub Copilot CLI",
         &["copilot", "copilotcli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = mode(
-                "{bin}",
-                args,
-                "copilot_jsonl_final_text",
-                Some(session),
-            );
+            let mut mode = mode("{bin}", args, "copilot_jsonl_final_text", Some(session));
             mode.stdout = copilot_jsonl_decoder();
             mode
         })]),
@@ -2984,12 +2969,7 @@ mod tests {
             &["bad-provider"],
             BTreeMap::from([(
                 "print".into(),
-                mode(
-                    "{bin}",
-                    vec![lit("{prompt.full}")],
-                    "text",
-                    None,
-                ),
+                mode("{bin}", vec![lit("{prompt.full}")], "text", None),
             )]),
             &[],
         );
@@ -3006,12 +2986,7 @@ mod tests {
             &["safe-agent"],
             BTreeMap::from([(
                 "print".into(),
-                mode(
-                    "other-agent",
-                    vec![lit("{prompt.full}")],
-                    "text",
-                    None,
-                ),
+                mode("other-agent", vec![lit("{prompt.full}")], "text", None),
             )]),
             &[],
         );
@@ -3031,12 +3006,7 @@ mod tests {
             &["candidate-agent"],
             BTreeMap::from([(
                 "print".into(),
-                mode(
-                    "candidate-agent",
-                    vec![lit("{prompt.full}")],
-                    "text",
-                    None,
-                ),
+                mode("candidate-agent", vec![lit("{prompt.full}")], "text", None),
             )]),
             &[],
         );
@@ -3137,12 +3107,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_provider_owned_prompt() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.prompt = Some(ProviderPromptSpec {
             workspace_files: Vec::new(),
             outputs: BTreeMap::from([(
@@ -3526,12 +3491,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unknown_decoder_format() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "xml".into();
         provider_mode.stdout.name = None;
         let manifest = manifest(
@@ -3548,12 +3508,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unknown_decoder_event_type() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "jsonl".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.events = vec![ProviderDecoderEventSpec {
@@ -3578,12 +3533,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_bad_decoder_reducer() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "jsonl".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
@@ -3608,12 +3558,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_allows_decoder_wildcard_path() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "jsonl".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
@@ -3637,12 +3582,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_allows_json_decoder() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "json".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {

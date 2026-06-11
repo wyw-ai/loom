@@ -4602,6 +4602,7 @@ impl Store {
         msg_id: Option<String>,
         fire_at: Timestamp,
         repeat: Option<String>,
+        meta: Option<Meta>,
     ) -> StoreResult<Reminder> {
         if title.trim().is_empty() {
             return Err(StoreError::InvalidState("reminder title is empty".into()));
@@ -4622,7 +4623,7 @@ impl Store {
             created_at: now,
             updated_at: now,
             last_fired_at: None,
-            _meta: None,
+            _meta: meta,
         };
         self.put_reminder(reminder)
     }
@@ -4752,7 +4753,7 @@ impl Store {
                     None,
                     payload,
                     relations,
-                    None,
+                    reminder._meta.clone(),
                 ) {
                     tracing::warn!(
                         reminder = %reminder.id,
@@ -6060,6 +6061,54 @@ mod tests {
                 None,
             )
             .expect("append message")
+    }
+
+    #[test]
+    fn fired_reminder_preserves_reply_target_meta_on_event() {
+        let store = fresh_store();
+        let channel = store
+            .create_channel("private".into(), Some("actor_agent_dm".into()))
+            .expect("create channel");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let mut meta = Meta::default();
+        meta.insert(
+            "loomReplyTarget".into(),
+            serde_json::json!("#chan_demo:msg_root"),
+        );
+
+        store
+            .schedule_reminder(
+                "actor_agent_dm".into(),
+                "recheck".into(),
+                Some(scope.clone()),
+                None,
+                Utc::now() - ChronoDuration::seconds(1),
+                None,
+                Some(meta),
+            )
+            .expect("schedule reminder");
+
+        let fired = store.fire_due_reminders();
+        assert_eq!(fired.len(), 1);
+
+        let inner = store.inner.read();
+        let event_id = inner
+            .events_by_scope
+            .get(&scope)
+            .and_then(|ids| ids.last())
+            .expect("event id");
+        let event = inner.events.get(event_id).expect("event");
+        assert_eq!(
+            event
+                ._meta
+                .as_ref()
+                .and_then(|meta| meta.get("loomReplyTarget"))
+                .and_then(serde_json::Value::as_str),
+            Some("#chan_demo:msg_root")
+        );
     }
 
     #[test]

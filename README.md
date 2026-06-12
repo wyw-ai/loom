@@ -191,8 +191,8 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow builds Linux and macOS runtime packages, packages the
-macOS desktop DMG, uploads GitHub Release assets, and refreshes the Pages
+The release workflow builds x86_64 Linux and macOS runtime packages, packages
+the macOS desktop DMG, uploads GitHub Release assets, and refreshes the Pages
 download metadata.
 
 ## Repository Layout

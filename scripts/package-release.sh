@@ -108,6 +108,12 @@ ensure_file() {
   fi
 }
 
+runtime_target_available() {
+  local target="$1"
+  local src_dir="$DIST_DIR/$PROFILE/$target"
+  [[ -f "$src_dir/loom" && -f "$src_dir/loom-daemon" && -f "$src_dir/loom-server" ]]
+}
+
 checksum_cmd() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$@"
@@ -263,6 +269,20 @@ write_manifest() {
   log "wrote $manifest"
 }
 
+archive_name_if_exists() {
+  local name="$1"
+  if [[ -f "$PACKAGE_OUT_DIR/$name" ]]; then
+    printf '%s' "$name"
+  fi
+}
+
+archive_sha_if_exists() {
+  local name="$1"
+  if [[ -n "$name" && -f "$PACKAGE_OUT_DIR/$name" ]]; then
+    checksum_cmd "$PACKAGE_OUT_DIR/$name" | awk '{print $1}'
+  fi
+}
+
 write_installer() {
   local installer="$PACKAGE_OUT_DIR/install.sh"
   local runtime_mac="loom-runtime-$VERSION-universal-apple-darwin.tar.gz"
@@ -270,13 +290,12 @@ write_installer() {
   local runtime_linux_arm="loom-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
   local sha_mac sha_linux_x86 sha_linux_arm
 
-  ensure_file "$PACKAGE_OUT_DIR/$runtime_mac"
-  ensure_file "$PACKAGE_OUT_DIR/$runtime_linux_x86"
-  ensure_file "$PACKAGE_OUT_DIR/$runtime_linux_arm"
-
-  sha_mac="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_mac" | awk '{print $1}')"
-  sha_linux_x86="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_linux_x86" | awk '{print $1}')"
-  sha_linux_arm="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_linux_arm" | awk '{print $1}')"
+  runtime_mac="$(archive_name_if_exists "$runtime_mac")"
+  runtime_linux_x86="$(archive_name_if_exists "$runtime_linux_x86")"
+  runtime_linux_arm="$(archive_name_if_exists "$runtime_linux_arm")"
+  sha_mac="$(archive_sha_if_exists "$runtime_mac")"
+  sha_linux_x86="$(archive_sha_if_exists "$runtime_linux_x86")"
+  sha_linux_arm="$(archive_sha_if_exists "$runtime_linux_arm")"
 
   cat >"$installer" <<EOF
 #!/usr/bin/env sh
@@ -473,6 +492,10 @@ package_path="\$package_dir/\$package_name"
 expected_sha="\$(runtime_sha256 "\$target")"
 modules="\$(normalize_modules "\$module_spec")"
 download_url=""
+
+[ -n "\$package_name" ] || die "no runtime package is available for target \$target"
+[ -n "\$expected_sha" ] || die "no checksum is available for target \$target"
+
 if [ -n "\$DOWNLOAD_BASE_URL" ]; then
   download_url="\${DOWNLOAD_BASE_URL%/}/\$package_name"
 fi
@@ -576,9 +599,20 @@ else
   log "skipping binary build; using existing $DIST_DIR/$PROFILE artifacts"
 fi
 
+runtime_package_count=0
 for target in "${RUNTIME_TARGETS[@]}"; do
+  if ! runtime_target_available "$target"; then
+    log "skipping $target; missing runtime artifacts"
+    continue
+  fi
   package_runtime_target "$target"
+  runtime_package_count=$((runtime_package_count + 1))
 done
+
+if [[ "$runtime_package_count" -eq 0 ]]; then
+  echo "no runtime artifacts found under $DIST_DIR/$PROFILE" >&2
+  exit 1
+fi
 
 if [[ "$SKIP_GUI" -eq 0 ]]; then
   package_gui_dmg

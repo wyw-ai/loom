@@ -4257,6 +4257,15 @@ fn render_trigger_prompt_with_names(
     }
     out.push_str("Visible message:\n");
     out.push_str(&visible);
+    out.push_str(
+        "\n\nResponse delivery reminder:\n\
+         If this message asks you to answer, speak, choose, vote, submit a result, or take your turn, make that\n\
+         answer visible by executing a Loom CLI message command before ending the turn. For a public reply use\n\
+         `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; for a private prompt reply use\n\
+         `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`. Do not put the answer only in\n\
+         your assistant final text: that text is private trace and is not delivered to the thread. If no visible\n\
+         reply is needed, end with `loom --json run ignore --reason \"...\"`.\n",
+    );
     out
 }
 

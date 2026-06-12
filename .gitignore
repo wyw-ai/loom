@@ -15,6 +15,10 @@ __pycache__/
 !/docs/loom-refactor-plan.md
 !/docs/loop-engineering.md
 !/docs/am-loom-bridge.md
+!/docs/article-loom-current-design.md
+!/docs/article-loom-image-1.md
+!/docs/article-loom-image-2.md
+!/docs/article-loom-image-3.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
 data

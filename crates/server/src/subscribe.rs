@@ -114,7 +114,10 @@ impl Subscriptions {
         // doing so would break is_noncanonical_agent_worker / wake suppression.
         if !matches!(
             (inner.actor_kind.get(&actor_id), actor_kind),
-            (Some(ActorKind::Agent | ActorKind::Service), ActorKind::Human)
+            (
+                Some(ActorKind::Agent | ActorKind::Service),
+                ActorKind::Human
+            )
         ) {
             inner.actor_kind.insert(actor_id.clone(), actor_kind);
         }
@@ -469,13 +472,25 @@ mod tests {
         let (tx_live, mut rx_live) = mpsc::unbounded_channel();
         let (tx_shell, _rx_shell) = mpsc::unbounded_channel();
 
-        subs.add_connection(Connection { id: "conn_stale".into(), actor_id: None, tx: tx_stale });
-        subs.add_connection(Connection { id: "conn_live".into(),  actor_id: None, tx: tx_live  });
-        subs.add_connection(Connection { id: "conn_shell".into(), actor_id: None, tx: tx_shell });
+        subs.add_connection(Connection {
+            id: "conn_stale".into(),
+            actor_id: None,
+            tx: tx_stale,
+        });
+        subs.add_connection(Connection {
+            id: "conn_live".into(),
+            actor_id: None,
+            tx: tx_live,
+        });
+        subs.add_connection(Connection {
+            id: "conn_shell".into(),
+            actor_id: None,
+            tx: tx_shell,
+        });
 
         // Long-lived daemon binds first, then restarts and the new conn takes over.
         subs.bind_actor("conn_stale", "actor_agent".into(), ActorKind::Agent, true);
-        subs.bind_actor("conn_live",  "actor_agent".into(), ActorKind::Agent, true);
+        subs.bind_actor("conn_live", "actor_agent".into(), ActorKind::Agent, true);
 
         // Simulate a CLI subcommand shelled from inside the agent turn (kind=Human).
         subs.bind_actor("conn_shell", "actor_agent".into(), ActorKind::Human, true);
@@ -501,8 +516,14 @@ mod tests {
             serde_json::json!({ "kind": "message.created" }),
         );
 
-        assert!(rx_live.try_recv().is_ok(),   "canonical agent worker must be woken");
-        assert!(rx_stale.try_recv().is_err(),  "stale agent worker must NOT be woken after a Human re-bind");
+        assert!(
+            rx_live.try_recv().is_ok(),
+            "canonical agent worker must be woken"
+        );
+        assert!(
+            rx_stale.try_recv().is_err(),
+            "stale agent worker must NOT be woken after a Human re-bind"
+        );
     }
 
     #[test]

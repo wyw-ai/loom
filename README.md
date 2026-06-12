@@ -183,6 +183,18 @@ make gui-dev
 Release packaging entry points are available through `make release`,
 `make all-release`, and `make package-release`.
 
+GitHub Actions publishes public artifacts from version tags:
+
+```bash
+node scripts/check-release-version.mjs v0.1.0
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds Linux and macOS runtime packages, packages the
+macOS desktop DMG, uploads GitHub Release assets, and refreshes the Pages
+download metadata.
+
 ## Repository Layout
 
 - `crates/proto` - shared protocol types and JSON-RPC method definitions.

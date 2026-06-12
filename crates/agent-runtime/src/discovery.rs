@@ -73,6 +73,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
     config_dir: &Path,
 ) -> Vec<DetectedAgentProvider> {
     let registry = ProviderRegistry::load(config_dir).ok();
+    let runtime_path = path.clone();
     crate::provider::detect_agent_cli_providers_with_config_dir_and_path(config_dir, path)
         .unwrap_or_default()
         .into_iter()
@@ -88,12 +89,15 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
             let manifest_id = provider.manifest.id;
             let runtime_plan = registry.as_ref().and_then(|registry| {
                 registry
-                    .resolve_runtime_plan(&AgentProviderRef {
-                        id: manifest_id,
-                        mode: Some("print".into()),
-                        model: default_model.clone(),
-                        reasoning_effort: None,
-                    })
+                    .resolve_runtime_plan_with_path(
+                        &AgentProviderRef {
+                            id: manifest_id,
+                            mode: Some("print".into()),
+                            model: default_model.clone(),
+                            reasoning_effort: None,
+                        },
+                        runtime_path.clone(),
+                    )
                     .ok()
             });
             DetectedAgentProvider {

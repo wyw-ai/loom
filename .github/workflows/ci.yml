@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: false
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Test
+        run: cargo test
+
+      - name: Build smoke binaries
+        run: cargo build
+
+      - name: E2E smoke
+        run: bash scripts/e2e/run-all.sh
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/gui-web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm --dir apps/gui-web install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --dir apps/gui-web lint
+
+      - name: Build
+        run: pnpm --dir apps/gui-web build
+
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check release versions
+        run: node scripts/check-release-version.mjs
+
+      - name: Check shell packaging script syntax
+        run: bash -n scripts/package-release.sh
+
+      - name: Check release metadata script syntax
+        run: node --check scripts/write-release-downloads.mjs
+
+      - name: Build Pages portal
+        run: bash pages/build.sh

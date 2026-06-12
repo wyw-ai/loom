@@ -168,6 +168,17 @@ make gui-dev
 
 发布打包入口包括 `make release`、`make all-release` 和 `make package-release`。
 
+GitHub Actions 会从版本 tag 发布公开产物：
+
+```bash
+node scripts/check-release-version.mjs v0.1.0
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+发布工作流会构建 Linux 和 macOS runtime 包、打包 macOS Desktop DMG、上传
+GitHub Release assets，并刷新 Pages 下载元数据。
+
 ## 仓库结构
 
 - `crates/proto` - 共享协议类型和 JSON-RPC method 定义。

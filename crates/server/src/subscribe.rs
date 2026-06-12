@@ -108,7 +108,16 @@ impl Subscriptions {
         if let Some(c) = inner.connections.get_mut(connection_id) {
             c.actor_id = Some(actor_id.clone());
         }
-        inner.actor_kind.insert(actor_id.clone(), actor_kind);
+        // Never downgrade a previously-learned Agent/Service kind to Human.
+        // Short-lived CLI subcommands shelled from inside an agent turn default
+        // to actor_kind=Human and must not overwrite the stable long-lived kind;
+        // doing so would break is_noncanonical_agent_worker / wake suppression.
+        if !matches!(
+            (inner.actor_kind.get(&actor_id), actor_kind),
+            (Some(ActorKind::Agent | ActorKind::Service), ActorKind::Human)
+        ) {
+            inner.actor_kind.insert(actor_id.clone(), actor_kind);
+        }
         if !claim_inbox {
             tracing::debug!(
                 actor = %actor_id,
@@ -446,6 +455,54 @@ mod tests {
             Some("conn_new"),
             "service kind must preempt the previous live binding",
         );
+    }
+
+    #[test]
+    fn human_bind_does_not_downgrade_agent_kind_for_wake_suppression() {
+        // Regression: a short-lived CLI command shelled from inside an agent turn
+        // calls bind_actor with actor_kind=Human.  Before the fix this overwrote
+        // the agent's actor_kind entry, so is_noncanonical_agent_worker returned
+        // false for the stale conn and it started receiving scope-wake messages
+        // again (duplicate-runtime risk).
+        let subs = Subscriptions::new();
+        let (tx_stale, mut rx_stale) = mpsc::unbounded_channel();
+        let (tx_live, mut rx_live) = mpsc::unbounded_channel();
+        let (tx_shell, _rx_shell) = mpsc::unbounded_channel();
+
+        subs.add_connection(Connection { id: "conn_stale".into(), actor_id: None, tx: tx_stale });
+        subs.add_connection(Connection { id: "conn_live".into(),  actor_id: None, tx: tx_live  });
+        subs.add_connection(Connection { id: "conn_shell".into(), actor_id: None, tx: tx_shell });
+
+        // Long-lived daemon binds first, then restarts and the new conn takes over.
+        subs.bind_actor("conn_stale", "actor_agent".into(), ActorKind::Agent, true);
+        subs.bind_actor("conn_live",  "actor_agent".into(), ActorKind::Agent, true);
+
+        // Simulate a CLI subcommand shelled from inside the agent turn (kind=Human).
+        subs.bind_actor("conn_shell", "actor_agent".into(), ActorKind::Human, true);
+
+        // conn_shell must not have stolen the inbox.
+        assert_eq!(
+            subs.inbox_owner("actor_agent").as_deref(),
+            Some("conn_live"),
+            "Human bind must not preempt the live agent connection",
+        );
+
+        // The stale agent worker must still be suppressed even after the Human bind.
+        let scope = ScopeRef {
+            kind: proto::types::ScopeKind::Channel,
+            id: "chan_test".into(),
+        };
+        for c in ["conn_stale", "conn_live", "conn_shell"] {
+            assert!(subs.subscribe(c, scope.clone()));
+        }
+        subs.broadcast_to_scope(
+            &scope,
+            "stream/update",
+            serde_json::json!({ "kind": "message.created" }),
+        );
+
+        assert!(rx_live.try_recv().is_ok(),   "canonical agent worker must be woken");
+        assert!(rx_stale.try_recv().is_err(),  "stale agent worker must NOT be woken after a Human re-bind");
     }
 
     #[test]

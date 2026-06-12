@@ -41,10 +41,10 @@ jobs:
       download_base_url: ${{ steps.meta.outputs.download_base_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.4.0
         with:
           node-version: 22
 
@@ -84,12 +84,12 @@ jobs:
     needs: version
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -98,13 +98,13 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build Linux release binaries
-        run: make linux-x86-release linux-arm-release LINUX_BUILDER=cross
+        run: make linux-x86-release LINUX_BUILDER=cross
 
       - name: Archive Linux dist
         run: tar -czf linux-dist.tar.gz -C dist release
 
       - name: Upload Linux dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: linux-dist
           path: linux-dist.tar.gz
@@ -116,7 +116,7 @@ jobs:
     needs: version
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -133,7 +133,7 @@ jobs:
         run: tar -czf macos-dist.tar.gz -C dist release
 
       - name: Upload macOS dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: macos-dist
           path: macos-dist.tar.gz
@@ -150,7 +150,7 @@ jobs:
       publish: ${{ needs.version.outputs.publish }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -161,12 +161,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: 9
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -179,13 +179,13 @@ jobs:
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Download Linux dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: linux-dist
           path: artifacts/linux
 
       - name: Download macOS dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: macos-dist
           path: artifacts/macos
@@ -215,7 +215,7 @@ jobs:
             --group "${{ needs.version.outputs.tag }}"
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: release-packages
           path: dist/packages
@@ -225,7 +225,7 @@ jobs:
         run: bash pages/build.sh
 
       - name: Upload Pages build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: pages-build
           path: pages/build
@@ -266,19 +266,19 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Download Pages build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: pages-build
           path: pages/build
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6.0.0
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: pages/build
 
       - name: Deploy Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5.0.0

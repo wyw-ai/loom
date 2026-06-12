@@ -10,6 +10,7 @@ PNPM="${PNPM:-pnpm}"
 LINUX_BUILDER="${LINUX_BUILDER:-$CARGO}"
 DIST_DIR="${DIST_DIR:-dist}"
 PACKAGE_OUT_DIR="${PACKAGE_OUT_DIR:-$DIST_DIR/packages}"
+DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
 PROFILE="release"
 SKIP_BUILD=0
 SKIP_GUI=0
@@ -34,6 +35,7 @@ Environment:
   LINUX_BUILDER      Builder for Linux Rust targets. Defaults to $CARGO.
   DIST_DIR           Dist directory. Defaults to dist.
   PACKAGE_OUT_DIR    Package output directory. Defaults to dist/packages.
+  DOWNLOAD_BASE_URL  Optional release URL embedded into install.sh for remote downloads.
 EOF
 }
 
@@ -231,15 +233,32 @@ package_gui_dmg() {
 
 write_manifest() {
   local manifest="$PACKAGE_OUT_DIR/manifest.txt"
+  local artifacts=()
+  local path name
+
+  for path in "$PACKAGE_OUT_DIR"/*; do
+    [[ -f "$path" ]] || continue
+    name="$(basename "$path")"
+    case "$name" in
+      *.tar.gz | *.dmg | install.sh)
+        artifacts+=("$name")
+        ;;
+    esac
+  done
+
   {
     printf 'version=%s\n' "$VERSION"
     printf 'git_sha=%s\n' "$GIT_SHA"
     printf 'generated_at=%s\n' "$GENERATED_AT"
     printf 'profile=%s\n' "$PROFILE"
     printf 'package_dir=%s\n' "$PACKAGE_OUT_DIR"
+    if [[ -n "$DOWNLOAD_BASE_URL" ]]; then
+      printf 'download_base_url=%s\n' "$DOWNLOAD_BASE_URL"
+    fi
     printf '\nartifacts:\n'
-    find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' \) \
-      -exec basename {} \; | sort | sed 's/^/- /'
+    if [[ "${#artifacts[@]}" -gt 0 ]]; then
+      printf '%s\n' "${artifacts[@]}" | sort | sed 's/^/- /'
+    fi
   } >"$manifest"
   log "wrote $manifest"
 }
@@ -265,6 +284,7 @@ set -eu
 
 VERSION='$VERSION'
 GIT_SHA='$GIT_SHA'
+DOWNLOAD_BASE_URL='$DOWNLOAD_BASE_URL'
 DEFAULT_BIN_DIR="\${HOME}/.local/bin"
 DEFAULT_PACKAGE_DIR="\$(CDPATH= cd "\$(dirname "\$0")" && pwd)"
 
@@ -344,6 +364,18 @@ sha256_file() {
     sha256sum "\$1" | awk '{print \$1}'
   else
     die "missing checksum command: install shasum or sha256sum"
+  fi
+}
+
+download_file() {
+  url="\$1"
+  out="\$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "\$url" -o "\$out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "\$out" "\$url"
+  else
+    die "missing downloader: install curl or wget"
   fi
 }
 
@@ -440,27 +472,57 @@ package_name="\$(runtime_package_name "\$target")"
 package_path="\$package_dir/\$package_name"
 expected_sha="\$(runtime_sha256 "\$target")"
 modules="\$(normalize_modules "\$module_spec")"
+download_url=""
+if [ -n "\$DOWNLOAD_BASE_URL" ]; then
+  download_url="\${DOWNLOAD_BASE_URL%/}/\$package_name"
+fi
 
 printf 'Loom %s (%s)\n' "\$VERSION" "\$GIT_SHA"
 printf 'target: %s\n' "\$target"
 printf 'modules:%s\n' "\$modules"
 printf 'bin dir: %s\n' "\$bin_dir"
 printf 'package: %s\n' "\$package_path"
+if [ -n "\$download_url" ]; then
+  printf 'download: %s\n' "\$download_url"
+fi
 
 if [ "\$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-[ -f "\$package_path" ] || die "missing runtime package: \$package_path"
 command -v tar >/dev/null 2>&1 || die "missing required command: tar"
+
+download_tmp_dir=""
+extract_tmp_dir=""
+cleanup() {
+  if [ -n "\$download_tmp_dir" ]; then
+    rm -rf "\$download_tmp_dir"
+  fi
+  if [ -n "\$extract_tmp_dir" ]; then
+    rm -rf "\$extract_tmp_dir"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -f "\$package_path" ]; then
+  [ -n "\$download_url" ] || die "missing runtime package: \$package_path"
+  download_tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install-download.XXXXXX")"
+  package_path="\$download_tmp_dir/\$package_name"
+  printf 'downloading %s\n' "\$download_url"
+  download_file "\$download_url" "\$package_path"
+fi
 
 actual_sha="\$(sha256_file "\$package_path")"
 [ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$package_path"
 
-tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
-trap 'rm -rf "\$tmp_dir"' EXIT INT TERM
-tar -xzf "\$package_path" -C "\$tmp_dir"
-package_root="\$(find "\$tmp_dir" -maxdepth 1 -type d -name "loom-runtime-*" | head -1)"
+extract_tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
+tar -xzf "\$package_path" -C "\$extract_tmp_dir"
+package_root=""
+for candidate in "\$extract_tmp_dir"/loom-runtime-*; do
+  [ -d "\$candidate" ] || continue
+  package_root="\$candidate"
+  break
+done
 [ -n "\$package_root" ] || die "runtime package did not extract correctly"
 
 for module in \$modules; do
@@ -479,17 +541,23 @@ write_checksums() {
   (
     cd "$PACKAGE_OUT_DIR"
     artifacts=()
-    while IFS= read -r artifact; do
-      artifacts+=("$artifact")
-    done < <(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' \) \
-      -exec basename {} \; | sort)
+    for path in *; do
+      [[ -f "$path" ]] || continue
+      case "$path" in
+        *.tar.gz | *.dmg | install.sh)
+          artifacts+=("$path")
+          ;;
+      esac
+    done
 
     if [[ "${#artifacts[@]}" -eq 0 ]]; then
       echo "no package artifacts found for checksum generation" >&2
       exit 1
     fi
 
-    checksum_cmd "${artifacts[@]}"
+    printf '%s\n' "${artifacts[@]}" | sort | while IFS= read -r artifact; do
+      checksum_cmd "$artifact"
+    done
   ) >"$sums"
   log "wrote $sums"
 }

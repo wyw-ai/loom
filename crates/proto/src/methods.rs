@@ -1494,6 +1494,8 @@ pub struct ReminderScheduleParams {
     pub fire_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

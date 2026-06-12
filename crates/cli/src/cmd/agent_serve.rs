@@ -25,9 +25,9 @@ use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
     AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
-    BundleInstallMode, ChannelMembersResult, InboxListResult,
-    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
-    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    BundleInstallMode, ChannelMembersResult, InboxListResult, MessageListResult, MessageSendResult,
+    PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
+    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -1222,12 +1222,44 @@ impl AgentTrigger {
     fn reply_target(&self) -> Option<String> {
         match self {
             AgentTrigger::Message(message) => Some(reply_target_for_message(message)),
-            AgentTrigger::Event(_) => None,
+            AgentTrigger::Event(_) => self
+                .meta_value("loomReplyTarget")
+                .or_else(|| self.meta_value("replyTarget"))
+                .and_then(Value::as_str)
+                .and_then(normalize_reply_target),
         }
     }
 
     fn is_message(&self) -> bool {
         matches!(self, AgentTrigger::Message(_))
+    }
+}
+
+async fn reply_target_for_trigger(
+    client: &Arc<Client>,
+    actor_id: &str,
+    trigger: &AgentTrigger,
+) -> Option<String> {
+    if let Some(target) = trigger.reply_target() {
+        return Some(target);
+    }
+    if !matches!(trigger, AgentTrigger::Event(_))
+        || !matches!(trigger.scope().kind, ScopeKind::Thread)
+    {
+        return None;
+    }
+    match message_target_for_scope(client, trigger.scope()).await {
+        Ok(target) => Some(target),
+        Err(e) => {
+            tracing::warn!(
+                actor = %actor_id,
+                trigger = %trigger.id(),
+                scope = %trigger.scope().id,
+                %e,
+                "failed to derive thread reply target for event trigger"
+            );
+            None
+        }
     }
 }
 
@@ -1243,6 +1275,18 @@ fn reply_target_for_message(message: &Message) -> String {
             format!("#{}:{}", message.scope.id, message.id)
         }
         ScopeKind::Channel => message.target.clone(),
+    }
+}
+
+fn normalize_reply_target(raw: &str) -> Option<String> {
+    let target = raw.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if target.starts_with('#') || target.starts_with("dm:") {
+        Some(target.to_string())
+    } else {
+        None
     }
 }
 
@@ -1313,7 +1357,6 @@ fn collect_private_to_ids(value: &Value, out: &mut Vec<String>) {
         _ => {}
     }
 }
-
 
 struct WorkerState {
     actor_id: String,
@@ -3276,13 +3319,14 @@ async fn dispatch_trigger(
         let prompt = compose_envelope_prompt(client, state, &trigger, &turn_input).await;
         let no_reply_file =
             no_reply_file_for_turn(client, state, trigger.scope(), &run_res.run.id).await;
+        let reply_target = reply_target_for_trigger(client, &state.actor_id, &trigger).await;
         let active = ActiveTurn {
             id: run_res.run.id.clone(),
             run_id: run_res.run.id.clone(),
             scope: trigger.scope().clone(),
             trigger_source_id: trigger.id().to_string(),
             trigger_is_message: trigger.is_message(),
-            reply_target: trigger.reply_target(),
+            reply_target,
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
             trigger_actor: trigger.actor_id().to_string(),
@@ -4213,6 +4257,15 @@ fn render_trigger_prompt_with_names(
     }
     out.push_str("Visible message:\n");
     out.push_str(&visible);
+    out.push_str(
+        "\n\nResponse delivery reminder:\n\
+         If this message asks you to answer, speak, choose, vote, submit a result, or take your turn, make that\n\
+         answer visible by executing a Loom CLI message command before ending the turn. For a public reply use\n\
+         `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; for a private prompt reply use\n\
+         `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`. Do not put the answer only in\n\
+         your assistant final text: that text is private trace and is not delivered to the thread. If no visible\n\
+         reply is needed, end with `loom --json run ignore --reason \"...\"`.\n",
+    );
     out
 }
 
@@ -5119,8 +5172,9 @@ async fn resolve_channel_for_scope(
 /// The agents driven by this manifest are Claude models, so this manifest is a
 /// system prompt and must follow those practices. Distilled rules that govern
 /// this manifest:
-///   * Structure with XML tags (<identity>, <core_principles>, <coordinator>,
-///     <privacy>, <examples>, <cli>) so the model can parse sections
+///   * Structure with XML tags (<identity>, <how_turns_work>, <responding>,
+///     <context_and_history>, <coordinator>, <privacy>, <examples>, <cli>) so the
+///     model can parse sections
 ///     unambiguously. Do NOT collapse it back into an undifferentiated wall of
 ///     prose or a flat numbered list.
 ///   * Lead with role/identity, then principles, then a worked <examples>
@@ -5156,7 +5210,10 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Your actor id is {actor_id}. You are acting in {scope_kind}:{scope_id}. Other @actors you see are\n\
          other participants — never assume you are them. You act by shelling out to the `loom` CLI (always\n\
          with --json). These environment variables are already set for you: LOOM_ACTOR, LOOM_SCOPE_ID,\n\
-         LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR.\n\
+         LOOM_SCOPE_KIND, LOOM_CHANNEL_ID, LOOM_REPLY_TARGET, LOOM_TRIGGER_MESSAGE_ID, LOOM_TRIGGER_ACTOR. When\n\
+         the message that woke you was sent privately, LOOM_TRIGGER_PRIVATE is also set to 1 and\n\
+         LOOM_TRIGGER_PRIVATE_TO_FLAGS holds the exact `--private-to` flags to reply within that same private\n\
+         group.\n\
          Your assistant/thinking text is private scratch and is never shown to anyone; the ONLY way to say\n\
          or do anything visible is to send a loom message. When your work for a turn is done and nothing\n\
          needs to be said, end with `loom --json run ignore --reason \"...\"`.\n\
@@ -5166,19 +5223,29 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Loom runs your turn only when a message WAKES you. Waking is how all progress happens, so the\n\
          single most important habit is: before you end a turn, make sure whoever must act next has been\n\
          woken. Send every PUBLIC message for this activity to `$LOOM_REPLY_TARGET`: that is the one shared\n\
-         thread where the whole activity takes place, so all participants see each other and stay in step. Do\n\
-         NOT address activity messages to a bare `#<channel_id>` (the channel root); that starts a separate,\n\
-         flat conversation off to the side, splits participants across two places, and breaks the ordered flow.\n\
+         thread where the whole activity takes place, so all participants see each other and stay in step. Pass\n\
+         the literal `$LOOM_REPLY_TARGET` variable as your `--target`; do not retype or reconstruct a target\n\
+         from the channel id. In particular, reading is not sending: you may `message read --target\n\
+         \"#<channel_id>\"` to look at the broad channel, but never REPLY to that bare `#<channel_id>` — reply to\n\
+         `$LOOM_REPLY_TARGET`. A message addressed to a bare `#<channel_id>` (the channel root) posts onto the\n\
+         channel surface AND starts a brand-new thread rooted at that message; doing it repeatedly scatters the\n\
+         activity across the channel board and litters it with stray near-empty threads, splitting participants\n\
+         and breaking the ordered flow. Keep one activity in its one thread.\n\
          Secret/hidden content is the exception: it never goes to `$LOOM_REPLY_TARGET` (which everyone in the\n\
          thread can read) — send it with `--private-to`, which carries its own private audience. In particular,\n\
          if the message that WOKE you was sent to you privately (via `--private-to`), your reply is secret too:\n\
          reply with `--private-to` (include at least `$LOOM_TRIGGER_ACTOR`, the actor who woke you, plus any\n\
          co-recipients you are coordinating with) — never to `$LOOM_REPLY_TARGET`, which would expose it.\n\
          These are the delivery choices and when to use each. Two independent things matter: WHO IS WOKEN\n\
-         (whose turn runs next) and WHO CAN SEE the message (visibility). `@mentions`/`ask` control only who is\n\
-         woken; they do NOT restrict visibility. Visibility is public UNLESS you use `--private-to`. So a\n\
-         message sent to `$LOOM_REPLY_TARGET` is readable by EVERYONE in the activity even if it @mentions or\n\
-         `ask`s only a few — naming hidden actors there exposes them to all.\n\
+         (whose turn runs next) and WHO CAN SEE the message (visibility). Treat `@id` in message text as an\n\
+         addressable participant reference, not as a harmless label: use it only when that actor is being\n\
+         directly addressed or intentionally woken/associated with the message. When a private message to A is\n\
+         ABOUT B (for example asking A to evaluate, choose, act on, report about, or remember B), write B's\n\
+         plain display name or a neutral description without `@`. The person or item a message is ABOUT is not\n\
+         automatically part of the message audience. `@mentions`/`ask` control only who is woken; they do NOT\n\
+         restrict visibility. Visibility is public UNLESS you use `--private-to`. So a message sent to\n\
+         `$LOOM_REPLY_TARGET` is readable by EVERYONE in the activity even if it @mentions or `ask`s only a few\n\
+         — naming hidden actors there exposes them to all.\n\
            - `loom --json message ask @id [@id2] --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
                Wakes those specific actors AND is publicly visible to everyone. Use only when what you ask is\n\
                public (an open turn, a public question). NEVER use it to wake a hidden individual/sub-group or\n\
@@ -5214,9 +5281,11 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              drop it straight into your send: `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text\n\
              \"...\"`. Do NOT send a private reply to `$LOOM_REPLY_TARGET` — that target is the public thread and\n\
              would broadcast your secret to everyone. Put ONLY your own group in that audience: never add anyone\n\
-             else, and in particular never add the person your hidden action concerns or targets — naming them\n\
-             in your text (e.g. proposing to act on them) does NOT mean adding them as a recipient, and\n\
-             including them would hand them your secret. Reasoning you do not send accomplishes nothing.\n\
+             else, and in particular never add the person your hidden action concerns or targets. When you need\n\
+             to mention that subject in the text, use their plain display name or a neutral description, not an\n\
+             `@id`; the subject is what the private message is ABOUT, not who may see it. Including them as a\n\
+             recipient, or writing them as an addressed @mention, can hand them your secret. Reasoning you do not\n\
+             send accomplishes nothing.\n\
            - It only gives you information you were not asked to act on (a role card, an assignment, an FYI,\n\
              a result to remember): simply remember it and end with `run ignore`. Do NOT reply \"got it\" /\n\
              \"收到\" — a needless acknowledgement wakes the sender, and for a coordinator mid-setup it can\n\
@@ -5225,6 +5294,40 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          Send a message only when you have real content: a requested answer, a state change, a needed\n\
          question, a claimed unit of work plus its result, or a genuine blocker.\n\
          </responding>\n\
+         \n\
+         <context_and_history>\n\
+         Every turn starts a fresh session with no memory, so the conversation lives on the server, not in your\n\
+         head. To save you a round-trip, Loom already injects the most recent messages of your current thread\n\
+         into every turn (the \"Recent Loom conversation\" section that appears above this turn's input) — so you\n\
+         usually do NOT need to fetch them again just to see what was last said. Pull more history yourself only\n\
+         when you actually need it, with the right tool:\n\
+           - `loom --json message read --target \"$LOOM_REPLY_TARGET\" --limit <n>` — re-read the current thread;\n\
+             raise --limit or pass `--before <message_id>` to page further back than the auto-injected window.\n\
+           - `loom --json inbox list --no-ack` — the messages directed specifically at you that you have not\n\
+             handled yet; use when a timer/reminder woke you and the replies you are waiting on are not already\n\
+             in your prompt.\n\
+           - `loom --json message search \"<text>\"` — find earlier messages by content across what you can see,\n\
+             when you recall that something was said but not where.\n\
+         How hard you should look at history depends on the KIND of exchange, because timeliness matters\n\
+         differently — read this as a judgement call, not a fixed rule:\n\
+           - In a fast, interactive back-and-forth — a live discussion, brainstorming, or any turn-by-turn\n\
+             exchange where people react to each other — recent history IS the task. Before you respond, make\n\
+             sure you have actually taken in what others said since you last spoke (re-read the thread when the\n\
+             auto-injected window may be stale or you were away a while), so you address the latest points,\n\
+             don't repeat what someone already contributed, and don't overlook a participant who already\n\
+             answered. Losing track of who said what is the main failure here, and it compounds when you are\n\
+             the one facilitating: account for who has and has not acted from the thread itself, never from\n\
+             memory.\n\
+           - When you were handed a self-contained unit of work to execute — a task, a build, a lookup — the\n\
+             context you need is usually already in front of you. Read more only when the work genuinely\n\
+             requires it; do not re-scan the whole history every turn out of habit, since unnecessary reads add\n\
+             nothing and waste effort.\n\
+         Finally, match the weight of your response to the weight of what was asked. When the message that woke\n\
+         you is an actual assigned task, Loom injects an authoritative \"assignment context\" block with the task\n\
+         input and how to finish it — work from that and follow its lifecycle. Ordinary conversation carries no\n\
+         such block: just talk, decide, and act — do not manufacture tasks, assignments, or formal artifacts for\n\
+         a casual exchange.\n\
+         </context_and_history>\n\
          \n\
          <coordinator>\n\
          If you are running a multi-step activity (a game, interview, review, or workflow), you own driving\n\
@@ -5348,14 +5451,43 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` (the daemon-provided `--private-to` flags for the author plus your\n\
              co-recipients) — or equivalently `--private-to` the actor who woke you plus the prompt's other\n\
              recipients — and NOT to `$LOOM_REPLY_TARGET` (the public thread). The audience is who may SEE the\n\
-             message — your own group only — not who it is ABOUT: never add the participant your hidden action\n\
-             targets or discusses, or you hand them the secret. Coordinate with hidden teammates only in that\n\
+             message — your own group only — not who it is ABOUT: never add or @mention the participant your\n\
+             hidden action targets or discusses; refer to that subject by plain display name or neutral\n\
+             description instead, or you hand them the secret. Coordinate with hidden teammates only in that\n\
              private audience, never in the shared channel. In open discussion you may argue, claim, or bluff;\n\
              only you may disclose your own hidden state, by your own choice in your own public message — never\n\
              the coordinator on your behalf.\n\
          </privacy>\n\
          \n\
          <examples>\n\
+         <example caption=\"In a live discussion, read what others just said before you respond\">\n\
+         You are part of a fast back-and-forth conversation and it is your turn. The recent messages are\n\
+         already in your prompt, but if the exchange moved quickly or you were away, re-read first so you build\n\
+         on the current state rather than a stale snapshot:\n\
+           loom --json message read --target \"$LOOM_REPLY_TARGET\" --limit 30\n\
+         Then respond to what people actually said: acknowledge points already made, answer anyone who\n\
+         addressed you, and add something new instead of repeating a contribution someone already gave. If you\n\
+         are facilitating, account for everyone from the thread itself — check who has and has not spoken by\n\
+         reading, not from memory — so you never tell a participant \"your turn\" or \"still waiting on you\" when\n\
+         they already answered.\n\
+         </example>\n\
+         <example caption=\"Executing an assigned task — work from the task input, read only what you need\">\n\
+         The message that woke you is a task assignment, so an authoritative assignment-context block is already\n\
+         in your prompt. Act on it directly; do not re-scan the whole channel history first. Pull extra context\n\
+         only when the task genuinely requires it (a specific file, a prior decision you must build on), and\n\
+         finish through the task's own completion step rather than a plain chat message. Reading more than the\n\
+         task needs only spends effort for nothing — and for a casual message that is NOT a task, the opposite\n\
+         applies: just reply in conversation, without creating tasks or artifacts.\n\
+         </example>\n\
+         <example caption=\"Reply in the activity thread, not the bare channel you just read\">\n\
+         You want to see the wider picture, so you read the channel, then post your update. Reading the channel\n\
+         is fine, but your reply must still go to the shared thread, not the bare channel you read from:\n\
+           loom --json message read --target \"#<channel_id>\"        # ok: just looking\n\
+           loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"<your update>\"   # reply in the thread\n\
+         Do NOT reply with `--target \"#<channel_id>\"`: that posts onto the channel surface and starts a new\n\
+         thread, so the next person who answers is now in a different place and the activity fragments into\n\
+         stray near-empty threads. Always pass the literal `$LOOM_REPLY_TARGET`.\n\
+         </example>\n\
          <example caption=\"Open a new phase — announce, THEN wake the first actor (two messages)\">\n\
          You finished resolving a phase and are opening the next one. The announcement and the hand-off are two\n\
          separate messages: post the neutral result, then in the SAME turn send a separate `ask` that wakes the\n\
@@ -5386,9 +5518,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          When a participant must receive confidential information only they should see (a private\n\
          assignment, a secret, a credential), send it to them alone; the public channel never carries it:\n\
            loom --json message send --private-to @participant_c --text \"<their private assignment / secret here>\"\n\
-         If several participants each need their own private piece, send each separately. Any public note\n\
-         stays neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's\n\
-         secret.\n\
+         If the private note is about another participant, task, option, or target, keep the audience and subject\n\
+         separate. Address only the recipient with `--private-to`; name the subject in plain text without `@`:\n\
+           loom --json message send --private-to @participant_c --text \"Please evaluate Participant B and send me the result privately.\"\n\
+         Wrong: `loom --json message send --private-to @participant_c --text \"Please evaluate @participant_b ...\"`\n\
+         because @participant_b is not being addressed and should not be attached to the private message. If\n\
+         several participants each need their own private piece, send each separately. Any public note stays\n\
+         neutral (e.g. \"Private assignments have been sent — check your messages\") and names no one's secret.\n\
          </example>\n\
          <example caption=\"Wake a hidden sub-group — with --private-to, NEVER ask on the shared thread\">\n\
          Several participants share hidden state and must coordinate a joint hidden decision. Convening them in\n\
@@ -5416,11 +5552,12 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          You were privately woken to make a hidden choice or to coordinate with your hidden teammates. The\n\
          daemon set `$LOOM_TRIGGER_PRIVATE_TO_FLAGS` to the exact `--private-to` flags for your group (author +\n\
          co-recipients, never you). Reply by dropping those flags straight in — NOT to `$LOOM_REPLY_TARGET`:\n\
-           loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"My choice is to act on @target.\"\n\
-         The audience is who may SEE this (your group), not who it is about: even though your text names\n\
-         @target, do NOT add @target to `--private-to` — that would reveal your group and plan to the very\n\
-         person you are acting on. `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination,\n\
-         role, or allegiance there (or to the target) exposes your side and usually loses the activity for you.\n\
+           loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"My choice is to act on Target Name.\"\n\
+         The audience is who may SEE this (your group), not who it is about. The target/subject is not being\n\
+         addressed, so write the target's plain display name or description without `@`, and do NOT add that\n\
+         target to `--private-to` — that would reveal your group and plan to the very person you are acting on.\n\
+         `$LOOM_REPLY_TARGET` is the public thread; sending your hidden coordination, role, or allegiance there\n\
+         (or to the target) exposes your side and usually loses the activity for you.\n\
          </example>\n\
          <example caption=\"You only received information — stay silent\">\n\
          You receive a private note that just informs you of something (an assignment, an FYI) and asks for\n\
@@ -5466,7 +5603,9 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          shared thread) — not a bare `#<channel_id>`; `$LOOM_CHANNEL_ID` is for `channel members` only and is\n\
          never a message target. `--private-to @id` stays in this scope and wakes @id; `--to @id`\n\
          opens a separate global DM (not part of this scope) and is rarely what you want. Read with\n\
-         `loom --json message read --target \"$LOOM_REPLY_TARGET\"`; before sending visible work, re-read the\n\
+         `loom --json message read --target \"$LOOM_REPLY_TARGET\"` (add `--limit <n>` or `--before <message_id>`\n\
+         to page older history beyond the auto-injected window; `loom --json message search \"<text>\"` finds\n\
+         messages by content); before sending visible work, re-read the\n\
          latest message and pass `--if-latest <message_id>` so you rebase on current state. For who is present,\n\
          use the injected channel-members section or `loom --json channel members \"$LOOM_CHANNEL_ID\"`, not\n\
          `loom actor list` (global and stale). `message ask` is the same as a `message send` carrying an\n\
@@ -5833,33 +5972,34 @@ async fn flush_failure_text(
     meta: Option<Meta>,
 ) -> Result<()> {
     let notice = failure_notice_for_turn(actor_id, active, text);
-    if active.trigger_is_message {
-        if let Some(target) = active.reply_target.as_deref() {
-            let parent_message_id =
-                parent_message_id_for_reply_target(&active.trigger_source_id, target);
-            return send_agent_message(
-                client,
-                target,
-                notice.body,
-                parent_message_id,
-                notice.audience_actor_id,
-                notice.intent,
-                notice.delivery_policy,
-                meta.unwrap_or_default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                tracing::warn!(
-                    actor = %actor_id,
-                    turn = %active.id,
-                    scope = %active.scope.id,
-                    %e,
-                    "failure message.send failed"
-                );
-                e
-            });
-        }
+    if let Some(target) = active.reply_target.as_deref() {
+        let parent_message_id = parent_message_id_for_reply_target(
+            &active.trigger_source_id,
+            target,
+            active.trigger_is_message,
+        );
+        return send_agent_message(
+            client,
+            target,
+            notice.body,
+            parent_message_id,
+            notice.audience_actor_id,
+            notice.intent,
+            notice.delivery_policy,
+            meta.unwrap_or_default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!(
+                actor = %actor_id,
+                turn = %active.id,
+                scope = %active.scope.id,
+                %e,
+                "failure message.send failed"
+            );
+            e
+        });
     }
     send_scope_message(
         client,
@@ -5887,7 +6027,14 @@ async fn flush_failure_text(
     })
 }
 
-fn parent_message_id_for_reply_target(trigger_source_id: &str, target: &str) -> Option<String> {
+fn parent_message_id_for_reply_target(
+    trigger_source_id: &str,
+    target: &str,
+    trigger_is_message: bool,
+) -> Option<String> {
+    if !trigger_is_message {
+        return None;
+    }
     let root_message_id = target.strip_prefix('#').and_then(|raw| raw.split_once(':'));
     if root_message_id.is_some_and(|(_, root_message_id)| root_message_id == trigger_source_id) {
         None
@@ -6050,7 +6197,8 @@ async fn append_run_started_ack(
         metadata
     };
     let result = if let Some(target) = active.reply_target.as_deref() {
-        let parent_message_id = parent_message_id_for_reply_target(trigger.id(), target);
+        let parent_message_id =
+            parent_message_id_for_reply_target(trigger.id(), target, trigger.is_message());
         send_agent_message(
             client,
             target,
@@ -6265,33 +6413,34 @@ async fn flush_text(
     text: String,
     meta: Option<Meta>,
 ) -> Result<()> {
-    if active.trigger_is_message {
-        if let Some(target) = active.reply_target.as_deref() {
-            let parent_message_id =
-                parent_message_id_for_reply_target(&active.trigger_source_id, target);
-            return send_agent_message(
-                client,
-                target,
-                text,
-                parent_message_id,
-                Some(active.trigger_actor.clone()),
-                MessageIntent::Chat,
-                DeliveryPolicy::NotifyOnly,
-                meta.unwrap_or_default(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                tracing::warn!(
-                    actor = %actor_id,
-                    turn = %active.id,
-                    scope = %active.scope.id,
-                    %e,
-                    "message.send failed"
-                );
-                e
-            });
-        }
+    if let Some(target) = active.reply_target.as_deref() {
+        let parent_message_id = parent_message_id_for_reply_target(
+            &active.trigger_source_id,
+            target,
+            active.trigger_is_message,
+        );
+        return send_agent_message(
+            client,
+            target,
+            text,
+            parent_message_id,
+            Some(active.trigger_actor.clone()),
+            MessageIntent::Chat,
+            DeliveryPolicy::NotifyOnly,
+            meta.unwrap_or_default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!(
+                actor = %actor_id,
+                turn = %active.id,
+                scope = %active.scope.id,
+                %e,
+                "message.send failed"
+            );
+            e
+        });
     }
     send_scope_message(
         client,
@@ -6392,6 +6541,21 @@ mod tests {
             attachments: Vec::new(),
             reactions: Vec::new(),
             metadata: Meta::default(),
+        }
+    }
+
+    fn sample_event(id: &str, scope: ScopeRef) -> Event {
+        Event {
+            id: id.into(),
+            kind: "reminder.fire".into(),
+            actor_id: "actor_agent_dm".into(),
+            scope,
+            turn_id: None,
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: json!({}),
+            relations: Vec::new(),
+            _meta: None,
         }
     }
 
@@ -6802,18 +6966,59 @@ mod tests {
     }
 
     #[test]
+    fn event_reply_target_comes_from_meta() {
+        let mut event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+        );
+        event._meta = Some(Meta::from([(
+            "loomReplyTarget".into(),
+            json!("#chan_demo:msg_root"),
+        )]));
+
+        assert_eq!(
+            AgentTrigger::Event(event).reply_target().as_deref(),
+            Some("#chan_demo:msg_root")
+        );
+    }
+
+    #[test]
+    fn event_reply_target_ignores_invalid_meta() {
+        let mut event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+        );
+        event._meta = Some(Meta::from([(
+            "loomReplyTarget".into(),
+            json!("thread_demo"),
+        )]));
+
+        assert_eq!(AgentTrigger::Event(event).reply_target(), None);
+    }
+
+    #[test]
     fn thread_root_reply_target_omits_invalid_channel_parent() {
         assert_eq!(
-            parent_message_id_for_reply_target("msg_root", "#chan_demo:msg_root"),
+            parent_message_id_for_reply_target("msg_root", "#chan_demo:msg_root", true),
             None
         );
         assert_eq!(
-            parent_message_id_for_reply_target("msg_reply", "#chan_demo:msg_root"),
+            parent_message_id_for_reply_target("msg_reply", "#chan_demo:msg_root", true),
             Some("msg_reply".into())
         );
         assert_eq!(
-            parent_message_id_for_reply_target("msg_channel", "#chan_demo"),
+            parent_message_id_for_reply_target("msg_channel", "#chan_demo", true),
             Some("msg_channel".into())
+        );
+        assert_eq!(
+            parent_message_id_for_reply_target("evt_reminder", "#chan_demo:msg_root", false),
+            None
         );
     }
 
@@ -7278,6 +7483,23 @@ mod tests {
     }
 
     #[test]
+    fn seed_manifest_keeps_private_subjects_out_of_addressing_mentions() {
+        let manifest = seed_manifest(
+            "actor_agent_dm",
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_private_workflow".into(),
+            },
+        );
+
+        assert!(manifest.contains("private message to A is"));
+        assert!(manifest.contains("plain display name or a neutral description without `@`"));
+        assert!(manifest.contains("Please evaluate Participant B"));
+        assert!(manifest.contains("My choice is to act on Target Name."));
+        assert!(!manifest.contains("My choice is to act on @target."));
+    }
+
+    #[test]
     fn seed_manifest_requires_wake_for_actionable_participant_prompts() {
         let manifest = seed_manifest(
             "actor_agent_dm",
@@ -7297,6 +7519,9 @@ mod tests {
         assert!(manifest.contains("Rebuild state first"));
         assert!(manifest.contains("reminder schedule"));
         assert!(manifest.contains("Set up exactly once"));
+        assert!(manifest.contains("<context_and_history>"));
+        assert!(manifest.contains("message search"));
+        assert!(manifest.contains("Recent Loom conversation"));
     }
 
     #[test]

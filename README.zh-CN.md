@@ -176,8 +176,8 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-发布工作流会构建 Linux 和 macOS runtime 包、打包 macOS Desktop DMG、上传
-GitHub Release assets，并刷新 Pages 下载元数据。
+发布工作流会构建 x86_64 Linux 和 macOS runtime 包、打包 macOS Desktop DMG、
+上传 GitHub Release assets，并刷新 Pages 下载元数据。
 
 ## 仓库结构
 

@@ -662,6 +662,9 @@ fn broadcast_filtered(
         if !allowed.contains(&actor) {
             continue;
         }
+        if state.subscriptions.is_suppressed_wake_target(&conn_id) {
+            continue;
+        }
         state
             .subscriptions
             .send_to_connection(&conn_id, frame.clone());

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use proto::methods::*;
-use proto::types::{ReminderStatus, ScopeKind, ScopeRef};
+use proto::types::{Meta, ReminderStatus, ScopeKind, ScopeRef};
 use serde_json::json;
 
 use crate::client::Client;
@@ -21,14 +21,22 @@ pub async fn schedule(
     fire_at: Option<String>,
     repeat: Option<String>,
 ) -> Result<()> {
-    let scope = match target {
-        Some(target) => Some(
-            resolve_target(&client, &actor_id, &target, TargetMode::Write)
-                .await?
-                .scope,
-        ),
-        None => current_scope_from_env(),
+    let (scope, reply_target) = match target {
+        Some(target) => {
+            let target = target.trim().to_string();
+            let scope = resolve_target_for_reminder(&client, &actor_id, &target).await?;
+            (Some(scope), Some(target))
+        }
+        None => {
+            if let Some(reply_target) = current_reply_target_from_env() {
+                let scope = resolve_target_for_reminder(&client, &actor_id, &reply_target).await?;
+                (Some(scope), Some(reply_target))
+            } else {
+                (current_scope_from_env(), None)
+            }
+        }
     };
+    let meta = reminder_meta(reply_target.as_deref());
     let fire_at = fire_at.map(parse_time).transpose()?;
     let res: ReminderScheduleResult = client
         .call(
@@ -41,6 +49,7 @@ pub async fn schedule(
                 "delaySeconds": delay_seconds,
                 "fireAt": fire_at,
                 "repeat": repeat,
+                "_meta": meta,
             }),
         )
         .await?;
@@ -159,6 +168,43 @@ fn current_scope_from_env() -> Option<ScopeRef> {
     Some(ScopeRef { kind, id })
 }
 
+fn current_reply_target_from_env() -> Option<String> {
+    std::env::var("LOOM_REPLY_TARGET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn resolve_target_for_reminder(
+    client: &Arc<Client>,
+    actor_id: &str,
+    target: &str,
+) -> Result<ScopeRef> {
+    let target_for_scope = target_for_scope_resolution(target);
+    Ok(
+        resolve_target(client, actor_id, &target_for_scope, TargetMode::Write)
+            .await?
+            .scope,
+    )
+}
+
+fn target_for_scope_resolution(target: &str) -> String {
+    if let Some(rest) = target.trim().strip_prefix("dm:@") {
+        format!("dm:{rest}")
+    } else {
+        target.trim().to_string()
+    }
+}
+
+fn reminder_meta(reply_target: Option<&str>) -> Option<Meta> {
+    let reply_target = reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mut meta = Meta::default();
+    meta.insert("loomReplyTarget".into(), json!(reply_target));
+    Some(meta)
+}
+
 fn parse_time(raw: String) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&raw)
         .map_err(|e| anyhow!("invalid RFC3339 time `{}`: {}", raw, e))?
@@ -192,4 +238,34 @@ fn parse_duration_seconds(raw: &str) -> Result<i64> {
         bail!("duration must be positive");
     }
     Ok(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reminder_meta_records_reply_target() {
+        let meta = reminder_meta(Some(" #chan_demo:msg_root ")).expect("meta");
+
+        assert_eq!(
+            meta.get("loomReplyTarget")
+                .and_then(serde_json::Value::as_str),
+            Some("#chan_demo:msg_root")
+        );
+        assert!(reminder_meta(Some("  ")).is_none());
+        assert!(reminder_meta(None).is_none());
+    }
+
+    #[test]
+    fn target_for_scope_resolution_accepts_dm_at_syntax() {
+        assert_eq!(
+            target_for_scope_resolution("dm:@actor_agent_dm"),
+            "dm:actor_agent_dm"
+        );
+        assert_eq!(
+            target_for_scope_resolution("#chan_demo:msg_root"),
+            "#chan_demo:msg_root"
+        );
+    }
 }

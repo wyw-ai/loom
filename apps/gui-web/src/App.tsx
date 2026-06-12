@@ -7242,7 +7242,7 @@ function AgentMemberDetail({
     selectedProvider?.modelChoices.length
       ? selectedProvider.modelChoices
       : agent.spec.models?.choices ?? [];
-  const modelValue = draft.model || selectedProvider?.defaultModel || "";
+  const modelValue = draft.model;
   const modelIsKnown =
     !modelValue || modelChoices.some((choice) => choice.id === modelValue);
   const showCustomModel =

@@ -712,6 +712,35 @@ fn reconcile_agents(
         .filter(|actor_id| !desired.contains_key(*actor_id))
         .cloned()
         .collect::<Vec<_>>();
+
+    // Collect stale IDs for server-side cleanup before removing them
+    // from the running map, so zombie actors (from a prior daemon restart
+    // with a different machine_id) don't shadow newer agents with the
+    // same display_name.
+    let stale_for_cleanup: Vec<String> = stale.clone();
+    if !stale_for_cleanup.is_empty() {
+        let url = server_url.to_string();
+        tokio::spawn(async move {
+            let client = match crate::client::Client::connect(&url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("loom-daemon: failed to connect for stale actor cleanup: {e:#}");
+                    return;
+                }
+            };
+            for id in &stale_for_cleanup {
+                let params = json!({ "actorId": id });
+                match client
+                    .call_raw(proto::methods::method::ACTOR_DELETE, Some(params))
+                    .await
+                {
+                    Ok(_) => eprintln!("[{id}] cleaned up stale actor on server"),
+                    Err(e) => eprintln!("[{id}] failed to clean up stale actor: {e:#}"),
+                }
+            }
+        });
+    }
+
     for actor_id in stale {
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();

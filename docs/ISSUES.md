@@ -23,6 +23,19 @@
 - **文件**: `apps/gui-web/src/App.tsx`, `apps/gui-web/src/ipc/bridge.ts`, `apps/gui-web/src/ipc/types.ts`, `crates/cli/src/cmd/daemon.rs`, `crates/gui/src/ipc.rs`
 - **关联**: [[GUI Agent Env 键值编辑器设计]], [[2026-06-13 AgentProviderRef Env 注入 (实施计划)]]
 
+### #3 `resolve_actor_alias` 返回僵尸 Actor 导致 `message.send` 失败 ✅ 已修复 (2026-06-14)
+
+- **严重程度**: 🔴 Critical — 消息发送完全失败
+- **影响范围**: 所有 `@actor` 提及解析，影响 message.send、task.assign 等
+- **根因**: Daemon 重启后 `machine_id` 变化导致 agent 的 actor ID 改变（如 `b1a29c41` → `31961458`），但旧 actor 残留在 server 内存中。`resolve_actor_alias()` 使用 `HashMap::values().find_map()` 返回第一个匹配 `display_name` 的 actor，由于 HashMap 迭代顺序不确定，可能返回僵尸 actor。僵尸 actor 不在频道的 explicit member 列表中，导致 `validate_scope_routing_actor()` 拒绝消息发送。
+- **修复**:
+  1. `upsert_actor()` 改为 remove-then-insert，确保最新 upsert 的 actor 在 HashMap 迭代顺序末尾
+  2. `resolve_actor_alias()` 改用 `filter().last()` 收集所有匹配并返回最后（最新）的 actor
+  3. `apply()` 中 `Mutation::ActorUpsert` 同样改为 remove-then-insert 保持 journal 回放一致性
+  4. `reconcile_agents()` 在停止 stale agent 前异步调用 `actor/delete` 清理 server 端僵尸
+- **文件**: `crates/server/src/store.rs`, `crates/cli/src/cmd/daemon.rs`
+- **关联**: [[2026-06-14 resolve_actor_alias 僵尸 Actor Bug]]
+
 ## 已关闭
 
 _（暂无）_
@@ -31,6 +44,7 @@ _（暂无）_
 
 | 日期 | 描述 |
 |------|------|
+| 2026-06-14 | 修复 `resolve_actor_alias` 返回僵尸 Actor 导致 `message.send` 失败 |
 | 2026-06-14 | 修复 Copilot CLI 首次运行 `--session-id` 与 `--resume` 参数分离 |
 | 2026-06-14 | 实现 GUI Agent Env 键值编辑器 |
 | 2026-06-13 | 添加 `AgentProviderRef.env` 字段（proto → runtime → CLI） |

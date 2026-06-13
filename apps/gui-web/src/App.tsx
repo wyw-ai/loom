@@ -378,7 +378,7 @@ export function App() {
   const [directMessages, setDirectMessages] = useState<Message[]>([]);
   const [threadStatsById, setThreadStatsById] = useState<Record<string, ThreadActivityStats>>({});
   const [actors, setActors] = useState<Record<string, Actor>>({});
-  const [, setRuns] = useState<Record<string, Run>>({});
+  const [runs, setRuns] = useState<Record<string, Run>>({});
   const [inbox, setInbox] = useState<InboxListEntry[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [machines, setMachines] = useState<MachineInfo[]>([]);
@@ -2044,6 +2044,7 @@ export function App() {
               actors={actors}
               feedKey={target ?? "channel:none"}
               machines={machines}
+              runs={runs}
               messages={messages}
               tasksBySourceMessageId={tasksBySourceMessageId}
               channelThreads={channelThreads}
@@ -2082,6 +2083,7 @@ export function App() {
               channels={visibleChannels}
               messages={messages}
               machines={machines}
+              runs={runs}
               threadMessages={threadMessages}
               threadStatsById={threadStatsById}
               threads={allThreads}
@@ -2134,6 +2136,7 @@ export function App() {
               draft={directDraft}
               linkedChannel={activeChannel}
               machines={machines}
+              runs={runs}
               messages={directMessages}
               selectedAgent={activeDirectActor}
               setDraft={setDirectDraft}
@@ -2213,6 +2216,7 @@ export function App() {
               agentForm={agentForm}
               setAgentForm={setAgentForm}
               machines={machines}
+              runs={runs}
               targetAgentId={settingsAgentId}
               onConsumeTargetAgent={consumeSettingsAgentTarget}
               onCheckMachines={checkMachines}
@@ -2246,6 +2250,7 @@ export function App() {
             draft={threadDraft}
             mentionAgents={channelAgentActors}
             machines={machines}
+            runs={runs}
             messages={threadMessages}
             setDraft={setThreadDraft}
             task={activeThreadTask}
@@ -3318,6 +3323,7 @@ function MessageFeed({
   allowThreads = true,
   feedKey,
   machines,
+  runs,
   messages,
   tasksBySourceMessageId,
   channelThreads,
@@ -3337,6 +3343,7 @@ function MessageFeed({
   allowThreads?: boolean;
   feedKey: string;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   messages: Message[];
   tasksBySourceMessageId: Record<string, Task>;
   channelThreads: Thread[];
@@ -3402,6 +3409,7 @@ function MessageFeed({
                   actor={actors[message.authorActorId]}
                   actors={actors}
                   machines={machines}
+                  runs={runs}
                   message={message}
                   workflowSourceIds={workflowSourceIds}
                   onReply={onReply}
@@ -3432,6 +3440,7 @@ function MessageRow({
   actor,
   actors,
   machines,
+  runs,
   message,
   workflowSourceIds,
   onReply,
@@ -3450,6 +3459,7 @@ function MessageRow({
   actor?: Actor;
   actors: Record<string, Actor>;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   message: Message;
   workflowSourceIds: Set<string>;
   onReply: (message: Message) => void;
@@ -3480,6 +3490,7 @@ function MessageRow({
       <WorkflowResultRow
         actor={actor}
         machines={machines}
+        runs={runs}
         message={message}
         onOpenAgentSettings={onOpenAgentSettings}
       />
@@ -3497,6 +3508,7 @@ function MessageRow({
           actor={actor}
           fallback={message.authorActorId}
           machines={machines}
+          runs={runs}
           onOpenAgentSettings={onOpenAgentSettings}
         />
         <div className="min-w-0 flex-1">
@@ -3763,11 +3775,13 @@ function WorkflowEventRow({
 function WorkflowResultRow({
   actor,
   machines,
+  runs,
   message,
   onOpenAgentSettings,
 }: {
   actor?: Actor;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   message: Message;
   onOpenAgentSettings: (actorId: string) => void;
 }) {
@@ -3778,6 +3792,7 @@ function WorkflowResultRow({
           actor={actor}
           fallback={message.authorActorId}
           machines={machines}
+          runs={runs}
           onOpenAgentSettings={onOpenAgentSettings}
         />
         <div className="min-w-0 flex-1">
@@ -4004,6 +4019,7 @@ function ThreadPanel({
   draft,
   mentionAgents,
   machines,
+  runs,
   messages,
   setDraft,
   task,
@@ -4023,6 +4039,7 @@ function ThreadPanel({
   draft: string;
   mentionAgents: Actor[];
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   messages: Message[];
   setDraft: (value: string) => void;
   task: Task | null;
@@ -4115,6 +4132,7 @@ function ThreadPanel({
                   busy={busy}
                   currentActorId={currentActorId}
                   machines={machines}
+                  runs={runs}
                   message={rootMessage}
                   onOpenAgentSettings={onOpenAgentSettings}
                   onToggleReaction={onToggleReaction}
@@ -4149,6 +4167,7 @@ function ThreadPanel({
                           busy={busy}
                           currentActorId={currentActorId}
                           machines={machines}
+                          runs={runs}
                           message={message}
                           onOpenAgentSettings={onOpenAgentSettings}
                           onToggleReaction={onToggleReaction}
@@ -4180,6 +4199,7 @@ function ThreadConversationMessage({
   actors,
   currentActorId,
   machines,
+  runs,
   message,
   busy,
   root = false,
@@ -4190,6 +4210,7 @@ function ThreadConversationMessage({
   actors: Record<string, Actor>;
   currentActorId: string | null;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   message: Message;
   busy: string | null;
   root?: boolean;
@@ -4214,6 +4235,7 @@ function ThreadConversationMessage({
           actor={actor}
           fallback={message.authorActorId}
           machines={machines}
+          runs={runs}
           onOpenAgentSettings={onOpenAgentSettings}
           preferredPlacement="left"
         />
@@ -4508,6 +4530,7 @@ function ThreadsView({
   channels,
   messages,
   machines,
+  runs,
   threadMessages,
   threadStatsById,
   threads,
@@ -4529,6 +4552,7 @@ function ThreadsView({
   channels: Channel[];
   messages: Message[];
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   threadMessages: Message[];
   threadStatsById: Record<string, ThreadActivityStats>;
   threads: ThreadWithChannel[];
@@ -4613,6 +4637,7 @@ function ThreadsView({
             activeChannel ? channelMentionAgentActors(activeChannel, actors) : []
           }
           machines={machines}
+          runs={runs}
           messages={threadMessages}
           setDraft={setThreadDraft}
           task={activeThreadTask}
@@ -4970,6 +4995,7 @@ function DirectMessagesView({
   draft,
   linkedChannel,
   machines,
+  runs,
   messages,
   selectedAgent,
   setDraft,
@@ -4988,6 +5014,7 @@ function DirectMessagesView({
   draft: string;
   linkedChannel: Channel | null;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   messages: Message[];
   selectedAgent: Actor | null;
   setDraft: (value: string) => void;
@@ -5092,6 +5119,7 @@ function DirectMessagesView({
               allowThreads={false}
               feedKey={`direct:${selectedAgent.id}`}
               machines={machines}
+              runs={runs}
               messages={messages}
               tasksBySourceMessageId={{}}
               channelThreads={[]}
@@ -5488,6 +5516,7 @@ function SettingsView({
   agentForm,
   setAgentForm,
   machines,
+  runs,
   targetAgentId,
   onConsumeTargetAgent,
   onCheckMachines,
@@ -5502,6 +5531,7 @@ function SettingsView({
   agentForm: AgentFormState;
   setAgentForm: (form: AgentFormState) => void;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   targetAgentId: string | null;
   onConsumeTargetAgent: () => void;
   onCheckMachines: () => void;
@@ -5926,6 +5956,7 @@ function SettingsView({
                       <MemberListItem
                         key={`${entry.machine.id}:${entry.agent.spec.actor.id}`}
                         entry={entry}
+                        runs={runs}
                         selected={selectedMemberEntry?.agent.spec.actor.id === entry.agent.spec.actor.id}
                         onSelect={() => selectAgent(entry)}
                       />
@@ -6215,13 +6246,16 @@ function HostListItem({
 function MemberListItem({
   entry,
   selected,
+  runs,
   onSelect,
 }: {
   entry: AgentMemberEntry;
   selected: boolean;
+  runs: Record<string, Run>;
   onSelect: () => void;
 }) {
   const actor = entry.agent.spec.actor;
+  const working = activeRunCountForActor(runs, actor.id) > 0;
 
   return (
     <button
@@ -6240,10 +6274,18 @@ function MemberListItem({
           <span className="truncate text-sm font-bold text-[#111827]">
             {agentDisplayName(entry.agent)}
           </span>
-          <span className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass(entry.agent.status))} />
+          <span
+            className={cn(
+              "h-2 w-2 shrink-0 rounded-full",
+              working
+                ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.5)]"
+                : statusDotClass(entry.agent.status),
+            )}
+            style={working ? { animation: "agent-status-pulse 1.5s ease-in-out infinite" } : undefined}
+          />
         </span>
         <span className="mt-0.5 block truncate text-xs text-[#667085]">
-          {entry.machine.name}
+          {working ? "Processing…" : entry.machine.name}
         </span>
       </span>
     </button>
@@ -9223,6 +9265,7 @@ function AgentMessageAvatar({
   actor,
   fallback,
   machines,
+  runs,
   onOpenAgentSettings,
   preferredPlacement = "right",
   small,
@@ -9230,6 +9273,7 @@ function AgentMessageAvatar({
   actor?: Actor;
   fallback: string;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   onOpenAgentSettings: (actorId: string) => void;
   preferredPlacement?: "left" | "right";
   small?: boolean;
@@ -9340,7 +9384,7 @@ function AgentMessageAvatar({
     return <ActorAvatar actor={actor} fallback={fallback} small={small} />;
   }
 
-  const badgeProps = agentIdentityBadgeProps(entry);
+  const badgeProps = agentIdentityBadgeProps(entry, activeRunCountForActor(runs, entry.agent.spec.actor.id));
   const entryActorId = entry.agent.spec.actor.id;
   const display = displayName(avatarActor);
 
@@ -9776,10 +9820,25 @@ function agentSettingsDraft(
   };
 }
 
-function agentIdentityBadgeProps(entry: AgentMemberEntry): AgentIdentityBadgeProps {
+function activeRunCountForActor(runs: Record<string, Run>, actorId: string): number {
+  return Object.values(runs).filter(
+    (run) =>
+      run.actorId === actorId &&
+      !["completed", "failed", "canceled"].includes(run.status),
+  ).length;
+}
+
+function agentIdentityBadgeProps(
+  entry: AgentMemberEntry,
+  activeRunCount?: number,
+): AgentIdentityBadgeProps {
   const provider = providerForAgent(entry.machine, entry.agent);
   const providerName = provider?.name || provider?.id || "AI Runtime";
   const iconKey = agentProviderIconKey(provider?.id, providerName);
+  const working = activeRunCount != null && activeRunCount > 0;
+  const workingLabel = activeRunCount != null && activeRunCount > 1
+    ? `${activeRunCount} runs active`
+    : "Processing…";
   return {
     avatarUrl: agentAvatarValue(entry.agent),
     agentName: agentDisplayName(entry.agent),
@@ -9790,6 +9849,8 @@ function agentIdentityBadgeProps(entry: AgentMemberEntry): AgentIdentityBadgePro
     usedTokensLabel: agentContextUsedLabel(entry.agent),
     remainingLabel: agentContextRemainingLabel(entry.agent),
     online: isOnlinePresenceStatus(entry.agent.status, entry.agent),
+    working,
+    workingLabel,
   };
 }
 

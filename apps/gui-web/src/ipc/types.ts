@@ -216,6 +216,7 @@ export interface AgentProviderRef {
   mode?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  env?: Record<string, string>;
 }
 
 export interface MachineAgentProviderInfo {

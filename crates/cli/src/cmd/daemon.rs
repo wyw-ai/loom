@@ -414,7 +414,12 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create agent spec dir {}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(spec)?;
+    // 写入磁盘前剥离 _meta，因为 _meta 是 daemon 运行时注入的元数据
+    // （machineId, workspaceId 等），不应持久化到 spec.json。
+    // 否则会导致下次 reload 时 fingerprint 不一致，触发无限重启循环。
+    let mut clean_spec = spec.clone();
+    clean_spec.actor._meta = None;
+    let text = serde_json::to_string_pretty(&clean_spec)?;
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
@@ -775,7 +780,12 @@ fn reconcile_agents(
 }
 
 fn spec_fingerprint(spec: &AgentSpec) -> String {
-    serde_json::to_string(spec).unwrap_or_else(|_| format!("{spec:?}"))
+    // 排除 _meta 字段计算 fingerprint，因为 _meta 是运行时注入的元数据，
+    // 不应作为“配置变更”的判断依据。否则 server 回传的 agent.update 命令
+    // 会覆写磁盘 spec.json（含 _meta），导致每次 reload 都检测到变更 → 无限重启。
+    let mut spec_without_meta = spec.clone();
+    spec_without_meta.actor._meta = None;
+    serde_json::to_string(&spec_without_meta).unwrap_or_else(|_| format!("{spec:?}"))
 }
 
 fn annotate_machine_agent_specs(specs: &mut [AgentSpec], machine: &MachineConfig) {

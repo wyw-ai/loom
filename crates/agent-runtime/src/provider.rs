@@ -2483,7 +2483,25 @@ fn qoder_manifest() -> ProviderManifest {
 }
 
 fn copilot_manifest() -> ProviderManifest {
-    let args = vec![
+    let first_run_args = vec![
+        lit("--add-dir"),
+        lit("{agent.configDir}"),
+        lit("--yolo"),
+        lit("--output-format"),
+        lit("json"),
+        lit("--stream"),
+        lit("off"),
+        lit("--session-id"),
+        lit("{session.id}"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("--effort"), lit("{reasoningEffort}")],
+        ),
+        lit("-p"),
+        lit("{prompt.full}"),
+    ];
+    let resume_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
         lit("--yolo"),
@@ -2503,7 +2521,7 @@ fn copilot_manifest() -> ProviderManifest {
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
-        resume_args: args.clone(),
+        resume_args,
         scope: Some("actor_scope".into()),
     };
     manifest(
@@ -2511,7 +2529,12 @@ fn copilot_manifest() -> ProviderManifest {
         "GitHub Copilot CLI",
         &["copilot", "copilotcli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = mode("{bin}", args, "copilot_jsonl_final_text", Some(session));
+            let mut mode = mode(
+                "{bin}",
+                first_run_args,
+                "copilot_jsonl_final_text",
+                Some(session),
+            );
             mode.stdout = copilot_jsonl_decoder();
             mode
         })]),

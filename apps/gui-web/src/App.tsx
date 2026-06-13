@@ -161,6 +161,7 @@ type AgentFormState = {
   instructions: string;
   model: string;
   autostart: boolean;
+  env: Record<string, string>;
 };
 type AgentUpdatePatch = {
   machineId: string;
@@ -173,6 +174,7 @@ type AgentUpdatePatch = {
   reasoningEffort: string;
   autostart: boolean;
   avatarUrl: string;
+  env: Record<string, string>;
 };
 type AgentSettingsDraft = {
   displayName: string;
@@ -183,6 +185,7 @@ type AgentSettingsDraft = {
   reasoningEffort: string;
   autostart: boolean;
   avatarUrl: string;
+  env: Record<string, string>;
 };
 type AgentMemberEntry = {
   machine: MachineInfo;
@@ -396,6 +399,7 @@ export function App() {
     instructions: "Reply concisely and report completed work.",
     model: "",
     autostart: true,
+    env: {},
   });
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -1305,6 +1309,7 @@ export function App() {
         promptAssembly: defaultAgentPromptAssembly,
         model: form.model.trim() || provider.defaultModel || "",
         autostart: form.autostart,
+        env: filterEmptyEnvKeys(form.env),
       });
       applyMachines(result.machines);
       setAgentForm((current) =>
@@ -1355,6 +1360,7 @@ export function App() {
         reasoningEffort: patch.reasoningEffort.trim(),
         autostart: patch.autostart,
         avatarUrl: patch.avatarUrl.trim(),
+        env: filterEmptyEnvKeys(patch.env),
       });
       await loadMachines();
       if (workspace && connection === "open") {
@@ -6955,6 +6961,33 @@ function AgentCreateDialog({
     onSelectMachine(nextMachine.id);
   }
 
+  function addEnvEntry() {
+    setDraft((current) => ({
+      ...current,
+      env: { ...current.env, "": "" },
+    }));
+  }
+
+  function updateEnvEntry(index: number, key: string, value: string) {
+    const entries = Object.entries(draft.env);
+    entries[index] = [key, value];
+    setDraft((current) => ({
+      ...current,
+      env: Object.fromEntries(entries),
+    }));
+  }
+
+  function removeEnvEntry(index: number) {
+    const entries = Object.entries(draft.env);
+    entries.splice(index, 1);
+    setDraft((current) => ({
+      ...current,
+      env: Object.fromEntries(entries),
+    }));
+  }
+
+  const envEntries = Object.entries(draft.env);
+
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const created = await onAddAgent(draft);
@@ -7188,6 +7221,54 @@ function AgentCreateDialog({
                 className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                 disabled={!canCreateAgent}
               />
+              <div className="space-y-2 md:col-span-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                    Environment Variables
+                  </span>
+                  <button
+                    type="button"
+                    onClick={addEnvEntry}
+                    disabled={!canCreateAgent}
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-[#dfe3ec] bg-white text-[#596174] hover:bg-[#f0f2f5] disabled:opacity-40"
+                    title="Add environment variable"
+                  >
+                    <Plus size={12} />
+                  </button>
+                </div>
+                {envEntries.map(([key, value], index) => (
+                  <div key={index} className="flex items-center gap-2">
+                    <Input
+                      value={key}
+                      onChange={(event) => updateEnvEntry(index, event.target.value, value)}
+                      placeholder="Key"
+                      className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm font-mono shadow-none"
+                      disabled={!canCreateAgent}
+                    />
+                    <Input
+                      value={value}
+                      onChange={(event) => updateEnvEntry(index, key, event.target.value)}
+                      placeholder="Value"
+                      className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                      disabled={!canCreateAgent}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeEnvEntry(index)}
+                      disabled={!canCreateAgent}
+                      className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
+                      title="Remove"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                ))}
+                {envEntries.length === 0 && (
+                  <div className="rounded-lg border border-dashed border-[#dfe3ec] px-3 py-2 text-center text-xs text-[#9aa1ae]">
+                    No environment variables. Click <Plus size={10} className="inline align-middle" /> to add one.
+                  </div>
+                )}
+              </div>
             </section>
           </div>
         </div>
@@ -7276,6 +7357,33 @@ function AgentMemberDetail({
     setDraft((current) => ({ ...current, ...patch }));
   }
 
+  function addEnvEntry() {
+    setDraft((current) => ({
+      ...current,
+      env: { ...current.env, "": "" },
+    }));
+  }
+
+  function updateEnvEntry(index: number, key: string, value: string) {
+    const entries = Object.entries(draft.env);
+    entries[index] = [key, value];
+    setDraft((current) => ({
+      ...current,
+      env: Object.fromEntries(entries),
+    }));
+  }
+
+  function removeEnvEntry(index: number) {
+    const entries = Object.entries(draft.env);
+    entries.splice(index, 1);
+    setDraft((current) => ({
+      ...current,
+      env: Object.fromEntries(entries),
+    }));
+  }
+
+  const envEntries = Object.entries(draft.env);
+
   function saveAgent() {
     onUpdateAgent({
       machineId: machine.id,
@@ -7288,6 +7396,7 @@ function AgentMemberDetail({
       reasoningEffort: draft.reasoningEffort,
       autostart: draft.autostart,
       avatarUrl: draft.avatarUrl,
+      env: draft.env,
     });
   }
 
@@ -7515,6 +7624,46 @@ function AgentMemberDetail({
                 />
                 Autostart
               </label>
+            </div>
+          </HostDetailSection>
+          <HostDetailSection title="Environment Variables">
+            <div className="space-y-2">
+              {envEntries.map(([key, value], index) => (
+                <div key={index} className="flex items-center gap-2">
+                  <Input
+                    value={key}
+                    onChange={(event) => updateEnvEntry(index, event.target.value, value)}
+                    placeholder="Key"
+                    className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm font-mono shadow-none"
+                    disabled={!canEdit}
+                  />
+                  <Input
+                    value={value}
+                    onChange={(event) => updateEnvEntry(index, key, event.target.value)}
+                    placeholder="Value"
+                    className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canEdit}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeEnvEntry(index)}
+                    disabled={!canEdit}
+                    className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
+                    title="Remove"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={addEnvEntry}
+                disabled={!canEdit}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[#dfe3ec] px-3 py-2 text-xs text-[#596174] hover:border-[#c0c7d2] hover:bg-[#f0f2f5] disabled:opacity-40"
+              >
+                <Plus size={12} />
+                Add environment variable
+              </button>
             </div>
           </HostDetailSection>
         </>
@@ -9623,6 +9772,7 @@ function agentSettingsDraft(
     reasoningEffort: agentReasoningEffort(agent),
     autostart: Boolean(agent.spec.autostart),
     avatarUrl: agentAvatarValue(agent),
+    env: { ...(agent.spec.providerRef.env ?? {}) },
   };
 }
 
@@ -10786,4 +10936,14 @@ function threadIdForMessage(
 
 function errorText(err: unknown) {
   return err instanceof Error ? err.message : String(err);
+}
+
+function filterEmptyEnvKeys(env: Record<string, string>): Record<string, string> {
+  const filtered: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.trim()) {
+      filtered[key.trim()] = value;
+    }
+  }
+  return filtered;
 }

@@ -220,7 +220,7 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "copilot")
             .expect("copilot provider");
-        assert!(copilot.args.contains(&"--resume".into()));
+        assert!(copilot.args.contains(&"--session-id".into()));
         assert!(copilot.args.contains(&"{prompt.full}".into()));
         assert_eq!(
             copilot.transport().output_format,

@@ -923,6 +923,8 @@ pub struct AgentCreateArgs {
     pub autostart: bool,
     #[serde(default)]
     pub avatar_url: String,
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[tauri::command]
@@ -997,6 +999,8 @@ pub struct AgentUpdateArgs {
     pub avatar_url: Option<String>,
     #[serde(default)]
     pub prompt_assembly: Option<Value>,
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[tauri::command]
@@ -1046,6 +1050,7 @@ pub async fn agent_update(
         "reasoningEffort": args.reasoning_effort,
         "autostart": args.autostart,
         "avatarUrl": args.avatar_url,
+        "env": args.env,
     });
     if let Some(prompt_assembly) = args.prompt_assembly {
         command["promptAssembly"] = prompt_assembly;
@@ -1433,6 +1438,7 @@ pub async fn machine_agent_create(
                 "reasoningEffort": args.reasoning_effort,
                 "autostart": args.autostart,
                 "avatarUrl": args.avatar_url,
+                "env": args.env,
             }),
         )
         .await?;

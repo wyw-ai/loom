@@ -498,6 +498,16 @@ fn agent_spec_from_command(
         })
         .transpose()?;
 
+    let env: BTreeMap<String, String> = command
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut meta = BTreeMap::new();
     meta.insert("providerId".into(), json!(provider.id.clone()));
     meta.insert("providerName".into(), json!(provider.display_name.clone()));
@@ -530,7 +540,7 @@ fn agent_spec_from_command(
             mode: Some("print".into()),
             model: model.clone(),
             reasoning_effort,
-            ..Default::default()
+            env,
         },
         autostart: command
             .get("autostart")
@@ -655,6 +665,16 @@ fn update_agent_spec_from_command(
                     .context("parse promptAssembly")?,
             )
         };
+    }
+    if let Some(env_value) = command.get("env") {
+        if env_value.is_null() {
+            spec.provider_ref.env.clear();
+        } else if let Some(obj) = env_value.as_object() {
+            spec.provider_ref.env = obj
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect();
+        }
     }
     if let Some(provider) = selected_provider {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);

@@ -1726,6 +1726,55 @@ impl WorkerState {
         None
     }
 
+    /// Cancel all active turns and queued triggers whose scope belongs to
+    /// `channel_id`. Returns the scopes that had active turns so the caller
+    /// can cancel the adapter for each. Called when a CHANNEL_DELETED stream
+    /// update arrives — the agent must stop working in the deleted channel
+    /// immediately to prevent error-looping and resource waste.
+    fn cancel_channel_work(&self, channel_id: &str) -> Vec<ScopeRef> {
+        // Snapshot the thread→channel cache first so we don't hold two locks.
+        let channel_for_thread: HashMap<String, String> = self
+            .scope_channel_cache
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+
+        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut scopes: Vec<ScopeRef> = Vec::new();
+
+        for turn in active.values_mut() {
+            let belongs = match &turn.scope.kind {
+                ScopeKind::Channel => turn.scope.id == channel_id,
+                ScopeKind::Thread => channel_for_thread
+                    .get(&turn.scope.id)
+                    .map(|c| c == channel_id)
+                    .unwrap_or(false),
+            };
+            if belongs {
+                turn.cancel_requested = true;
+                scopes.push(turn.scope.clone());
+            }
+        }
+        drop(active);
+
+        // Clear pending triggers for scopes in the deleted channel so queued
+        // work doesn't re-dispatch after the adapter finishes.
+        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        for scope in &scopes {
+            pending.remove(&scope.id);
+        }
+        drop(pending);
+
+        // Release the scope-busy gate so the worker doesn't think these scopes
+        // are still occupied.
+        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
+        for scope in &scopes {
+            busy.remove(&scope.id);
+        }
+
+        scopes
+    }
+
     fn has_pending_source(&self, source_id: &str) -> bool {
         self.pending_triggers
             .lock()
@@ -2417,6 +2466,39 @@ async fn notification_loop(
             };
             if run.actor_id == actor_id && run_requests_no_reply(&run) {
                 let _ = state.mark_no_reply_requested(&run.id);
+            }
+            continue;
+        }
+        if kind == stream_kind::CHANNEL_DELETED {
+            let Some(channel_id) = params
+                .get("data")
+                .and_then(|d| d.get("channelId"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let scopes = state.cancel_channel_work(channel_id);
+            if !scopes.is_empty() {
+                eprintln!(
+                    "[{actor_id}] channel {channel_id} deleted — canceling {} active turn(s)",
+                    scopes.len()
+                );
+                for scope in &scopes {
+                    if let Err(e) = adapter.cancel(scope.clone()).await {
+                        tracing::warn!(
+                            actor = %actor_id,
+                            channel = %channel_id,
+                            scope = %scope.id,
+                            %e,
+                            "adapter cancel failed for deleted channel",
+                        );
+                    }
+                    // Discard any buffered text for the canceled turn so it
+                    // won't be published later when the adapter finishes.
+                    if let Some(turn) = state.current_turn(&scope.id) {
+                        state.take_text(&turn.id);
+                    }
+                }
             }
             continue;
         }

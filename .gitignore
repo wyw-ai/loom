@@ -32,3 +32,4 @@ data
 /apps/gui-web/vite.config.js
 /crates/gui/gen/
 /crates/gui/target/
+/logs/

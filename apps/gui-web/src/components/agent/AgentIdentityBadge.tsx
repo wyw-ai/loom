@@ -35,6 +35,8 @@ export type AgentIdentityBadgeProps = {
   remainingLabel?: string;
   segments?: AgentIdentityBadgeSegment[];
   online?: boolean;
+  working?: boolean;
+  workingLabel?: string;
   className?: string;
   defaultExpanded?: boolean;
   onAvatarClick?: () => void;
@@ -100,13 +102,15 @@ export function AgentIdentityBadge({
   remainingLabel = "13%",
   segments = defaultSegments,
   online = true,
+  working = false,
+  workingLabel = "Processing…",
   className,
   defaultExpanded = false,
   onAvatarClick,
   onExpandedChange,
 }: AgentIdentityBadgeProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
-  const activeLabel = online ? "Active" : "Idle";
+  const activeLabel = working ? workingLabel : online ? "Active" : "Idle";
   function updateExpanded(nextExpanded: boolean) {
     setExpanded(nextExpanded);
     onExpandedChange?.(nextExpanded);
@@ -125,6 +129,7 @@ export function AgentIdentityBadge({
         remainingLabel={remainingLabel}
         segments={segments}
         activeLabel={activeLabel}
+        working={working}
         className={className}
         onAvatarClick={onAvatarClick}
         onCollapse={() => updateExpanded(false)}
@@ -134,7 +139,8 @@ export function AgentIdentityBadge({
 
   return (
     <article className={cn("agent-identity-badge", className)} aria-label={`${agentName} agent badge`}>
-      {online && <span className="agent-identity-badge__status" aria-label="Active" />}
+      {working && <span className="agent-identity-badge__status agent-identity-badge__status--working" aria-label={workingLabel} />}
+      {!working && online && <span className="agent-identity-badge__status" aria-label="Active" />}
       {onAvatarClick ? (
         <button
           type="button"
@@ -197,6 +203,7 @@ function AgentIdentityDetailCard({
   remainingLabel,
   segments,
   activeLabel,
+  working = false,
   className,
   onAvatarClick,
   onCollapse,
@@ -211,6 +218,7 @@ function AgentIdentityDetailCard({
   remainingLabel: string;
   segments: AgentIdentityBadgeSegment[];
   activeLabel: string;
+  working?: boolean;
   className?: string;
   onAvatarClick?: () => void;
   onCollapse: () => void;
@@ -257,7 +265,7 @@ function AgentIdentityDetailCard({
             <h2>{modelName}</h2>
           </div>
 
-          <span className="agent-detail-card__active">
+          <span className={cn("agent-detail-card__active", working && "agent-detail-card__active--working")}>
             <span />
             {activeLabel}
           </span>

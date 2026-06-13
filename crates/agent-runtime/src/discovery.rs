@@ -95,6 +95,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
                             mode: Some("print".into()),
                             model: default_model.clone(),
                             reasoning_effort: None,
+                            ..Default::default()
                         },
                         runtime_path.clone(),
                     )

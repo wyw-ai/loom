@@ -530,6 +530,7 @@ fn agent_spec_from_command(
             mode: Some("print".into()),
             model: model.clone(),
             reasoning_effort,
+            ..Default::default()
         },
         autostart: command
             .get("autostart")
@@ -2297,6 +2298,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("gpt-5.5".into()),
                 reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
             },
             autostart: false,
             models: Some(AgentModelSpec {
@@ -2379,6 +2381,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: false,
             models: None,
@@ -2523,6 +2526,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: true,
             models: None,

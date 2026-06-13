@@ -1910,11 +1910,15 @@ fn runtime_plan_from_manifest(
     } else {
         flatten_args_for_inventory(&resume_arg_specs)
     };
-    let env = mode
+    let mut env: BTreeMap<String, String> = mode
         .env
         .iter()
         .map(|(key, value)| (key.clone(), expand_static_template(value, bin)))
-        .collect::<BTreeMap<_, _>>();
+        .collect();
+    // Merge agent-spec env overrides — agent spec wins over provider manifest.
+    for (key, value) in &provider_ref.env {
+        env.insert(key.clone(), value.clone());
+    }
     let model_args = mode
         .model_args
         .iter()
@@ -3634,6 +3638,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("sonnet".into()),
                 reasoning_effort: None,
+                ..Default::default()
             },
         )
         .expect("transport");
@@ -3673,6 +3678,7 @@ mod tests {
                 mode: Some("nonprint".into()),
                 model: Some("sonnet".into()),
                 reasoning_effort: None,
+                ..Default::default()
             },
         )
         .expect("transport");
@@ -3732,6 +3738,7 @@ mod tests {
             mode: Some("print".into()),
             model: Some("opencode/big-pickle".into()),
             reasoning_effort: None,
+            ..Default::default()
         };
         let plan = runtime_plan_from_manifest(
             &provider.manifest,
@@ -3785,6 +3792,7 @@ mod tests {
             mode: Some("print".into()),
             model: Some("auto".into()),
             reasoning_effort: Some("high".into()),
+            ..Default::default()
         };
         let plan = runtime_plan_from_manifest(
             &provider.manifest,
@@ -3886,6 +3894,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("demo-model".into()),
                 reasoning_effort: None,
+                ..Default::default()
             },
         )
         .expect("runtime plan");
@@ -4026,6 +4035,7 @@ mod tests {
                     mode: Some("print".into()),
                     model: None,
                     reasoning_effort: None,
+                    ..Default::default()
                 },
                 path_dir.into_os_string(),
             )
@@ -4189,5 +4199,67 @@ mod tests {
 
         let err = ProviderRegistry::load(&config).expect_err("shadow should fail");
         assert!(err.contains("conflicts with an existing provider id"));
+    }
+
+    #[test]
+    fn agent_provider_ref_env_overrides_mode_env() {
+        let bin = Path::new("/usr/local/bin/fake-cli");
+        let mode = ProviderModeSpec {
+            transport: "command".into(),
+            command: "/usr/local/bin/fake-cli".into(),
+            args: vec![lit("{prompt.full}")],
+            env: BTreeMap::from([
+                ("BASE_KEY".into(), "from-mode".into()),
+                ("OVERRIDE_ME".into(), "from-mode".into()),
+            ]),
+            stdout: ProviderDecoderSpec {
+                format: "text".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manifest = manifest(
+            "test-provider",
+            "Test Provider",
+            &["fake-cli"],
+            BTreeMap::from([("print".into(), mode.clone())]),
+            &[],
+        );
+
+        let provider_ref = AgentProviderRef {
+            id: "test-provider".into(),
+            mode: Some("print".into()),
+            model: None,
+            reasoning_effort: None,
+            env: BTreeMap::from([
+                ("OVERRIDE_ME".into(), "from-agent-spec".into()),
+                ("AGENT_ONLY".into(), "from-agent-spec".into()),
+            ]),
+        };
+
+        let plan = runtime_plan_from_manifest(
+            &manifest,
+            "print",
+            manifest.modes.get("print").unwrap(),
+            bin,
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        // agent spec 的 env 覆盖 mode 的同名 key
+        assert_eq!(
+            plan.env.get("OVERRIDE_ME").map(String::as_str),
+            Some("from-agent-spec")
+        );
+        // mode 独有的 key 保留
+        assert_eq!(
+            plan.env.get("BASE_KEY").map(String::as_str),
+            Some("from-mode")
+        );
+        // agent spec 独有的 key 加入
+        assert_eq!(
+            plan.env.get("AGENT_ONLY").map(String::as_str),
+            Some("from-agent-spec")
+        );
     }
 }

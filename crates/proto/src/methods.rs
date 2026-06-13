@@ -2723,6 +2723,10 @@ pub struct AgentProviderRef {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-agent environment variables injected into the provider child process.
+    /// Keys here override same-named keys from the provider manifest's mode.env.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.

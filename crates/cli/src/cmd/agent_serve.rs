@@ -6504,6 +6504,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: false,
             models: None,

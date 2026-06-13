@@ -36,6 +36,21 @@
 - **文件**: `crates/server/src/store.rs`, `crates/cli/src/cmd/daemon.rs`
 - **关联**: [[2026-06-14 resolve_actor_alias 僵尸 Actor Bug]]
 
+### #4 Agent 在频道删除后继续执行导致错误循环 🔴 进行中 (2026-06-14)
+
+- **严重程度**: 🔴 Critical — Agent 持续重试已删除频道的操作，浪费资源并产生噪音
+- **影响范围**: 所有 agent worker，影响频道删除后的 agent 运行稳定性
+- **根因**: Agent 的 `notification_loop()` 只处理 `MESSAGE_CREATED`、`EVENT_CREATED`、`RUN_UPDATED` 三种流更新，完全忽略了 `CHANNEL_DELETED` 事件。当频道被删除时：
+  1. Server 正确广播 `CHANNEL_DELETED` 事件（ws.rs:371-410），public 频道广播给所有连接，private 频道推送到成员 inbox
+  2. Agent worker 收到 `STREAM_UPDATE` 但 `kind` 不匹配任何已知类型，直接 `continue` 跳过
+  3. Agent 继续处理该频道的 pending trigger 和 inbox delivery，反复尝试 `scope/subscribe` 和 `run.open`，均失败于 "not a member of channel"（code -32002）
+  4. `drain_pending_inbox` 中的 `is_unreachable_scope_error` 可以 ack 这些失败消息，但 agent 仍在浪费 CPU/网络资源重试
+- **修复**:
+  1. `WorkerState::cancel_channel_work(channel_id)` — 遍历所有 `active_turns`，标记属于该频道的 turn 为 `cancel_requested`；清除 `pending_triggers` 中该频道的队列；释放 `scope_busy` 锁
+  2. `notification_loop` 新增 `CHANNEL_DELETED` 分支 — 调用 `cancel_channel_work()` + `adapter.cancel()` 停止正在运行的 LLM 推理
+- **文件**: `crates/cli/src/cmd/agent_serve.rs`
+- **关联**: [[2026-06-14 频道删除 Agent 未停止 Bug]]
+
 ## 已关闭
 
 _（暂无）_
@@ -44,6 +59,7 @@ _（暂无）_
 
 | 日期 | 描述 |
 |------|------|
+| 2026-06-14 | 修复频道删除后 Agent 继续执行导致错误循环（新增 CHANNEL_DELETED 处理） |
 | 2026-06-14 | 修复 `resolve_actor_alias` 返回僵尸 Actor 导致 `message.send` 失败 |
 | 2026-06-14 | 修复 Copilot CLI 首次运行 `--session-id` 与 `--resume` 参数分离 |
 | 2026-06-14 | 实现 GUI Agent Env 键值编辑器 |

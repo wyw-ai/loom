@@ -51,6 +51,23 @@
 - **文件**: `crates/cli/src/cmd/agent_serve.rs`
 - **关联**: [[2026-06-14 频道删除 Agent 未停止 Bug]]
 
+### #5 Copilot CLI Session 上下文膨胀导致长需求无响应 ✅ 已修复 (2026-06-14)
+
+- **严重程度**: 🔴 Critical — Agent 收到长消息后无限等待 API 响应
+- **影响范围**: 所有使用 Copilot CLI provider 的 agent
+- **根因**: Copilot CLI 不支持 `--system-prompt` 参数（与 Codex/CC 不同），LOOM 将所有 prompt 内容通过 `-p "{prompt.full}"` 传入。每次 resume，copilot 的 events.jsonl 都会新增一条 user.message（~47KB），其中 40KB 为固定不变的 `agent_instructions`。52 轮对话后 session 膨胀至 10MB/1769 条事件，传递给模型 API 时超时。
+- **修复**（Provider manifest 注入策略 — `instructions_via`）:
+  1. `ProviderModeSpec` 新增 `instructions_via` 字段：`"prompt"`（默认）或 `"agents_md"`
+  2. Copilot manifest 设置 `instructions_via: "agents_md"`
+  3. `ensure_agents_md` 扩展，接受 `agent_instructions` 和 `actor_context` 写入 AGENTS.md
+  4. `compose_envelope_prompt` 对 `instructions_via == "agents_md"` 的 provider 跳过 prompt 中的指令段落
+  5. Copilot CLI 通过 `--add-dir` 自动加载 `AGENTS.md`（官方标准机制）
+  6. 编译通过，全部 677 测试无回归
+- **预期效果**: 每条 user.message 从 ~47KB → ~5KB（减少 89%），session 总量从 ~10MB → ~3MB
+- **文件**: `crates/agent-runtime/src/provider.rs`, `crates/agent-runtime/src/agents_md.rs`, `crates/proto/src/methods.rs`, `crates/cli/src/cmd/agent_serve.rs`
+- **设计文档**: [[2026-06-14-copilot-instructions-injection-design]]
+- **关联**: [[Session 上下文去重优化设计]]
+
 ## 已关闭
 
 _（暂无）_
@@ -59,6 +76,7 @@ _（暂无）_
 
 | 日期 | 描述 |
 |------|------|
+| 2026-06-14 | 修复 Copilot CLI Session 上下文膨胀（instructions_via 注入策略，677 测试通过） |
 | 2026-06-14 | 修复频道删除后 Agent 继续执行导致错误循环（新增 CHANNEL_DELETED 处理） |
 | 2026-06-14 | 修复 `resolve_actor_alias` 返回僵尸 Actor 导致 `message.send` 失败 |
 | 2026-06-14 | 修复 Copilot CLI 首次运行 `--session-id` 与 `--resume` 参数分离 |

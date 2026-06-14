@@ -1,5 +1,5 @@
 import { PageHeader } from "@/components/shared/PageComponents";
-import { SettingsSection } from "@/components/views/SettingsView";
+import { SettingsSection } from "@/components/settings/SettingsSection";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";

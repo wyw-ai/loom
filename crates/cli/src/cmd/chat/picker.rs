@@ -277,6 +277,28 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn status_color(status: &str) -> Color {
+    if status.starts_with("⚠") {
+        return Color::Yellow;
+    }
+    if status.contains("思考中") {
+        return Color::Magenta;
+    }
+    if status.contains("等待工具") {
+        return Color::Rgb(255, 165, 0); // orange
+    }
+    if status.contains("准备中") {
+        return Color::Blue;
+    }
+    if status.contains("排队中") {
+        return Color::Gray;
+    }
+    if status.contains("运行失败") {
+        return Color::Red;
+    }
+    if status.contains("已取消") {
+        return Color::DarkGray;
+    }
+    // Legacy fallback for old status strings
     match status {
         "running" => Color::Green,
         "idle" => Color::Yellow,

@@ -80,6 +80,7 @@ pub async fn run(
             display_name
         ));
     }
+    let mut frame_count: u64 = 0;
 
     loop {
         // Sidebar may have queued a scope switch on the previous frame —
@@ -95,6 +96,14 @@ pub async fn run(
             app.set_status("disconnected");
             app.disconnected = true;
         }
+
+        // Periodic stale/timeout refresh: re-run aggregation ~every 30
+        // frames (≈3 s at 100 ms poll). Keeps status labels fresh even
+        // when no new run.updated events arrive.
+        if frame_count % 30 == 0 {
+            app.recompute_agent_statuses();
+        }
+        frame_count = frame_count.wrapping_add(1);
 
         terminal.draw(|f| ui::render(f, &mut app))?;
         if app.should_quit {
@@ -297,8 +306,11 @@ async fn bootstrap_display_name(client: &Client, actor_id: &str) -> String {
 
 async fn refresh_actor_directory(client: &Client, app: &mut App) {
     use proto::methods::ActorListResult;
+    // V4: agent_statuses is now a HashMap<String, AgentStatusInfo> managed by
+    // recompute_agent_statuses() with per-run TTL cleanup — we no longer
+    // blindly clear it here because we want status to survive actor-list
+    // refreshes (runs are independent of actor directory membership).
     app.agent_ids.clear();
-    app.agent_statuses.clear();
     if let Ok(list) = client
         .call::<_, ActorListResult>(method::ACTOR_LIST, json!({}))
         .await
@@ -464,12 +476,47 @@ fn apply_cross_scope_action_request_message(app: &mut App, scope: &ScopeRef, mes
     );
 }
 
-/// Register a run so cancel and the in-flight bar know about it. Skip runs we
-/// ourselves own; the human chat only cancels remote agent runs.
+/// Register a run for agent status display AND the in-flight bar / cancel.
+/// Terminal runs stay in run_cache for TTL seconds so the user sees brief
+/// "运行失败"/"已取消" labels before they disappear.
 fn apply_run_updated(app: &mut App, run: Run) {
     if run.actor_id == app.actor_id {
         return;
     }
+
+    // Always update run_cache for status aggregation.
+    let tool_name = run
+        .metadata
+        .get("toolName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let error = run
+        .metadata
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let no_reply_reason = run
+        .metadata
+        .get("noReplyReason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cr = super::app::CachedRun {
+        actor_id: run.actor_id.clone(),
+        status: run.status,
+        start_reason: run.start_reason.clone(),
+        opened_at: run.opened_at,
+        closed_at: run.closed_at,
+        tool_name,
+        error,
+        no_reply_reason,
+    };
+    app.run_cache.insert(run.id.clone(), cr);
+
+    // Recompute agent statuses after every run update.
+    app.recompute_agent_statuses();
+
+    // OpenTurn tracking (in-flight bar / cancel) — unchanged logic,
+    // just driven from the same event.
     if matches!(
         run.status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
@@ -1855,14 +1902,12 @@ fn patch_member_cache_after_invite(app: &mut App, channel_id: &str, actor_id: &s
         _ => proto::types::ActorKind::Human,
     };
     if let Some(s) = app.sidebar.as_mut() {
-        s.add_member(
-            channel_id,
-            MemberRow {
-                actor_id: actor_id.to_string(),
-                display,
-                kind,
-            },
-        );
+        let row = MemberRow {
+            actor_id: actor_id.to_string(),
+            display,
+            kind,
+        };
+        s.add_member(channel_id, row);
     }
 }
 

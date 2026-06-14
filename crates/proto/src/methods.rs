@@ -1914,6 +1914,9 @@ pub struct AgentTransport {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// 指令注入方式（从 ProviderModeSpec 复制）。"prompt" 或 "agents_md"。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "instructionsVia")]
+    pub instructions_via: Option<String>,
 }
 
 impl AgentTransport {
@@ -2036,16 +2039,20 @@ pub struct ProviderModeSpec {
     pub session: Option<ProviderSessionSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "idleTimeoutMs"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idleTimeoutMs")]
     pub idle_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// 指令注入方式："prompt"（默认，注入 prompt 文本）或
+    /// "agents_md"（写入工作区 AGENTS.md，由 provider 自动加载）。
+    #[serde(default = "default_instructions_via", rename = "instructionsVia")]
+    pub instructions_via: String,
+}
+
+pub fn default_instructions_via() -> String {
+    "prompt".into()
 }
 
 fn default_provider_transport() -> String {

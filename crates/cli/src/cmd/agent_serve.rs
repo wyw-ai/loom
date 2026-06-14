@@ -828,13 +828,15 @@ impl AgentPaths {
         actor_id: &str,
         channel_id: &str,
         scope_ref: &ScopeRef,
+        agent_instructions: Option<&str>,
+        actor_context: Option<&str>,
     ) -> std::io::Result<ScopePaths> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
         std::fs::create_dir_all(&scope.workspace)?;
         std::fs::create_dir_all(&scope.logs)?;
         std::fs::create_dir_all(&scope.channel_artifacts)?;
         ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
-        agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
+        agent_runtime::ensure_agents_md(&scope.workspace, actor_id, agent_instructions, actor_context)?;
         Ok(scope)
     }
 
@@ -1412,6 +1414,8 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
+    /// 指令注入方式（从 provider manifest 复制）。"prompt" 或 "agents_md"。
+    instructions_via: String,
 }
 
 #[derive(Clone)]
@@ -1514,6 +1518,7 @@ fn test_command_transport() -> AgentTransport {
         session: None,
         output_format: None,
         decoder: None,
+        instructions_via: None,
         stderr_decoder: None,
         prompt_via: proto::methods::PromptVia::default(),
         prompt: None,
@@ -1576,6 +1581,11 @@ impl WorkerState {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
+        let instructions_via = transport
+            .instructions_via
+            .as_deref()
+            .unwrap_or("prompt")
+            .to_string();
         Self {
             actor_id,
             spec,
@@ -1594,6 +1604,7 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
+            instructions_via,
         }
     }
 
@@ -3488,9 +3499,17 @@ async fn build_adapter_prompt(
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
         .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
+    let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let agent_instructions = agent_instructions_manifest(&state.spec);
     let scope_paths = state
         .paths
-        .ensure_scope(&state.actor_id, &channel_id, scope)?;
+        .ensure_scope(
+            &state.actor_id,
+            &channel_id,
+            scope,
+            Some(&agent_instructions),
+            Some(&actor_context),
+        )?;
     let mut template_vars = state
         .paths
         .template_vars(&state.actor_id, &channel_id, scope);
@@ -3995,7 +4014,7 @@ async fn no_reply_file_for_turn(
     let channel_id = resolve_channel_for_scope(client, state, scope).await?;
     let paths = state
         .paths
-        .ensure_scope(&state.actor_id, &channel_id, scope)
+        .ensure_scope(&state.actor_id, &channel_id, scope, None, None)
         .ok()?;
     Some(run_no_reply_file(&paths.logs, run_id))
 }
@@ -4731,8 +4750,15 @@ async fn compose_envelope_prompt(
 ) -> PromptTelemetry {
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
-    let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
-    let agent_instructions = agent_instructions_manifest(&state.spec);
+    let mut actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let mut agent_instructions = agent_instructions_manifest(&state.spec);
+    // For providers that inject instructions via AGENTS.md (e.g. Copilot CLI),
+    // skip the fixed instruction sections from the prompt to avoid bloating
+    // the provider's session context (events.jsonl) with repeated 40KB payloads.
+    if state.instructions_via == "agents_md" {
+        actor_context.clear();
+        agent_instructions.clear();
+    }
     let conversation_context = recent_conversation_context(client, state, trigger).await;
     let members_context = current_scope_members_context(client, state, scope).await;
     let runtime_context = join_prompt_sections([
@@ -6882,7 +6908,7 @@ mod tests {
         };
 
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope)
+            .ensure_scope("actor_demo", "chan_demo", &scope, None, None)
             .expect("ensure scope");
 
         assert_eq!(

@@ -106,7 +106,6 @@ import type {
   ConnectionState,
   PanelResizeDrag,
   PanelResizeKind,
-  PanelSizes,
   PromptAssemblyBuildOptions,
   PromptTemplateDraft,
   ProviderAvailabilityGroup,
@@ -213,7 +212,6 @@ import {
   formatShortDateTime,
   initialViewportWidth,
   isComposingKeyEvent,
-  loadPanelSizes,
   machineCanCreateAgent,
   mentionAudience,
   mentionCandidates,
@@ -255,41 +253,94 @@ import {
 } from "@/lib/agent-utils";
 import { agentIdentityBadgeProps } from "@/lib/agent-identity-utils";
 
+// Zustand stores (P2)
+import { useConnectionStore } from "@/store/connectionStore";
+import { useUIStore } from "@/store/uiStore";
+import { useChannelStore } from "@/store/channelStore";
+import { useMessageStore } from "@/store/messageStore";
+import { useActorStore } from "@/store/actorStore";
+import { useTaskStore } from "@/store/taskStore";
+
 export function App() {
-  const [config, setConfig] = useState<DesktopConfig>({
-    workspaces: [],
-    account: null,
-  });
-  const [workspace, setWorkspace] = useState<Workspace | null>(null);
-  const [connection, setConnection] = useState<ConnectionState>("idle");
-  const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<View>("chat");
-  const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
-  const [channels, setChannels] = useState<Channel[]>([]);
-  const [channelGroups, setChannelGroups] = useState<ChannelGroup[]>(() =>
-    loadChannelGroups(channelGroupStorageKey(null)),
-  );
-  const [threadsByChannel, setThreadsByChannel] = useState<Record<string, Thread[]>>({});
-  const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
-  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
-  const [activeDirectActorId, setActiveDirectActorId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [threadMessages, setThreadMessages] = useState<Message[]>([]);
-  const [directMessages, setDirectMessages] = useState<Message[]>([]);
-  const [threadStatsById, setThreadStatsById] = useState<Record<string, ThreadActivityStats>>({});
-  const [actors, setActors] = useState<Record<string, Actor>>({});
-  const [runs, setRuns] = useState<Record<string, Run>>({});
-  const [inbox, setInbox] = useState<InboxListEntry[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [machines, setMachines] = useState<MachineInfo[]>([]);
-  const [draft, setDraft] = useState("");
-  const [threadDraft, setThreadDraft] = useState("");
-  const [directDraft, setDirectDraft] = useState("");
-  const [directScopesByActorId, setDirectScopesByActorId] = useState<Record<string, ScopeRef>>({});
-  const [workspaceForm, setWorkspaceForm] = useState({
-    name: "Local",
-    serverUrl: localServerUrl,
-  });
+  // --- Connection store ---
+  const config = useConnectionStore((s) => s.config);
+  const setConfig = useConnectionStore((s) => s.setConfig);
+  const workspace = useConnectionStore((s) => s.workspace);
+  const setWorkspace = useConnectionStore((s) => s.setWorkspace);
+  const connection = useConnectionStore((s) => s.connection);
+  const setConnection = useConnectionStore((s) => s.setConnection);
+  const error = useConnectionStore((s) => s.error);
+  const setError = useConnectionStore((s) => s.setError);
+  const notice = useConnectionStore((s) => s.notice);
+  const setNotice = useConnectionStore((s) => s.setNotice);
+  const busy = useConnectionStore((s) => s.busy);
+  const setBusy = useConnectionStore((s) => s.setBusy);
+  const workspaceForm = useConnectionStore((s) => s.workspaceForm);
+  const setWorkspaceForm = useConnectionStore((s) => s.setWorkspaceForm);
+
+  // --- UI store ---
+  const view = useUIStore((s) => s.view);
+  const setView = useUIStore((s) => s.setView);
+  const settingsAgentId = useUIStore((s) => s.settingsAgentId);
+  const setSettingsAgentId = useUIStore((s) => s.setSettingsAgentId);
+  const channelPanelTab = useUIStore((s) => s.channelPanelTab);
+  const setChannelPanelTab = useUIStore((s) => s.setChannelPanelTab);
+  const panelSizes = useUIStore((s) => s.panelSizes);
+  const setPanelSizes = useUIStore((s) => s.setPanelSizes);
+  const viewportWidth = useUIStore((s) => s.viewportWidth);
+  const setViewportWidth = useUIStore((s) => s.setViewportWidth);
+  const resizingPanel = useUIStore((s) => s.resizingPanel);
+  const setResizingPanel = useUIStore((s) => s.setResizingPanel);
+  const replyTo = useUIStore((s) => s.replyTo);
+  const setReplyTo = useUIStore((s) => s.setReplyTo);
+
+  // --- Channel store ---
+  const channels = useChannelStore((s) => s.channels);
+  const setChannels = useChannelStore((s) => s.setChannels);
+  const channelGroups = useChannelStore((s) => s.channelGroups);
+  const setChannelGroups = useChannelStore((s) => s.setChannelGroups);
+  const threadsByChannel = useChannelStore((s) => s.threadsByChannel);
+  const setThreadsByChannel = useChannelStore((s) => s.setThreadsByChannel);
+  const activeChannelId = useChannelStore((s) => s.activeChannelId);
+  const setActiveChannelId = useChannelStore((s) => s.setActiveChannelId);
+  const activeThreadId = useChannelStore((s) => s.activeThreadId);
+  const setActiveThreadId = useChannelStore((s) => s.setActiveThreadId);
+  const activeDirectActorId = useChannelStore((s) => s.activeDirectActorId);
+  const setActiveDirectActorId = useChannelStore((s) => s.setActiveDirectActorId);
+  const directScopesByActorId = useChannelStore((s) => s.directScopesByActorId);
+  const setDirectScopesByActorId = useChannelStore((s) => s.setDirectScopesByActorId);
+
+  // --- Message store ---
+  const messages = useMessageStore((s) => s.messages);
+  const setMessages = useMessageStore((s) => s.setMessages);
+  const threadMessages = useMessageStore((s) => s.threadMessages);
+  const setThreadMessages = useMessageStore((s) => s.setThreadMessages);
+  const directMessages = useMessageStore((s) => s.directMessages);
+  const setDirectMessages = useMessageStore((s) => s.setDirectMessages);
+  const threadStatsById = useMessageStore((s) => s.threadStatsById);
+  const setThreadStatsById = useMessageStore((s) => s.setThreadStatsById);
+  const draft = useMessageStore((s) => s.draft);
+  const setDraft = useMessageStore((s) => s.setDraft);
+  const threadDraft = useMessageStore((s) => s.threadDraft);
+  const setThreadDraft = useMessageStore((s) => s.setThreadDraft);
+  const directDraft = useMessageStore((s) => s.directDraft);
+  const setDirectDraft = useMessageStore((s) => s.setDirectDraft);
+
+  // --- Actor store ---
+  const actors = useActorStore((s) => s.actors);
+  const setActors = useActorStore((s) => s.setActors);
+  const runs = useActorStore((s) => s.runs);
+  const setRuns = useActorStore((s) => s.setRuns);
+  const inbox = useActorStore((s) => s.inbox);
+  const setInbox = useActorStore((s) => s.setInbox);
+  const machines = useActorStore((s) => s.machines);
+  const setMachines = useActorStore((s) => s.setMachines);
+
+  // --- Task store ---
+  const tasks = useTaskStore((s) => s.tasks);
+  const setTasks = useTaskStore((s) => s.setTasks);
+
+  // Component-local state (to be extracted in P3-P6)
   const [agentForm, setAgentForm] = useState<AgentFormState>({
     machineId: "",
     providerId: "",
@@ -301,13 +352,6 @@ export function App() {
     autostart: true,
     env: {},
   });
-  const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [replyTo, setReplyTo] = useState<Message | null>(null);
-  const [channelPanelTab, setChannelPanelTab] = useState<ChannelPanelTab | null>(null);
-  const [panelSizes, setPanelSizes] = useState<PanelSizes>(() => loadPanelSizes());
-  const [viewportWidth, setViewportWidth] = useState(() => initialViewportWidth());
-  const [resizingPanel, setResizingPanel] = useState<PanelResizeKind | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);

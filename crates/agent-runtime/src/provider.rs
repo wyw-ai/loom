@@ -22,7 +22,7 @@ use proto::methods::{
     ProviderJsonConditionSpec, ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec,
     ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec, ProviderPromptRoleHint,
     ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
-    ProviderWorkspaceFileSpec,
+    ProviderWorkspaceFileSpec, default_instructions_via,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -81,6 +81,9 @@ pub struct ProviderRuntimePlan {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// 指令注入方式。"prompt" 或 "agents_md"。
+    #[serde(default)]
+    pub instructions_via: String,
 }
 
 /// Transport-neutral events produced by provider output decoders before Loom
@@ -131,6 +134,7 @@ impl ProviderRuntimePlan {
             idle_timeout_ms: self.idle_timeout_ms,
             interactive: self.interactive,
             provider: self.provider,
+            instructions_via: Some(self.instructions_via),
         }
     }
 }
@@ -1970,6 +1974,7 @@ fn runtime_plan_from_manifest(
         idle_timeout_ms: mode.idle_timeout_ms,
         interactive: mode.interactive.clone(),
         provider: mode.provider.clone(),
+        instructions_via: mode.instructions_via.clone(),
     };
     output_format(&mode.stdout)?;
     validate_manifest(manifest)?;
@@ -2128,6 +2133,7 @@ fn mode(
         env: BTreeMap::new(),
         stdin: None,
         prompt: None,
+        instructions_via: default_instructions_via(),
         stdout: ProviderDecoderSpec {
             format: "builtin".into(),
             name: Some(stdout_name.into()),
@@ -2337,6 +2343,7 @@ fn claude_manifest() -> ProviderManifest {
         env: BTreeMap::new(),
         stdin: None,
         prompt: None,
+        instructions_via: default_instructions_via(),
         stdout: ProviderDecoderSpec {
             format: "text".into(),
             ..Default::default()
@@ -2536,6 +2543,7 @@ fn copilot_manifest() -> ProviderManifest {
                 Some(session),
             );
             mode.stdout = copilot_jsonl_decoder();
+            mode.instructions_via = "agents_md".into();
             mode
         })]),
         &[

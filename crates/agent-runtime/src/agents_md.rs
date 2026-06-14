@@ -20,9 +20,18 @@ const END_MARKER: &str = "<!-- END loom -->";
 
 /// Write or refresh the Loom block inside `{workspace}/AGENTS.md`. Safe to
 /// call on every agent spawn — cheap and idempotent.
-pub fn ensure_agents_md(workspace: &Path, actor_id: &str) -> io::Result<()> {
+///
+/// When `agent_instructions` or `actor_context` are provided (e.g. for providers
+/// that use `instructions_via = "agents_md"`), they are included in the Loom
+/// block so the provider picks them up without repeating them in every prompt.
+pub fn ensure_agents_md(
+    workspace: &Path,
+    actor_id: &str,
+    agent_instructions: Option<&str>,
+    actor_context: Option<&str>,
+) -> io::Result<()> {
     let path = workspace.join("AGENTS.md");
-    let block = loom_block(actor_id);
+    let block = loom_block(actor_id, agent_instructions, actor_context);
     let new_content = match std::fs::read_to_string(&path) {
         Ok(existing) => update_block(&existing, &block),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -65,8 +74,8 @@ fn update_block(existing: &str, new_block: &str) -> String {
     out
 }
 
-fn loom_block(actor_id: &str) -> String {
-    format!(
+fn loom_block(actor_id: &str, agent_instructions: Option<&str>, actor_context: Option<&str>) -> String {
+    let mut block = format!(
         "{BEGIN_MARKER}\n\
 ## Loom multi-actor runtime\n\
 \n\
@@ -451,8 +460,22 @@ action as a message before ending — publicly, or with `message send\n\
 actor that is asked to act but sends no message stalls the flow.\n\
 \n\
 Use `loom --help` and `loom <subcommand> --help` for the full surface.\n\
-{END_MARKER}"
-    )
+");
+
+    // Inject agent-specific instructions and context when using agents_md mode.
+    if let Some(instructions) = agent_instructions.filter(|s| !s.trim().is_empty()) {
+        block.push_str("\n### Agent instructions\n\n");
+        block.push_str(instructions.trim());
+        block.push('\n');
+    }
+    if let Some(context) = actor_context.filter(|s| !s.trim().is_empty()) {
+        block.push_str("\n### Actor context\n\n");
+        block.push_str(context.trim());
+        block.push('\n');
+    }
+
+    block.push_str(&format!("\n{END_MARKER}"));
+    block
 }
 
 #[cfg(test)]
@@ -461,7 +484,7 @@ mod tests {
 
     #[test]
     fn first_write_just_loom_block() {
-        let out = update_block("", &loom_block("actor_demo"));
+        let out = update_block("", &loom_block("actor_demo", None, None));
         assert!(out.contains("actor_demo"));
         assert!(out.contains("LOOM_SCOPE_ID"));
         assert!(out.contains("### Runtime contract"));
@@ -516,7 +539,7 @@ mod tests {
         let existing = format!(
             "# My project rules\n\nStyle: tabs.\n\n{BEGIN_MARKER}\nold loom content\n{END_MARKER}\n\n## Postscript\n\nMore notes.\n"
         );
-        let out = update_block(&existing, &loom_block("actor_x"));
+        let out = update_block(&existing, &loom_block("actor_x", None, None));
         assert!(out.contains("My project rules"));
         assert!(out.contains("Style: tabs."));
         assert!(out.contains("Postscript"));
@@ -528,7 +551,7 @@ mod tests {
     #[test]
     fn appends_block_when_no_markers() {
         let existing = "# Existing file\n\nHello.\n";
-        let out = update_block(existing, &loom_block("actor_y"));
+        let out = update_block(existing, &loom_block("actor_y", None, None));
         assert!(out.starts_with("# Existing file"));
         assert!(out.contains("actor_y"));
         assert!(out.contains(BEGIN_MARKER));
@@ -536,8 +559,8 @@ mod tests {
 
     #[test]
     fn idempotent_across_repeated_writes() {
-        let once = update_block("", &loom_block("actor_z"));
-        let twice = update_block(&once, &loom_block("actor_z"));
+        let once = update_block("", &loom_block("actor_z", None, None));
+        let twice = update_block(&once, &loom_block("actor_z", None, None));
         assert_eq!(once, twice);
     }
 }

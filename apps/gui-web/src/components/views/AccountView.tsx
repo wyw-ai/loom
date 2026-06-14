@@ -1,6 +1,6 @@
 import { Avatar } from "@/components/layout/Avatar";
 import { PageHeader } from "@/components/shared/PageComponents";
-import { SettingsSection } from "@/components/views/SettingsView";
+import { SettingsSection } from "@/components/settings/SettingsSection";
 import { Button } from "@/components/ui/button";
 import { accountName, capitalize } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";

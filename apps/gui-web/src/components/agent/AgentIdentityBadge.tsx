@@ -11,6 +11,7 @@ import {
 
 import { cn } from "@/lib/utils";
 import { AgentProviderIcon } from "@/components/agent/AgentProviderIcon";
+import type { RunStatus } from "@/ipc/types";
 
 import "./AgentIdentityBadge.css";
 
@@ -37,6 +38,9 @@ export type AgentIdentityBadgeProps = {
   online?: boolean;
   working?: boolean;
   workingLabel?: string;
+  runStatus?: RunStatus | null;
+  isStale?: boolean;
+  isTerminal?: boolean;
   className?: string;
   defaultExpanded?: boolean;
   onAvatarClick?: () => void;
@@ -91,6 +95,47 @@ const defaultSegments: AgentIdentityBadgeSegment[] = [
   },
 ];
 
+const runStatusLabels: Record<string, string> = {
+  queued: "排队中",
+  preparing_context: "准备中",
+  running: "思考中",
+  waiting_tool: "等待工具",
+  failed: "运行失败",
+  canceled: "已取消",
+};
+
+function runStatusModifierClass(status: RunStatus | null | undefined, isStale?: boolean, isTerminal?: boolean): string {
+  if (isTerminal) {
+    return status === "failed"
+      ? "agent-identity-badge__status--failed"
+      : "agent-identity-badge__status--canceled";
+  }
+  if (isStale) return "agent-identity-badge__status--stale-warning";
+  switch (status) {
+    case "queued": return "agent-identity-badge__status--queued";
+    case "preparing_context": return "agent-identity-badge__status--preparing-context";
+    case "running": return "agent-identity-badge__status--running";
+    case "waiting_tool": return "agent-identity-badge__status--waiting-tool";
+    default: return "";
+  }
+}
+
+function detailCardStatusClass(status: RunStatus | null | undefined, isStale?: boolean, isTerminal?: boolean): string {
+  if (isTerminal) {
+    return status === "failed"
+      ? "agent-detail-card__active--failed"
+      : "agent-detail-card__active--canceled";
+  }
+  if (isStale) return "agent-detail-card__active--stale-warning";
+  switch (status) {
+    case "queued": return "agent-detail-card__active--queued";
+    case "preparing_context": return "agent-detail-card__active--preparing-context";
+    case "running": return "agent-detail-card__active--running";
+    case "waiting_tool": return "agent-detail-card__active--waiting-tool";
+    default: return "";
+  }
+}
+
 export function AgentIdentityBadge({
   avatarUrl = "/avatars/avatar-01.png",
   agentName = "Aiden Brooks",
@@ -102,15 +147,20 @@ export function AgentIdentityBadge({
   remainingLabel = "13%",
   segments = defaultSegments,
   online = true,
-  working = false,
-  workingLabel = "Processing…",
+  working: _working = false,
+  workingLabel,
+  runStatus,
+  isStale = false,
+  isTerminal = false,
   className,
   defaultExpanded = false,
   onAvatarClick,
   onExpandedChange,
 }: AgentIdentityBadgeProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
-  const activeLabel = working ? workingLabel : online ? "Active" : "Idle";
+  const derivedWorking = runStatus != null && !isTerminal;
+  const derivedWorkingLabel = workingLabel ?? (runStatus ? (runStatusLabels[runStatus] ?? "Processing…") : "Processing…");
+  const activeLabel = derivedWorking ? derivedWorkingLabel : isTerminal ? (runStatusLabels[runStatus ?? ""] ?? "Terminated") : online ? "Active" : "Idle";
   function updateExpanded(nextExpanded: boolean) {
     setExpanded(nextExpanded);
     onExpandedChange?.(nextExpanded);
@@ -129,7 +179,10 @@ export function AgentIdentityBadge({
         remainingLabel={remainingLabel}
         segments={segments}
         activeLabel={activeLabel}
-        working={working}
+        working={derivedWorking}
+        runStatus={runStatus}
+        isStale={isStale}
+        isTerminal={isTerminal}
         className={className}
         onAvatarClick={onAvatarClick}
         onCollapse={() => updateExpanded(false)}
@@ -137,10 +190,23 @@ export function AgentIdentityBadge({
     );
   }
 
+  const statusMod = runStatusModifierClass(runStatus, isStale, isTerminal);
+
   return (
     <article className={cn("agent-identity-badge", className)} aria-label={`${agentName} agent badge`}>
-      {working && <span className="agent-identity-badge__status agent-identity-badge__status--working" aria-label={workingLabel} />}
-      {!working && online && <span className="agent-identity-badge__status" aria-label="Active" />}
+      {derivedWorking && (
+        <span
+          className={cn("agent-identity-badge__status agent-identity-badge__status--working", statusMod)}
+          aria-label={derivedWorkingLabel}
+        />
+      )}
+      {!derivedWorking && isTerminal && (
+        <span
+          className={cn("agent-identity-badge__status", statusMod)}
+          aria-label={runStatusLabels[runStatus ?? ""] ?? "Terminated"}
+        />
+      )}
+      {!derivedWorking && !isTerminal && online && <span className="agent-identity-badge__status" aria-label="Active" />}
       {onAvatarClick ? (
         <button
           type="button"
@@ -204,6 +270,9 @@ function AgentIdentityDetailCard({
   segments,
   activeLabel,
   working = false,
+  runStatus,
+  isStale = false,
+  isTerminal = false,
   className,
   onAvatarClick,
   onCollapse,
@@ -219,10 +288,14 @@ function AgentIdentityDetailCard({
   segments: AgentIdentityBadgeSegment[];
   activeLabel: string;
   working?: boolean;
+  runStatus?: RunStatus | null;
+  isStale?: boolean;
+  isTerminal?: boolean;
   className?: string;
   onAvatarClick?: () => void;
   onCollapse: () => void;
 }) {
+  const statusClass = runStatus ? detailCardStatusClass(runStatus, isStale, isTerminal) : "";
   return (
     <article className={cn("agent-detail-card", className)} aria-label={`${agentName} agent details`}>
       <div className="agent-detail-card__hero">
@@ -265,7 +338,7 @@ function AgentIdentityDetailCard({
             <h2>{modelName}</h2>
           </div>
 
-          <span className={cn("agent-detail-card__active", working && "agent-detail-card__active--working")}>
+          <span className={cn("agent-detail-card__active", working && "agent-detail-card__active--working", statusClass)}>
             <span />
             {activeLabel}
           </span>

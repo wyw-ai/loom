@@ -58,12 +58,88 @@
 .agent-identity-badge__status--working {
   background: #fef3c7;
   box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
-  animation: agent-status-pulse 1.2s ease-in-out infinite;
 }
 
 .agent-identity-badge__status--working::after {
   background: #f59e0b;
+}
+
+/* ---- 排队中 (Queued) - 灰色脉冲 ---- */
+.agent-identity-badge__status--queued {
+  background: #f3f4f6;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+  animation: agent-status-pulse 1.8s ease-in-out infinite;
+}
+
+.agent-identity-badge__status--queued::after {
+  background: #9ca3af;
+  animation: agent-status-blink 1.8s ease-in-out infinite;
+}
+
+/* ---- 准备中 (PreparingContext) - 蓝色旋转 ---- */
+.agent-identity-badge__status--preparing-context {
+  background: #dbeafe;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--preparing-context::after {
+  background: #3b82f6;
+  animation: agent-status-spin 1s linear infinite;
+}
+
+/* ---- 思考中 (Running) - 紫色脉冲 ---- */
+.agent-identity-badge__status--running {
+  background: #f3e8ff;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+  animation: agent-status-pulse 1.2s ease-in-out infinite;
+}
+
+.agent-identity-badge__status--running::after {
+  background: #a855f7;
   animation: agent-status-blink 1.2s ease-in-out infinite;
+}
+
+/* ---- 等待工具 (WaitingTool) - 橙色闪烁 ---- */
+.agent-identity-badge__status--waiting-tool {
+  background: #fff7ed;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--waiting-tool::after {
+  background: #f97316;
+  animation: agent-status-blink-fast 0.6s ease-in-out infinite;
+}
+
+/* ---- 运行失败 (Failed) - 红色静态 ---- */
+.agent-identity-badge__status--failed {
+  background: #fef2f2;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--failed::after {
+  background: #ef4444;
+}
+
+/* ---- 已取消 (Canceled) - 灰色静态 ---- */
+.agent-identity-badge__status--canceled {
+  background: #f9fafb;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--canceled::after {
+  background: #9ca3af;
+}
+
+/* ---- 超时警告 (Stale Warning) - 黄色动画 ---- */
+.agent-identity-badge__status--stale-warning {
+  background: #fef9c3;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+  animation: agent-status-pulse 1.5s ease-in-out infinite;
+}
+
+.agent-identity-badge__status--stale-warning::after {
+  background: #eab308;
+  animation: agent-status-blink 1.5s ease-in-out infinite;
 }
 
 @keyframes agent-status-pulse {
@@ -74,6 +150,53 @@
 @keyframes agent-status-blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
+}
+
+@keyframes agent-status-blink-fast {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes agent-status-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* ---- MemberListItem inline animation keyframes ---- */
+@keyframes agent-status-queued {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+@keyframes agent-status-preparing-context {
+  0% { transform: rotate(0deg) scale(1); }
+  50% { transform: rotate(180deg) scale(1.1); }
+  100% { transform: rotate(360deg) scale(1); }
+}
+
+@keyframes agent-status-running {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+@keyframes agent-status-waiting-tool {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes agent-status-failed {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.1); }
+}
+
+@keyframes agent-status-canceled {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+@keyframes agent-status-stale-warning {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
 }
 
 .agent-identity-badge__avatar {
@@ -399,6 +522,88 @@
 .agent-detail-card__active--working span {
   background: #f59e0b;
   animation: agent-status-blink 1.2s ease-in-out infinite;
+}
+
+/* ---- Detail card: 排队中 (Queued) ---- */
+.agent-detail-card__active--queued {
+  border-color: #d1d5db;
+  background: linear-gradient(180deg, #f9fafb 0%, #f3f4f6 100%);
+  color: #6b7280;
+}
+
+.agent-detail-card__active--queued span {
+  background: #9ca3af;
+  animation: agent-status-blink 1.8s ease-in-out infinite;
+}
+
+/* ---- Detail card: 准备中 (PreparingContext) ---- */
+.agent-detail-card__active--preparing-context {
+  border-color: #93c5fd;
+  background: linear-gradient(180deg, #eff6ff 0%, #dbeafe 100%);
+  color: #2563eb;
+}
+
+.agent-detail-card__active--preparing-context span {
+  background: #3b82f6;
+  animation: agent-status-spin 1s linear infinite;
+}
+
+/* ---- Detail card: 思考中 (Running) ---- */
+.agent-detail-card__active--running {
+  border-color: #c4b5fd;
+  background: linear-gradient(180deg, #faf5ff 0%, #f3e8ff 100%);
+  color: #7c3aed;
+}
+
+.agent-detail-card__active--running span {
+  background: #a855f7;
+  animation: agent-status-blink 1.2s ease-in-out infinite;
+}
+
+/* ---- Detail card: 等待工具 (WaitingTool) ---- */
+.agent-detail-card__active--waiting-tool {
+  border-color: #fdba74;
+  background: linear-gradient(180deg, #fff7ed 0%, #ffedd5 100%);
+  color: #ea580c;
+}
+
+.agent-detail-card__active--waiting-tool span {
+  background: #f97316;
+  animation: agent-status-blink-fast 0.6s ease-in-out infinite;
+}
+
+/* ---- Detail card: 运行失败 (Failed) ---- */
+.agent-detail-card__active--failed {
+  border-color: #fca5a5;
+  background: linear-gradient(180deg, #fef2f2 0%, #fee2e2 100%);
+  color: #dc2626;
+}
+
+.agent-detail-card__active--failed span {
+  background: #ef4444;
+}
+
+/* ---- Detail card: 已取消 (Canceled) ---- */
+.agent-detail-card__active--canceled {
+  border-color: #d1d5db;
+  background: linear-gradient(180deg, #f9fafb 0%, #f3f4f6 100%);
+  color: #6b7280;
+}
+
+.agent-detail-card__active--canceled span {
+  background: #9ca3af;
+}
+
+/* ---- Detail card: 超时警告 (Stale Warning) ---- */
+.agent-detail-card__active--stale-warning {
+  border-color: #fde047;
+  background: linear-gradient(180deg, #fefce8 0%, #fef9c3 100%);
+  color: #a16207;
+}
+
+.agent-detail-card__active--stale-warning span {
+  background: #eab308;
+  animation: agent-status-blink 1.5s ease-in-out infinite;
 }
 
 .agent-detail-section {

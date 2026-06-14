@@ -1,10 +1,18 @@
-import { Fragment, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import type { Actor, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ThreadActivityStats } from "@/lib/types";
-import { isHiddenProtocolMessage, isWorkflowMessage, canUseAsThreadRoot } from "@/lib/message-utils";
-import { groupMessagesByDate } from "@/lib/message-utils";
-import { useStickToBottomScroll } from "@/hooks/useStickToBottomScroll";
+import {
+  isHiddenProtocolMessage,
+  isWorkflowMessage,
+  canUseAsThreadRoot,
+  groupMessagesByDate,
+} from "@/lib/message-utils";
+import { Virtuoso } from "react-virtuoso";
 import { MessageRow } from "@/components/chat/MessageRow";
+
+type FeedItem =
+  | { kind: "date-divider"; key: string; label: string }
+  | { kind: "message"; message: Message };
 
 export function MessageFeed({
   actors,
@@ -47,19 +55,28 @@ export function MessageFeed({
   currentActorId: string | null;
   busy: string | null;
 }) {
-  const workflowSourceIds = new Set(
-    messages.filter(isWorkflowMessage).map((message) => message.id),
+  const workflowSourceIds = useMemo(
+    () => new Set(messages.filter(isWorkflowMessage).map((m) => m.id)),
+    [messages],
   );
-  const visibleMessages = messages.filter((message) => !isHiddenProtocolMessage(message));
-  const messageGroups = groupMessagesByDate(visibleMessages);
-  const messageListKey = visibleMessages
-    .map((message) => `${message.id}:${message.createdAt}:${message.body.length}`)
-    .join("|");
-  const feedScroll = useStickToBottomScroll({
-    contentKey: messageListKey,
-    itemCount: visibleMessages.length,
-    scrollKey: feedKey,
-  });
+
+  const visibleMessages = useMemo(
+    () => messages.filter((m) => !isHiddenProtocolMessage(m)),
+    [messages],
+  );
+
+  // Flatten date-grouped messages into a unified item list for Virtuoso
+  const feedItems = useMemo<FeedItem[]>(() => {
+    const groups = groupMessagesByDate(visibleMessages);
+    const items: FeedItem[] = [];
+    for (const group of groups) {
+      items.push({ kind: "date-divider", key: `div-${group.key}`, label: group.label });
+      for (const message of group.messages) {
+        items.push({ kind: "message", message });
+      }
+    }
+    return items;
+  }, [visibleMessages]);
 
   if (visibleMessages.length === 0) {
     return (
@@ -71,56 +88,56 @@ export function MessageFeed({
       </div>
     );
   }
+
   return (
-    <div
-      ref={feedScroll.ref}
-      className="min-h-0 flex-1 overflow-y-auto bg-white px-5 py-2 soft-scrollbar"
-      onScroll={feedScroll.onScroll}
-    >
-      <div className="mx-auto flex max-w-4xl flex-col gap-2">
-        {messageGroups.map((group) => (
-          <Fragment key={group.key}>
-            <div className="date-divider">
-              <span />
-              <div>{group.label}</div>
-              <span />
-            </div>
-            {group.messages.map((message) => {
-              const threadSummary =
-                channelThreads.find((thread) => thread.rootMessageId === message.id) ?? null;
-              const sourceTask =
-                message.scope.kind === "channel"
-                  ? tasksBySourceMessageId[message.id] ?? null
-                  : null;
-              return (
-                <MessageRow
-                  key={message.id}
-                  actor={actors[message.authorActorId]}
-                  actors={actors}
-                  machines={machines}
-                  runs={runs}
-                  message={message}
-                  workflowSourceIds={workflowSourceIds}
-                  onReply={onReply}
-                  onStartThread={onStartThread}
-                  onToggleReaction={onToggleReaction}
-                  onAnswerAction={onAnswerAction}
-                  onOpenAgentSettings={onOpenAgentSettings}
-                  canReply={allowReply}
-                  canStartThread={allowThreads && canUseAsThreadRoot(message)}
-                  threadSummary={threadSummary}
-                  threadStats={
-                    threadSummary ? threadStatsById[threadSummary.id] : undefined
-                  }
-                  sourceTask={sourceTask}
-                  currentActorId={currentActorId}
-                  busy={busy}
-                />
-              );
-            })}
-          </Fragment>
-        ))}
-      </div>
+    <div className="min-h-0 flex-1 bg-white soft-scrollbar">
+      <Virtuoso
+        key={feedKey}
+        className="h-full"
+        totalCount={feedItems.length}
+        followOutput="smooth"
+        itemContent={(index) => {
+          const item = feedItems[index];
+          if (item.kind === "date-divider") {
+            return (
+              <div className="date-divider">
+                <span />
+                <div>{item.label}</div>
+                <span />
+              </div>
+            );
+          }
+          const message = item.message;
+          const threadSummary =
+            channelThreads.find((t) => t.rootMessageId === message.id) ?? null;
+          const sourceTask =
+            message.scope.kind === "channel"
+              ? tasksBySourceMessageId[message.id] ?? null
+              : null;
+          return (
+            <MessageRow
+              actor={actors[message.authorActorId]}
+              actors={actors}
+              machines={machines}
+              runs={runs}
+              message={message}
+              workflowSourceIds={workflowSourceIds}
+              onReply={onReply}
+              onStartThread={onStartThread}
+              onToggleReaction={onToggleReaction}
+              onAnswerAction={onAnswerAction}
+              onOpenAgentSettings={onOpenAgentSettings}
+              canReply={allowReply}
+              canStartThread={allowThreads && canUseAsThreadRoot(message)}
+              threadSummary={threadSummary}
+              threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
+              sourceTask={sourceTask}
+              currentActorId={currentActorId}
+              busy={busy}
+            />
+          );
+        }}
+      />
     </div>
   );
 }

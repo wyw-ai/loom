@@ -18,7 +18,7 @@ import {
   MessageSquare,
   Server,
 } from "lucide-react";
-import type { Actor, Channel, Thread } from "@/ipc/types";
+import type { Actor, Channel, MachineInfo, Run, Thread } from "@/ipc/types";
 import type {
   ChannelContextMenu,
   ChannelGroup,
@@ -36,6 +36,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ChannelDeleteConfirm } from "@/components/channel/ChannelDeleteConfirm";
 import { ActorAvatar } from "@/components/agent/ActorAvatar";
+import { getActorRunContext, runStatusAnimationName, runStatusDotClass, runStatusFullLabel, memberPresence } from "@/lib/agent-utils";
 
 export function Sidebar({
   view,
@@ -50,6 +51,8 @@ export function Sidebar({
   activeDirectActorId,
   activeThreadId,
   directAgents,
+  runs,
+  machines,
   threadsByChannel,
   onAddChannel,
   onAddChannelGroup,
@@ -75,6 +78,8 @@ export function Sidebar({
   activeDirectActorId: string | null;
   activeThreadId: string | null;
   directAgents: Actor[];
+  runs: Record<string, Run>;
+  machines: MachineInfo[];
   threadsByChannel: Record<string, Thread[]>;
   onAddChannel: (title: string) => void;
   onAddChannelGroup: (title: string) => void;
@@ -449,6 +454,13 @@ export function Sidebar({
             ) : (
               directAgents.map((actor) => {
                 const selected = actor.id === activeDirectActorId;
+                const ctx = getActorRunContext(runs, actor.id);
+                const presence = memberPresence(actor, machines, null);
+                const dotClass = ctx ? runStatusDotClass(ctx) : (
+                  presence.online ? "bg-green-500" : "bg-[#98a2b3]"
+                );
+                const animation = runStatusAnimationName(ctx);
+                const label = runStatusFullLabel(ctx) ?? presence.label;
                 return (
                   <button
                     key={actor.id}
@@ -456,8 +468,24 @@ export function Sidebar({
                     className={cn("nav-row h-10 text-sm", selected && "nav-row-active")}
                     onClick={() => onSelectDirectAgent(actor.id)}
                   >
-                    <ActorAvatar actor={actor} fallback={actor.id} small />
-                    <span className="min-w-0 flex-1 truncate">{displayName(actor)}</span>
+                    <span className="relative shrink-0">
+                      <ActorAvatar actor={actor} fallback={actor.id} small />
+                      <span
+                        className={cn(
+                          "absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white",
+                          dotClass,
+                        )}
+                        style={animation ? { animationName: animation, animationDuration: "1.5s", animationIterationCount: "infinite", animationTimingFunction: "ease-in-out" } : undefined}
+                      />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <span className="truncate">{displayName(actor)}</span>
+                      {label && (
+                        <span className="block truncate text-[10px] text-[#667085]">
+                          {label}
+                        </span>
+                      )}
+                    </div>
                   </button>
                 );
               })

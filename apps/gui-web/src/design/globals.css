@@ -831,3 +831,14 @@
     background: rgb(105 114 132 / 0.35);
   }
 }
+
+/* ChatHeader agent activity status animations */
+@keyframes chat-header-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+.chat-header-activity-running {
+  animation: chat-header-pulse 2s ease-in-out infinite;
+}
+

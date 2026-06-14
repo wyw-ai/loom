@@ -2,7 +2,6 @@ import {
   Fragment,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -14,7 +13,6 @@ import type {
   ReactNode,
   SelectHTMLAttributes
 } from "react";import { createPortal } from "react-dom";
-import ReactMarkdown, { type Components } from "react-markdown";
 import {
   ArrowLeft,
   Bell,
@@ -32,15 +30,11 @@ import {
   Loader2,
   LogOut,
   MessageCircle,
-  MessageSquare,
   Plus,
   RefreshCw,
-  Reply,
   Search,
-  Send,
   Server,
   Settings,
-  Smile,
   Split,
   Trash2,
   UserPlus,
@@ -64,7 +58,6 @@ import {
   type MachineAgentProviderInfo,
   type MachineInfo,
   type Message,
-  type MessageMention,
   type Run,
   type ScopeRef,
   type StreamUpdate,
@@ -74,7 +67,6 @@ import {
 } from "@/ipc/types";
 
 import { Badge } from "@/components/ui/badge";
-import { AgentIdentityBadge } from "@/components/agent/AgentIdentityBadge";
 import {
   AgentProviderIcon,
   agentProviderIconKey,
@@ -85,7 +77,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn, formatTime, shortId } from "@/lib/utils";
 
 import type {
-  ActionChoice,
   ActorWorkspaceSection,
   AgentDetailTab,
   AgentFormState,
@@ -106,11 +97,6 @@ import type {
   ThreadWithChannel
 } from "@/lib/types";
 import {
-  agentMessageBadgeCompactHeight,
-  agentMessageBadgeCompactWidth,
-  agentMessageBadgeDetailHeight,
-  agentMessageBadgeDetailWidth,
-  agentMessageBadgePopoverScale,
   avatarLibraryUrls,
   defaultAgentPromptAssembly,
   defaultNewPromptFilePath,
@@ -125,7 +111,6 @@ import {
   promptPresetParts,
   promptVariableOptions,
   reasoningEffortChoices,
-  supportedReactionEmojis,
   ungroupedChannelGroupId
 } from "@/lib/constants";
 import {
@@ -154,18 +139,9 @@ import {
 } from "@/lib/channel-utils";
 import {
   actionChoices,
-  attachmentKind,
-  attachmentTitle,
-  bodyPollFromMessage,
-  canUseAsThreadRoot,
   channelFromMessage,
   emptyThreadStats,
-  groupMessagesByDate,
-  isHiddenProtocolMessage,
-  isWorkflowMessage,
-  isWorkflowResultMessage,
   messageIsActionRequestFor,
-  messageKind,
   messageTitle,
   metadataText,
   normalizeMessage,
@@ -178,15 +154,10 @@ import {
   threadTitle,
   upsertMessage,
   upsertThreadStatsMessage,
-  workflowResultSummary,
-  workflowSummary
 } from "@/lib/message-utils";
 import {
   accountName,
   accountToActor,
-  activeMentionQuery,
-  actorMentionActorId,
-  actorMentionRemarkPlugin,
   actorName,
   agentFormForMachine,
   audienceWakesAgent,
@@ -200,17 +171,14 @@ import {
   fitPanelSizes,
   formatShortDateTime,
   initialViewportWidth,
-  isComposingKeyEvent,
   machineCanCreateAgent,
   mentionAudience,
-  mentionCandidates,
   normalizeAgentForm,
   reconnectDelayMs,
   resolveAgentMachine,
   resolveAgentProvider,
   savePanelSizes,
   shortActorAlias,
-  shouldSendOnEnter,
   sortTasks,
   sortThreads,
   statusDotClass,
@@ -218,9 +186,7 @@ import {
   uniqueAudience,
   upsert,
   workspaceInitials
-} from "@/lib/format-utils";import type { MentionOption } from "@/lib/format-utils";
-
-import { useStickToBottomScroll } from "@/hooks/useStickToBottomScroll";
+} from "@/lib/format-utils";
 
 import {
   agentMemberEntries,
@@ -239,7 +205,6 @@ import {
   actorKindLabel,
   memberPresence
 } from "@/lib/agent-utils";
-import { agentIdentityBadgeProps } from "@/lib/agent-identity-utils";
 
 // Zustand stores (P2)
 import { useConnectionStore } from "@/store/connectionStore";
@@ -258,6 +223,12 @@ import { Avatar } from "@/components/layout/Avatar";
 import { ActorAvatar } from "@/components/agent/ActorAvatar";
 import { AvatarStack } from "@/components/agent/AvatarStack";
 import { ChannelDeleteConfirm } from "@/components/channel/ChannelDeleteConfirm";
+// P4 — Extracted chat / message components
+import { EmptyState } from "@/components/shared/EmptyState";
+import { MutedLine } from "@/components/shared/MutedLine";
+import { MessageFeed } from "@/components/chat/MessageFeed";
+import { Composer } from "@/components/chat/Composer";
+import { ThreadPanel } from "@/components/chat/ThreadPanel";
 
 export function App() {
   // --- Connection store ---
@@ -2242,1213 +2213,21 @@ export function App() {
 
 
 
-function MessageFeed({
-  actors,
-  allowReply = true,
-  allowThreads = true,
-  feedKey,
-  machines,
-  runs,
-  messages,
-  tasksBySourceMessageId,
-  channelThreads,
-  threadStatsById,
-  emptyText,
-  emptyAction,
-  onReply,
-  onStartThread,
-  onToggleReaction,
-  onAnswerAction,
-  onOpenAgentSettings,
-  currentActorId,
-  busy,
-}: {
-  actors: Record<string, Actor>;
-  allowReply?: boolean;
-  allowThreads?: boolean;
-  feedKey: string;
-  machines: MachineInfo[];
-  runs: Record<string, Run>;
-  messages: Message[];
-  tasksBySourceMessageId: Record<string, Task>;
-  channelThreads: Thread[];
-  threadStatsById: Record<string, ThreadActivityStats>;
-  emptyText: string;
-  emptyAction?: ReactNode;
-  onReply: (message: Message) => void;
-  onStartThread: (message: Message) => void;
-  onToggleReaction: (message: Message, emoji: string) => void;
-  onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
-  onOpenAgentSettings: (actorId: string) => void;
-  currentActorId: string | null;
-  busy: string | null;
-}) {
-  const workflowSourceIds = new Set(
-    messages.filter(isWorkflowMessage).map((message) => message.id),
-  );
-  const visibleMessages = messages.filter((message) => !isHiddenProtocolMessage(message));
-  const messageGroups = groupMessagesByDate(visibleMessages);
-  const messageListKey = visibleMessages
-    .map((message) => `${message.id}:${message.createdAt}:${message.body.length}`)
-    .join("|");
-  const feedScroll = useStickToBottomScroll({
-    contentKey: messageListKey,
-    itemCount: visibleMessages.length,
-    scrollKey: feedKey,
-  });
 
-  if (visibleMessages.length === 0) {
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
-        <div className="w-full max-w-lg rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-8 py-10 text-center">
-          <div className="text-sm font-semibold text-[#667085]">{emptyText}</div>
-          {emptyAction}
-        </div>
-      </div>
-    );
-  }
-  return (
-    <div
-      ref={feedScroll.ref}
-      className="min-h-0 flex-1 overflow-y-auto bg-white px-5 py-2 soft-scrollbar"
-      onScroll={feedScroll.onScroll}
-    >
-      <div className="mx-auto flex max-w-4xl flex-col gap-2">
-        {messageGroups.map((group) => (
-          <Fragment key={group.key}>
-            <div className="date-divider">
-              <span />
-              <div>{group.label}</div>
-              <span />
-            </div>
-            {group.messages.map((message) => {
-              const threadSummary =
-                channelThreads.find((thread) => thread.rootMessageId === message.id) ?? null;
-              const sourceTask =
-                message.scope.kind === "channel"
-                  ? tasksBySourceMessageId[message.id] ?? null
-                  : null;
-              return (
-                <MessageRow
-                  key={message.id}
-                  actor={actors[message.authorActorId]}
-                  actors={actors}
-                  machines={machines}
-                  runs={runs}
-                  message={message}
-                  workflowSourceIds={workflowSourceIds}
-                  onReply={onReply}
-                  onStartThread={onStartThread}
-                  onToggleReaction={onToggleReaction}
-                  onAnswerAction={onAnswerAction}
-                  onOpenAgentSettings={onOpenAgentSettings}
-                  canReply={allowReply}
-                  canStartThread={allowThreads && canUseAsThreadRoot(message)}
-                  threadSummary={threadSummary}
-                  threadStats={
-                    threadSummary ? threadStatsById[threadSummary.id] : undefined
-                  }
-                  sourceTask={sourceTask}
-                  currentActorId={currentActorId}
-                  busy={busy}
-                />
-              );
-            })}
-          </Fragment>
-        ))}
-      </div>
-    </div>
-  );
-}
 
-function MessageRow({
-  actor,
-  actors,
-  machines,
-  runs,
-  message,
-  workflowSourceIds,
-  onReply,
-  onStartThread,
-  onToggleReaction,
-  onAnswerAction,
-  onOpenAgentSettings,
-  canReply,
-  canStartThread,
-  threadSummary,
-  threadStats,
-  sourceTask,
-  currentActorId,
-  busy,
-}: {
-  actor?: Actor;
-  actors: Record<string, Actor>;
-  machines: MachineInfo[];
-  runs: Record<string, Run>;
-  message: Message;
-  workflowSourceIds: Set<string>;
-  onReply: (message: Message) => void;
-  onStartThread: (message: Message) => void;
-  onToggleReaction: (message: Message, emoji: string) => void;
-  onAnswerAction: (message: Message, optionId: string, accepted: boolean) => void;
-  onOpenAgentSettings: (actorId: string) => void;
-  canReply: boolean;
-  canStartThread: boolean;
-  threadSummary: Thread | null;
-  threadStats?: ThreadActivityStats;
-  sourceTask: Task | null;
-  currentActorId: string | null;
-  busy: string | null;
-}) {
-  const actionRequest = messageKind(message) === "action.request";
-  const bodyPoll = actionRequest ? null : bodyPollFromMessage(message);
-  const choices = actionChoices(message);
-  const pollChoices = choices.length > 0 ? choices : bodyPoll?.choices ?? [];
-  const displayBody = bodyPoll?.question || message.body || metadataText(message);
-  const reactions = message.reactions ?? [];
-  const attachments = message.attachments ?? [];
-  if (isWorkflowMessage(message)) {
-    return <WorkflowEventRow actor={actor} actors={actors} message={message} />;
-  }
-  if (isWorkflowResultMessage(message, workflowSourceIds)) {
-    return (
-      <WorkflowResultRow
-        actor={actor}
-        machines={machines}
-        runs={runs}
-        message={message}
-        onOpenAgentSettings={onOpenAgentSettings}
-      />
-    );
-  }
-  return (
-    <article
-      className={cn(
-        "group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]",
-        actionRequest && "border border-amber-300 bg-amber-50",
-      )}
-    >
-      <div className="flex items-start gap-4">
-        <AgentMessageAvatar
-          actor={actor}
-          fallback={message.authorActorId}
-          machines={machines}
-          runs={runs}
-          onOpenAgentSettings={onOpenAgentSettings}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
-            <span className="text-xs font-medium text-[#667085]">{formatTime(message.createdAt)}</span>
-            {sourceTask && <TaskStateBadge task={sourceTask} />}
-            {message.parentMessageId && (
-              <span className="font-mono text-xs text-muted-foreground">
-                reply {shortId(message.parentMessageId)}
-              </span>
-            )}
-          </div>
-          <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown
-              actors={actors}
-              body={displayBody}
-              mentions={displayBody === message.body ? message.mentions : []}
-            />
-          </div>
-          {attachments.length > 0 && (
-            <AttachmentStack attachments={attachments} />
-          )}
-          {pollChoices.length > 0 && (
-            <PollCard
-              choices={pollChoices}
-              disabled={!actionRequest || Boolean(busy?.startsWith(`action:${message.id}:`))}
-              onChoose={
-                actionRequest
-                  ? (choice) => onAnswerAction(message, choice.id, choice.accepted)
-                  : undefined
-              }
-            />
-          )}
-          {reactions.length > 0 && (
-            <div className="mt-3 flex min-h-7 flex-wrap items-center gap-1.5">
-              {reactions.map((reaction) => {
-                const selected = Boolean(
-                  currentActorId && reaction.actorIds.includes(currentActorId),
-                );
-                return (
-                  <button
-                    key={reaction.emoji}
-                    type="button"
-                    className={cn(
-                      "reaction-chip",
-                      selected
-                        ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
-                        : "border-[#e2e5ed] bg-white text-[#31394a]",
-                    )}
-                    title={reaction.actorIds
-                      .map((actorId) => actorName(actors, actorId))
-                      .join(", ")}
-                    disabled={busy === `message:reaction:${message.id}:${reaction.emoji}`}
-                    onClick={() => onToggleReaction(message, reaction.emoji)}
-                  >
-                    <span className="text-sm leading-none">{reaction.emoji}</span>
-                    <span>{reaction.actorIds.length}</span>
-                  </button>
-                );
-              })}
-              <ReactionPicker
-                busy={busy}
-                compact
-                message={message}
-                onToggleReaction={onToggleReaction}
-              />
-            </div>
-          )}
-          {threadSummary && (
-            <ThreadSummaryRow
-              actors={actors}
-              rootAuthor={actor}
-              thread={threadSummary}
-              threadStats={threadStats}
-              onOpen={() => onStartThread(message)}
-            />
-          )}
-          <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
-            {canReply && (
-              <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
-                <Reply size={14} />
-                Reply
-              </Button>
-            )}
-            {reactions.length === 0 && (
-              <ReactionPicker
-                busy={busy}
-                message={message}
-                onToggleReaction={onToggleReaction}
-              />
-            )}
-            {canStartThread && !threadSummary && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onStartThread(message)}
-                disabled={busy === `thread:create:${message.id}`}
-              >
-                <Split size={14} />
-                Thread
-              </Button>
-            )}
-            <span className="self-center font-mono text-[11px] text-muted-foreground">
-              {shortId(message.id, 10)}
-            </span>
-          </div>
-        </div>
-      </div>
-    </article>
-  );
-}
 
-function AttachmentStack({ attachments }: { attachments: string[] }) {
-  return (
-    <div className="mt-3 grid max-w-[560px] gap-2">
-      {attachments.slice(0, 3).map((attachment) => (
-        <AttachmentCard key={attachment} attachment={attachment} />
-      ))}
-    </div>
-  );
-}
 
-function AttachmentCard({ attachment }: { attachment: string }) {
-  const title = attachmentTitle(attachment);
-  const kind = attachmentKind(attachment);
-  return (
-    <div className="attachment-card">
-      <div className="attachment-icon">
-        <FileText size={18} />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-bold text-[#303849]">{title}</div>
-        <div className="mt-0.5 truncate text-xs font-medium text-[#667085]">{kind}</div>
-      </div>
-      <div className="attachment-preview" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-      </div>
-    </div>
-  );
-}
 
-function PollCard({
-  choices,
-  disabled,
-  onChoose,
-}: {
-  choices: ActionChoice[];
-  disabled: boolean;
-  onChoose?: (choice: ActionChoice) => void;
-}) {
-  const totalVotes = choices.reduce((sum, choice) => sum + (choice.votes ?? 0), 0);
-  const fallbackMax = choices.length;
-  return (
-    <div className="poll-card">
-      {choices.map((choice, index) => {
-        const votes = choice.votes ?? (totalVotes === 0 ? fallbackMax - index : 0);
-        const denominator = totalVotes || fallbackMax || 1;
-        const percent = Math.max(6, Math.round((votes / denominator) * 100));
-        return (
-          <button
-            key={choice.id}
-            type="button"
-            className="poll-choice"
-            disabled={disabled || !onChoose}
-            onClick={() => onChoose?.(choice)}
-          >
-            <span className="poll-letter">{choice.id.slice(0, 1).toUpperCase()}</span>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm font-semibold text-[#303849]">
-                {choice.label}
-              </span>
-              <span className="mt-1 block h-0.5 overflow-hidden rounded-full bg-[#e7e9f3]">
-                <span
-                  className="block h-full rounded-full bg-[#5a47e9]"
-                  style={{ width: `${percent}%` }}
-                />
-              </span>
-            </span>
-            <span className="w-8 text-right text-sm font-bold text-[#303849]">
-              {votes}
-            </span>
-          </button>
-        );
-      })}
-      <div className="mt-2 flex items-center gap-2 px-1 text-xs font-medium text-[#667085]">
-        <span>{totalVotes || choices.length} votes</span>
-        <span>•</span>
-        <span>Poll closes soon</span>
-      </div>
-    </div>
-  );
-}
 
-function ThreadSummaryRow({
-  actors,
-  rootAuthor,
-  thread,
-  threadStats,
-  onOpen,
-}: {
-  actors: Record<string, Actor>;
-  rootAuthor?: Actor;
-  thread: Thread;
-  threadStats?: ThreadActivityStats;
-  onOpen: () => void;
-}) {
-  const participants = threadParticipants(thread, actors, rootAuthor, threadStats);
-  const replyCount = threadReplyCount(thread, threadStats);
-  const lastReply = threadLastReplyLabel(thread, threadStats);
-  return (
-    <button type="button" className="thread-summary-row" onClick={onOpen}>
-      <AvatarStack actors={participants} max={4} small />
-      <span className="min-w-0 truncate text-xs font-bold text-[#503ed4]">
-        {typeof replyCount === "number"
-          ? `${replyCount}${threadStats?.hasMoreReplies ? "+" : ""} ${
-              replyCount === 1 ? "reply" : "replies"
-            }`
-          : "Thread"}
-      </span>
-      {lastReply && (
-        <span className="shrink-0 text-xs font-medium text-[#667085]">
-          Last reply {lastReply}
-        </span>
-      )}
-    </button>
-  );
-}
 
-function TaskStateBadge({ task }: { task: Task }) {
-  return (
-    <Badge
-      variant="outline"
-      title={task.id}
-      className={cn("whitespace-nowrap font-semibold", taskStatusBadgeClass(task.status))}
-    >
-      Task #{task.number} · {task.status}
-    </Badge>
-  );
-}
 
-function WorkflowEventRow({
-  actor,
-  actors,
-  message,
-}: {
-  actor?: Actor;
-  actors: Record<string, Actor>;
-  message: Message;
-}) {
-  const summary = workflowSummary(message, actors);
-  return (
-    <div className="mx-auto flex max-w-[80%] items-center gap-2 rounded-xl border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
-      <Check size={14} />
-      <span className="min-w-0 flex-1 truncate">{summary}</span>
-      <span>{formatTime(message.createdAt)}</span>
-      {actor && <Badge variant="outline">{displayName(actor)}</Badge>}
-    </div>
-  );
-}
 
-function WorkflowResultRow({
-  actor,
-  machines,
-  runs,
-  message,
-  onOpenAgentSettings,
-}: {
-  actor?: Actor;
-  machines: MachineInfo[];
-  runs: Record<string, Run>;
-  message: Message;
-  onOpenAgentSettings: (actorId: string) => void;
-}) {
-  return (
-    <article className="group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]">
-      <div className="flex items-start gap-4">
-        <AgentMessageAvatar
-          actor={actor}
-          fallback={message.authorActorId}
-          machines={machines}
-          runs={runs}
-          onOpenAgentSettings={onOpenAgentSettings}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
-            <span className="text-xs text-muted-foreground">{formatTime(message.createdAt)}</span>
-            <Badge variant="success">task result</Badge>
-          </div>
-          <div className="mt-1 text-sm leading-6 text-[#303849]">{workflowResultSummary(message)}</div>
-        </div>
-      </div>
-    </article>
-  );
-}
 
-function MentionMenu({
-  options,
-  selectedIndex,
-  onSelect,
-}: {
-  options: MentionOption[];
-  selectedIndex: number;
-  onSelect: (option: MentionOption) => void;
-}) {
-  return (
-    <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-full max-w-xl overflow-hidden rounded-xl border border-[#dfe3ec] bg-white shadow-soft">
-      <div className="border-b border-[#edf0f5] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-        Mentions
-      </div>
-      <div className="max-h-64 overflow-y-auto py-1 scrollbar-thin">
-        {options.map((option, index) => (
-          <button
-            key={`${option.kind}:${option.id}`}
-            type="button"
-            className={cn(
-              "flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors",
-              index === selectedIndex
-                ? "bg-[#f1efff] text-[#5843d7]"
-                : "hover:bg-[#f7f8fb]",
-            )}
-            onMouseDown={(event) => {
-              event.preventDefault();
-              onSelect(option);
-            }}
-          >
-            {option.actor ? (
-              <ActorAvatar actor={option.actor} fallback={option.actor.id} small />
-            ) : (
-              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
-                <Users size={14} />
-              </span>
-            )}
-            <span className="min-w-0 flex-1">
-              <span className="block truncate font-medium">{option.title}</span>
-              <span className="block truncate text-xs text-muted-foreground">
-                {option.detail}
-              </span>
-            </span>
-            <span className="font-mono text-xs text-muted-foreground">
-              {option.token}
-            </span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
 
-function Composer({
-  draft,
-  setDraft,
-  disabled,
-  replyTo,
-  actorName,
-  onClearReply,
-  onSend,
-  mentionAgents,
-  placeholder = "Message",
-  disabledPlaceholder = "Connect and select a channel",
-  busy,
-}: {
-  draft: string;
-  setDraft: (value: string) => void;
-  disabled: boolean;
-  replyTo: Message | null;
-  actorName: string;
-  onClearReply: () => void;
-  onSend: () => void;
-  mentionAgents: Actor[];
-  placeholder?: string;
-  disabledPlaceholder?: string;
-  busy: boolean;
-}) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [caretIndex, setCaretIndex] = useState(draft.length);
-  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
-  const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
-  const activeMention = activeMentionQuery(draft, caretIndex);
-  const mentionKey = activeMention
-    ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`
-    : null;
-  const mentionOptions = activeMention
-    ? mentionCandidates(mentionAgents, activeMention)
-    : [];
-  const showMentions =
-    !disabled &&
-    !busy &&
-    activeMention !== null &&
-    dismissedMentionKey !== mentionKey &&
-    mentionOptions.length > 0;
-  const effectiveMentionIndex = mentionOptions.length
-    ? Math.min(selectedMentionIndex, mentionOptions.length - 1)
-    : 0;
-  const selectedMention = showMentions ? mentionOptions[effectiveMentionIndex] : null;
 
-  useEffect(() => {
-    setSelectedMentionIndex(0);
-  }, [mentionKey]);
 
-  function syncCaret(element: HTMLTextAreaElement) {
-    setCaretIndex(element.selectionStart ?? element.value.length);
-  }
 
-  function chooseMention(option: MentionOption) {
-    const before = draft.slice(0, option.start);
-    const after = draft.slice(option.end).replace(/^\s*/, "");
-    const next = `${before}${option.token} ${after}`;
-    const nextCaret = before.length + option.token.length + 1;
-    setDraft(next);
-    setCaretIndex(nextCaret);
-    setDismissedMentionKey(null);
-    requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-      textareaRef.current?.setSelectionRange(nextCaret, nextCaret);
-    });
-  }
 
-  return (
-    <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
-      <div className="mx-auto max-w-4xl">
-        {replyTo && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
-            <span className="min-w-0 flex-1 truncate">Replying to {actorName}</span>
-            <button onClick={onClearReply}>
-              <X size={14} />
-            </button>
-          </div>
-        )}
-        <div className="composer-box relative">
-          {showMentions && (
-            <MentionMenu
-              options={mentionOptions}
-              selectedIndex={effectiveMentionIndex}
-              onSelect={chooseMention}
-            />
-          )}
-          <Textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              syncCaret(event.currentTarget);
-              setDismissedMentionKey(null);
-            }}
-            onClick={(event) => syncCaret(event.currentTarget)}
-            onKeyUp={(event) => syncCaret(event.currentTarget)}
-            onKeyDown={(event) => {
-              if (isComposingKeyEvent(event)) return;
-              if (showMentions) {
-                if (event.key === "ArrowDown") {
-                  event.preventDefault();
-                  setSelectedMentionIndex((index) =>
-                    (index + 1) % mentionOptions.length,
-                  );
-                  return;
-                }
-                if (event.key === "ArrowUp") {
-                  event.preventDefault();
-                  setSelectedMentionIndex((index) =>
-                    (index - 1 + mentionOptions.length) % mentionOptions.length,
-                  );
-                  return;
-                }
-                if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
-                  event.preventDefault();
-                  chooseMention(selectedMention);
-                  return;
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  setDismissedMentionKey(mentionKey);
-                  return;
-                }
-              }
-              if (shouldSendOnEnter(event)) {
-                event.preventDefault();
-                onSend();
-              }
-            }}
-            disabled={disabled}
-            placeholder={disabled ? disabledPlaceholder : placeholder}
-            className="max-h-48 min-h-[44px] flex-1 border-0 bg-transparent px-0 py-1 shadow-none focus-visible:ring-0"
-          />
-          <Button
-            size="icon"
-            onClick={onSend}
-            disabled={disabled || !draft.trim() || busy}
-            className="h-9 w-9 rounded-lg"
-          >
-            {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
-          </Button>
-        </div>
-      </div>
-    </footer>
-  );
-}
-
-function ThreadPanel({
-  actors,
-  channel,
-  channelMessages,
-  currentActorId,
-  disabled,
-  draft,
-  mentionAgents,
-  machines,
-  runs,
-  messages,
-  setDraft,
-  task,
-  thread,
-  busy,
-  className,
-  onClose,
-  onSend,
-  onToggleReaction,
-  onOpenAgentSettings,
-}: {
-  actors: Record<string, Actor>;
-  channel: Channel | null;
-  channelMessages: Message[];
-  currentActorId: string | null;
-  disabled: boolean;
-  draft: string;
-  mentionAgents: Actor[];
-  machines: MachineInfo[];
-  runs: Record<string, Run>;
-  messages: Message[];
-  setDraft: (value: string) => void;
-  task: Task | null;
-  thread: Thread | null;
-  busy: string | null;
-  className?: string;
-  onClose: () => void;
-  onSend: () => void;
-  onToggleReaction: (message: Message, emoji: string) => void;
-  onOpenAgentSettings: (actorId: string) => void;
-}) {
-  const rootMessage = thread
-    ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
-    : null;
-  const replyMessages = messages.filter(
-    (message) =>
-      !isHiddenProtocolMessage(message) &&
-      (!rootMessage || message.id !== rootMessage.id),
-  );
-  const replyGroups = groupMessagesByDate(replyMessages);
-  const starter = rootMessage ? actors[rootMessage.authorActorId] : undefined;
-  const threadScrollKey = thread?.id ?? "thread:none";
-  const threadContentKey = [
-    rootMessage
-      ? `${rootMessage.id}:${rootMessage.createdAt}:${rootMessage.body.length}`
-      : "root:none",
-    ...replyMessages.map(
-      (message) => `${message.id}:${message.createdAt}:${message.body.length}`,
-    ),
-  ].join("|");
-  const threadScroll = useStickToBottomScroll({
-    contentKey: threadContentKey,
-    itemCount: replyMessages.length + (rootMessage ? 1 : 0),
-    scrollKey: threadScrollKey,
-  });
-  return (
-    <aside
-      className={cn(
-        "min-h-0 min-w-0 flex-col bg-white",
-        className ?? "hidden border-l border-[#e2e6ef] xl:flex",
-      )}
-    >
-      <div className="flex min-h-[86px] shrink-0 items-center border-b border-[#e2e6ef] bg-white px-5 py-3">
-        <div className="flex min-w-0 flex-1 items-center justify-between gap-3">
-          <div className="min-w-0">
-            <div className="min-w-0 truncate text-lg font-bold text-[#111827]">
-              {thread?.title ?? "Thread"}
-            </div>
-            <div className="mt-0.5 truncate text-sm text-[#485063]">
-              {thread
-                ? starter
-                  ? `Started by ${displayName(starter)} in #${channel?.title ?? "channel"}`
-                  : `#${channel?.title ?? "channel"}`
-                : "Select a thread"}
-            </div>
-            {task && (
-              <div className="mt-2 flex">
-                <TaskStateBadge task={task} />
-              </div>
-            )}
-          </div>
-          <div className="flex items-center gap-1">
-            <button className="composer-icon" type="button" title="Close" onClick={onClose}>
-              <X size={16} />
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div
-        ref={threadScroll.ref}
-        className="min-h-0 flex-1 overflow-y-auto bg-white soft-scrollbar"
-        onScroll={threadScroll.onScroll}
-      >
-        {!thread ? (
-          <div className="p-4">
-            <EmptyState icon={Split} text="Select a thread." />
-          </div>
-        ) : (
-          <div>
-            <section className="border-b border-[#edf0f5] bg-white px-5 py-4">
-              <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
-                <Split size={13} />
-                Original message
-              </div>
-              {rootMessage ? (
-                <ThreadConversationMessage
-                  actor={starter}
-                  actors={actors}
-                  busy={busy}
-                  currentActorId={currentActorId}
-                  machines={machines}
-                  runs={runs}
-                  message={rootMessage}
-                  onOpenAgentSettings={onOpenAgentSettings}
-                  onToggleReaction={onToggleReaction}
-                  root
-                />
-              ) : (
-                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6">
-                  <MutedLine>Original message unavailable.</MutedLine>
-                </div>
-              )}
-            </section>
-
-            <section className="bg-white px-5 py-2">
-              {replyMessages.length === 0 ? (
-                <div className="py-8">
-                  <EmptyState icon={MessageSquare} text="No replies in this thread." />
-                </div>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  {replyGroups.map((group) => (
-                    <Fragment key={group.key}>
-                      <div className="date-divider px-0">
-                        <span />
-                        <div>{group.label}</div>
-                        <span />
-                      </div>
-                      {group.messages.map((message) => (
-                        <ThreadConversationMessage
-                          key={message.id}
-                          actor={actors[message.authorActorId]}
-                          actors={actors}
-                          busy={busy}
-                          currentActorId={currentActorId}
-                          machines={machines}
-                          runs={runs}
-                          message={message}
-                          onOpenAgentSettings={onOpenAgentSettings}
-                          onToggleReaction={onToggleReaction}
-                        />
-                      ))}
-                    </Fragment>
-                  ))}
-                </div>
-              )}
-            </section>
-          </div>
-        )}
-      </div>
-
-      <ThreadComposer
-        draft={draft}
-        setDraft={setDraft}
-        disabled={disabled || !thread}
-        busy={busy === "thread:message:send"}
-        mentionAgents={mentionAgents}
-        onSend={onSend}
-      />
-    </aside>
-  );
-}
-
-function ThreadConversationMessage({
-  actor,
-  actors,
-  currentActorId,
-  machines,
-  runs,
-  message,
-  busy,
-  root = false,
-  onOpenAgentSettings,
-  onToggleReaction,
-}: {
-  actor?: Actor;
-  actors: Record<string, Actor>;
-  currentActorId: string | null;
-  machines: MachineInfo[];
-  runs: Record<string, Run>;
-  message: Message;
-  busy: string | null;
-  root?: boolean;
-  onOpenAgentSettings: (actorId: string) => void;
-  onToggleReaction: (message: Message, emoji: string) => void;
-}) {
-  const reactions = message.reactions ?? [];
-  const bodyPoll = bodyPollFromMessage(message);
-  const choices = actionChoices(message);
-  const pollChoices = choices.length > 0 ? choices : bodyPoll?.choices ?? [];
-  const displayBody = bodyPoll?.question || message.body || metadataText(message);
-  const attachments = message.attachments ?? [];
-  return (
-    <article
-      className={cn(
-        "group rounded-xl px-4 py-3 transition-colors",
-        root ? "bg-[#fbfbfd]" : "hover:bg-[#f7f8fb]",
-      )}
-    >
-      <div className="flex items-start gap-4">
-        <AgentMessageAvatar
-          actor={actor}
-          fallback={message.authorActorId}
-          machines={machines}
-          runs={runs}
-          onOpenAgentSettings={onOpenAgentSettings}
-          preferredPlacement="left"
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-semibold text-[#111827]">
-              {actor ? displayName(actor) : message.authorActorId}
-            </span>
-            <span className="text-xs font-medium text-[#667085]">
-              {formatTime(message.createdAt)}
-            </span>
-          </div>
-          <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown
-              actors={actors}
-              body={displayBody}
-              mentions={displayBody === message.body ? message.mentions : []}
-            />
-          </div>
-          {pollChoices.length > 0 && (
-            <PollCard choices={pollChoices} disabled />
-          )}
-          {attachments.length > 0 && (
-            <AttachmentStack attachments={attachments} />
-          )}
-          {reactions.length > 0 ? (
-            <div className="mt-3 flex min-h-7 flex-wrap items-center gap-1.5">
-              {reactions.map((reaction) => {
-                const selected = Boolean(
-                  currentActorId && reaction.actorIds.includes(currentActorId),
-                );
-                return (
-                  <button
-                    key={reaction.emoji}
-                    type="button"
-                    className={cn(
-                      "reaction-chip",
-                      selected
-                        ? "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]"
-                        : "border-[#e2e5ed] bg-white text-[#31394a]",
-                    )}
-                    title={reaction.actorIds
-                      .map((actorId) => actorName(actors, actorId))
-                      .join(", ")}
-                    disabled={busy === `message:reaction:${message.id}:${reaction.emoji}`}
-                    onClick={() => onToggleReaction(message, reaction.emoji)}
-                  >
-                    <span className="text-sm leading-none">{reaction.emoji}</span>
-                    <span>{reaction.actorIds.length}</span>
-                  </button>
-                );
-              })}
-              <ReactionPicker
-                busy={busy}
-                compact
-                message={message}
-                onToggleReaction={onToggleReaction}
-              />
-            </div>
-          ) : (
-            <div className="mt-2 flex flex-wrap gap-2 opacity-0 transition-opacity group-hover:opacity-100">
-              <ReactionPicker
-                busy={busy}
-                message={message}
-                onToggleReaction={onToggleReaction}
-              />
-            </div>
-          )}
-        </div>
-      </div>
-    </article>
-  );
-}
-
-function MessageMarkdown({
-  actors,
-  body,
-  mentions = [],
-}: {
-  actors: Record<string, Actor>;
-  body: string;
-  mentions?: MessageMention[];
-}) {
-  const components: Components = {
-    a({ href, children, node: _node, ...props }) {
-      const actorId = href ? actorMentionActorId(href) : null;
-      if (actorId) {
-        return (
-          <span
-            className="message-mention"
-            data-actor-id={actorId}
-            title={actorName(actors, actorId)}
-          >
-            {children}
-          </span>
-        );
-      }
-      return (
-        <a href={href} rel="noreferrer" target="_blank" {...props}>
-          {children}
-        </a>
-      );
-    },
-  };
-
-  return (
-    <ReactMarkdown
-      remarkPlugins={[actorMentionRemarkPlugin(actors, mentions)]}
-      components={components}
-    >
-      {body}
-    </ReactMarkdown>
-  );
-}
-
-function ReactionPicker({
-  busy,
-  compact = false,
-  message,
-  onToggleReaction,
-}: {
-  busy: string | null;
-  compact?: boolean;
-  message: Message;
-  onToggleReaction: (message: Message, emoji: string) => void;
-}) {
-  return (
-    <div className={cn("reaction-picker", compact && "h-7")}>
-      <button
-        type="button"
-        className={cn(
-          "composer-icon reaction-picker-trigger rounded-full",
-          compact ? "h-7 min-w-7" : "h-8 min-w-8",
-        )}
-        title="Add reaction"
-        aria-label="Add reaction"
-        aria-haspopup="true"
-      >
-        <Smile size={compact ? 14 : 15} />
-      </button>
-      <div className="reaction-picker-menu" role="menu" aria-label="Choose reaction">
-        {supportedReactionEmojis.map((emoji) => (
-          <button
-            key={emoji}
-            type="button"
-            className={cn("reaction-picker-option", compact && "h-7 w-7 text-sm")}
-            title={`React ${emoji}`}
-            aria-label={`React ${emoji}`}
-            disabled={busy === `message:reaction:${message.id}:${emoji}`}
-            onClick={() => onToggleReaction(message, emoji)}
-            role="menuitem"
-          >
-            {emoji}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function ThreadComposer({
-  draft,
-  setDraft,
-  disabled,
-  busy,
-  mentionAgents,
-  onSend,
-}: {
-  draft: string;
-  setDraft: (value: string) => void;
-  disabled: boolean;
-  busy: boolean;
-  mentionAgents: Actor[];
-  onSend: () => void;
-}) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [caretIndex, setCaretIndex] = useState(draft.length);
-  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
-  const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
-  const activeMention = activeMentionQuery(draft, caretIndex);
-  const mentionKey = activeMention
-    ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`
-    : null;
-  const mentionOptions = activeMention
-    ? mentionCandidates(mentionAgents, activeMention)
-    : [];
-  const showMentions =
-    !disabled &&
-    !busy &&
-    activeMention !== null &&
-    dismissedMentionKey !== mentionKey &&
-    mentionOptions.length > 0;
-  const effectiveMentionIndex = mentionOptions.length
-    ? Math.min(selectedMentionIndex, mentionOptions.length - 1)
-    : 0;
-  const selectedMention = showMentions ? mentionOptions[effectiveMentionIndex] : null;
-
-  useEffect(() => {
-    setSelectedMentionIndex(0);
-  }, [mentionKey]);
-
-  function syncCaret(element: HTMLTextAreaElement) {
-    setCaretIndex(element.selectionStart ?? element.value.length);
-  }
-
-  function chooseMention(option: MentionOption) {
-    const before = draft.slice(0, option.start);
-    const after = draft.slice(option.end).replace(/^\s*/, "");
-    const next = `${before}${option.token} ${after}`;
-    const nextCaret = before.length + option.token.length + 1;
-    setDraft(next);
-    setCaretIndex(nextCaret);
-    setDismissedMentionKey(null);
-    requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-      textareaRef.current?.setSelectionRange(nextCaret, nextCaret);
-    });
-  }
-
-  return (
-    <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
-      <div className="composer-box composer-box-compact relative">
-        {showMentions && (
-          <MentionMenu
-            options={mentionOptions}
-            selectedIndex={effectiveMentionIndex}
-            onSelect={chooseMention}
-          />
-        )}
-        <Textarea
-          ref={textareaRef}
-          value={draft}
-          onChange={(event) => {
-            setDraft(event.target.value);
-            syncCaret(event.currentTarget);
-            setDismissedMentionKey(null);
-          }}
-          onClick={(event) => syncCaret(event.currentTarget)}
-          onKeyUp={(event) => syncCaret(event.currentTarget)}
-          onKeyDown={(event) => {
-            if (isComposingKeyEvent(event)) return;
-            if (showMentions) {
-              if (event.key === "ArrowDown") {
-                event.preventDefault();
-                setSelectedMentionIndex((index) =>
-                  (index + 1) % mentionOptions.length,
-                );
-                return;
-              }
-              if (event.key === "ArrowUp") {
-                event.preventDefault();
-                setSelectedMentionIndex((index) =>
-                  (index - 1 + mentionOptions.length) % mentionOptions.length,
-                );
-                return;
-              }
-              if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
-                event.preventDefault();
-                chooseMention(selectedMention);
-                return;
-              }
-              if (event.key === "Escape") {
-                event.preventDefault();
-                setDismissedMentionKey(mentionKey);
-                return;
-              }
-            }
-            if (shouldSendOnEnter(event)) {
-              event.preventDefault();
-              onSend();
-            }
-          }}
-          disabled={disabled}
-          placeholder={disabled ? "Select a thread" : "Reply in thread..."}
-          className="max-h-36 min-h-[42px] flex-1 border-0 bg-transparent px-0 py-1 text-sm shadow-none focus-visible:ring-0"
-        />
-        <Button
-          size="icon"
-          onClick={onSend}
-          disabled={disabled || !draft.trim() || busy}
-          className="h-9 w-9 rounded-lg bg-[#503ed4] text-white hover:bg-[#4635c5]"
-        >
-          {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
-        </Button>
-      </div>
-    </footer>
-  );
-}
 
 function ThreadsView({
   actors,
@@ -8045,21 +6824,6 @@ function ErrorBanner({ error }: { error: string | null }) {
   );
 }
 
-function EmptyState({
-  icon: Icon,
-  text,
-}: {
-  icon: ComponentType<{ size?: string | number; className?: string }>;
-  text: string;
-}) {
-  return (
-    <div className="flex min-h-80 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] text-[#667085]">
-      <Icon size={28} />
-      <div className="text-sm">{text}</div>
-    </div>
-  );
-}
-
 function NoSpaceConnectionGuide({
   onUseLocalServer,
 }: {
@@ -8087,198 +6851,6 @@ function NoSpaceConnectionGuide({
         Prepare Space Connection
       </Button>
     </div>
-  );
-}
-
-function MutedLine({ children }: { children: ReactNode }) {
-  return <div className="text-sm text-muted-foreground">{children}</div>;
-}
-
-
-
-function AgentMessageAvatar({
-  actor,
-  fallback,
-  machines,
-  runs,
-  onOpenAgentSettings,
-  preferredPlacement = "right",
-  small,
-}: {
-  actor?: Actor;
-  fallback: string;
-  machines: MachineInfo[];
-  runs: Record<string, Run>;
-  onOpenAgentSettings: (actorId: string) => void;
-  preferredPlacement?: "left" | "right";
-  small?: boolean;
-}) {
-  const actorId = actor?.id ?? fallback;
-  const entry = findAgentMemberEntry(machines, actorId);
-  const avatarActor = actor ?? entry?.agent.spec.actor;
-  const [open, setOpen] = useState(false);
-  const [badgeExpanded, setBadgeExpanded] = useState(false);
-  const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
-  const anchorRef = useRef<HTMLButtonElement | null>(null);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const closeTimerRef = useRef<number | null>(null);
-
-  const clearCloseTimer = useCallback(() => {
-    if (closeTimerRef.current === null) return;
-    window.clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = null;
-  }, []);
-
-  const updatePopoverPosition = useCallback((expanded = badgeExpanded) => {
-    const anchor = anchorRef.current;
-    if (!anchor) return;
-    const rect = anchor.getBoundingClientRect();
-    const margin = 16;
-    const gap = 12;
-    const fallbackWidth =
-      (expanded ? agentMessageBadgeDetailWidth : agentMessageBadgeCompactWidth) *
-      agentMessageBadgePopoverScale;
-    const fallbackHeight =
-      (expanded ? agentMessageBadgeDetailHeight : agentMessageBadgeCompactHeight) *
-      agentMessageBadgePopoverScale;
-    const content = popoverRef.current?.firstElementChild;
-    const contentRect = content?.getBoundingClientRect();
-    const visualWidth =
-      contentRect && contentRect.width > 0
-        ? Math.min(contentRect.width, window.innerWidth - margin * 2)
-        : Math.min(fallbackWidth, window.innerWidth - margin * 2);
-    const visualHeight =
-      contentRect && contentRect.height > 0 ? contentRect.height : fallbackHeight;
-    const maxVisualHeight = Math.max(120, window.innerHeight - margin * 2);
-    const clampedVisualHeight = Math.min(visualHeight, maxVisualHeight);
-    let left =
-      preferredPlacement === "left"
-        ? rect.left - visualWidth - gap
-        : rect.right + gap;
-
-    if (left + visualWidth > window.innerWidth - margin) {
-      left = rect.left - visualWidth - gap;
-    }
-    if (left < margin) {
-      left = Math.min(window.innerWidth - margin - visualWidth, rect.right + gap);
-    }
-    if (left < margin) left = margin;
-
-    const maxTop = Math.max(margin, window.innerHeight - margin - clampedVisualHeight);
-    const top = Math.max(margin, Math.min(rect.top - 12, maxTop));
-    const availableVisualHeight = Math.max(120, window.innerHeight - top - margin);
-    setPopoverStyle({
-      left,
-      top,
-      "--agent-message-avatar-popover-max-height": `${availableVisualHeight / agentMessageBadgePopoverScale}px`,
-    } as CSSProperties);
-  }, [badgeExpanded, preferredPlacement]);
-
-  const openPopover = useCallback(() => {
-    clearCloseTimer();
-    if (!open) setBadgeExpanded(false);
-    updatePopoverPosition(false);
-    setOpen(true);
-  }, [clearCloseTimer, open, updatePopoverPosition]);
-
-  const scheduleClose = useCallback(() => {
-    clearCloseTimer();
-    closeTimerRef.current = window.setTimeout(() => setOpen(false), 180);
-  }, [clearCloseTimer]);
-
-  useEffect(() => {
-    if (!open) return;
-    updatePopoverPosition();
-    const reposition = () => updatePopoverPosition();
-    window.addEventListener("resize", reposition);
-    window.addEventListener("scroll", reposition, true);
-    return () => {
-      window.removeEventListener("resize", reposition);
-      window.removeEventListener("scroll", reposition, true);
-    };
-  }, [open, updatePopoverPosition]);
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    updatePopoverPosition();
-    const popover = popoverRef.current;
-    if (!popover || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => updatePopoverPosition());
-    observer.observe(popover);
-    if (popover.firstElementChild) observer.observe(popover.firstElementChild);
-    return () => observer.disconnect();
-  }, [badgeExpanded, open, updatePopoverPosition]);
-
-  useEffect(() => {
-    if (!open) setBadgeExpanded(false);
-  }, [open]);
-
-  useEffect(() => () => clearCloseTimer(), [clearCloseTimer]);
-
-  if (!entry || avatarActor?.kind !== "agent") {
-    return <ActorAvatar actor={actor} fallback={fallback} small={small} />;
-  }
-
-  const badgeProps = agentIdentityBadgeProps(entry, getActorRunContext(runs, entry.agent.spec.actor.id));
-  const entryActorId = entry.agent.spec.actor.id;
-  const display = displayName(avatarActor);
-
-  function openSettings() {
-    setOpen(false);
-    onOpenAgentSettings(entryActorId);
-  }
-
-  const scaledPopoverStyle = {
-    ...popoverStyle,
-    "--agent-message-avatar-popover-scale": agentMessageBadgePopoverScale,
-  } as CSSProperties;
-
-  const popover =
-    open && typeof document !== "undefined"
-      ? createPortal(
-          <div
-            ref={popoverRef}
-            className="agent-message-avatar-popover"
-            style={scaledPopoverStyle}
-            onFocus={openPopover}
-            onMouseEnter={openPopover}
-            onMouseLeave={scheduleClose}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") setOpen(false);
-            }}
-          >
-            <AgentIdentityBadge
-              {...badgeProps}
-              onAvatarClick={openSettings}
-              onExpandedChange={setBadgeExpanded}
-            />
-          </div>,
-          document.body,
-        )
-      : null;
-
-  return (
-    <>
-      <span className="agent-message-avatar">
-        <button
-          ref={anchorRef}
-          type="button"
-          className="agent-message-avatar__button"
-          title={`Open ${display} agent settings`}
-          aria-label={`Open ${display} agent settings`}
-          aria-haspopup="dialog"
-          aria-expanded={open}
-          onClick={openSettings}
-          onFocus={openPopover}
-          onBlur={scheduleClose}
-          onMouseEnter={openPopover}
-          onMouseLeave={scheduleClose}
-        >
-          <ActorAvatar actor={avatarActor} fallback={fallback} small={small} />
-        </button>
-      </span>
-      {popover}
-    </>
   );
 }
 

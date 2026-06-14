@@ -73,6 +73,7 @@ import {
   type Message,
   type MessageMention,
   type Run,
+  type RunStatus,
   type ScopeRef,
   type StreamUpdate,
   type Task,
@@ -2272,6 +2273,7 @@ export function App() {
             channelThreads={channelThreads}
             currentActorId={workspace?.actorId ?? null}
             machines={machines}
+            runs={runs}
             threadStatsById={threadStatsById}
             tab={channelPanelTab}
             busy={busy}
@@ -6255,7 +6257,10 @@ function MemberListItem({
   onSelect: () => void;
 }) {
   const actor = entry.agent.spec.actor;
-  const working = activeRunCountForActor(runs, actor.id) > 0;
+  const ctx = getActorRunContext(runs, actor.id);
+  const working = ctx != null && !ctx.isTerminal;
+  const label = working ? (runStatusFullLabel(ctx) ?? "Processing…") : entry.machine.name;
+  const animationName = runStatusAnimationName(ctx);
 
   return (
     <button
@@ -6277,15 +6282,15 @@ function MemberListItem({
           <span
             className={cn(
               "h-2 w-2 shrink-0 rounded-full",
-              working
-                ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.5)]"
+              working || ctx?.isTerminal
+                ? runStatusDotClass(ctx)
                 : statusDotClass(entry.agent.status),
             )}
-            style={working ? { animation: "agent-status-pulse 1.5s ease-in-out infinite" } : undefined}
+            style={animationName ? { animation: `${animationName} 1.5s ease-in-out infinite` } : undefined}
           />
         </span>
         <span className="mt-0.5 block truncate text-xs text-[#667085]">
-          {working ? "Processing…" : entry.machine.name}
+          {label}
         </span>
       </span>
     </button>
@@ -8554,6 +8559,7 @@ function ChannelPanel({
   channelThreads,
   currentActorId,
   machines,
+  runs,
   threadStatsById,
   tab,
   busy,
@@ -8571,6 +8577,7 @@ function ChannelPanel({
   channelThreads: Thread[];
   currentActorId: string | null;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   threadStatsById: Record<string, ThreadActivityStats>;
   tab: ChannelPanelTab;
   busy: string | null;
@@ -8590,6 +8597,7 @@ function ChannelPanel({
       channelThreads={channelThreads}
       currentActorId={currentActorId}
       machines={machines}
+      runs={runs}
       threadStatsById={threadStatsById}
       tab={tab}
       busy={busy}
@@ -8612,6 +8620,7 @@ function ChannelDetailPanel({
   channelThreads,
   currentActorId,
   machines,
+  runs,
   threadStatsById,
   tab,
   busy,
@@ -8630,6 +8639,7 @@ function ChannelDetailPanel({
   channelThreads: Thread[];
   currentActorId: string | null;
   machines: MachineInfo[];
+  runs: Record<string, Run>;
   threadStatsById: Record<string, ThreadActivityStats>;
   tab: ChannelPanelTab;
   busy: string | null;
@@ -8743,6 +8753,7 @@ function ChannelDetailPanel({
             memberQuery={memberQuery}
             offlineMembers={offlineMembers}
             onlineMembers={onlineMembers}
+            runs={runs}
             setMemberQuery={setMemberQuery}
             onInviteMember={onInviteMember}
             onRemoveMember={onRemoveMember}
@@ -8861,6 +8872,7 @@ function ChannelMembersPanel({
   memberQuery,
   offlineMembers,
   onlineMembers,
+  runs,
   setMemberQuery,
   onInviteMember,
   onRemoveMember,
@@ -8872,6 +8884,7 @@ function ChannelMembersPanel({
   memberQuery: string;
   offlineMembers: ChannelMemberPanelItem[];
   onlineMembers: ChannelMemberPanelItem[];
+  runs: Record<string, Run>;
   setMemberQuery: (value: string) => void;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
@@ -8882,6 +8895,7 @@ function ChannelMembersPanel({
         busy={busy}
         channel={channel}
         items={onlineMembers}
+        runs={runs}
         title="在线"
         onRemoveMember={onRemoveMember}
       />
@@ -8889,6 +8903,7 @@ function ChannelMembersPanel({
         busy={busy}
         channel={channel}
         items={offlineMembers}
+        runs={runs}
         title="离线"
         onRemoveMember={onRemoveMember}
       />
@@ -8957,12 +8972,14 @@ function ChannelMemberGroup({
   busy,
   channel,
   items,
+  runs,
   title,
   onRemoveMember,
 }: {
   busy: string | null;
   channel: Channel;
   items: ChannelMemberPanelItem[];
+  runs: Record<string, Run>;
   title: string;
   onRemoveMember: (channelId: string, actorId: string) => void;
 }) {
@@ -8983,6 +9000,7 @@ function ChannelMemberGroup({
             busy={busy}
             channel={channel}
             presence={presence}
+            runs={runs}
             onRemoveMember={onRemoveMember}
           />
         ))}
@@ -8996,15 +9014,20 @@ function ChannelMemberRow({
   busy,
   channel,
   presence,
+  runs,
   onRemoveMember,
 }: {
   actor: Actor;
   busy: string | null;
   channel: Channel;
   presence: ChannelMemberPresence;
+  runs: Record<string, Run>;
   onRemoveMember: (channelId: string, actorId: string) => void;
 }) {
   const revokeBusy = busy === `channel:revoke:${channel.id}:${actor.id}`;
+  const ctx = actor.kind === "agent" ? getActorRunContext(runs, actor.id) : null;
+  const runLabel = runStatusFullLabel(ctx);
+
   return (
     <div className="flex items-center gap-3 rounded-xl border border-[#edf0f5] bg-white px-3 py-2.5 shadow-[0_1px_2px_rgb(16_24_40_/_0.03)]">
       <span className="relative shrink-0">
@@ -9012,7 +9035,7 @@ function ChannelMemberRow({
         <span
           className={cn(
             "absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white",
-            statusDotClass(presence.status),
+            ctx ? runStatusDotClass(ctx) : statusDotClass(presence.status),
           )}
         />
       </span>
@@ -9026,10 +9049,14 @@ function ChannelMemberRow({
           </span>
         </div>
         <div className="truncate text-xs text-[#667085]">
-          {presence.label}
-          {actor.kind === "agent" && presence.status !== "offline"
-            ? ` · ${presence.status}`
-            : ""}
+          {runLabel ?? (
+            <>
+              {presence.label}
+              {actor.kind === "agent" && presence.status !== "offline"
+                ? ` · ${presence.status}`
+                : ""}
+            </>
+          )}
         </div>
       </div>
       {canRemoveChannelMember(channel, actor.id) && (
@@ -9384,7 +9411,7 @@ function AgentMessageAvatar({
     return <ActorAvatar actor={actor} fallback={fallback} small={small} />;
   }
 
-  const badgeProps = agentIdentityBadgeProps(entry, activeRunCountForActor(runs, entry.agent.spec.actor.id));
+  const badgeProps = agentIdentityBadgeProps(entry, getActorRunContext(runs, entry.agent.spec.actor.id));
   const entryActorId = entry.agent.spec.actor.id;
   const display = displayName(avatarActor);
 
@@ -9820,25 +9847,162 @@ function agentSettingsDraft(
   };
 }
 
-function activeRunCountForActor(runs: Record<string, Run>, actorId: string): number {
-  return Object.values(runs).filter(
-    (run) =>
-      run.actorId === actorId &&
-      !["completed", "failed", "canceled"].includes(run.status),
-  ).length;
+// ---- V3: ActorRunContext - 带上下文信息的运行状态 ----
+interface ActorRunContext {
+  status: RunStatus;
+  run: Run;
+  isStale: boolean;
+  staleThresholdSec: number;
+  isTerminal: boolean;
+  terminalExpired: boolean;
+}
+
+const STALE_THRESHOLDS: Record<string, number> = {
+  queued: 300,
+  preparing_context: 180,
+  running: 600,
+  waiting_tool: 120,
+};
+const TERMINAL_SHOW_SEC = 30;
+
+function getActorRunContext(runs: Record<string, Run>, actorId: string): ActorRunContext | null {
+  const statusPriority: Record<string, number> = {
+    running: 4,
+    waiting_tool: 3,
+    preparing_context: 2,
+    queued: 1,
+  };
+  let best: { run: Run; priority: number } | null = null;
+  for (const run of Object.values(runs)) {
+    if (run.actorId !== actorId) continue;
+    const p = statusPriority[run.status] ?? 0;
+    if (p > (best?.priority ?? 0)) {
+      best = { run, priority: p };
+    }
+  }
+
+  if (!best) {
+    // P1: 检查最近的终端运行 (failed/canceled 在 30s 内)
+    const now = Date.now();
+    for (const run of Object.values(runs)) {
+      if (run.actorId !== actorId) continue;
+      if (run.status === "failed" || run.status === "canceled") {
+        if (run.closedAt) {
+          const elapsed = (now - new Date(run.closedAt).getTime()) / 1000;
+          if (elapsed <= TERMINAL_SHOW_SEC) {
+            return {
+              status: run.status,
+              run,
+              isStale: false,
+              staleThresholdSec: 0,
+              isTerminal: true,
+              terminalExpired: false,
+            };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  const { run } = best;
+  const threshold = STALE_THRESHOLDS[run.status] ?? 600;
+  const elapsed = (Date.now() - new Date(run.openedAt).getTime()) / 1000;
+  const isStale = elapsed > threshold;
+
+  return {
+    status: run.status,
+    run,
+    isStale,
+    staleThresholdSec: threshold,
+    isTerminal: false,
+    terminalExpired: false,
+  };
+}
+
+// runStatus 到用户可见标签映射
+const runStatusLabel: Record<string, string> = {
+  queued: "排队中",
+  preparing_context: "准备中",
+  running: "思考中",
+  waiting_tool: "等待工具",
+  failed: "运行失败",
+  canceled: "已取消",
+};
+
+// P0: 带上下文信息的完整标签
+function runStatusFullLabel(ctx: ActorRunContext | null): string | undefined {
+  if (!ctx) return undefined;
+
+  if (ctx.isTerminal) {
+    const meta = ctx.run.metadata ?? {};
+    const error = typeof meta.error === "string" ? meta.error : undefined;
+    const noReplyReason = typeof meta.noReplyReason === "string" ? meta.noReplyReason : undefined;
+    const reason = error || noReplyReason || ctx.run.startReason;
+    const base = runStatusLabel[ctx.status] ?? ctx.status;
+    return reason ? `${base} · ${reason}` : base;
+  }
+
+  const base = runStatusLabel[ctx.status] ?? ctx.status;
+
+  if (ctx.isStale) {
+    return `⚠ ${base} (超时)`;
+  }
+
+  const reason = ctx.run.startReason;
+  const meta = ctx.run.metadata ?? {};
+
+  if (ctx.status === "queued" && reason) return `排队中 · ${reason}`;
+  if (ctx.status === "preparing_context" && reason) return `准备中 · ${reason}`;
+  if (ctx.status === "running" && reason) return `思考中 · ${reason}`;
+  if (ctx.status === "waiting_tool") {
+    const toolName = typeof meta.toolName === "string" ? meta.toolName : undefined;
+    if (toolName) return `等待工具 · ${toolName}`;
+  }
+
+  return base;
+}
+
+// runStatus 到 CSS 颜色类映射 (V3: 支持 ActorRunContext)
+function runStatusDotClass(ctx: ActorRunContext | null): string {
+  if (!ctx) return "bg-[#98a2b3]";
+
+  if (ctx.isTerminal) {
+    if (ctx.status === "failed") return "bg-red-500";
+    return "bg-gray-500";
+  }
+
+  if (ctx.isStale) return "bg-yellow-400 shadow-[0_0_6px_rgba(250,204,21,0.5)]";
+
+  switch (ctx.status) {
+    case "queued": return "bg-gray-400";
+    case "preparing_context": return "bg-blue-400";
+    case "running": return "bg-purple-400 shadow-[0_0_6px_rgba(168,85,247,0.5)]";
+    case "waiting_tool": return "bg-orange-400 shadow-[0_0_6px_rgba(251,146,60,0.5)]";
+    default: return "bg-[#98a2b3]";
+  }
+}
+
+// V3: MemberListItem inline animation key
+function runStatusAnimationName(ctx: ActorRunContext | null): string | undefined {
+  if (!ctx) return undefined;
+  if (ctx.isTerminal) {
+    return ctx.status === "failed" ? "agent-status-failed" : "agent-status-canceled";
+  }
+  if (ctx.isStale) return "agent-status-stale-warning";
+  return `agent-status-${ctx.status.replace(/_/g, "-")}`;
 }
 
 function agentIdentityBadgeProps(
   entry: AgentMemberEntry,
-  activeRunCount?: number,
+  runContext?: ActorRunContext | null,
 ): AgentIdentityBadgeProps {
   const provider = providerForAgent(entry.machine, entry.agent);
   const providerName = provider?.name || provider?.id || "AI Runtime";
   const iconKey = agentProviderIconKey(provider?.id, providerName);
-  const working = activeRunCount != null && activeRunCount > 0;
-  const workingLabel = activeRunCount != null && activeRunCount > 1
-    ? `${activeRunCount} runs active`
-    : "Processing…";
+  const working = runContext != null && !runContext.isTerminal;
+  const workingLabel = runContext ? runStatusFullLabel(runContext) : undefined;
+  const runStatus = runContext?.status ?? null;
   return {
     avatarUrl: agentAvatarValue(entry.agent),
     agentName: agentDisplayName(entry.agent),
@@ -9851,6 +10015,9 @@ function agentIdentityBadgeProps(
     online: isOnlinePresenceStatus(entry.agent.status, entry.agent),
     working,
     workingLabel,
+    runStatus,
+    isStale: runContext?.isStale ?? false,
+    isTerminal: runContext?.isTerminal ?? false,
   };
 }
 

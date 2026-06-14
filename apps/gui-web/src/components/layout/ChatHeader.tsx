@@ -1,12 +1,30 @@
 import type { ComponentType } from "react";
 import { Check, Hash, Split, Users } from "lucide-react";
-import type { Channel } from "@/ipc/types";
+import type { Actor, Channel, Run } from "@/ipc/types";
 import type { ChannelPanelTab } from "@/lib/types";
 import type { ConnectionState } from "@/lib/types";
 import { channelTopic } from "@/lib/channel-utils";
+import { getChannelAgentActivity } from "@/lib/agent-utils";
+import type { ChannelAgentActivity } from "@/lib/agent-utils";
+import { useMemo } from "react";
 import { connectionLabel } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+
+function formatActivityLabel(activity: ChannelAgentActivity): string {
+  const { primaryAgentName, primaryStatus, activeCount, hasFailed } = activity;
+  if (hasFailed && activeCount === 0) return `⚠ ${primaryAgentName} 运行异常`;
+  if (activeCount === 1) {
+    switch (primaryStatus) {
+      case "running": return `${primaryAgentName} 正在思考…`;
+      case "waiting_tool": return `${primaryAgentName} 正在等待工具…`;
+      case "preparing_context": return `${primaryAgentName} 正在准备…`;
+      case "queued": return `${primaryAgentName} 排队中…`;
+      default: return `${primaryAgentName} 工作中…`;
+    }
+  }
+  return `${primaryAgentName} 等 ${activeCount} 个 Agent 工作中…`;
+}
 
 export function ChatHeader({
   channel,
@@ -14,14 +32,22 @@ export function ChatHeader({
   connection,
   activePanel,
   onOpenPanel,
+  runs,
+  agentActors,
 }: {
   channel: Channel | null;
   target: string | null;
   connection: ConnectionState;
   activePanel: ChannelPanelTab | null;
   onOpenPanel: (panel: ChannelPanelTab) => void;
+  runs: Record<string, Run>;
+  agentActors: Actor[];
 }) {
   const topic = channelTopic(channel);
+  const activity = useMemo(
+    () => getChannelAgentActivity(runs, agentActors),
+    [runs, agentActors],
+  );
   const panelActions: Array<{
     id: ChannelPanelTab;
     title: string;
@@ -43,7 +69,17 @@ export function ChatHeader({
           </h1>
         </div>
         <div className="mt-1 truncate pl-11 text-sm text-[#485063]">
-          {topic || target || connectionLabel(connection)}
+          {activity && !activity.isIdle ? (
+            <span className={cn(
+              activity.hasFailed && activity.activeCount === 0 && "text-red-500",
+              activity.primaryStatus === "running" && "text-purple-500 chat-header-activity-running",
+              activity.primaryStatus === "waiting_tool" && "text-orange-500",
+            )}>
+              {formatActivityLabel(activity)}
+            </span>
+          ) : (
+            topic || target || connectionLabel(connection)
+          )}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">

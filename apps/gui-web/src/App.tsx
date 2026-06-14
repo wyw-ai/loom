@@ -1794,6 +1794,8 @@ export function App() {
           activeDirectActorId={activeDirectActorId}
           activeThreadId={activeThreadId}
           directAgents={agentActors}
+          runs={runs}
+          machines={machines}
           threadsByChannel={threadsByChannel}
           onAddChannel={(title) => {
             void createChannelWithTitle(title);
@@ -1847,6 +1849,8 @@ export function App() {
                 setActiveThreadId(null);
                 setChannelPanelTab((current) => (current === panel ? null : panel));
               }}
+              runs={runs}
+              agentActors={agentActors}
             />
             {error && (
               <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">

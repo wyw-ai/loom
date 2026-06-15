@@ -141,16 +141,29 @@ package_runtime_target() {
     local archive_ext="tar.gz"
   fi
 
-  ensure_file "$src_dir/loom"
-  ensure_file "$src_dir/loom-daemon"
-  ensure_file "$src_dir/loom-server"
+  if [[ "$target" == *windows* ]]; then
+    ensure_file "$src_dir/loom.exe"
+    ensure_file "$src_dir/loom-daemon.exe"
+    ensure_file "$src_dir/loom-server.exe"
+  else
+    ensure_file "$src_dir/loom"
+    ensure_file "$src_dir/loom-daemon"
+    ensure_file "$src_dir/loom-server"
+  fi
 
   rm -rf "$stage_dir"
   mkdir -p "$stage_dir/bin"
-  cp "$src_dir/loom" "$stage_dir/bin/loom"
-  cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
-  cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
-  chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
+
+  if [[ "$target" == *windows* ]]; then
+    cp "$src_dir/loom.exe"        "$stage_dir/bin/loom.exe"
+    cp "$src_dir/loom-daemon.exe" "$stage_dir/bin/loom-daemon.exe"
+    cp "$src_dir/loom-server.exe" "$stage_dir/bin/loom-server.exe"
+  else
+    cp "$src_dir/loom" "$stage_dir/bin/loom"
+    cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
+    cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
+    chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
+  fi
 
   cat >"$stage_dir/README.txt" <<EOF
 Loom runtime package
@@ -160,9 +173,9 @@ Git SHA: $GIT_SHA
 Target: $target
 
 Contents:
-- bin/loom: operator CLI.
-- bin/loom-daemon: machine-scoped agent and service host.
-- bin/loom-server: WebSocket collaboration server.
+- bin/loom$( [[ "$target" == *windows* ]] && echo .exe ): operator CLI.
+- bin/loom-daemon$( [[ "$target" == *windows* ]] && echo .exe ): machine-scoped agent and service host.
+- bin/loom-server$( [[ "$target" == *windows* ]] && echo .exe ): WebSocket collaboration server.
 EOF
 
   if [[ "$archive_ext" == "zip" ]]; then

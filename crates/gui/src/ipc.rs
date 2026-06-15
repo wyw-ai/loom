@@ -2170,22 +2170,24 @@ fn daemon_start_commands(
         .unwrap_or_else(|| "loom-daemon".into());
     let serve_command = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
         format!(
-            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
+            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}{}",
             config_dir_arg,
             data_root_arg,
             daemon_bin,
             shell_arg(server_url),
             shell_arg(machine_id),
             shell_arg(machine_name),
+            if cfg!(windows) { " --no-ipc" } else { "" },
         )
     } else {
         format!(
-            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
+            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}{}",
             data_root_arg,
             daemon_bin,
             shell_arg(server_url),
             shell_arg(machine_id),
             shell_arg(machine_name),
+            if cfg!(windows) { " --no-ipc" } else { "" },
         )
     };
     let mkdir_args = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
@@ -2198,7 +2200,7 @@ fn daemon_start_commands(
         .map(|config_dir_arg| format!("export LOOM_CONFIG_DIR={config_dir_arg}\n"))
         .unwrap_or_default();
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {} --machine-name {}\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {} --machine-name {}{}\n",
         mkdir_args,
         config_export,
         shell_path_arg(data_root),
@@ -2206,6 +2208,7 @@ fn daemon_start_commands(
         shell_arg(server_url),
         shell_arg(machine_id),
         shell_arg(machine_name),
+        if cfg!(windows) { " --no-ipc" } else { "" },
     );
     (serve_command, setup_script)
 }

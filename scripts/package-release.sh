@@ -163,6 +163,11 @@ package_runtime_target() {
     cp "$src_dir/loom-daemon.exe" "$stage_dir/bin/loom-daemon.exe"
     cp "$src_dir/loom-server.exe" "$stage_dir/bin/loom-server.exe"
 
+    # Bundle loom-shell GUI management tool
+    if [[ -f "$src_dir/loom-shell.exe" ]]; then
+      cp "$src_dir/loom-shell.exe" "$stage_dir/bin/loom-shell.exe"
+    fi
+
     # Bundle winsw Windows Service wrapper files
     if [[ -f "$src_dir/WinSW-x64.exe" ]]; then
       cp "$src_dir/WinSW-x64.exe" "$stage_dir/bin/WinSW-x64.exe"
@@ -216,6 +221,9 @@ To install Loom as a Windows Service (auto-start, crash recovery):
     sc start  LoomDaemon
     sc stop   LoomDaemon
     sc query  LoomDaemon
+
+  Or use the GUI management tool:
+    .\loom-shell.exe
 
   Uninstall:
     .\uninstall.ps1

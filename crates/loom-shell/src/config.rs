@@ -1,9 +1,9 @@
 //! 路径解析 — 定位可执行文件、配置目录和日志目录。
 //!
 //! 所有路径都相对于 loom-shell.exe 所在目录解析：
-//! - 二进制文件：`<exe_dir>/server.exe`、`<exe_dir>/loom-daemon.exe`
+//! - 二进制文件：`<exe_dir>/loom-server.exe`、`<exe_dir>/loom-daemon.exe`
 //! - 配置 XML：`<exe_dir>/../config/`
-//! - 日志文件：`<exe_dir>/../logs/`
+//! - 日志文件：`%LOCALAPPDATA%\loom\logs\server\` / `daemon\`（winsw 默认输出）
 
 use std::path::{Path, PathBuf};
 
@@ -15,9 +15,9 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// server.exe 的完整路径。
+/// loom-server.exe 的完整路径。
 pub fn server_exe() -> PathBuf {
-    exe_dir().join("server.exe")
+    exe_dir().join("loom-server.exe")
 }
 
 /// loom-daemon.exe 的完整路径。
@@ -25,7 +25,7 @@ pub fn daemon_exe() -> PathBuf {
     exe_dir().join("loom-daemon.exe")
 }
 
-/// WinSW 可执行文件路径（与 server.exe 同目录）。
+/// WinSW 可执行文件路径（与 loom-shell.exe 同目录）。
 pub fn winsw_exe() -> PathBuf {
     exe_dir().join("WinSW-x64.exe")
 }
@@ -35,7 +35,20 @@ pub fn config_dir() -> PathBuf {
     exe_dir().join("..").join("config")
 }
 
-/// 日志目录（<exe_dir>/../logs）。
-pub fn log_dir() -> PathBuf {
-    exe_dir().join("..").join("logs")
+/// 日志根目录（%LOCALAPPDATA%\loom\logs）。
+fn local_appdata() -> PathBuf {
+    // 从环境变量读取 LOCALAPPDATA；若不可用则回退到 exe_dir
+    std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| exe_dir().join("..").join("logs"))
+}
+
+/// Server 日志目录（%LOCALAPPDATA%\loom\logs\server）。
+pub fn server_log_dir() -> PathBuf {
+    local_appdata().join("loom").join("logs").join("server")
+}
+
+/// Daemon 日志目录（%LOCALAPPDATA%\loom\logs\daemon）。
+pub fn daemon_log_dir() -> PathBuf {
+    local_appdata().join("loom").join("logs").join("daemon")
 }

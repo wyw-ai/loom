@@ -49,6 +49,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    windows_console::init();
     init_tracing();
     let args = Args::parse();
     loom_cli::cmd::daemon::run(

@@ -162,6 +162,22 @@ package_runtime_target() {
     cp "$src_dir/loom.exe"        "$stage_dir/bin/loom.exe"
     cp "$src_dir/loom-daemon.exe" "$stage_dir/bin/loom-daemon.exe"
     cp "$src_dir/loom-server.exe" "$stage_dir/bin/loom-server.exe"
+
+    # Bundle winsw Windows Service wrapper files
+    if [[ -f "$src_dir/WinSW-x64.exe" ]]; then
+      cp "$src_dir/WinSW-x64.exe" "$stage_dir/bin/WinSW-x64.exe"
+    fi
+    if [[ -f "$src_dir/install.ps1" ]]; then
+      cp "$src_dir/install.ps1" "$stage_dir/bin/install.ps1"
+    fi
+    if [[ -f "$src_dir/uninstall.ps1" ]]; then
+      cp "$src_dir/uninstall.ps1" "$stage_dir/bin/uninstall.ps1"
+    fi
+    if [[ -d "$src_dir/config" ]]; then
+      mkdir -p "$stage_dir/config"
+      cp "$src_dir/config/loom-server.xml" "$stage_dir/config/loom-server.xml" 2>/dev/null || true
+      cp "$src_dir/config/loom-daemon.xml" "$stage_dir/config/loom-daemon.xml" 2>/dev/null || true
+    fi
   else
     cp "$src_dir/loom" "$stage_dir/bin/loom"
     cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
@@ -181,6 +197,32 @@ Contents:
 - bin/loom-daemon$( [[ "$target" == *windows* ]] && echo .exe ): machine-scoped agent and service host.
 - bin/loom-server$( [[ "$target" == *windows* ]] && echo .exe ): WebSocket collaboration server.
 EOF
+
+  if [[ "$target" == *windows* ]]; then
+    cat >>"$stage_dir/README.txt" <<'EOF'
+
+Windows Service deployment
+--------------------------
+To install Loom as a Windows Service (auto-start, crash recovery):
+
+  Run PowerShell as Administrator, then:
+    cd bin
+    .\install.ps1
+
+  Manage services:
+    sc start  LoomServer
+    sc stop   LoomServer
+    sc query  LoomServer
+    sc start  LoomDaemon
+    sc stop   LoomDaemon
+    sc query  LoomDaemon
+
+  Uninstall:
+    .\uninstall.ps1
+
+  Logs: %LOCALAPPDATA%\loom\logs\
+EOF
+  fi
 
   if [[ "$archive_ext" == "zip" ]]; then
     (cd "$TMP_DIR" && zip -qr "$archive" "$package_name")
@@ -643,6 +685,8 @@ rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   log "building CLI/daemon/server release binaries for macOS and Linux targets"
   run_make all-release
+  log "assembling Windows Service (winsw) package"
+  run_make windows-service-package
 else
   log "skipping binary build; using existing $DIST_DIR/$PROFILE artifacts"
 fi

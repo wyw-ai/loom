@@ -118,7 +118,8 @@ pub async fn start_proxy(socket: PathBuf, server_url: String) -> Result<JoinHand
     #[cfg(not(unix))]
     {
         let _ = (socket, server_url);
-        bail!("loom-daemon IPC is only supported on Unix platforms");
+        tracing::warn!("loom-daemon IPC is only supported on Unix platforms; running without IPC proxy");
+        Ok(tokio::spawn(async {}))
     }
 
     #[cfg(unix)]

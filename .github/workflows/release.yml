@@ -161,9 +161,9 @@ jobs:
           set -euo pipefail
           cargo build --release --target x86_64-pc-windows-msvc -p loom-cli -p loom-server
           mkdir -p dist/release/x86_64-pc-windows-msvc
-          cp target/x86_64-pc-windows-msvc/release/loom.exe        dist/release/x86_64-pc-windows-msvc/loom
-          cp target/x86_64-pc-windows-msvc/release/loom-daemon.exe dist/release/x86_64-pc-windows-msvc/loom-daemon
-          cp target/x86_64-pc-windows-msvc/release/loom-server.exe dist/release/x86_64-pc-windows-msvc/loom-server
+          cp target/x86_64-pc-windows-msvc/release/loom.exe        dist/release/x86_64-pc-windows-msvc/loom.exe
+          cp target/x86_64-pc-windows-msvc/release/loom-daemon.exe dist/release/x86_64-pc-windows-msvc/loom-daemon.exe
+          cp target/x86_64-pc-windows-msvc/release/loom-server.exe dist/release/x86_64-pc-windows-msvc/loom-server.exe
 
       - name: Archive Windows dist
         shell: bash

@@ -123,7 +123,6 @@ impl LoomShell {
         // ---------- 日志文本区 ----------
         nwg::TextBox::builder()
             .readonly(true)
-            .multiline(true)
             .position((10, 130))
             .size((610, 250))
             .parent(&shell.window)
@@ -309,9 +308,9 @@ fn refresh_tab(
     lbl_detail: &nwg::ControlHandle,
     log_area: &nwg::ControlHandle,
 ) {
-    let (svc_name, exe_path, log_name, label) = match tab {
-        Tab::Server => ("loom-server", config::server_exe(), "server.log", "Server"),
-        Tab::Daemon => ("loom-daemon", config::daemon_exe(), "daemon.log", "Daemon"),
+    let (svc_name, exe_path, label) = match tab {
+        Tab::Server => ("LoomServer", config::server_exe(), "Server"),
+        Tab::Daemon => ("LoomDaemon", config::daemon_exe(), "Daemon"),
         Tab::Logs => {
             // 日志标签：显示两个服务的日志
             let server_log = log_viewer::tail_server();
@@ -320,9 +319,9 @@ fn refresh_tab(
                 "=== Server 日志 ===\n{}\n\n=== Daemon 日志 ===\n{}",
                 server_log, daemon_log
             );
-            nwg::Label::set_text(lbl_status, "状态：日志查看");
-            nwg::Label::set_text(lbl_detail, "显示 server.log 和 daemon.log 最后 100 行");
-            nwg::TextBox::set_text(log_area, &combined);
+            set_ctrl_text(lbl_status, "状态：日志查看");
+            set_ctrl_text(lbl_detail, "显示 LoomServer.out.log 和 LoomDaemon.out.log 最后 100 行");
+            set_ctrl_text(log_area, &combined);
             return;
         }
     };
@@ -358,12 +357,34 @@ fn refresh_tab(
         );
     }
 
-    nwg::Label::set_text(lbl_status, &status_text);
-    nwg::Label::set_text(lbl_detail, &detail_text);
+    set_ctrl_text(lbl_status, &status_text);
+    set_ctrl_text(lbl_detail, &detail_text);
 
-    // 非日志标签页也刷新日志区
-    let log_content = log_viewer::tail(log_name, 100);
-    nwg::TextBox::set_text(log_area, &log_content);
+    // 刷新日志区
+    let log_content = match tab {
+        Tab::Server => log_viewer::tail_server(),
+        Tab::Daemon => log_viewer::tail_daemon(),
+        Tab::Logs => String::new(),
+    };
+    set_ctrl_text(log_area, &log_content);
+}
+
+/// 通过 ControlHandle 的 HWND 设置控件文本（兼容 NWG 1.0.12/1.0.13）。
+fn set_ctrl_text(handle: &nwg::ControlHandle, text: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+    let hwnd = match handle.hwnd() {
+        Some(h) => h as windows_sys::Win32::Foundation::HWND,
+        None => return,
+    };
+    let wide: Vec<u16> = OsStr::new(text)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        SetWindowTextW(hwnd, wide.as_ptr());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,19 +394,19 @@ fn refresh_tab(
 fn handle_start(tab: Tab) {
     match tab {
         Tab::Server => {
-            let svc_state = service::query("loom-server");
+            let svc_state = service::query("LoomServer");
             if svc_state == service::SvcState::NotInstalled {
                 let _ = process::start_server(&config::server_exe().to_string_lossy());
             } else {
-                let _ = service::start("loom-server");
+                let _ = service::start("LoomServer");
             }
         }
         Tab::Daemon => {
-            let svc_state = service::query("loom-daemon");
+            let svc_state = service::query("LoomDaemon");
             if svc_state == service::SvcState::NotInstalled {
                 let _ = process::start_daemon(&config::daemon_exe().to_string_lossy());
             } else {
-                let _ = service::start("loom-daemon");
+                let _ = service::start("LoomDaemon");
             }
         }
         Tab::Logs => {}
@@ -395,19 +416,19 @@ fn handle_start(tab: Tab) {
 fn handle_stop(tab: Tab) {
     match tab {
         Tab::Server => {
-            let svc_state = service::query("loom-server");
+            let svc_state = service::query("LoomServer");
             if svc_state == service::SvcState::NotInstalled {
                 let _ = process::stop_server();
             } else {
-                let _ = service::stop("loom-server");
+                let _ = service::stop("LoomServer");
             }
         }
         Tab::Daemon => {
-            let svc_state = service::query("loom-daemon");
+            let svc_state = service::query("LoomDaemon");
             if svc_state == service::SvcState::NotInstalled {
                 let _ = process::stop_daemon();
             } else {
-                let _ = service::stop("loom-daemon");
+                let _ = service::stop("LoomDaemon");
             }
         }
         Tab::Logs => {}

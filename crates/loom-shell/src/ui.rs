@@ -173,7 +173,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_server.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 state_rc.borrow_mut().current_tab = Tab::Server;
                 refresh_tab(Tab::Server, &lbl_status, &lbl_detail, &log_area);
             },
@@ -187,7 +190,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_daemon.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 state_rc.borrow_mut().current_tab = Tab::Daemon;
                 refresh_tab(Tab::Daemon, &lbl_status, &lbl_detail, &log_area);
             },
@@ -201,7 +207,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_logs.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 state_rc.borrow_mut().current_tab = Tab::Logs;
                 refresh_tab(Tab::Logs, &lbl_status, &lbl_detail, &log_area);
             },
@@ -215,7 +224,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_start.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 let tab = state_rc.borrow().current_tab;
                 handle_start(tab);
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
@@ -230,7 +242,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_stop.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 let tab = state_rc.borrow().current_tab;
                 handle_stop(tab);
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
@@ -245,7 +260,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_restart.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 let tab = state_rc.borrow().current_tab;
                 handle_stop(tab);
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -262,7 +280,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_install.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 let tab = state_rc.borrow().current_tab;
                 handle_install(tab);
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
@@ -277,7 +298,10 @@ impl LoomShell {
         let log_area = shell.log_area.handle;
         let ev = nwg::full_bind_event_handler(
             &shell.btn_uninstall.handle,
-            move |_ev, _evd, _handle| {
+            move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnButtonClick {
+                    return;
+                }
                 let tab = state_rc.borrow().current_tab;
                 handle_uninstall(tab);
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);

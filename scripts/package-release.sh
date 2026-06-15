@@ -86,6 +86,7 @@ RUNTIME_TARGETS=(
   "universal-apple-darwin"
   "aarch64-unknown-linux-musl"
   "x86_64-unknown-linux-musl"
+  "x86_64-pc-windows-msvc"
 )
 
 log() {
@@ -129,8 +130,16 @@ package_runtime_target() {
   local target="$1"
   local src_dir="$DIST_DIR/$PROFILE/$target"
   local package_name="loom-runtime-$VERSION-$target"
-  local stage_dir="$TMP_DIR/$package_name"
-  local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
+
+  if [[ "$target" == *windows* ]]; then
+    local stage_dir="$TMP_DIR/$package_name"
+    local archive="$PACKAGE_OUT_DIR/$package_name.zip"
+    local archive_ext="zip"
+  else
+    local stage_dir="$TMP_DIR/$package_name"
+    local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
+    local archive_ext="tar.gz"
+  fi
 
   ensure_file "$src_dir/loom"
   ensure_file "$src_dir/loom-daemon"
@@ -156,7 +165,11 @@ Contents:
 - bin/loom-server: WebSocket collaboration server.
 EOF
 
-  tar -C "$TMP_DIR" -czf "$archive" "$package_name"
+  if [[ "$archive_ext" == "zip" ]]; then
+    (cd "$TMP_DIR" && zip -qr "$archive" "$package_name")
+  else
+    tar -C "$TMP_DIR" -czf "$archive" "$package_name"
+  fi
   log "wrote $archive"
 }
 
@@ -246,7 +259,7 @@ write_manifest() {
     [[ -f "$path" ]] || continue
     name="$(basename "$path")"
     case "$name" in
-      *.tar.gz | *.dmg | install.sh)
+      *.tar.gz | *.zip | *.dmg | install.sh)
         artifacts+=("$name")
         ;;
     esac
@@ -288,14 +301,17 @@ write_installer() {
   local runtime_mac="loom-runtime-$VERSION-universal-apple-darwin.tar.gz"
   local runtime_linux_x86="loom-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
   local runtime_linux_arm="loom-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
-  local sha_mac sha_linux_x86 sha_linux_arm
+  local runtime_windows_x86="loom-runtime-$VERSION-x86_64-pc-windows-msvc.zip"
+  local sha_mac sha_linux_x86 sha_linux_arm sha_windows_x86
 
   runtime_mac="$(archive_name_if_exists "$runtime_mac")"
   runtime_linux_x86="$(archive_name_if_exists "$runtime_linux_x86")"
   runtime_linux_arm="$(archive_name_if_exists "$runtime_linux_arm")"
+  runtime_windows_x86="$(archive_name_if_exists "$runtime_windows_x86")"
   sha_mac="$(archive_sha_if_exists "$runtime_mac")"
   sha_linux_x86="$(archive_sha_if_exists "$runtime_linux_x86")"
   sha_linux_arm="$(archive_sha_if_exists "$runtime_linux_arm")"
+  sha_windows_x86="$(archive_sha_if_exists "$runtime_windows_x86")"
 
   cat >"$installer" <<EOF
 #!/usr/bin/env sh
@@ -313,6 +329,8 @@ PKG_X86_64_UNKNOWN_LINUX_MUSL='$runtime_linux_x86'
 SHA_X86_64_UNKNOWN_LINUX_MUSL='$sha_linux_x86'
 PKG_AARCH64_UNKNOWN_LINUX_MUSL='$runtime_linux_arm'
 SHA_AARCH64_UNKNOWN_LINUX_MUSL='$sha_linux_arm'
+PKG_X86_64_PC_WINDOWS_MSVC='$runtime_windows_x86'
+SHA_X86_64_PC_WINDOWS_MSVC='$sha_windows_x86'
 
 usage() {
   cat <<'USAGE'
@@ -326,7 +344,8 @@ Options:
   -t, --target TARGET   Override target package:
                         universal-apple-darwin,
                         x86_64-unknown-linux-musl,
-                        aarch64-unknown-linux-musl.
+                        aarch64-unknown-linux-musl,
+                        x86_64-pc-windows-msvc.
       --package-dir DIR Directory containing loom-runtime-*.tar.gz.
                         Default: the directory containing install.sh.
       --bin-dir DIR     Install binaries into DIR. Default: \$HOME/.local/bin.
@@ -354,6 +373,7 @@ detect_target() {
     Darwin:*) printf '%s\n' universal-apple-darwin ;;
     Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-musl ;;
     Linux:aarch64|Linux:arm64) printf '%s\n' aarch64-unknown-linux-musl ;;
+    MINGW64_NT:*|MSYS_NT:*|CYGWIN_NT:*) printf '%s\n' x86_64-pc-windows-msvc ;;
     *) die "unsupported platform: \$os \$arch; pass --target explicitly" ;;
   esac
 }
@@ -363,6 +383,7 @@ runtime_package_name() {
     universal-apple-darwin) printf '%s\n' "\$PKG_UNIVERSAL_APPLE_DARWIN" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$PKG_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$PKG_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "\$PKG_X86_64_PC_WINDOWS_MSVC" ;;
     *) die "unknown target: \$1" ;;
   esac
 }
@@ -372,6 +393,7 @@ runtime_sha256() {
     universal-apple-darwin) printf '%s\n' "\$SHA_UNIVERSAL_APPLE_DARWIN" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$SHA_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$SHA_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "\$SHA_X86_64_PC_WINDOWS_MSVC" ;;
     *) die "unknown target: \$1" ;;
   esac
 }
@@ -539,7 +561,15 @@ actual_sha="\$(sha256_file "\$package_path")"
 [ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$package_path"
 
 extract_tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
-tar -xzf "\$package_path" -C "\$extract_tmp_dir"
+case "\$package_name" in
+  *.zip)
+    command -v unzip >/dev/null 2>&1 || die "missing required command: unzip"
+    unzip -q "\$package_path" -d "\$extract_tmp_dir"
+    ;;
+  *)
+    tar -xzf "\$package_path" -C "\$extract_tmp_dir"
+    ;;
+esac
 package_root=""
 for candidate in "\$extract_tmp_dir"/loom-runtime-*; do
   [ -d "\$candidate" ] || continue
@@ -567,7 +597,7 @@ write_checksums() {
     for path in *; do
       [[ -f "$path" ]] || continue
       case "$path" in
-        *.tar.gz | *.dmg | install.sh)
+        *.tar.gz | *.zip | *.dmg | install.sh)
           artifacts+=("$path")
           ;;
       esac
@@ -587,6 +617,7 @@ write_checksums() {
 
 mkdir -p "$PACKAGE_OUT_DIR"
 rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
+  "$PACKAGE_OUT_DIR"/loom-runtime-*.zip \
   "$PACKAGE_OUT_DIR"/loom-gui-*.dmg \
   "$PACKAGE_OUT_DIR"/install.sh \
   "$PACKAGE_OUT_DIR"/SHA256SUMS \

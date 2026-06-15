@@ -124,23 +124,23 @@ $(eval $(call define-target,mac-x86,$(TRIPLE_MAC_X86),$(CARGO)))
 $(eval $(call define-target,linux-x86,$(TRIPLE_LINUX_X86),$(LINUX_BUILDER)))
 $(eval $(call define-target,linux-arm,$(TRIPLE_LINUX_ARM),$(LINUX_BUILDER)))
 
-# Windows target — binaries carry .exe extension; strip it on copy so the
-# dist tree stays uniform (no .exe suffix in any target directory).
+# Windows target — binaries carry .exe extension; keep it so Windows
+# users get native executables.
 .PHONY: windows-x86-debug windows-x86-release
 
 windows-x86-debug:
 	$(CARGO) build --target $(TRIPLE_WINDOWS_X86) $(PKG_FLAGS)
 	@mkdir -p $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)
-	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom.exe        $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom
-	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-daemon.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-daemon
-	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-server.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-server
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom.exe        $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-daemon.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-daemon.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-server.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-server.exe
 
 windows-x86-release:
 	$(CARGO) build --release --target $(TRIPLE_WINDOWS_X86) $(PKG_FLAGS)
 	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)
-	cp target/$(TRIPLE_WINDOWS_X86)/release/loom.exe        $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom
-	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-daemon.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-daemon
-	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-server.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-server
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom.exe        $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-daemon.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-daemon.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-server.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-server.exe
 
 # ---- macOS universal binary (lipo) ---------------------------------------
 

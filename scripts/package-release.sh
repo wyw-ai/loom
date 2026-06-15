@@ -112,7 +112,11 @@ ensure_file() {
 runtime_target_available() {
   local target="$1"
   local src_dir="$DIST_DIR/$PROFILE/$target"
-  [[ -f "$src_dir/loom" && -f "$src_dir/loom-daemon" && -f "$src_dir/loom-server" ]]
+  if [[ "$target" == *windows* ]]; then
+    [[ -f "$src_dir/loom.exe" && -f "$src_dir/loom-daemon.exe" && -f "$src_dir/loom-server.exe" ]]
+  else
+    [[ -f "$src_dir/loom" && -f "$src_dir/loom-daemon" && -f "$src_dir/loom-server" ]]
+  fi
 }
 
 checksum_cmd() {

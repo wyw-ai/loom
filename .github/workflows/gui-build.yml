@@ -1,0 +1,197 @@
+name: GUI Build
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "crates/gui/**"
+      - "crates/loom-shell/**"
+      - "crates/server/**"
+      - "crates/proto/**"
+      - "apps/gui-web/**"
+      - ".github/workflows/gui-build.yml"
+  pull_request:
+    paths:
+      - "crates/gui/**"
+      - "crates/loom-shell/**"
+      - "crates/server/**"
+      - "crates/proto/**"
+      - "apps/gui-web/**"
+      - ".github/workflows/gui-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gui-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: false
+
+jobs:
+  # ── Linux GUI build ────────────────────────────────────────────────────
+  gui-linux:
+    name: GUI (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev
+
+      - name: Check loom-server (backend)
+        run: cargo check -p loom-server
+
+      - name: Check loom-gui (Tauri)
+        run: cargo check -p loom-gui
+
+      - name: Build loom-server
+        run: cargo build -p loom-server
+
+      - name: Build loom-gui
+        run: cargo build -p loom-gui
+
+  # ── macOS GUI build ────────────────────────────────────────────────────
+  gui-macos:
+    name: GUI (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check loom-server (backend)
+        run: cargo check -p loom-server
+
+      - name: Check loom-gui (Tauri)
+        run: cargo check -p loom-gui
+
+      - name: Build loom-server
+        run: cargo build -p loom-server
+
+      - name: Build loom-gui
+        run: cargo build -p loom-gui
+
+      - name: Upload macOS loom-server artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: loom-server-macos
+          path: target/debug/loom-server
+          if-no-files-found: error
+
+  # ── Windows GUI build ──────────────────────────────────────────────────
+  gui-windows:
+    name: GUI (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check loom-server (backend)
+        run: cargo check -p loom-server
+
+      - name: Check loom-gui (Tauri)
+        run: cargo check -p loom-gui
+
+      - name: Check loom-shell
+        run: cargo check -p loom-shell
+
+      - name: Build loom-server
+        run: cargo build -p loom-server
+
+      - name: Build loom-gui
+        run: cargo build -p loom-gui
+
+      - name: Build loom-shell
+        run: cargo build -p loom-shell
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: gui-windows-debug
+          path: |
+            target/debug/loom-server.exe
+            target/debug/loom-shell.exe
+          if-no-files-found: error
+
+  # ── Frontend web build ─────────────────────────────────────────────────
+  gui-frontend:
+    name: GUI Frontend (web)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.0.8
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/gui-web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm --dir apps/gui-web install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm --dir apps/gui-web lint
+
+      - name: Build
+        run: pnpm --dir apps/gui-web build
+
+  # ── Summary ────────────────────────────────────────────────────────────
+  gui-summary:
+    name: GUI Build Summary
+    runs-on: ubuntu-latest
+    needs:
+      - gui-linux
+      - gui-macos
+      - gui-windows
+      - gui-frontend
+    if: always()
+    steps:
+      - name: Report results
+        run: |
+          echo "## GUI Build Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Platform | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Linux    | ${{ needs.gui-linux.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| macOS    | ${{ needs.gui-macos.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Windows  | ${{ needs.gui-windows.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Frontend | ${{ needs.gui-frontend.result }} |" >> "$GITHUB_STEP_SUMMARY"

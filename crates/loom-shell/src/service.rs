@@ -2,12 +2,11 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Security::SC_MANAGER_CONNECT;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
-    SC_MANAGER_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-    SERVICE_START, SERVICE_STATUS, SERVICE_STOPPED, SERVICE_STOP_PENDING, StartServiceW,
+    SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
+    SERVICE_STOP_PENDING, StartServiceW,
 };
 
 /// 将 Rust 字符串转为 Windows 宽字符串（以 null 结尾的 Vec<u16>）。
@@ -38,17 +37,17 @@ impl SvcState {
 }
 
 /// 查询指定服务的当前状态。
-/// `service_name` 是服务的短名称（如 "loom-server"）。
+/// `service_name` 是服务的短名称（如 "LoomServer"）。
 pub fn query(service_name: &str) -> SvcState {
     let wide_name = to_wide(service_name);
     unsafe {
         let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-        if scm == 0 {
+        if scm.is_null() {
             return SvcState::Unknown;
         }
 
         let svc = OpenServiceW(scm, wide_name.as_ptr(), SERVICE_QUERY_STATUS);
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return SvcState::NotInstalled;
         }
@@ -76,11 +75,11 @@ pub fn start(service_name: &str) -> Result<(), String> {
     let wide_name = to_wide(service_name);
     unsafe {
         let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
-        if scm == 0 {
+        if scm.is_null() {
             return Err("无法打开 SCM".into());
         }
         let svc = OpenServiceW(scm, wide_name.as_ptr(), SERVICE_START);
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return Err("无法打开服务".into());
         }
@@ -100,11 +99,11 @@ pub fn stop(service_name: &str) -> Result<(), String> {
     let wide_name = to_wide(service_name);
     unsafe {
         let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
-        if scm == 0 {
+        if scm.is_null() {
             return Err("无法打开 SCM".into());
         }
         let svc = OpenServiceW(scm, wide_name.as_ptr(), SERVICE_QUERY_STATUS | SERVICE_STOP);
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return Err("无法打开服务".into());
         }

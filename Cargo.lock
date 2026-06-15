@@ -2458,6 +2458,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "windows-console",
 ]
 
 [[package]]
@@ -2507,6 +2508,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-console",
 ]
 
 [[package]]
@@ -5872,6 +5874,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
  "windows-core 0.61.2",
+]
+
+[[package]]
+name = "windows-console"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

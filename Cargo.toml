@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui"]
+members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui", "crates/windows-console"]
 # GUI crate pulls a sizable native dep tree (Tauri + system webkit on macOS, webkit2gtk
 # on Linux). Keep it out of the default `cargo build` the CI uses by excluding it
 # from `default-members`; developers opt in via `make gui-dev` / `cargo tauri dev`.

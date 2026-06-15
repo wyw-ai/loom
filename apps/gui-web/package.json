@@ -21,6 +21,9 @@
     "remark-gfm": "^4.0.0",
     "zustand": "^4.5.5"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
     "@types/node": "^24.9.1",

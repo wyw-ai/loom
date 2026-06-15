@@ -17,6 +17,9 @@ CROSS          ?= cross
 LIPO           ?= lipo
 DIST_DIR       ?= dist
 PACKAGE_OUT_DIR ?= $(DIST_DIR)/packages
+WINSW_VERSION  ?= v2.12.0
+WINSW_URL      := https://github.com/winsw/winsw/releases/download/$(WINSW_VERSION)/WinSW-x64.exe
+WINSW_CACHE    := .cache/WinSW-x64.exe
 # Default to native cargo + musl-cross toolchain; cross+Docker is broken on
 # Apple Silicon (rustc segfaults under QEMU). Override with LINUX_BUILDER=cross
 # if you actually have a working cross container setup.
@@ -66,6 +69,7 @@ help:
 	@echo "  all-release                 every target, release"
 	@echo "  all                         debug + release"
 	@echo "  package-release             one-shot runtime archives + mac arm64 GUI dmg"
+	@echo "  windows-service-package     assemble winsw Windows Service zip (requires windows-x86-release)"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  install-targets             rustup target add (all triples)"
@@ -141,6 +145,23 @@ windows-x86-release:
 	cp target/$(TRIPLE_WINDOWS_X86)/release/loom.exe        $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom.exe
 	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-daemon.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-daemon.exe
 	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-server.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-server.exe
+
+# ---- Windows Service package (winsw) ------------------------------------
+
+$(WINSW_CACHE):
+	@mkdir -p .cache
+	curl -fsSL $(WINSW_URL) -o $(WINSW_CACHE)
+	@echo "downloaded winsw $(WINSW_VERSION)"
+
+.PHONY: windows-service-package
+windows-service-package: windows-x86-release $(WINSW_CACHE)
+	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config
+	cp scripts/windows/loom-server.xml  $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config/
+	cp scripts/windows/loom-daemon.xml  $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config/
+	cp scripts/windows/install.ps1      $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/
+	cp scripts/windows/uninstall.ps1    $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/
+	cp $(WINSW_CACHE)                   $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/WinSW-x64.exe
+	@echo "windows-service-package: assembled winsw service files for $(TRIPLE_WINDOWS_X86)"
 
 # ---- macOS universal binary (lipo) ---------------------------------------
 

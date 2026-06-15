@@ -47,6 +47,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    windows_console::init();
     init_tracing();
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);

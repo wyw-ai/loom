@@ -174,7 +174,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_server.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Server;
@@ -191,7 +191,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_daemon.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Daemon;
@@ -208,7 +208,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_logs.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Logs;
@@ -225,7 +225,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_start.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
@@ -243,7 +243,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_stop.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
@@ -261,7 +261,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_restart.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
@@ -281,7 +281,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_install.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
@@ -299,7 +299,7 @@ impl LoomShell {
         let ev = nwg::full_bind_event_handler(
             &shell.btn_uninstall.handle,
             move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnButtonClick {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;

@@ -20,6 +20,7 @@ PACKAGE_OUT_DIR ?= $(DIST_DIR)/packages
 WINSW_VERSION  ?= v2.12.0
 WINSW_URL      := https://github.com/winsw/winsw/releases/download/$(WINSW_VERSION)/WinSW-x64.exe
 WINSW_CACHE    := .cache/WinSW-x64.exe
+SHELL_PKG      := -p loom-shell
 # Default to native cargo + musl-cross toolchain; cross+Docker is broken on
 # Apple Silicon (rustc segfaults under QEMU). Override with LINUX_BUILDER=cross
 # if you actually have a working cross container setup.
@@ -63,6 +64,7 @@ help:
 	@echo "  linux-x86-{debug,release}   $(TRIPLE_LINUX_X86)"
 	@echo "  linux-arm-{debug,release}   $(TRIPLE_LINUX_ARM)"
 	@echo "  windows-x86-{debug,release} $(TRIPLE_WINDOWS_X86)"
+	@echo "  windows-shell-{debug,release}  loom-shell.exe (Windows only)"
 	@echo ""
 	@echo "Bulk:"
 	@echo "  all-debug                   every target, debug"
@@ -146,6 +148,20 @@ windows-x86-release:
 	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-daemon.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-daemon.exe
 	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-server.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-server.exe
 
+# ---- Windows Shell GUI (NWG) ---------------------------------------------
+
+.PHONY: windows-shell-debug windows-shell-release
+
+windows-shell-debug:
+	$(CARGO) build --target $(TRIPLE_WINDOWS_X86) $(SHELL_PKG)
+	@mkdir -p $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-shell.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-shell.exe
+
+windows-shell-release:
+	$(CARGO) build --release --target $(TRIPLE_WINDOWS_X86) $(SHELL_PKG)
+	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-shell.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-shell.exe
+
 # ---- Windows Service package (winsw) ------------------------------------
 
 $(WINSW_CACHE):
@@ -154,7 +170,7 @@ $(WINSW_CACHE):
 	@echo "downloaded winsw $(WINSW_VERSION)"
 
 .PHONY: windows-service-package
-windows-service-package: windows-x86-release $(WINSW_CACHE)
+windows-service-package: windows-x86-release windows-shell-release $(WINSW_CACHE)
 	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config
 	cp scripts/windows/loom-server.xml  $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config/
 	cp scripts/windows/loom-daemon.xml  $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config/

@@ -1,0 +1,41 @@
+//! 路径解析 — 定位可执行文件、配置目录和日志目录。
+//!
+//! 所有路径都相对于 loom-shell.exe 所在目录解析：
+//! - 二进制文件：`<exe_dir>/server.exe`、`<exe_dir>/loom-daemon.exe`
+//! - 配置 XML：`<exe_dir>/../config/`
+//! - 日志文件：`<exe_dir>/../logs/`
+
+use std::path::{Path, PathBuf};
+
+/// 返回 loom-shell.exe 所在目录。
+pub fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// server.exe 的完整路径。
+pub fn server_exe() -> PathBuf {
+    exe_dir().join("server.exe")
+}
+
+/// loom-daemon.exe 的完整路径。
+pub fn daemon_exe() -> PathBuf {
+    exe_dir().join("loom-daemon.exe")
+}
+
+/// WinSW 可执行文件路径（与 server.exe 同目录）。
+pub fn winsw_exe() -> PathBuf {
+    exe_dir().join("WinSW-x64.exe")
+}
+
+/// 服务 XML 配置目录（<exe_dir>/../config）。
+pub fn config_dir() -> PathBuf {
+    exe_dir().join("..").join("config")
+}
+
+/// 日志目录（<exe_dir>/../logs）。
+pub fn log_dir() -> PathBuf {
+    exe_dir().join("..").join("logs")
+}

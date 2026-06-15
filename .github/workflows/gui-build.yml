@@ -8,7 +8,6 @@ on:
     paths:
       - "crates/gui/**"
       - "crates/loom-shell/**"
-      - "crates/server/**"
       - "crates/proto/**"
       - "apps/gui-web/**"
       - ".github/workflows/gui-build.yml"
@@ -16,7 +15,6 @@ on:
     paths:
       - "crates/gui/**"
       - "crates/loom-shell/**"
-      - "crates/server/**"
       - "crates/proto/**"
       - "apps/gui-web/**"
       - ".github/workflows/gui-build.yml"
@@ -40,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -59,14 +57,8 @@ jobs:
             libjavascriptcoregtk-4.1-dev \
             libsoup-3.0-dev
 
-      - name: Check loom-server (backend)
-        run: cargo check -p loom-server
-
       - name: Check loom-gui (Tauri)
         run: cargo check -p loom-gui
-
-      - name: Build loom-server
-        run: cargo build -p loom-server
 
       - name: Build loom-gui
         run: cargo build -p loom-gui
@@ -77,7 +69,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -85,24 +77,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check loom-server (backend)
-        run: cargo check -p loom-server
-
       - name: Check loom-gui (Tauri)
         run: cargo check -p loom-gui
 
-      - name: Build loom-server
-        run: cargo build -p loom-server
-
       - name: Build loom-gui
         run: cargo build -p loom-gui
-
-      - name: Upload macOS loom-server artifact
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: loom-server-macos
-          path: target/debug/loom-server
-          if-no-files-found: error
 
   # ── Windows GUI build ──────────────────────────────────────────────────
   gui-windows:
@@ -110,7 +89,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -118,32 +97,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Check loom-server (backend)
-        run: cargo check -p loom-server
-
       - name: Check loom-gui (Tauri)
         run: cargo check -p loom-gui
 
       - name: Check loom-shell
         run: cargo check -p loom-shell
 
-      - name: Build loom-server
-        run: cargo build -p loom-server
-
       - name: Build loom-gui
         run: cargo build -p loom-gui
 
       - name: Build loom-shell
         run: cargo build -p loom-shell
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: gui-windows-debug
-          path: |
-            target/debug/loom-server.exe
-            target/debug/loom-shell.exe
-          if-no-files-found: error
 
   # ── Frontend web build ─────────────────────────────────────────────────
   gui-frontend:

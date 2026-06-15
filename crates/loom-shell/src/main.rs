@@ -26,7 +26,7 @@ fn main() {
     nwg::init().expect("Failed to init Native Windows GUI");
 
     // 构建 UI 并运行消息循环
-    let app = ui::LoomShell::build().expect("Failed to build LoomShell UI");
+    let _app = ui::LoomShell::build().expect("Failed to build LoomShell UI");
     nwg::dispatch_thread_events();
     // 消息循环结束（窗口关闭）
 }

@@ -23,6 +23,7 @@ __pycache__/
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
 !/docs/superpowers/
+!/docs/windows-build-guide.md
 data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/

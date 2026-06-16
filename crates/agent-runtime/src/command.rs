@@ -624,7 +624,7 @@ fn spawn_and_collect(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     slot: &Arc<Mutex<InFlight>>,
 ) -> Result<SpawnOutcome, String> {
-    std::fs::create_dir_all(&prompt.cwd).map_err(|e| {
+    crate::acp::create_dir_all_unc(&prompt.cwd).map_err(|e| {
         format!(
             "failed to create command cwd `{}`: {}",
             prompt.cwd.display(),

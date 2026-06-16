@@ -44,6 +44,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::acp::create_dir_all_unc;
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 use crate::provider::ProviderRuntimeEvent;
 use crate::usage::extract_token_usage_from_text;
@@ -2316,7 +2317,7 @@ fn acquire_session_lock(cfg: &CommandConfig, scope: &ScopeRef) -> Result<Session
 #[cfg(unix)]
 fn acquire_lock_file(path: &Path) -> Result<SessionLockGuard, String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+        create_dir_all_unc(parent).map_err(|e| {
             format!(
                 "failed to create session lock dir `{}`: {e}",
                 parent.display()
@@ -2381,7 +2382,7 @@ fn save_session(
         return Ok(());
     };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     let now = chrono::Utc::now().to_rfc3339();
     let existing = load_session(cfg, scope);

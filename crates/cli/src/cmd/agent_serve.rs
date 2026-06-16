@@ -69,10 +69,10 @@ pub async fn run(
     allow_actors: Vec<String>,
 ) -> Result<()> {
     let specs_dir = specs_dir_opt.unwrap_or_else(default_specs_dir);
-    std::fs::create_dir_all(&specs_dir)
+    create_dir_all_unc(&specs_dir)
         .with_context(|| format!("create specs dir {}", specs_dir.display()))?;
     let data_root = default_data_root();
-    std::fs::create_dir_all(&data_root)
+    create_dir_all_unc(&data_root)
         .with_context(|| format!("create data dir {}", data_root.display()))?;
 
     let mut specs = load_specs(&specs_dir)?;
@@ -341,7 +341,7 @@ fn agent_config_dir(actor_id: &str) -> PathBuf {
 fn ensure_agent_config_dirs(specs: &[AgentSpec]) -> Result<()> {
     for spec in specs {
         let dir = agent_config_dir(&spec.actor.id);
-        std::fs::create_dir_all(&dir)
+        create_dir_all_unc(&dir)
             .with_context(|| format!("create agent config dir {}", dir.display()))?;
     }
     Ok(())
@@ -1060,7 +1060,7 @@ fn run_no_reply_file(logs_dir: &Path, run_id: &str) -> PathBuf {
 }
 
 fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(skills_target)?;
+    create_dir_all_unc(skills_target)?;
     let link_path = workspace.join("skills");
     match std::fs::read_link(&link_path) {
         Ok(existing) if existing == skills_target => return Ok(()),
@@ -1077,7 +1077,7 @@ fn ensure_bundle(
     paths: &BundlePaths,
     agent_paths: &AgentPaths,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(&paths.root)?;
+    create_dir_all_unc(&paths.root)?;
     let current = validate_bundle_current(
         &agent_paths.root,
         &agent_paths.profile,
@@ -1112,7 +1112,7 @@ fn install_bundle_dir(
     }
     remove_path_if_exists(target)?;
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     match mode {
         BundleInstallMode::Copy => copy_recursively(source, target),
@@ -1123,14 +1123,14 @@ fn install_bundle_dir(
 fn link_current_bundle(installed: &Path, current: &Path) -> std::io::Result<()> {
     remove_path_if_exists(current)?;
     if let Some(parent) = current.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     symlink_path(installed, current)
 }
 
 fn reset_bundle_current_dir(current: &Path) -> std::io::Result<()> {
     remove_path_if_exists(current)?;
-    std::fs::create_dir_all(current)
+    create_dir_all_unc(current)
 }
 
 fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
@@ -1154,12 +1154,12 @@ fn copy_recursively(source: &Path, target: &Path) -> std::io::Result<()> {
     }
     if meta.is_file() {
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_all_unc(parent)?;
         }
         std::fs::copy(source, target)?;
         return Ok(());
     }
-    std::fs::create_dir_all(target)?;
+    create_dir_all_unc(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         copy_recursively(&entry.path(), &target.join(entry.file_name()))?;
@@ -1953,7 +1953,7 @@ fn load_model_state(profile_dir: &Path) -> Option<String> {
 }
 
 fn persist_model_state(profile_dir: &Path, model: &str) -> Result<()> {
-    std::fs::create_dir_all(profile_dir)
+    create_dir_all_unc(profile_dir)
         .with_context(|| format!("create profile dir {}", profile_dir.display()))?;
     let path = model_state_path(profile_dir);
     let text = serde_json::to_string_pretty(&ModelStateFile {

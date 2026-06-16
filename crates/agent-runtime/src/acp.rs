@@ -249,7 +249,7 @@ impl AcpAdapter {
         let mcp_servers = shared.mcp_servers.clone();
         let model = requested_model.clone();
         let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            std::fs::create_dir_all(&cwd).map_err(|e| {
+            crate::acp::create_dir_all_unc(&cwd).map_err(|e| {
                 format!(
                     "Failed to create ACP session cwd `{}`: {}",
                     cwd.display(),
@@ -528,7 +528,7 @@ fn start_blocking(
             .map_err(|e| e.to_string())?
             .join(&cfg.process_cwd)
     };
-    std::fs::create_dir_all(&process_cwd).map_err(|e| {
+    crate::acp::create_dir_all_unc(&process_cwd).map_err(|e| {
         format!(
             "Failed to create ACP workdir `{}`: {}",
             process_cwd.display(),
@@ -1060,6 +1060,19 @@ pub(crate) fn unc_prefix_path(path: std::path::PathBuf) -> std::path::PathBuf {
     }
     let prefixed = format!(r"\\?\{}", s);
     std::path::PathBuf::from(prefixed)
+}
+
+/// Create a directory (and all parents), applying the Windows UNC prefix
+/// to bypass MAX_PATH (260 char) when the path is long.
+#[cfg(windows)]
+pub(crate) fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
+    let prefixed = unc_prefix_path(path.to_path_buf());
+    std::fs::create_dir_all(&prefixed)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {

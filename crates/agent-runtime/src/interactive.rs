@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::acp::create_dir_all_unc;
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
 use crate::usage::extract_token_usage_from_text;
 
@@ -638,7 +639,7 @@ fn resolve_claude_settings(
         ClaudeSettingsMode::ActorProfile => {
             let path = cfg.profile_dir.join("claude").join("settings.json");
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                create_dir_all_unc(parent).map_err(|e| {
                     format!(
                         "failed to create claude settings dir `{}`: {e}",
                         parent.display()
@@ -802,7 +803,7 @@ fn save_session(
 ) -> std::io::Result<()> {
     let path = session_path(cfg, scope);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     let now = chrono::Utc::now().to_rfc3339();
     let existing = load_session(cfg, scope);

@@ -319,7 +319,7 @@ fn run_prompt_inner(
     prompt: &AdapterPrompt,
     slot: &Arc<Mutex<InFlight>>,
 ) -> Result<RunOutcome, String> {
-    std::fs::create_dir_all(&prompt.cwd).map_err(|e| {
+    crate::acp::create_dir_all_unc(&prompt.cwd).map_err(|e| {
         format!(
             "failed to create interactive command cwd `{}`: {}",
             prompt.cwd.display(),

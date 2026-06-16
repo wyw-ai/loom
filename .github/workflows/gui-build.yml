@@ -148,6 +148,7 @@ jobs:
           name: frontend-dist
           path: apps/gui-web/dist
           retention-days: 7
+          if-no-files-found: error
 
   # ── Linux GUI bundle (tag / workflow_dispatch only) ────────────────────
   gui-bundle-linux:
@@ -165,6 +166,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/gui-web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/gui-web install --frozen-lockfile
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -174,7 +190,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libjavascriptcoregtk-4.1-dev \
-            libsoup-3.0-dev
+            libsoup-3.0-dev \
+            libfuse2
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
@@ -193,9 +210,10 @@ jobs:
         with:
           name: gui-bundle-linux
           path: |
-            crates/gui/target/release/bundle/deb/*.deb
-            crates/gui/target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
           retention-days: 90
+          if-no-files-found: error
 
   # ── macOS GUI bundle (tag / workflow_dispatch only) ────────────────────
   gui-bundle-macos:
@@ -213,6 +231,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/gui-web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/gui-web install --frozen-lockfile
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
@@ -229,8 +262,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gui-bundle-macos
-          path: crates/gui/target/release/bundle/dmg/*.dmg
+          path: target/release/bundle/dmg/*.dmg
           retention-days: 90
+          if-no-files-found: error
 
   # ── Windows GUI bundle (tag / workflow_dispatch only) ──────────────────
   gui-bundle-windows:
@@ -247,6 +281,21 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/gui-web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/gui-web install --frozen-lockfile
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
@@ -268,9 +317,10 @@ jobs:
         with:
           name: gui-bundle-windows
           path: |
-            crates/gui/target/release/bundle/msi/*.msi
+            target/release/bundle/msi/*.msi
             target/release/loom-shell.exe
           retention-days: 90
+          if-no-files-found: error
 
   # ── Summary ────────────────────────────────────────────────────────────
   gui-summary:

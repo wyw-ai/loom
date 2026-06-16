@@ -1065,13 +1065,13 @@ pub(crate) fn unc_prefix_path(path: std::path::PathBuf) -> std::path::PathBuf {
 /// Create a directory (and all parents), applying the Windows UNC prefix
 /// to bypass MAX_PATH (260 char) when the path is long.
 #[cfg(windows)]
-pub(crate) fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
+pub fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
     let prefixed = unc_prefix_path(path.to_path_buf());
     std::fs::create_dir_all(&prefixed)
 }
 
 #[cfg(not(windows))]
-pub(crate) fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
+pub fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 

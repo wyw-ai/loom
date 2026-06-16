@@ -22,6 +22,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use proto::types::ScopeRef;
@@ -526,12 +535,30 @@ fn start_blocking(
             e
         )
     })?;
-    let mut cmd = Command::new(&cfg.command);
+    // On Windows, prefix both the command path and cwd with \\?\ UNC prefix
+    // to bypass MAX_PATH (260 char) limit, fixing os error 206
+    // (ERROR_FILENAME_EXCED_RANGE). Both paths must be prefixed because
+    // CreateProcessW requires UNC prefix on both the application name AND
+    // the current directory for long-path support.
+    #[cfg(windows)]
+    let process_cwd = unc_prefix_path(process_cwd);
+    #[cfg(windows)]
+    let command_path = unc_prefix_path(std::path::PathBuf::from(&cfg.command));
+    #[cfg(not(windows))]
+    let command_path = std::path::PathBuf::from(&cfg.command);
+
+    let mut cmd = Command::new(&command_path);
     cmd.args(&cfg.args)
         .current_dir(&process_cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Prevent console windows from popping up for CLI child processes on
+    // Windows, and let child processes break away from the Tauri GUI's job
+    // object (fixes os error 1314 ERROR_PRIVILEGE_NOT_HELD).
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+
     let mut path_for_error = std::env::var("PATH").unwrap_or_default();
     let mut process_env = BTreeMap::new();
     if should_capture_shell_env() {
@@ -558,9 +585,18 @@ fn start_blocking(
         process_env.insert(k.clone(), v.clone());
     }
     cmd.envs(&process_env);
+
+    // Diagnostic: print spawn details to stderr for Windows debugging.
+    eprintln!(
+        "[loom:acp] spawning `{}` with {} args in `{}`",
+        command_path.display(),
+        cfg.args.len(),
+        process_cwd.display()
+    );
+
     let mut child = cmd
         .spawn()
-        .map_err(|e| spawn_error_message(&cfg.command, &process_cwd, &path_for_error, e))?;
+        .map_err(|e| spawn_error_message(&command_path.to_string_lossy(), &process_cwd, &path_for_error, e))?;
     let stdin = child.stdin.take().ok_or("Failed to open agent stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to open agent stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to open agent stderr")?;
@@ -1013,28 +1049,54 @@ fn is_auth_required_error(err: &str) -> bool {
         .is_some_and(|message| message == "Authentication required")
 }
 
+/// Prefix a path with the Windows `\\?\` UNC prefix to bypass the 260-char
+/// MAX_PATH limit.  Only compiled on Windows.
+#[cfg(windows)]
+pub(crate) fn unc_prefix_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    // Already prefixed — don't double it.
+    if s.starts_with(r"\\?\") {
+        return path;
+    }
+    let prefixed = format!(r"\\?\{}", s);
+    std::path::PathBuf::from(prefixed)
+}
+
 fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {
+    let raw_code = err.raw_os_error();
+    let raw_info = raw_code
+        .map(|c| format!(" (os error {c})"))
+        .unwrap_or_default();
     if err.kind() == ErrorKind::NotFound {
         return format!(
             "Failed to start ACP command `{command}`: command not found on PATH \
-             (cwd `{}`, PATH `{}`)",
+             (cwd `{}`, PATH `{}`){raw_info}",
             cwd.display(),
             truncate_for_log(&path, 500),
         );
     }
     format!(
-        "Failed to start ACP command `{command}` in `{}`: {err}",
+        "Failed to start ACP command `{command}` in `{}`: {err}{raw_info}",
         cwd.display()
     )
 }
 
 fn should_capture_shell_env() -> bool {
-    match std::env::var("LOOM_ACP_SHELL_ENV") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
+    // Shell env capture is Unix-only; on Windows it always fails and costs an
+    // 8-second timeout per agent start, so skip it unconditionally.
+    #[cfg(not(unix))]
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        match std::env::var("LOOM_ACP_SHELL_ENV") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            Err(_) => true,
+        }
     }
 }
 
@@ -1136,7 +1198,30 @@ fn kill_process(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_process(_pid: u32) {}
+fn kill_process(pid: u32) {
+    // On Windows use TerminateProcess via OpenProcess to kill the child.
+    // SAFETY: pid is a valid process ID from a Child we own; handles are
+    // closed after the call.
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::io::RawHandle;
+        extern "system" {
+            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+            fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+            fn CloseHandle(hObject: isize) -> i32;
+        }
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle != 0 {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+    }
+}
 
 fn parse_env_output(
     stdout: &[u8],

@@ -29,6 +29,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use proto::methods::{
@@ -628,14 +631,25 @@ fn spawn_and_collect(
             e
         )
     })?;
-    let mut cmd = Command::new(&cfg.command);
+    // On Windows, prefix both the command path and cwd with UNC prefix
+    // to bypass MAX_PATH (260 char) limit (Bug #2 Phase 2).
+    #[cfg(windows)]
+    let command_path = crate::acp::unc_prefix_path(PathBuf::from(&cfg.command));
+    #[cfg(not(windows))]
+    let command_path = PathBuf::from(&cfg.command);
+    #[cfg(windows)]
+    let spawn_cwd = crate::acp::unc_prefix_path(prompt.cwd.clone());
+    #[cfg(not(windows))]
+    let spawn_cwd = prompt.cwd.clone();
+
+    let mut cmd = Command::new(&command_path);
     let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
     } else {
         Stdio::null()
     };
     cmd.args(argv)
-        .current_dir(&prompt.cwd)
+        .current_dir(&spawn_cwd)
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -646,9 +660,13 @@ fn spawn_and_collect(
         cmd.env("LOOM_PROMPT", &prompt.content);
     }
     configure_process_group(&mut cmd);
+    // On Windows, prevent console windows and let child escape the Tauri
+    // GUI's restrictive job object.
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000 | 0x01000000); // CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))?;
+        .map_err(|e| format!("failed to spawn `{}`: {}", command_path.display(), e))?;
     // Register the PID so cancel() can find and signal it. If a cancel call
     // landed BEFORE we got here (cancel_requested already true), kill the
     // child immediately; the wait below will pick up the SIGTERM exit.

@@ -43,7 +43,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, sleep, Duration};
 
-use agent_runtime::acp::{AcpAdapter, AcpConfig};
+use agent_runtime::acp::{AcpAdapter, AcpConfig, create_dir_all_unc};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 use agent_runtime::usage;
@@ -764,8 +764,8 @@ impl AgentPaths {
         spec: &AgentSpec,
         bundle_paths: &BundlePaths,
     ) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.profile)?;
-        std::fs::create_dir_all(&self.sessions)?;
+        create_dir_all_unc(&self.profile)?;
+        create_dir_all_unc(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
         if spec.memory.is_some() {
             let memory_root = spec
@@ -832,9 +832,9 @@ impl AgentPaths {
         actor_context: Option<&str>,
     ) -> std::io::Result<ScopePaths> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
-        std::fs::create_dir_all(&scope.workspace)?;
-        std::fs::create_dir_all(&scope.logs)?;
-        std::fs::create_dir_all(&scope.channel_artifacts)?;
+        create_dir_all_unc(&scope.workspace)?;
+        create_dir_all_unc(&scope.logs)?;
+        create_dir_all_unc(&scope.channel_artifacts)?;
         ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
         agent_runtime::ensure_agents_md(&scope.workspace, actor_id, agent_instructions, actor_context)?;
         Ok(scope)

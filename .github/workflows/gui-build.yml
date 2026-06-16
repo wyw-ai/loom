@@ -109,6 +109,15 @@ jobs:
       - name: Build loom-shell
         run: cargo build -p loom-shell
 
+      - name: Upload loom-shell artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-shell-windows
+          path: target/debug/loom-shell.exe
+          retention-days: 30
+          if-no-files-found: error
+
   # ── Frontend web build ─────────────────────────────────────────────────
   gui-frontend:
     name: GUI Frontend (web)

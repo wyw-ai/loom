@@ -5,13 +5,21 @@
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 /// 受管理的子进程句柄。
 static SERVER_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static DAEMON_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
 /// 启动 server.exe 作为子进程。
 pub fn start_server(exe_path: &str) -> Result<u32, String> {
-    let child = Command::new(exe_path)
+    let mut cmd = Command::new(exe_path);
+    // On Windows, prevent console windows and let child escape the Tauri
+    // GUI's restrictive job object (fixes ERROR_PRIVILEGE_NOT_HELD).
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000 | 0x01000000); // CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+    let child = cmd
         .spawn()
         .map_err(|e| format!("启动 server 失败: {e}"))?;
     let pid = child.id();
@@ -21,7 +29,10 @@ pub fn start_server(exe_path: &str) -> Result<u32, String> {
 
 /// 启动 loom-daemon.exe 作为子进程。
 pub fn start_daemon(exe_path: &str) -> Result<u32, String> {
-    let child = Command::new(exe_path)
+    let mut cmd = Command::new(exe_path);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000 | 0x01000000); // CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+    let child = cmd
         .spawn()
         .map_err(|e| format!("启动 daemon 失败: {e}"))?;
     let pid = child.id();

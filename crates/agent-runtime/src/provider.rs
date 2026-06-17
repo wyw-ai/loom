@@ -127,7 +127,11 @@ impl ProviderRuntimePlan {
             output_format: Some(output_format),
             decoder: self.decoder,
             stderr_decoder: self.stderr_decoder,
-            prompt_via: PromptVia::Args,
+            prompt_via: if self.stdin.is_some() {
+                PromptVia::Stdin
+            } else {
+                PromptVia::Args
+            },
             prompt: self.prompt,
             stdin: self.stdin,
             timeout_ms: self.timeout_ms,
@@ -2786,6 +2790,11 @@ mod tests {
         let mut perms = std::fs::metadata(path).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(path: &Path) {
+        std::fs::write(path, "").expect("write executable");
     }
 
     fn prompt_part(key: &'static str, content: &'static str) -> PromptPart {

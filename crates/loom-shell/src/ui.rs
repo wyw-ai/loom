@@ -229,7 +229,10 @@ impl LoomShell {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
-                handle_start(tab);
+                match handle_start(tab) {
+                    Ok(()) => set_ctrl_text(&lbl_detail, "启动成功"),
+                    Err(e) => set_ctrl_text(&lbl_detail, &format!("启动失败: {}", e)),
+                }
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
             },
         );
@@ -247,17 +250,21 @@ impl LoomShell {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
-                handle_stop(tab);
+                match handle_stop(tab) {
+                    Ok(()) => set_ctrl_text(&lbl_detail, "停止成功"),
+                    Err(e) => set_ctrl_text(&lbl_detail, &format!("停止失败: {}", e)),
+                }
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
             },
         );
         shell._event_handles.push(ev);
 
-        // 重启按钮
+        // 重启按钮 — 在后台线程执行 stop+wait+start 以避免阻塞 UI。
+        // NWG ControlHandle 不是 Send，因此在线程外提取原始 HWND 再传入。
         let state_rc = shell.state.clone();
-        let lbl_status = shell.lbl_status.handle;
-        let lbl_detail = shell.lbl_detail.handle;
-        let log_area = shell.log_area.handle;
+        let lbl_status_raw = extract_hwnd(&shell.lbl_status.handle);
+        let lbl_detail_raw = extract_hwnd(&shell.lbl_detail.handle);
+        let log_area_raw = extract_hwnd(&shell.log_area.handle);
         let ev = nwg::full_bind_event_handler(
             &shell.btn_restart.handle,
             move |ev, _evd, _handle| {
@@ -265,10 +272,18 @@ impl LoomShell {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
-                handle_stop(tab);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                handle_start(tab);
-                refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
+                let lbl_status_raw = lbl_status_raw;
+                let lbl_detail_raw = lbl_detail_raw;
+                let log_area_raw = log_area_raw;
+                std::thread::spawn(move || {
+                    let _ = handle_stop(tab);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    match handle_start(tab) {
+                        Ok(()) => set_hwnd_text(lbl_detail_raw, "重启成功"),
+                        Err(e) => set_hwnd_text(lbl_detail_raw, &format!("重启失败: {}", e)),
+                    }
+                    refresh_tab_raw(tab, lbl_status_raw, lbl_detail_raw, log_area_raw);
+                });
             },
         );
         shell._event_handles.push(ev);
@@ -285,7 +300,10 @@ impl LoomShell {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
-                handle_install(tab);
+                match handle_install(tab) {
+                    Ok(()) => set_ctrl_text(&lbl_detail, "安装服务成功"),
+                    Err(e) => set_ctrl_text(&lbl_detail, &format!("安装服务失败: {}", e)),
+                }
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
             },
         );
@@ -303,7 +321,10 @@ impl LoomShell {
                     return;
                 }
                 let tab = state_rc.borrow().current_tab;
-                handle_uninstall(tab);
+                match handle_uninstall(tab) {
+                    Ok(()) => set_ctrl_text(&lbl_detail, "卸载服务成功"),
+                    Err(e) => set_ctrl_text(&lbl_detail, &format!("卸载服务失败: {}", e)),
+                }
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
             },
         );
@@ -395,90 +416,167 @@ fn refresh_tab(
 
 /// 通过 ControlHandle 的 HWND 设置控件文本（兼容 NWG 1.0.12/1.0.13）。
 fn set_ctrl_text(handle: &nwg::ControlHandle, text: &str) {
+    let hwnd = match handle.hwnd() {
+        Some(h) => h as isize,
+        None => return,
+    };
+    set_hwnd_text(hwnd, text);
+}
+
+/// 提取 ControlHandle 内部的原始 HWND（isize），用于跨线程传递。
+/// 返回值 0 表示无效句柄。
+fn extract_hwnd(handle: &nwg::ControlHandle) -> isize {
+    handle.hwnd().map(|h| h as isize).unwrap_or(0)
+}
+
+/// 通过原始 HWND 设置窗口文本（线程安全，仅从 UI 线程调用或通过 refresh_tab_raw）。
+fn set_hwnd_text(hwnd: isize, text: &str) {
+    if hwnd == 0 {
+        return;
+    }
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
-    let hwnd = match handle.hwnd() {
-        Some(h) => h as windows_sys::Win32::Foundation::HWND,
-        None => return,
-    };
     let wide: Vec<u16> = OsStr::new(text)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
     unsafe {
-        SetWindowTextW(hwnd, wide.as_ptr());
+        SetWindowTextW(hwnd as windows_sys::Win32::Foundation::HWND, wide.as_ptr());
     }
+}
+
+/// refresh_tab 的原始 HWND 版本，用于后台线程回调。
+fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isize) {
+    let (svc_name, exe_path, label) = match tab {
+        Tab::Server => ("LoomServer", config::server_exe(), "Server"),
+        Tab::Daemon => ("LoomDaemon", config::daemon_exe(), "Daemon"),
+        Tab::Logs => {
+            let server_log = log_viewer::tail_server();
+            let daemon_log = log_viewer::tail_daemon();
+            let combined = format!(
+                "=== Server 日志 ===\n{}\n\n=== Daemon 日志 ===\n{}",
+                server_log, daemon_log
+            );
+            set_hwnd_text(lbl_status, "状态：日志查看");
+            set_hwnd_text(lbl_detail, "显示 LoomServer.out.log 和 LoomDaemon.out.log 最后 100 行");
+            set_hwnd_text(log_area, &combined);
+            return;
+        }
+    };
+
+    let svc_state = service::query(svc_name);
+    let status_text: String;
+    let detail_text: String;
+
+    if svc_state == service::SvcState::NotInstalled {
+        let running = match tab {
+            Tab::Server => process::is_server_running(),
+            Tab::Daemon => process::is_daemon_running(),
+            _ => false,
+        };
+        if running {
+            status_text = format!("{} 状态：进程运行中", label);
+            detail_text = format!("模式：独立进程\n可执行文件：{}", exe_path.display());
+        } else {
+            status_text = format!("{} 状态：未运行", label);
+            detail_text = format!(
+                "模式：独立进程（服务未安装）\n可执行文件：{}",
+                exe_path.display()
+            );
+        }
+    } else {
+        status_text = format!("{} 状态：{}", label, svc_state.label());
+        detail_text = format!(
+            "模式：Windows 服务\n服务名：{}\n可执行文件：{}",
+            svc_name,
+            exe_path.display()
+        );
+    }
+
+    set_hwnd_text(lbl_status, &status_text);
+    set_hwnd_text(lbl_detail, &detail_text);
+
+    let log_content = match tab {
+        Tab::Server => log_viewer::tail_server(),
+        Tab::Daemon => log_viewer::tail_daemon(),
+        Tab::Logs => String::new(),
+    };
+    set_hwnd_text(log_area, &log_content);
 }
 
 // ---------------------------------------------------------------------------
 // 操作处理
 // ---------------------------------------------------------------------------
 
-fn handle_start(tab: Tab) {
+fn handle_start(tab: Tab) -> Result<(), String> {
     match tab {
         Tab::Server => {
             let svc_state = service::query("LoomServer");
             if svc_state == service::SvcState::NotInstalled {
-                let _ = process::start_server(&config::server_exe().to_string_lossy());
+                process::start_server(&config::server_exe().to_string_lossy())?;
             } else {
-                let _ = service::start("LoomServer");
+                service::start("LoomServer")?;
             }
         }
         Tab::Daemon => {
             let svc_state = service::query("LoomDaemon");
             if svc_state == service::SvcState::NotInstalled {
-                let _ = process::start_daemon(&config::daemon_exe().to_string_lossy());
+                process::start_daemon(&config::daemon_exe().to_string_lossy())?;
             } else {
-                let _ = service::start("LoomDaemon");
+                service::start("LoomDaemon")?;
             }
         }
         Tab::Logs => {}
     }
+    Ok(())
 }
 
-fn handle_stop(tab: Tab) {
+fn handle_stop(tab: Tab) -> Result<(), String> {
     match tab {
         Tab::Server => {
             let svc_state = service::query("LoomServer");
             if svc_state == service::SvcState::NotInstalled {
-                let _ = process::stop_server();
+                process::stop_server()?;
             } else {
-                let _ = service::stop("LoomServer");
+                service::stop("LoomServer")?;
             }
         }
         Tab::Daemon => {
             let svc_state = service::query("LoomDaemon");
             if svc_state == service::SvcState::NotInstalled {
-                let _ = process::stop_daemon();
+                process::stop_daemon()?;
             } else {
-                let _ = service::stop("LoomDaemon");
+                service::stop("LoomDaemon")?;
             }
         }
         Tab::Logs => {}
     }
+    Ok(())
 }
 
-fn handle_install(tab: Tab) {
+fn handle_install(tab: Tab) -> Result<(), String> {
     match tab {
         Tab::Server => {
-            let _ = install::install_server();
+            install::install_server().map(|_| ())?;
         }
         Tab::Daemon => {
-            let _ = install::install_daemon();
+            install::install_daemon().map(|_| ())?;
         }
         Tab::Logs => {}
     }
+    Ok(())
 }
 
-fn handle_uninstall(tab: Tab) {
+fn handle_uninstall(tab: Tab) -> Result<(), String> {
     match tab {
         Tab::Server => {
-            let _ = install::uninstall_server();
+            install::uninstall_server().map(|_| ())?;
         }
         Tab::Daemon => {
-            let _ = install::uninstall_daemon();
+            install::uninstall_daemon().map(|_| ())?;
         }
         Tab::Logs => {}
     }
+    Ok(())
 }

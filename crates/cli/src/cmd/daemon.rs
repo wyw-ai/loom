@@ -108,13 +108,13 @@ pub async fn run(
         let proxy_handle = daemon_ipc::start_proxy(socket_path.clone(), server_url.clone()).await?;
         std::env::set_var(daemon_ipc::ENV_DAEMON_SOCKET, &socket_path);
         if let Err(err) = daemon_ipc::write_discovery(&socket_path, &server_url) {
-            eprintln!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
+            tracing::warn!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
         }
         (Some(socket_path), Some(proxy_handle))
     };
 
     if no_services {
-        eprintln!("loom-daemon: service host disabled by --no-services");
+        tracing::info!("loom-daemon: service host disabled by --no-services");
     } else {
         spawn_service_host(services_dir, server_url.clone(), allow_services);
     }
@@ -124,7 +124,7 @@ pub async fn run(
     let mut running_agents = HashMap::new();
     let mut warned_missing = HashSet::new();
 
-    eprintln!(
+    tracing::info!(
         "loom-daemon: machine={} providers={} data={} reload={}s",
         machine.id,
         providers.len(),
@@ -132,11 +132,11 @@ pub async fn run(
         CONFIG_RELOAD_INTERVAL.as_secs()
     );
     if let Some(socket_path) = socket_path.as_ref() {
-        eprintln!("loom-daemon: socket={}", socket_path.display());
+        tracing::info!("loom-daemon: socket={}", socket_path.display());
     } else {
-        eprintln!("loom-daemon: socket disabled");
+        tracing::info!("loom-daemon: socket disabled");
     }
-    eprintln!("loom-daemon: ready (ctrl-c to stop)");
+    tracing::info!("loom-daemon: ready (ctrl-c to stop)");
 
     loop {
         match refresh_machine_runtime(
@@ -152,14 +152,14 @@ pub async fn run(
             &mut warned_missing,
         ) {
             Ok(()) => {}
-            Err(e) => eprintln!("loom-daemon: reload failed: {e:#}"),
+            Err(e) => tracing::error!("loom-daemon: reload failed: {e:#}"),
         }
 
         tokio::select! {
             _ = shutdown_signal() => break,
             maybe_command = machine_command_rx.recv() => {
                 let Some(command) = maybe_command else {
-                    eprintln!("loom-daemon: machine command channel closed");
+                    tracing::warn!("loom-daemon: machine command channel closed");
                     continue;
                 };
                 let result = handle_machine_command(
@@ -194,7 +194,7 @@ pub async fn run(
         }
     }
 
-    eprintln!("\nloom-daemon: shutting down");
+    tracing::info!("loom-daemon: shutting down");
     if let Some(proxy_handle) = proxy_handle {
         proxy_handle.abort();
     }
@@ -302,7 +302,7 @@ fn load_machine_specs(
         .is_none_or(|machine| machine.id != selected_machine_id);
     let restored_context = if was_missing {
         if warned_missing.insert(format!("machine:{selected_machine_id}")) {
-            eprintln!(
+            tracing::warn!(
                 "loom-daemon: selected machine {selected_machine_id} is missing from daemon.toml; restoring live runtime snapshot"
             );
         }
@@ -729,7 +729,7 @@ fn reconcile_agents(
             let client = match crate::client::Client::connect(&url).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("loom-daemon: failed to connect for stale actor cleanup: {e:#}");
+                    tracing::error!("loom-daemon: failed to connect for stale actor cleanup: {e:#}");
                     return;
                 }
             };
@@ -739,8 +739,8 @@ fn reconcile_agents(
                     .call_raw(proto::methods::method::ACTOR_DELETE, Some(params))
                     .await
                 {
-                    Ok(_) => eprintln!("[{id}] cleaned up stale actor on server"),
-                    Err(e) => eprintln!("[{id}] failed to clean up stale actor: {e:#}"),
+                    Ok(_) => tracing::info!("[{id}] cleaned up stale actor on server"),
+                    Err(e) => tracing::warn!("[{id}] failed to clean up stale actor: {e:#}"),
                 }
             }
         });
@@ -749,7 +749,7 @@ fn reconcile_agents(
     for actor_id in stale {
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();
-            eprintln!("[{actor_id}] stopped: removed from machine config");
+            tracing::info!("[{actor_id}] stopped: removed from machine config");
         }
     }
 
@@ -763,9 +763,9 @@ fn reconcile_agents(
         }
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();
-            eprintln!("[{actor_id}] restarting: machine config changed");
+            tracing::info!("[{actor_id}] restarting: machine config changed");
         } else {
-            eprintln!("[{actor_id}] starting from machine config");
+            tracing::info!("[{actor_id}] starting from machine config");
         }
         let handle =
             agent_serve::spawn_agent_worker_loop(spec, server_url.to_string(), data_root.clone());
@@ -808,7 +808,7 @@ fn spawn_service_host(
 ) {
     tokio::spawn(async move {
         if let Err(e) = service::serve(services_dir, server_url, allow_services).await {
-            eprintln!("loom-daemon: service host exited with error: {e:#}");
+            tracing::error!("loom-daemon: service host exited with error: {e:#}");
         }
     });
 }

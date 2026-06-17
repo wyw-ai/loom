@@ -91,7 +91,7 @@ pub async fn run(
     }
     ensure_agent_config_dirs(&specs)?;
 
-    eprintln!(
+    tracing::info!(
         "loom agent serve: loaded {} agent(s) from {}",
         specs.len(),
         specs_dir.display()
@@ -116,7 +116,7 @@ pub async fn run(
                     }
                     Ok(None) => last_spec.clone(),
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[{actor}] failed to re-read spec ({e}); continuing with last-known spec"
                         );
                         last_spec.clone()
@@ -136,7 +136,7 @@ pub async fn run(
                         sleep(Duration::from_millis(1000)).await;
                         let cur = crate::cmd::reload::read_epoch(&watcher_marker);
                         if cur > baseline_epoch {
-                            eprintln!(
+                            tracing::info!(
                                 "[{actor_for_watch}] reload requested (epoch_ms={cur}); restarting worker"
                             );
                             worker_abort.abort();
@@ -151,24 +151,24 @@ pub async fn run(
                 match join_result {
                     Ok(Ok(())) => {
                         attempt = 0;
-                        eprintln!(
+                        tracing::info!(
                             "[{actor}] worker disconnected; reconnecting in {}s",
                             delay.as_secs()
                         );
                     }
                     Ok(Err(e)) => {
-                        eprintln!(
+                        tracing::error!(
                             "[{actor}] worker exited with error: {e}; reconnecting in {}s",
                             delay.as_secs()
                         );
                     }
                     Err(join_err) if join_err.is_cancelled() => {
                         attempt = 0;
-                        eprintln!("[{actor}] worker aborted for reload; respawning");
+                        tracing::info!("[{actor}] worker aborted for reload; respawning");
                         continue;
                     }
                     Err(join_err) => {
-                        eprintln!(
+                        tracing::error!(
                             "[{actor}] worker task panicked: {join_err}; reconnecting in {}s",
                             delay.as_secs()
                         );
@@ -203,13 +203,13 @@ pub fn spawn_agent_worker_loop(
             match run_agent_worker(spec.clone(), server_url.clone(), data_root.clone()).await {
                 Ok(()) => {
                     attempt = 0;
-                    eprintln!(
+                    tracing::info!(
                         "[{actor}] worker disconnected; reconnecting in {}s",
                         delay.as_secs()
                     );
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[{actor}] worker exited with error: {e}; reconnecting in {}s",
                         delay.as_secs()
                     );
@@ -473,14 +473,14 @@ async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
         match run_machine_host_once(&host, &server_url).await {
             Ok(()) => {
                 attempt = 0;
-                eprintln!(
+                tracing::info!(
                     "[{}] machine host disconnected; reconnecting in {}s",
                     host.machine_id,
                     delay.as_secs()
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[{}] machine host exited with error: {e:#}; reconnecting in {}s",
                     host.machine_id,
                     delay.as_secs()
@@ -498,7 +498,7 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     client
         .open_connection_as(&host.actor_id, "service", Some(&host.display_name))
         .await?;
-    eprintln!(
+    tracing::info!(
         "[{}] machine host connected to {} as {}",
         host.machine_id, server_url, host.actor_id
     );
@@ -2088,14 +2088,14 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         .await?;
     let agent_config_version_id =
         publish_runtime_agent_config(&client, &actor_id, &spec, &transport).await?;
-    eprintln!(
+    tracing::info!(
         "[{actor_id}] connected to {server_url} as {:?}",
         spec.actor.kind
     );
 
     let agent_server_url = agent_child_server_url(&server_url);
     if agent_server_url != server_url {
-        eprintln!(
+        tracing::info!(
             "[{actor_id}] injecting LOOM_SERVER={} for child agents (agent-client connected via {})",
             agent_server_url, server_url
         );
@@ -2367,7 +2367,7 @@ async fn notification_loop(
                     &mut started,
                     actor_id,
                 ).await {
-                    eprintln!("[{actor_id}] failed to drain pending inbox: {e}");
+                    tracing::error!("[{actor_id}] failed to drain pending inbox: {e}");
                 }
                 continue;
             }
@@ -2377,7 +2377,7 @@ async fn notification_loop(
             } => next,
         };
         let Some(n) = next else {
-            eprintln!("[{actor_id}] server disconnected, worker exiting");
+            tracing::info!("[{actor_id}] server disconnected, worker exiting");
             return Ok(());
         };
 
@@ -2410,7 +2410,7 @@ async fn notification_loop(
                 if let Err(e) =
                     handle_action_response_message(&client, &state, &adapter, &message).await
                 {
-                    eprintln!("[{actor_id}] failed to handle action.response message: {e}");
+                    tracing::error!("[{actor_id}] failed to handle action.response message: {e}");
                 } else if let Err(e) =
                     record_delivery_seen_by_id(&client, actor_id, &message.id).await
                 {
@@ -2436,7 +2436,7 @@ async fn notification_loop(
             {
                 Ok(TriggerOutcome::Dispatched) => {}
                 Ok(TriggerOutcome::Queued) => {}
-                Err(e) => eprintln!("[{actor_id}] failed to handle message trigger: {e}"),
+                Err(e) => tracing::error!("[{actor_id}] failed to handle message trigger: {e}"),
             }
             continue;
         }
@@ -2466,7 +2466,7 @@ async fn notification_loop(
             {
                 Ok(TriggerOutcome::Dispatched) => {}
                 Ok(TriggerOutcome::Queued) => {}
-                Err(e) => eprintln!("[{actor_id}] failed to handle event trigger: {e}"),
+                Err(e) => tracing::error!("[{actor_id}] failed to handle event trigger: {e}"),
             }
             continue;
         }
@@ -2492,7 +2492,7 @@ async fn notification_loop(
             };
             let scopes = state.cancel_channel_work(channel_id);
             if !scopes.is_empty() {
-                eprintln!(
+                tracing::info!(
                     "[{actor_id}] channel {channel_id} deleted — canceling {} active turn(s)",
                     scopes.len()
                 );
@@ -2547,7 +2547,7 @@ async fn handle_model_action_response_message(
         .trim()
         .to_string();
     if option_id.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[{}] model action.response message {} ignored: missing metadata.optionId",
             state.actor_id, message.id
         );
@@ -2569,7 +2569,7 @@ async fn handle_model_action_response_message(
         .or_else(|| state.model_choice(&option_id));
 
     let Some(choice) = choice else {
-        eprintln!(
+        tracing::warn!(
             "[{}] model action.response message {} ignored: unknown model `{}`",
             state.actor_id, message.id, option_id
         );
@@ -2584,7 +2584,7 @@ async fn handle_model_action_response_message(
         state.forget_model_action_request(request_message_id);
         append_model_selection_failure_message(client, state, message, &choice, &option_id, &err)
             .await?;
-        eprintln!(
+        tracing::error!(
             "[{}] failed to select model `{}` via {}: {}",
             state.actor_id, option_id, message.id, err
         );
@@ -2605,7 +2605,7 @@ async fn handle_model_action_response_message(
         Meta::default(),
     )
     .await?;
-    eprintln!(
+    tracing::info!(
         "[{}] selected model `{}` via {}",
         state.actor_id, option_id, message.id
     );
@@ -2883,7 +2883,7 @@ async fn handle_action_response_message(
         })
         .filter(|value| !value.trim().is_empty());
     let Some(request_message_id) = request_message_id else {
-        eprintln!(
+        tracing::warn!(
             "[{}] action.response message {} ignored: missing parentMessageId",
             state.actor_id, message.id
         );
@@ -2894,7 +2894,7 @@ async fn handle_action_response_message(
         .as_deref()
         .is_some_and(is_loom_tool_request_id)
     {
-        eprintln!(
+        tracing::info!(
             "[{}] action.response message {} is for a loom human-interaction tool {}; leaving it for the waiting tool process",
             state.actor_id, message.id, request_message_id
         );
@@ -2913,14 +2913,14 @@ async fn handle_action_response_message(
         Some(id) => id,
         None => match echoed_request_id {
             Some(id) => {
-                eprintln!(
+                tracing::info!(
                     "[{}] action.response message {} used echoed ACP request id for {}",
                     state.actor_id, message.id, request_message_id
                 );
                 id
             }
             None => {
-                eprintln!(
+                tracing::warn!(
                     "[{}] action.response message {} ignored: no pending ACP request for {} \
                      (loom-daemon may have restarted after the action.request)",
                     state.actor_id, message.id, request_message_id
@@ -2936,13 +2936,13 @@ async fn handle_action_response_message(
         .unwrap_or("")
         .to_string();
     if option_id.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[{}] action.response message {} ignored: missing metadata.optionId",
             state.actor_id, message.id
         );
         return Ok(());
     }
-    eprintln!(
+    tracing::info!(
         "[{}] action.response message {} -> ACP request {} option {}",
         state.actor_id, message.id, request_id, option_id
     );
@@ -3206,18 +3206,18 @@ async fn try_ensure_adapter_started(
     if *started {
         return None;
     }
-    eprintln!(
+    tracing::info!(
         "[{}] starting adapter for control command (ACP cold-start can take 30-60s)…",
         state.actor_id
     );
     match adapter.start(event_tx.clone()).await {
         Ok(_) => {
             *started = true;
-            eprintln!("[{}] adapter ready", state.actor_id);
+            tracing::info!("[{}] adapter ready", state.actor_id);
             None
         }
         Err(err) => {
-            eprintln!(
+            tracing::error!(
                 "[{}] adapter start failed for control command: {}",
                 state.actor_id, err
             );
@@ -3241,7 +3241,7 @@ async fn open_model_picker(
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
                 Err(err) => {
-                    eprintln!(
+                    tracing::error!(
                         "[{}] failed to load ACP model options: {}",
                         state.actor_id, err
                     );
@@ -3311,7 +3311,7 @@ async fn open_model_picker(
         sent.message.id.clone(),
         ModelActionRequest { source, choices },
     );
-    eprintln!(
+    tracing::info!(
         "[{}] opened model picker {} for {}",
         state.actor_id,
         sent.message.id,
@@ -4026,7 +4026,7 @@ async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &Scop
         .call::<_, Value>(method::SCOPE_SUBSCRIBE, json!({ "scope": scope }))
         .await
     {
-        eprintln!(
+        tracing::error!(
             "[{}] scope/subscribe {}:{} failed: {e}",
             state.actor_id,
             match scope.kind {
@@ -5746,13 +5746,13 @@ async fn translate_events(
         // across awaits.
         let Some(ev) = rx.recv().await else { return };
         if let Err(e) = translate_one(&client, &state, &adapter, &actor_id, ev).await {
-            eprintln!("[{actor_id}] translate failed: {e}");
+            tracing::error!("[{actor_id}] translate failed: {e}");
         }
         loop {
             match rx.try_recv() {
                 Ok(ev) => {
                     if let Err(e) = translate_one(&client, &state, &adapter, &actor_id, ev).await {
-                        eprintln!("[{actor_id}] translate failed: {e}");
+                        tracing::error!("[{actor_id}] translate failed: {e}");
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -5880,7 +5880,7 @@ async fn translate_one(
             )
             .await?;
             state.record_action_request(sent.message.id.clone(), id.clone());
-            eprintln!(
+            tracing::info!(
                 "[{actor_id}] action.request {} -> trigger {} (ACP request {})",
                 sent.message.id, active.trigger_actor, id
             );
@@ -5988,7 +5988,7 @@ async fn translate_one(
             if let Some(next) = next_trigger {
                 match dispatch_trigger(client, state, adapter, next).await {
                     Ok(_) => {}
-                    Err(e) => eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}"),
+                    Err(e) => tracing::error!("[{actor_id}] failed to dispatch queued trigger: {e}"),
                 }
             }
         }
@@ -6002,7 +6002,7 @@ async fn translate_one(
                 )
                 .await?;
             } else {
-                eprintln!("[{actor_id}] adapter error (agent-wide): {message}");
+                tracing::error!("[{actor_id}] adapter error (agent-wide): {message}");
             }
         }
     }

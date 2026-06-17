@@ -43,7 +43,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, sleep, Duration};
 
-use agent_runtime::acp::{AcpAdapter, AcpConfig, create_dir_all_unc};
+use agent_runtime::acp::{AcpAdapter, AcpConfig, create_dir_all_unc, normalize_path_separators};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 use agent_runtime::usage;
@@ -731,10 +731,12 @@ impl AgentPaths {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("workspaces"));
+        let bundle_root_val = agent_root.join("bundles");
+        let bundle_current_val = bundle_root_val.join("current");
         Self {
             profile: agent_root.join("profile"),
-            bundle_root: agent_root.join("bundles"),
-            bundle_current: agent_root.join("bundles").join("current"),
+            bundle_root: bundle_root_val,
+            bundle_current: bundle_current_val,
             root: agent_root,
             sessions: data_root.join("sessions"),
             scope_workspaces_root,
@@ -797,12 +799,12 @@ impl AgentPaths {
         let root = if bundle.root.trim().is_empty() {
             self.bundle_root.clone()
         } else {
-            PathBuf::from(self.expand_base(&bundle.root))
+            normalize_path_separators(PathBuf::from(self.expand_base(&bundle.root)))
         };
         let current = if bundle.current.trim().is_empty() {
             self.bundle_current.clone()
         } else {
-            PathBuf::from(self.expand_base(&bundle.current))
+            normalize_path_separators(PathBuf::from(self.expand_base(&bundle.current)))
         };
         BundlePaths {
             root,

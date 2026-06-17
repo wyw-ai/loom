@@ -664,7 +664,7 @@ fn spawn_and_collect(
     // On Windows, prevent console windows and let child escape the Tauri
     // GUI's restrictive job object.
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000 | 0x01000000); // CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+    cmd.creation_flags(crate::path_util::CREATE_NO_WINDOW | crate::path_util::CREATE_BREAKAWAY_FROM_JOB);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", command_path.display(), e))?;
@@ -2646,7 +2646,9 @@ fn expand_first_run_argv(
     prompt: &str,
 ) -> Vec<String> {
     if !cfg.arg_specs.is_empty() {
-        return expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
+        let mut argv = expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
+        strip_prompt_args(&mut argv);
+        return argv;
     }
     let mut argv: Vec<String> = cfg
         .args
@@ -2657,6 +2659,7 @@ fn expand_first_run_argv(
         let mut model_args = Vec::new();
         append_model_args(&mut model_args, cfg, request, session_id, prompt);
         argv.splice(pos..pos, model_args);
+        strip_prompt_args(&mut argv);
         return argv;
     }
     if matches!(cfg.prompt_via, PromptVia::Args) {
@@ -2681,7 +2684,26 @@ fn expand_first_run_argv(
             argv.push(prompt.to_string());
         }
     }
+    strip_prompt_args(&mut argv);
     argv
+}
+
+/// Remove `-p <prompt>` or `--prompt <prompt>` from argv when prompt is
+/// delivered via stdin to avoid hitting the Windows command-line length limit.
+fn strip_prompt_args(argv: &mut Vec<String>) {
+    let mut i = 0;
+    while i < argv.len() {
+        if matches!(argv[i].as_str(), "-p" | "--prompt") {
+            if i + 1 < argv.len() {
+                argv.remove(i);     // remove -p
+                argv.remove(i);     // remove its value
+            } else {
+                argv.remove(i);     // trailing -p with no value
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn expand_arg_specs(
@@ -2751,6 +2773,7 @@ fn expand_argv(
         let mut model_args = Vec::new();
         append_model_args(&mut model_args, cfg, request, session_id, prompt);
         argv.splice(pos..pos, model_args);
+        strip_prompt_args(&mut argv);
         return argv;
     }
     if matches!(cfg.prompt_via, PromptVia::Args) {
@@ -2773,6 +2796,7 @@ fn expand_argv(
             argv.push(prompt.to_string());
         }
     }
+    strip_prompt_args(&mut argv);
     argv
 }
 
@@ -2816,14 +2840,22 @@ fn expand_template(
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{model}", active_model(request).as_deref().unwrap_or(""))
-        .replace("{prompt}", prompt)
+        .replace("{prompt}", if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            ""
+        } else {
+            prompt
+        })
         .replace(
             "{prompt.full}",
-            request
-                .outputs
-                .get("full")
-                .map(String::as_str)
-                .unwrap_or(prompt),
+            if matches!(cfg.prompt_via, PromptVia::Stdin) {
+                ""
+            } else {
+                request
+                    .outputs
+                    .get("full")
+                    .map(String::as_str)
+                    .unwrap_or(prompt)
+            },
         )
         .replace(
             "{loom_envelope}",

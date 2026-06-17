@@ -25,11 +25,9 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
+use crate::path_util::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-#[cfg(windows)]
-const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -1049,31 +1047,9 @@ fn is_auth_required_error(err: &str) -> bool {
         .is_some_and(|message| message == "Authentication required")
 }
 
-/// Prefix a path with the Windows `\\?\` UNC prefix to bypass the 260-char
-/// MAX_PATH limit.  Only compiled on Windows.
-#[cfg(windows)]
-pub(crate) fn unc_prefix_path(path: std::path::PathBuf) -> std::path::PathBuf {
-    let s = path.to_string_lossy();
-    // Already prefixed — don't double it.
-    if s.starts_with(r"\\?\") {
-        return path;
-    }
-    let prefixed = format!(r"\\?\{}", s);
-    std::path::PathBuf::from(prefixed)
-}
-
-/// Create a directory (and all parents), applying the Windows UNC prefix
-/// to bypass MAX_PATH (260 char) when the path is long.
-#[cfg(windows)]
-pub fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
-    let prefixed = unc_prefix_path(path.to_path_buf());
-    std::fs::create_dir_all(&prefixed)
-}
-
-#[cfg(not(windows))]
-pub fn create_dir_all_unc(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
-}
+// UNC path utilities moved to `path_util` for shared use across the crate.
+// Re-export for backward compatibility.
+pub use crate::path_util::{create_dir_all_unc, normalize_path_separators, unc_prefix_path};
 
 fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {
     let raw_code = err.raw_os_error();

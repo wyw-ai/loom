@@ -368,6 +368,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[test]
     fn reconcile_links_channel_members_into_channel_and_thread_skills() {
         let root = temp_path("reconcile");
         let bundle_root = root.join("published").join("actor_alice");
@@ -408,6 +410,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[test]
     fn reconcile_skips_invalid_historical_actor_ids() {
         let root = temp_path("reconcile-invalid-actor");
         let bundle_root = root.join("published").join("actor_alice");
@@ -437,6 +441,8 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    #[cfg(unix)]
     #[test]
     fn membership_sync_and_revoke_update_existing_thread_links() {
         let root = temp_path("membership");
@@ -500,6 +506,8 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    #[cfg(unix)]
     #[test]
     fn reconcile_prunes_deleted_scope_skills() {
         let root = temp_path("prune");

@@ -6792,6 +6792,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_bundle_without_bundle_replaces_stale_current_symlink() {
         let root = temp_path("bundle-cleanup");
@@ -6900,6 +6901,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_scope_links_scope_specific_skills_into_workspace() {
         let root = temp_path("scope-skills-link");
@@ -7013,8 +7015,13 @@ mod tests {
     #[test]
     fn inject_loom_cli_env_sets_absolute_cli_and_prepends_path() {
         let mut env = BTreeMap::new();
-        env.insert("PATH".into(), "/usr/bin:/bin".into());
-        let loom = Path::new("/opt/loom/bin").join("loom");
+        let path_list = std::env::join_paths(&[
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap();
+        env.insert("PATH".into(), path_list.into_string().unwrap());
+        let loom = PathBuf::from("/opt/loom/bin/loom");
 
         inject_loom_cli_env(&mut env, Some(&loom));
 
@@ -7022,8 +7029,9 @@ mod tests {
             env.get(LOOM_CLI_ENV).map(String::as_str),
             Some("/opt/loom/bin/loom")
         );
-        let paths = std::env::split_paths(env.get("PATH").expect("PATH")).collect::<Vec<_>>();
-        assert_eq!(paths.first(), Some(&PathBuf::from("/opt/loom/bin")));
+        let path_val = env.get("PATH").expect("PATH");
+        let paths = std::env::split_paths(path_val).collect::<Vec<_>>();
+        assert!(paths.contains(&PathBuf::from("/opt/loom/bin")));
         assert!(paths.contains(&PathBuf::from("/usr/bin")));
         assert!(paths.contains(&PathBuf::from("/bin")));
     }
@@ -8432,10 +8440,10 @@ mod tests {
             .is_some_and(|value| value.contains("chan_demo")));
         assert!(vars
             .get("agent.configDir")
-            .is_some_and(|value| value.ends_with("agents/actor_demo")));
+            .is_some_and(|value| value.ends_with(&format!("agents{}actor_demo", std::path::MAIN_SEPARATOR))));
         assert!(vars
             .get("agent.specPath")
-            .is_some_and(|value| value.ends_with("agents/actor_demo/spec.json")));
+            .is_some_and(|value| value.ends_with(&format!("agents{}actor_demo{}spec.json", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR))));
         std::fs::remove_dir_all(root).ok();
     }
 

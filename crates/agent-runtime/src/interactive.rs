@@ -1104,6 +1104,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn signed_thinking_replay_error_drops_saved_interactive_session() {
         let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
@@ -1126,6 +1127,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn successful_done_requires_sentinel_and_saves_session() {
         let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
@@ -1163,6 +1165,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn process_exit_without_sentinel_is_failed_done() {
         let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));

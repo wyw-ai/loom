@@ -2960,7 +2960,7 @@ mod tests {
             prompt_via: PromptVia::Args,
             prompt: None,
             stdin_template: None,
-            sessions_dir: PathBuf::from("/tmp/loom-test-sessions"),
+            sessions_dir: std::env::temp_dir().join("loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
             command_signature: "sha256:test".into(),
@@ -2988,7 +2988,7 @@ mod tests {
             parts: Vec::new(),
             outputs: BTreeMap::from([("full".into(), content.into())]),
             model: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             template_vars: BTreeMap::new(),
         }
@@ -3786,6 +3786,7 @@ mod tests {
         assert_eq!(messages, vec!["First", "Final"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_stream_does_not_duplicate_completed_messages_at_process_end() {
         let mut cfg = cfg();
@@ -3852,6 +3853,7 @@ mod tests {
         assert_eq!(argv, vec!["--input", "hi"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn args_prompt_does_not_pipe_stdin_to_child() {
         let mut cfg = cfg();
@@ -4035,6 +4037,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_prompt_saves_decoder_captured_provider_session() {
         let mut cfg = cfg();
@@ -4076,6 +4079,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_prompt_saves_stderr_decoder_captured_provider_session() {
         let mut cfg = cfg();
@@ -4117,6 +4121,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stderr_decoder_final_text_is_emitted() {
         let mut cfg = cfg();
@@ -4153,6 +4158,7 @@ mod tests {
         assert_eq!(texts, vec!["from stderr"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_prompt_resumes_with_arg_specs_without_legacy_resume_args() {
         let mut cfg = cfg();
@@ -4185,6 +4191,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn signed_thinking_replay_error_drops_saved_resume_session() {
         let mut cfg = cfg();

@@ -11,13 +11,12 @@
 1. [前置依赖](#1-前置依赖)
 2. [项目克隆与结构](#2-项目克隆与结构)
 3. [Server 构建](#3-server-构建)
-4. [Daemon 构建](#4-daemon-构建)
-5. [CLI 构建](#5-cli-构建)
-6. [Shell 构建](#6-shell-构建)
-7. [GUI 构建](#7-gui-构建)
-8. [验证方法](#8-验证方法)
-9. [常见问题](#9-常见问题)
-10. [产物路径速查](#10-产物路径速查)
+4. [Daemon + CLI 构建](#4-daemon--cli-构建)
+5. [Shell 构建](#5-shell-构建)
+6. [GUI 构建](#6-gui-构建)
+7. [验证方法](#7-验证方法)
+8. [常见问题](#8-常见问题)
+9. [产物路径速查](#9-产物路径速查)
 
 ---
 
@@ -133,37 +132,27 @@ cargo build -p loom-server --release
 
 **产物路径**：`target/release/loom-server.exe`
 
-**可选参数**：
-- 去掉 `--release` 构建 debug 版本（更大、有调试符号、未优化）
-- 添加 `--target x86_64-pc-windows-msvc` 显式指定目标平台
-
 ---
 
-## 4. Daemon 构建
+## 4. Daemon + CLI 构建
+
+> **注意**：`loom` 和 `loom-daemon` 是二进制名称，它们都属于同一个 Rust 包 `loom-cli`。
 
 ```powershell
-cargo build -p loom-daemon --release
-```
+# 同时构建 CLI + Daemon（推荐）
+cargo build -p loom-cli --release
 
-**产物路径**：`target/release/loom-daemon.exe`
+# 产物路径
+#   target/release/loom.exe         — CLI 工具
+#   target/release/loom-daemon.exe  — 守护进程
+```
 
 loom-daemon 是 Loom 多 actor 协作的守护进程，负责管理 agent 生命周期和消息路由。
-
----
-
-## 5. CLI 构建
-
-```powershell
-cargo build -p loom --release
-```
-
-**产物路径**：`target/release/loom.exe`
-
 CLI 工具用于与 loom-daemon 交互（发送消息、查询状态等）。
 
 ---
 
-## 6. Shell 构建
+## 5. Shell 构建
 
 ```powershell
 cargo build -p loom-shell --release
@@ -175,9 +164,9 @@ loom-shell 是 Agent 执行 shell 命令的代理进程，独立于 Tauri GUI �
 
 ---
 
-## 7. GUI 构建
+## 6. GUI 构建
 
-### 7.1 前端构建（独立验证）
+### 6.1 前端构建（独立验证）
 
 ```powershell
 cd apps/gui-web
@@ -187,7 +176,7 @@ pnpm build
 
 产物输出到 `apps/gui-web/dist/`。
 
-### 7.2 Tauri 桌面应用构建
+### 6.2 Tauri 桌面应用构建
 
 **前置步骤**：确保已安装 Tauri CLI：
 
@@ -219,18 +208,18 @@ cargo tauri build --ci --bundles nsis
 
 ---
 
-## 8. 验证方法
+## 7. 验证方法
 
 ### Server 验证
 
 ```powershell
-.\target\release\loom-server.exe --version
+.\target\release\loom-server.exe --help
 ```
 
 ### Daemon 验证
 
 ```powershell
-.\target\release\loom-daemon.exe --version
+.\target\release\loom-daemon.exe --help
 ```
 
 ### CLI 验证
@@ -242,7 +231,7 @@ cargo tauri build --ci --bundles nsis
 ### Shell 验证
 
 ```powershell
-.\target\release\loom-shell.exe --version
+.\target\release\loom-shell.exe --help
 ```
 
 ### GUI 验证
@@ -256,14 +245,14 @@ cargo tauri build --ci --bundles nsis
 ### 一键构建所有组件
 
 ```powershell
-cargo build -p loom-server -p loom-daemon -p loom -p loom-shell --release
+cargo build -p loom-server -p loom-cli -p loom-shell --release
 ```
 
 ---
 
-## 9. 常见问题
+## 8. 常见问题
 
-### 9.1 `error: linker 'link.exe' not found`
+### 8.1 `error: linker 'link.exe' not found`
 
 **原因**：未安装 Visual Studio C++ Build Tools 或未正确配置 MSVC 工具链。
 
@@ -274,7 +263,7 @@ where link.exe
 # 如未找到，重新运行 Visual Studio Installer，安装 "使用 C++ 的桌面开发" 工作负载
 ```
 
-### 9.2 `error: could not compile openssl-sys`
+### 8.2 `error: could not compile openssl-sys`
 
 **原因**：Tauri 依赖 OpenSSL C 库，需要系统级编译工具。
 
@@ -291,7 +280,7 @@ set OPENSSL_DIR=C:\vcpkg\packages\openssl_x64-windows-static
 winget install StrawberryPerl.StrawberryPerl
 ```
 
-### 9.3 `mingw-w64-gcc not found`
+### 8.3 `mingw-w64-gcc not found`
 
 **原因**：部分 Rust crate 的 C 依赖需要 GCC 编译器（`openssl-sys`、`ring` 等）。
 
@@ -305,7 +294,7 @@ pacman -S mingw-w64-ucrt-x86_64-gcc
 # 方案 B：使用 vcpkg（见 9.2）
 ```
 
-### 9.4 路径过长错误 (MAX_PATH / Error 206 / os error 3)
+### 8.4 路径过长错误 (MAX_PATH / Error 206 / os error 3)
 
 **原因**：agent ID、thread ID、channel ID 拼接的目录路径超过 Windows MAX_PATH 260 字符限制。
 
@@ -324,7 +313,7 @@ pacman -S mingw-w64-ucrt-x86_64-gcc
 >   -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
 > ```
 
-### 9.5 `pnpm install` 失败
+### 8.5 `pnpm install` 失败
 
 **原因**：pnpm workspace 配置或 lockfile 版本不匹配。
 
@@ -338,7 +327,7 @@ rm -r node_modules apps/gui-web/node_modules
 pnpm install --frozen-lockfile
 ```
 
-### 9.6 GUI 构建时 `beforeBuildCommand` 失败
+### 8.6 GUI 构建时 `beforeBuildCommand` 失败
 
 **原因**：前端依赖未安装或 TypeScript 编译错误。
 
@@ -353,7 +342,7 @@ pnpm build
 ls dist/index.html
 ```
 
-### 9.7 NSIS 安装包构建失败
+### 8.7 NSIS 安装包构建失败
 
 **原因**：NSIS 工具未安装。
 
@@ -365,18 +354,19 @@ winget install NSIS.NSIS
 
 ---
 
-## 10. 产物路径速查
+## 9. 产物路径速查
 
 | 组件 | Cargo 包名 | 构建命令 | 产物路径 |
 |------|-----------|----------|----------|
 | Server | `loom-server` | `cargo build -p loom-server --release` | `target/release/loom-server.exe` |
-| Daemon | `loom-daemon` | `cargo build -p loom-daemon --release` | `target/release/loom-daemon.exe` |
-| CLI | `loom` | `cargo build -p loom --release` | `target/release/loom.exe` |
+| CLI | `loom-cli` | `cargo build -p loom-cli --release` | `target/release/loom.exe` |
+| Daemon | `loom-cli` | `cargo build -p loom-cli --release` | `target/release/loom-daemon.exe` |
 | Shell | `loom-shell` | `cargo build -p loom-shell --release` | `target/release/loom-shell.exe` |
 | GUI 安装包 | `loom-gui` | `cd crates/gui && cargo tauri build --ci --bundles nsis` | `target/release/bundle/nsis/Loom Desktop_0.1.0_x64-setup.exe` |
 | GUI 可执行 | `loom-gui` | （同上） | `target/release/loom-gui.exe` |
 
-> **注意**：所有 `cargo build` 命令从项目根目录执行。`cargo tauri build` 必须从 `crates/gui/` 目录执行，因为 `tauri.conf.json` 中的 `beforeBuildCommand.cwd` 路径相对于该目录解析。
+> **注意**：`loom` 和 `loom-daemon` 是同一个 Rust 包 `loom-cli` 下的两个二进制。构建 `loom-cli` 会同时产出两个 .exe。
+> 所有 `cargo build` 命令从项目根目录执行。`cargo tauri build` 必须从 `crates/gui/` 目录执行。
 
 ---
 

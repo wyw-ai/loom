@@ -68,6 +68,23 @@
 - **设计文档**: [[2026-06-14-copilot-instructions-injection-design]]
 - **关联**: [[Session 上下文去重优化设计]]
 
+### #6 HANSIONSTATION Host 无法删除 + loom-shell ANSI 乱码 ✅ 已修复 (2026-06-18)
+
+- **严重程度**: 🔴 Critical — GUI 无法删除遗留 host，loom-shell 日志显示乱码
+- **影响范围**: GUI Host 管理、loom-shell 控制面板
+- **问题 A — HANSIONSTATION 无法删除**:
+  - 遗留 `actor_service_local`（displayName: "HANSIONSTATION"）存储在默认服务器数据库 `%APPDATA%\loom\server\loom.sqlite3`（85 MB）中
+  - GUI `machine_remove` 命令是硬编码 stub，始终返回 "host is daemon-owned; stop or reconfigure the daemon instead"
+  - 通过 CLI `actor delete actor_service_local` 连接默认数据目录删除
+- **问题 B — loom-shell 日志 ANSI 乱码**:
+  - 三层缺陷：`log_viewer.rs` 无 ANSI 剥离 → `ui.rs` `SetWindowTextW` 不支持 ANSI → `agent-runtime` `strip_ansi()` 仅处理 CSI
+  - 修复：扩展 `strip_ansi()` 覆盖 OSC/DCS/APC/SOS 全部 ESC 变体，在 `command.rs`、`log_viewer.rs`、`ui.rs` 三处添加 ANSI 剥离
+- **问题 C — machine_remove stub**:
+  - `crates/gui/src/ipc.rs` `machine_remove()` 从硬编码错误改为完整实现：删除服务器 actor + 清理本地配置目录
+- **文件**: `crates/agent-runtime/src/interactive.rs`, `crates/agent-runtime/src/command.rs`, `crates/loom-shell/src/log_viewer.rs`, `crates/loom-shell/src/ui.rs`, `crates/gui/src/ipc.rs`
+- **测试**: 699/699 测试通过
+- **关联**: [[2026-06-18 HANSIONSTATION 删除与 ANSI 显示修复]]
+
 ## 已关闭
 
 _（暂无）_
@@ -76,6 +93,7 @@ _（暂无）_
 
 | 日期 | 描述 |
 |------|------|
+| 2026-06-18 | 修复 HANSIONSTATION 无法删除、loom-shell ANSI 乱码、实现 machine_remove（699 测试通过） |
 | 2026-06-14 | 修复 Copilot CLI Session 上下文膨胀（instructions_via 注入策略，677 测试通过） |
 | 2026-06-14 | 修复频道删除后 Agent 继续执行导致错误循环（新增 CHANNEL_DELETED 处理） |
 | 2026-06-14 | 修复 `resolve_actor_alias` 返回僵尸 Actor 导致 `message.send` 失败 |

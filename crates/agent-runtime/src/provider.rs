@@ -1776,6 +1776,7 @@ fn is_supported_runtime_template_var(name: &str) -> bool {
             | "loom.trigger.actor"
             | "paths.cwd"
             | "workspace.dir"
+            | "loom_agent_home"
             | "agent.root"
             | "agent.configDir"
             | "agent.specPath"
@@ -1783,6 +1784,7 @@ fn is_supported_runtime_template_var(name: &str) -> bool {
             | "agent.workspace"
             | "agent.logs"
             | "agent.skills"
+            | "agent.skillWorkspace"
             | "agent.bundle_root"
             | "agent.bundle"
             | "agent.skillBody"
@@ -2281,6 +2283,8 @@ fn claude_manifest() -> ProviderManifest {
     let first_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         lit("--permission-mode"),
         lit("bypassPermissions"),
         lit("--output-format"),
@@ -2297,6 +2301,8 @@ fn claude_manifest() -> ProviderManifest {
     let resume_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         lit("--permission-mode"),
         lit("bypassPermissions"),
         lit("--output-format"),
@@ -2318,7 +2324,12 @@ fn claude_manifest() -> ProviderManifest {
     let nonprint_mode = ProviderModeSpec {
         transport: "interactive_command".into(),
         command: "{bin}".into(),
-        args: vec![lit("--add-dir"), lit("{agent.configDir}")],
+        args: vec![
+            lit("--add-dir"),
+            lit("{agent.configDir}"),
+            lit("--add-dir"),
+            lit("{agent.skillWorkspace}"),
+        ],
         model_args: vec!["--model".into(), "{model}".into()],
         env: BTreeMap::new(),
         stdin: None,
@@ -2395,12 +2406,7 @@ fn claude_manifest() -> ProviderManifest {
         BTreeMap::from([
             (
                 "print".into(),
-                mode(
-                    "{bin}",
-                    first_args,
-                    "claude_stream_json",
-                    Some(session),
-                ),
+                mode("{bin}", first_args, "claude_stream_json", Some(session)),
             ),
             ("nonprint".into(), nonprint_mode),
         ]),
@@ -2418,6 +2424,8 @@ fn qoder_manifest() -> ProviderManifest {
     let first_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         lit("--yolo"),
         lit("--output-format"),
         lit("stream-json"),
@@ -2434,6 +2442,8 @@ fn qoder_manifest() -> ProviderManifest {
     let resume_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         lit("--yolo"),
         lit("--output-format"),
         lit("stream-json"),
@@ -2459,12 +2469,7 @@ fn qoder_manifest() -> ProviderManifest {
         "Qoder CLI",
         &["qodercli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = mode(
-                "{bin}",
-                first_args,
-                "claude_stream_json",
-                Some(session),
-            );
+            let mut mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
             mode.stdout.capture = Some(session_capture("$.session_id"));
             mode
         })]),
@@ -2482,6 +2487,8 @@ fn copilot_manifest() -> ProviderManifest {
     let args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         lit("--yolo"),
         lit("--output-format"),
         lit("json"),
@@ -2495,27 +2502,24 @@ fn copilot_manifest() -> ProviderManifest {
             vec![lit("--effort"), lit("{reasoningEffort}")],
         ),
         lit("-p"),
-        lit("{prompt.full}"),
+        lit("{prompt.user}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
         resume_args: args.clone(),
         scope: Some("actor_scope".into()),
     };
+    let mut mode = mode("{bin}", args, "copilot_jsonl_final_text", Some(session));
+    mode.stdout = copilot_jsonl_decoder();
+    mode.env.insert(
+        "COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(),
+        "{loom_agent_home}".into(),
+    );
     manifest(
         "copilot",
         "GitHub Copilot CLI",
         &["copilot", "copilotcli"],
-        BTreeMap::from([("print".into(), {
-            let mut mode = mode(
-                "{bin}",
-                args,
-                "copilot_jsonl_final_text",
-                Some(session),
-            );
-            mode.stdout = copilot_jsonl_decoder();
-            mode
-        })]),
+        BTreeMap::from([("print".into(), mode)]),
         &[
             ("gpt-5.5", "GPT-5.5"),
             ("gpt-5.4", "GPT-5.4"),
@@ -2549,8 +2553,10 @@ fn codex_manifest() -> ProviderManifest {
         lit("sandbox_workspace_write.network_access=true"),
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("{prompt.full}"),
+        lit("{prompt.user}"),
     ];
     let resume_args = vec![
         lit("exec"),
@@ -2564,8 +2570,10 @@ fn codex_manifest() -> ProviderManifest {
         lit("sandbox_workspace_write.network_access=true"),
         lit("--add-dir"),
         lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("{prompt.full}"),
+        lit("{prompt.user}"),
     ];
     let mut mode = mode(
         "{bin}",
@@ -2579,6 +2587,8 @@ fn codex_manifest() -> ProviderManifest {
     );
     mode.stdout.capture = Some(session_capture("$.session_id"));
     mode.env.insert("LOOM_NO_DAEMON".into(), "1".into());
+    mode.env
+        .insert("CODEX_HOME".into(), "{loom_agent_home}".into());
     manifest(
         "codex",
         "Codex CLI",
@@ -2606,7 +2616,7 @@ fn opencode_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--variant"), lit("{reasoningEffort}")],
         ),
-        lit("{prompt.full}"),
+        lit("{prompt.user}"),
     ];
     let resume_args = vec![
         lit("run"),
@@ -2620,7 +2630,7 @@ fn opencode_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--variant"), lit("{reasoningEffort}")],
         ),
-        lit("{prompt.full}"),
+        lit("{prompt.user}"),
     ];
     let mut mode = mode(
         "{bin}",
@@ -2644,6 +2654,10 @@ fn opencode_manifest() -> ProviderManifest {
     mode.env.insert(
         "XDG_CACHE_HOME".into(),
         "{agent.profile}/opencode/cache".into(),
+    );
+    mode.env.insert(
+        "OPENCODE_CONFIG".into(),
+        "{agent.skillWorkspace}/.opencode/opencode.json".into(),
     );
     manifest(
         "opencode",
@@ -2984,12 +2998,7 @@ mod tests {
             &["bad-provider"],
             BTreeMap::from([(
                 "print".into(),
-                mode(
-                    "{bin}",
-                    vec![lit("{prompt.full}")],
-                    "text",
-                    None,
-                ),
+                mode("{bin}", vec![lit("{prompt.full}")], "text", None),
             )]),
             &[],
         );
@@ -3006,12 +3015,7 @@ mod tests {
             &["safe-agent"],
             BTreeMap::from([(
                 "print".into(),
-                mode(
-                    "other-agent",
-                    vec![lit("{prompt.full}")],
-                    "text",
-                    None,
-                ),
+                mode("other-agent", vec![lit("{prompt.full}")], "text", None),
             )]),
             &[],
         );
@@ -3031,12 +3035,7 @@ mod tests {
             &["candidate-agent"],
             BTreeMap::from([(
                 "print".into(),
-                mode(
-                    "candidate-agent",
-                    vec![lit("{prompt.full}")],
-                    "text",
-                    None,
-                ),
+                mode("candidate-agent", vec![lit("{prompt.full}")], "text", None),
             )]),
             &[],
         );
@@ -3137,12 +3136,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_provider_owned_prompt() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.prompt = Some(ProviderPromptSpec {
             workspace_files: Vec::new(),
             outputs: BTreeMap::from([(
@@ -3526,12 +3520,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unknown_decoder_format() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "xml".into();
         provider_mode.stdout.name = None;
         let manifest = manifest(
@@ -3548,12 +3537,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unknown_decoder_event_type() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "jsonl".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.events = vec![ProviderDecoderEventSpec {
@@ -3578,12 +3562,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_bad_decoder_reducer() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "jsonl".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
@@ -3608,12 +3587,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_allows_decoder_wildcard_path() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "jsonl".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
@@ -3637,12 +3611,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_allows_json_decoder() {
-        let mut provider_mode = mode(
-            "{bin}",
-            vec![lit("{prompt.full}")],
-            "text",
-            None,
-        );
+        let mut provider_mode = mode("{bin}", vec![lit("{prompt.full}")], "text", None);
         provider_mode.stdout.format = "json".into();
         provider_mode.stdout.name = None;
         provider_mode.stdout.reduce = Some(ProviderJsonlReduceSpec {
@@ -3691,6 +3660,7 @@ mod tests {
         assert!(transport.args.contains(&"{prompt.system}".into()));
         assert!(transport.args.contains(&"{prompt.user}".into()));
         assert!(transport.args.contains(&"{agent.configDir}".into()));
+        assert!(transport.args.contains(&"{agent.skillWorkspace}".into()));
         assert!(!transport.args.contains(&"{loom.configDir}".into()));
         assert_eq!(
             transport.session.as_ref().and_then(|s| s.id_source),
@@ -3728,7 +3698,15 @@ mod tests {
         .expect("transport");
 
         assert_eq!(transport.kind, "interactive_command");
-        assert_eq!(transport.args, vec!["--add-dir", "{agent.configDir}"]);
+        assert_eq!(
+            transport.args,
+            vec![
+                "--add-dir",
+                "{agent.configDir}",
+                "--add-dir",
+                "{agent.skillWorkspace}"
+            ]
+        );
         assert_eq!(transport.model_args, vec!["--model", "{model}"]);
         let interactive = transport.interactive.as_ref().expect("interactive config");
         assert!(interactive.session.new_args.contains(&"{prompt}".into()));
@@ -3748,7 +3726,7 @@ mod tests {
     }
 
     #[test]
-    fn builtins_default_add_dir_to_agent_config_dir() {
+    fn builtins_default_add_dir_to_agent_config_and_skill_workspace() {
         for provider_id in ["claude", "qoder", "copilot", "codex"] {
             let manifest = builtin_provider_manifests()
                 .into_iter()
@@ -3757,7 +3735,11 @@ mod tests {
             let rendered = serde_json::to_string(&manifest).expect("manifest json");
             assert!(
                 rendered.contains("{agent.configDir}"),
-                "{provider_id} should expose only the current agent config dir by default"
+                "{provider_id} should expose the current agent config dir by default"
+            );
+            assert!(
+                rendered.contains("{agent.skillWorkspace}"),
+                "{provider_id} should expose the current agent skill workspace by default"
             );
             assert!(
                 !rendered.contains("{loom.configDir}"),
@@ -3795,7 +3777,11 @@ mod tests {
         assert_eq!(plan.provider_id, "opencode");
         assert!(plan.args.contains(&"--format".into()));
         assert!(plan.args.contains(&"json".into()));
-        assert!(plan.args.contains(&"{prompt.full}".into()));
+        assert!(plan.args.contains(&"{prompt.user}".into()));
+        assert_eq!(
+            plan.env.get("OPENCODE_CONFIG").map(String::as_str),
+            Some("{agent.skillWorkspace}/.opencode/opencode.json")
+        );
         assert_eq!(
             plan.session.as_ref().and_then(|session| session.id_source),
             Some(CommandSessionIdSource::ProviderCapture)
@@ -3806,7 +3792,7 @@ mod tests {
             .and_then(|session| session.resume_args.as_ref())
             .is_some_and(|args| args.contains(&"--session".into())
                 && args.contains(&"{session_id}".into())
-                && args.contains(&"{prompt.full}".into())));
+                && args.contains(&"{prompt.user}".into())));
         assert_eq!(
             plan.decoder.as_ref().map(|decoder| decoder.format.as_str()),
             Some("jsonl")

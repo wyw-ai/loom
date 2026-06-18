@@ -2154,7 +2154,9 @@ fn reminder_schedule(state: &AppState, params: Option<Value>) -> HandlerResult {
     };
     let reminder = state
         .store
-        .schedule_reminder(p.actor_id, p.title, p.scope, p.msg_id, fire_at, p.repeat)
+        .schedule_reminder(
+            p.actor_id, p.title, p.scope, p.msg_id, fire_at, p.repeat, p._meta,
+        )
         .map_err(map_store_err)?;
     ok(ReminderScheduleResult { reminder })
 }

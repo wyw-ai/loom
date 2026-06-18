@@ -1372,6 +1372,7 @@ pub async fn machine_create(
         return Err("host name is required".into());
     }
     let machine = pending_machine_registration(&cfg, name, args.data_root)?;
+    save_pending_machine_registration(&machine)?;
     let mut result = machines_from_config(&cfg, state.try_client().await).await?;
     upsert_server_machine_info(&mut result.machines, machine);
     Ok(result)
@@ -1542,9 +1543,9 @@ async fn machines_from_config(
 ) -> Result<MachineListResult, String> {
     let server_url = active_server_url(cfg);
     let mut result = MachineListResult {
-        machines: Vec::new(),
+        machines: pending_machine_infos(cfg)?,
     };
-    merge_server_machine_inventory(&mut result, cfg, client.as_ref(), server_url).await;
+    merge_server_machine_inventory(&mut result, cfg, client.as_ref(), server_url).await?;
     apply_connection_status(&mut result, client).await;
     Ok(result)
 }
@@ -1577,16 +1578,18 @@ async fn merge_server_machine_inventory(
     cfg: &DesktopConfig,
     client: Option<&Arc<Client>>,
     server_url: &str,
-) {
+) -> Result<(), String> {
     let Some(client) = client else {
-        return;
+        return Ok(());
     };
-    let Ok(value) = client.call_raw(method::ACTOR_LIST, None).await else {
-        return;
-    };
-    let Some(actors) = value.get("actors").and_then(Value::as_array) else {
-        return;
-    };
+    let value = client
+        .call_raw(method::ACTOR_LIST, None)
+        .await
+        .map_err(deep_stringify)?;
+    let actors = value
+        .get("actors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "actor/list returned malformed machine inventory response".to_string())?;
     for actor in actors {
         if let Some(meta) = remote_machine_meta_from_actor(actor) {
             if is_legacy_remote_machine_inventory(&meta) {
@@ -1599,11 +1602,15 @@ async fn merge_server_machine_inventory(
         };
         upsert_server_machine_info(&mut result.machines, machine);
     }
+    Ok(())
 }
 
 fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, machine: MachineInfo) {
     if let Some(existing) = machines.iter_mut().find(|m| m.id == machine.id) {
-        if machine.inventory_revision >= existing.inventory_revision {
+        if machine.inventory_revision > existing.inventory_revision
+            || (machine.inventory_revision == existing.inventory_revision
+                && machine.inventory_observed_at > existing.inventory_observed_at)
+        {
             *existing = machine;
         }
     } else {
@@ -1930,7 +1937,7 @@ fn pending_machine_registration(
 
     Ok(MachineInfo {
         workspace_id: config::active_workspace_id(cfg).map(str::to_string),
-        owner_actor_id: cfg.account.as_ref().map(|account| account.actor_id.clone()),
+        owner_actor_id: config::active_owner_actor_id(cfg),
         id: machine_id,
         name: name.to_string(),
         kind: "local".into(),
@@ -1954,6 +1961,151 @@ fn pending_machine_registration(
         serve_command,
         setup_script,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingMachineRegistration {
+    workspace_id: Option<String>,
+    owner_actor_id: Option<String>,
+    id: String,
+    name: String,
+    kind: String,
+    data_root: String,
+    config_dir: String,
+}
+
+fn pending_machine_registrations_path() -> PathBuf {
+    config::config_dir().join("pending-hosts.json")
+}
+
+fn load_pending_machine_registrations() -> Result<Vec<PendingMachineRegistration>, String> {
+    let path = pending_machine_registrations_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("read pending hosts {}: {err}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map_err(|err| format!("parse pending hosts {}: {err}", path.display()))
+}
+
+fn write_pending_machine_registrations(
+    registrations: &[PendingMachineRegistration],
+) -> Result<(), String> {
+    let path = pending_machine_registrations_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("create pending hosts directory {}: {err}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(registrations)
+        .map_err(|err| format!("serialize pending hosts: {err}"))?;
+    std::fs::write(&path, text)
+        .map_err(|err| format!("write pending hosts {}: {err}", path.display()))
+}
+
+fn pending_machine_from_info(machine: &MachineInfo) -> PendingMachineRegistration {
+    PendingMachineRegistration {
+        workspace_id: machine.workspace_id.clone(),
+        owner_actor_id: machine.owner_actor_id.clone(),
+        id: machine.id.clone(),
+        name: machine.name.clone(),
+        kind: machine.kind.clone(),
+        data_root: machine.data_root.clone(),
+        config_dir: machine.config_dir.clone(),
+    }
+}
+
+fn save_pending_machine_registration(machine: &MachineInfo) -> Result<(), String> {
+    let mut registrations = load_pending_machine_registrations()?;
+    let pending = pending_machine_from_info(machine);
+    if let Some(existing) = registrations
+        .iter_mut()
+        .find(|registration| registration.id == pending.id)
+    {
+        *existing = pending;
+    } else {
+        registrations.push(pending);
+    }
+    write_pending_machine_registrations(&registrations)
+}
+
+fn pending_machine_infos(cfg: &DesktopConfig) -> Result<Vec<MachineInfo>, String> {
+    let registrations = load_pending_machine_registrations()?;
+    Ok(pending_machine_infos_from_registrations(
+        cfg,
+        &registrations,
+    ))
+}
+
+fn pending_machine_infos_from_registrations(
+    cfg: &DesktopConfig,
+    registrations: &[PendingMachineRegistration],
+) -> Vec<MachineInfo> {
+    registrations
+        .iter()
+        .filter(|registration| pending_machine_visible(cfg, registration))
+        .map(|registration| pending_machine_info_from_registration(cfg, registration))
+        .collect()
+}
+
+fn pending_machine_visible(cfg: &DesktopConfig, registration: &PendingMachineRegistration) -> bool {
+    if let Some(workspace_id) = registration.workspace_id.as_deref() {
+        if config::active_workspace_id(cfg) != Some(workspace_id) {
+            return false;
+        }
+    }
+    if let Some(owner_actor_id) = registration.owner_actor_id.as_deref() {
+        if config::active_owner_actor_id(cfg).as_deref() != Some(owner_actor_id) {
+            return false;
+        }
+    }
+    true
+}
+
+fn pending_machine_info_from_registration(
+    cfg: &DesktopConfig,
+    registration: &PendingMachineRegistration,
+) -> MachineInfo {
+    let data_root = PathBuf::from(&registration.data_root);
+    let config_dir = PathBuf::from(&registration.config_dir);
+    let (serve_command, setup_script) = daemon_start_commands(
+        &data_root,
+        Some(&config_dir),
+        active_server_url(cfg),
+        &registration.id,
+        &registration.name,
+    );
+    MachineInfo {
+        workspace_id: registration.workspace_id.clone(),
+        owner_actor_id: registration.owner_actor_id.clone(),
+        id: registration.id.clone(),
+        name: registration.name.clone(),
+        kind: if registration.kind.trim().is_empty() {
+            "local".into()
+        } else {
+            registration.kind.clone()
+        },
+        source: "local_registration".into(),
+        read_only: true,
+        can_command: false,
+        can_open_local_path: true,
+        capabilities: vec!["machine.register".into()],
+        inventory_revision: 0,
+        inventory_observed_at: None,
+        status: "pending".into(),
+        setup_status: "pending".into(),
+        connection_status: "notConnected".into(),
+        connection_actor_id: String::new(),
+        data_root: registration.data_root.clone(),
+        config_dir: registration.config_dir.clone(),
+        agent_count: 0,
+        online_agent_count: 0,
+        providers: Vec::new(),
+        agents: Vec::new(),
+        serve_command,
+        setup_script,
+    }
 }
 
 fn default_machine_data_root(machine_id: &str) -> PathBuf {
@@ -2444,6 +2596,98 @@ mod tests {
     }
 
     #[test]
+    fn pending_machine_registration_is_visible_for_active_workspace() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+        };
+        let registrations = vec![PendingMachineRegistration {
+            workspace_id: Some("default".into()),
+            owner_actor_id: Some(account.actor_id.clone()),
+            id: "machine_pending".into(),
+            name: "Pending Host".into(),
+            kind: "local".into(),
+            data_root: "/tmp/loom-pending-data".into(),
+            config_dir: "/tmp/loom-pending-config".into(),
+        }];
+
+        let machines = pending_machine_infos_from_registrations(&cfg, &registrations);
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].id, "machine_pending");
+        assert_eq!(machines[0].source, "local_registration");
+        assert_eq!(machines[0].setup_status, "pending");
+        assert!(machines[0]
+            .serve_command
+            .contains("--machine-id machine_pending"));
+    }
+
+    #[test]
+    fn server_inventory_replaces_pending_machine_registration() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+        };
+        let registrations = vec![PendingMachineRegistration {
+            workspace_id: Some("default".into()),
+            owner_actor_id: Some(account.actor_id.clone()),
+            id: "machine_pending".into(),
+            name: "Pending Host".into(),
+            kind: "local".into(),
+            data_root: "/tmp/loom-pending-data".into(),
+            config_dir: "/tmp/loom-pending-config".into(),
+        }];
+        let actor = json!({
+            "id": "actor_service_machine_pending",
+            "kind": "service",
+            "displayName": "Pending Host",
+            "_meta": {
+                "role": "machine",
+                "source": "daemon",
+                "machineId": "machine_pending",
+                "inventoryVersion": 2,
+                "revision": 2,
+                "observedAt": "2026-05-13T10:50:00Z",
+                "workspaceId": "default",
+                "ownerActorId": account.actor_id,
+                "name": "Pending Host",
+                "kind": "local",
+                "dataRoot": "/tmp/loom-pending-data",
+                "configDir": "/tmp/loom-pending-config",
+                "capabilities": ["inventory.read", "connection.status", "machine.command"],
+                "providers": [],
+                "agentSpecs": []
+            }
+        });
+        let server_machine = server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc")
+            .expect("server machine");
+        let mut machines = pending_machine_infos_from_registrations(&cfg, &registrations);
+
+        upsert_server_machine_info(&mut machines, server_machine);
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].id, "machine_pending");
+        assert_eq!(machines[0].source, "server_inventory");
+        assert_eq!(machines[0].inventory_revision, 2);
+    }
+
+    #[test]
     fn actor_list_filter_ignores_agents_without_daemon_inventory() {
         let account = test_account();
         let cfg = DesktopConfig {
@@ -2803,6 +3047,52 @@ mod tests {
             machines[0].agents[0].info.spec.actor.id,
             "actor_remote_agent"
         );
+    }
+
+    #[test]
+    fn server_machine_inventory_same_revision_keeps_newer_observed_snapshot() {
+        let mut current = MachineInfo {
+            workspace_id: Some("default".into()),
+            owner_actor_id: Some("actor_human_1".into()),
+            id: "machine_remote".into(),
+            name: "Remote Box".into(),
+            kind: "local".into(),
+            source: "server_inventory".into(),
+            read_only: false,
+            can_command: true,
+            can_open_local_path: false,
+            capabilities: vec!["machine.command".into()],
+            inventory_revision: 7,
+            inventory_observed_at: Some("2026-05-13T10:51:00Z".into()),
+            status: "configured".into(),
+            setup_status: "configured".into(),
+            connection_status: "online".into(),
+            connection_actor_id: "actor_service_machine_remote".into(),
+            data_root: "/tmp/loom-data".into(),
+            config_dir: "/tmp/loom-config".into(),
+            agent_count: 1,
+            online_agent_count: 0,
+            providers: Vec::new(),
+            agents: Vec::new(),
+            serve_command: String::new(),
+            setup_script: String::new(),
+        };
+        let mut stale = current.clone();
+        stale.name = "Stale Box".into();
+        stale.inventory_observed_at = Some("2026-05-13T10:50:00Z".into());
+        let mut machines = vec![current.clone()];
+
+        upsert_server_machine_info(&mut machines, stale);
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].name, "Remote Box");
+
+        current.name = "Fresh Box".into();
+        current.inventory_observed_at = Some("2026-05-13T10:52:00Z".into());
+        upsert_server_machine_info(&mut machines, current);
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].name, "Fresh Box");
     }
 
     #[test]

@@ -1494,6 +1494,8 @@ pub struct ReminderScheduleParams {
     pub fire_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2717,8 +2719,10 @@ pub struct AgentSpec {
     pub models: Option<AgentModelSpec>,
     /// Optional actor-local bundle configuration. When present, the runtime
     /// ensures a skill / tool bundle is available under the actor home before
-    /// the transport is started, then exposes its resolved paths through
-    /// template variables / env injection.
+    /// the transport is started. Each turn projects the current scope's
+    /// bundles into provider-native skill directories under the agent
+    /// workspace, then exposes the resolved paths through template variables /
+    /// env injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<AgentBundleSpec>,
     /// Optional per-actor memory configuration. Defines where records live

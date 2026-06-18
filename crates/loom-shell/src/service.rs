@@ -4,14 +4,17 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
-    SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
-    SERVICE_STOP_PENDING, StartServiceW,
+    StartServiceW, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP,
+    SERVICE_STOPPED, SERVICE_STOP_PENDING,
 };
 
 /// 将 Rust 字符串转为 Windows 宽字符串（以 null 结尾的 Vec<u16>）。
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 服务状态枚举。

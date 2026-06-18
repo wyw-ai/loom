@@ -74,7 +74,11 @@ fn update_block(existing: &str, new_block: &str) -> String {
     out
 }
 
-fn loom_block(actor_id: &str, agent_instructions: Option<&str>, actor_context: Option<&str>) -> String {
+fn loom_block(
+    actor_id: &str,
+    agent_instructions: Option<&str>,
+    actor_context: Option<&str>,
+) -> String {
     let mut block = format!(
         "{BEGIN_MARKER}\n\
 ## Loom multi-actor runtime\n\

@@ -46,8 +46,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use crate::acp::create_dir_all_unc;
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use crate::acp::create_dir_all_unc;
 use crate::provider::ProviderRuntimeEvent;
 use crate::usage::extract_token_usage_from_text;
 
@@ -682,7 +682,9 @@ fn spawn_and_collect(
     // On Windows, prevent console windows and let child escape the Tauri
     // GUI's restrictive job object.
     #[cfg(windows)]
-    cmd.creation_flags(crate::path_util::CREATE_NO_WINDOW | crate::path_util::CREATE_BREAKAWAY_FROM_JOB);
+    cmd.creation_flags(
+        crate::path_util::CREATE_NO_WINDOW | crate::path_util::CREATE_BREAKAWAY_FROM_JOB,
+    );
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", command_path.display(), e))?;
@@ -754,7 +756,9 @@ fn spawn_and_collect(
             let stdin_body = cfg
                 .stdin_template
                 .as_ref()
-                .map(|template| expand_stdin_template(template, cfg, prompt, session_id, &prompt.content))
+                .map(|template| {
+                    expand_stdin_template(template, cfg, prompt, session_id, &prompt.content)
+                })
                 .unwrap_or_else(|| prompt.content.clone());
             // Write stdin on a background thread so a slow write doesn't stall
             // the foreground polling loop.  The reader threads above guarantee
@@ -2778,10 +2782,10 @@ fn strip_prompt_args(argv: &mut Vec<String>) {
     while i < argv.len() {
         if matches!(argv[i].as_str(), "-p" | "--prompt") {
             if i + 1 < argv.len() {
-                argv.remove(i);     // remove -p
-                argv.remove(i);     // remove its value
+                argv.remove(i); // remove -p
+                argv.remove(i); // remove its value
             } else {
-                argv.remove(i);     // trailing -p with no value
+                argv.remove(i); // trailing -p with no value
             }
         } else {
             i += 1;
@@ -2952,11 +2956,7 @@ fn expand_template_inner(
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{model}", active_model(request).as_deref().unwrap_or(""))
-        .replace("{prompt}", if strip_prompt {
-            ""
-        } else {
-            prompt
-        })
+        .replace("{prompt}", if strip_prompt { "" } else { prompt })
         .replace(
             "{prompt.full}",
             if strip_prompt {

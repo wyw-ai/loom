@@ -43,7 +43,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, sleep, Duration};
 
-use agent_runtime::acp::{AcpAdapter, AcpConfig, create_dir_all_unc, normalize_path_separators};
+use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 use agent_runtime::usage;
@@ -500,7 +500,9 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
         .await?;
     tracing::info!(
         "[{}] machine host connected to {} as {}",
-        host.machine_id, server_url, host.actor_id
+        host.machine_id,
+        server_url,
+        host.actor_id
     );
 
     let mut notifications = client.notifications.lock().await;
@@ -871,7 +873,13 @@ impl AgentPaths {
             );
             e
         })?;
-        agent_runtime::ensure_agents_md(&scope.workspace, actor_id, agent_instructions, actor_context).map_err(|e| {
+        agent_runtime::ensure_agents_md(
+            &scope.workspace,
+            actor_id,
+            agent_instructions,
+            actor_context,
+        )
+        .map_err(|e| {
             tracing::error!(
                 actor = %actor_id,
                 workspace = %scope.workspace.display(),
@@ -1239,26 +1247,28 @@ fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
         // not DeleteFileW (remove_file). Try remove_dir first for symlinks
         // since they typically point to directories; fall back to remove_file
         // for file symlinks.
-        std::fs::remove_dir(path).or_else(|e| {
-            if e.raw_os_error() == Some(5) {
-                // os error 5 on remove_dir for a file symlink — try remove_file
-                std::fs::remove_file(path)
-            } else {
+        std::fs::remove_dir(path)
+            .or_else(|e| {
+                if e.raw_os_error() == Some(5) {
+                    // os error 5 on remove_dir for a file symlink — try remove_file
+                    std::fs::remove_file(path)
+                } else {
+                    tracing::error!(
+                        path = %path.display(),
+                        %e,
+                        "remove_path_if_exists: remove_dir failed on symlink"
+                    );
+                    Err(e)
+                }
+            })
+            .map_err(|e| {
                 tracing::error!(
                     path = %path.display(),
                     %e,
-                    "remove_path_if_exists: remove_dir failed on symlink"
+                    "remove_path_if_exists: failed to remove symlink"
                 );
-                Err(e)
-            }
-        }).map_err(|e| {
-            tracing::error!(
-                path = %path.display(),
-                %e,
-                "remove_path_if_exists: failed to remove symlink"
-            );
-            e
-        })
+                e
+            })
     } else if meta.is_file() {
         std::fs::remove_file(path).map_err(|e| {
             tracing::error!(
@@ -2721,7 +2731,8 @@ async fn handle_model_action_response_message(
     if option_id.is_empty() {
         tracing::warn!(
             "[{}] model action.response message {} ignored: missing metadata.optionId",
-            state.actor_id, message.id
+            state.actor_id,
+            message.id
         );
         return Ok(());
     }
@@ -2743,7 +2754,9 @@ async fn handle_model_action_response_message(
     let Some(choice) = choice else {
         tracing::warn!(
             "[{}] model action.response message {} ignored: unknown model `{}`",
-            state.actor_id, message.id, option_id
+            state.actor_id,
+            message.id,
+            option_id
         );
         state.forget_model_action_request(request_message_id);
         return Ok(());
@@ -2758,7 +2771,10 @@ async fn handle_model_action_response_message(
             .await?;
         tracing::error!(
             "[{}] failed to select model `{}` via {}: {}",
-            state.actor_id, option_id, message.id, err
+            state.actor_id,
+            option_id,
+            message.id,
+            err
         );
         return Ok(());
     }
@@ -2779,7 +2795,9 @@ async fn handle_model_action_response_message(
     .await?;
     tracing::info!(
         "[{}] selected model `{}` via {}",
-        state.actor_id, option_id, message.id
+        state.actor_id,
+        option_id,
+        message.id
     );
     Ok(())
 }
@@ -3057,7 +3075,8 @@ async fn handle_action_response_message(
     let Some(request_message_id) = request_message_id else {
         tracing::warn!(
             "[{}] action.response message {} ignored: missing parentMessageId",
-            state.actor_id, message.id
+            state.actor_id,
+            message.id
         );
         return Ok(());
     };
@@ -3087,7 +3106,9 @@ async fn handle_action_response_message(
             Some(id) => {
                 tracing::info!(
                     "[{}] action.response message {} used echoed ACP request id for {}",
-                    state.actor_id, message.id, request_message_id
+                    state.actor_id,
+                    message.id,
+                    request_message_id
                 );
                 id
             }
@@ -3095,7 +3116,9 @@ async fn handle_action_response_message(
                 tracing::warn!(
                     "[{}] action.response message {} ignored: no pending ACP request for {} \
                      (loom-daemon may have restarted after the action.request)",
-                    state.actor_id, message.id, request_message_id
+                    state.actor_id,
+                    message.id,
+                    request_message_id
                 );
                 return Ok(());
             }
@@ -3110,13 +3133,17 @@ async fn handle_action_response_message(
     if option_id.is_empty() {
         tracing::warn!(
             "[{}] action.response message {} ignored: missing metadata.optionId",
-            state.actor_id, message.id
+            state.actor_id,
+            message.id
         );
         return Ok(());
     }
     tracing::info!(
         "[{}] action.response message {} -> ACP request {} option {}",
-        state.actor_id, message.id, request_id, option_id
+        state.actor_id,
+        message.id,
+        request_id,
+        option_id
     );
     adapter
         .respond_action(request_id.clone(), option_id)
@@ -3391,7 +3418,8 @@ async fn try_ensure_adapter_started(
         Err(err) => {
             tracing::error!(
                 "[{}] adapter start failed for control command: {}",
-                state.actor_id, err
+                state.actor_id,
+                err
             );
             Some(err)
         }
@@ -3415,7 +3443,8 @@ async fn open_model_picker(
                 Err(err) => {
                     tracing::error!(
                         "[{}] failed to load ACP model options: {}",
-                        state.actor_id, err
+                        state.actor_id,
+                        err
                     );
                     adapter_error = Some(err);
                     None
@@ -3676,15 +3705,13 @@ async fn build_adapter_prompt(
         .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
     let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
     let agent_instructions = agent_instructions_manifest(&state.spec);
-    let scope_paths = state
-        .paths
-        .ensure_scope(
-            &state.actor_id,
-            &channel_id,
-            scope,
-            Some(&agent_instructions),
-            Some(&actor_context),
-        )?;
+    let scope_paths = state.paths.ensure_scope(
+        &state.actor_id,
+        &channel_id,
+        scope,
+        Some(&agent_instructions),
+        Some(&actor_context),
+    )?;
     let mut template_vars = state
         .paths
         .template_vars(&state.actor_id, &channel_id, scope);
@@ -6056,7 +6083,9 @@ async fn translate_one(
             state.record_action_request(sent.message.id.clone(), id.clone());
             tracing::info!(
                 "[{actor_id}] action.request {} -> trigger {} (ACP request {})",
-                sent.message.id, active.trigger_actor, id
+                sent.message.id,
+                active.trigger_actor,
+                id
             );
         }
         AdapterEvent::StatusChange { scope: _, status } => {
@@ -6162,7 +6191,9 @@ async fn translate_one(
             if let Some(next) = next_trigger {
                 match dispatch_trigger(client, state, adapter, next).await {
                     Ok(_) => {}
-                    Err(e) => tracing::error!("[{actor_id}] failed to dispatch queued trigger: {e}"),
+                    Err(e) => {
+                        tracing::error!("[{actor_id}] failed to dispatch queued trigger: {e}")
+                    }
                 }
             }
         }
@@ -6636,7 +6667,11 @@ async fn send_action_request_message(
     let body = format_action_request_body(&metadata);
     // Prefer the explicit reply target (which carries the correct thread
     // root for channel-scoped messages) over deriving from scope alone.
-    let target = match (reply_target_override.as_deref(), scope.kind, &parent_message_id) {
+    let target = match (
+        reply_target_override.as_deref(),
+        scope.kind,
+        &parent_message_id,
+    ) {
         (Some(ovr), _, _) => ovr.to_string(),
         (None, ScopeKind::Channel, Some(parent)) => format!("#{}:{}", scope.id, parent),
         _ => message_target_for_scope(client, scope).await?,
@@ -7197,11 +7232,8 @@ mod tests {
     #[test]
     fn inject_loom_cli_env_sets_absolute_cli_and_prepends_path() {
         let mut env = BTreeMap::new();
-        let path_list = std::env::join_paths(&[
-            PathBuf::from("/usr/bin"),
-            PathBuf::from("/bin"),
-        ])
-        .unwrap();
+        let path_list =
+            std::env::join_paths(&[PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
         env.insert("PATH".into(), path_list.into_string().unwrap());
         let loom = PathBuf::from("/opt/loom/bin/loom");
 
@@ -8656,12 +8688,16 @@ mod tests {
         assert!(vars
             .get("workspace.dir")
             .is_some_and(|value| value.contains("chan_demo")));
-        assert!(vars
-            .get("agent.configDir")
-            .is_some_and(|value| value.ends_with(&format!("agents{}actor_demo", std::path::MAIN_SEPARATOR))));
+        assert!(vars.get("agent.configDir").is_some_and(
+            |value| value.ends_with(&format!("agents{}actor_demo", std::path::MAIN_SEPARATOR))
+        ));
         assert!(vars
             .get("agent.specPath")
-            .is_some_and(|value| value.ends_with(&format!("agents{}actor_demo{}spec.json", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR))));
+            .is_some_and(|value| value.ends_with(&format!(
+                "agents{}actor_demo{}spec.json",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            ))));
         std::fs::remove_dir_all(root).ok();
     }
 

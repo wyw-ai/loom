@@ -834,11 +834,52 @@ impl AgentPaths {
         actor_context: Option<&str>,
     ) -> std::io::Result<ScopePaths> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
-        create_dir_all_unc(&scope.workspace)?;
-        create_dir_all_unc(&scope.logs)?;
-        create_dir_all_unc(&scope.channel_artifacts)?;
-        ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
-        agent_runtime::ensure_agents_md(&scope.workspace, actor_id, agent_instructions, actor_context)?;
+        create_dir_all_unc(&scope.workspace).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %scope.workspace.display(),
+                %e,
+                "ensure_scope: create_dir_all_unc workspace failed"
+            );
+            e
+        })?;
+        create_dir_all_unc(&scope.logs).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %scope.logs.display(),
+                %e,
+                "ensure_scope: create_dir_all_unc logs failed"
+            );
+            e
+        })?;
+        create_dir_all_unc(&scope.channel_artifacts).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %scope.channel_artifacts.display(),
+                %e,
+                "ensure_scope: create_dir_all_unc channel_artifacts failed"
+            );
+            e
+        })?;
+        ensure_scope_skills_link(&scope.workspace, &scope.skills).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                workspace = %scope.workspace.display(),
+                skills_target = %scope.skills.display(),
+                %e,
+                "ensure_scope: ensure_scope_skills_link failed"
+            );
+            e
+        })?;
+        agent_runtime::ensure_agents_md(&scope.workspace, actor_id, agent_instructions, actor_context).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                workspace = %scope.workspace.display(),
+                %e,
+                "ensure_scope: ensure_agents_md failed"
+            );
+            e
+        })?;
         Ok(scope)
     }
 
@@ -1062,15 +1103,60 @@ fn run_no_reply_file(logs_dir: &Path, run_id: &str) -> PathBuf {
 }
 
 fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
-    create_dir_all_unc(skills_target)?;
+    create_dir_all_unc(skills_target).map_err(|e| {
+        tracing::error!(
+            target = %skills_target.display(),
+            %e,
+            "ensure_scope_skills_link: create_dir_all_unc skills_target failed"
+        );
+        e
+    })?;
     let link_path = workspace.join("skills");
     match std::fs::read_link(&link_path) {
         Ok(existing) if existing == skills_target => return Ok(()),
-        Ok(_) => remove_path_if_exists(&link_path)?,
+        Ok(existing) => {
+            tracing::debug!(
+                link = %link_path.display(),
+                existing = %existing.display(),
+                new_target = %skills_target.display(),
+                "ensure_scope_skills_link: symlink target mismatch, removing old link"
+            );
+            remove_path_if_exists(&link_path).map_err(|e| {
+                tracing::error!(
+                    link = %link_path.display(),
+                    %e,
+                    "ensure_scope_skills_link: remove_path_if_exists failed"
+                );
+                e
+            })?;
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => remove_path_if_exists(&link_path)?,
+        Err(err) => {
+            tracing::debug!(
+                link = %link_path.display(),
+                %err,
+                "ensure_scope_skills_link: read_link error, attempting remove_path_if_exists"
+            );
+            remove_path_if_exists(&link_path).map_err(|e| {
+                tracing::error!(
+                    link = %link_path.display(),
+                    read_link_err = %err,
+                    remove_err = %e,
+                    "ensure_scope_skills_link: remove_path_if_exists after read_link failure"
+                );
+                e
+            })?;
+        }
     }
-    symlink_path(skills_target, &link_path)
+    symlink_path(skills_target, &link_path).map_err(|e| {
+        tracing::error!(
+            target = %skills_target.display(),
+            link = %link_path.display(),
+            %e,
+            "ensure_scope_skills_link: symlink_path failed"
+        );
+        e
+    })
 }
 
 fn ensure_bundle(
@@ -1139,12 +1225,58 @@ fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+        Err(err) => {
+            tracing::error!(
+                path = %path.display(),
+                %err,
+                "remove_path_if_exists: symlink_metadata failed"
+            );
+            return Err(err);
+        }
     };
-    if meta.file_type().is_symlink() || meta.is_file() {
-        std::fs::remove_file(path)
+    if meta.file_type().is_symlink() {
+        // On Windows, directory symlinks require RemoveDirectoryW (remove_dir),
+        // not DeleteFileW (remove_file). Try remove_dir first for symlinks
+        // since they typically point to directories; fall back to remove_file
+        // for file symlinks.
+        std::fs::remove_dir(path).or_else(|e| {
+            if e.raw_os_error() == Some(5) {
+                // os error 5 on remove_dir for a file symlink — try remove_file
+                std::fs::remove_file(path)
+            } else {
+                tracing::error!(
+                    path = %path.display(),
+                    %e,
+                    "remove_path_if_exists: remove_dir failed on symlink"
+                );
+                Err(e)
+            }
+        }).map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: failed to remove symlink"
+            );
+            e
+        })
+    } else if meta.is_file() {
+        std::fs::remove_file(path).map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: remove_file failed"
+            );
+            e
+        })
     } else {
-        std::fs::remove_dir_all(path)
+        std::fs::remove_dir_all(path).map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: remove_dir_all failed"
+            );
+            e
+        })
     }
 }
 

@@ -210,8 +210,6 @@ agent 管理现在归属于 machine 配置和 daemon：
 | `crates/cli/src/cmd/agent_serve.rs` | daemon 复用的 agent worker supervisor |
 | `crates/cli/src/cmd/agent.rs` | daemon-configured agent 离线查看 |
 | `crates/gui` | Tauri GUI |
-| `crates/loom-shell` | Windows native service management GUI (system tray, service control, logs) |
-| `crates/windows-console` | Windows console allocation for GUI-subsystem binaries |
 
 新的 runtime 能力只能放进 `crates/agent-runtime` 或 agent client；新的协议能力才进入
 server。

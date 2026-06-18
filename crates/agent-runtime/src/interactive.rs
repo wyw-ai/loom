@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::acp::create_dir_all_unc;
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
+use crate::acp::create_dir_all_unc;
 use crate::usage::extract_token_usage_from_text;
 
 #[derive(Debug, Clone)]

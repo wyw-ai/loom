@@ -3883,9 +3883,7 @@ impl Store {
         };
         self.journal
             .append(&Mutation::ThreadCreate(thread.clone()))?;
-        inner
-            .threads
-            .insert(thread.id.clone(), thread.clone());
+        inner.threads.insert(thread.id.clone(), thread.clone());
         drop(inner);
         self.emit(StoreEvent::ThreadCreated(thread.clone()));
         Ok(thread)
@@ -3988,12 +3986,17 @@ impl Store {
         // does a remove-then-insert to ensure this). This avoids picking
         // a zombie actor left over from a prior daemon restart that
         // produced a different machine_id / actor ID.
-        inner.actors.values().filter(|actor| {
-            let id_lower = actor.id.to_ascii_lowercase();
-            let display_lower = actor.display_name.to_ascii_lowercase();
-            let short = short_actor_alias(&actor.id).to_ascii_lowercase();
-            key == id_lower || key == display_lower || key == short
-        }).last().map(|actor| actor.id.clone())
+        inner
+            .actors
+            .values()
+            .filter(|actor| {
+                let id_lower = actor.id.to_ascii_lowercase();
+                let display_lower = actor.display_name.to_ascii_lowercase();
+                let short = short_actor_alias(&actor.id).to_ascii_lowercase();
+                key == id_lower || key == display_lower || key == short
+            })
+            .last()
+            .map(|actor| actor.id.clone())
     }
 
     fn resolve_actor_group_alias(&self, scope: &ScopeRef, raw: &str) -> Option<ActorGroup> {

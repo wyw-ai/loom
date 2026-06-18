@@ -372,7 +372,10 @@ fn refresh_tab(
         };
         if running {
             status_text = format!("{} Status: Process running", label);
-            detail_text = format!("Mode: Standalone process\nExecutable: {}", exe_path.display());
+            detail_text = format!(
+                "Mode: Standalone process\nExecutable: {}",
+                exe_path.display()
+            );
         } else {
             status_text = format!("{} Status: Not running", label);
             detail_text = format!(
@@ -469,7 +472,10 @@ fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isi
         };
         if running {
             status_text = format!("{} Status: Process running", label);
-            detail_text = format!("Mode: Standalone process\nExecutable: {}", exe_path.display());
+            detail_text = format!(
+                "Mode: Standalone process\nExecutable: {}",
+                exe_path.display()
+            );
         } else {
             status_text = format!("{} Status: Not running", label);
             detail_text = format!(

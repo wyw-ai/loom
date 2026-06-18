@@ -1992,16 +1992,69 @@ fn daemon_config_path() -> PathBuf {
 }
 
 fn resolve_daemon_server_url(cfg: &mut DaemonConfig, server_url: Option<&str>) -> (String, bool) {
-    let selected = server_url
+    let raw = server_url
         .and_then(trimmed_non_empty)
         .or_else(|| trimmed_non_empty(&cfg.server_url))
         .unwrap_or("ws://127.0.0.1:7878/rpc")
         .to_string();
+    let selected = normalize_daemon_server_url(&raw);
     let changed = cfg.server_url != selected;
     if changed {
         cfg.server_url = selected.clone();
     }
+    tracing::info!(
+        raw = %raw,
+        normalized = %selected,
+        "daemon server URL resolved"
+    );
     (selected, changed)
+}
+
+/// Normalize a daemon server URL so that a WebSocket connection to the
+/// server always succeeds regardless of how the URL was persisted.
+///
+/// - Forces `ws://` scheme (replaces `http://`).
+/// - Appends `/rpc` path when missing so the server can upgrade the
+///   connection to WebSocket (the server only upgrades on `/rpc`).
+fn normalize_daemon_server_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "ws://127.0.0.1:7878/rpc".to_string();
+    }
+
+    // Parse the URL, defaulting to ws:// scheme if missing.
+    let (scheme, rest) = if let Some(idx) = trimmed.find("://") {
+        let scheme = &trimmed[..idx];
+        let rest = &trimmed[idx + 3..];
+        (scheme, rest)
+    } else {
+        ("ws", trimmed)
+    };
+
+    // Force ws:// scheme — http:// cannot be upgraded to WebSocket by
+    // tokio_tungstenite and the server only upgrades on the /rpc route.
+    let scheme = if scheme.eq_ignore_ascii_case("wss") {
+        "wss"
+    } else {
+        "ws"
+    };
+
+    // Split host:port from path.
+    let (authority, path) = if let Some(idx) = rest.find('/') {
+        (&rest[..idx], &rest[idx..])
+    } else {
+        (rest, "/")
+    };
+
+    // Ensure path contains /rpc so the server recognises the WebSocket
+    // upgrade route.
+    let path = if path.contains("/rpc") {
+        path.to_string()
+    } else {
+        format!("/rpc{}", path.trim_end_matches('/'))
+    };
+
+    format!("{}://{}{}", scheme, authority.trim_end_matches('/'), path)
 }
 
 fn select_machine_for_daemon(

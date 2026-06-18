@@ -29,6 +29,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::interactive::strip_ansi;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -1002,8 +1004,9 @@ fn collect_stdout_line(
     line: &str,
     collected_stdout: &mut String,
 ) -> OutputLineEvents {
-    collected_stdout.push_str(line);
-    let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
+    let clean = strip_ansi(line);
+    collected_stdout.push_str(&clean);
+    let parsed_line = clean.trim_end_matches(&['\r', '\n'][..]);
     if let Some(decoder) = cfg.decoder.as_ref() {
         return collect_provider_decoder_line(decoder, parsed_line, &prompt.scope, sender);
     }

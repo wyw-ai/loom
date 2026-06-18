@@ -1,25 +1,25 @@
-//! 服务安装/卸载 — 调用 WinSW-x64.exe 安装或卸载 Windows 服务。
+//! Service install/uninstall — invoke WinSW-x64.exe to install or remove Windows services.
 
 use crate::config;
 use std::process::Command;
 
-/// 安装 loom-server 服务（调用 WinSW install）。
+/// Install the loom-server service (calls WinSW install).
 pub fn install_server() -> Result<String, String> {
     let winsw = config::winsw_exe();
     let xml = config::config_dir().join("loom-server.xml");
 
     if !winsw.exists() {
-        return Err(format!("WinSW 未找到: {}", winsw.display()));
+        return Err(format!("WinSW not found: {}", winsw.display()));
     }
     if !xml.exists() {
-        return Err(format!("服务配置文件未找到: {}", xml.display()));
+        return Err(format!("Service config file not found: {}", xml.display()));
     }
 
     let output = Command::new(&winsw)
         .arg("install")
         .arg(&xml)
         .output()
-        .map_err(|e| format!("执行 install 失败: {e}"))?;
+        .map_err(|e| format!("Executing install failed: {e}"))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -28,23 +28,23 @@ pub fn install_server() -> Result<String, String> {
     }
 }
 
-/// 安装 loom-daemon 服务。
+/// Install the loom-daemon service.
 pub fn install_daemon() -> Result<String, String> {
     let winsw = config::winsw_exe();
     let xml = config::config_dir().join("loom-daemon.xml");
 
     if !winsw.exists() {
-        return Err(format!("WinSW 未找到: {}", winsw.display()));
+        return Err(format!("WinSW not found: {}", winsw.display()));
     }
     if !xml.exists() {
-        return Err(format!("服务配置文件未找到: {}", xml.display()));
+        return Err(format!("Service config file not found: {}", xml.display()));
     }
 
     let output = Command::new(&winsw)
         .arg("install")
         .arg(&xml)
         .output()
-        .map_err(|e| format!("执行 install 失败: {e}"))?;
+        .map_err(|e| format!("Executing install failed: {e}"))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -53,7 +53,7 @@ pub fn install_daemon() -> Result<String, String> {
     }
 }
 
-/// 卸载 loom-server 服务。
+/// Uninstall the loom-server service.
 pub fn uninstall_server() -> Result<String, String> {
     let winsw = config::winsw_exe();
     let xml = config::config_dir().join("loom-server.xml");
@@ -61,7 +61,7 @@ pub fn uninstall_server() -> Result<String, String> {
         .arg("uninstall")
         .arg(&xml)
         .output()
-        .map_err(|e| format!("执行 uninstall 失败: {e}"))?;
+        .map_err(|e| format!("Executing uninstall failed: {e}"))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -70,7 +70,7 @@ pub fn uninstall_server() -> Result<String, String> {
     }
 }
 
-/// 卸载 loom-daemon 服务。
+/// Uninstall the loom-daemon service.
 pub fn uninstall_daemon() -> Result<String, String> {
     let winsw = config::winsw_exe();
     let xml = config::config_dir().join("loom-daemon.xml");
@@ -78,7 +78,7 @@ pub fn uninstall_daemon() -> Result<String, String> {
         .arg("uninstall")
         .arg(&xml)
         .output()
-        .map_err(|e| format!("执行 uninstall 失败: {e}"))?;
+        .map_err(|e| format!("Executing uninstall failed: {e}"))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())

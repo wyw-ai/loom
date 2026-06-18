@@ -478,7 +478,7 @@ fn apply_cross_scope_action_request_message(app: &mut App, scope: &ScopeRef, mes
 
 /// Register a run for agent status display AND the in-flight bar / cancel.
 /// Terminal runs stay in run_cache for TTL seconds so the user sees brief
-/// "运行失败"/"已取消" labels before they disappear.
+/// "Failed"/"Canceled" labels before they disappear.
 fn apply_run_updated(app: &mut App, run: Run) {
     if run.actor_id == app.actor_id {
         return;

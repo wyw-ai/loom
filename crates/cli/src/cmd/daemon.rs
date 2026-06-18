@@ -2075,7 +2075,10 @@ fn select_machine_for_daemon(
         .as_deref()
         .map(parse_machine_data_root_context)
         .unwrap_or_default();
-    let requested_id = requested.clone().unwrap_or_else(|| "local".into());
+    let requested_id = requested
+        .clone()
+        .or_else(|| cfg.machine.as_ref().map(|m| m.id.clone()))
+        .unwrap_or_else(|| "local".into());
     let mut machine = cfg.machine.clone().unwrap_or_else(|| MachineConfig {
         workspace_id: context.workspace_id.clone(),
         owner_actor_id: context.owner_actor_id.clone(),

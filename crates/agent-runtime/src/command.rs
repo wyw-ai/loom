@@ -634,10 +634,12 @@ fn spawn_and_collect(
             e
         )
     })?;
-    // On Windows, prefix both the command path and cwd with UNC prefix
-    // to bypass MAX_PATH (260 char) limit (Bug #2 Phase 2).
+    // On Windows, prefix the cwd with UNC prefix to bypass MAX_PATH (260
+    // char) limit (Bug #2 Phase 2).  Do NOT UNC-prefix the command path —
+    // `\\?\` bypasses PATHEXT resolution in CreateProcessW, so e.g.
+    // `\\?\D:\nodejs\copilot` would fail to resolve to `copilot.cmd`.
     #[cfg(windows)]
-    let command_path = crate::acp::unc_prefix_path(PathBuf::from(&cfg.command));
+    let command_path = PathBuf::from(&cfg.command);
     #[cfg(not(windows))]
     let command_path = PathBuf::from(&cfg.command);
     #[cfg(windows)]
@@ -645,13 +647,27 @@ fn spawn_and_collect(
     #[cfg(not(windows))]
     let spawn_cwd = prompt.cwd.clone();
 
+    // On Windows, `cmd.exe` treats newlines as command separators when
+    // wrapping `.CMD`/`.BAT` file invocations via `cmd.exe /c`. Arguments
+    // containing newlines (e.g. multi-line prompt content) cause "batch file
+    // arguments are invalid" (CreateProcessW error 0xC1). Replace newlines
+    // with spaces to prevent this.
+    let mut sanitized_argv: Vec<String>;
+    let final_argv: &[String] = if cfg!(windows) && is_batch_file(&command_path) {
+        sanitized_argv = argv.to_vec();
+        sanitize_batch_args(&mut sanitized_argv);
+        &sanitized_argv
+    } else {
+        argv
+    };
+
     let mut cmd = Command::new(&command_path);
     let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
     } else {
         Stdio::null()
     };
-    cmd.args(argv)
+    cmd.args(final_argv)
         .current_dir(&spawn_cwd)
         .stdin(stdin)
         .stdout(Stdio::piped())
@@ -996,6 +1012,30 @@ fn configure_process_group(cmd: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_process_group(_cmd: &mut Command) {}
+
+/// Check if the command path is a Windows batch file (.CMD or .BAT).
+/// Windows wraps `.CMD`/`.BAT` invocations with `cmd.exe /c`, which
+/// treats newlines as command separators.
+fn is_batch_file(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_ascii_lowercase();
+        lower == "cmd" || lower == "bat"
+    } else {
+        false
+    }
+}
+
+/// Replace newlines in arguments with spaces to prevent `cmd.exe` from
+/// treating them as command separators when wrapping `.CMD`/`.BAT`
+/// invocations with `cmd.exe /c`. Without this, multi-line prompt
+/// content triggers "batch file arguments are invalid" (error 0xC1).
+fn sanitize_batch_args(args: &mut [String]) {
+    for arg in args.iter_mut() {
+        if arg.contains('\n') || arg.contains('\r') {
+            *arg = arg.replace('\r', " ").replace('\n', " ");
+        }
+    }
+}
 
 fn collect_stdout_line(
     cfg: &CommandConfig,
@@ -2650,7 +2690,9 @@ fn expand_first_run_argv(
 ) -> Vec<String> {
     if !cfg.arg_specs.is_empty() {
         let mut argv = expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
-        strip_prompt_args(&mut argv);
+        if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            strip_prompt_args(&mut argv);
+        }
         return argv;
     }
     let mut argv: Vec<String> = cfg
@@ -2662,7 +2704,9 @@ fn expand_first_run_argv(
         let mut model_args = Vec::new();
         append_model_args(&mut model_args, cfg, request, session_id, prompt);
         argv.splice(pos..pos, model_args);
-        strip_prompt_args(&mut argv);
+        if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            strip_prompt_args(&mut argv);
+        }
         return argv;
     }
     if matches!(cfg.prompt_via, PromptVia::Args) {
@@ -2687,7 +2731,9 @@ fn expand_first_run_argv(
             argv.push(prompt.to_string());
         }
     }
-    strip_prompt_args(&mut argv);
+    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        strip_prompt_args(&mut argv);
+    }
     argv
 }
 
@@ -2776,7 +2822,9 @@ fn expand_argv(
         let mut model_args = Vec::new();
         append_model_args(&mut model_args, cfg, request, session_id, prompt);
         argv.splice(pos..pos, model_args);
-        strip_prompt_args(&mut argv);
+        if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            strip_prompt_args(&mut argv);
+        }
         return argv;
     }
     if matches!(cfg.prompt_via, PromptVia::Args) {
@@ -2799,7 +2847,9 @@ fn expand_argv(
             argv.push(prompt.to_string());
         }
     }
-    strip_prompt_args(&mut argv);
+    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        strip_prompt_args(&mut argv);
+    }
     argv
 }
 

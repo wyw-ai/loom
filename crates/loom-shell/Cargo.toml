@@ -8,6 +8,7 @@ license = "MIT"
 # Only build on Windows; excluded from default-members so non-Windows
 # `cargo check --workspace` won't try to resolve these deps.
 [target.'cfg(windows)'.dependencies]
+proto = { workspace = true }
 native-windows-gui = "1.0.12"
 native-windows-derive = "1.0.5"
 windows-sys = { version = "0.59", features = [

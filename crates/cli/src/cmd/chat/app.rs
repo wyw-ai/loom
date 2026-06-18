@@ -69,7 +69,7 @@ pub struct CachedRun {
 /// Computed agent status info for the Members pane and @-mention picker.
 #[derive(Debug, Clone)]
 pub struct AgentStatusInfo {
-    pub label: String,             // "思考中 · user mention"
+    pub label: String,             // "Thinking · user mention"
     pub status: Option<RunStatus>, // for color dot
     pub is_stale: bool,            // timed out
 }
@@ -282,7 +282,7 @@ impl App {
     /// picks the highest-priority non-terminal run for each, computes a
     /// Chinese label, and writes into `agent_statuses`. Terminal runs
     /// linger for `TTL_TERMINAL_SECS` after closing so the user can see
-    /// "运行失败" / "已取消" briefly.
+    /// "Failed" / "Canceled" briefly.
     pub fn recompute_agent_statuses(&mut self) {
         use std::collections::HashMap;
         let now = Utc::now();
@@ -387,11 +387,11 @@ impl App {
     ///
     /// In a private channel the picker is restricted to actors the operator
     /// can actually message without first inviting: members of the
-    /// current channel ∪ "公区" actors (today: union of all Public channel
+    /// current channel ∪ "public area" actors (today: union of all Public channel
     /// memberships). Non-members are deliberately *not* listed — explicit
     /// invitation goes through the dedicated invite picker.
     /// TODO: once the dedicated lobby channel concept lands (in-flight on
-    /// another branch), narrow "公区" from "any Public channel" to that
+    /// another branch), narrow "public area" from "any Public channel" to that
     /// single lobby channel.
     pub fn update_at_menu(&mut self) {
         let input = self.input.display_text();
@@ -446,7 +446,7 @@ impl App {
 
     /// Union of member sets across all Public channels currently visible in
     /// the sidebar — actors the operator can address from anywhere because
-    /// they live in the shared "公区". Empty when there's no sidebar yet
+    /// they live in the shared "public area". Empty when there's no sidebar yet
     /// (first frame after launch); the caller's filter falls back to "no
     /// public actors" which is the safe default.
     fn publicly_addressable_actors(&self) -> std::collections::HashSet<String> {
@@ -750,16 +750,16 @@ fn timeout_for(s: RunStatus) -> i64 {
 /// gui-web V3 `runStatusFullLabel()`.
 pub fn compute_run_status_label(cr: &CachedRun, is_stale: bool) -> String {
     let base = match cr.status {
-        RunStatus::Queued => "排队中".to_string(),
-        RunStatus::PreparingContext => "准备中".to_string(),
-        RunStatus::Running => "思考中".to_string(),
+        RunStatus::Queued => "Queued".to_string(),
+        RunStatus::PreparingContext => "Preparing".to_string(),
+        RunStatus::Running => "Thinking".to_string(),
         RunStatus::WaitingTool => {
             // GUI V3 uses meta.toolName for tool name; fall back to start_reason.
             let tool = cr.tool_name.as_deref().or(cr.start_reason.as_deref());
             if let Some(tool) = tool {
-                format!("等待工具 · {}", tool)
+                format!("Waiting · {}", tool)
             } else {
-                "等待工具".to_string()
+                "Waiting".to_string()
             }
         }
         RunStatus::Failed => {
@@ -770,17 +770,17 @@ pub fn compute_run_status_label(cr: &CachedRun, is_stale: bool) -> String {
                 .or(cr.no_reply_reason.as_deref())
                 .or(cr.start_reason.as_deref());
             if let Some(reason) = reason {
-                format!("运行失败 · {}", reason)
+                format!("Failed · {}", reason)
             } else {
-                "运行失败".to_string()
+                "Failed".to_string()
             }
         }
-        RunStatus::Canceled => "已取消".to_string(),
+        RunStatus::Canceled => "Canceled".to_string(),
         RunStatus::Completed => return String::new(), // never show "completed"
     };
 
     if is_stale {
-        return format!("⚠ {} (超时)", base);
+        return format!("⚠ {} (stale)", base);
     }
 
     // Append start_reason for non-terminal states (except waiting_tool / failed
@@ -843,7 +843,7 @@ mod tests {
         );
         // Three registered agents:
         //   alpha: member of the current private channel
-        //   gamma: member of a separate Public channel ("公区")
+        //   gamma: member of a separate Public channel ("public area")
         //   beta:  member of nothing visible — should be filtered out
         app.agent_ids.insert("actor_agent_alpha".into());
         app.agent_ids.insert("actor_agent_beta".into());
@@ -900,7 +900,7 @@ mod tests {
 
         let picker = app.at_menu.expect("expected @-menu");
         let ids: Vec<String> = picker.items.iter().map(|it| it.id.clone()).collect();
-        // Alpha (channel member) and Gamma (公区) are listed; Beta is gone.
+        // Alpha (channel member) and Gamma (public area) are listed; Beta is gone.
         assert_eq!(ids, vec!["actor_agent_alpha", "actor_agent_gamma"]);
         // No more `(not in #foo)` hints — non-members don't appear at all.
         assert!(picker.items.iter().all(|it| it.hint.is_none()));
@@ -1127,25 +1127,25 @@ mod tests {
     #[test]
     fn compute_run_status_label_queued() {
         let r = cr(RunStatus::Queued, 0, None);
-        assert_eq!(compute_run_status_label(&r, false), "排队中 · mention");
+        assert_eq!(compute_run_status_label(&r, false), "Queued · mention");
     }
 
     #[test]
     fn compute_run_status_label_preparing_context() {
         let r = cr(RunStatus::PreparingContext, 0, None);
-        assert_eq!(compute_run_status_label(&r, false), "准备中 · mention");
+        assert_eq!(compute_run_status_label(&r, false), "Preparing · mention");
     }
 
     #[test]
     fn compute_run_status_label_running() {
         let r = cr(RunStatus::Running, 0, None);
-        assert_eq!(compute_run_status_label(&r, false), "思考中 · mention");
+        assert_eq!(compute_run_status_label(&r, false), "Thinking · mention");
     }
 
     #[test]
     fn compute_run_status_label_waiting_tool_with_tool_name() {
         let r = cr_tool(RunStatus::WaitingTool, "read_file");
-        assert_eq!(compute_run_status_label(&r, false), "等待工具 · read_file");
+        assert_eq!(compute_run_status_label(&r, false), "Waiting · read_file");
     }
 
     #[test]
@@ -1162,7 +1162,7 @@ mod tests {
         };
         assert_eq!(
             compute_run_status_label(&r, false),
-            "等待工具 · human_mention"
+            "Waiting · human_mention"
         );
     }
 
@@ -1178,7 +1178,7 @@ mod tests {
             error: None,
             no_reply_reason: None,
         };
-        assert_eq!(compute_run_status_label(&r, false), "等待工具");
+        assert_eq!(compute_run_status_label(&r, false), "Waiting");
     }
 
     #[test]
@@ -1186,41 +1186,38 @@ mod tests {
         let r = cr_failed(Some("connection refused"), None, None);
         assert_eq!(
             compute_run_status_label(&r, false),
-            "运行失败 · connection refused"
+            "Failed · connection refused"
         );
     }
 
     #[test]
     fn compute_run_status_label_failed_with_no_reply_reason() {
         let r = cr_failed(None, Some("rate limited"), None);
-        assert_eq!(
-            compute_run_status_label(&r, false),
-            "运行失败 · rate limited"
-        );
+        assert_eq!(compute_run_status_label(&r, false), "Failed · rate limited");
     }
 
     #[test]
     fn compute_run_status_label_failed_with_start_reason_fallback() {
         let r = cr_failed(None, None, Some("timeout"));
-        assert_eq!(compute_run_status_label(&r, false), "运行失败 · timeout");
+        assert_eq!(compute_run_status_label(&r, false), "Failed · timeout");
     }
 
     #[test]
     fn compute_run_status_label_failed_error_priority_over_no_reply() {
         let r = cr_failed(Some("crash"), Some("rate limited"), None);
-        assert_eq!(compute_run_status_label(&r, false), "运行失败 · crash");
+        assert_eq!(compute_run_status_label(&r, false), "Failed · crash");
     }
 
     #[test]
     fn compute_run_status_label_failed_no_reason() {
         let r = cr_failed(None, None, None);
-        assert_eq!(compute_run_status_label(&r, false), "运行失败");
+        assert_eq!(compute_run_status_label(&r, false), "Failed");
     }
 
     #[test]
     fn compute_run_status_label_canceled() {
         let r = cr(RunStatus::Canceled, 0, None);
-        assert_eq!(compute_run_status_label(&r, false), "已取消");
+        assert_eq!(compute_run_status_label(&r, false), "Canceled");
     }
 
     #[test]
@@ -1233,7 +1230,7 @@ mod tests {
     fn compute_run_status_label_stale_queued() {
         let r = cr(RunStatus::Queued, 0, None);
         // stale path returns early before appending start_reason
-        assert_eq!(compute_run_status_label(&r, true), "⚠ 排队中 (超时)");
+        assert_eq!(compute_run_status_label(&r, true), "⚠ Queued (stale)");
     }
 
     #[test]
@@ -1248,7 +1245,7 @@ mod tests {
             error: None,
             no_reply_reason: None,
         };
-        assert_eq!(compute_run_status_label(&r, false), "思考中");
+        assert_eq!(compute_run_status_label(&r, false), "Thinking");
     }
 
     #[test]
@@ -1297,7 +1294,7 @@ mod tests {
             .expect("agent_x should have status");
         assert_eq!(info.status, Some(RunStatus::Running));
         assert!(!info.is_stale, "not old enough to be stale");
-        assert!(info.label.contains("思考中"));
+        assert!(info.label.contains("Thinking"));
     }
 
     #[test]
@@ -1333,7 +1330,7 @@ mod tests {
             .expect("agent_y should have status within TTL");
         assert_eq!(info.status, Some(RunStatus::Failed));
         assert!(!info.is_stale);
-        assert!(info.label.contains("运行失败"));
+        assert!(info.label.contains("Failed"));
     }
 
     #[test]

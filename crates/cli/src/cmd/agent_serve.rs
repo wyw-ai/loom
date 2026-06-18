@@ -1598,7 +1598,7 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
-    /// 指令注入方式（从 provider manifest 复制）。"prompt" 或 "agents_md"。
+    /// How instructions are injected (copied from provider manifest). "prompt" or "agents_md".
     instructions_via: String,
 }
 

@@ -2525,6 +2525,7 @@ version = "0.1.0"
 dependencies = [
  "native-windows-derive",
  "native-windows-gui",
+ "proto",
  "windows-sys 0.59.0",
 ]
 

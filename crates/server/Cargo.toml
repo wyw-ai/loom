@@ -19,6 +19,7 @@ tokio = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }

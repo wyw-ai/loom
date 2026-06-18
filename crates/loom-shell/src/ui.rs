@@ -5,7 +5,7 @@
 //! - 中部：状态面板（服务名称、运行状态、PID）
 //! - 底部：操作按钮（启动/停止/重启/安装/卸载）
 //!
-//! 使用 NWG 原生控件，中文界面。
+//! 使用 NWG 原生控件，中文界面。自动 3 秒刷新日志。
 
 use native_windows_gui as nwg;
 use std::cell::RefCell;
@@ -48,6 +48,8 @@ pub struct LoomShell {
     btn_uninstall: nwg::Button,
     // 日志文本区（只读）
     log_area: nwg::TextBox,
+    // 自动刷新定时器
+    refresh_timer: nwg::Timer,
     // 共享状态
     state: Rc<RefCell<AppState>>,
     // 事件处理器句柄（保持存活）
@@ -73,6 +75,7 @@ impl LoomShell {
             btn_install: Default::default(),
             btn_uninstall: Default::default(),
             log_area: Default::default(),
+            refresh_timer: Default::default(),
             state,
             _event_handles: Vec::new(),
         };
@@ -127,6 +130,31 @@ impl LoomShell {
             .size((610, 250))
             .parent(&shell.window)
             .build(&mut shell.log_area)?;
+
+        // ---------- 自动刷新定时器（3 秒间隔）----------
+        nwg::Timer::builder()
+            .interval(3000u32)
+            .parent(&shell.window)
+            .build(&mut shell.refresh_timer)?;
+
+        // 定时器事件：自动刷新当前标签页的日志内容
+        {
+            let state_rc = shell.state.clone();
+            let lbl_status = shell.lbl_status.handle;
+            let lbl_detail = shell.lbl_detail.handle;
+            let log_area = shell.log_area.handle;
+            let ev = nwg::full_bind_event_handler(
+                &shell.refresh_timer.handle,
+                move |ev, _evd, _handle| {
+                    if ev != nwg::Event::OnTimerTick {
+                        return;
+                    }
+                    let tab = state_rc.borrow().current_tab;
+                    refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
+                },
+            );
+            shell._event_handles.push(ev);
+        }
 
         // ---------- 操作按钮 ----------
         nwg::Button::builder()
@@ -365,7 +393,7 @@ fn refresh_tab(
                 server_log, daemon_log
             );
             set_ctrl_text(lbl_status, "状态：日志查看");
-            set_ctrl_text(lbl_detail, "显示 LoomServer.out.log 和 LoomDaemon.out.log 最后 100 行");
+            set_ctrl_text(lbl_detail, "显示 loom-server.log 和 loom-daemon.log 最后 100 行（每3秒自动刷新）");
             set_ctrl_text(log_area, &combined);
             return;
         }
@@ -498,7 +526,7 @@ fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isi
                 server_log, daemon_log
             );
             set_hwnd_text(lbl_status, "状态：日志查看");
-            set_hwnd_text(lbl_detail, "显示 LoomServer.out.log 和 LoomDaemon.out.log 最后 100 行");
+            set_hwnd_text(lbl_detail, "显示 loom-server.log 和 loom-daemon.log 最后 100 行\n自动每 3 秒刷新");
             set_hwnd_text(log_area, &combined);
             return;
         }

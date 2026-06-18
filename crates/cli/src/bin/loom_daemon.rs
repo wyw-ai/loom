@@ -70,12 +70,37 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
+    use tracing_subscriber::prelude::*;
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+
+    // File log directory.  On Windows: %LOCALAPPDATA%\loom\logs\daemon.
+    // On Unix: ~/.local/share/loom/logs/daemon.
+    #[cfg(target_os = "windows")]
+    let log_dir = {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(local).join("loom").join("logs").join("daemon")
+    };
+    #[cfg(not(target_os = "windows"))]
+    let log_dir = {
+        let home = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        home.join("loom").join("logs").join("daemon")
+    };
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "loom-daemon.log");
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_appender)
+        .with_ansi(false);
+
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer)
+        .with(file_layer)
         .try_init();
+    tracing::info!(path = %log_dir.display(), "loom-daemon logging to file");
 }
 
 #[cfg(test)]

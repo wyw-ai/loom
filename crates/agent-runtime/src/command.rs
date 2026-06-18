@@ -699,21 +699,13 @@ fn spawn_and_collect(
         }
     }
 
-    if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
-        if let Some(mut stdin) = child.stdin.take() {
-            let stdin_body = cfg
-                .stdin_template
-                .as_ref()
-                .map(|template| expand_stdin_template(template, cfg, prompt, session_id, &prompt.content))
-                .unwrap_or_else(|| prompt.content.clone());
-            stdin
-                .write_all(stdin_body.as_bytes())
-                .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
-        }
-    }
-    // Drop unused stdin so the child doesn't block on read.
-    drop(child.stdin.take());
-
+    // Take stdout/stderr handles FIRST and start reader threads BEFORE writing
+    // stdin.  This prevents a deadlock where the parent blocks on stdin write
+    // (pipe buffer full because the child hasn't started reading yet) while the
+    // child blocks on stdout/stderr write (pipe buffer full because nobody is
+    // draining).  With readers already draining, the child can complete its
+    // startup output, reach the point where it reads stdin, and unblock the
+    // parent's write.
     let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
     let stderr = child.stderr.take().ok_or("failed to open child stderr")?;
 
@@ -751,6 +743,40 @@ fn spawn_and_collect(
         }
     });
     drop(output_tx);
+
+    // Write stdin AFTER reader threads are draining child output, preventing
+    // the pipe-buffer deadlock described above.  On Windows, write_all for a
+    // large prompt (> pipe buffer) can block; the readers keep the child from
+    // deadlocking on full stdout/stderr pipes.
+    let needs_stdin = cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin);
+    let stdin_handle = if needs_stdin {
+        if let Some(mut stdin_writer) = child.stdin.take() {
+            let stdin_body = cfg
+                .stdin_template
+                .as_ref()
+                .map(|template| expand_stdin_template(template, cfg, prompt, session_id, &prompt.content))
+                .unwrap_or_else(|| prompt.content.clone());
+            // Write stdin on a background thread so a slow write doesn't stall
+            // the foreground polling loop.  The reader threads above guarantee
+            // the child won't deadlock on its own output pipes.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = stdin_writer
+                    .write_all(stdin_body.as_bytes())
+                    .map_err(|e| format!("failed to write prompt to stdin: {e}"));
+                // Drop the writer so the child sees EOF on stdin.
+                drop(stdin_writer);
+                let _ = done_tx.send(result);
+            });
+            Some(done_rx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Drop unused stdin so the child doesn't block on read.
+    drop(child.stdin.take());
 
     let mut collected_stdout = String::new();
     let mut collected_stderr = String::new();
@@ -874,6 +900,14 @@ fn spawn_and_collect(
     };
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
+    // Check the background stdin write result.  If it failed, surface the error
+    // as an early_runtime_error so the caller gets a clear message instead of
+    // a confusing "No prompt provided" from the child.
+    if let Some(done_rx) = stdin_handle {
+        if let Ok(Err(e)) = done_rx.recv() {
+            early_runtime_error = Some(e);
+        }
+    }
     for output in output_rx.try_iter() {
         let events = collect_process_output(
             cfg,

@@ -1,6 +1,8 @@
-//! 日志查看器 — 读取 winsw 生成的日志文件末尾若干行，在只读文本区展示。
+//! 日志查看器 — 读取独立进程写入的日志文件末尾若干行，在只读文本区展示。
 //!
-//! winsw 默认日志命名：`<service-id>.out.log` / `<service-id>.err.log`
+//! 日志由 daemon/server 的 tracing-appender 写入（非 winsw）：
+//! - `loom-server.log`（滚动，每天一个新文件）
+//! - `loom-daemon.log`（滚动，每天一个新文件）
 
 use crate::config;
 use std::fs;
@@ -55,12 +57,12 @@ fn tail_file(path: &std::path::Path, n: usize) -> String {
     }
 }
 
-/// 读取 Server 日志最后 100 行（LoomServer.out.log）。
+/// 读取 Server 日志最后 100 行（loom-server.log）。
 pub fn tail_server() -> String {
-    tail_file(&config::server_log_dir().join("LoomServer.out.log"), 100)
+    tail_file(&config::server_log_file(), 100)
 }
 
-/// 读取 Daemon 日志最后 100 行（LoomDaemon.out.log）。
+/// 读取 Daemon 日志最后 100 行（loom-daemon.log）。
 pub fn tail_daemon() -> String {
-    tail_file(&config::daemon_log_dir().join("LoomDaemon.out.log"), 100)
+    tail_file(&config::daemon_log_file(), 100)
 }

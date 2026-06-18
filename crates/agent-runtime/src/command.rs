@@ -29,7 +29,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::interactive::strip_ansi;
+use proto::ansi::strip_ansi;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;

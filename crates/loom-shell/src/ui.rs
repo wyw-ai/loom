@@ -437,7 +437,7 @@ fn set_hwnd_text(hwnd: isize, text: &str) {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
-    let clean = strip_ansi_for_display(text);
+    let clean = proto::ansi::strip_ansi(text);
     let wide: Vec<u16> = OsStr::new(&clean)
         .encode_wide()
         .chain(std::iter::once(0))
@@ -447,43 +447,7 @@ fn set_hwnd_text(hwnd: isize, text: &str) {
     }
 }
 
-/// Strip ANSI escape sequences for Windows display.
-fn strip_ansi_for_display(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' {
-            out.push(ch);
-            continue;
-        }
-        match chars.peek().copied() {
-            Some('[') => {
-                let _ = chars.next();
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() { break; }
-                }
-            }
-            Some(']') => {
-                let _ = chars.next();
-                let mut prev = '\0';
-                for c in chars.by_ref() {
-                    if c == '\u{07}' || (prev == '\u{1b}' && c == '\\') { break; }
-                    prev = c;
-                }
-            }
-            Some(c) if "PX_^".contains(c) => {
-                let _ = chars.next();
-                let mut prev = '\0';
-                for c2 in chars.by_ref() {
-                    if c2 == '\u{07}' || (prev == '\u{1b}' && c2 == '\\') { break; }
-                    prev = c2;
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
+
 
 /// refresh_tab 的原始 HWND 版本，用于后台线程回调。
 fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isize) {

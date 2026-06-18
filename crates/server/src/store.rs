@@ -3861,6 +3861,18 @@ impl Store {
         channel_id: &str,
         root_message_id: &str,
     ) -> StoreResult<Thread> {
+        // Hold the write lock across existence check + creation to prevent
+        // TOCTOU: concurrent resolve_hash_message_target calls can both pass
+        // find_thread_by_root before either acquires the write lock here,
+        // creating duplicate threads for the same root message.
+        let mut inner = self.inner.write();
+        if let Some(existing) = inner
+            .threads
+            .values()
+            .find(|t| t.channel_id == channel_id && t.root_message_id == root_message_id)
+        {
+            return Ok(existing.clone());
+        }
         let thread = Thread {
             id: format!("thread_{}", short_id()),
             channel_id: channel_id.to_string(),
@@ -3871,10 +3883,10 @@ impl Store {
         };
         self.journal
             .append(&Mutation::ThreadCreate(thread.clone()))?;
-        self.inner
-            .write()
+        inner
             .threads
             .insert(thread.id.clone(), thread.clone());
+        drop(inner);
         self.emit(StoreEvent::ThreadCreated(thread.clone()));
         Ok(thread)
     }

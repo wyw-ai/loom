@@ -48,8 +48,6 @@ pub struct LoomShell {
     btn_uninstall: nwg::Button,
     // 日志文本区（只读）
     log_area: nwg::TextBox,
-    // 自动刷新定时器
-    refresh_timer: nwg::Timer,
     // 共享状态
     state: Rc<RefCell<AppState>>,
     // 事件处理器句柄（保持存活）
@@ -75,7 +73,6 @@ impl LoomShell {
             btn_install: Default::default(),
             btn_uninstall: Default::default(),
             log_area: Default::default(),
-            refresh_timer: Default::default(),
             state,
             _event_handles: Vec::new(),
         };
@@ -130,31 +127,6 @@ impl LoomShell {
             .size((610, 250))
             .parent(&shell.window)
             .build(&mut shell.log_area)?;
-
-        // ---------- 自动刷新定时器（3 秒间隔）----------
-        nwg::Timer::builder()
-            .interval(3000u32)
-            .parent(&shell.window)
-            .build(&mut shell.refresh_timer)?;
-
-        // 定时器事件：自动刷新当前标签页的日志内容
-        {
-            let state_rc = shell.state.clone();
-            let lbl_status = shell.lbl_status.handle;
-            let lbl_detail = shell.lbl_detail.handle;
-            let log_area = shell.log_area.handle;
-            let ev = nwg::full_bind_event_handler(
-                &shell.refresh_timer.handle,
-                move |ev, _evd, _handle| {
-                    if ev != nwg::Event::OnTimerTick {
-                        return;
-                    }
-                    let tab = state_rc.borrow().current_tab;
-                    refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
-                },
-            );
-            shell._event_handles.push(ev);
-        }
 
         // ---------- 操作按钮 ----------
         nwg::Button::builder()

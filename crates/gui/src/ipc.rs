@@ -1390,13 +1390,50 @@ pub struct MachineRemoveArgs {
 
 #[tauri::command]
 pub async fn machine_remove(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     args: MachineRemoveArgs,
 ) -> Result<MachineListResult, String> {
-    Err(format!(
-        "host `{}` is daemon-owned; stop or reconfigure the daemon instead of deleting it from GUI local state",
-        args.machine_id
-    ))
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let machine_id = args.machine_id.trim();
+    if machine_id.is_empty() {
+        return Err("machine id is required".into());
+    }
+
+    // Try to find this machine on the server and delete its actor.
+    // Server machines are registered as service actors with _meta.role == "machine".
+    if let Some(client) = state.try_client().await {
+        if let Ok(value) = client.call_raw(method::ACTOR_LIST, None).await {
+            if let Some(actors) = value.get("actors").and_then(Value::as_array) {
+                for actor in actors {
+                    let meta = actor.get("_meta");
+                    let machine_meta_id = meta
+                        .and_then(|m| m.get("machineId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let is_service = actor
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(|k| k == "service")
+                        .unwrap_or(false);
+                    if is_service && machine_meta_id == machine_id {
+                        if let Some(actor_id) = actor.get("id").and_then(Value::as_str) {
+                            delete_actors_from_server(Some(client.clone()), &[actor_id.to_string()])
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up local daemon config directory.
+    let config_dir = config::config_dir().join("daemon-configs").join(machine_id);
+    if config_dir.exists() {
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    // Return updated machine list.
+    machines_from_config(&cfg, state.try_client().await).await
 }
 #[tauri::command]
 pub async fn machine_agent_create(
@@ -2645,7 +2682,7 @@ mod tests {
         assert_eq!(machine.agents[0].info.spec.actor.id, "actor_remote_agent");
         assert_eq!(
             machine.agents[0].profile_path,
-            "/home/canfeng/.agentx/machine_remote/agents/actor_remote_agent/profile"
+            format!("/home/canfeng/.agentx/machine_remote{}agents{}actor_remote_agent{}profile", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)
         );
     }
 

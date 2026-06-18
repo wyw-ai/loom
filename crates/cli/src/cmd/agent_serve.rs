@@ -1176,6 +1176,33 @@ fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    match symlink_path_impl(source, target) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if err.raw_os_error() == Some(1314) || err.raw_os_error() == Some(5) {
+                tracing::warn!(
+                    "loom-daemon: symlink requires administrator privileges on Windows; \
+                     falling back to copy: {} -> {}",
+                    source.display(),
+                    target.display()
+                );
+                if source.is_dir() {
+                    copy_recursively(source, target)
+                } else {
+                    if let Some(parent) = target.parent() {
+                        create_dir_all_unc(parent)?;
+                    }
+                    std::fs::copy(source, target).map(|_| ())
+                }
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn symlink_path_impl(source: &Path, target: &Path) -> std::io::Result<()> {
     if source.is_dir() {
         std::os::windows::fs::symlink_dir(source, target)
     } else {

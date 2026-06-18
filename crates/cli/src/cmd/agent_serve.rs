@@ -6517,7 +6517,7 @@ async fn append_run_started_ack(
         send_agent_message(
             client,
             target,
-            "已收到，正在处理。".into(),
+            "Received, processing.".into(),
             parent_message_id,
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,
@@ -6530,7 +6530,7 @@ async fn append_run_started_ack(
         send_scope_message(
             client,
             &active.scope,
-            "已收到，正在处理。".into(),
+            "Received, processing.".into(),
             trigger.is_message().then(|| trigger.id().to_string()),
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,

@@ -729,7 +729,9 @@ fn reconcile_agents(
             let client = match crate::client::Client::connect(&url).await {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!("loom-daemon: failed to connect for stale actor cleanup: {e:#}");
+                    tracing::error!(
+                        "loom-daemon: failed to connect for stale actor cleanup: {e:#}"
+                    );
                     return;
                 }
             };

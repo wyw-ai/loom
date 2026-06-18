@@ -170,17 +170,19 @@ fn spawn_reminder_worker(state: AppState) {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    use tracing_subscriber::EnvFilter;
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // File log directory.  On Windows: %LOCALAPPDATA%\loom\logs\server.
     // On Unix: ~/.local/share/loom/logs/server.
     #[cfg(target_os = "windows")]
     let log_dir = {
         let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        std::path::PathBuf::from(local).join("loom").join("logs").join("server")
+        std::path::PathBuf::from(local)
+            .join("loom")
+            .join("logs")
+            .join("server")
     };
     #[cfg(not(target_os = "windows"))]
     let log_dir = {
@@ -199,8 +201,7 @@ fn init_tracing() {
     let (non_blocking, _guard) = tracing_appender::non_blocking(file);
 
     // Stderr layer for console/daemon manager output.
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr);
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     // File layer for persistent log storage.
     let file_layer = tracing_subscriber::fmt::layer()

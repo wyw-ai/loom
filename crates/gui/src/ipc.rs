@@ -1417,8 +1417,11 @@ pub async fn machine_remove(
                         .unwrap_or(false);
                     if is_service && machine_meta_id == machine_id {
                         if let Some(actor_id) = actor.get("id").and_then(Value::as_str) {
-                            delete_actors_from_server(Some(client.clone()), &[actor_id.to_string()])
-                                .await;
+                            delete_actors_from_server(
+                                Some(client.clone()),
+                                &[actor_id.to_string()],
+                            )
+                            .await;
                         }
                     }
                 }
@@ -2682,7 +2685,12 @@ mod tests {
         assert_eq!(machine.agents[0].info.spec.actor.id, "actor_remote_agent");
         assert_eq!(
             machine.agents[0].profile_path,
-            format!("/home/canfeng/.agentx/machine_remote{}agents{}actor_remote_agent{}profile", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)
+            format!(
+                "/home/canfeng/.agentx/machine_remote{}agents{}actor_remote_agent{}profile",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            )
         );
     }
 

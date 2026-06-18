@@ -1,11 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::config;
 
@@ -118,7 +116,9 @@ pub async fn start_proxy(socket: PathBuf, server_url: String) -> Result<JoinHand
     #[cfg(not(unix))]
     {
         let _ = (socket, server_url);
-        tracing::warn!("loom-daemon IPC is only supported on Unix platforms; running without IPC proxy");
+        tracing::warn!(
+            "loom-daemon IPC is only supported on Unix platforms; running without IPC proxy"
+        );
         Ok(tokio::spawn(async {}))
     }
 

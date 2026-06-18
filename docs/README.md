@@ -14,6 +14,19 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 - [loom-refactor-plan.md](./loom-refactor-plan.md) - target breaking-change specification for Loom's actor/channel/thread/task/service model.
 - [architecture-v1-agent-client.md](./architecture-v1-agent-client.md) - v1 agent client split, adapter model, registry ownership, wakeup flow, and deployment quick start.
 
+## PR Analysis
+
+- [pr-windows-port-loom-native-analysis-2026-06-19.md](./pr-windows-port-loom-native-analysis-2026-06-19.md) — full analysis of 43 dev-branch commits (plumeink/羽墨): 10-category Loom Native compliance review, root cause analysis, solution design assessment, Loom-wide impact.
+
+## Knowledge Base
+
+Operational standards and guidelines maintained by OPS:
+
+- [knowledge-base/collaboration-standards.md](./knowledge-base/collaboration-standards.md) — team structure, workflow sequence, branch naming, PR workflow, review process, communication discipline.
+- [knowledge-base/architecture-standards.md](./knowledge-base/architecture-standards.md) — process boundaries, data ownership, protocol model, scheduling loop, code boundaries, platform abstraction.
+- [knowledge-base/testing-standards.md](./knowledge-base/testing-standards.md) — test isolation (production vs test environment), test gates, test categories, CI/CD testing, writing guidelines.
+- [knowledge-base/code-review-guidelines.md](./knowledge-base/code-review-guidelines.md) — review authority matrix, review checklist, severity classification, review process, ARCH review specifics.
+
 ## Protocol
 
 - [protocol/open-multi-actor-collaboration-research.md](./protocol/open-multi-actor-collaboration-research.md) - research notes, tradeoffs, rejected approaches, terminology, and design decisions for open multi-actor collaboration.

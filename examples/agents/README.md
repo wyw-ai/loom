@@ -12,7 +12,7 @@ provider manifest，再让 agent 的 `providerRef.id` 指向它。
 
 | 文件 | providerRef | 说明 |
 | --- | --- | --- |
-| [`actor_claude_stream.json`](actor_claude_stream.json) | `claude` / `print` | Claude Code `-p --output-format stream-json` 模式，system/user prompt 由 provider manifest 拆分注入 |
+| [`actor_claude_stream.json`](actor_claude_stream.json) | `claude` / `print` | Claude Code `-p --output-format stream-json` 模式，AgentSpec 组装 system/user，provider manifest 只负责把它们映射到 CLI 参数 |
 | [`actor_claude_nonprint.json`](actor_claude_nonprint.json) | `claude` / `nonprint` | Claude Code 普通交互模式，用 sentinel 判断完成 |
 | [`codex.json`](codex.json) | `codex` / `print` | Codex CLI agent |
 | [`copilot.json`](copilot.json) | `copilot` / `print` | GitHub Copilot CLI agent |
@@ -39,8 +39,16 @@ provider manifest，再让 agent 的 `providerRef.id` 指向它。
 ```
 
 `instructions` 是这个 agent 自己的静态行为说明。Loom 会把它作为
-`agent_instructions` prompt part 交给 provider manifest 的 prompt 组装规则；provider
-决定它最终进入 system prompt、user prompt，还是完整 prompt。
+`agent_instructions` prompt part 交给 `AgentSpec.promptAssembly`；运行时把
+`prompt.system` 写入该 agent home 下的 `AGENTS.md`，provider manifest 只决定当前
+CLI 是读取 `AGENTS.md` 后接收 `prompt.user`，还是直接接收 `prompt.system` /
+`prompt.user` / `prompt.full`。
 
 `providerRef.model` 和 `providerRef.reasoningEffort` 是具体 agent 的偏好。provider
 manifest 负责声明这些值如何映射成 CLI 参数，例如 `--model {model}`。
+
+如果 agent 配置了 `bundle.source`，Loom 会把 bundle 安装到该 agent home 下，并把当前
+scope 可见的 agent bundles 以 symlink 方式挂到该 agent 自己的
+`{loom_agent_home}/workspace/scopes/<kind>/<scope>/` 下。provider manifest 再通过
+`--add-dir {agent.skillWorkspace}` 或 provider 专属配置把这个外挂路径接入，让 Codex、
+Copilot、Claude Code、Qoder、OpenCode 按各自的原生规则发现同一批 scope skills。

@@ -17,6 +17,7 @@
 //!     private `run.append` trace frames back to the server.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -751,7 +752,7 @@ impl AgentPaths {
             channel_root,
             channel_shared,
             channel_artifacts,
-            skills: self.scope_skills_dir(scope_ref),
+            skills: self.scope_skills_dir(scope_ref).join("skills"),
             workspace: agent_root.join("workspace"),
             logs: agent_root.join("logs"),
             agent_root,
@@ -764,6 +765,7 @@ impl AgentPaths {
         spec: &AgentSpec,
         bundle_paths: &BundlePaths,
     ) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
         std::fs::create_dir_all(&self.profile)?;
         std::fs::create_dir_all(&self.sessions)?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
@@ -789,6 +791,7 @@ impl AgentPaths {
         input
             .replace("{agent.profile}", &self.profile.display().to_string())
             .replace("{agent.root}", &self.root.display().to_string())
+            .replace("{loom_agent_home}", &self.root.display().to_string())
     }
 
     fn bundle_paths(&self, spec: &AgentSpec) -> BundlePaths {
@@ -833,9 +836,24 @@ impl AgentPaths {
         std::fs::create_dir_all(&scope.workspace)?;
         std::fs::create_dir_all(&scope.logs)?;
         std::fs::create_dir_all(&scope.channel_artifacts)?;
-        ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
-        agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
+        std::fs::create_dir_all(&scope.skills)?;
         Ok(scope)
+    }
+
+    fn ensure_agents_md(&self, system_prompt: &str) -> io::Result<()> {
+        write_text_file_if_changed(&self.root.join("AGENTS.md"), system_prompt)
+    }
+
+    fn ensure_skill_workspace(
+        &self,
+        scope_ref: &ScopeRef,
+        skill_targets: &BTreeMap<String, PathBuf>,
+    ) -> io::Result<()> {
+        ensure_agent_skill_workspace(
+            &self.scope_skills_dir(scope_ref),
+            skill_targets,
+            &self.root.join("AGENTS.md"),
+        )
     }
 
     fn template_vars(
@@ -869,6 +887,11 @@ impl AgentPaths {
         );
         vars.insert("agent.root".into(), scope.agent_root.display().to_string());
         vars.insert("agent.profile".into(), self.profile.display().to_string());
+        vars.insert("loom_agent_home".into(), self.root.display().to_string());
+        vars.insert(
+            "agent.skillWorkspace".into(),
+            self.scope_skills_dir(scope_ref).display().to_string(),
+        );
         let agent_config_dir = agent_config_dir(actor_id);
         vars.insert(
             "agent.configDir".into(),
@@ -965,6 +988,7 @@ impl AgentPaths {
             "LOOM_AGENT_PROFILE".into(),
             self.profile.display().to_string(),
         );
+        env.insert("LOOM_AGENT_HOME".into(), self.root.display().to_string());
         env.insert(
             "LOOM_AGENT_BUNDLE_DIR".into(),
             self.bundle_current.display().to_string(),
@@ -1014,6 +1038,10 @@ impl AgentPaths {
         env.insert("LOOM_AGENT_LOGS".into(), scope.logs.display().to_string());
         env.insert("AGENTX_AGENT_LOGS".into(), scope.logs.display().to_string());
         env.insert(
+            "LOOM_AGENT_SKILL_WORKSPACE".into(),
+            self.scope_skills_dir(scope_ref).display().to_string(),
+        );
+        env.insert(
             "LOOM_SCOPE_SKILLS".into(),
             scope.skills.display().to_string(),
         );
@@ -1029,11 +1057,32 @@ impl AgentPaths {
     }
 
     fn scope_skills_dir(&self, scope_ref: &ScopeRef) -> PathBuf {
-        self.scope_workspaces_root
+        self.root
+            .join("workspace")
+            .join("scopes")
             .join(scope_kind_name(scope_ref.kind))
             .join(&scope_ref.id)
-            .join("skills")
     }
+
+    fn skill_registry_agents_root(&self) -> PathBuf {
+        self.scope_workspaces_root
+            .parent()
+            .map(|parent| parent.join("agents"))
+            .unwrap_or_else(|| self.data_root.join("agents"))
+    }
+}
+
+fn write_text_file_if_changed(path: &Path, content: &str) -> io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if existing == content => return Ok(()),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)
 }
 
 fn scope_kind_name(kind: ScopeKind) -> &'static str {
@@ -1057,16 +1106,76 @@ fn run_no_reply_file(logs_dir: &Path, run_id: &str) -> PathBuf {
     logs_dir.join(format!("{safe_run_id}.no-reply.json"))
 }
 
-fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(skills_target)?;
-    let link_path = workspace.join("skills");
+const SCOPE_SKILLS_LINKS: &[&str] = &[
+    "skills",
+    ".agents/skills",
+    ".claude/skills",
+    ".qoder/skills",
+    ".opencode/skills",
+];
+
+fn ensure_agent_skill_workspace(
+    skill_workspace: &Path,
+    skill_targets: &BTreeMap<String, PathBuf>,
+    agents_md_path: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(skill_workspace)?;
+    for rel_path in SCOPE_SKILLS_LINKS {
+        sync_skill_projection_dir(&skill_workspace.join(rel_path), skill_targets)?;
+    }
+    ensure_opencode_skill_workspace_config(skill_workspace, agents_md_path)
+}
+
+fn sync_skill_projection_dir(
+    projection_dir: &Path,
+    skill_targets: &BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(projection_dir)?;
+    let desired_ids = skill_targets
+        .keys()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Ok(entries) = std::fs::read_dir(projection_dir) {
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if !desired_ids.contains(name.as_str()) {
+                remove_path_if_exists(&entry.path())?;
+            }
+        }
+    }
+    for (skill_id, target) in skill_targets {
+        ensure_skill_mount(&projection_dir.join(skill_id), target)?;
+    }
+    Ok(())
+}
+
+fn ensure_skill_mount(link_path: &Path, target: &Path) -> std::io::Result<()> {
+    if let Some(parent) = link_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::read_link(&link_path) {
-        Ok(existing) if existing == skills_target => return Ok(()),
+        Ok(existing) if existing == target => return Ok(()),
         Ok(_) => remove_path_if_exists(&link_path)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => remove_path_if_exists(&link_path)?,
     }
-    symlink_path(skills_target, &link_path)
+    symlink_path(target, link_path)
+}
+
+fn ensure_opencode_skill_workspace_config(
+    skill_workspace: &Path,
+    agents_md_path: &Path,
+) -> std::io::Result<()> {
+    let config_dir = skill_workspace.join(".opencode");
+    std::fs::create_dir_all(&config_dir)?;
+    let content = serde_json::to_string_pretty(&json!({
+        "instructions": [agents_md_path.display().to_string()],
+    }))
+    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    write_text_file_if_changed(&config_dir.join("opencode.json"), &content)
 }
 
 fn ensure_bundle(
@@ -2194,6 +2303,12 @@ fn build_adapter(
     command_env
         .entry("LOOM_AGENT_PROFILE".into())
         .or_insert_with(|| paths.profile.display().to_string());
+    process_env
+        .entry("LOOM_AGENT_HOME".into())
+        .or_insert_with(|| paths.root.display().to_string());
+    command_env
+        .entry("LOOM_AGENT_HOME".into())
+        .or_insert_with(|| paths.root.display().to_string());
     process_env
         .entry("LOOM_AGENT_BUNDLE_ROOT".into())
         .or_insert_with(|| bundle_paths.root.display().to_string());
@@ -3448,6 +3563,14 @@ async fn build_adapter_prompt(
     )?);
     let outputs =
         render_agent_prompt_outputs(state.spec.prompt_assembly.as_ref(), &parts, &prompt.content)?;
+    if let Some(system_prompt) = outputs.get("system") {
+        state.paths.ensure_agents_md(system_prompt)?;
+    }
+    let skill_targets = current_scope_skill_targets(client, state, &channel_id).await;
+    state
+        .paths
+        .ensure_skill_workspace(scope, &skill_targets)
+        .with_context(|| format!("ensure skill workspace for scope {}", scope.id))?;
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content: prompt.content.clone(),
@@ -4052,6 +4175,73 @@ async fn current_scope_members_context(
             String::new()
         }
     }
+}
+
+async fn current_scope_skill_targets(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    channel_id: &str,
+) -> BTreeMap<String, PathBuf> {
+    let result: Result<ChannelMembersResult> = client
+        .call(
+            method::CHANNEL_MEMBERS,
+            json!({
+                "channelId": channel_id,
+            }),
+        )
+        .await
+        .with_context(|| format!("channel.members channelId={channel_id}"));
+    let members = match result {
+        Ok(result) => result.members,
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                channel = %channel_id,
+                %err,
+                "scope skill members unavailable"
+            );
+            return BTreeMap::new();
+        }
+    };
+    let agents_root = state.paths.skill_registry_agents_root();
+    let mut targets = BTreeMap::new();
+    for actor in members {
+        match actor_bundle_source(&agents_root, &actor.id) {
+            Ok(Some(target)) => {
+                targets.insert(actor.id, target);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    skill_actor = %actor.id,
+                    %err,
+                    "scope skill target unavailable"
+                );
+            }
+        }
+    }
+    targets
+}
+
+fn actor_bundle_source(agents_root: &Path, actor_id: &str) -> io::Result<Option<PathBuf>> {
+    proto::path_component::validate_path_component(actor_id, "actor_id")
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let release_path = agents_root.join(actor_id).join("bundle-release.json");
+    let release_text = match std::fs::read_to_string(&release_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let release: Value = serde_json::from_str(&release_text)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let Some(source) = release.get("source").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if source.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(source)))
 }
 
 fn format_current_scope_members_context(channel_id: &str, members: &[Actor]) -> String {
@@ -6622,6 +6812,23 @@ mod tests {
         path
     }
 
+    #[test]
+    fn agent_home_agents_md_is_system_prompt_content() {
+        let root = temp_path("agent-home-agents-md");
+        let paths = AgentPaths::new(&root, "actor_demo");
+
+        paths
+            .ensure_agents_md("system prompt body")
+            .expect("write agents md");
+        assert_eq!(
+            std::fs::read_to_string(root.join("agents/actor_demo/AGENTS.md"))
+                .expect("read agents md"),
+            "system prompt body"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
     fn empty_prompt_stats() -> PromptStats {
         PromptStats {
             char_count: 0,
@@ -6790,26 +6997,63 @@ mod tests {
     }
 
     #[test]
-    fn ensure_scope_links_scope_specific_skills_into_workspace() {
-        let root = temp_path("scope-skills-link");
+    fn ensure_scope_mounts_skills_under_agent_local_workspace() {
+        let root = temp_path("agent-skill-workspace");
         let paths = AgentPaths::new(&root, "actor_demo");
         let scope = ScopeRef {
             kind: ScopeKind::Thread,
             id: "thread_demo".into(),
         };
+        let skill_target = root.join("published").join("actor_alice");
+        std::fs::create_dir_all(&skill_target).expect("skill target");
+        let skill_targets = BTreeMap::from([("actor_alice".to_string(), skill_target.clone())]);
 
         let scope_paths = paths
             .ensure_scope("actor_demo", "chan_demo", &scope)
             .expect("ensure scope");
+        paths
+            .ensure_skill_workspace(&scope, &skill_targets)
+            .expect("ensure skill workspace");
 
+        let expected = root
+            .join("agents")
+            .join("actor_demo")
+            .join("workspace")
+            .join("scopes")
+            .join("thread")
+            .join("thread_demo");
+        for rel_path in [
+            "skills",
+            ".agents/skills",
+            ".claude/skills",
+            ".qoder/skills",
+            ".opencode/skills",
+        ] {
+            assert_eq!(
+                std::fs::read_link(expected.join(rel_path).join("actor_alice"))
+                    .expect("skill mount"),
+                skill_target
+            );
+        }
+        assert_eq!(scope_paths.skills, expected.join("skills"));
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(expected.join(".opencode/opencode.json"))
+                .expect("read opencode config"),
+        )
+        .expect("parse opencode config");
+        let agents_md = root
+            .join("agents/actor_demo/AGENTS.md")
+            .display()
+            .to_string();
         assert_eq!(
-            std::fs::read_link(scope_paths.workspace.join("skills")).expect("skills link"),
-            root.join("workspaces")
-                .join("thread")
-                .join("thread_demo")
-                .join("skills")
+            config
+                .get("instructions")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str),
+            Some(agents_md.as_str())
         );
-        assert!(scope_paths.skills.exists());
+        assert!(!root.join("workspaces").exists());
 
         std::fs::remove_dir_all(root).ok();
     }

@@ -28,11 +28,11 @@ pub fn start_server(exe_path: &str) -> Result<u32, String> {
     // GUI's restrictive job object (fixes ERROR_PRIVILEGE_NOT_HELD).
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("启动 server 失败: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("启动 server 失败: {e}"))?;
     let pid = child.id();
-    *SERVER_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
+    *SERVER_PROCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
     Ok(pid)
 }
 
@@ -41,17 +41,19 @@ pub fn start_daemon(exe_path: &str) -> Result<u32, String> {
     let mut cmd = Command::new(exe_path);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("启动 daemon 失败: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("启动 daemon 失败: {e}"))?;
     let pid = child.id();
-    *DAEMON_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
+    *DAEMON_PROCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
     Ok(pid)
 }
 
 /// 停止 server 子进程（kill 后 wait 回收）。
 pub fn stop_server() -> Result<(), String> {
-    let mut guard = SERVER_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = SERVER_PROCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(mut child) = guard.take() {
         child.kill().map_err(|e| format!("停止 server 失败: {e}"))?;
         child.wait().ok();
@@ -61,7 +63,9 @@ pub fn stop_server() -> Result<(), String> {
 
 /// 停止 daemon 子进程。
 pub fn stop_daemon() -> Result<(), String> {
-    let mut guard = DAEMON_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = DAEMON_PROCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(mut child) = guard.take() {
         child.kill().map_err(|e| format!("停止 daemon 失败: {e}"))?;
         child.wait().ok();
@@ -71,10 +75,12 @@ pub fn stop_daemon() -> Result<(), String> {
 
 /// 检查 server 子进程是否仍在运行。
 pub fn is_server_running() -> bool {
-    let mut guard = SERVER_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = SERVER_PROCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(ref mut child) = *guard {
         match child.try_wait() {
-            Ok(None) => true,  // 仍在运行
+            Ok(None) => true, // 仍在运行
             Ok(Some(_)) | Err(_) => {
                 *guard = None;
                 false
@@ -87,7 +93,9 @@ pub fn is_server_running() -> bool {
 
 /// 检查 daemon 子进程是否仍在运行。
 pub fn is_daemon_running() -> bool {
-    let mut guard = DAEMON_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = DAEMON_PROCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(ref mut child) = *guard {
         match child.try_wait() {
             Ok(None) => true,

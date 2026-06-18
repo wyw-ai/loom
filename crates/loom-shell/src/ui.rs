@@ -171,16 +171,14 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_server.handle,
-            move |ev, _evd, _handle| {
+        let ev =
+            nwg::full_bind_event_handler(&shell.btn_server.handle, move |ev, _evd, _handle| {
                 if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Server;
                 refresh_tab(Tab::Server, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+            });
         shell._event_handles.push(ev);
 
         // 标签切换 — Daemon
@@ -188,16 +186,14 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_daemon.handle,
-            move |ev, _evd, _handle| {
+        let ev =
+            nwg::full_bind_event_handler(&shell.btn_daemon.handle, move |ev, _evd, _handle| {
                 if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Daemon;
                 refresh_tab(Tab::Daemon, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+            });
         shell._event_handles.push(ev);
 
         // 标签切换 — Logs
@@ -205,16 +201,13 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_logs.handle,
-            move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
-                    return;
-                }
-                state_rc.borrow_mut().current_tab = Tab::Logs;
-                refresh_tab(Tab::Logs, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+        let ev = nwg::full_bind_event_handler(&shell.btn_logs.handle, move |ev, _evd, _handle| {
+            if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
+                return;
+            }
+            state_rc.borrow_mut().current_tab = Tab::Logs;
+            refresh_tab(Tab::Logs, &lbl_status, &lbl_detail, &log_area);
+        });
         shell._event_handles.push(ev);
 
         // 启动按钮
@@ -222,20 +215,17 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_start.handle,
-            move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
-                    return;
-                }
-                let tab = state_rc.borrow().current_tab;
-                match handle_start(tab) {
-                    Ok(()) => set_ctrl_text(&lbl_detail, "启动成功"),
-                    Err(e) => set_ctrl_text(&lbl_detail, &format!("启动失败: {}", e)),
-                }
-                refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+        let ev = nwg::full_bind_event_handler(&shell.btn_start.handle, move |ev, _evd, _handle| {
+            if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
+                return;
+            }
+            let tab = state_rc.borrow().current_tab;
+            match handle_start(tab) {
+                Ok(()) => set_ctrl_text(&lbl_detail, "启动成功"),
+                Err(e) => set_ctrl_text(&lbl_detail, &format!("启动失败: {}", e)),
+            }
+            refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
+        });
         shell._event_handles.push(ev);
 
         // 停止按钮
@@ -243,20 +233,17 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_stop.handle,
-            move |ev, _evd, _handle| {
-                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
-                    return;
-                }
-                let tab = state_rc.borrow().current_tab;
-                match handle_stop(tab) {
-                    Ok(()) => set_ctrl_text(&lbl_detail, "停止成功"),
-                    Err(e) => set_ctrl_text(&lbl_detail, &format!("停止失败: {}", e)),
-                }
-                refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+        let ev = nwg::full_bind_event_handler(&shell.btn_stop.handle, move |ev, _evd, _handle| {
+            if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
+                return;
+            }
+            let tab = state_rc.borrow().current_tab;
+            match handle_stop(tab) {
+                Ok(()) => set_ctrl_text(&lbl_detail, "停止成功"),
+                Err(e) => set_ctrl_text(&lbl_detail, &format!("停止失败: {}", e)),
+            }
+            refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
+        });
         shell._event_handles.push(ev);
 
         // 重启按钮 — 在后台线程执行 stop+wait+start 以避免阻塞 UI。
@@ -265,9 +252,8 @@ impl LoomShell {
         let lbl_status_raw = extract_hwnd(&shell.lbl_status.handle);
         let lbl_detail_raw = extract_hwnd(&shell.lbl_detail.handle);
         let log_area_raw = extract_hwnd(&shell.log_area.handle);
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_restart.handle,
-            move |ev, _evd, _handle| {
+        let ev =
+            nwg::full_bind_event_handler(&shell.btn_restart.handle, move |ev, _evd, _handle| {
                 if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
@@ -284,8 +270,7 @@ impl LoomShell {
                     }
                     refresh_tab_raw(tab, lbl_status_raw, lbl_detail_raw, log_area_raw);
                 });
-            },
-        );
+            });
         shell._event_handles.push(ev);
 
         // 安装服务
@@ -293,9 +278,8 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_install.handle,
-            move |ev, _evd, _handle| {
+        let ev =
+            nwg::full_bind_event_handler(&shell.btn_install.handle, move |ev, _evd, _handle| {
                 if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
@@ -305,8 +289,7 @@ impl LoomShell {
                     Err(e) => set_ctrl_text(&lbl_detail, &format!("安装服务失败: {}", e)),
                 }
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+            });
         shell._event_handles.push(ev);
 
         // 卸载服务
@@ -314,9 +297,8 @@ impl LoomShell {
         let lbl_status = shell.lbl_status.handle;
         let lbl_detail = shell.lbl_detail.handle;
         let log_area = shell.log_area.handle;
-        let ev = nwg::full_bind_event_handler(
-            &shell.btn_uninstall.handle,
-            move |ev, _evd, _handle| {
+        let ev =
+            nwg::full_bind_event_handler(&shell.btn_uninstall.handle, move |ev, _evd, _handle| {
                 if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
                     return;
                 }
@@ -326,8 +308,7 @@ impl LoomShell {
                     Err(e) => set_ctrl_text(&lbl_detail, &format!("卸载服务失败: {}", e)),
                 }
                 refresh_tab(tab, &lbl_status, &lbl_detail, &log_area);
-            },
-        );
+            });
         shell._event_handles.push(ev);
 
         // 初始刷新
@@ -365,7 +346,10 @@ fn refresh_tab(
                 server_log, daemon_log
             );
             set_ctrl_text(lbl_status, "状态：日志查看");
-            set_ctrl_text(lbl_detail, "显示 loom-server.log 和 loom-daemon.log 最后 100 行（点击标签刷新）");
+            set_ctrl_text(
+                lbl_detail,
+                "显示 loom-server.log 和 loom-daemon.log 最后 100 行（点击标签刷新）",
+            );
             set_ctrl_text(log_area, &combined);
             return;
         }
@@ -447,8 +431,6 @@ fn set_hwnd_text(hwnd: isize, text: &str) {
     }
 }
 
-
-
 /// refresh_tab 的原始 HWND 版本，用于后台线程回调。
 fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isize) {
     let (svc_name, exe_path, label) = match tab {
@@ -462,7 +444,10 @@ fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isi
                 server_log, daemon_log
             );
             set_hwnd_text(lbl_status, "状态：日志查看");
-            set_hwnd_text(lbl_detail, "显示 loom-server.log 和 loom-daemon.log 最后 100 行\n自动每 3 秒刷新");
+            set_hwnd_text(
+                lbl_detail,
+                "显示 loom-server.log 和 loom-daemon.log 最后 100 行\n自动每 3 秒刷新",
+            );
             set_hwnd_text(log_area, &combined);
             return;
         }

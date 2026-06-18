@@ -23,11 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
 use crate::path_util::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -592,9 +590,14 @@ fn start_blocking(
         process_cwd.display()
     );
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| spawn_error_message(&command_path.to_string_lossy(), &process_cwd, &path_for_error, e))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        spawn_error_message(
+            &command_path.to_string_lossy(),
+            &process_cwd,
+            &path_for_error,
+            e,
+        )
+    })?;
     let stdin = child.stdin.take().ok_or("Failed to open agent stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to open agent stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to open agent stderr")?;
@@ -1193,7 +1196,6 @@ fn kill_process(pid: u32) {
     // closed after the call.
     #[cfg(windows)]
     unsafe {
-        use std::os::windows::io::RawHandle;
         extern "system" {
             fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
             fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;

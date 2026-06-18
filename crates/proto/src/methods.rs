@@ -1914,7 +1914,7 @@ pub struct AgentTransport {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// 指令注入方式（从 ProviderModeSpec 复制）。"prompt" 或 "agents_md"。
+    /// How instructions are injected (copied from ProviderModeSpec). "prompt" or "agents_md".
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2053,8 +2053,8 @@ pub struct ProviderModeSpec {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// 指令注入方式："prompt"（默认，注入 prompt 文本）或
-    /// "agents_md"（写入工作区 AGENTS.md，由 provider 自动加载）。
+    /// How instructions are injected: "prompt" (default, injected into prompt text) or
+    /// "agents_md" (written to workspace AGENTS.md, auto-loaded by provider).
     #[serde(default = "default_instructions_via", rename = "instructionsVia")]
     pub instructions_via: String,
 }

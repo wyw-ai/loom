@@ -280,22 +280,22 @@ fn status_color(status: &str) -> Color {
     if status.starts_with("⚠") {
         return Color::Yellow;
     }
-    if status.contains("思考中") {
+    if status.contains("Thinking") {
         return Color::Magenta;
     }
-    if status.contains("等待工具") {
+    if status.contains("Waiting") {
         return Color::Rgb(255, 165, 0); // orange
     }
-    if status.contains("准备中") {
+    if status.contains("Preparing") {
         return Color::Blue;
     }
-    if status.contains("排队中") {
+    if status.contains("Queued") {
         return Color::Gray;
     }
-    if status.contains("运行失败") {
+    if status.contains("Failed") {
         return Color::Red;
     }
-    if status.contains("已取消") {
+    if status.contains("Canceled") {
         return Color::DarkGray;
     }
     // Legacy fallback for old status strings

@@ -365,7 +365,7 @@ fn refresh_tab(
                 server_log, daemon_log
             );
             set_ctrl_text(lbl_status, "状态：日志查看");
-            set_ctrl_text(lbl_detail, "显示 loom-server.log 和 loom-daemon.log 最后 100 行（每3秒自动刷新）");
+            set_ctrl_text(lbl_detail, "显示 loom-server.log 和 loom-daemon.log 最后 100 行（点击标签刷新）");
             set_ctrl_text(log_area, &combined);
             return;
         }

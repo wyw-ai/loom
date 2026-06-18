@@ -87,12 +87,20 @@ fn init_tracing() {
         home.join("loom").join("logs").join("daemon")
     };
     let _ = std::fs::create_dir_all(&log_dir);
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "loom-daemon.log");
+
+    // Use a fixed-name log file so loom-shell can always find it.
+    let log_path = log_dir.join("loom-daemon.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("failed to open loom-daemon.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file);
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr);
     let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file_appender)
+        .with_writer(non_blocking)
         .with_ansi(false);
 
     let _ = tracing_subscriber::registry()
@@ -100,7 +108,9 @@ fn init_tracing() {
         .with(stderr_layer)
         .with(file_layer)
         .try_init();
-    tracing::info!(path = %log_dir.display(), "loom-daemon logging to file");
+    // Keep _guard alive so non_blocking worker stays active.
+    std::mem::forget(_guard);
+    tracing::info!(path = %log_path.display(), "loom-daemon logging to file");
 }
 
 #[cfg(test)]

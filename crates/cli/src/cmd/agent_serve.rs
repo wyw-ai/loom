@@ -1437,7 +1437,20 @@ fn reply_target_for_message(message: &Message) -> String {
         {
             format!("#{}:{}", message.scope.id, message.id)
         }
-        ScopeKind::Channel => message.target.clone(),
+        ScopeKind::Channel => {
+            // Message carries thread context (parent_message_id or
+            // thread_root_message_id is set). Derive the correct thread
+            // reply target instead of returning the bare channel target.
+            let root_or_parent = message
+                .thread_root_message_id
+                .as_ref()
+                .or(message.parent_message_id.as_ref());
+            if let Some(id) = root_or_parent {
+                format!("#{}:{}", message.scope.id, id)
+            } else {
+                message.target.clone()
+            }
+        }
     }
 }
 
@@ -3464,6 +3477,7 @@ async fn open_model_picker(
         payload,
         trigger.is_message().then(|| trigger.id().to_string()),
         None,
+        trigger.reply_target(),
     )
     .await?;
     state.record_model_action_request(
@@ -6036,6 +6050,7 @@ async fn translate_one(
                     .trigger_is_message
                     .then(|| active.trigger_source_id.clone()),
                 Some(active.run_id.clone()),
+                active.reply_target.clone(),
             )
             .await?;
             state.record_action_request(sent.message.id.clone(), id.clone());
@@ -6612,15 +6627,23 @@ async fn send_action_request_message(
     payload: Value,
     parent_message_id: Option<String>,
     run_id: Option<String>,
+    reply_target_override: Option<String>,
 ) -> Result<MessageSendResult> {
     let mut metadata = action_request_metadata(payload)?;
     if let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) {
         metadata.insert("runId".into(), json!(run_id));
     }
     let body = format_action_request_body(&metadata);
-    send_scope_message(
+    // Prefer the explicit reply target (which carries the correct thread
+    // root for channel-scoped messages) over deriving from scope alone.
+    let target = match (reply_target_override.as_deref(), scope.kind, &parent_message_id) {
+        (Some(ovr), _, _) => ovr.to_string(),
+        (None, ScopeKind::Channel, Some(parent)) => format!("#{}:{}", scope.id, parent),
+        _ => message_target_for_scope(client, scope).await?,
+    };
+    send_agent_message(
         client,
-        scope,
+        &target,
         body,
         parent_message_id,
         Some(target_actor),
@@ -7241,6 +7264,42 @@ mod tests {
         );
 
         assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn candidate1_channel_message_with_thread_root_returns_thread_target() {
+        // Channel-scoped message that carries thread_root_message_id:
+        // the reply must go to the correct thread, not the bare channel.
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+
+        assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn candidate1_channel_message_with_only_parent_returns_parent_target() {
+        // Channel-scoped message with only parent_message_id set
+        // (fallback when thread_root_message_id is absent).
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            Some("msg_parent"),
+            None,
+        );
+
+        assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_parent");
     }
 
     #[test]

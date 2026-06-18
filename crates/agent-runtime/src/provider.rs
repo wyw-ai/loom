@@ -2855,7 +2855,14 @@ mod tests {
 
     #[cfg(not(unix))]
     fn make_executable(path: &Path) {
-        std::fs::write(path, "").expect("write executable");
+        // On Windows, extensionless files require a PE (MZ) header to pass
+        // is_executable().  Append .cmd so resolve_command_with_pathext()
+        // finds the stub via PATHEXT resolution — this mirrors how .cmd
+        // wrappers (e.g. copilot.CMD) are the Windows equivalent of Unix
+        // shell scripts.
+        let mut cmd_path = path.to_path_buf();
+        cmd_path.set_extension("cmd");
+        std::fs::write(&cmd_path, "@echo off\r\n").expect("write executable");
     }
 
     fn prompt_part(key: &'static str, content: &'static str) -> PromptPart {

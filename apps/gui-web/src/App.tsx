@@ -7235,12 +7235,19 @@ function AgentMemberDetail({
     agentSettingsDraft(machine, agent),
   );
   const [activeTab, setActiveTab] = useState<AgentDetailTab>("profile");
+  const [customModelActive, setCustomModelActive] = useState(false);
   const handledAgentDetailKeyRef = useRef(agentDetailKey);
   const selectedProvider = providerForAgent(machine, agent, draft.providerId);
   const modelChoices =
     selectedProvider?.modelChoices.length
       ? selectedProvider.modelChoices
       : agent.spec.models?.choices ?? [];
+  const modelValue = draft.model;
+  const modelIsKnown =
+    !modelValue || modelChoices.some((choice) => choice.id === modelValue);
+  const showCustomModel =
+    modelChoices.length === 0 || customModelActive || !modelIsKnown;
+  const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
   const saving = busy === `agent:update:${actor.id}`;
   const removing = busy === `agent:remove:${actor.id}`;
   const canEdit = !machine.readOnly;
@@ -7258,6 +7265,7 @@ function AgentMemberDetail({
     if (handledAgentDetailKeyRef.current === agentDetailKey) return;
     handledAgentDetailKeyRef.current = agentDetailKey;
     setDraft(agentSettingsDraft(machine, agent));
+    setCustomModelActive(false);
   }, [agentDetailKey, machine, agent]);
 
   useEffect(() => {
@@ -7425,9 +7433,10 @@ function AgentMemberDetail({
                   const provider = machine.providers.find(
                     (item) => item.id === event.target.value,
                   );
+                  setCustomModelActive(false);
                   updateDraft({
                     providerId: event.target.value,
-                    model: provider?.defaultModel ?? draft.model,
+                    model: provider?.defaultModel || provider?.modelChoices[0]?.id || "",
                   });
                 }}
                 disabled={!canEdit || machine.providers.length === 0}
@@ -7443,17 +7452,40 @@ function AgentMemberDetail({
                 )}
               </StyledSelect>
               {modelChoices.length > 0 ? (
-                <StyledSelect
-                  value={draft.model}
-                  onChange={(event) => updateDraft({ model: event.target.value })}
-                  disabled={!canEdit}
-                >
-                  {modelChoices.map((choice) => (
-                    <option key={choice.id} value={choice.id}>
-                      {choice.label || choice.id}
-                    </option>
-                  ))}
-                </StyledSelect>
+                <div className="space-y-2">
+                  <StyledSelect
+                    value={modelSelectValue}
+                    onChange={(event) => {
+                      if (event.target.value === customModelOptionValue) {
+                        setCustomModelActive(true);
+                        updateDraft({
+                          model: modelIsKnown ? "" : draft.model,
+                        });
+                        return;
+                      }
+                      setCustomModelActive(false);
+                      updateDraft({ model: event.target.value });
+                    }}
+                    disabled={!canEdit}
+                  >
+                    <option value="">Default model</option>
+                    {modelChoices.map((choice) => (
+                      <option key={choice.id} value={choice.id}>
+                        {choice.label || choice.id}
+                      </option>
+                    ))}
+                    <option value={customModelOptionValue}>Custom...</option>
+                  </StyledSelect>
+                  {showCustomModel && (
+                    <Input
+                      value={draft.model}
+                      onChange={(event) => updateDraft({ model: event.target.value })}
+                      placeholder="Custom model"
+                      className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                      disabled={!canEdit}
+                    />
+                  )}
+                </div>
               ) : (
                 <Input
                   value={draft.model}

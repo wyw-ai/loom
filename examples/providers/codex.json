@@ -48,6 +48,8 @@
         "sandbox_workspace_write.network_access=true",
         "--add-dir",
         "{agent.configDir}",
+        "--add-dir",
+        "{agent.skillWorkspace}",
         {
           "args": [
             "--model",
@@ -55,20 +57,12 @@
           ],
           "when": "model"
         },
-        "{prompt.full}"
+        "{prompt.user}"
       ],
       "command": "{bin}",
       "env": {
+        "CODEX_HOME": "{loom_agent_home}",
         "LOOM_NO_DAEMON": "1"
-      },
-      "prompt": {
-        "outputs": {
-          "full": {
-            "include": [],
-            "preset": "loom_full",
-            "required": []
-          }
-        }
       },
       "session": {
         "idSource": "provider_capture",
@@ -84,6 +78,8 @@
           "sandbox_workspace_write.network_access=true",
           "--add-dir",
           "{agent.configDir}",
+          "--add-dir",
+          "{agent.skillWorkspace}",
           {
             "args": [
               "--model",
@@ -91,7 +87,7 @@
             ],
             "when": "model"
           },
-          "{prompt.full}"
+          "{prompt.user}"
         ],
         "scope": "actor_scope"
       },

@@ -533,15 +533,15 @@ fn start_blocking(
             e
         )
     })?;
-    // On Windows, prefix both the command path and cwd with \\?\ UNC prefix
-    // to bypass MAX_PATH (260 char) limit, fixing os error 206
-    // (ERROR_FILENAME_EXCED_RANGE). Both paths must be prefixed because
-    // CreateProcessW requires UNC prefix on both the application name AND
-    // the current directory for long-path support.
+    // On Windows, prefix cwd with UNC prefix to bypass MAX_PATH (260 char)
+    // limit, fixing os error 206 (ERROR_FILENAME_EXCED_RANGE).
+    // Do NOT UNC-prefix the command path — `\\?\` bypasses PATHEXT
+    // resolution in CreateProcessW, so e.g. `\\?\D:\nodejs\copilot`
+    // would fail to resolve to `copilot.cmd`.
     #[cfg(windows)]
     let process_cwd = unc_prefix_path(process_cwd);
     #[cfg(windows)]
-    let command_path = unc_prefix_path(std::path::PathBuf::from(&cfg.command));
+    let command_path = std::path::PathBuf::from(&cfg.command);
     #[cfg(not(windows))]
     let command_path = std::path::PathBuf::from(&cfg.command);
 

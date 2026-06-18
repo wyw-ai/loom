@@ -2494,6 +2494,10 @@ fn qoder_manifest() -> ProviderManifest {
 }
 
 fn copilot_manifest() -> ProviderManifest {
+    // Prompt is delivered via stdin (not -p) to avoid Windows command-line
+    // length limits (MAX_PATH / 32,768 chars).  When the full user prompt is
+    // in argv, long prompts cause os error 206 (ERROR_FILENAME_EXCED_RANGE)
+    // on Windows.  stdin delivery is cross-platform safe.
     let first_run_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
@@ -2509,8 +2513,6 @@ fn copilot_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--effort"), lit("{reasoningEffort}")],
         ),
-        lit("-p"),
-        lit("{prompt.full}"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2527,8 +2529,6 @@ fn copilot_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--effort"), lit("{reasoningEffort}")],
         ),
-        lit("-p"),
-        lit("{prompt.full}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
@@ -2548,6 +2548,9 @@ fn copilot_manifest() -> ProviderManifest {
             );
             mode.stdout = copilot_jsonl_decoder();
             mode.instructions_via = "agents_md".into();
+            // Deliver prompt via stdin to avoid Windows command-line length
+            // limits.  Copilot reads from stdin when no -p flag is present.
+            mode.stdin = Some("{prompt.full}".into());
             mode
         })]),
         &[
@@ -2711,12 +2714,45 @@ fn find_command_in_path(candidates: &[String], path: &OsString) -> Option<PathBu
         }
         for dir in &path_dirs {
             let path = dir.join(candidate);
-            if is_executable(&path) {
-                return Some(path);
+            if let Some(resolved) = resolve_command_with_pathext(&path) {
+                return Some(resolved);
             }
         }
     }
     None
+}
+
+/// On Windows, a command name like `copilot` may exist as `copilot` (shell
+/// script), `copilot.cmd`, `copilot.exe`, etc.  We must try PATHEXT
+/// extensions in order so we don't pick a non-executable file (e.g. a
+/// `#!/bin/sh` wrapper) that `CreateProcessW` cannot run.
+#[cfg(windows)]
+fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
+    // If the path already has an extension, check it directly.
+    if path.extension().is_some() {
+        return if is_executable(path) { Some(path.to_path_buf()) } else { None };
+    }
+    // Try each PATHEXT extension in order.
+    let pathext = std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT"));
+    for ext in std::env::split_paths(&pathext) {
+        let mut with_ext = path.as_os_str().to_os_string();
+        with_ext.push(&ext);
+        let candidate = PathBuf::from(with_ext);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    // Fallback: check the extensionless path (may be a valid PE without
+    // extension, or a shell script — is_executable checks the PE header).
+    if is_executable(path) {
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
+    if is_executable(path) { Some(path.to_path_buf()) } else { None }
 }
 
 fn fallback_command_dirs() -> Vec<PathBuf> {
@@ -2759,7 +2795,32 @@ fn is_executable(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         meta.permissions().mode() & 0o111 != 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Files with a PATHEXT-recognized extension (.exe, .cmd, .bat,
+        // .ps1, etc.) are executable by CreateProcessW.
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let pathext = std::env::var_os("PATHEXT")
+                .unwrap_or_else(|| std::ffi::OsString::from(".EXE;.CMD;.BAT"));
+            let ext_dot = format!(".{ext}");
+            return std::env::split_paths(&pathext)
+                .filter_map(|e| {
+                    e.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_ascii_lowercase())
+                })
+                .any(|n| n == ext_dot.to_ascii_lowercase());
+        }
+        // Extensionless files: must be PE images (MZ header).
+        // This rejects Unix shell scripts like `#!/bin/sh` wrappers.
+        if meta.len() < 2 {
+            return false;
+        }
+        std::fs::read(path).map_or(false, |bytes| {
+            bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z'
+        })
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         true
     }

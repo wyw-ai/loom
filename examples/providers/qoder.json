@@ -36,6 +36,8 @@
       "args": [
         "--add-dir",
         "{agent.configDir}",
+        "--add-dir",
+        "{agent.skillWorkspace}",
         "--yolo",
         "--output-format",
         "stream-json",
@@ -59,30 +61,13 @@
         "{prompt.user}"
       ],
       "command": "{bin}",
-      "prompt": {
-        "outputs": {
-          "full": {
-            "include": [],
-            "preset": "loom_full",
-            "required": []
-          },
-          "system": {
-            "include": [],
-            "preset": "loom_system",
-            "required": []
-          },
-          "user": {
-            "include": [],
-            "preset": "loom_turn",
-            "required": []
-          }
-        }
-      },
       "session": {
         "idSource": "provider_capture",
         "resumeArgs": [
           "--add-dir",
           "{agent.configDir}",
+          "--add-dir",
+          "{agent.skillWorkspace}",
           "--yolo",
           "--output-format",
           "stream-json",

@@ -11,7 +11,6 @@
 
 pub mod acp;
 pub mod adapter;
-pub mod agents_md;
 pub mod bundle;
 pub mod command;
 pub mod discovery;
@@ -28,7 +27,6 @@ pub use adapter::{
     ActionChoice, Adapter, AdapterEvent, AdapterModelChoice, AdapterModelOptions, AdapterPrompt,
     AdapterStartInfo, PromptPart, PromptRoleHint, TokenUsage,
 };
-pub use agents_md::ensure_agents_md;
 pub use bundle::{
     prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,
 };

@@ -78,6 +78,9 @@ pub async fn send(
         params["ifLatestMessageId"] = json!(if_latest);
     }
     let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
+    if let Some(warning) = channel_fragmentation_warning(&target, !private_to.is_empty()) {
+        eprintln!("{warning}");
+    }
     let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
     let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
     if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
@@ -111,8 +114,11 @@ pub async fn ask(
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
-    let params = build_ask_params(target, recipients, body, if_latest, attachment_ids)?;
+    let params = build_ask_params(target.clone(), recipients, body, if_latest, attachment_ids)?;
     let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
+    if let Some(warning) = channel_fragmentation_warning(&target, false) {
+        eprintln!("{warning}");
+    }
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -156,6 +162,47 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "开始投票",
     ];
     CUES.iter().any(|cue| lower.contains(cue))
+}
+
+/// Best-effort, non-blocking nudge: warn when a non-private message is being
+/// posted to the bare channel root (`#<channel_id>`) even though this turn has a
+/// thread reply target (`#<channel_id>:<root>`). Posting to the bare channel both
+/// surfaces on the channel ("public board") and spawns a fresh thread rooted at
+/// that message, fragmenting an activity that otherwise lives in one shared
+/// thread. Returns the warning text (for testing) when the situation applies.
+fn channel_fragmentation_warning(target: &str, scope_private: bool) -> Option<String> {
+    let reply_target = std::env::var("LOOM_REPLY_TARGET").ok();
+    channel_fragmentation_warning_inner(target, scope_private, reply_target.as_deref())
+}
+
+fn channel_fragmentation_warning_inner(
+    target: &str,
+    scope_private: bool,
+    reply_target: Option<&str>,
+) -> Option<String> {
+    if scope_private {
+        return None;
+    }
+    let target = target.trim();
+    // Only same-scope channel targets matter; ignore dm:/global targets.
+    if !target.starts_with('#') {
+        return None;
+    }
+    // A thread target carries a `:`; a bare channel target does not.
+    if target.contains(':') {
+        return None;
+    }
+    let reply_target = reply_target?.trim();
+    // Only warn when the established reply target IS a thread we are bypassing.
+    if !reply_target.contains(':') || reply_target == target {
+        return None;
+    }
+    Some(format!(
+        "loom: warning: you sent this to the bare channel `{target}`, but this turn's \
+         shared thread is `{reply_target}`. A bare-channel message shows on the channel \
+         surface and starts a NEW thread, fragmenting the conversation. Send activity \
+         messages to \"$LOOM_REPLY_TARGET\" so everyone stays in one thread."
+    ))
 }
 
 fn read_message_body(text: Option<String>) -> Result<String> {
@@ -211,14 +258,14 @@ async fn resolve_send_target(
                 Ok(format!("dm:@{to}"))
             }
         }
-        (None, None, true) => infer_current_scope_target(client).await,
+        (None, None, true) => infer_current_scope_target(client, true).await,
         (Some(_), Some(_), _) => bail!("use either --target or --to, not both"),
         (None, Some(_), true) => unreachable!("--to/--private-to conflict checked earlier"),
         _ => bail!("missing destination: pass --target or --to"),
     }
 }
 
-async fn infer_current_scope_target(client: &Client) -> Result<String> {
+async fn infer_current_scope_target(client: &Client, scope_private: bool) -> Result<String> {
     if let Some(target) = std::env::var("LOOM_REPLY_TARGET")
         .ok()
         .map(|value| value.trim().to_string())
@@ -237,7 +284,7 @@ async fn infer_current_scope_target(client: &Client) -> Result<String> {
         .filter(|value| !value.is_empty())
         .context("missing destination: pass --target or run inside a Loom agent turn")?;
     match scope_kind.as_str() {
-        "channel" => Ok(format!("#{scope_id}")),
+        "channel" => current_channel_scope_target(&scope_id, scope_private),
         "thread" => {
             let mut params = json!({});
             if let Some(channel_id) = std::env::var("LOOM_CHANNEL_ID")
@@ -257,6 +304,15 @@ async fn infer_current_scope_target(client: &Client) -> Result<String> {
         }
         _ => bail!("missing destination: unsupported LOOM_SCOPE_KIND `{scope_kind}`"),
     }
+}
+
+fn current_channel_scope_target(scope_id: &str, scope_private: bool) -> Result<String> {
+    if scope_private {
+        bail!(
+            "missing destination: same-scope private delivery from a channel turn would target the bare channel and create a new thread; pass --target \"$LOOM_REPLY_TARGET\" or an explicit #channel:root target, or pass --target #channel if a new root is intentional"
+        );
+    }
+    Ok(format!("#{scope_id}"))
 }
 
 fn normalize_actor_ids(raw_values: Vec<String>) -> Result<Vec<String>> {
@@ -373,8 +429,36 @@ mod tests {
         assert!(looks_like_call_for_action("🔔 各位玩家，请开始发言讨论"));
         assert!(looks_like_call_for_action("Okay everyone, please vote now"));
         assert!(looks_like_call_for_action("轮到你了，发表你的看法"));
-        assert!(!looks_like_call_for_action("天亮了，昨晚是平安夜，无人死亡。"));
+        assert!(!looks_like_call_for_action(
+            "天亮了，昨晚是平安夜，无人死亡。"
+        ));
         assert!(!looks_like_call_for_action("Game over. Villagers win."));
+    }
+
+    #[test]
+    fn channel_fragmentation_warns_only_when_bypassing_an_active_thread() {
+        let thread = Some("#chan_x:msg_root");
+        // Bare channel target while a thread reply target exists -> warn.
+        assert!(channel_fragmentation_warning_inner("#chan_x", false, thread).is_some());
+        // Already targeting the thread -> no warning.
+        assert!(channel_fragmentation_warning_inner("#chan_x:msg_root", false, thread).is_none());
+        // Private message (role card / hidden prompt) -> never warn.
+        assert!(channel_fragmentation_warning_inner("#chan_x", true, thread).is_none());
+        // Global DM target -> not our concern.
+        assert!(channel_fragmentation_warning_inner("dm:@actor_x", false, thread).is_none());
+        // No active thread (e.g. the channel itself is the reply target) -> no warning.
+        assert!(channel_fragmentation_warning_inner("#chan_x", false, Some("#chan_x")).is_none());
+        assert!(channel_fragmentation_warning_inner("#chan_x", false, None).is_none());
+    }
+
+    #[test]
+    fn channel_scope_private_delivery_requires_explicit_target() {
+        let error = current_channel_scope_target("chan_demo", true).unwrap_err();
+        assert!(error.to_string().contains("explicit #channel:root"));
+        assert_eq!(
+            current_channel_scope_target("chan_demo", false).unwrap(),
+            "#chan_demo"
+        );
     }
 
     #[test]

@@ -35,3 +35,4 @@ data
 /crates/gui/gen/
 /crates/gui/target/
 /logs/
+/tmp/

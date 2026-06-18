@@ -81,7 +81,7 @@ pub struct ProviderRuntimePlan {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// 指令注入方式。"prompt" 或 "agents_md"。
+    /// How instructions are injected. "prompt" or "agents_md".
     #[serde(default)]
     pub instructions_via: String,
 }
@@ -4362,17 +4362,17 @@ mod tests {
         )
         .expect("runtime plan");
 
-        // agent spec 的 env 覆盖 mode 的同名 key
+        // agent spec env overrides mode's same-name keys
         assert_eq!(
             plan.env.get("OVERRIDE_ME").map(String::as_str),
             Some("from-agent-spec")
         );
-        // mode 独有的 key 保留
+        // mode-only keys are kept
         assert_eq!(
             plan.env.get("BASE_KEY").map(String::as_str),
             Some("from-mode")
         );
-        // agent spec 独有的 key 加入
+        // agent-spec-only keys are added
         assert_eq!(
             plan.env.get("AGENT_ONLY").map(String::as_str),
             Some("from-agent-spec")

@@ -69,17 +69,19 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    use tracing_subscriber::EnvFilter;
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     // File log directory.  On Windows: %LOCALAPPDATA%\loom\logs\daemon.
     // On Unix: ~/.local/share/loom/logs/daemon.
     #[cfg(target_os = "windows")]
     let log_dir = {
         let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        std::path::PathBuf::from(local).join("loom").join("logs").join("daemon")
+        std::path::PathBuf::from(local)
+            .join("loom")
+            .join("logs")
+            .join("daemon")
     };
     #[cfg(not(target_os = "windows"))]
     let log_dir = {
@@ -97,8 +99,7 @@ fn init_tracing() {
         .expect("failed to open loom-daemon.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file);
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr);
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
         .with_ansi(false);

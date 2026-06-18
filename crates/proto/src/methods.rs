@@ -1915,7 +1915,11 @@ pub struct AgentTransport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
     /// 指令注入方式（从 ProviderModeSpec 复制）。"prompt" 或 "agents_md"。
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "instructionsVia")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "instructionsVia"
+    )]
     pub instructions_via: Option<String>,
 }
 
@@ -2039,7 +2043,11 @@ pub struct ProviderModeSpec {
     pub session: Option<ProviderSessionSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idleTimeoutMs")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "idleTimeoutMs"
+    )]
     pub idle_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,

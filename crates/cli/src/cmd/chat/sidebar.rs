@@ -398,7 +398,12 @@ impl Sidebar {
         }
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect, agent_statuses: &HashMap<String, AgentStatusInfo>) {
+    pub fn render(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        agent_statuses: &HashMap<String, AgentStatusInfo>,
+    ) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -514,7 +519,12 @@ impl Sidebar {
         f.render_stateful_widget(list, area, &mut self.threads_state);
     }
 
-    fn render_members(&mut self, f: &mut Frame, area: Rect, agent_statuses: &HashMap<String, AgentStatusInfo>) {
+    fn render_members(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        agent_statuses: &HashMap<String, AgentStatusInfo>,
+    ) {
         let focused = matches!(self.focus, SidebarFocus::Members);
         let title = if focused {
             " ▸ Members  [i=invite · I=by-id · x=remove] "

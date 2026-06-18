@@ -38,12 +38,21 @@ fn unc_path_mixed_separators() {
     let normalized = normalize_path_separators(mixed);
     let normalized_str = normalized.to_string_lossy();
     // After normalization, all separators should be \
-    assert!(!normalized_str.contains('/'), "should have no forward slashes: {normalized_str}");
+    assert!(
+        !normalized_str.contains('/'),
+        "should have no forward slashes: {normalized_str}"
+    );
 
     let prefixed = unc_prefix_path(normalized);
     let prefixed_str = prefixed.to_string_lossy();
-    assert!(prefixed_str.starts_with(r"\\?\"), "should start with UNC prefix: {prefixed_str}");
-    assert!(!prefixed_str.contains('/'), "prefixed path should have no forward slashes: {prefixed_str}");
+    assert!(
+        prefixed_str.starts_with(r"\\?\"),
+        "should start with UNC prefix: {prefixed_str}"
+    );
+    assert!(
+        !prefixed_str.contains('/'),
+        "prefixed path should have no forward slashes: {prefixed_str}"
+    );
 }
 
 /// Robustness: unc_prefix_path on an already-prefixed path → no double `\\?\`.
@@ -53,8 +62,14 @@ fn unc_path_no_double_prefix() {
     let already_prefixed = std::path::PathBuf::from(r"\\?\C:\Users\test");
     let result = unc_prefix_path(already_prefixed);
     let result_str = result.to_string_lossy();
-    assert!(result_str.starts_with(r"\\?\"), "should start with UNC prefix");
+    assert!(
+        result_str.starts_with(r"\\?\"),
+        "should start with UNC prefix"
+    );
     // Should NOT have two UNC prefixes
     let prefix_count = result_str.match_indices(r"\\?\").count();
-    assert_eq!(prefix_count, 1, "should have exactly one UNC prefix, got {prefix_count}: {result_str}");
+    assert_eq!(
+        prefix_count, 1,
+        "should have exactly one UNC prefix, got {prefix_count}: {result_str}"
+    );
 }

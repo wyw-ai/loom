@@ -49,8 +49,7 @@ fn dual_write_file_contains_event_and_strips_ansi() {
 
     // Integration tests in tests/ each get their own binary, so
     // set_global_default will succeed exactly once.
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("set global default subscriber");
+    tracing::subscriber::set_global_default(subscriber).expect("set global default subscriber");
 
     tracing::info!("dual_write_test_marker_with_cjk_中文测试");
 

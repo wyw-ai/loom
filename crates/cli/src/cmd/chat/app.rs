@@ -69,9 +69,9 @@ pub struct CachedRun {
 /// Computed agent status info for the Members pane and @-mention picker.
 #[derive(Debug, Clone)]
 pub struct AgentStatusInfo {
-    pub label: String,           // "思考中 · user mention"
+    pub label: String,             // "思考中 · user mention"
     pub status: Option<RunStatus>, // for color dot
-    pub is_stale: bool,          // timed out
+    pub is_stale: bool,            // timed out
 }
 
 // ── Timeout thresholds (seconds) per run status ────────────────────────
@@ -306,10 +306,7 @@ impl App {
         self.agent_statuses.clear();
         for (actor_id, runs) in &by_actor {
             // Pick the highest-priority run.
-            let Some(best) = runs
-                .iter()
-                .max_by_key(|r| run_priority(r.status))
-            else {
+            let Some(best) = runs.iter().max_by_key(|r| run_priority(r.status)) else {
                 continue;
             };
 
@@ -758,10 +755,7 @@ pub fn compute_run_status_label(cr: &CachedRun, is_stale: bool) -> String {
         RunStatus::Running => "思考中".to_string(),
         RunStatus::WaitingTool => {
             // GUI V3 uses meta.toolName for tool name; fall back to start_reason.
-            let tool = cr
-                .tool_name
-                .as_deref()
-                .or(cr.start_reason.as_deref());
+            let tool = cr.tool_name.as_deref().or(cr.start_reason.as_deref());
             if let Some(tool) = tool {
                 format!("等待工具 · {}", tool)
             } else {
@@ -794,10 +788,7 @@ pub fn compute_run_status_label(cr: &CachedRun, is_stale: bool) -> String {
     if let Some(reason) = cr.start_reason.as_ref() {
         if !matches!(
             cr.status,
-            RunStatus::WaitingTool
-                | RunStatus::Failed
-                | RunStatus::Canceled
-                | RunStatus::Completed
+            RunStatus::WaitingTool | RunStatus::Failed | RunStatus::Canceled | RunStatus::Completed
         ) {
             return format!("{} · {}", base, reason);
         }
@@ -1075,8 +1066,7 @@ mod tests {
             status,
             start_reason: Some("mention".into()),
             opened_at: now - chrono::Duration::seconds(opened_ago_secs),
-            closed_at: closed_ago_secs
-                .map(|s| now - chrono::Duration::seconds(s)),
+            closed_at: closed_ago_secs.map(|s| now - chrono::Duration::seconds(s)),
             tool_name: None,
             error: None,
             no_reply_reason: None,
@@ -1096,7 +1086,11 @@ mod tests {
         }
     }
 
-    fn cr_failed(error: Option<&str>, no_reply_reason: Option<&str>, start_reason: Option<&str>) -> CachedRun {
+    fn cr_failed(
+        error: Option<&str>,
+        no_reply_reason: Option<&str>,
+        start_reason: Option<&str>,
+    ) -> CachedRun {
         CachedRun {
             actor_id: "a".into(),
             status: RunStatus::Failed,
@@ -1151,10 +1145,7 @@ mod tests {
     #[test]
     fn compute_run_status_label_waiting_tool_with_tool_name() {
         let r = cr_tool(RunStatus::WaitingTool, "read_file");
-        assert_eq!(
-            compute_run_status_label(&r, false),
-            "等待工具 · read_file"
-        );
+        assert_eq!(compute_run_status_label(&r, false), "等待工具 · read_file");
     }
 
     #[test]
@@ -1211,19 +1202,13 @@ mod tests {
     #[test]
     fn compute_run_status_label_failed_with_start_reason_fallback() {
         let r = cr_failed(None, None, Some("timeout"));
-        assert_eq!(
-            compute_run_status_label(&r, false),
-            "运行失败 · timeout"
-        );
+        assert_eq!(compute_run_status_label(&r, false), "运行失败 · timeout");
     }
 
     #[test]
     fn compute_run_status_label_failed_error_priority_over_no_reply() {
         let r = cr_failed(Some("crash"), Some("rate limited"), None);
-        assert_eq!(
-            compute_run_status_label(&r, false),
-            "运行失败 · crash"
-        );
+        assert_eq!(compute_run_status_label(&r, false), "运行失败 · crash");
     }
 
     #[test]
@@ -1248,10 +1233,7 @@ mod tests {
     fn compute_run_status_label_stale_queued() {
         let r = cr(RunStatus::Queued, 0, None);
         // stale path returns early before appending start_reason
-        assert_eq!(
-            compute_run_status_label(&r, true),
-            "⚠ 排队中 (超时)"
-        );
+        assert_eq!(compute_run_status_label(&r, true), "⚠ 排队中 (超时)");
     }
 
     #[test]
@@ -1271,7 +1253,12 @@ mod tests {
 
     #[test]
     fn recompute_agent_statuses_picks_highest_priority() {
-        let mut app = App::new("me".into(), "t1".into(), proto::types::ScopeKind::Thread, "demo".into());
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
         let now = Utc::now();
 
         // Two runs for same actor: running (priority 4) + queued (priority 1)
@@ -1315,7 +1302,12 @@ mod tests {
 
     #[test]
     fn recompute_agent_statuses_terminal_run_has_ttl() {
-        let mut app = App::new("me".into(), "t1".into(), proto::types::ScopeKind::Thread, "demo".into());
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
         let now = Utc::now();
 
         // Terminal run closed just now — should still appear
@@ -1346,7 +1338,12 @@ mod tests {
 
     #[test]
     fn recompute_agent_statuses_terminal_run_expired_ttl() {
-        let mut app = App::new("me".into(), "t1".into(), proto::types::ScopeKind::Thread, "demo".into());
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
         let now = Utc::now();
 
         // Terminal run closed 60s ago — beyond 30s TTL
@@ -1374,7 +1371,12 @@ mod tests {
 
     #[test]
     fn recompute_agent_statuses_stale_detection() {
-        let mut app = App::new("me".into(), "t1".into(), proto::types::ScopeKind::Thread, "demo".into());
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
         let now = Utc::now();
 
         // Queued run opened 400s ago — exceeds 300s timeout
@@ -1398,13 +1400,21 @@ mod tests {
             .agent_statuses
             .get("agent_slow")
             .expect("agent_slow should have status");
-        assert!(info.is_stale, "run open 400s should be stale for Queued (300s)");
+        assert!(
+            info.is_stale,
+            "run open 400s should be stale for Queued (300s)"
+        );
         assert!(info.label.contains("⚠"));
     }
 
     #[test]
     fn recompute_agent_statuses_removes_stale_entries() {
-        let mut app = App::new("me".into(), "t1".into(), proto::types::ScopeKind::Thread, "demo".into());
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
 
         // Only stale runs — after recompute status_label is stale-marked but
         // the entry should remain (is_stale is informational, not eviction).
@@ -1433,7 +1443,12 @@ mod tests {
 
     #[test]
     fn recompute_agent_statuses_idle_actor_no_entry() {
-        let mut app = App::new("me".into(), "t1".into(), proto::types::ScopeKind::Thread, "demo".into());
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
         app.run_cache.clear();
         app.agent_statuses.clear();
 

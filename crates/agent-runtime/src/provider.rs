@@ -12,17 +12,17 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use proto::methods::{
-    AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, ClaudeSettingsMode,
-    ClaudeSettingsSpec, CommandOutputFormat, CommandSession, CommandSessionIdSource,
-    InteractiveCommandSpec, InteractiveCompletionContractSpec, InteractiveCompletionSpec,
-    InteractiveKillAction, InteractiveKillKind, InteractiveKillSpec, InteractiveOutputSpec,
-    InteractivePromptSpec, InteractiveProviderSpec, InteractiveSessionSpec, PromptVia,
-    ProviderArgSpec, ProviderConditionalArgSpec, ProviderDecoderCaptureSpec,
+    default_instructions_via, AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport,
+    ClaudeSettingsMode, ClaudeSettingsSpec, CommandOutputFormat, CommandSession,
+    CommandSessionIdSource, InteractiveCommandSpec, InteractiveCompletionContractSpec,
+    InteractiveCompletionSpec, InteractiveKillAction, InteractiveKillKind, InteractiveKillSpec,
+    InteractiveOutputSpec, InteractivePromptSpec, InteractiveProviderSpec, InteractiveSessionSpec,
+    PromptVia, ProviderArgSpec, ProviderConditionalArgSpec, ProviderDecoderCaptureSpec,
     ProviderDecoderEmitSpec, ProviderDecoderEventSpec, ProviderDecoderSpec, ProviderDetectSpec,
     ProviderJsonConditionSpec, ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec,
     ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec, ProviderPromptRoleHint,
     ProviderPromptSpec, ProviderRenderTitle, ProviderSessionIdSource, ProviderSessionSpec,
-    ProviderWorkspaceFileSpec, default_instructions_via,
+    ProviderWorkspaceFileSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -2730,7 +2730,11 @@ fn find_command_in_path(candidates: &[String], path: &OsString) -> Option<PathBu
 fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
     // If the path already has an extension, check it directly.
     if path.extension().is_some() {
-        return if is_executable(path) { Some(path.to_path_buf()) } else { None };
+        return if is_executable(path) {
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
     }
     // Try each PATHEXT extension in order.
     let pathext = std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT"));
@@ -2752,7 +2756,11 @@ fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
-    if is_executable(path) { Some(path.to_path_buf()) } else { None }
+    if is_executable(path) {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn fallback_command_dirs() -> Vec<PathBuf> {

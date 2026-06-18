@@ -79,18 +79,18 @@ pub fn show_double_click_help() -> bool {
             .collect();
 
         let body = "\
-Loom — 多 actor 协作 CLI 工具
+Loom — multi-actor collaboration CLI
 
-loom.exe 是命令行工具，请在终端中运行：
+loom.exe is a command-line tool; run it in a terminal:
 
-  loom.exe --help          查看完整帮助
-  loom.exe message send    发送消息
-  loom.exe task list       查看任务
-  loom.exe chat            交互式聊天
+  loom.exe --help          view full help
+  loom.exe message send    send a message
+  loom.exe task list       list tasks
+  loom.exe chat            interactive chat
 
-常用子命令：channel, thread, message, task, chat, agent, run
+Common subcommands: channel, thread, message, task, chat, agent, run
 
-项目地址：joi-apps-temp-fork
+Project: joi-apps-temp-fork
         ";
         let body: Vec<u16> = OsStr::new(body)
             .encode_wide()

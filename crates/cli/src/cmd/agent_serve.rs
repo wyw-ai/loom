@@ -1598,7 +1598,7 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
-    /// 指令注入方式（从 provider manifest 复制）。"prompt" 或 "agents_md"。
+    /// How instructions are injected (copied from provider manifest). "prompt" or "agents_md".
     instructions_via: String,
 }
 
@@ -6517,7 +6517,7 @@ async fn append_run_started_ack(
         send_agent_message(
             client,
             target,
-            "已收到，正在处理。".into(),
+            "Received, processing.".into(),
             parent_message_id,
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,
@@ -6530,7 +6530,7 @@ async fn append_run_started_ack(
         send_scope_message(
             client,
             &active.scope,
-            "已收到，正在处理。".into(),
+            "Received, processing.".into(),
             trigger.is_message().then(|| trigger.id().to_string()),
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,

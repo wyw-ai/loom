@@ -1,16 +1,17 @@
-//! loom-shell — Windows 管理 GUI
+//! loom-shell — Windows admin GUI
 //!
-//! 通过托盘图标 + 标签页界面管理 loom-server 和 loom-daemon 的
-//! 启停、服务安装/卸载，以及实时日志查看。
+//! Manage loom-server and loom-daemon start/stop, service install/uninstall,
+//! and live log viewing through a tray icon + tabbed interface.
 //!
-//! 整个 crate 仅面向 Windows 构建；非 Windows 平台提供一个空 stub。
+//! This crate targets Windows only; non-Windows platforms get an empty stub.
 //!
-//! ## 管理员自动提权
+//! ## Auto-elevation
 //!
-//! Loom 致力于自动化无看管运行。loom-shell 启动时检测是否以管理员
-//! 身份运行：如果不是，自动通过 `ShellExecuteW("runas")` 提权重启。
-//! 提权后的进程以及它 spawn 的所有子进程（server、daemon、agent
-//! provider 命令）都继承管理员令牌，无需用户反复确认 UAC。
+//! Loom is built for unattended automation. On startup, loom-shell checks
+//! whether it runs with administrator privileges: if not, it automatically
+//! re-launches itself via `ShellExecuteW("runas")`. The elevated process
+//! and all its spawned children (server, daemon, agent provider commands)
+//! inherit the admin token, so the user never needs to re-confirm UAC.
 
 #[cfg(windows)]
 mod config;
@@ -29,25 +30,25 @@ mod ui;
 fn main() {
     use native_windows_gui as nwg;
 
-    // 确保以管理员身份运行 — Loom Native 自动化原则。
+    // Ensure we run as admin — Loom Native automation principle.
     ensure_admin_or_restart();
 
-    // 初始化 NWG
+    // Initialize NWG
     nwg::init().expect("Failed to init Native Windows GUI");
 
-    // 构建 UI 并运行消息循环
+    // Build UI and run message loop
     let _app = ui::LoomShell::build().expect("Failed to build LoomShell UI");
     nwg::dispatch_thread_events();
-    // 消息循环结束（窗口关闭）
+    // Message loop ends (window closed)
 }
 
 #[cfg(windows)]
-/// 检测当前进程是否以管理员身份运行。如果不是，通过 ShellExecuteW("runas")
-/// 自动提权重启当前 exe，然后退出当前进程。
+/// Check whether the current process runs as admin. If not, re-launch
+/// via `ShellExecuteW("runas")` with elevation, then exit the current process.
 ///
-/// Windows 安全模型要求 UAC 弹窗确认；用户只需确认一次，之后整个
-/// loom-shell → server → daemon → agent provider 进程树都运行在管理员
-/// 令牌下。
+/// Windows security model requires a single UAC confirmation; after that the
+/// entire loom-shell → server → daemon → agent provider process tree runs
+/// under the admin token.
 fn ensure_admin_or_restart() {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::HANDLE;
@@ -58,11 +59,11 @@ fn ensure_admin_or_restart() {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
-    // 检查当前令牌是否已提权
+    // Check if the current token is already elevated
     let mut token: HANDLE = std::ptr::null_mut();
     let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
     if ok == 0 {
-        // 无法打开令牌 → 继续（降级运行），不要在这里 panic
+        // Failed to open token → continue (degraded), don't panic here
         return;
     }
     let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
@@ -77,11 +78,11 @@ fn ensure_admin_or_restart() {
         )
     };
     if ok != 0 && elevation.TokenIsElevated != 0 {
-        // 已经是管理员 → 正常继续
+        // Already admin → proceed normally
         return;
     }
 
-    // 不是管理员 → 通过 ShellExecuteW("runas") 提权重启
+    // Not admin → re-launch with elevation via ShellExecuteW("runas")
     let exe_path = std::env::current_exe().unwrap_or_default();
     let exe_wide: Vec<u16> = exe_path
         .as_os_str()
@@ -89,7 +90,7 @@ fn ensure_admin_or_restart() {
         .chain(std::iter::once(0))
         .collect();
 
-    // 收集命令行参数（不含 exe 自身）
+    // Collect command-line arguments (excluding the exe itself)
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args_str = args.join(" ");
     let args_wide: Vec<u16> = if args_str.is_empty() {
@@ -109,12 +110,12 @@ fn ensure_admin_or_restart() {
         )
     };
 
-    // ShellExecuteW 返回值 > 32 表示成功启动新进程
+    // ShellExecuteW return value > 32 means the new process was launched
     if result as isize > 32 {
-        // 新实例已启动 → 退出当前非管理员实例
+        // New elevated instance started → exit current non-admin instance
         std::process::exit(0);
     }
-    // 否则（用户拒绝 UAC 或出错）→ 降级运行，不做打断
+    // Otherwise (user denied UAC or error) → continue degraded, don't interrupt
 }
 
 #[cfg(not(windows))]

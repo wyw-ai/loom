@@ -54,17 +54,13 @@ fn ensure_admin_or_restart() {
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcessToken,
-    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
     // 检查当前令牌是否已提权
     let mut token: HANDLE = std::ptr::null_mut();
-    let ok = unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
-    };
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
     if ok == 0 {
         // 无法打开令牌 → 继续（降级运行），不要在这里 panic
         return;
@@ -99,20 +95,17 @@ fn ensure_admin_or_restart() {
     let args_wide: Vec<u16> = if args_str.is_empty() {
         vec![0]
     } else {
-        args_str
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
+        args_str.encode_utf16().chain(std::iter::once(0)).collect()
     };
 
     let result = unsafe {
         ShellExecuteW(
-            std::ptr::null_mut(),              // hwnd
-            windows_sys::core::w!("runas"),     // lpOperation
-            exe_wide.as_ptr(),                  // lpFile
-            args_wide.as_ptr(),                 // lpParameters
-            windows_sys::core::w!(""),           // lpDirectory
-            SW_SHOW,                             // nShowCmd
+            std::ptr::null_mut(),           // hwnd
+            windows_sys::core::w!("runas"), // lpOperation
+            exe_wide.as_ptr(),              // lpFile
+            args_wide.as_ptr(),             // lpParameters
+            windows_sys::core::w!(""),      // lpDirectory
+            SW_SHOW,                        // nShowCmd
         )
     };
 

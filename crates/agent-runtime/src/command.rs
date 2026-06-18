@@ -704,7 +704,7 @@ fn spawn_and_collect(
             let stdin_body = cfg
                 .stdin_template
                 .as_ref()
-                .map(|template| expand_template(template, cfg, prompt, session_id, &prompt.content))
+                .map(|template| expand_stdin_template(template, cfg, prompt, session_id, &prompt.content))
                 .unwrap_or_else(|| prompt.content.clone());
             stdin
                 .write_all(stdin_body.as_bytes())
@@ -2884,23 +2884,48 @@ fn expand_template(
     session_id: Option<&str>,
     prompt: &str,
 ) -> String {
+    expand_template_inner(input, cfg, request, session_id, prompt, false)
+}
+
+/// Like [`expand_template`] but preserves `{prompt}` / `{prompt.full}` even
+/// when [`PromptVia::Stdin`] is set.  Used when expanding the stdin body
+/// template so the prompt content actually reaches the child process.
+fn expand_stdin_template(
+    input: &str,
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> String {
+    expand_template_inner(input, cfg, request, session_id, prompt, true)
+}
+
+fn expand_template_inner(
+    input: &str,
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+    for_stdin: bool,
+) -> String {
     let scope_kind = match request.scope.kind {
         proto::types::ScopeKind::Thread => "thread",
         proto::types::ScopeKind::Channel => "channel",
     };
+    let strip_prompt = !for_stdin && matches!(cfg.prompt_via, PromptVia::Stdin);
     let mut out = input
         .replace("{actor.id}", &cfg.actor_id)
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{model}", active_model(request).as_deref().unwrap_or(""))
-        .replace("{prompt}", if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        .replace("{prompt}", if strip_prompt {
             ""
         } else {
             prompt
         })
         .replace(
             "{prompt.full}",
-            if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            if strip_prompt {
                 ""
             } else {
                 request

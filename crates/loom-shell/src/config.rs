@@ -3,7 +3,8 @@
 //! 所有路径都相对于 loom-shell.exe 所在目录解析：
 //! - 二进制文件：`<exe_dir>/loom-server.exe`、`<exe_dir>/loom-daemon.exe`
 //! - 配置 XML：`<exe_dir>/../config/`
-//! - 日志文件：`%LOCALAPPDATA%\loom\logs\server\` / `daemon\`（winsw 默认输出）
+//! - 日志文件：`%LOCALAPPDATA%\loom\logs\server\loom-server.log` /
+//!   `daemon\loom-daemon.log`（独立进程写入，不依赖 winsw）
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,6 @@ pub fn config_dir() -> PathBuf {
 
 /// 日志根目录（%LOCALAPPDATA%\loom\logs）。
 fn local_appdata() -> PathBuf {
-    // 从环境变量读取 LOCALAPPDATA；若不可用则回退到 exe_dir
     std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| exe_dir().join("..").join("logs"))
@@ -51,4 +51,14 @@ pub fn server_log_dir() -> PathBuf {
 /// Daemon 日志目录（%LOCALAPPDATA%\loom\logs\daemon）。
 pub fn daemon_log_dir() -> PathBuf {
     local_appdata().join("loom").join("logs").join("daemon")
+}
+
+/// Server 日志文件路径（独立进程写入，不依赖 winsw）。
+pub fn server_log_file() -> PathBuf {
+    server_log_dir().join("loom-server.log")
+}
+
+/// Daemon 日志文件路径（独立进程写入，不依赖 winsw）。
+pub fn daemon_log_file() -> PathBuf {
+    daemon_log_dir().join("loom-daemon.log")
 }

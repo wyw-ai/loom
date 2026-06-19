@@ -329,14 +329,35 @@ export function MachineCard({
 
       <HostDetailSection title="Actions">
         {isLocalRegistration ? (
-          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
-            <div className="min-w-0">
-              <div className="text-sm font-bold text-[#111827]">Start Host</div>
-              <div className="mt-1 text-sm text-[#667085]">
-                Run the serve command above, then refresh hosts after the daemon connects.
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-sm font-bold text-[#111827]">Start Host</div>
+                <div className="mt-1 text-sm text-[#667085]">
+                  Run the serve command above, then refresh hosts after the daemon connects.
+                </div>
               </div>
+              <Badge variant="warning">pending daemon</Badge>
             </div>
-            <Badge variant="warning">pending daemon</Badge>
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-sm font-bold text-[#991b1b]">Discard Registration</div>
+                <div className="mt-1 text-sm text-[#b91c1c]">
+                  Remove this pending host registration. This will delete the local config and data directories.
+                </div>
+              </div>
+              <Button
+                variant="destructive"
+                size="sm"
+                title="Discard pending registration"
+                onClick={() => onRemove(machine.id)}
+                disabled={busy === `machine:remove:${machine.id}`}
+                className="rounded-lg"
+              >
+                <Trash2 size={15} />
+                Discard
+              </Button>
+            </div>
           </div>
         ) : (
           <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">

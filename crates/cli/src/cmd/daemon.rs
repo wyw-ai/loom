@@ -1933,6 +1933,7 @@ fn machine_inventory_meta(
             "inventory.read",
             "connection.status",
             "machine.command",
+            "machine.remove",
             "agent.create",
             "agent.update",
             "agent.remove",

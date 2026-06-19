@@ -2528,6 +2528,8 @@ dependencies = [
  "native-windows-derive",
  "native-windows-gui",
  "proto",
+ "serde_json",
+ "tracing",
  "windows-sys 0.59.0",
 ]
 

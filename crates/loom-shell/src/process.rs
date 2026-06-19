@@ -3,8 +3,14 @@
 //!
 //! Used in non-service mode; spawns child processes directly and tracks PIDs.
 
+use std::collections::HashMap;
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Mutex;
+use std::time::Duration;
+
+use crate::preflight::loom_config_dir;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,6 +27,88 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 /// Managed child process handle.
 static SERVER_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static DAEMON_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Path to the saved user environment snapshot (written before UAC elevation).
+///
+/// In admin context LOCALAPPDATA points to the system profile, so we fall
+/// back to USERPROFILE\AppData\Local.
+fn user_env_path() -> PathBuf {
+    let candidates = [
+        std::env::var("LOCALAPPDATA").ok(),
+        std::env::var("USERPROFILE")
+            .ok()
+            .map(|up| format!("{up}\\AppData\\Local")),
+    ];
+    for c in candidates.iter().flatten() {
+        let p = PathBuf::from(c).join("loom").join("user-env.json");
+        if p.exists() {
+            return p;
+        }
+    }
+    // Fallback to LOCALAPPDATA path even if it doesn't exist yet
+    std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("loom")
+        .join("user-env.json")
+}
+
+/// Load the user environment snapshot saved before UAC elevation.
+/// Returns a map of env var name → value from the user's original session.
+fn load_user_env() -> HashMap<String, String> {
+    let path = user_env_path();
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        tracing::warn!(path = %path.display(), "no user-env snapshot found; daemon will use system PATH");
+        return HashMap::new();
+    };
+    let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&data) else {
+        return HashMap::new();
+    };
+    let mut env = HashMap::new();
+    if let Some(obj) = json.as_object() {
+        for (key, value) in obj {
+            if let Some(val) = value.as_str() {
+                if !val.is_empty() {
+                    env.insert(key.clone(), val.to_string());
+                }
+            }
+        }
+    }
+    tracing::info!(path = %path.display(), vars = ?env.keys().collect::<Vec<_>>(), "loaded user env snapshot");
+    env
+}
+
+/// Try to read the daemon.toml machine-id so we can pass `--machine-id` to the
+/// daemon child process. Returns None if daemon.toml is missing or unreadable.
+pub(crate) fn machine_id_from_daemon_config() -> Option<String> {
+    let config_dir = loom_config_dir()?;
+    let path = config_dir.join("daemon.toml");
+    let data = std::fs::read_to_string(&path).ok()?;
+    // Simple TOML key-value extraction for [machine] id = "..."
+    // without pulling in a full TOML parser dependency.
+    let mut in_machine_section = false;
+    for line in data.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[machine]" {
+            in_machine_section = true;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_machine_section = false;
+            continue;
+        }
+        if in_machine_section {
+            if let Some(rest) = trimmed.strip_prefix("id") {
+                let value = rest.trim_start_matches(|c: char| c == ' ' || c == '=' || c == '"')
+                    .trim_end_matches('"');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Start server.exe as a child process.
 pub fn start_server(exe_path: &str) -> Result<u32, String> {
@@ -40,10 +128,29 @@ pub fn start_server(exe_path: &str) -> Result<u32, String> {
 }
 
 /// Start loom-daemon.exe as a child process.
+///
+/// Injects the user-level PATH (saved before UAC elevation) so that tools
+/// managed by version managers (fnm, nvm, etc.) are discoverable. Also passes
+/// `--machine-id` if available from daemon.toml.
 pub fn start_daemon(exe_path: &str) -> Result<u32, String> {
+    let user_env = load_user_env();
+
     let mut cmd = Command::new(exe_path);
+
+    // Inject user-level environment variables so the daemon can find
+    // copilot CLI and other npm-global tools installed via fnm/nvm.
+    for (key, value) in &user_env {
+        cmd.env(key, value);
+    }
+
+    // Pass --machine-id if we can determine it from daemon.toml.
+    if let Some(machine_id) = machine_id_from_daemon_config() {
+        cmd.arg("--machine-id").arg(&machine_id);
+    }
+
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start daemon: {e}"))?;
@@ -116,4 +223,30 @@ pub fn is_daemon_running() -> bool {
     } else {
         false
     }
+}
+
+/// Check if any loom-server process is listening on the default port.
+/// This detects servers started by other shell instances (not just our tracked child).
+pub fn is_server_port_open() -> bool {
+    TcpStream::connect_timeout(
+        &"127.0.0.1:7878".parse().unwrap(),
+        Duration::from_millis(500),
+    )
+    .is_ok()
+}
+
+/// Find any running loom-daemon.exe process by scanning the process list.
+/// This detects daemons started by other shell instances.
+pub fn is_daemon_running_any() -> bool {
+    #[cfg(windows)]
+    {
+        if let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq loom-daemon.exe", "/FO", "CSV", "/NH"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return stdout.contains("loom-daemon.exe");
+        }
+    }
+    is_daemon_running()
 }

@@ -619,6 +619,171 @@ struct SpawnOutcome {
     stderr: String,
 }
 
+/// Observes provider subprocess output and emits periodic health-status
+/// `AdapterEvent::StatusChange` events.  Pure observation — never kills.
+struct HealthObserver {
+    scope: ScopeRef,
+    last_activity: Instant,
+    last_health_report: Instant,
+    /// Sliding window of recent line hashes for repetition detection.
+    recent_hashes: std::collections::VecDeque<u64>,
+    /// How many times the same hash can appear in the window before a
+    /// repetition warning fires.
+    repetition_threshold: usize,
+    /// Maximum recent-window size.
+    window_size: usize,
+    /// How long without activity before emitting `"health: idle [N s]"`.
+    idle_warning: Duration,
+    /// Set to Some when a repetition warning has already fired for the current
+    /// dominant hash (avoids spam).
+    repetition_fired_for: Option<u64>,
+    /// Minimum line length for repetition detection (ignore blank/very short lines).
+    min_line_len: usize,
+}
+
+impl HealthObserver {
+    fn new(scope: ScopeRef) -> Self {
+        Self {
+            scope,
+            last_activity: Instant::now(),
+            last_health_report: Instant::now(),
+            recent_hashes: std::collections::VecDeque::with_capacity(128),
+            repetition_threshold: 20,
+            window_size: 100,
+            idle_warning: Duration::from_secs(60),
+            repetition_fired_for: None,
+            min_line_len: 4,
+        }
+    }
+
+    /// Call after each stdout line is processed.  If the line produced
+    /// meaningful output (text/finish), reset the idle timer.
+    fn observe_stdout(&mut self, raw_line: &str, had_output: bool) {
+        if had_output {
+            self.last_activity = Instant::now();
+        }
+        let trimmed = raw_line.trim();
+        if trimmed.len() >= self.min_line_len {
+            let hash = hash_line(trimmed);
+            if self.recent_hashes.len() >= self.window_size {
+                self.recent_hashes.pop_front();
+            }
+            self.recent_hashes.push_back(hash);
+        }
+    }
+
+    /// Call after each stderr line.
+    fn observe_stderr(&mut self, _raw_line: &str) {
+        // Stderr is informational; we track it but it doesn't affect liveness
+        // directly.  Specific error-flood detection can be added here later.
+    }
+
+    /// Call once per read-loop iteration.  Emits `StatusChange` when the
+    /// health picture changes meaningfully, and persists health events to
+    /// the tracing log for audit and diagnostics.
+    fn tick(&mut self, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+        let now = Instant::now();
+        let idle_secs = now.duration_since(self.last_activity).as_secs();
+
+        // 1. Repetition detection (check every tick)
+        if let Some(repeat_msg) = self.check_repetition() {
+            let status = format!("health: warning [{}]", repeat_msg);
+            tracing::warn!(
+                scope = %self.scope.id,
+                "health: warning [{}]", repeat_msg
+            );
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(self.scope.clone()),
+                status,
+            });
+            self.last_health_report = now;
+            return;
+        }
+
+        // 2. Idle escalation — only report when crossing the idle threshold
+        // for the first time, then periodically.
+        if idle_secs >= 300 {
+            if now.duration_since(self.last_health_report) >= Duration::from_secs(120) {
+                tracing::info!(
+                    scope = %self.scope.id,
+                    idle_secs,
+                    "health: idle [{idle_secs}s]"
+                );
+                let _ = sender.send(AdapterEvent::StatusChange {
+                    scope: Some(self.scope.clone()),
+                    status: format!("health: idle [{idle_secs}s]"),
+                });
+                self.last_health_report = now;
+            }
+            return;
+        }
+        if idle_secs >= self.idle_warning.as_secs()
+            && now.duration_since(self.last_health_report) >= Duration::from_secs(60)
+        {
+            tracing::info!(
+                scope = %self.scope.id,
+                idle_secs,
+                "health: idle [{idle_secs}s]"
+            );
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(self.scope.clone()),
+                status: format!("health: idle [{idle_secs}s]"),
+            });
+            self.last_health_report = now;
+            return;
+        }
+
+        // 3. Periodic active reaffirmation (every ~30s when active)
+        if idle_secs == 0
+            && now.duration_since(self.last_health_report) >= Duration::from_secs(30)
+        {
+            tracing::info!(
+                scope = %self.scope.id,
+                "health: active"
+            );
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(self.scope.clone()),
+                status: "health: active".to_string(),
+            });
+            self.last_health_report = now;
+        }
+    }
+
+    fn check_repetition(&mut self) -> Option<String> {
+        if self.recent_hashes.len() < self.repetition_threshold {
+            return None;
+        }
+        let mut counts: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        for &h in &self.recent_hashes {
+            *counts.entry(h).or_insert(0) += 1;
+        }
+        let (dominant, count) =
+            counts.into_iter().max_by_key(|(_, c)| *c).unwrap_or((0, 0));
+        if count as usize >= self.repetition_threshold {
+            let already_fired = self.repetition_fired_for == Some(dominant);
+            if !already_fired {
+                self.repetition_fired_for = Some(dominant);
+                return Some(format!(
+                    "repeating output x{count} in last {} lines",
+                    self.recent_hashes.len()
+                ));
+            }
+        } else {
+            self.repetition_fired_for = None;
+        }
+        None
+    }
+}
+
+/// Fast non-crypto hash for output-line deduplication.
+fn hash_line(line: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut h);
+    h.finish()
+}
+
 fn spawn_and_collect(
     cfg: &CommandConfig,
     prompt: &AdapterPrompt,
@@ -799,10 +964,16 @@ fn spawn_and_collect(
     let mut timed_out = false;
     let mut idle_timed_out = false;
     let mut early_runtime_error: Option<String> = None;
+    let mut health_observer = HealthObserver::new(prompt.scope.clone());
 
     loop {
+        health_observer.tick(sender);
         while let Ok(output) = output_rx.try_recv() {
             last_output_at = Instant::now();
+            let (raw_line, is_stdout) = match &output {
+                ProcessOutput::Stdout(s) => (s.clone(), true),
+                ProcessOutput::Stderr(s) => (s.clone(), false),
+            };
             let events = collect_process_output(
                 cfg,
                 prompt,
@@ -814,6 +985,14 @@ fn spawn_and_collect(
             );
             emitted_text |= events.emitted_text;
             emitted_finish |= events.emitted_finish;
+            if is_stdout {
+                health_observer.observe_stdout(
+                    &raw_line,
+                    events.emitted_text || events.emitted_finish,
+                );
+            } else {
+                health_observer.observe_stderr(&raw_line);
+            }
         }
         if early_runtime_error.is_some() {
             if force_kill_child(child.id()).is_err() {
@@ -871,6 +1050,10 @@ fn spawn_and_collect(
         match output_rx.recv_timeout(wait_for) {
             Ok(output) => {
                 last_output_at = Instant::now();
+                let (raw_line, is_stdout) = match &output {
+                    ProcessOutput::Stdout(s) => (s.clone(), true),
+                    ProcessOutput::Stderr(s) => (s.clone(), false),
+                };
                 let events = collect_process_output(
                     cfg,
                     prompt,
@@ -882,6 +1065,14 @@ fn spawn_and_collect(
                 );
                 emitted_text |= events.emitted_text;
                 emitted_finish |= events.emitted_finish;
+                if is_stdout {
+                    health_observer.observe_stdout(
+                        &raw_line,
+                        events.emitted_text || events.emitted_finish,
+                    );
+                } else {
+                    health_observer.observe_stderr(&raw_line);
+                }
                 if early_runtime_error.is_some() {
                     if force_kill_child(child.id()).is_err() {
                         let _ = child.kill();
@@ -913,6 +1104,10 @@ fn spawn_and_collect(
         }
     }
     for output in output_rx.try_iter() {
+        let (raw_line, is_stdout) = match &output {
+            ProcessOutput::Stdout(s) => (s.clone(), true),
+            ProcessOutput::Stderr(s) => (s.clone(), false),
+        };
         let events = collect_process_output(
             cfg,
             prompt,
@@ -924,6 +1119,14 @@ fn spawn_and_collect(
         );
         emitted_text |= events.emitted_text;
         emitted_finish |= events.emitted_finish;
+        if is_stdout {
+            health_observer.observe_stdout(
+                &raw_line,
+                events.emitted_text || events.emitted_finish,
+            );
+        } else {
+            health_observer.observe_stderr(&raw_line);
+        }
     }
     let exit_code = exit.code().unwrap_or(-1);
     // Snapshot + clear the cancel flag now that the child is reaped, before

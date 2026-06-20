@@ -54,6 +54,10 @@ pub fn run_checks() -> Vec<CheckResult> {
         check_copilot_cli(),
         check_daemon_config(),
         check_user_env_snapshot(),
+        check_disk_space(),
+        check_data_dir_writable(),
+        check_webview2(),
+        check_server_port(),
     ];
 
     // Persist diagnostics to the daemon log for high-availability visibility.
@@ -372,6 +376,320 @@ fn check_user_env_snapshot() -> CheckResult {
             status: CheckStatus::Warn,
             detail: "no user-env.json — normal if loom-shell was not elevated by UAC"
                 .to_string(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disk space check
+// ---------------------------------------------------------------------------
+
+/// Minimum free disk space (100 MB) before warning.
+const MIN_FREE_DISK_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Check that the data directory has adequate free disk space.
+///
+/// The loom data directory stores SQLite journals, agent workspaces, and
+/// logs. Running out of disk space can corrupt the database mid-write.
+fn check_disk_space() -> CheckResult {
+    let data_dir = loom_data_dir();
+    let free = match free_disk_space_bytes(&data_dir) {
+        Some(bytes) => bytes,
+        None => {
+            return CheckResult {
+                label: "disk space",
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "cannot query free space on {}",
+                    data_dir.display(),
+                ),
+            };
+        }
+    };
+
+    if free < MIN_FREE_DISK_BYTES {
+        let free_mb = free / (1024 * 1024);
+        CheckResult {
+            label: "disk space",
+            status: CheckStatus::Warn,
+            detail: format!(
+                "low disk space: {free_mb} MB free on {} — minimum recommended is 100 MB.\n\
+                 Running out of space can corrupt SQLite journals mid-write.",
+                data_dir.display(),
+            ),
+        }
+    } else {
+        let free_mb = free / (1024 * 1024);
+        CheckResult {
+            label: "disk space",
+            status: CheckStatus::Ok,
+            detail: format!("{free_mb} MB free on {}", data_dir.display()),
+        }
+    }
+}
+
+/// Query free disk space (in bytes) for the volume containing `path`
+/// using the Windows `GetDiskFreeSpaceExW` API.
+fn free_disk_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // Get the root of the volume (e.g. "C:\")
+    let path_str = path.to_string_lossy();
+    let root = if path_str.len() >= 2 && path_str.as_bytes()[1] == b':' {
+        format!("{}:\\", &path_str[..1])
+    } else {
+        // Fallback: use the current directory's root
+        let cwd = std::env::current_dir().ok()?;
+        let cwd_str = cwd.to_string_lossy();
+        if cwd_str.len() >= 2 && cwd_str.as_bytes()[1] == b':' {
+            format!("{}:\\", &cwd_str[..1])
+        } else {
+            "C:\\".to_string()
+        }
+    };
+
+    let root_wide: Vec<u16> = std::ffi::OsStr::new(&root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut free_bytes: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_free_bytes: u64 = 0;
+
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            root_wide.as_ptr(),
+            &mut free_bytes,
+            &mut total_bytes,
+            &mut total_free_bytes,
+        )
+    };
+
+    if ok != 0 {
+        // `free_bytes` is the free space available to the calling user
+        // (accounts for quotas). `total_free_bytes` is total free on the
+        // volume. We report the user-available free space.
+        Some(free_bytes)
+    } else {
+        None
+    }
+}
+
+/// Return the loom data directory used for journals, workspaces, and logs.
+fn loom_data_dir() -> PathBuf {
+    std::env::var_os("LOOM_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA").map(|appdata| PathBuf::from(appdata).join("loom"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+// ---------------------------------------------------------------------------
+// Data directory writability check
+// ---------------------------------------------------------------------------
+
+/// Check that the loom data directory is writable.
+///
+/// The daemon and agents write journal entries, workspace files, and
+/// session state to this directory. A read-only directory blocks all
+/// agent activity.
+fn check_data_dir_writable() -> CheckResult {
+    let data_dir = loom_data_dir();
+
+    // Ensure the directory exists before testing writability.
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        return CheckResult {
+            label: "data dir writable",
+            status: CheckStatus::Error,
+            detail: format!(
+                "cannot create data directory {}: {e}",
+                data_dir.display(),
+            ),
+        };
+    }
+
+    // Write a probe file and clean it up.
+    let probe = data_dir.join(".preflight-write-test");
+    match std::fs::write(&probe, b"loom preflight probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            CheckResult {
+                label: "data dir writable",
+                status: CheckStatus::Ok,
+                detail: format!("{} is writable", data_dir.display()),
+            }
+        }
+        Err(e) => CheckResult {
+            label: "data dir writable",
+            status: CheckStatus::Error,
+            detail: format!(
+                "{} is not writable: {e}\n\
+                 Check filesystem permissions or antivirus blocking.",
+                data_dir.display(),
+            ),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebView2 runtime check
+// ---------------------------------------------------------------------------
+
+/// Check whether the Microsoft Edge WebView2 runtime is installed.
+///
+/// The Tauri GUI shell depends on WebView2 for rendering the desktop
+/// interface. Without it the GUI will fail to launch.
+fn check_webview2() -> CheckResult {
+    // WebView2 Evergreen installer key (machine-wide).
+    // Per-user installs use HKCU instead, but the Evergreen bootstrapper
+    // typically installs to HKLM.
+    let key_path = r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+    let value_name = "pv"; // product version
+
+    if let Some(version) = read_registry_string(key_path, value_name) {
+        return CheckResult {
+            label: "WebView2 runtime",
+            status: CheckStatus::Ok,
+            detail: format!("installed (v{version})"),
+        };
+    }
+
+    // Try per-user install location as fallback.
+    let per_user_key =
+        r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+    if let Some(version) = read_registry_string_hkcu(per_user_key, value_name) {
+        return CheckResult {
+            label: "WebView2 runtime",
+            status: CheckStatus::Ok,
+            detail: format!("installed per-user (v{version})"),
+        };
+    }
+
+    CheckResult {
+        label: "WebView2 runtime",
+        status: CheckStatus::Warn,
+        detail: "WebView2 runtime not detected — the Tauri GUI will fail to launch.\n\
+                 Install from: https://developer.microsoft.com/microsoft-edge/webview2/"
+            .to_string(),
+    }
+}
+
+/// Read a string value from HKLM registry.
+fn read_registry_string(key_path: &str, value_name: &str) -> Option<String> {
+    read_registry_string_impl(
+        windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        key_path,
+        value_name,
+    )
+}
+
+/// Read a string value from HKCU registry.
+fn read_registry_string_hkcu(key_path: &str, value_name: &str) -> Option<String> {
+    read_registry_string_impl(
+        windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+        key_path,
+        value_name,
+    )
+}
+
+fn read_registry_string_impl(
+    hkey_root: windows_sys::Win32::System::Registry::HKEY,
+    key_path: &str,
+    value_name: &str,
+) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, KEY_READ, REG_SZ,
+    };
+
+    let subkey: Vec<u16> = std::ffi::OsStr::new(key_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let val: Vec<u16> = std::ffi::OsStr::new(value_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(hkey_root, subkey.as_ptr(), 0, KEY_READ, &mut hkey)
+    };
+    if status != 0 {
+        return None;
+    }
+
+    let mut data_type: u32 = 0;
+    let mut data_size: u32 = 0;
+    let status = unsafe {
+        RegQueryValueExW(
+            hkey,
+            val.as_ptr(),
+            std::ptr::null_mut(),
+            &mut data_type,
+            std::ptr::null_mut(),
+            &mut data_size,
+        )
+    };
+    if status != 0 || data_type != REG_SZ {
+        unsafe { RegCloseKey(hkey) };
+        return None;
+    }
+
+    let byte_len = (data_size / 2) as usize;
+    let mut buf: Vec<u16> = vec![0u16; byte_len];
+    let status = unsafe {
+        RegQueryValueExW(
+            hkey,
+            val.as_ptr(),
+            std::ptr::null_mut(),
+            &mut data_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut data_size,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+    if status != 0 {
+        return None;
+    }
+
+    let raw = OsString::from_wide(
+        &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())],
+    );
+    Some(raw.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Server port check
+// ---------------------------------------------------------------------------
+
+/// Check whether the default loom-server port (7878) is already in use.
+///
+/// A port conflict means another loom-server instance is already running,
+/// or another application is occupying the port. This is informational —
+/// the user may want to stop the existing instance first.
+fn check_server_port() -> CheckResult {
+    use std::net::TcpStream;
+
+    match TcpStream::connect_timeout(
+        &"127.0.0.1:7878".parse().unwrap(),
+        Duration::from_millis(500),
+    ) {
+        Ok(_) => CheckResult {
+            label: "server port 7878",
+            status: CheckStatus::Ok,
+            detail: "port 7878 is reachable — a loom-server instance appears to be running"
+                .to_string(),
+        },
+        Err(_) => CheckResult {
+            label: "server port 7878",
+            status: CheckStatus::Ok,
+            detail: "port 7878 is free — no conflicting server detected".to_string(),
         },
     }
 }

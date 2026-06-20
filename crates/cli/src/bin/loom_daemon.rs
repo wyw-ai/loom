@@ -50,7 +50,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     windows_console::init();
-    agent_runtime::tracing_setup::init_file_tracing("daemon", "warn");
+    agent_runtime::tracing_setup::init_file_tracing("daemon", "info");
 
     // Install a panic hook that logs panics to the tracing system before the
     // process exits. This ensures we have a record of what went wrong even if

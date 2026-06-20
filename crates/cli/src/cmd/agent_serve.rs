@@ -1276,32 +1276,35 @@ fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
         }
     };
     if meta.file_type().is_symlink() {
+        // On Unix, symlinks are removed via unlink(2) (remove_file).
         // On Windows, directory symlinks require RemoveDirectoryW (remove_dir),
         // not DeleteFileW (remove_file). Try remove_dir first for symlinks
         // since they typically point to directories; fall back to remove_file
         // for file symlinks.
-        std::fs::remove_dir(path)
-            .or_else(|e| {
-                if e.raw_os_error() == Some(5) {
-                    // os error 5 on remove_dir for a file symlink — try remove_file
-                    std::fs::remove_file(path)
-                } else {
-                    tracing::error!(
-                        path = %path.display(),
-                        %e,
-                        "remove_path_if_exists: remove_dir failed on symlink"
-                    );
-                    Err(e)
-                }
-            })
-            .map_err(|e| {
+        #[cfg(unix)]
+        let result = std::fs::remove_file(path);
+        #[cfg(windows)]
+        let result = std::fs::remove_dir(path).or_else(|e| {
+            if e.raw_os_error() == Some(5) {
+                // os error 5 on remove_dir for a file symlink — try remove_file
+                std::fs::remove_file(path)
+            } else {
                 tracing::error!(
                     path = %path.display(),
                     %e,
-                    "remove_path_if_exists: failed to remove symlink"
+                    "remove_path_if_exists: remove_dir failed on symlink"
                 );
-                e
-            })
+                Err(e)
+            }
+        });
+        result.map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: failed to remove symlink"
+            );
+            e
+        })
     } else if meta.is_file() {
         std::fs::remove_file(path).map_err(|e| {
             tracing::error!(

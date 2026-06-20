@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[cfg(unix)]
 use anyhow::{anyhow, bail};

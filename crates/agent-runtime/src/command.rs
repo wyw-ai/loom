@@ -734,8 +734,7 @@ impl HealthObserver {
         }
 
         // 3. Periodic active reaffirmation (every ~30s when active)
-        if idle_secs == 0
-            && now.duration_since(self.last_health_report) >= Duration::from_secs(30)
+        if idle_secs == 0 && now.duration_since(self.last_health_report) >= Duration::from_secs(30)
         {
             tracing::info!(
                 scope = %self.scope.id,
@@ -753,13 +752,11 @@ impl HealthObserver {
         if self.recent_hashes.len() < self.repetition_threshold {
             return None;
         }
-        let mut counts: std::collections::HashMap<u64, u32> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for &h in &self.recent_hashes {
             *counts.entry(h).or_insert(0) += 1;
         }
-        let (dominant, count) =
-            counts.into_iter().max_by_key(|(_, c)| *c).unwrap_or((0, 0));
+        let (dominant, count) = counts.into_iter().max_by_key(|(_, c)| *c).unwrap_or((0, 0));
         if count as usize >= self.repetition_threshold {
             let already_fired = self.repetition_fired_for == Some(dominant);
             if !already_fired {
@@ -986,10 +983,8 @@ fn spawn_and_collect(
             emitted_text |= events.emitted_text;
             emitted_finish |= events.emitted_finish;
             if is_stdout {
-                health_observer.observe_stdout(
-                    &raw_line,
-                    events.emitted_text || events.emitted_finish,
-                );
+                health_observer
+                    .observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
             } else {
                 health_observer.observe_stderr(&raw_line);
             }
@@ -1066,10 +1061,8 @@ fn spawn_and_collect(
                 emitted_text |= events.emitted_text;
                 emitted_finish |= events.emitted_finish;
                 if is_stdout {
-                    health_observer.observe_stdout(
-                        &raw_line,
-                        events.emitted_text || events.emitted_finish,
-                    );
+                    health_observer
+                        .observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
                 } else {
                     health_observer.observe_stderr(&raw_line);
                 }
@@ -1120,10 +1113,7 @@ fn spawn_and_collect(
         emitted_text |= events.emitted_text;
         emitted_finish |= events.emitted_finish;
         if is_stdout {
-            health_observer.observe_stdout(
-                &raw_line,
-                events.emitted_text || events.emitted_finish,
-            );
+            health_observer.observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
         } else {
             health_observer.observe_stderr(&raw_line);
         }

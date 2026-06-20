@@ -1,9 +1,20 @@
+#[cfg(unix)]
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use anyhow::{anyhow, bail};
 use anyhow::{Context, Result};
+#[cfg(unix)]
+use futures_util::SinkExt;
+#[cfg(unix)]
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
+#[cfg(unix)]
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::config;
 

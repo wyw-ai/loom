@@ -1,4 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
+#[cfg(unix)]
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +12,8 @@ use proto::{Notification, Request, Response, RpcEnvelope};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 

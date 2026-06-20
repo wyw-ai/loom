@@ -768,8 +768,24 @@ impl AgentPaths {
         spec: &AgentSpec,
         bundle_paths: &BundlePaths,
     ) -> std::io::Result<()> {
-        create_dir_all_unc(&self.profile)?;
-        create_dir_all_unc(&self.sessions)?;
+        create_dir_all_unc(&self.profile).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %self.profile.display(),
+                %e,
+                "ensure: create_dir_all_unc profile failed"
+            );
+            e
+        })?;
+        create_dir_all_unc(&self.sessions).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %self.sessions.display(),
+                %e,
+                "ensure: create_dir_all_unc sessions failed"
+            );
+            e
+        })?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
         if spec.memory.is_some() {
             let memory_root = spec
@@ -1173,14 +1189,31 @@ fn ensure_bundle(
     paths: &BundlePaths,
     agent_paths: &AgentPaths,
 ) -> std::io::Result<()> {
-    create_dir_all_unc(&paths.root)?;
+    create_dir_all_unc(&paths.root).map_err(|e| {
+        tracing::error!(
+            path = %paths.root.display(),
+            %e,
+            "ensure_bundle: create_dir_all_unc failed for bundle root"
+        );
+        e
+    })?;
     let current = validate_bundle_current(
         &agent_paths.root,
         &agent_paths.profile,
         &agent_paths.root.join("logs"),
         &paths.root,
         &paths.current,
-    )?;
+    )
+    .map_err(|e| {
+        tracing::error!(
+            actor_root = %agent_paths.root.display(),
+            current = %paths.current.display(),
+            bundle_root = %paths.root.display(),
+            %e,
+            "ensure_bundle: validate_bundle_current failed"
+        );
+        e
+    })?;
     let Some(bundle) = spec.bundle.as_ref() else {
         reset_bundle_current_dir(&current)?;
         return Ok(());
@@ -1795,7 +1828,7 @@ impl WorkerState {
     fn current_turn(&self, scope_id: &str) -> Option<ActiveTurn> {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(scope_id)
             .cloned()
     }
@@ -1803,12 +1836,12 @@ impl WorkerState {
     fn set_turn(&self, turn: ActiveTurn) {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(turn.scope.id.clone(), turn);
     }
 
     fn mark_cancel_requested(&self, scope_id: &str, turn_id: &str) -> Option<ActiveTurn> {
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         let turn = active.get_mut(scope_id)?;
         if turn.id != turn_id {
             return None;
@@ -1818,7 +1851,7 @@ impl WorkerState {
     }
 
     fn mark_no_reply_requested(&self, run_id: &str) -> Option<ActiveTurn> {
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         let turn = active.values_mut().find(|turn| turn.run_id == run_id)?;
         turn.no_reply_requested = true;
         Some(turn.clone())
@@ -1828,10 +1861,13 @@ impl WorkerState {
     /// that same scope (if any). Test-only; production uses `finish_and_next`.
     #[cfg(test)]
     fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         active.remove(scope_id);
         drop(active);
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let next = match pending.get_mut(scope_id) {
             Some(queue) => queue.pop_front(),
             None => None,
@@ -1848,7 +1884,10 @@ impl WorkerState {
 
     #[cfg(test)]
     fn enqueue(&self, scope_id: &str, trigger: AgentTrigger) {
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Self::enqueue_locked(&mut pending, scope_id, trigger);
     }
 
@@ -1884,9 +1923,12 @@ impl WorkerState {
     /// is what previously let a burst of wakes spawn several overlapping turns
     /// for the same scope.
     fn begin_or_enqueue(&self, scope_id: &str, trigger: AgentTrigger) -> bool {
-        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
+        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
         if busy.contains(scope_id) {
-            let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+            let mut pending = self
+                .pending_triggers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             Self::enqueue_locked(&mut pending, scope_id, trigger);
             false
         } else {
@@ -1904,10 +1946,13 @@ impl WorkerState {
     fn finish_and_next(&self, scope_id: &str) -> Option<AgentTrigger> {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(scope_id);
-        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(queue) = pending.get_mut(scope_id) {
             let next = queue.pop_front();
             if queue.is_empty() {
@@ -1934,7 +1979,7 @@ impl WorkerState {
             .map(|c| c.clone())
             .unwrap_or_default();
 
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         let mut scopes: Vec<ScopeRef> = Vec::new();
 
         for turn in active.values_mut() {
@@ -1954,7 +1999,10 @@ impl WorkerState {
 
         // Clear pending triggers for scopes in the deleted channel so queued
         // work doesn't re-dispatch after the adapter finishes.
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for scope in &scopes {
             pending.remove(&scope.id);
         }
@@ -1962,7 +2010,7 @@ impl WorkerState {
 
         // Release the scope-busy gate so the worker doesn't think these scopes
         // are still occupied.
-        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
+        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
         for scope in &scopes {
             busy.remove(&scope.id);
         }
@@ -1973,7 +2021,7 @@ impl WorkerState {
     fn has_pending_source(&self, source_id: &str) -> bool {
         self.pending_triggers
             .lock()
-            .expect("pending poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|queue| queue.iter().any(|trigger| trigger.id() == source_id))
     }
@@ -1981,7 +2029,7 @@ impl WorkerState {
     fn has_active_trigger(&self, source_id: &str) -> bool {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|turn| turn.trigger_source_id == source_id)
     }
@@ -1992,19 +2040,19 @@ impl WorkerState {
         }
         self.text_buffer
             .lock()
-            .expect("text_buffer poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .entry(turn_id.to_string())
             .or_default()
             .push_str(chunk);
     }
 
     fn take_text(&self, turn_id: &str) -> Option<String> {
-        let mut buf = self.text_buffer.lock().expect("text_buffer poisoned");
+        let mut buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.remove(turn_id).filter(|s| !s.is_empty())
     }
 
     fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
-        let mut totals = self.usage_totals.lock().expect("usage_totals poisoned");
+        let mut totals = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
         let total = totals.entry(scope_id.to_string()).or_default();
         usage::add_usage(total, increment);
         usage::normalized_usage(total.clone())
@@ -2013,21 +2061,21 @@ impl WorkerState {
     fn take_seed_slot(&self, scope_id: &str) -> bool {
         self.seeded
             .lock()
-            .expect("seeded poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id.to_string())
     }
 
     fn record_action_request(&self, message_id: String, request_id: String) {
         self.action_map
             .lock()
-            .expect("action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(message_id, request_id);
     }
 
     fn lookup_action_request(&self, message_id: &str) -> Option<String> {
         self.action_map
             .lock()
-            .expect("action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(message_id)
             .cloned()
     }
@@ -2036,14 +2084,14 @@ impl WorkerState {
         let _ = self
             .action_map
             .lock()
-            .expect("action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(message_id);
     }
 
     fn current_model(&self) -> Option<String> {
         self.selected_model
             .lock()
-            .expect("selected_model poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -2073,21 +2121,24 @@ impl WorkerState {
             return Err(anyhow!("model cannot be empty for {}", self.actor_id));
         }
         persist_model_state(&self.profile_dir, &model)?;
-        *self.selected_model.lock().expect("selected_model poisoned") = Some(model);
+        *self
+            .selected_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(model);
         Ok(())
     }
 
     fn record_model_action_request(&self, message_id: String, request: ModelActionRequest) {
         self.model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(message_id, request);
     }
 
     fn lookup_model_action_request(&self, message_id: &str) -> Option<ModelActionRequest> {
         self.model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(message_id)
             .cloned()
     }
@@ -2095,7 +2146,7 @@ impl WorkerState {
     fn is_model_action_request(&self, message_id: &str) -> bool {
         self.model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .contains_key(message_id)
     }
 
@@ -2103,14 +2154,14 @@ impl WorkerState {
         let _ = self
             .model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(message_id);
     }
 
     fn remember_source(&self, source_id: &str) -> bool {
         self.seen_sources
             .lock()
-            .expect("seen_sources poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(source_id.to_string())
     }
 }
@@ -2238,7 +2289,7 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
 
 async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
     let transport = resolve_transport_for_spec(&spec)
-        .map_err(|e| anyhow!("resolve transport for {}: {e}", spec.actor.id))?;
+        .with_context(|| format!("resolve transport for agent {}", spec.actor.id))?;
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -2247,10 +2298,17 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     };
     let paths = AgentPaths::new(&data_root, &actor_id);
     let bundle_paths = paths.bundle_paths(&spec);
-    paths.ensure(&actor_id, &spec, &bundle_paths)?;
+    paths
+        .ensure(&actor_id, &spec, &bundle_paths)
+        .with_context(|| format!("ensure agent dirs for {}", actor_id))?;
 
-    let client = Client::connect(&server_url).await?;
-    client.initialize().await?;
+    let client = Client::connect(&server_url)
+        .await
+        .with_context(|| format!("connect to {server_url} for {actor_id}"))?;
+    client
+        .initialize()
+        .await
+        .with_context(|| format!("rpc initialize for {actor_id}"))?;
     // Pre-register the actor row before opening our agent-bound connection.
     // `connection/open` would auto-upsert under the hood, but it can't carry
     // the spec's full `Actor` (display name, kind, capabilities) — explicitly
@@ -2292,7 +2350,8 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         agent_config_version_id,
     ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
-    let adapter = build_adapter(&spec, &transport, &paths, &bundle_paths, &agent_server_url)?;
+    let adapter = build_adapter(&spec, &transport, &paths, &bundle_paths, &agent_server_url)
+        .with_context(|| format!("build adapter for {actor_id}"))?;
 
     // Translator: AdapterEvent → server RPC. Drains until adapter drops the
     // sender (worker exit) — at which point the loop falls out and the task

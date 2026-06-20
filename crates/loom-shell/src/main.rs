@@ -38,6 +38,10 @@ fn main() {
     // Initialize NWG
     nwg::init().expect("Failed to init Native Windows GUI");
 
+    // Start the process supervisor — monitors server/daemon child processes and
+    // auto-restarts them if they exit unexpectedly (e.g., during long jobs).
+    process::start_supervisor();
+
     // Build UI and run message loop
     let _app = ui::LoomShell::build().expect("Failed to build LoomShell UI");
     nwg::dispatch_thread_events();
@@ -154,7 +158,10 @@ fn save_user_env_before_elevation() {
     };
 
     // Write to both locations so the reader finds it regardless of context.
-    for appdata in [&*local_appdata.to_string_lossy(), &*format!("{}\\AppData\\Local", userprofile.to_string_lossy())] {
+    for appdata in [
+        &*local_appdata.to_string_lossy(),
+        &*format!("{}\\AppData\\Local", userprofile.to_string_lossy()),
+    ] {
         let dir = std::path::PathBuf::from(appdata).join("loom");
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("user-env.json");
@@ -166,7 +173,9 @@ fn save_user_env_before_elevation() {
 /// Check whether the current process runs with admin privileges.
 fn is_admin() -> bool {
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token: HANDLE = std::ptr::null_mut();
@@ -202,8 +211,8 @@ fn read_user_path_from_registry() -> Option<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ,
-        REG_EXPAND_SZ, REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_EXPAND_SZ,
+        REG_SZ,
     };
 
     let subkey = wide_null("Environment");
@@ -211,15 +220,8 @@ fn read_user_path_from_registry() -> Option<String> {
 
     // Open HKCU\Environment with read access.
     let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_READ,
-            &mut hkey,
-        )
-    };
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
     if status != 0 {
         return None;
     }
@@ -270,9 +272,7 @@ fn read_user_path_from_registry() -> Option<String> {
     }
 
     // Convert wide string to Rust String (strip null terminator).
-    let raw = OsString::from_wide(
-        &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())],
-    );
+    let raw = OsString::from_wide(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]);
     let raw_str = raw.to_string_lossy().into_owned();
 
     // Expand environment variables for REG_EXPAND_SZ values.
@@ -294,26 +294,23 @@ fn expand_env_string(raw: &str) -> Option<String> {
         .collect();
 
     // First call to get required buffer size (in characters, including null).
-    let needed =
-        unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), std::ptr::null_mut(), 0) };
+    let needed = unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), std::ptr::null_mut(), 0) };
     if needed == 0 {
         return None;
     }
 
     let mut wide_output: Vec<u16> = vec![0u16; needed as usize];
-    let written = unsafe {
-        ExpandEnvironmentStringsW(
-            wide_input.as_ptr(),
-            wide_output.as_mut_ptr(),
-            needed,
-        )
-    };
+    let written =
+        unsafe { ExpandEnvironmentStringsW(wide_input.as_ptr(), wide_output.as_mut_ptr(), needed) };
     if written == 0 || written > needed {
         return None;
     }
 
     let result = std::ffi::OsString::from_wide(
-        &wide_output[..wide_output.iter().position(|&c| c == 0).unwrap_or(wide_output.len())],
+        &wide_output[..wide_output
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(wide_output.len())],
     );
     Some(result.to_string_lossy().into_owned())
 }

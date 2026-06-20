@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -63,13 +63,16 @@ jobs:
       - name: Build loom-gui
         run: cargo build -p loom-gui
 
+      - name: Check loom-shell
+        run: cargo check -p loom-shell
+
   # ── macOS GUI build ────────────────────────────────────────────────────
   gui-macos:
     name: GUI (macOS)
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -83,13 +86,16 @@ jobs:
       - name: Build loom-gui
         run: cargo build -p loom-gui
 
+      - name: Check loom-shell
+        run: cargo check -p loom-shell
+
   # ── Windows GUI build ──────────────────────────────────────────────────
   gui-windows:
     name: GUI (Windows)
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -111,7 +117,7 @@ jobs:
 
       - name: Upload loom-shell artifact
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: loom-shell-windows
           path: target/debug/loom-shell.exe
@@ -127,15 +133,15 @@ jobs:
         working-directory: apps/gui-web
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.0.4
         with:
           node-version: 22
           cache: pnpm
@@ -152,7 +158,7 @@ jobs:
 
       - name: Upload frontend dist (for bundle jobs)
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: frontend-dist
           path: apps/gui-web/dist
@@ -167,7 +173,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -176,12 +182,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.0.4
         with:
           node-version: 22
           cache: pnpm
@@ -209,7 +215,7 @@ jobs:
         run: cd crates/gui && cargo tauri build --ci --bundles deb,appimage
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: gui-bundle-linux
           path: |
@@ -226,7 +232,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -235,12 +241,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.0.4
         with:
           node-version: 22
           cache: pnpm
@@ -256,7 +262,7 @@ jobs:
         run: cd crates/gui && cargo tauri build --ci --bundles dmg
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: gui-bundle-macos
           path: target/release/bundle/dmg/*.dmg
@@ -271,7 +277,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -280,12 +286,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.0.4
         with:
           node-version: 22
           cache: pnpm
@@ -304,7 +310,7 @@ jobs:
         run: cargo build -p loom-shell --release
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: gui-bundle-windows
           path: |

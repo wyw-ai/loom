@@ -50,9 +50,36 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     windows_console::init();
-    init_tracing();
+    agent_runtime::tracing_setup::init_file_tracing("daemon", "warn");
+
+    // Install a panic hook that logs panics to the tracing system before the
+    // process exits. This ensures we have a record of what went wrong even if
+    // the panic happens outside the main loop's catch_unwind guards.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Log the panic through tracing so it appears in the file log.
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        tracing::error!(
+            location = %location,
+            payload = %payload,
+            "loom-daemon PANIC"
+        );
+        // Also call the default hook (prints to stderr).
+        default_hook(info);
+    }));
+
     let args = Args::parse();
-    loom_cli::cmd::daemon::run(
+    if let Err(e) = loom_cli::cmd::daemon::run(
         args.machine_id,
         args.machine_name,
         args.data_root,
@@ -66,52 +93,16 @@ async fn main() -> Result<()> {
         args.server,
     )
     .await
-}
-
-fn init_tracing() {
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::EnvFilter;
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-
-    // File log directory.  On Windows: %LOCALAPPDATA%\loom\logs\daemon.
-    // On Unix: ~/.local/share/loom/logs/daemon.
-    #[cfg(target_os = "windows")]
-    let log_dir = {
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        std::path::PathBuf::from(local)
-            .join("loom")
-            .join("logs")
-            .join("daemon")
-    };
-    #[cfg(not(target_os = "windows"))]
-    let log_dir = {
-        let home = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        home.join("loom").join("logs").join("daemon")
-    };
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    // Use a fixed-name log file so loom-shell can always find it.
-    let log_path = log_dir.join("loom-daemon.log");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("failed to open loom-daemon.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file);
-
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false);
-
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(stderr_layer)
-        .with(file_layer)
-        .try_init();
-    // Keep _guard alive so non_blocking worker stays active.
-    std::mem::forget(_guard);
-    tracing::info!(path = %log_path.display(), "loom-daemon logging to file");
+    {
+        // Log startup/run-time failures before exiting.
+        // The daemon typically has no visible terminal (CREATE_NO_WINDOW on
+        // Windows), so tracing is the only record.
+        tracing::error!(error = %e, "loom-daemon run failed, exiting");
+        // Ensure logs are flushed.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

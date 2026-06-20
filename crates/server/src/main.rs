@@ -48,7 +48,30 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     windows_console::init();
-    init_tracing();
+    agent_runtime::tracing_setup::init_file_tracing("server", "info");
+
+    // Install a panic hook that logs panics to the tracing system.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        tracing::error!(
+            location = %location,
+            payload = %payload,
+            "loom-server PANIC"
+        );
+        default_hook(info);
+    }));
+
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
@@ -161,59 +184,12 @@ fn spawn_reminder_worker(state: AppState) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
+            // fire_due_reminders is infallible (returns Vec, not Result).
+            // RwLock poisoning is handled by rc4 mutex-poisoning fixes.
             let fired = state.store.fire_due_reminders();
             for reminder in fired {
                 tracing::debug!(reminder = %reminder.id, "reminder processed");
             }
         }
     });
-}
-
-fn init_tracing() {
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::EnvFilter;
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    // File log directory.  On Windows: %LOCALAPPDATA%\loom\logs\server.
-    // On Unix: ~/.local/share/loom/logs/server.
-    #[cfg(target_os = "windows")]
-    let log_dir = {
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        std::path::PathBuf::from(local)
-            .join("loom")
-            .join("logs")
-            .join("server")
-    };
-    #[cfg(not(target_os = "windows"))]
-    let log_dir = {
-        let home = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        home.join("loom").join("logs").join("server")
-    };
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    // Use a fixed-name log file (not rolling) so loom-shell can always find it.
-    let log_path = log_dir.join("loom-server.log");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("failed to open loom-server.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file);
-
-    // Stderr layer for console/daemon manager output.
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-
-    // File layer for persistent log storage.
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false);
-
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(stderr_layer)
-        .with(file_layer)
-        .try_init();
-    // Keep _guard alive so non_blocking worker stays active.
-    std::mem::forget(_guard);
-    tracing::info!(path = %log_path.display(), "loom-server logging to file");
 }

@@ -6,7 +6,7 @@
 //!
 //! On non-Windows platforms, these are transparent no-ops.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Windows `CREATE_NO_WINDOW` — prevents a console window from appearing.
 #[cfg(windows)]
@@ -38,6 +38,7 @@ pub fn unc_prefix_path(path: PathBuf) -> PathBuf {
 /// convert `/` to `\`. Returns a string.
 #[cfg(windows)]
 fn normalize_path_for_unc(path: PathBuf) -> String {
+    use std::path::Component;
     let mut result = std::path::PathBuf::new();
     for c in path.components() {
         match c {

@@ -141,7 +141,7 @@ jobs:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v6.0.4
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
@@ -187,7 +187,7 @@ jobs:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v6.0.4
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
@@ -246,7 +246,7 @@ jobs:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v6.0.4
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
@@ -291,7 +291,7 @@ jobs:
           version: 9.15.0
 
       - name: Install Node
-        uses: actions/setup-node@v6.0.4
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm

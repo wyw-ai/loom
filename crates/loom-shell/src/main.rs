@@ -120,6 +120,7 @@ fn main() {
 ///
 /// When already running as admin, PATH is the system PATH (no fnm). In that
 /// case we try to recover the user's real PATH from the registry.
+#[cfg(windows)]
 fn save_user_env_before_elevation() {
     let mut path = std::env::var_os("PATH").unwrap_or_default();
 
@@ -171,6 +172,7 @@ fn save_user_env_before_elevation() {
 }
 
 /// Check whether the current process runs with admin privileges.
+#[cfg(windows)]
 fn is_admin() -> bool {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::{
@@ -207,6 +209,7 @@ fn is_admin() -> bool {
 /// Uses the Windows Registry API directly instead of shelling out to
 /// `reg.exe`, which avoids fragile string parsing of console output
 /// (encoding, leading whitespace, multi-column layout).
+#[cfg(windows)]
 fn read_user_path_from_registry() -> Option<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -284,6 +287,7 @@ fn read_user_path_from_registry() -> Option<String> {
 }
 
 /// Expand environment-variable references (e.g. `%SystemRoot%`) in a string.
+#[cfg(windows)]
 fn expand_env_string(raw: &str) -> Option<String> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -316,6 +320,7 @@ fn expand_env_string(raw: &str) -> Option<String> {
 }
 
 /// Create a null-terminated UTF-16 string from a Rust &str.
+#[cfg(windows)]
 fn wide_null(s: &str) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     std::ffi::OsStr::new(s)

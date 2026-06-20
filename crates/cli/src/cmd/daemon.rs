@@ -67,6 +67,7 @@ pub async fn run(
     let selected_machine_id = machine.id.clone();
     let mut selected_machine = machine.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
+    let data_root = abs_path(data_root);
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
@@ -139,53 +140,116 @@ pub async fn run(
     tracing::info!("loom-daemon: ready (ctrl-c to stop)");
 
     loop {
-        match refresh_machine_runtime(
-            &selected_machine_id,
-            &mut selected_machine,
-            &allow_actors,
-            &data_root,
-            &server_url,
-            &machine_inventory,
-            &mut inventory_revision,
-            &mut inventory_fingerprint,
-            &mut running_agents,
-            &mut warned_missing,
-        ) {
-            Ok(()) => {}
-            Err(e) => tracing::error!("loom-daemon: reload failed: {e:#}"),
+        // Wrap config reload in a panic guard so a single reload failure
+        // (e.g., from corrupted spec file parsing) doesn't kill the daemon.
+        let reload_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refresh_machine_runtime(
+                &selected_machine_id,
+                &mut selected_machine,
+                &allow_actors,
+                &data_root,
+                &server_url,
+                &machine_inventory,
+                &mut inventory_revision,
+                &mut inventory_fingerprint,
+                &mut running_agents,
+                &mut warned_missing,
+            )
+        }));
+        match reload_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("loom-daemon: reload failed: {e:#}"),
+            Err(panic_err) => {
+                let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("loom-daemon: reload panicked: {msg}");
+                // Sleep a bit after a panic to avoid tight panic loops.
+                sleep(Duration::from_secs(5)).await;
+            }
         }
 
         tokio::select! {
             _ = shutdown_signal() => break,
             maybe_command = machine_command_rx.recv() => {
                 let Some(command) = maybe_command else {
-                    tracing::warn!("loom-daemon: machine command channel closed");
+                    // Channel closed — the server-side machine command sender was
+                    // dropped. Log once and add a sleep so we don't tight-loop
+                    // on disk I/O from refresh_machine_runtime above.
+                    tracing::warn!("loom-daemon: machine command channel closed; will keep polling config");
+                    sleep(Duration::from_secs(15)).await;
                     continue;
                 };
-                let result = handle_machine_command(
-                    &selected_machine_id,
-                    &mut selected_machine,
-                    command.payload,
-                );
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    if let Err(err) = refresh_machine_runtime(
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_machine_command(
                         &selected_machine_id,
                         &mut selected_machine,
-                        &allow_actors,
-                        &data_root,
-                        &server_url,
-                        &machine_inventory,
-                        &mut inventory_revision,
-                        &mut inventory_fingerprint,
-                        &mut running_agents,
-                        &mut warned_missing,
-                    ) {
-                        let fallback = machine_command_error_from_result(
-                            &result,
-                            format!("machine command applied but runtime refresh failed: {err:#}"),
+                        command.payload,
+                    )
+                }));
+                let result = match result {
+                    Ok(r) => r,
+                    Err(panic_err) => {
+                        let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!("loom-daemon: machine command handler panicked: {msg}");
+                        let fallback = machine_command_error(
+                            json!({}),
+                            format!("internal panic handling machine command: {msg}"),
                         );
                         let _ = command.reply.send(fallback);
                         continue;
+                    }
+                };
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let refresh_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        refresh_machine_runtime(
+                            &selected_machine_id,
+                            &mut selected_machine,
+                            &allow_actors,
+                            &data_root,
+                            &server_url,
+                            &machine_inventory,
+                            &mut inventory_revision,
+                            &mut inventory_fingerprint,
+                            &mut running_agents,
+                            &mut warned_missing,
+                        )
+                    }));
+                    match refresh_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            let fallback = machine_command_error_from_result(
+                                &result,
+                                format!("machine command applied but runtime refresh failed: {err:#}"),
+                            );
+                            let _ = command.reply.send(fallback);
+                            continue;
+                        }
+                        Err(panic_err) => {
+                            let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            let fallback = machine_command_error_from_result(
+                                &result,
+                                format!("machine command applied but refresh panicked: {msg}"),
+                            );
+                            let _ = command.reply.send(fallback);
+                            continue;
+                        }
                     }
                 }
                 let _ = command.reply.send(result);
@@ -421,7 +485,7 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
     let mut clean_spec = spec.clone();
     clean_spec.actor._meta = None;
     let text = serde_json::to_string_pretty(&clean_spec)?;
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    atomic_write(&path, &text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -1069,7 +1133,7 @@ fn write_local_provider_manifest(
         ));
     }
     let text = serde_json::to_string_pretty(raw).context("serialize provider manifest")?;
-    std::fs::write(&path, text)
+    atomic_write(&path, &text)
         .with_context(|| format!("write provider manifest {}", path.display()))?;
     Ok(path)
 }
@@ -1989,7 +2053,17 @@ fn save_daemon_config(cfg: &DaemonConfig) -> Result<()> {
             .with_context(|| format!("create config dir {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    std::fs::write(&path, text).with_context(|| format!("write daemon config {}", path.display()))
+    atomic_write(&path, &text).with_context(|| format!("write daemon config {}", path.display()))
+}
+
+/// Write `content` to `path` atomically: write to a temporary file first,
+/// then rename it into place.  This prevents config corruption if the
+/// process crashes mid-write.
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp_path, content)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
 }
 
 fn daemon_config_path() -> PathBuf {
@@ -2252,10 +2326,23 @@ fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineC
 }
 
 fn machine_data_root(machine: &MachineConfig) -> PathBuf {
-    if machine.data_root.trim().is_empty() {
+    let raw = if machine.data_root.trim().is_empty() {
         expand_home(&default_agent_data_root_expr())
     } else {
         expand_home(&machine.data_root)
+    };
+    // Always resolve to an absolute path — relative paths break UNC prefixing
+    // in create_dir_all_unc, causing "os error 3" on agent directory creation.
+    abs_path(raw)
+}
+
+fn abs_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 

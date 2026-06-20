@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
-#[cfg(unix)]
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use tokio::io::BufReader;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};

@@ -1,6 +1,6 @@
-#[cfg(unix)]
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use tokio::io::BufReader;
 
 #[cfg(unix)]
 use anyhow::{anyhow, bail};

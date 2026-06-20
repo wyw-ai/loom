@@ -7,7 +7,9 @@
 //! Tests are cross-platform where applicable; the no-op path is
 //! Windows-gated.
 
-use loom_cli::daemon_ipc::{daemon_disabled, resolve_socket, start_proxy};
+#[cfg(windows)]
+use loom_cli::daemon_ipc::start_proxy;
+use loom_cli::daemon_ipc::{daemon_disabled, resolve_socket};
 
 /// AC-B4.1, B4.2: Call start_proxy on Windows — assert returns Ok(JoinHandle),
 /// await the handle resolves without panic.

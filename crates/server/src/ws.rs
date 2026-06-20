@@ -140,11 +140,27 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         tx: tx.clone(),
     });
 
-    // Outbound writer.
+    // Outbound writer — sends RPC frames and periodic WebSocket pings to keep
+    // client connections alive through NAT/firewall timeouts and long idle periods.
     let writer = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if sink.send(Message::Text(frame)).await.is_err() {
-                break;
+        let mut ping_ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                frame = rx.recv() => {
+                    match frame {
+                        Some(f) => {
+                            if sink.send(Message::Text(f)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_ticker.tick() => {
+                    if sink.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = sink.send(Message::Close(None)).await;

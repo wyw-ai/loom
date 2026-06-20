@@ -125,8 +125,8 @@ fn format_daemon_detail(extra_info: &str) -> String {
         } else {
             detail.push_str("\r\nAvailable machine configs in daemon-configs/:");
             for entry in &entries {
-                let marker = if Some(entry.as_str()) ==
-                    process::machine_id_from_daemon_config().as_deref()
+                let marker = if Some(entry.as_str())
+                    == process::machine_id_from_daemon_config().as_deref()
                 {
                     " <-- active"
                 } else {
@@ -372,7 +372,13 @@ impl LoomShell {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Server;
-                refresh_tab(Tab::Server, &lbl_status, &lbl_detail, &log_area, &cmb_machine);
+                refresh_tab(
+                    Tab::Server,
+                    &lbl_status,
+                    &lbl_detail,
+                    &log_area,
+                    &cmb_machine,
+                );
                 populate_config_editor(Tab::Server, &lbl_config, &txt_config, Some(&btn_save));
             });
         shell._event_handles.push(ev);
@@ -392,7 +398,13 @@ impl LoomShell {
                     return;
                 }
                 state_rc.borrow_mut().current_tab = Tab::Daemon;
-                refresh_tab(Tab::Daemon, &lbl_status, &lbl_detail, &log_area, &cmb_machine);
+                refresh_tab(
+                    Tab::Daemon,
+                    &lbl_status,
+                    &lbl_detail,
+                    &log_area,
+                    &cmb_machine,
+                );
                 populate_config_editor(Tab::Daemon, &lbl_config, &txt_config, Some(&btn_save));
             });
         shell._event_handles.push(ev);
@@ -425,14 +437,21 @@ impl LoomShell {
         let lbl_config = shell.lbl_config.handle;
         let txt_config = shell.txt_config.handle;
         let btn_save = shell.btn_save_config.handle;
-        let ev = nwg::full_bind_event_handler(&shell.btn_config.handle, move |ev, _evd, _handle| {
-            if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
-                return;
-            }
-            state_rc.borrow_mut().current_tab = Tab::Config;
-            refresh_tab(Tab::Config, &lbl_status, &lbl_detail, &log_area, &cmb_machine);
-            populate_config_editor(Tab::Config, &lbl_config, &txt_config, Some(&btn_save));
-        });
+        let ev =
+            nwg::full_bind_event_handler(&shell.btn_config.handle, move |ev, _evd, _handle| {
+                if ev != nwg::Event::OnMousePress(nwg::MousePressEvent::MousePressLeftUp) {
+                    return;
+                }
+                state_rc.borrow_mut().current_tab = Tab::Config;
+                refresh_tab(
+                    Tab::Config,
+                    &lbl_status,
+                    &lbl_detail,
+                    &log_area,
+                    &cmb_machine,
+                );
+                populate_config_editor(Tab::Config, &lbl_config, &txt_config, Some(&btn_save));
+            });
         shell._event_handles.push(ev);
 
         // Start button
@@ -520,7 +539,13 @@ impl LoomShell {
                         Ok(()) => set_hwnd_text(lbl_detail_raw, "Restarted successfully"),
                         Err(e) => set_hwnd_text(lbl_detail_raw, &format!("Restart failed: {}", e)),
                     }
-                    refresh_tab_raw(tab, lbl_status_raw, lbl_detail_raw, log_area_raw, cmb_machine_raw);
+                    refresh_tab_raw(
+                        tab,
+                        lbl_status_raw,
+                        lbl_detail_raw,
+                        log_area_raw,
+                        cmb_machine_raw,
+                    );
                     populate_config_editor_raw(tab, lbl_config_raw, txt_config_raw);
                 });
             });
@@ -621,12 +646,10 @@ impl LoomShell {
                 }
                 let machine_id = read_combo_machine_id(extract_hwnd(&cmb_machine));
                 match machine_id {
-                    Some(ref id) if !id.is_empty() => {
-                        match handle_discard_machine(id) {
-                            Ok(msg) => set_ctrl_text(&lbl_detail, &msg),
-                            Err(e) => set_ctrl_text(&lbl_detail, &format!("Discard failed: {}", e)),
-                        }
-                    }
+                    Some(ref id) if !id.is_empty() => match handle_discard_machine(id) {
+                        Ok(msg) => set_ctrl_text(&lbl_detail, &msg),
+                        Err(e) => set_ctrl_text(&lbl_detail, &format!("Discard failed: {}", e)),
+                    },
                     _ => set_ctrl_text(&lbl_detail, "No machine selected to discard"),
                 }
                 let tab = state_rc.borrow().current_tab;
@@ -661,7 +684,9 @@ impl LoomShell {
                     let result = handle_clean_zombie_actors();
                     match &result {
                         Ok(msg) => set_hwnd_text(lbl_detail_raw, msg),
-                        Err(e) => set_hwnd_text(lbl_detail_raw, &format!("Clean zombies failed: {}", e)),
+                        Err(e) => {
+                            set_hwnd_text(lbl_detail_raw, &format!("Clean zombies failed: {}", e))
+                        }
                     }
                     // Refresh the Server tab
                     refresh_tab_raw(
@@ -799,7 +824,9 @@ fn set_ctrl_text(handle: &nwg::ControlHandle, text: &str) {
 
 /// Read text from a TextBox control via raw HWND.
 fn get_ctrl_text(handle: &nwg::ControlHandle) -> String {
-    let Some(hwnd) = handle.hwnd() else { return String::new() };
+    let Some(hwnd) = handle.hwnd() else {
+        return String::new();
+    };
     let hwnd = hwnd as isize;
     if hwnd == 0 {
         return String::new();
@@ -824,7 +851,14 @@ fn show_window(hwnd: isize, visible: bool) {
     }
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
-        ShowWindow(hwnd as _, if visible { 5 /* SW_SHOW */ } else { 0 /* SW_HIDE */ });
+        ShowWindow(
+            hwnd as _,
+            if visible {
+                5 /* SW_SHOW */
+            } else {
+                0 /* SW_HIDE */
+            },
+        );
     }
 }
 
@@ -847,12 +881,10 @@ fn save_daemon_toml(content: &str) -> Result<(), String> {
     }) {
         let lower = line.to_lowercase();
         if lower.contains("http://") && !lower.contains("ws://") {
-            return Err(
-                "serverUrl must use ws:// (or wss://), not http://.\n\
+            return Err("serverUrl must use ws:// (or wss://), not http://.\n\
                  Using http:// causes ALL actors to go offline.\n\
                  Correct format: serverUrl = \"ws://127.0.0.1:7878/rpc\""
-                    .to_string(),
-            );
+                .to_string());
         }
     }
     let Some(config_dir) = preflight::loom_config_dir() else {
@@ -885,8 +917,7 @@ fn save_daemon_toml(content: &str) -> Result<(), String> {
     };
 
     let _ = std::fs::create_dir_all(&config_dir);
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write daemon.toml: {}", e))?;
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write daemon.toml: {}", e))?;
 
     if let Some(warning) = id_change_warning {
         // Return success with machine-id change warning baked in.
@@ -906,8 +937,7 @@ fn save_cli_toml(content: &str) -> Result<(), String> {
     };
     let _ = std::fs::create_dir_all(&config_dir);
     let path = config_dir.join("cli.toml");
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write cli.toml: {}", e))
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write cli.toml: {}", e))
 }
 
 /// Populate the config editor TextBox with daemon.toml or cli.toml content,
@@ -918,7 +948,9 @@ fn populate_config_editor(
     txt_config: &nwg::ControlHandle,
     btn_save_config: Option<&nwg::ControlHandle>,
 ) {
-    let Some(config_dir) = preflight::loom_config_dir() else { return };
+    let Some(config_dir) = preflight::loom_config_dir() else {
+        return;
+    };
     let (label, path) = match tab {
         Tab::Daemon => ("daemon.toml", config_dir.join("daemon.toml")),
         Tab::Config => ("cli.toml", config_dir.join("cli.toml")),
@@ -941,7 +973,10 @@ fn populate_config_editor(
         show_window(extract_hwnd(btn), true);
     }
     // Set label
-    set_ctrl_text(lbl_config, &format!("  {label}  (editable — Save to apply)"));
+    set_ctrl_text(
+        lbl_config,
+        &format!("  {label}  (editable — Save to apply)"),
+    );
     // Load file content
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     set_ctrl_text(txt_config, &content);
@@ -954,7 +989,6 @@ fn populate_machine_combo(handle: &nwg::ControlHandle) {
 }
 
 fn populate_machine_combo_raw(hwnd: isize) {
-
     // Clear existing items
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
@@ -970,7 +1004,12 @@ fn populate_machine_combo_raw(hwnd: isize) {
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
-            SendMessageW(hwnd as _, 0x0143 /* CB_ADDSTRING */, 0, text.as_ptr() as _);
+            SendMessageW(
+                hwnd as _,
+                0x0143, /* CB_ADDSTRING */
+                0,
+                text.as_ptr() as _,
+            );
         }
     } else {
         let active_id = process::machine_id_from_daemon_config();
@@ -979,7 +1018,12 @@ fn populate_machine_combo_raw(hwnd: isize) {
             let label_wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
             unsafe {
                 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
-                SendMessageW(hwnd as _, 0x0143 /* CB_ADDSTRING */, 0, label_wide.as_ptr() as _);
+                SendMessageW(
+                    hwnd as _,
+                    0x0143, /* CB_ADDSTRING */
+                    0,
+                    label_wide.as_ptr() as _,
+                );
             }
             // Select the active one
             if active_id.as_deref() == Some(machine_id.as_str()) {
@@ -1053,7 +1097,13 @@ fn set_hwnd_text(hwnd: isize, text: &str) {
 }
 
 /// Raw HWND version of refresh_tab, for background thread callbacks.
-fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isize, cmb_machine: isize) {
+fn refresh_tab_raw(
+    tab: Tab,
+    lbl_status: isize,
+    lbl_detail: isize,
+    log_area: isize,
+    cmb_machine: isize,
+) {
     let (svc_name, exe_path, label) = match tab {
         Tab::Server => ("LoomServer", config::server_exe(), "Server"),
         Tab::Daemon => ("LoomDaemon", config::daemon_exe(), "Daemon"),
@@ -1128,12 +1178,10 @@ fn refresh_tab_raw(tab: Tab, lbl_status: isize, lbl_detail: isize, log_area: isi
 }
 
 /// Raw-HWND variant of populate_config_editor — callable from background threads.
-fn populate_config_editor_raw(
-    tab: Tab,
-    lbl_config: isize,
-    txt_config: isize,
-) {
-    let Some(config_dir) = preflight::loom_config_dir() else { return };
+fn populate_config_editor_raw(tab: Tab, lbl_config: isize, txt_config: isize) {
+    let Some(config_dir) = preflight::loom_config_dir() else {
+        return;
+    };
     let (label, path) = match tab {
         Tab::Daemon => ("daemon.toml", config_dir.join("daemon.toml")),
         Tab::Config => ("cli.toml", config_dir.join("cli.toml")),
@@ -1145,7 +1193,10 @@ fn populate_config_editor_raw(
     };
     show_window(lbl_config, true);
     show_window(txt_config, true);
-    set_hwnd_text(lbl_config, &format!("  {label}  (editable — Save to apply)"));
+    set_hwnd_text(
+        lbl_config,
+        &format!("  {label}  (editable — Save to apply)"),
+    );
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     set_hwnd_text(txt_config, &content);
 }
@@ -1227,10 +1278,20 @@ fn load_env_snapshot() -> std::collections::HashMap<String, String> {
 fn env_json_candidates() -> Vec<std::path::PathBuf> {
     let mut v = Vec::new();
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-        v.push(std::path::PathBuf::from(&appdata).join("loom").join("user-env.json"));
+        v.push(
+            std::path::PathBuf::from(&appdata)
+                .join("loom")
+                .join("user-env.json"),
+        );
     }
     if let Ok(up) = std::env::var("USERPROFILE") {
-        v.push(std::path::PathBuf::from(&up).join("AppData").join("Local").join("loom").join("user-env.json"));
+        v.push(
+            std::path::PathBuf::from(&up)
+                .join("AppData")
+                .join("Local")
+                .join("loom")
+                .join("user-env.json"),
+        );
     }
     v
 }
@@ -1284,10 +1345,7 @@ fn handle_start(tab: Tab, machine_id: Option<&str>) -> Result<(), String> {
                 if let Some(parent) = config_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let content = format!(
-                    "[machine]\nid = \"{}\"\n",
-                    mid.replace('"', "\\\"")
-                );
+                let content = format!("[machine]\nid = \"{}\"\n", mid.replace('"', "\\\""));
                 std::fs::write(&config_path, &content)
                     .map_err(|e| format!("Failed to write daemon.toml: {}", e))?;
             }
@@ -1500,10 +1558,7 @@ fn handle_clean_zombie_actors() -> Result<String, String> {
         }
     }
 
-    let mut msg = format!(
-        "Cleaned {} zombie actor(s) from server:\n",
-        deleted.len()
-    );
+    let mut msg = format!("Cleaned {} zombie actor(s) from server:\n", deleted.len());
     for id in &deleted {
         msg.push_str(&format!("  - deleted {}\n", id));
     }

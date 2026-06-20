@@ -60,9 +60,16 @@ pub fn unc_prefix_path(path: PathBuf) -> PathBuf {
 
 /// Create a directory (and all parents), applying the Windows UNC prefix
 /// to bypass MAX_PATH (260 char) when the path is long.
+/// Relative paths are resolved to absolute before UNC prefixing — UNC `\\?\`
+/// requires an absolute path.
 #[cfg(windows)]
 pub fn create_dir_all_unc(path: &Path) -> std::io::Result<()> {
-    let prefixed = unc_prefix_path(path.to_path_buf());
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let prefixed = unc_prefix_path(absolute);
     std::fs::create_dir_all(&prefixed)
 }
 

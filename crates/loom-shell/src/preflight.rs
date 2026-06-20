@@ -107,10 +107,7 @@ fn check_copilot_cli() -> CheckResult {
                 binary_path.display(),
             ),
         },
-        SmokeResult::Failed {
-            exit_code,
-            stderr,
-        } => CheckResult {
+        SmokeResult::Failed { exit_code, stderr } => CheckResult {
             label: "copilot CLI",
             status: CheckStatus::Error,
             detail: format!(
@@ -374,8 +371,7 @@ fn check_user_env_snapshot() -> CheckResult {
         None => CheckResult {
             label: "user env snapshot",
             status: CheckStatus::Warn,
-            detail: "no user-env.json — normal if loom-shell was not elevated by UAC"
-                .to_string(),
+            detail: "no user-env.json — normal if loom-shell was not elevated by UAC".to_string(),
         },
     }
 }
@@ -399,10 +395,7 @@ fn check_disk_space() -> CheckResult {
             return CheckResult {
                 label: "disk space",
                 status: CheckStatus::Warn,
-                detail: format!(
-                    "cannot query free space on {}",
-                    data_dir.display(),
-                ),
+                detail: format!("cannot query free space on {}", data_dir.display(),),
             };
         }
     };
@@ -505,10 +498,7 @@ fn check_data_dir_writable() -> CheckResult {
         return CheckResult {
             label: "data dir writable",
             status: CheckStatus::Error,
-            detail: format!(
-                "cannot create data directory {}: {e}",
-                data_dir.display(),
-            ),
+            detail: format!("cannot create data directory {}: {e}", data_dir.display(),),
         };
     }
 
@@ -617,9 +607,7 @@ fn read_registry_string_impl(
         .collect();
 
     let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(hkey_root, subkey.as_ptr(), 0, KEY_READ, &mut hkey)
-    };
+    let status = unsafe { RegOpenKeyExW(hkey_root, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
     if status != 0 {
         return None;
     }
@@ -658,9 +646,7 @@ fn read_registry_string_impl(
         return None;
     }
 
-    let raw = OsString::from_wide(
-        &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())],
-    );
+    let raw = OsString::from_wide(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]);
     Some(raw.to_string_lossy().into_owned())
 }
 
@@ -752,7 +738,13 @@ fn user_env_json_candidates() -> Vec<PathBuf> {
     }
     // 2. USERPROFILE\AppData\Local (correct for admin context)
     if let Ok(up) = std::env::var("USERPROFILE") {
-        v.push(PathBuf::from(&up).join("AppData").join("Local").join("loom").join("user-env.json"));
+        v.push(
+            PathBuf::from(&up)
+                .join("AppData")
+                .join("Local")
+                .join("loom")
+                .join("user-env.json"),
+        );
     }
     v
 }
@@ -817,7 +809,10 @@ fn npm_global_dirs() -> Vec<PathBuf> {
     }
     // USERPROFILE fallback for admin context (FNM_DIR may not be set)
     if let Ok(up) = std::env::var("USERPROFILE") {
-        let fnm_roaming = PathBuf::from(&up).join("AppData").join("Roaming").join("fnm");
+        let fnm_roaming = PathBuf::from(&up)
+            .join("AppData")
+            .join("Roaming")
+            .join("fnm");
         if fnm_roaming.exists() {
             dirs.push(fnm_roaming.clone());
             // Also scan node-versions/<ver>/installation for .cmd shims

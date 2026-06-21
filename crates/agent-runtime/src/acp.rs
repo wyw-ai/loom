@@ -1178,45 +1178,20 @@ fn wait_status_with_timeout(mut child: Child, timeout: Duration) -> Result<ExitS
     }
 }
 
-#[cfg(unix)]
 fn kill_process(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process(pid: u32) {
-    // WHY (PM-Arbitration-001 residual cfg(windows)): Windows process
-    // termination requires `OpenProcess(PROCESS_TERMINATE) +
-    // TerminateProcess + CloseHandle` — there is no portable cross-platform
-    // forced-kill abstraction in std/tokio that does NOT race with normal
-    // exit handling on Windows (`Child::kill` works on a still-owned handle;
-    // this path receives only a pid that may have been adopted by the OS).
-    // The Unix counterpart at `kill_process(unix)` uses
-    // `libc::kill(pid, SIGKILL)`. This whole pair moves into
-    // `loom_platform::process::force_kill_pid` in P0-PAL-6; until then this
-    // is the single remaining cfg(windows) in acp.rs.
-    // SAFETY: pid is a valid process ID from a Child we own; handles are
-    // closed after the call.
-    #[cfg(windows)]
-    unsafe {
-        extern "system" {
-            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
-            fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
-            fn CloseHandle(hObject: isize) -> i32;
-        }
-        const PROCESS_TERMINATE: u32 = 0x0001;
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle != 0 {
-            TerminateProcess(handle, 1);
-            CloseHandle(handle);
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = pid;
-    }
+    // PAL-6: closed the cfg(windows) / cfg(unix) split here by delegating
+    // forced termination to `loom_platform::signal::force_kill_pid`. The
+    // Unix side calls `libc::kill(pid, SIGKILL)`; the Windows side does
+    // `OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE) + TerminateProcess(1)
+    // + CloseHandle`. See ARCH D5 and the PAL signal module for the
+    // rationale (exit-code-1 standardisation, SYNCHRONIZE so a future
+    // wait does not need to re-open the handle).
+    //
+    // We deliberately swallow the error: callers reach this path because
+    // the child is already considered hung/abandoned, and there is
+    // nothing actionable to do with an `ESRCH`/`ACCESS_DENIED` other than
+    // log it. The previous implementation was also infallible.
+    let _ = loom_platform::signal::force_kill_pid(pid);
 }
 
 fn parse_env_output(

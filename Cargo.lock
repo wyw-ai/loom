@@ -2452,6 +2452,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "loom-platform",
  "parking_lot",
  "proto",
  "pulldown-cmark",
@@ -2470,7 +2471,6 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
- "windows-console",
 ]
 
 [[package]]
@@ -2499,6 +2499,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-platform"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "loom-server"
 version = "0.1.0"
 dependencies = [
@@ -2510,6 +2518,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "hex",
+ "loom-platform",
  "parking_lot",
  "proto",
  "rusqlite",
@@ -2522,7 +2531,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
- "windows-console",
 ]
 
 [[package]]
@@ -6008,13 +6016,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
  "windows-core 0.61.2",
-]
-
-[[package]]
-name = "windows-console"
-version = "0.1.0"
-dependencies = [
- "windows-sys 0.59.0",
 ]
 
 [[package]]

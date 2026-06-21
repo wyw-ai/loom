@@ -15,7 +15,7 @@ path = "src/bin/loom_daemon.rs"
 [dependencies]
 proto = { workspace = true }
 agent-runtime = { workspace = true }
-windows-console = { path = "../windows-console" }
+loom-platform = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

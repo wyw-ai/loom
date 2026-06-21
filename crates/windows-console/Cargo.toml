@@ -1,8 +1,0 @@
-[package]
-name = "windows-console"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }

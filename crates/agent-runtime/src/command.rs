@@ -25,14 +25,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use proto::ansi::strip_ansi;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use loom_platform::process::Command;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -53,8 +52,6 @@ use crate::usage::extract_token_usage_from_text;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 enum ProcessOutput {
     Stdout(String),
@@ -800,14 +797,9 @@ fn spawn_and_collect(
     // char) limit (Bug #2 Phase 2).  Do NOT UNC-prefix the command path —
     // `\\?\` bypasses PATHEXT resolution in CreateProcessW, so e.g.
     // `\\?\D:\nodejs\copilot` would fail to resolve to `copilot.cmd`.
-    #[cfg(windows)]
+    // `unc_prefix_path` is a no-op on Unix so the call site stays cfg-free.
     let command_path = PathBuf::from(&cfg.command);
-    #[cfg(not(windows))]
-    let command_path = PathBuf::from(&cfg.command);
-    #[cfg(windows)]
     let spawn_cwd = crate::acp::unc_prefix_path(prompt.cwd.clone());
-    #[cfg(not(windows))]
-    let spawn_cwd = prompt.cwd.clone();
 
     // On Windows, `cmd.exe` treats newlines as command separators when
     // wrapping `.CMD`/`.BAT` file invocations via `cmd.exe /c`. Arguments
@@ -840,13 +832,9 @@ fn spawn_and_collect(
     if matches!(cfg.prompt_via, PromptVia::Env) {
         cmd.env("LOOM_PROMPT", &prompt.content);
     }
-    configure_process_group(&mut cmd);
-    // On Windows, prevent console windows and let child escape the Tauri
-    // GUI's restrictive job object.
-    #[cfg(windows)]
-    cmd.creation_flags(
-        crate::path_util::CREATE_NO_WINDOW | crate::path_util::CREATE_BREAKAWAY_FROM_JOB,
-    );
+    // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
+    // `loom_platform::process::Command::new` automatically — no cfg block here.
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", command_path.display(), e))?;
@@ -1235,14 +1223,6 @@ fn spawn_and_collect(
         stderr: collected_stderr,
     })
 }
-
-#[cfg(unix)]
-fn configure_process_group(cmd: &mut Command) {
-    cmd.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_process_group(_cmd: &mut Command) {}
 
 /// Check if the command path is a Windows batch file (.CMD or .BAT).
 /// Windows wraps `.CMD`/`.BAT` invocations with `cmd.exe /c`, which

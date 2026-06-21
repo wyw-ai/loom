@@ -23,6 +23,13 @@ mod imp {
             }
 
             let frontend_dir = frontend_dir();
+            // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3 /
+            // PM-Arbitration-002 — dev-mode `pnpm dev` keeps stdout/stderr
+            // inherited; deferring the migration to `loom_platform::process`
+            // until P1-Cmd-Sweep verifies that the newtype's default flags
+            // don't disturb the inherited handles. P0-D's
+            // `clippy::disallowed_methods` is also deferred; bare comment
+            // suffices.
             let mut command = Command::new("pnpm");
             command
                 .arg("--dir")

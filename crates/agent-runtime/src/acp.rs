@@ -16,16 +16,13 @@ use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{
-    Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
+    Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(windows)]
-use crate::path_util::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use loom_platform::process::Command;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -536,11 +533,8 @@ fn start_blocking(
     // Do NOT UNC-prefix the command path — `\\?\` bypasses PATHEXT
     // resolution in CreateProcessW, so e.g. `\\?\D:\nodejs\copilot`
     // would fail to resolve to `copilot.cmd`.
-    #[cfg(windows)]
+    // `unc_prefix_path` is a no-op on Unix so the call site stays cfg-free.
     let process_cwd = unc_prefix_path(process_cwd);
-    #[cfg(windows)]
-    let command_path = std::path::PathBuf::from(&cfg.command);
-    #[cfg(not(windows))]
     let command_path = std::path::PathBuf::from(&cfg.command);
 
     let mut cmd = Command::new(&command_path);
@@ -549,11 +543,9 @@ fn start_blocking(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Prevent console windows from popping up for CLI child processes on
-    // Windows, and let child processes break away from the Tauri GUI's job
-    // object (fixes os error 1314 ERROR_PRIVILEGE_NOT_HELD).
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+    // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
+    // `loom_platform::process::Command::new` automatically — no cfg block.
 
     let mut path_for_error = std::env::var("PATH").unwrap_or_default();
     let mut process_env = BTreeMap::new();
@@ -1110,14 +1102,15 @@ fn capture_login_shell_env(
         end
     );
 
-    let child = Command::new(&shell)
-        .arg("-l")
+    let mut cmd = Command::new(&shell);
+    cmd.arg("-l")
         .arg("-i")
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
         .spawn()
         .map_err(|e| format!("failed to start `{}`: {e}", shell.display()))?;
 
@@ -1191,7 +1184,16 @@ fn kill_process(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_process(pid: u32) {
-    // On Windows use TerminateProcess via OpenProcess to kill the child.
+    // WHY (PM-Arbitration-001 residual cfg(windows)): Windows process
+    // termination requires `OpenProcess(PROCESS_TERMINATE) +
+    // TerminateProcess + CloseHandle` — there is no portable cross-platform
+    // forced-kill abstraction in std/tokio that does NOT race with normal
+    // exit handling on Windows (`Child::kill` works on a still-owned handle;
+    // this path receives only a pid that may have been adopted by the OS).
+    // The Unix counterpart at `kill_process(unix)` uses
+    // `libc::kill(pid, SIGKILL)`. This whole pair moves into
+    // `loom_platform::process::force_kill_pid` in P0-PAL-6; until then this
+    // is the single remaining cfg(windows) in acp.rs.
     // SAFETY: pid is a valid process ID from a Child we own; handles are
     // closed after the call.
     #[cfg(windows)]

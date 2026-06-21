@@ -8,10 +8,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use loom_platform::process::Command;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -549,10 +549,8 @@ fn spawn_child(
     // char) limit.  Do NOT UNC-prefix the command path — `\\?\` bypasses
     // PATHEXT resolution in CreateProcessW, so e.g.
     // `\\?\D:\nodejs\claude` would fail to resolve to `claude.cmd`.
-    #[cfg(windows)]
+    // `unc_prefix_path` is a no-op on Unix so the call site stays cfg-free.
     let spawn_cwd = unc_prefix_path(prompt.cwd.clone());
-    #[cfg(not(windows))]
-    let spawn_cwd = prompt.cwd.clone();
 
     let mut cmd = Command::new(&cfg.command);
     cmd.args(argv)
@@ -563,12 +561,9 @@ fn spawn_child(
     for (k, v) in expanded_env(cfg, prompt) {
         cmd.env(k, v);
     }
-    // On Windows, prevent console windows and let child escape the Tauri
-    // GUI's restrictive job object.
-    #[cfg(windows)]
-    cmd.creation_flags(
-        crate::path_util::CREATE_NO_WINDOW | crate::path_util::CREATE_BREAKAWAY_FROM_JOB,
-    );
+    // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
+    // `loom_platform::process::Command::new` automatically — no cfg block.
     cmd.spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))
 }

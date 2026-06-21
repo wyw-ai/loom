@@ -2504,6 +2504,7 @@ name = "loom-platform"
 version = "0.1.0"
 dependencies = [
  "dunce",
+ "libc",
  "tempfile",
  "tokio",
  "windows-sys 0.59.0",

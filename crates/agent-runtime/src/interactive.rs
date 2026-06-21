@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +29,7 @@ use uuid::Uuid;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
 use crate::acp::create_dir_all_unc;
+use crate::path_util::unc_prefix_path;
 use crate::usage::extract_token_usage_from_text;
 
 #[derive(Debug, Clone)]
@@ -541,15 +545,30 @@ fn spawn_child(
     prompt: &AdapterPrompt,
     argv: &[String],
 ) -> Result<Child, String> {
+    // On Windows, prefix the cwd with UNC prefix to bypass MAX_PATH (260
+    // char) limit.  Do NOT UNC-prefix the command path — `\\?\` bypasses
+    // PATHEXT resolution in CreateProcessW, so e.g.
+    // `\\?\D:\nodejs\claude` would fail to resolve to `claude.cmd`.
+    #[cfg(windows)]
+    let spawn_cwd = unc_prefix_path(prompt.cwd.clone());
+    #[cfg(not(windows))]
+    let spawn_cwd = prompt.cwd.clone();
+
     let mut cmd = Command::new(&cfg.command);
     cmd.args(argv)
-        .current_dir(&prompt.cwd)
+        .current_dir(&spawn_cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in expanded_env(cfg, prompt) {
         cmd.env(k, v);
     }
+    // On Windows, prevent console windows and let child escape the Tauri
+    // GUI's restrictive job object.
+    #[cfg(windows)]
+    cmd.creation_flags(
+        crate::path_util::CREATE_NO_WINDOW | crate::path_util::CREATE_BREAKAWAY_FROM_JOB,
+    );
     cmd.spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))
 }

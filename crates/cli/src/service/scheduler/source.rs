@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
-use tokio::process::Command;
+use loom_platform::process::TokioCommand as Command;
 
 use super::spec::Source;
 

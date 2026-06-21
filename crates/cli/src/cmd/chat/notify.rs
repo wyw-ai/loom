@@ -7,7 +7,9 @@
 //! on Linux. On any other platform the desktop notifier is a no-op.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use loom_platform::process::Command;
 
 /// Write the BEL character (`\x07`) to stderr. Most terminals honor this as a
 /// short audible/visible alert; alternate-screen mode (which the TUI uses)
@@ -31,9 +33,13 @@ pub fn desktop_notify(title: &str, body: &str) {
             escape_dq(&body),
             escape_dq(&title),
         );
-        spawn_detached(Command::new("osascript").arg("-e").arg(script));
+        let mut cmd = Command::new("osascript");
+        cmd.arg("-e").arg(script);
+        spawn_detached(&mut cmd);
     } else if cfg!(target_os = "linux") {
-        spawn_detached(Command::new("notify-send").arg(&title).arg(&body));
+        let mut cmd = Command::new("notify-send");
+        cmd.arg(&title).arg(&body);
+        spawn_detached(&mut cmd);
     }
     // Other platforms: no-op.
 }

@@ -5,7 +5,9 @@
 //! All tests are gated to Windows only.
 
 #[cfg(windows)]
-use agent_runtime::path_util::{create_dir_all_unc, normalize_path_separators, unc_prefix_path};
+use loom_platform::path::{
+    create_dir_all as create_dir_all_unc, normalize_path_separators, unc_prefix_path,
+};
 #[cfg(windows)]
 use std::io::Write;
 

@@ -7,7 +7,7 @@
 //! All tests are gated to Windows only.
 
 #[cfg(windows)]
-use agent_runtime::path_util::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+use loom_platform::process::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]

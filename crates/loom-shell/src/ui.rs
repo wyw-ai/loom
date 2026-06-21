@@ -1483,12 +1483,14 @@ fn handle_clean_zombie_actors() -> Result<String, String> {
     }
 
     // 1. List all actors on server
-    let output = std::process::Command::new(&loom_path)
+    let mut list_cmd = loom_platform::process::Command::new(&loom_path);
+    list_cmd
         .arg("--json")
         .arg("--server")
         .arg(&server_url)
         .arg("actor")
-        .arg("list")
+        .arg("list");
+    let output = list_cmd
         .output()
         .map_err(|e| format!("Failed to run loom actor list: {}", e))?;
     if !output.status.success() {
@@ -1542,12 +1544,14 @@ fn handle_clean_zombie_actors() -> Result<String, String> {
     let mut deleted: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for actor_id in &zombie_ids {
-        let output = std::process::Command::new(&loom_path)
+        let mut del_cmd = loom_platform::process::Command::new(&loom_path);
+        del_cmd
             .arg("--server")
             .arg(&server_url)
             .arg("actor")
             .arg("delete")
-            .arg(actor_id)
+            .arg(actor_id);
+        let output = del_cmd
             .output()
             .map_err(|e| format!("Failed to run actor delete: {}", e))?;
         if output.status.success() {

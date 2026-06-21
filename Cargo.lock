@@ -2540,6 +2540,7 @@ dependencies = [
 name = "loom-shell"
 version = "0.1.0"
 dependencies = [
+ "loom-platform",
  "native-windows-derive",
  "native-windows-gui",
  "proto",

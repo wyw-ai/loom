@@ -11,10 +11,11 @@
 //! Only when the smoke test passes will the check return Ok, giving confidence
 //! that the daemon's agents can actually launch copilot subprocesses.
 
+use loom_platform::process::Command;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Max wall-clock time for the `copilot --version` smoke test.
@@ -206,13 +207,12 @@ enum SmokeResult {
 /// `--version` is purely local — it prints the version banner and exits
 /// immediately. No token is consumed, no network request is made.
 fn smoke_test_copilot(binary: &Path) -> SmokeResult {
-    let mut child = match Command::new(binary)
-        .arg("--version")
+    let mut cmd = Command::new(binary);
+    cmd.arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return SmokeResult::SpawnFailed {

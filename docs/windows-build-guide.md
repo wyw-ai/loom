@@ -112,10 +112,10 @@ joi-apps-temp/
 │   ├── gui/                   # Tauri v2 桌面应用
 │   │   ├── tauri.conf.json    #   Tauri 配置
 │   │   └── src-tauri/         #   Rust 后端 (loom-gui)
+│   ├── loom-platform/         # 跨平台 PAL (path/process/signal/fs/ipc/console/env/time)
 │   ├── loom-shell/            # Shell 执行代理 (loom-shell.exe)
 │   ├── proto/                 # Protobuf 协议定义
-│   ├── server/                # 后台服务 (loom-server.exe)
-│   └── windows-console/       # Windows 控制台工具
+│   └── server/                # 后台服务 (loom-server.exe)
 └── apps/
     └── gui-web/               # 前端 (React + Vite + TypeScript)
         ├── package.json

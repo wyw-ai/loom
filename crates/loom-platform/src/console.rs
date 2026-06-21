@@ -1,12 +1,15 @@
 //! Windows console compatibility helpers.
 //!
-//! On Windows, the default console host (conhost.exe) enables "Quick Edit
+//! On Windows, the default console host (`conhost.exe`) enables "Quick Edit
 //! Mode" which suspends all output threads when the user clicks inside the
 //! console window. This makes long-running server/daemon processes appear to
-//! hang. Calling [`init()`] at process start disables this behaviour.
+//! hang. Calling [`init`] at process start disables this behaviour.
 //!
-//! On non-Windows platforms [`init()`] is a no-op so callers can invoke it
+//! On non-Windows platforms [`init`] is a no-op so callers can invoke it
 //! unconditionally without `#[cfg]` gating at the call site.
+//!
+//! Migrated from the deprecated `crates/windows-console` crate in P0-PAL-1
+//! (see ARCH §2.1 and §6.1).
 
 /// Initialise the Windows console for long-running background processes.
 ///

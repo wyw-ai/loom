@@ -47,7 +47,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    windows_console::init();
+    loom_platform::console::init();
     agent_runtime::tracing_setup::init_file_tracing("server", "info");
 
     // Install a panic hook that logs panics to the tracing system.

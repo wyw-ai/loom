@@ -28,5 +28,5 @@ hex = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
 rusqlite = { workspace = true }
-windows-console = { path = "../windows-console" }
+loom-platform = { workspace = true }
 dirs = { workspace = true }

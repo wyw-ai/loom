@@ -1536,7 +1536,7 @@ async fn main() -> Result<()> {
     init_tracing();
     // On Windows: if the binary was double-clicked (no arguments), show a
     // friendly help dialog instead of flashing a terminal and disappearing.
-    if windows_console::show_double_click_help() {
+    if loom_platform::console::show_double_click_help() {
         return Ok(());
     }
     let args = Args::parse();

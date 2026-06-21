@@ -17,26 +17,31 @@
 //!
 //! Note: the `CREATE_NO_WINDOW` / `CREATE_BREAKAWAY_FROM_JOB` constants
 //! historically lived here because of file-locality with `unc_prefix_path`;
-//! they are *process* spawn flags and will move to
-//! `loom_platform::process::windows` in **P0-PAL-3**. They are kept here
-//! verbatim until then so the spawn-integration tests
-//! (`tests/windows_spawn_integration.rs`) remain stable.
+//! they are *process* spawn flags and moved to
+//! [`loom_platform::process`] in **P0-PAL-3**. They are still re-exported
+//! here verbatim so the spawn-integration tests
+//! (`tests/windows_spawn_integration.rs`) and any external consumers
+//! continue to compile during the P0-PAL-4 migration window.
 
 use std::path::{Path, PathBuf};
 
 /// Windows `CREATE_NO_WINDOW` — prevents a console window from appearing.
 ///
-/// Moves to `loom_platform::process::windows` in P0-PAL-3.
+/// Re-export of [`loom_platform::process::CREATE_NO_WINDOW`]. The
+/// canonical home is `loom_platform::process`; this bridge entry is
+/// retained for the P0-PAL-4 migration window.
 #[cfg(windows)]
-pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub use loom_platform::process::CREATE_NO_WINDOW;
 
 /// Windows `CREATE_BREAKAWAY_FROM_JOB` — lets the child escape a parent's
-/// job object (fixes `ERROR_PRIVILEGE_NOT_HELD` when spawning from the Tauri
-/// GUI).
+/// job object (fixes `ERROR_PRIVILEGE_NOT_HELD` when spawning from the
+/// Tauri GUI).
 ///
-/// Moves to `loom_platform::process::windows` in P0-PAL-3.
+/// Re-export of [`loom_platform::process::CREATE_BREAKAWAY_FROM_JOB`]. The
+/// canonical home is `loom_platform::process`; this bridge entry is
+/// retained for the P0-PAL-4 migration window.
 #[cfg(windows)]
-pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+pub use loom_platform::process::CREATE_BREAKAWAY_FROM_JOB;
 
 /// Prefix a path with the Windows `\\?\` UNC prefix to bypass the
 /// 260-character `MAX_PATH` limit. No-op on non-Windows.

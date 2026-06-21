@@ -21,6 +21,7 @@ ipc-interprocess = []
 ipc-native = []
 
 [dependencies]
+tokio = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
@@ -30,3 +31,4 @@ dunce = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

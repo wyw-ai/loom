@@ -9,6 +9,7 @@ license = "MIT"
 # `cargo check --workspace` won't try to resolve these deps.
 [target.'cfg(windows)'.dependencies]
 proto = { workspace = true }
+loom-platform = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 native-windows-gui = "1.0.12"

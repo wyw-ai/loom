@@ -1,7 +1,7 @@
 //! Service install/uninstall — invoke WinSW-x64.exe to install or remove Windows services.
 
 use crate::config;
-use std::process::Command;
+use loom_platform::process::Command;
 
 /// Install the loom-server service (calls WinSW install).
 pub fn install_server() -> Result<String, String> {
@@ -15,9 +15,9 @@ pub fn install_server() -> Result<String, String> {
         return Err(format!("Service config file not found: {}", xml.display()));
     }
 
-    let output = Command::new(&winsw)
-        .arg("install")
-        .arg(&xml)
+    let mut cmd = Command::new(&winsw);
+    cmd.arg("install").arg(&xml);
+    let output = cmd
         .output()
         .map_err(|e| format!("Executing install failed: {e}"))?;
 
@@ -40,9 +40,9 @@ pub fn install_daemon() -> Result<String, String> {
         return Err(format!("Service config file not found: {}", xml.display()));
     }
 
-    let output = Command::new(&winsw)
-        .arg("install")
-        .arg(&xml)
+    let mut cmd = Command::new(&winsw);
+    cmd.arg("install").arg(&xml);
+    let output = cmd
         .output()
         .map_err(|e| format!("Executing install failed: {e}"))?;
 
@@ -57,9 +57,9 @@ pub fn install_daemon() -> Result<String, String> {
 pub fn uninstall_server() -> Result<String, String> {
     let winsw = config::winsw_exe();
     let xml = config::config_dir().join("loom-server.xml");
-    let output = Command::new(&winsw)
-        .arg("uninstall")
-        .arg(&xml)
+    let mut cmd = Command::new(&winsw);
+    cmd.arg("uninstall").arg(&xml);
+    let output = cmd
         .output()
         .map_err(|e| format!("Executing uninstall failed: {e}"))?;
 
@@ -74,9 +74,9 @@ pub fn uninstall_server() -> Result<String, String> {
 pub fn uninstall_daemon() -> Result<String, String> {
     let winsw = config::winsw_exe();
     let xml = config::config_dir().join("loom-daemon.xml");
-    let output = Command::new(&winsw)
-        .arg("uninstall")
-        .arg(&xml)
+    let mut cmd = Command::new(&winsw);
+    cmd.arg("uninstall").arg(&xml);
+    let output = cmd
         .output()
         .map_err(|e| format!("Executing uninstall failed: {e}"))?;
 

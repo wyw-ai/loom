@@ -5,27 +5,16 @@
 //! Includes an optional supervisor that auto-restarts processes that exit
 //! unexpectedly, ensuring high availability for long-running services.
 
+use loom_platform::process::Command;
 use std::collections::HashMap;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::preflight::loom_config_dir;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-/// Windows `CREATE_NO_WINDOW` — prevents a console window from appearing.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-/// Windows `CREATE_BREAKAWAY_FROM_JOB` — lets the child escape a parent's job
-/// object (fixes ERROR_PRIVILEGE_NOT_HELD when spawning from Tauri GUI).
-#[cfg(windows)]
-const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 
 /// Managed child process handle.
 static SERVER_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
@@ -132,10 +121,10 @@ pub(crate) fn machine_id_from_daemon_config() -> Option<String> {
 pub fn start_server(exe_path: &str) -> Result<u32, String> {
     SERVER_STOPPED_INTENTIONALLY.store(false, Ordering::SeqCst);
     let mut cmd = Command::new(exe_path);
-    // On Windows, prevent console windows and let child escape the Tauri
-    // GUI's restrictive job object (fixes ERROR_PRIVILEGE_NOT_HELD).
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+    // Platform spawn flags (Windows: CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+    // | CREATE_NEW_PROCESS_GROUP; Unix: process_group(0)) are applied by
+    // `loom_platform::process::Command::new` at construction time, so no
+    // per-call-site `#[cfg(windows)] creation_flags(...)` block is needed.
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start server: {e}"))?;
@@ -168,8 +157,9 @@ pub fn start_daemon(exe_path: &str) -> Result<u32, String> {
         cmd.arg("--machine-id").arg(&machine_id);
     }
 
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+    // Spawn flags (Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP, Unix process_group(0)) are applied by
+    // `loom_platform::process::Command::new` at construction time.
 
     let child = cmd
         .spawn()
@@ -264,10 +254,9 @@ pub fn is_server_port_open() -> bool {
 pub fn is_daemon_running_any() -> bool {
     #[cfg(windows)]
     {
-        if let Ok(output) = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq loom-daemon.exe", "/FO", "CSV", "/NH"])
-            .output()
-        {
+        let mut cmd = Command::new("tasklist");
+        cmd.args(["/FI", "IMAGENAME eq loom-daemon.exe", "/FO", "CSV", "/NH"]);
+        if let Ok(output) = cmd.output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             return stdout.contains("loom-daemon.exe");
         }

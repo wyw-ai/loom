@@ -1042,9 +1042,12 @@ fn is_auth_required_error(err: &str) -> bool {
         .is_some_and(|message| message == "Authentication required")
 }
 
-// UNC path utilities moved to `path_util` for shared use across the crate.
-// Re-export for backward compatibility.
-pub use crate::path_util::{create_dir_all_unc, normalize_path_separators, unc_prefix_path};
+// UNC path utilities re-exported from `loom_platform::path` (P0-PAL-4b).
+// External consumers of `agent_runtime::acp::*` keep the historical
+// `create_dir_all_unc` name through this rename re-export.
+pub use loom_platform::path::{
+    create_dir_all as create_dir_all_unc, normalize_path_separators, unc_prefix_path,
+};
 
 fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {
     let raw_code = err.raw_os_error();

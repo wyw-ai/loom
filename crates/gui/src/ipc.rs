@@ -2136,6 +2136,13 @@ fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 fn open_path_with_system(path: &Path) -> anyhow::Result<()> {
+    // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3 /
+    // PM-Arbitration-002 — these user-facing file-manager launchers must NOT
+    // use `loom_platform::process::Command` until P1-Cmd-Sweep verifies that
+    // the newtype's default Windows flags don't break Explorer's popup
+    // behavior (ARCH-flagged risk for `explorer`). P0-D's
+    // `clippy::disallowed_methods` lint is also deferred; the bare comment is
+    // sufficient signaling until then.
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = std::process::Command::new("open");

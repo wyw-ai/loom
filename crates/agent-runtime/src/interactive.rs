@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
 use crate::acp::create_dir_all_unc;
-use crate::path_util::unc_prefix_path;
+use loom_platform::path::unc_prefix_path;
 use crate::usage::extract_token_usage_from_text;
 
 #[derive(Debug, Clone)]

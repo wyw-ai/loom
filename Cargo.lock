@@ -17,6 +17,7 @@ dependencies = [
  "dirs 5.0.1",
  "hex",
  "libc",
+ "loom-platform",
  "parking_lot",
  "proto",
  "serde",
@@ -2502,6 +2503,7 @@ dependencies = [
 name = "loom-platform"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "tempfile",
  "windows-sys 0.59.0",
 ]

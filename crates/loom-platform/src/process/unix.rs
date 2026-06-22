@@ -6,6 +6,13 @@
 //! `kill(-pgid, SIGTERM)` reaches the whole subtree, which matches the
 //! Windows `CTRL_BREAK_EVENT` path in `loom_platform::signal` (ARCH D5).
 
+// `process_group` is an extension method provided by `CommandExt`. Tokio's
+// `tokio::process::Command` implements the same std trait (forwarding to the
+// inner std `Command`), so this single import covers both call sites below —
+// mirroring `windows.rs`, which imports `std::os::windows::process::CommandExt`
+// for both std and tokio `creation_flags`.
+use std::os::unix::process::CommandExt;
+
 pub(super) fn apply_std_defaults(cmd: &mut std::process::Command) {
     cmd.process_group(0);
 }

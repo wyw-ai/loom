@@ -1,19 +1,31 @@
-use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, BufReader};
+//! Daemon IPC proxy and discovery.
+//!
+//! On both Unix and Windows the daemon binds a local socket
+//! (UDS / Named Pipe) through [`loom_platform::ipc`] and proxies
+//! JSON-line frames between local clients and the server's WebSocket
+//! (or another local socket, if `server_url` is itself a `unix://`
+//! URL). Discovery is shared on both platforms: the file
+//! `<config>/daemon/discovery.json` records the resolved socket path
+//! plus the upstream server URL.
+//!
+//! # D4 — empty `LOOM_DAEMON_SOCKET` ⇒ WebSocket fallback
+//!
+//! [`env_socket_path`] filters out an empty `LOOM_DAEMON_SOCKET`
+//! value before propagating it; an unset env var likewise yields
+//! `None`. Callers (see `connect_client` in `main.rs`) then bypass
+//! the local-socket fast path and fall back to
+//! `Client::connect_ws(server_url)`. This is the canonical D4
+//! contract for Windows, where running without a daemon (and thus
+//! without an IPC socket) is a supported deployment.
 
-#[cfg(unix)]
-use anyhow::{anyhow, bail};
-use anyhow::{Context, Result};
-#[cfg(unix)]
-use futures_util::SinkExt;
-#[cfg(unix)]
-use futures_util::StreamExt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use loom_platform::ipc::{LocalListener, LocalSocketName, LocalStream};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
-#[cfg(unix)]
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config;
@@ -123,82 +135,79 @@ pub fn remove_discovery_for(socket: &Path) {
     }
 }
 
+/// Bind the daemon's local IPC socket and start a background proxy
+/// that forwards JSON-line frames between locally-connected clients
+/// and the upstream `server_url`.
+///
+/// `socket` is interpreted by [`LocalSocketName::from_path`] — on
+/// Unix it is the literal filesystem path; on Windows the file stem
+/// is taken as the named-pipe stem and the per-user SID is appended.
+/// The returned `JoinHandle` holds the accept loop; aborting the
+/// handle (or dropping the listener) is how the daemon shuts the
+/// proxy down.
 pub async fn start_proxy(socket: PathBuf, server_url: String) -> Result<JoinHandle<()>> {
-    #[cfg(not(unix))]
-    {
-        let _ = (socket, server_url);
-        tracing::warn!(
-            "loom-daemon IPC is only supported on Unix platforms; running without IPC proxy"
-        );
-        Ok(tokio::spawn(async {}))
+    // Ensure the parent directory exists for Unix path-based sockets.
+    // No-op on Windows because named pipes have no filesystem parent,
+    // but harmless because Windows paths under config_dir already
+    // exist when the discovery file is created.
+    if let Some(parent) = socket.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create daemon socket dir {}", parent.display())
+            })?;
+        }
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        use tokio::net::UnixListener;
+    let name = LocalSocketName::from_path(socket.clone())
+        .with_context(|| format!("build socket name from {}", socket.display()))?;
+    let listener = LocalListener::bind(&name)
+        .await
+        .with_context(|| format!("bind daemon socket {}", name.display()))?;
 
-        prepare_socket_path(&socket).await?;
-        let listener = UnixListener::bind(&socket)
-            .with_context(|| format!("bind daemon socket {}", socket.display()))?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod daemon socket {}", socket.display()))?;
-
-        Ok(tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let server_url = server_url.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = proxy_client(stream, server_url).await {
-                                tracing::warn!(error = %err, "daemon IPC client disconnected");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "daemon IPC accept failed");
-                    }
+    Ok(tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok(stream) => {
+                    let server_url = server_url.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = proxy_client(stream, server_url).await {
+                            tracing::warn!(error = %err, "daemon IPC client disconnected");
+                        }
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "daemon IPC accept failed");
                 }
             }
-        }))
-    }
-}
-
-pub async fn cleanup_socket(socket: &Path) {
-    let _ = std::fs::remove_file(socket);
-}
-
-#[cfg(unix)]
-async fn prepare_socket_path(socket: &Path) -> Result<()> {
-    use tokio::net::UnixStream;
-
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create daemon socket dir {}", parent.display()))?;
-    }
-
-    if socket.exists() {
-        if UnixStream::connect(socket).await.is_ok() {
-            bail!("loom-daemon socket is already active: {}", socket.display());
         }
-        std::fs::remove_file(socket)
-            .with_context(|| format!("remove stale daemon socket {}", socket.display()))?;
-    }
-
-    Ok(())
+    }))
 }
 
-#[cfg(unix)]
-async fn proxy_client(stream: tokio::net::UnixStream, server_url: String) -> Result<()> {
+/// Best-effort socket-file cleanup after the daemon shuts down.
+///
+/// Unix: unlinks the socket file. Windows: no-op (named pipes are
+/// kernel objects that disappear when their last handle closes).
+pub async fn cleanup_socket(socket: &Path) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(socket);
+    }
+    #[cfg(windows)]
+    {
+        let _ = socket;
+    }
+}
+
+async fn proxy_client(stream: LocalStream, server_url: String) -> Result<()> {
     if let Some(path) = unix_url_path(&server_url) {
-        return proxy_client_to_unix(stream, path).await;
+        return proxy_client_to_local(stream, path).await;
     }
 
     let (ws, _) = tokio_tungstenite::connect_async(&server_url)
         .await
         .with_context(|| format!("ws connect {}", server_url))?;
     let (mut ws_sink, mut ws_stream) = ws.split();
-    let (local_reader, mut local_writer) = stream.into_split();
+    let (local_reader, mut local_writer) = tokio::io::split(stream);
     let mut local_lines = BufReader::new(local_reader).lines();
 
     let local_to_ws = async {
@@ -235,13 +244,17 @@ async fn proxy_client(stream: tokio::net::UnixStream, server_url: String) -> Res
     }
 }
 
-#[cfg(unix)]
-async fn proxy_client_to_unix(stream: tokio::net::UnixStream, path: &str) -> Result<()> {
-    let server = tokio::net::UnixStream::connect(path)
+async fn proxy_client_to_local(stream: LocalStream, path: &str) -> Result<()> {
+    if path.is_empty() {
+        bail!("unix server URL is missing a socket path");
+    }
+    let server_name = LocalSocketName::from_path(PathBuf::from(path))
+        .with_context(|| format!("build socket name from {}", path))?;
+    let server = LocalStream::connect(&server_name)
         .await
-        .with_context(|| format!("connect unix server socket {}", path))?;
-    let (server_reader, mut server_writer) = server.into_split();
-    let (local_reader, mut local_writer) = stream.into_split();
+        .with_context(|| format!("connect upstream local socket {}", server_name.display()))?;
+    let (server_reader, mut server_writer) = tokio::io::split(server);
+    let (local_reader, mut local_writer) = tokio::io::split(stream);
     let mut local_lines = BufReader::new(local_reader).lines();
     let mut server_lines = BufReader::new(server_reader).lines();
 
@@ -272,7 +285,6 @@ async fn proxy_client_to_unix(stream: tokio::net::UnixStream, path: &str) -> Res
     }
 }
 
-#[cfg(unix)]
 fn unix_url_path(url: &str) -> Option<&str> {
     url.strip_prefix("unix://")
         .or_else(|| url.strip_prefix("unix:"))

@@ -185,12 +185,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;
 }
 
-#[cfg(unix)]
-pub async fn handle_unix_socket(state: AppState, socket: tokio::net::UnixStream) {
+pub async fn handle_local_socket(state: AppState, socket: loom_platform::ipc::LocalStream) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let connection_id = new_connection_id();
-    let (reader, mut writer) = socket.into_split();
+    let (reader, mut writer) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     state.subscriptions.add_connection(Connection {
@@ -217,7 +216,7 @@ pub async fn handle_unix_socket(state: AppState, socket: tokio::net::UnixStream)
             Ok(Some(text)) => handle_text_frame(&state, &connection_id, &tx, text).await,
             Ok(None) => break,
             Err(err) => {
-                tracing::warn!(error = %err, "unix rpc socket read failed");
+                tracing::warn!(error = %err, "local socket read failed");
                 break;
             }
         }

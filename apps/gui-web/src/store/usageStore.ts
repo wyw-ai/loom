@@ -33,6 +33,32 @@ export interface AgentUsageSnapshot {
   promptBreakdown?: PromptBreakdown | null;
   updatedAt: string;
   messageId: string;
+  /** Scope the usage was recorded in (message.scope.id). Iter#5: enables
+   * channel/thread-level aggregation without a BE change. */
+  scopeId: string;
+  /** "channel" | "thread" — mirrors message.scope.kind. */
+  scopeKind: string;
+}
+
+/**
+ * Aggregated token usage for a single channel or thread scope (Iter#5 Part B).
+ * Derived on the FE by summing per-actor snapshots whose `scopeId` matches and
+ * whose `cumulative.totalTokens > 0`. Each actor's `cumulative` is the BE
+ * authoritative scope-cumulative value (see ARCH Part B §B0), so summing them
+ * yields the scope total with no drift risk.
+ */
+export interface ScopeUsageSummary {
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  byActor: Array<{
+    actorId: string;
+    totalTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    updatedAt: string;
+  }>;
 }
 
 export interface UsageStore {
@@ -74,6 +100,8 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
       promptBreakdown: readMessagePromptBreakdown(message.metadata),
       updatedAt: message.createdAt,
       messageId: message.id,
+      scopeId: message.scope?.id ?? "",
+      scopeKind: message.scope?.kind ?? "",
     };
     const prev = get().byActor[actorId];
     if (!shouldReplace(prev, candidate)) return;
@@ -93,6 +121,48 @@ export function useAgentUsage(actorId: string | null | undefined): AgentUsageSna
   return useUsageStore((state) =>
     actorId ? state.byActor[actorId] ?? null : null,
   );
+}
+
+/**
+ * FE-side scope aggregation selector (Iter#5 Part B).
+ *
+ * Sums per-actor `cumulative` snapshots whose `scopeId === scopeId` and whose
+ * `cumulative.totalTokens > 0`. Returns `null` when no actor in the scope has
+ * meaningful usage yet, so callers can silent-hide the L1 summary.
+ *
+ * Each actor's `cumulative` is already the BE's scope-cumulative value
+ * (agent_serve.rs `accumulate_usage(scope_id)`), so the sum is the scope total
+ * with no double-counting: different actors in the same scope contribute
+ * different, non-overlapping turn totals.
+ */
+export function useScopeUsageSummary(scopeId: string | null | undefined): ScopeUsageSummary | null {
+  return useUsageStore((state) => {
+    if (!scopeId) return null;
+    const byActor: ScopeUsageSummary["byActor"] = [];
+    let totalTokens = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    for (const [actorId, snap] of Object.entries(state.byActor)) {
+      if (snap.scopeId !== scopeId) continue;
+      const tot = snap.cumulative.total_tokens ?? 0;
+      if (tot <= 0) continue;
+      totalTokens += tot;
+      inputTokens += snap.cumulative.input_tokens ?? 0;
+      outputTokens += snap.cumulative.output_tokens ?? 0;
+      cacheReadTokens += snap.cumulative.cache_read_input_tokens ?? 0;
+      byActor.push({
+        actorId,
+        totalTokens: tot,
+        inputTokens: snap.cumulative.input_tokens ?? 0,
+        outputTokens: snap.cumulative.output_tokens ?? 0,
+        updatedAt: snap.updatedAt,
+      });
+    }
+    if (totalTokens <= 0) return null;
+    byActor.sort((a, b) => b.totalTokens - a.totalTokens);
+    return { totalTokens, inputTokens, outputTokens, cacheReadTokens, byActor };
+  });
 }
 
 // Internal helper exported for tests.

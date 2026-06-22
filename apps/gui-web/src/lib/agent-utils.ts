@@ -217,14 +217,21 @@ export function getActorRunContext(runs: Record<string, Run>, actorId: string): 
 
 export const runStatusLabel: Record<string, string> = {
   queued: "排队中",
-  preparing_context: "准备中",
+  preparing_context: "准备上下文",
   running: "思考中",
-  waiting_tool: "等待工具",
+  waiting_tool: "执行工具",
   failed: "运行失败",
   canceled: "已取消",
 };
 
-export function runStatusFullLabel(ctx: ActorRunContext | null): string | undefined {
+/**
+ * Shared status phrase for ChatHeader activity label and AgentIdentityBadge
+ * working label (Iter#5 Part C §C4 AC-S5).
+ *
+ * Returns the base action phrase WITHOUT the health suffix; callers that need
+ * the full label (with health/timing) should use `runStatusFullLabel`.
+ */
+export function runStatusPhrase(ctx: ActorRunContext | null): string | undefined {
   if (!ctx) return undefined;
 
   if (ctx.isTerminal) {
@@ -238,19 +245,51 @@ export function runStatusFullLabel(ctx: ActorRunContext | null): string | undefi
 
   const base = runStatusLabel[ctx.status] ?? ctx.status;
 
-  if (ctx.isStale) {
-    return `⚠ ${base} (超时)`;
-  }
-
   const reason = ctx.run.startReason;
   const meta = ctx.run.metadata ?? {};
 
   if (ctx.status === "queued" && reason) return `排队中 · ${reason}`;
-  if (ctx.status === "preparing_context" && reason) return `准备中 · ${reason}`;
+  if (ctx.status === "preparing_context" && reason) return `准备上下文 · ${reason}`;
   if (ctx.status === "running" && reason) return `思考中 · ${reason}`;
   if (ctx.status === "waiting_tool") {
     const toolName = typeof meta.toolName === "string" ? meta.toolName : undefined;
-    if (toolName) return `等待工具 · ${toolName}`;
+    if (toolName) return `执行工具 · ${toolName}`;
+  }
+
+  return base;
+}
+
+/**
+ * Full status label with 3-tier health suffix (Iter#5 Part C §C3 AC-S2).
+ *
+ * Replaces the old `⚠ {base} (超时)` bracket pattern with:
+ * - (a) normal: `{base}` (no suffix)
+ * - (b) slow: `{base} · 已等 {min}m · 较慢` (isStale && elapsed < threshold*1.5)
+ * - (c) stuck: `{base} · 已等 {min}m · 可能卡住` (isStale && elapsed >= threshold*1.5)
+ * - (d) server-confirmed timeout: terminal failed/canceled with timeout reason
+ */
+export function runStatusFullLabel(ctx: ActorRunContext | null): string | undefined {
+  if (!ctx) return undefined;
+
+  if (ctx.isTerminal) {
+    const meta = ctx.run.metadata ?? {};
+    const error = typeof meta.error === "string" ? meta.error : undefined;
+    const noReplyReason = typeof meta.noReplyReason === "string" ? meta.noReplyReason : undefined;
+    const reason = error || noReplyReason || ctx.run.startReason;
+    const base = runStatusLabel[ctx.status] ?? ctx.status;
+    return reason ? `${base} · ${reason}` : base;
+  }
+
+  const base = runStatusPhrase(ctx) ?? runStatusLabel[ctx.status] ?? ctx.status;
+
+  if (ctx.isStale) {
+    const elapsedSec = (Date.now() - new Date(ctx.run.openedAt).getTime()) / 1000;
+    const minutes = Math.floor(elapsedSec / 60);
+    const elapsedLabel = minutes > 0 ? `${minutes}m` : `${Math.floor(elapsedSec)}s`;
+    if (elapsedSec >= ctx.staleThresholdSec * 1.5) {
+      return `${base} · 已等 ${elapsedLabel} · 可能卡住`;
+    }
+    return `${base} · 已等 ${elapsedLabel} · 较慢`;
   }
 
   return base;

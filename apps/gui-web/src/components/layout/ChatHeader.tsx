@@ -10,6 +10,7 @@ import { useMemo } from "react";
 import { connectionLabel } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
 
 function formatActivityLabel(activity: ChannelAgentActivity): string {
   const { primaryAgentName, primaryStatus, activeCount, hasFailed } = activity;
@@ -17,8 +18,8 @@ function formatActivityLabel(activity: ChannelAgentActivity): string {
   if (activeCount === 1) {
     switch (primaryStatus) {
       case "running": return `${primaryAgentName} 正在思考…`;
-      case "waiting_tool": return `${primaryAgentName} 正在等待工具…`;
-      case "preparing_context": return `${primaryAgentName} 正在准备…`;
+      case "waiting_tool": return `${primaryAgentName} 正在执行工具…`;
+      case "preparing_context": return `${primaryAgentName} 正在准备上下文…`;
       case "queued": return `${primaryAgentName} 排队中…`;
       default: return `${primaryAgentName} 工作中…`;
     }
@@ -34,6 +35,8 @@ export function ChatHeader({
   onOpenPanel,
   runs,
   agentActors,
+  scopeId,
+  actors,
 }: {
   channel: Channel | null;
   target: string | null;
@@ -42,6 +45,8 @@ export function ChatHeader({
   onOpenPanel: (panel: ChannelPanelTab) => void;
   runs: Record<string, Run>;
   agentActors: Actor[];
+  scopeId?: string | null;
+  actors?: Record<string, Actor>;
 }) {
   const topic = channelTopic(channel);
   const activity = useMemo(
@@ -82,6 +87,8 @@ export function ChatHeader({
           )}
         </div>
       </div>
+      {/* L1/L2 scope token summary — silent-hidden when null */}
+      <ScopeTokenSummary scopeId={scopeId} actors={actors ?? {}} />
       <div className="flex shrink-0 items-center gap-1.5">
         {panelActions.map((item) => {
           const Icon = item.icon;

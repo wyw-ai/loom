@@ -19,7 +19,6 @@ pub mod envelope;
 pub mod interactive;
 pub mod mcp_servers;
 pub mod memory;
-pub mod path_util;
 pub mod profile;
 pub mod provider;
 pub mod server_url;

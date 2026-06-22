@@ -10,9 +10,9 @@
 //! ## Migration history
 //!
 //! Migrated from `agent-runtime/src/path_util.rs` in P0-PAL-2
-//! (ARCH §2.1 / §6.1). The original location is kept as a thin re-export
-//! bridge during the transition; consumers should switch to
-//! `loom_platform::path` directly.
+//! (ARCH §2.1 / §6.1). The original bridge module was removed in
+//! P0-PAL-9; all consumers now import from `loom_platform::path`
+//! directly.
 
 use std::path::{Path, PathBuf};
 

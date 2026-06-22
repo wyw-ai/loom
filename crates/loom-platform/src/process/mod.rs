@@ -17,9 +17,8 @@
 //! ## Migration map
 //!
 //! - The constants [`CREATE_NO_WINDOW`] / [`CREATE_BREAKAWAY_FROM_JOB`] used
-//!   to live in `agent_runtime::path_util`. They now live here. The old
-//!   path still re-exports them for backward compatibility through the
-//!   P0-PAL-4 wave.
+//!   to live in `agent_runtime::path_util`. They now live here; the
+//!   `agent_runtime::path_util` bridge was removed in P0-PAL-9.
 //! - Direct call sites that build `std::process::Command` and manually call
 //!   `.creation_flags(...)` or `.process_group(0)` migrate to
 //!   `loom_platform::process::Command::new(...)` in P0-PAL-4. The newtype

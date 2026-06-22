@@ -97,6 +97,25 @@ pub fn extract_token_usage_from_text(text: &str) -> Option<TokenUsage> {
     last.map(normalized_usage)
 }
 
+/// Observe a single ndjson-style stdout line and return a normalized usage
+/// snapshot if (a) it parses as JSON, (b) it contains usage information
+/// the extractor recognizes, and (c) the snapshot differs from the last one
+/// returned. On a hit the helper also updates `last` in place. Callers
+/// should treat the returned snapshot as a streaming UsageUpdate payload.
+pub fn observe_usage_line(line: &str, last: &mut Option<TokenUsage>) -> Option<TokenUsage> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let usage = normalized_usage(extract_token_usage(&value)?);
+    if last.as_ref() == Some(&usage) {
+        return None;
+    }
+    *last = Some(usage.clone());
+    Some(usage)
+}
+
 pub fn extract_token_usage(value: &Value) -> Option<TokenUsage> {
     for candidate in usage_candidates(value) {
         if let Some(usage) = token_usage_from_object(candidate) {

@@ -244,7 +244,7 @@ fn run_prompt(
     sender: mpsc::UnboundedSender<AdapterEvent>,
     slot: Arc<Mutex<InFlight>>,
 ) -> Result<(), String> {
-    let outcome = run_prompt_inner(&cfg, &prompt, &slot);
+    let outcome = run_prompt_inner(&cfg, &prompt, &slot, &sender);
     match outcome {
         Ok(outcome) => {
             if !outcome.stderr.trim().is_empty() {
@@ -323,6 +323,7 @@ fn run_prompt_inner(
     cfg: &InteractiveCommandConfig,
     prompt: &AdapterPrompt,
     slot: &Arc<Mutex<InFlight>>,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> Result<RunOutcome, String> {
     crate::acp::create_dir_all_unc(&prompt.cwd).map_err(|e| {
         format!(
@@ -413,6 +414,7 @@ fn run_prompt_inner(
     let mut found_done = false;
     let summary: String;
     let mut success = false;
+    let mut last_emitted_usage: Option<crate::TokenUsage> = None;
 
     loop {
         if slot.lock().cancel_requested {
@@ -427,8 +429,26 @@ fn run_prompt_inner(
         }
         match stdout_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
-                if append_stdout_chunk(&mut collected, chunk, cfg.spec.output.strip_ansi, &sentinel)
-                {
+                let sentinel_hit = append_stdout_chunk(
+                    &mut collected,
+                    chunk,
+                    cfg.spec.output.strip_ansi,
+                    &sentinel,
+                );
+                // Streaming UsageUpdate: rescan the full collected text for the
+                // latest token-usage snapshot. The text-extractor walks the
+                // collected blob and returns the most recent usage object;
+                // we emit only when it changed from the last snapshot.
+                if let Some(usage) = extract_token_usage_from_text(&collected) {
+                    if last_emitted_usage.as_ref() != Some(&usage) {
+                        let _ = sender.send(AdapterEvent::UsageUpdate {
+                            scope: Some(prompt.scope.clone()),
+                            usage: usage.clone(),
+                        });
+                        last_emitted_usage = Some(usage);
+                    }
+                }
+                if sentinel_hit {
                     final_text = text_before_sentinel(&collected, &sentinel);
                     if cfg.spec.completion.strip_sentinel {
                         final_text = final_text.trim_end().to_string();

@@ -17,14 +17,16 @@ default = ["ipc-interprocess"]
 # Default IPC backend uses the `interprocess` crate (Win Named Pipe / Unix UDS).
 # `ipc-native` is the rollback path: hand-rolled tokio::net::windows::named_pipe /
 # tokio::net::UnixListener implementation. Toggled in P0-PAL-7/8.
-ipc-interprocess = []
+ipc-interprocess = ["dep:interprocess"]
 ipc-native = []
 
 [dependencies]
 tokio = { workspace = true }
+interprocess = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Authorization"] }
+widestring = "1"
 dunce = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

@@ -11,7 +11,7 @@ mod ws;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
@@ -145,38 +145,29 @@ async fn serve_file_rpc(state: AppState, root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 async fn serve_unix(state: AppState, socket: PathBuf) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
+    use loom_platform::ipc::{LocalListener, LocalSocketName};
 
     if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create unix socket dir {}", parent.display()))?;
-    }
-    if socket.exists() {
-        let file_type = std::fs::symlink_metadata(&socket)
-            .with_context(|| format!("stat unix socket {}", socket.display()))?
-            .file_type();
-        if !file_type.is_socket() {
-            bail!("{} exists and is not a unix socket", socket.display());
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create local socket dir {}", parent.display()))?;
         }
-        std::fs::remove_file(&socket)
-            .with_context(|| format!("remove stale unix socket {}", socket.display()))?;
     }
 
-    let listener = tokio::net::UnixListener::bind(&socket)
-        .with_context(|| format!("bind unix socket {}", socket.display()))?;
-    tracing::info!(socket = %socket.display(), "loom-server listening on unix socket");
+    let name = LocalSocketName::from_path(socket.clone())
+        .with_context(|| format!("build socket name from {}", socket.display()))?;
+    let listener = LocalListener::bind(&name)
+        .await
+        .with_context(|| format!("bind local socket {}", name.display()))?;
+    tracing::info!(socket = %name.display(), "loom-server listening on local socket");
     loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(ws::handle_unix_socket(state.clone(), stream));
+        let stream = listener
+            .accept()
+            .await
+            .with_context(|| format!("accept local socket {}", name.display()))?;
+        tokio::spawn(ws::handle_local_socket(state.clone(), stream));
     }
-}
-
-#[cfg(not(unix))]
-async fn serve_unix(_state: AppState, socket: PathBuf) -> Result<()> {
-    let _ = socket;
-    bail!("unix sockets are only supported on Unix platforms");
 }
 
 fn spawn_reminder_worker(state: AppState) {

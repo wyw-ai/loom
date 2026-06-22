@@ -12,6 +12,7 @@ import {
 import { cn } from "@/lib/utils";
 import { AgentProviderIcon } from "@/components/agent/AgentProviderIcon";
 import type { RunStatus } from "@/ipc/types";
+import type { UsageDisplayState } from "@/lib/agent-identity-utils";
 
 import "./AgentIdentityBadge.css";
 
@@ -51,6 +52,15 @@ export type AgentIdentityBadgeProps = {
    * PRD §4.2 anomaly rule.
    */
   hasUsageData?: boolean;
+  /**
+   * Three-state usage display (Iter#5 Part D). When provided, overrides
+   * `hasUsageData` for the usage-region rendering logic:
+   * - `available`: render existing segment bar (no regression)
+   * - `no_data`: show "暂无用量数据" (agent hasn't completed a turn)
+   * - `estimated_only`: silently hide the usage region (provider doesn't
+   *   return real token data)
+   */
+  usageState?: UsageDisplayState;
   online?: boolean;
   working?: boolean;
   workingLabel?: string;
@@ -171,6 +181,7 @@ export function AgentIdentityBadge({
   tokensLeftLabel,
   estimated = false,
   hasUsageData,
+  usageState,
   online = true,
   working: _working = false,
   workingLabel,
@@ -217,6 +228,7 @@ export function AgentIdentityBadge({
         tokensLeftLabel={tokensLeftLabel}
         estimated={estimated}
         hasUsageData={hasUsageData ?? segmentsToRender.length > 0}
+        usageState={usageState}
         activeLabel={activeLabel}
         working={derivedWorking}
         runStatus={runStatus}
@@ -326,6 +338,7 @@ function AgentIdentityDetailCard({
   tokensLeftLabel,
   estimated = false,
   hasUsageData = true,
+  usageState,
   activeLabel,
   working = false,
   runStatus,
@@ -350,6 +363,7 @@ function AgentIdentityDetailCard({
   tokensLeftLabel?: string;
   estimated?: boolean;
   hasUsageData?: boolean;
+  usageState?: UsageDisplayState;
   activeLabel: string;
   working?: boolean;
   runStatus?: RunStatus | null;
@@ -362,6 +376,16 @@ function AgentIdentityDetailCard({
   const statusClass = runStatus ? detailCardStatusClass(runStatus, isStale, isTerminal) : "";
   const hasTokenStats =
     Boolean(inputOutputLabel) || Boolean(cacheBenefitLabel) || Boolean(costLabel);
+  // Iter#5 Part D — three-state usage rendering.
+  // estimated_only: silently hide the entire usage region (both sections).
+  const hideUsageRegion = usageState?.kind === "estimated_only";
+  // no_data: show "暂无用量数据" instead of "Token tracking unavailable..."
+  const usageEmptyText =
+    usageState?.kind === "no_data"
+      ? "暂无用量数据"
+      : hasUsageData
+        ? "Token statistics will appear once this agent finishes a turn."
+        : "Token tracking unavailable for this provider.";
   return (
     <article className={cn("agent-detail-card", className)} aria-label={`${agentName} agent details`}>
       <div className="agent-detail-card__hero">
@@ -411,6 +435,8 @@ function AgentIdentityDetailCard({
         </div>
       </div>
 
+      {hideUsageRegion ? null : (
+      <>
       <section className="agent-detail-section agent-detail-traits">
         <div className="agent-detail-section__heading">
           <span className="agent-detail-section__icon">
@@ -451,9 +477,7 @@ function AgentIdentityDetailCard({
               </ul>
             ) : (
               <p className="agent-detail-traits__empty">
-                {hasUsageData
-                  ? "Token statistics will appear once this agent finishes a turn."
-                  : "Token tracking unavailable for this provider."}
+                {usageEmptyText}
               </p>
             )}
           </div>
@@ -516,9 +540,11 @@ function AgentIdentityDetailCard({
           </>
         ) : (
           <p className="agent-detail-context__empty">
-            {hasUsageData
-              ? "Breakdown will populate after the first turn completes."
-              : "Token tracking unavailable for this provider."}
+            {usageState?.kind === "no_data"
+              ? "暂无用量数据"
+              : hasUsageData
+                ? "Breakdown will populate after the first turn completes."
+                : "Token tracking unavailable for this provider."}
           </p>
         )}
 
@@ -527,6 +553,8 @@ function AgentIdentityDetailCard({
           <strong>{usedTokensLabel}</strong>
         </div>
       </section>
+      </>
+      )}
 
       <section className="agent-detail-section agent-detail-hp">
         <div className="agent-detail-hp__top">

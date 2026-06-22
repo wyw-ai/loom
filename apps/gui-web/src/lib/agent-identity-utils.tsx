@@ -17,7 +17,32 @@ import {
 import { metadataNumber } from "@/lib/message-utils";
 import type { ActorRunContext } from "@/lib/agent-utils";
 import type { AgentUsageSnapshot } from "@/store/usageStore";
-import { buildUsageDisplay } from "@/lib/agent-usage-display";
+import { buildUsageDisplay, type UsageDisplay } from "@/lib/agent-usage-display";
+
+/**
+ * Three-state usage display (Iter#5 Part D §D4).
+ *
+ * - `available`: snapshot exists and `buildUsageDisplay` returns non-null →
+ *   render the existing segment bar (no regression).
+ * - `no_data`: no snapshot (agent hasn't completed a turn yet) → show
+ *   "暂无用量数据" instead of the misleading "Token tracking unavailable..."
+ * - `estimated_only`: snapshot exists but `cumulative.estimated === true`
+ *   (provider doesn't return real token data) → silently hide the usage region.
+ */
+export type UsageDisplayState =
+  | { kind: "available"; display: UsageDisplay }
+  | { kind: "no_data" }
+  | { kind: "estimated_only" };
+
+function deriveUsageDisplayState(
+  usage: AgentUsageSnapshot | null | undefined,
+  display: UsageDisplay | null,
+): UsageDisplayState {
+  if (!usage) return { kind: "no_data" };
+  if (usage.cumulative?.estimated === true) return { kind: "estimated_only" };
+  if (display) return { kind: "available", display };
+  return { kind: "no_data" };
+}
 
 export function agentIdentityBadgeProps(
   entry: AgentMemberEntry,
@@ -35,10 +60,12 @@ export function agentIdentityBadgeProps(
   // Iteration #4 — derive live token usage display from the per-actor
   // snapshot when available; fall back to the historical static labels so
   // existing behavior (agents that have not produced usage yet) is unchanged.
+  // Iter#5 Part D — derive UsageDisplayState for three-way branch.
   const meta = entry.agent.spec._meta;
   const contextWindow =
     metadataNumber(meta, ["contextWindowTokens", "totalTokens", "maxTokens"]) ?? null;
   const display = buildUsageDisplay(usage, contextWindow);
+  const usageState = deriveUsageDisplayState(usage, display);
 
   return {
     avatarUrl: agentAvatarValue(entry.agent),
@@ -56,6 +83,7 @@ export function agentIdentityBadgeProps(
     tokensLeftLabel: display?.tokensLeftLabel,
     estimated: display?.estimated ?? false,
     hasUsageData: display != null,
+    usageState,
     online: isOnlinePresenceStatus(entry.agent.status, entry.agent),
     working,
     workingLabel,

@@ -790,6 +790,101 @@
     background: transparent;
     padding: 0;
   }
+
+  /* GFM elements (remark-gfm): tables, strikethrough, task lists, headings,
+     lists, blockquotes, hr. Scoped under .message-markdown so they never leak
+     into the wider app. Loom-native palette (see ARCH Part A §2.2). */
+  .message-markdown table {
+    border-collapse: collapse;
+    width: 100%;
+    display: block;
+    overflow-x: auto;
+    margin: 0 0 0.45rem;
+  }
+
+  .message-markdown thead th {
+    background: #f7f8fb;
+    font-weight: 600;
+    text-align: left;
+    border-bottom: 2px solid #dfe3ec;
+  }
+
+  .message-markdown th,
+  .message-markdown td {
+    padding: 6px 12px;
+    border: 1px solid #dfe3ec;
+  }
+
+  .message-markdown tbody tr:nth-child(even) {
+    background: #fbfbfd;
+  }
+
+  .message-markdown del {
+    color: #98a2b3;
+  }
+
+  .message-markdown input[type="checkbox"] {
+    margin-right: 6px;
+    pointer-events: none;
+  }
+
+  .message-markdown h1,
+  .message-markdown h2,
+  .message-markdown h3,
+  .message-markdown h4,
+  .message-markdown h5,
+  .message-markdown h6 {
+    margin: 0.6rem 0 0.4rem;
+    font-weight: 700;
+    line-height: 1.3;
+    color: #111827;
+  }
+
+  .message-markdown h1 {
+    font-size: 1.4em;
+  }
+
+  .message-markdown h2 {
+    font-size: 1.25em;
+  }
+
+  .message-markdown h3 {
+    font-size: 1.15em;
+  }
+
+  .message-markdown h4,
+  .message-markdown h5,
+  .message-markdown h6 {
+    font-size: 1em;
+  }
+
+  .message-markdown ul,
+  .message-markdown ol {
+    margin: 0 0 0.45rem;
+    padding-left: 1.5rem;
+  }
+
+  .message-markdown li {
+    margin: 0.15rem 0;
+  }
+
+  .message-markdown li > ul,
+  .message-markdown li > ol {
+    margin: 0.2rem 0;
+  }
+
+  .message-markdown blockquote {
+    margin: 0 0 0.45rem;
+    padding: 0.2rem 0 0.2rem 0.9rem;
+    border-left: 3px solid #5843d7;
+    color: #485063;
+  }
+
+  .message-markdown hr {
+    border: none;
+    border-top: 1px solid #dfe3ec;
+    margin: 0.8rem 0;
+  }
 }
 
 @layer utilities {

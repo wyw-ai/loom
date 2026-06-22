@@ -113,7 +113,10 @@ struct AcpShared {
     /// response. Some ACP agents report usage as a session/update rather than
     /// on the prompt response itself.
     usage_by_session: Mutex<HashMap<String, TokenUsage>>,
-    action_namespace: String,
+        /// session id → last emitted UsageUpdate snapshot, used for emission-side
+        /// dedup so we don't flood the event channel with identical snapshots.
+        last_emitted_usage: Mutex<HashMap<String, TokenUsage>>,
+        action_namespace: String,
     /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
     /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
     mcp_servers: Vec<Value>,
@@ -606,7 +609,8 @@ fn start_blocking(
         sessions_by_id: Mutex::new(HashMap::new()),
         model_options_by_session: Mutex::new(HashMap::new()),
         usage_by_session: Mutex::new(HashMap::new()),
-        action_namespace: Uuid::new_v4().to_string(),
+                last_emitted_usage: Mutex::new(HashMap::new()),
+                action_namespace: Uuid::new_v4().to_string(),
         mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
     });
@@ -1475,10 +1479,31 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
     if let Some(session_id) = session_id.as_deref() {
         update_model_options_for_session(shared, session_id, &update);
         if let Some(usage) = extract_token_usage(&update) {
+            let normalized = normalized_usage(usage);
             shared
                 .usage_by_session
                 .lock()
-                .insert(session_id.to_string(), normalized_usage(usage));
+                .insert(session_id.to_string(), normalized.clone());
+            // Emission-side dedup: only fire UsageUpdate when the snapshot
+            // actually changes for this session. Avoids flooding the event
+            // channel with identical snapshots when providers echo the same
+            // cache_read totals on every chunk.
+            let should_emit = {
+                let mut last = shared.last_emitted_usage.lock();
+                match last.get(session_id) {
+                    Some(prev) if *prev == normalized => false,
+                    _ => {
+                        last.insert(session_id.to_string(), normalized.clone());
+                        true
+                    }
+                }
+            };
+            if should_emit {
+                let _ = shared.event_sender.send(AdapterEvent::UsageUpdate {
+                    scope: scope.clone(),
+                    usage: normalized,
+                });
+            }
         }
     }
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
@@ -1536,6 +1561,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         );
         if let Some(error) = message.get("error") {
             shared.usage_by_session.lock().remove(&session_id);
+                    shared.last_emitted_usage.lock().remove(&session_id);
             let _ = shared.event_sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: json_value_to_string(error),
@@ -1550,6 +1576,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         let update_usage = shared.usage_by_session.lock().remove(&session_id);
+        shared.last_emitted_usage.lock().remove(&session_id);
         let usage = extract_token_usage(&result)
             .map(normalized_usage)
             .or(update_usage);

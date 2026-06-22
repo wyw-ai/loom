@@ -1,0 +1,94 @@
+# Token-usage extraction manifest.
+#
+# Configures which JSON paths inside an adapter event hold the usage object,
+# and which field names within that object correspond to each TokenUsage slot.
+#
+# Resolution order at runtime (`extract_token_usage(provider_id, &value)`):
+#   1. If `provider_id` is supplied AND a matching `[providers.<id>]` section
+#      exists, try its `paths` first, then its `default` path (the value
+#      itself), using its `fields.*` field-name aliases.
+#   2. Otherwise / on miss, fall back to `[default]` paths + field aliases.
+#
+# Each `paths` entry is a JSON Pointer (RFC 6901). The value AT that pointer is
+# expected to be an object whose fields match one of the aliases for each
+# TokenUsage slot. The empty pointer ("") means "the value itself".
+#
+# This manifest is embedded into the agent-runtime binary via include_str! so
+# providers ship with sensible defaults out of the box.
+
+[default]
+paths = [
+    "",                       # the value itself (e.g. when caller passes the usage object directly)
+    "/usage",
+    "/tokenUsage",
+    "/token_usage",
+    "/result/usage",
+    "/result/tokenUsage",
+    "/result/token_usage",
+    "/data/usage",
+    "/data/tokenUsage",
+    "/data/token_usage",
+    "/message/usage",
+    "/message/tokenUsage",
+    "/message/token_usage",
+    "/response/usage",
+    "/response/tokenUsage",
+    "/response/token_usage",
+]
+
+[default.fields]
+input_tokens = ["input_tokens", "inputTokens", "prompt_tokens", "promptTokens", "input", "prompt"]
+output_tokens = ["output_tokens", "outputTokens", "completion_tokens", "completionTokens", "output", "completion"]
+total_tokens = ["total_tokens", "totalTokens", "tokens", "token_count", "tokenCount"]
+cache_creation_input_tokens = ["cache_creation_input_tokens", "cacheCreationInputTokens", "cache_write_input_tokens", "cacheWriteInputTokens"]
+cache_read_input_tokens = ["cache_read_input_tokens", "cacheReadInputTokens", "cached_input_tokens", "cachedInputTokens"]
+reasoning_tokens = ["reasoning_tokens", "reasoningTokens", "reasoning_output_tokens", "reasoningOutputTokens"]
+total_cost_usd = ["total_cost_usd", "totalCostUsd", "cost_usd", "costUsd", "cost"]
+
+# ---- Provider-specific overrides ----------------------------------------------
+# Each [providers.<id>] section may declare:
+#   - `paths`: additional JSON pointers to try BEFORE the default list
+#   - `fields.*`: additional field-name aliases to try BEFORE the default ones
+# Providers that need no overrides can be omitted; the default extractor already
+# handles the most common shapes used by claude-code, codex, and copilot.
+
+[providers.claude]
+paths = [
+    "/message/usage",
+    "/usage",
+    "/result/usage",
+]
+
+[providers.claude.fields]
+# Anthropic-flavoured field names already covered by defaults; this section is
+# a hook for future divergence (e.g. tool-use-specific counters).
+
+[providers.codex]
+paths = [
+    "/msg/info/last_token_usage",
+    "/msg/info/token_usage",
+    "/info/last_token_usage",
+    "/info/token_usage",
+    "/usage",
+]
+
+[providers.codex.fields]
+# Codex stream events nest usage one level deeper inside `msg.info`.
+
+[providers.copilot]
+paths = [
+    "/usage",
+    "/tokenUsage",
+    "/data/usage",
+]
+
+[providers.copilot.fields]
+# Copilot CLI surfaces standard snake_case usage; defaults suffice.
+
+[providers.opencode]
+paths = [
+    "/usage",
+    "/data/usage",
+]
+
+[providers.opencode.fields]

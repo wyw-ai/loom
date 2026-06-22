@@ -1,7 +1,7 @@
 //! B-2.2: Windows Spawn Flag Integration Tests
 //!
 //! Validates that the Windows process creation flags exported from
-//! `agent_runtime::path_util` match documented Win32 constants and
+//! `loom_platform::process` match documented Win32 constants and
 //! that spawning with CREATE_NO_WINDOW + CREATE_BREAKAWAY_FROM_JOB
 //! succeeds without error.
 //! All tests are gated to Windows only.

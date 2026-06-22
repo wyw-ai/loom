@@ -1,6 +1,6 @@
 //! B-2.1: UNC Path Round-Trip Integration Tests
 //!
-//! Validates that the Windows UNC path utilities in `agent_runtime::path_util`
+//! Validates that the Windows UNC path utilities in `loom_platform::path`
 //! correctly handle deep paths, mixed separators, and avoid double-prefixing.
 //! All tests are gated to Windows only.
 

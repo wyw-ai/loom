@@ -1,10 +1,16 @@
+import { memo } from "react";
+import remarkGfm from "remark-gfm";
 import { actorName } from "@/lib/format-utils";
 import type { Actor, MessageMention } from "@/ipc/types";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import { actorMentionRemarkPlugin, actorMentionActorId } from "@/lib/format-utils";
 
-export function MessageMarkdown({
+// remark-gfm must run BEFORE actorMentionRemarkPlugin so GFM syntax (tables,
+// strikethrough, autolinks) is parsed into mdast nodes first; actorMention then
+// scans the resulting tree and skips link/linkReference nodes (see
+// format-utils.ts guard), so @mentions inside table cells survive.
+export const MessageMarkdown = memo(function MessageMarkdown({
   actors,
   body,
   mentions = [],
@@ -37,10 +43,10 @@ export function MessageMarkdown({
 
   return (
     <ReactMarkdown
-      remarkPlugins={[actorMentionRemarkPlugin(actors, mentions)]}
+      remarkPlugins={[remarkGfm, actorMentionRemarkPlugin(actors, mentions)]}
       components={components}
     >
       {body}
     </ReactMarkdown>
   );
-}
+});

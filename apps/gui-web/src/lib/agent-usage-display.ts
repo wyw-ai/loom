@@ -152,7 +152,7 @@ export function deriveSegments(
   return { segments, total };
 }
 
-function formatCompact(value: number): string {
+export function formatCompact(value: number): string {
   if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
   return `${Math.round(value)}`;
 }

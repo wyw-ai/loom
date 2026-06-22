@@ -1854,6 +1854,8 @@ export function App() {
               }}
               runs={runs}
               agentActors={agentActors}
+              scopeId={activeScope?.id}
+              actors={actors}
             />
             {error && (
               <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">
@@ -2081,6 +2083,7 @@ export function App() {
             onSend={sendThreadMessage}
             onToggleReaction={toggleMessageReaction}
             onOpenAgentSettings={openAgentSettings}
+            scopeId={activeThreadScope?.id}
           />
         ) : channelPanelTab && activeChannel ? (
           <ChannelPanel

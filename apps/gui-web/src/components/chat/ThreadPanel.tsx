@@ -11,6 +11,7 @@ import { MutedLine } from "@/components/shared/MutedLine";
 import { TaskStateBadge } from "@/components/chat/TaskStateBadge";
 import { ThreadConversationMessage } from "@/components/chat/ThreadConversationMessage";
 import { ThreadComposer } from "@/components/chat/ThreadComposer";
+import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
 
 type ReplyItem =
   | { kind: "date-divider"; key: string; label: string }
@@ -36,6 +37,7 @@ export function ThreadPanel({
   onSend,
   onToggleReaction,
   onOpenAgentSettings,
+  scopeId,
 }: {
   actors: Record<string, Actor>;
   channel: Channel | null;
@@ -56,6 +58,7 @@ export function ThreadPanel({
   onSend: () => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onOpenAgentSettings: (actorId: string) => void;
+  scopeId?: string | null;
 }) {
   const rootMessage = thread
     ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
@@ -113,6 +116,8 @@ export function ThreadPanel({
             )}
           </div>
           <div className="flex items-center gap-1">
+            {/* L1/L2 thread token summary (AC-T2) — silent-hidden when null */}
+            <ScopeTokenSummary scopeId={scopeId} actors={actors} />
             <button className="composer-icon" type="button" title="Close" onClick={onClose}>
               <X size={16} />
             </button>

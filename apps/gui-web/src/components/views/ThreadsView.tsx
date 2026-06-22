@@ -135,6 +135,7 @@ export function ThreadsView({
           onSend={onSendThreadMessage}
           onToggleReaction={onToggleReaction}
           onOpenAgentSettings={onOpenAgentSettings}
+          scopeId={activeThread?.id}
         />
       </div>
     </section>

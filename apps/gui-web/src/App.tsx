@@ -105,6 +105,7 @@ import { useChannelStore } from "@/store/channelStore";
 import { useMessageStore } from "@/store/messageStore";
 import { useActorStore } from "@/store/actorStore";
 import { useTaskStore } from "@/store/taskStore";
+import { applyMessageToUsageStore } from "@/store/usageStore";
 
 // P3 — Extracted layout / shared components
 import { Rail } from "@/components/layout/Rail";
@@ -795,7 +796,8 @@ export function App() {
       case "message.created": {
         const message = update.data.message as Message | undefined;
         if (!message) return;
-        if (messageIsActionRequestFor(message, actorIdRef.current)) {
+              applyMessageToUsageStore(message);
+              if (messageIsActionRequestFor(message, actorIdRef.current)) {
           setInbox((current) =>
             current.some((item) => item.delivery.sourceId === message.id)
               ? current
@@ -843,7 +845,8 @@ export function App() {
       case "message.updated": {
         const message = update.data.message as Message | undefined;
         if (!message) return;
-        if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
+              applyMessageToUsageStore(message);
+              if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
           setMessages((current) => sortMessages(upsertMessage(current, message)));
         }
         if (message.scope.kind === "thread") {

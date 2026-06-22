@@ -8,16 +8,21 @@
 //!   `CloseHandle`. `SYNCHRONIZE` is added (vs. PRD-original
 //!   `PROCESS_TERMINATE` alone) so a follow-up `WaitForSingleObject` is
 //!   permitted without a re-open (ARCH D5 risk hint).
-//! - **Interrupt** → `GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)`. The
+//! - **Interrupt** → `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)`. The
 //!   target must own its own console process group (children spawned via
 //!   `loom_platform::process::Command` satisfy this thanks to
-//!   `CREATE_NEW_PROCESS_GROUP` in `apply_*_defaults`). If the call fails,
-//!   we fall back to the `TerminateProcess` path so the caller's
-//!   "interrupt or kill" intent is never silently dropped.
+//!   `CREATE_NEW_PROCESS_GROUP` in `apply_*_defaults`). We use
+//!   `CTRL_BREAK_EVENT` rather than `CTRL_C_EVENT` because `CTRL_C_EVENT` is
+//!   broadcast to every process sharing the sender's console and *ignores*
+//!   the process-group id argument, whereas `CTRL_BREAK_EVENT` is the event
+//!   that actually respects per-group delivery enabled by
+//!   `CREATE_NEW_PROCESS_GROUP`. If the call fails, we fall back to the
+//!   `TerminateProcess` path so the caller's "interrupt or kill" intent is
+//!   never silently dropped.
 
 use super::Signal;
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
-use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
+use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
 use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
 /// Standard `SYNCHRONIZE` access right (0x0010_0000) from `WinNT.h`.
@@ -39,10 +44,10 @@ const FORCED_EXIT_CODE: u32 = 1;
 pub(super) fn signal_child(pid: u32, sig: Signal) -> std::io::Result<()> {
     match sig {
         Signal::Term | Signal::Kill | Signal::Quit => terminate_via_handle(pid),
-        Signal::Interrupt => match send_ctrl_c(pid) {
+        Signal::Interrupt => match send_ctrl_break(pid) {
             Ok(()) => Ok(()),
             // Fall back to forced termination — preserves the caller's
-            // "make this stop" intent even when CTRL_C_EVENT cannot be
+            // "make this stop" intent even when CTRL_BREAK_EVENT cannot be
             // delivered (target not in its own process group, etc.).
             Err(_) => terminate_via_handle(pid),
         },
@@ -75,13 +80,20 @@ fn terminate_via_handle(pid: u32) -> std::io::Result<()> {
     }
 }
 
-fn send_ctrl_c(pid: u32) -> std::io::Result<()> {
+fn send_ctrl_break(pid: u32) -> std::io::Result<()> {
     // SAFETY: `GenerateConsoleCtrlEvent` is a scalar-arg syscall wrapper;
     // the only invariant we owe it is `pid` is meaningful as a console
     // process group ID. Children spawned via
     // `loom_platform::process::Command` satisfy this by virtue of the
     // `CREATE_NEW_PROCESS_GROUP` flag baked into `apply_*_defaults`.
-    let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
+    //
+    // We send `CTRL_BREAK_EVENT` (not `CTRL_C_EVENT`): per the Win32
+    // contract `CTRL_C_EVENT` is broadcast to every process sharing the
+    // caller's console and ignores the process-group id argument, so it
+    // would not target just our child group. `CTRL_BREAK_EVENT` is the
+    // event that honours per-group delivery for a `CREATE_NEW_PROCESS_GROUP`
+    // child.
+    let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
     if ok == 0 {
         Err(std::io::Error::last_os_error())
     } else {

@@ -90,7 +90,7 @@ contaminate the host project cache:
 
 | platform | default `CARGO_TARGET_DIR`                          |
 |----------|------------------------------------------------------|
-| Windows  | `F:\pj\loom-test\target`                            |
+| Windows  | `%LOCALAPPDATA%\loom-test\target`                   |
 | macOS    | `~/Library/Caches/loom-test/target`                  |
 | Linux    | `${XDG_CACHE_HOME:-$HOME/.cache}/loom-test/target`   |
 | other    | `~/.loom-test/target`                                |
@@ -160,7 +160,7 @@ re-compiles the workspace from cold. Subsequent runs are incremental.
 To share the host project cache instead (faster but less isolated):
 
 ```powershell
-$env:LOOM_MATRIX_TARGET_DIR = 'F:\pj\joi-apps-temp\target'
+$env:LOOM_MATRIX_TARGET_DIR = "$env:LOCALAPPDATA\joi-apps-temp\target"
 .\scripts\ci\run-matrix.ps1
 ```
 

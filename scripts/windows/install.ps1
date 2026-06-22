@@ -43,6 +43,15 @@ if ($Service -eq "server" -or $Service -eq "all") {
     $ServerConfig | Set-Content $TempXml -Encoding UTF8
 
     Write-Host "Installing Loom Server service..."
+    # Idempotent: WinSW `install` fails if the service already exists, so on a
+    # re-run (config change, upgrade, partial prior install) stop+uninstall the
+    # existing instance first. Native-exe non-zero exits don't trip
+    # $ErrorActionPreference, so failures here just fall through to install.
+    if (Get-Service -Name LoomServer -ErrorAction SilentlyContinue) {
+        Write-Host "LoomServer already installed; removing old instance for a clean reinstall..."
+        & $WinSW stop   $TempXml 2>$null
+        & $WinSW uninstall $TempXml 2>$null
+    }
     & $WinSW install $TempXml
     Write-Host "Setting Loom Server to Automatic (delayed start)..."
     & $WinSW set $TempXml --startmode Automatic
@@ -66,6 +75,12 @@ if ($Service -eq "daemon" -or $Service -eq "all") {
     $DaemonConfig | Set-Content $TempXml -Encoding UTF8
 
     Write-Host "Installing Loom Daemon service..."
+    # Idempotent: see the server block above.
+    if (Get-Service -Name LoomDaemon -ErrorAction SilentlyContinue) {
+        Write-Host "LoomDaemon already installed; removing old instance for a clean reinstall..."
+        & $WinSW stop   $TempXml 2>$null
+        & $WinSW uninstall $TempXml 2>$null
+    }
     & $WinSW install $TempXml
     Write-Host "Starting Loom Daemon..."
     & $WinSW start $TempXml

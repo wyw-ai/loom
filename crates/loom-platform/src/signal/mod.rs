@@ -12,7 +12,7 @@
 //! | [`Signal::Term`]   | `SIGTERM` (15)| `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
 //! | [`Signal::Kill`]   | `SIGKILL` (9) | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
 //! | [`Signal::Quit`]   | `SIGQUIT` (3) | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
-//! | [`Signal::Interrupt`] | `SIGINT` (2) | `GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)` then fallback to `TerminateProcess(1)` if it fails |
+//! | [`Signal::Interrupt`] | `SIGINT` (2) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` then fallback to `TerminateProcess(1)` if it fails |
 //!
 //! Windows has no per-signal granularity for `TerminateProcess`; the three
 //! "forced" variants therefore collapse to the same handle-based call.
@@ -53,7 +53,10 @@ pub enum Signal {
     /// Unconditional kill. Unix: `SIGKILL`. Windows: `TerminateProcess`.
     Kill,
     /// Console interrupt (Ctrl-C). Unix: `SIGINT`. Windows:
-    /// `GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)`, with a
+    /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` (`CTRL_BREAK_EVENT`
+    /// is the event that honours per-process-group delivery for a
+    /// `CREATE_NEW_PROCESS_GROUP` child; `CTRL_C_EVENT` would broadcast to
+    /// the whole console and ignore the group id), with a
     /// `TerminateProcess` fallback if the call fails.
     Interrupt,
     /// Quit with optional core dump. Unix: `SIGQUIT`. Windows:

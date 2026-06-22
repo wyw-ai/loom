@@ -1395,8 +1395,20 @@ pub async fn machine_remove(
 ) -> Result<MachineListResult, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
     let machine_id = args.machine_id.trim();
-    if machine_id.is_empty() {
-        return Err("machine id is required".into());
+    // `machine_id` is joined into a filesystem path and remove_dir_all'd
+    // below, so it must be a plain identifier. Reject anything that could
+    // escape the daemon-configs/ directory (path traversal → arbitrary
+    // directory deletion). Since no path separators are allowed, traversal
+    // via `..` segments is impossible; `.`/`..` alone are rejected too
+    // (they would delete the daemon-configs dir itself).
+    if machine_id.is_empty()
+        || machine_id.contains('\\')
+        || machine_id.contains('/')
+        || machine_id.contains('\0')
+        || machine_id == "."
+        || machine_id == ".."
+    {
+        return Err("invalid machine id".into());
     }
 
     // Try to find this machine on the server and delete its actor.

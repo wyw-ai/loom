@@ -5,6 +5,16 @@
 //! that spawning with CREATE_NO_WINDOW + CREATE_BREAKAWAY_FROM_JOB
 //! succeeds without error.
 //! All tests are gated to Windows only.
+//!
+//! ## Lint exemption
+//!
+//! This file uses raw `std::process::Command::new` directly. That is the
+//! architecturally correct choice for a PAL primitive test: the test exists
+//! precisely to verify the underlying Win32 primitives that
+//! `loom_platform::process::Command` builds on. The file-level
+//! `#![allow(clippy::disallowed_methods)]` below is the documented opt-out for
+//! "exception #3" in the workspace-root `clippy.toml` (PAL primitive tests).
+#![allow(clippy::disallowed_methods)]
 
 #[cfg(windows)]
 use loom_platform::process::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};

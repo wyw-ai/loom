@@ -54,15 +54,24 @@ the structural facts that motivated this work unit.
 Each script runs three stages in order. The first failing stage exits
 non-zero and stops the script.
 
-| stage  | default command                                                        | failure exit code |
-|--------|------------------------------------------------------------------------|-------------------|
-| fmt    | `cargo fmt --all -- --check`                                           | 2 |
-| clippy | `cargo clippy --workspace --exclude loom-gui --all-targets` (informational by default; add `-D warnings` via `--strict-clippy` / `-StrictClippy`) | 3 |
-| test   | `cargo test --workspace --exclude loom-gui --no-fail-fast`             | 4 |
+| stage      | default command                                                        | failure exit code |
+|------------|------------------------------------------------------------------------|-------------------|
+| fmt        | `cargo fmt --all -- --check`                                           | 2 |
+| clippy-pal | `cargo clippy --workspace --all-targets -- -D clippy::disallowed_methods` (PAL guardrail; **always strict**, includes `loom-gui`) | 3 |
+| clippy     | `cargo clippy --workspace --exclude loom-gui --all-targets` (informational by default; add `-D warnings` via `--strict-clippy` / `-StrictClippy`) | 3 |
+| test       | `cargo test --workspace --exclude loom-gui --no-fail-fast`             | 4 |
 
 Notes:
 
-- `loom-gui` is excluded because Tauri build is heavy and depends on
+- The **`clippy-pal` PAL guardrail** runs across the full workspace
+  (including `loom-gui`) with only `clippy::disallowed_methods` denied,
+  so any new `std::process::Command::new` / `tokio::process::Command::new`
+  regression in `gui/` is caught even though the broader baseline rewrite
+  for `loom-gui` is still deferred (Iter#3 §8.9 Known Limitation). The two
+  documented G1 OS-shell exemptions in `crates/gui` (`account.rs::open_browser`
+  and `ipc.rs::open_path_with_system`) carry function-level
+  `#[allow(clippy::disallowed_methods)]` per PM-Arbitration-003.
+- `loom-gui` is excluded **from the broader `clippy` and `test` stages** because Tauri build is heavy and depends on
   native toolchains not available in every developer setup. GUI builds
   remain gated by `.github/workflows/gui-build.yml` on a separate cadence.
 - `--all-targets` covers unit tests, integration tests, examples, and
@@ -209,9 +218,12 @@ OPS established in the audit report (`msg_a0f348c04bce`, §4).
    parity from one machine. That is the irreducible cost of running
    offline; remote GHA matrix would be required for true triple-coverage
    in one shot, and remote CI is currently out-of-scope per PRD §2.
-2. **`loom-gui` is excluded.** Tauri's GUI bundle is left to
-   `.github/workflows/gui-build.yml`. Local matrix does not catch GUI
-   regressions; treat GUI changes as a separate validation track.
+2. **`loom-gui` is excluded from the broader matrix.** Tauri's GUI bundle
+   is left to `.github/workflows/gui-build.yml` for build/test, and the
+   broad `clippy --exclude loom-gui` stage skips it. The new `clippy-pal`
+   guardrail stage (added in Iteration #4) DOES include `loom-gui` for
+   `clippy::disallowed_methods`, so PAL regressions in the GUI are caught
+   locally even though style-warning rewrites remain deferred.
 3. **`--all-targets` is on but `cargo bench` is not.** Benches compile
    under clippy/test but are not executed (Criterion benches would
    blow up matrix runtime). Add explicit bench runs to this doc when

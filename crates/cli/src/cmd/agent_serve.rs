@@ -6168,6 +6168,38 @@ async fn translate_one(
                 tracing::debug!(actor = %actor_id, %status, "adapter status (no active turn)");
             }
         }
+        AdapterEvent::UsageUpdate {
+            scope: _,
+            usage,
+        } => {
+            // Streaming token-usage snapshot. Snapshot semantics: each
+            // event REPLACES the latest per-scope in-flight usage; do NOT
+            // feed into the cross-turn `accumulate_usage` (which is delta
+            // semantics, owned by `Finished`). U4 wires this through the
+            // `agent.usage` WS broadcast; for now we only surface a trace
+            // so adapters can be exercised end-to-end.
+            if let Some(active) = active {
+                if active.cancel_requested {
+                    return Ok(());
+                }
+                append_trace(
+                    client,
+                    &active.run_id,
+                    TraceKind::Status,
+                    json!({
+                        "kind": "agent.usage",
+                        "usage": usage,
+                        "isFinal": false,
+                    }),
+                )
+                .await?;
+            } else {
+                tracing::debug!(
+                    actor = %actor_id,
+                    "UsageUpdate without active turn; dropping"
+                );
+            }
+        }
         AdapterEvent::Finished {
             scope,
             success,

@@ -1,10 +1,10 @@
 import { type ReactNode, useState } from "react";
 import {
-  Brain,
   ChevronDown,
-  ChevronRight,
   ChevronUp,
+  Coins,
   Database,
+  Gauge,
   HeartPulse,
   Sparkles,
 } from "lucide-react";
@@ -35,6 +35,22 @@ export type AgentIdentityBadgeProps = {
   usedTokensLabel?: string;
   remainingLabel?: string;
   segments?: AgentIdentityBadgeSegment[];
+  /** Input X · Output Y label; hidden when undefined. */
+  inputOutputLabel?: string;
+  /** "Cache saved X tokens" label; hidden when undefined (PRD AC-8). */
+  cacheBenefitLabel?: string;
+  /** "$X.YY" label; hidden when undefined (PRD AC-7). */
+  costLabel?: string;
+  /** "X tokens left" label; hidden when undefined. */
+  tokensLeftLabel?: string;
+  /** When true, the badge is showing estimated/heuristic numbers (PRD AC-4). */
+  estimated?: boolean;
+  /**
+   * Whether dynamic usage data is available for this agent. When false the
+   * detail card shows the "Token tracking unavailable" placeholder per
+   * PRD §4.2 anomaly rule.
+   */
+  hasUsageData?: boolean;
   online?: boolean;
   working?: boolean;
   workingLabel?: string;
@@ -47,51 +63,54 @@ export type AgentIdentityBadgeProps = {
   onExpandedChange?: (expanded: boolean) => void;
 };
 
+// Workbench / Storybook-style preview values. Used when the badge renders
+// without dynamic usage data (e.g. the standalone AgentIdentityBadgeWorkbench
+// route). Production usage now derives segments from the live usage snapshot.
 const defaultSegments: AgentIdentityBadgeSegment[] = [
   {
-    id: "memory",
-    label: "Memory",
-    detail: "Agent's long-term memory",
-    color: "#a981e6",
-    width: 22,
-    value: "24.3K",
-    percent: "22%",
-  },
-  {
-    id: "files",
-    label: "Files",
-    detail: "Uploaded documents & data",
-    color: "#54afe8",
-    width: 29,
-    value: "31.6K",
-    percent: "29%",
-  },
-  {
-    id: "chat",
-    label: "Chat History",
-    detail: "Recent conversations",
-    color: "#72c76a",
-    width: 24,
-    value: "27.2K",
-    percent: "24%",
-  },
-  {
-    id: "tools",
-    label: "Tools",
-    detail: "Functions & tool definitions",
-    color: "#ff9d35",
-    width: 13,
-    value: "15.1K",
-    percent: "13%",
-  },
-  {
-    id: "system",
-    label: "System Context",
-    detail: "Instructions & system prompts",
+    id: "system_prompt",
+    label: "System Prompt",
+    detail: "Agent persona & rules",
     color: "#ff737b",
     width: 12,
     value: "13.8K",
     percent: "12%",
+  },
+  {
+    id: "context_history",
+    label: "Context History",
+    detail: "Prior turns & messages",
+    color: "#54afe8",
+    width: 38,
+    value: "44.1K",
+    percent: "38%",
+  },
+  {
+    id: "tool_definitions",
+    label: "Tool Definitions",
+    detail: "Function & tool schemas",
+    color: "#ff9d35",
+    width: 14,
+    value: "16.2K",
+    percent: "14%",
+  },
+  {
+    id: "tool_results",
+    label: "Tool Results",
+    detail: "Tool call outputs",
+    color: "#72c76a",
+    width: 18,
+    value: "21.0K",
+    percent: "18%",
+  },
+  {
+    id: "completions",
+    label: "Completions",
+    detail: "Model output tokens",
+    color: "#a981e6",
+    width: 18,
+    value: "20.4K",
+    percent: "18%",
   },
 ];
 
@@ -145,7 +164,13 @@ export function AgentIdentityBadge({
   modelName = "Claude 4 Sonnet",
   usedTokensLabel = "112.0K / 128.0K tokens",
   remainingLabel = "13%",
-  segments = defaultSegments,
+  segments,
+  inputOutputLabel,
+  cacheBenefitLabel,
+  costLabel,
+  tokensLeftLabel,
+  estimated = false,
+  hasUsageData,
   online = true,
   working: _working = false,
   workingLabel,
@@ -158,6 +183,14 @@ export function AgentIdentityBadge({
   onExpandedChange,
 }: AgentIdentityBadgeProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+  // When `hasUsageData` is undefined (legacy callers / standalone workbench)
+  // we treat caller-provided segments as the visible truth and fall back to
+  // the static workbench segments when none are supplied.
+  const segmentsToRender: AgentIdentityBadgeSegment[] = segments
+    ? segments
+    : hasUsageData === false
+      ? []
+      : defaultSegments;
   const derivedWorking = runStatus != null && !isTerminal;
   const derivedWorkingLabel = workingLabel ?? (runStatus ? (runStatusLabels[runStatus] ?? "Processing…") : "Processing…");
   const activeLabel = derivedWorking ? derivedWorkingLabel : isTerminal ? (runStatusLabels[runStatus ?? ""] ?? "Terminated") : online ? "Active" : "Idle";
@@ -177,7 +210,13 @@ export function AgentIdentityBadge({
         modelName={modelName}
         usedTokensLabel={usedTokensLabel}
         remainingLabel={remainingLabel}
-        segments={segments}
+        segments={segmentsToRender}
+        inputOutputLabel={inputOutputLabel}
+        cacheBenefitLabel={cacheBenefitLabel}
+        costLabel={costLabel}
+        tokensLeftLabel={tokensLeftLabel}
+        estimated={estimated}
+        hasUsageData={hasUsageData ?? segmentsToRender.length > 0}
         activeLabel={activeLabel}
         working={derivedWorking}
         runStatus={runStatus}
@@ -230,8 +269,14 @@ export function AgentIdentityBadge({
 
       <h2 className="agent-identity-badge__model">{modelName}</h2>
 
-      <div className="agent-identity-badge__meter" aria-hidden="true">
-        {segments.map((segment) => (
+      <div
+        className={cn(
+          "agent-identity-badge__meter",
+          estimated && "agent-identity-badge__meter--estimated",
+        )}
+        aria-hidden="true"
+      >
+        {segmentsToRender.map((segment) => (
           <span
             key={segment.id}
             className="agent-identity-badge__segment"
@@ -240,9 +285,16 @@ export function AgentIdentityBadge({
         ))}
       </div>
 
-      <div className="agent-identity-badge__usage">
+      <div
+        className={cn(
+          "agent-identity-badge__usage",
+          estimated && "agent-identity-badge__usage--estimated",
+        )}
+      >
         <span>{usedTokensLabel}</span>
-        <span className="agent-identity-badge__remaining">{remainingLabel}</span>
+        {remainingLabel ? (
+          <span className="agent-identity-badge__remaining">{remainingLabel}</span>
+        ) : null}
       </div>
 
       <button
@@ -268,6 +320,12 @@ function AgentIdentityDetailCard({
   usedTokensLabel,
   remainingLabel,
   segments,
+  inputOutputLabel,
+  cacheBenefitLabel,
+  costLabel,
+  tokensLeftLabel,
+  estimated = false,
+  hasUsageData = true,
   activeLabel,
   working = false,
   runStatus,
@@ -286,6 +344,12 @@ function AgentIdentityDetailCard({
   usedTokensLabel: string;
   remainingLabel: string;
   segments: AgentIdentityBadgeSegment[];
+  inputOutputLabel?: string;
+  cacheBenefitLabel?: string;
+  costLabel?: string;
+  tokensLeftLabel?: string;
+  estimated?: boolean;
+  hasUsageData?: boolean;
   activeLabel: string;
   working?: boolean;
   runStatus?: RunStatus | null;
@@ -296,6 +360,8 @@ function AgentIdentityDetailCard({
   onCollapse: () => void;
 }) {
   const statusClass = runStatus ? detailCardStatusClass(runStatus, isStale, isTerminal) : "";
+  const hasTokenStats =
+    Boolean(inputOutputLabel) || Boolean(cacheBenefitLabel) || Boolean(costLabel);
   return (
     <article className={cn("agent-detail-card", className)} aria-label={`${agentName} agent details`}>
       <div className="agent-detail-card__hero">
@@ -348,34 +414,52 @@ function AgentIdentityDetailCard({
       <section className="agent-detail-section agent-detail-traits">
         <div className="agent-detail-section__heading">
           <span className="agent-detail-section__icon">
-            <Sparkles size={17} strokeWidth={2.05} />
+            <Gauge size={17} strokeWidth={2.05} />
           </span>
-          <span>PERSONAL TRAITS</span>
+          <span>TOKEN STATS</span>
+          {estimated ? (
+            <span
+              className="agent-detail-traits__estimated"
+              title="Some values are estimated (~)"
+            >
+              estimated
+            </span>
+          ) : null}
         </div>
         <div className="agent-detail-traits__content">
           <div className="agent-detail-traits__copy">
-            <div className="agent-detail-traits__chips">
-              <span>Thoughtful</span>
-              <span className="agent-detail-traits__dot agent-detail-traits__dot-orange" />
-              <span>Analytical</span>
-              <span className="agent-detail-traits__dot agent-detail-traits__dot-green" />
-              <span>Reliable</span>
-            </div>
-            <p>
-              Calm, precise, and context-aware. Excels at reasoning, summarization, and
-              complex problem solving.
-            </p>
-            <button type="button" className="agent-detail-traits__link">
-              Read more
-              <ChevronRight size={18} strokeWidth={2.4} />
-            </button>
+            {hasTokenStats ? (
+              <ul className="agent-detail-traits__stats">
+                {inputOutputLabel ? (
+                  <li>
+                    <span className="agent-detail-traits__stats-label">Throughput</span>
+                    <strong>{inputOutputLabel}</strong>
+                  </li>
+                ) : null}
+                {cacheBenefitLabel ? (
+                  <li>
+                    <span className="agent-detail-traits__stats-label">Cache</span>
+                    <strong>{cacheBenefitLabel}</strong>
+                  </li>
+                ) : null}
+                {costLabel ? (
+                  <li>
+                    <span className="agent-detail-traits__stats-label">Cost</span>
+                    <strong>{costLabel}</strong>
+                  </li>
+                ) : null}
+              </ul>
+            ) : (
+              <p className="agent-detail-traits__empty">
+                {hasUsageData
+                  ? "Token statistics will appear once this agent finishes a turn."
+                  : "Token tracking unavailable for this provider."}
+              </p>
+            )}
           </div>
 
           <div className="agent-detail-traits__brain" aria-hidden="true">
-            <span className="agent-detail-traits__spark agent-detail-traits__spark-one" />
-            <span className="agent-detail-traits__spark agent-detail-traits__spark-two" />
-            <span className="agent-detail-traits__spark agent-detail-traits__spark-three" />
-            <Brain size={82} strokeWidth={1.55} />
+            <Coins size={72} strokeWidth={1.55} />
           </div>
         </div>
       </section>
@@ -399,28 +483,44 @@ function AgentIdentityDetailCard({
           </button>
         </div>
 
-        <div className="agent-detail-context__meter" aria-hidden="true">
-          {segments.map((segment) => (
-            <span
-              key={segment.id}
-              style={{ backgroundColor: segment.color, flex: `0 0 ${segment.width}%` }}
-            />
-          ))}
-        </div>
-
-        <div className="agent-detail-context__table">
-          {segments.map((segment) => (
-            <div key={segment.id} className="agent-detail-context__row">
-              <span className="agent-detail-context__swatch" style={{ backgroundColor: segment.color }} />
-              <span className="agent-detail-context__name">
-                <strong>{segment.label}</strong>
-                <span>{segment.detail}</span>
-              </span>
-              <span className="agent-detail-context__value">{segment.value}</span>
-              <span className="agent-detail-context__percent">{segment.percent}</span>
+        {segments.length > 0 ? (
+          <>
+            <div
+              className={cn(
+                "agent-detail-context__meter",
+                estimated && "agent-detail-context__meter--estimated",
+              )}
+              aria-hidden="true"
+            >
+              {segments.map((segment) => (
+                <span
+                  key={segment.id}
+                  style={{ backgroundColor: segment.color, flex: `0 0 ${segment.width}%` }}
+                />
+              ))}
             </div>
-          ))}
-        </div>
+
+            <div className="agent-detail-context__table">
+              {segments.map((segment) => (
+                <div key={segment.id} className="agent-detail-context__row">
+                  <span className="agent-detail-context__swatch" style={{ backgroundColor: segment.color }} />
+                  <span className="agent-detail-context__name">
+                    <strong>{segment.label}</strong>
+                    <span>{segment.detail}</span>
+                  </span>
+                  <span className="agent-detail-context__value">{segment.value}</span>
+                  <span className="agent-detail-context__percent">{segment.percent}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="agent-detail-context__empty">
+            {hasUsageData
+              ? "Breakdown will populate after the first turn completes."
+              : "Token tracking unavailable for this provider."}
+          </p>
+        )}
 
         <div className="agent-detail-context__total">
           <span>Total Used</span>
@@ -436,7 +536,9 @@ function AgentIdentityDetailCard({
             </span>
             <span>CONTEXT HP</span>
           </div>
-          <strong>{remainingLabel} <span>remaining</span></strong>
+          {remainingLabel ? (
+            <strong>{remainingLabel} <span>remaining</span></strong>
+          ) : null}
         </div>
 
         <div className="agent-detail-hp__track" aria-hidden="true">
@@ -445,7 +547,7 @@ function AgentIdentityDetailCard({
 
         <div className="agent-detail-hp__bottom">
           <span>{usedTokensLabel} used</span>
-          <strong>16.0K tokens left</strong>
+          {tokensLeftLabel ? <strong>{tokensLeftLabel}</strong> : null}
         </div>
       </section>
     </article>

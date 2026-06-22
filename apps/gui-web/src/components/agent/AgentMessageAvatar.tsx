@@ -4,6 +4,7 @@ import type { Actor, MachineInfo, Run } from "@/ipc/types";
 import { findAgentMemberEntry } from "@/lib/format-utils";
 import { getActorRunContext } from "@/lib/agent-utils";
 import { agentIdentityBadgeProps } from "@/lib/agent-identity-utils";
+import { useAgentUsage } from "@/store/usageStore";
 import { displayName } from "@/lib/format-utils";
 import {
   agentMessageBadgeCompactWidth,
@@ -35,6 +36,8 @@ export function AgentMessageAvatar({
   const actorId = actor?.id ?? fallback;
   const entry = findAgentMemberEntry(machines, actorId);
   const avatarActor = actor ?? entry?.agent.spec.actor;
+  const entryActorId = entry?.agent.spec.actor.id ?? null;
+  const usageSnapshot = useAgentUsage(entryActorId);
   const [open, setOpen] = useState(false);
   const [badgeExpanded, setBadgeExpanded] = useState(false);
   const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
@@ -138,13 +141,17 @@ export function AgentMessageAvatar({
     return <ActorAvatar actor={actor} fallback={fallback} small={small} />;
   }
 
-  const badgeProps = agentIdentityBadgeProps(entry, getActorRunContext(runs, entry.agent.spec.actor.id));
-  const entryActorId = entry.agent.spec.actor.id;
+  const badgeProps = agentIdentityBadgeProps(
+    entry,
+    getActorRunContext(runs, entry.agent.spec.actor.id),
+    usageSnapshot,
+  );
+  const settingsActorId = entry.agent.spec.actor.id;
   const display = displayName(avatarActor);
 
   function openSettings() {
     setOpen(false);
-    onOpenAgentSettings(entryActorId);
+    onOpenAgentSettings(settingsActorId);
   }
 
   const scaledPopoverStyle = {

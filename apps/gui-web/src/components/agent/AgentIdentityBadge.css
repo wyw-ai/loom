@@ -656,32 +656,6 @@
   padding-left: 49px;
 }
 
-.agent-detail-traits__chips {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 14px;
-  margin-top: 13px;
-  color: #1d2635;
-  font-size: 17px;
-  font-weight: 650;
-  line-height: 1.35;
-}
-
-.agent-detail-traits__dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-}
-
-.agent-detail-traits__dot-orange {
-  background: #ff9b28;
-}
-
-.agent-detail-traits__dot-green {
-  background: #69c863;
-}
-
 .agent-detail-traits__copy p {
   max-width: 385px;
   margin: 12px 0 0;
@@ -689,20 +663,6 @@
   font-size: 16px;
   font-weight: 500;
   line-height: 1.42;
-}
-
-.agent-detail-traits__link {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 0;
-  background: transparent;
-  color: #443cff;
-  cursor: pointer;
-  margin-top: 18px;
-  padding: 0;
-  font-size: 16px;
-  font-weight: 650;
 }
 
 .agent-detail-traits__brain {
@@ -718,45 +678,6 @@
 .agent-detail-traits__brain svg {
   fill: rgb(224 219 249 / 0.45);
   filter: drop-shadow(0 2px 1px rgb(137 122 190 / 0.08));
-}
-
-.agent-detail-traits__spark {
-  position: absolute;
-  width: 13px;
-  height: 13px;
-  color: #d9d2f4;
-}
-
-.agent-detail-traits__spark::before,
-.agent-detail-traits__spark::after {
-  position: absolute;
-  inset: 0;
-  border-radius: 2px;
-  background: currentColor;
-  content: "";
-  clip-path: polygon(50% 0, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0 50%, 38% 38%);
-}
-
-.agent-detail-traits__spark::after {
-  transform: rotate(45deg) scale(0.54);
-  opacity: 0.72;
-}
-
-.agent-detail-traits__spark-one {
-  top: 26px;
-  left: 28px;
-}
-
-.agent-detail-traits__spark-two {
-  top: 16px;
-  right: 41px;
-  transform: scale(0.76);
-}
-
-.agent-detail-traits__spark-three {
-  right: 7px;
-  bottom: 23px;
-  transform: scale(1.05);
 }
 
 .agent-detail-context {
@@ -1127,4 +1048,68 @@
 .agent-identity-badge-workbench__stage > .agent-detail-card .agent-detail-hp__bottom {
   align-items: center;
   flex-direction: row;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Iteration #4 — dynamic token-usage UI                                    */
+/* ------------------------------------------------------------------------ */
+
+.agent-detail-traits__stats {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-detail-traits__stats li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.agent-detail-traits__stats-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.agent-detail-traits__stats strong {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-detail-traits__empty,
+.agent-detail-context__empty {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.55);
+  font-style: italic;
+}
+
+.agent-detail-traits__estimated {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255, 215, 130, 0.85);
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 215, 130, 0.35);
+}
+
+/* PRD AC-4: ~ prefix already in label; dim values when estimated. */
+.agent-identity-badge__meter--estimated,
+.agent-detail-context__meter--estimated {
+  opacity: 0.78;
+}
+
+.agent-identity-badge__usage--estimated {
+  color: rgba(255, 255, 255, 0.75);
+  font-style: italic;
 }

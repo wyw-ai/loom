@@ -25,6 +25,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

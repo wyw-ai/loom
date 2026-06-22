@@ -381,7 +381,13 @@ async fn dispatch_frame(text: String, pending: &Pending, notif_tx: &mpsc::Sender
             }
         }
         RpcEnvelope::Notification(n) => {
-            let _ = notif_tx.try_send(n);
+            // The bounded notification channel (capacity 1024) protects the
+            // reader task if the consumer falls behind, but a *silent* drop
+            // loses events like `run.updated` and freezes the agent-status
+            // display. Surface backpressure as a warning instead of `let _ =`.
+            if let Err(e) = notif_tx.try_send(n) {
+                tracing::warn!(error = %e, "notification channel full or closed; event dropped");
+            }
         }
         RpcEnvelope::Request(_) => {
             // Server doesn't send requests in v0.

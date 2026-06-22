@@ -174,7 +174,7 @@ fn save_user_env_before_elevation() {
 /// Check whether the current process runs with admin privileges.
 #[cfg(windows)]
 fn is_admin() -> bool {
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
@@ -186,21 +186,23 @@ fn is_admin() -> bool {
             return false;
         }
     }
+    // From here `token` is an open kernel handle. It must be closed on every
+    // return path (Rust can't drop a raw HANDLE for us); the previous version
+    // leaked one kernel handle per is_admin() call (launch / elevation probe).
     let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut returned: u32 = 0;
-    unsafe {
-        if GetTokenInformation(
+    let elevated = unsafe {
+        let ok = GetTokenInformation(
             token,
             TokenElevation,
             &mut elevation as *mut _ as *mut std::ffi::c_void,
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &mut returned,
-        ) == 0
-        {
-            return false;
-        }
-    }
-    elevation.TokenIsElevated != 0
+        );
+        let _ = CloseHandle(token);
+        ok != 0
+    };
+    elevated && elevation.TokenIsElevated != 0
 }
 
 /// Read the user PATH from `HKCU\Environment\Path` registry value.

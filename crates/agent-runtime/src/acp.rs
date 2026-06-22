@@ -575,12 +575,13 @@ fn start_blocking(
     }
     cmd.envs(&process_env);
 
-    // Diagnostic: print spawn details to stderr for Windows debugging.
-    eprintln!(
-        "[loom:acp] spawning `{}` with {} args in `{}`",
-        command_path.display(),
-        cfg.args.len(),
-        process_cwd.display()
+    // Diagnostic: log spawn details for debugging (was eprintln!, which
+    // fired on every ACP turn and polluted stderr).
+    tracing::debug!(
+        command = %command_path.display(),
+        args = cfg.args.len(),
+        cwd = %process_cwd.display(),
+        "acp spawn"
     );
 
     let mut child = cmd.spawn().map_err(|e| {

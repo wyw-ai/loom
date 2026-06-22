@@ -68,7 +68,10 @@ pub async fn run(
     let mut selected_machine = machine.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
     let data_root = abs_path(data_root);
-    std::fs::create_dir_all(&data_root)
+    // Use the UNC-aware wrapper so a deep data root (%USERPROFILE% + machine
+    // id + agent/scope tree) does not trip the 260-char MAX_PATH limit on
+    // Windows. `data_root` is absolute (abs_path), so UNC prefixing is safe.
+    loom_platform::path::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
@@ -2062,7 +2065,14 @@ fn save_daemon_config(cfg: &DaemonConfig) -> Result<()> {
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
     std::fs::write(&temp_path, content)?;
-    std::fs::rename(&temp_path, path)?;
+    // On Windows, `rename` over an existing file fails with `PermissionDenied`
+    // if anything holds the destination open (AV, search indexer, the daemon
+    // re-reading config). Best-effort: remove the orphaned temp file so a flaky
+    // rename under contention does not leak a UUID-named temp file per reload.
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
     Ok(())
 }
 

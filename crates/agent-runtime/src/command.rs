@@ -351,50 +351,24 @@ impl Adapter for CommandAdapter {
     }
 }
 
-/// Send SIGTERM to `pid`. Unix only — Windows builds get a stub error so
-/// callers know cancel isn't wired there yet (loom-server's audience is Unix).
-#[cfg(unix)]
+/// Request graceful termination of `pid`. Cross-platform via
+/// `loom_platform::signal` (`SIGTERM` on Unix, `TerminateProcess` on
+/// Windows). Children spawned through `loom_platform::process::Command` are
+/// their own process-group leader (`process_group(0)` is applied
+/// automatically), so the leader PID is the correct signal target on both
+/// platforms.
 fn signal_child(pid: u32) -> Result<(), String> {
-    signal_child_with(pid, libc::SIGTERM)
+    loom_platform::signal::signal_child(pid, loom_platform::signal::Signal::Term)
+        .map_err(|e| format!("signal_child({pid}, SIGTERM) failed: {e}"))
 }
 
-#[cfg(unix)]
-fn signal_child_with(pid: u32, signal: libc::c_int) -> Result<(), String> {
-    let rc = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
-    let rc = if rc == 0 {
-        rc
-    } else {
-        // Older processes may not have been spawned into their own process
-        // group. Fall back to the direct PID for compatibility.
-        unsafe { libc::kill(pid as libc::pid_t, signal) }
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        let err = std::io::Error::last_os_error();
-        // ESRCH (no such process) means the child already exited — racy but
-        // harmless; treat as a successful no-op.
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(format!("kill({pid}, SIGTERM) failed: {err}"))
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn signal_child(_pid: u32) -> Result<(), String> {
-    Err("command transport cancel is not implemented for this platform".into())
-}
-
-#[cfg(unix)]
+/// Force-kill `pid`. Cross-platform via `loom_platform::signal`
+/// (`SIGKILL` on Unix, `TerminateProcess` on Windows). Previously the
+/// Windows arm was an unconditional `Err` no-op, which left timed-out /
+/// cancelled agent subprocesses (and their grandchildren) running.
 fn force_kill_child(pid: u32) -> Result<(), String> {
-    signal_child_with(pid, libc::SIGKILL)
-}
-
-#[cfg(not(unix))]
-fn force_kill_child(_pid: u32) -> Result<(), String> {
-    Err("command transport timeout kill is not implemented for this platform".into())
+    loom_platform::signal::force_kill_pid(pid)
+        .map_err(|e| format!("force_kill({pid}) failed: {e}"))
 }
 
 fn run_prompt(

@@ -862,6 +862,21 @@ fn show_window(hwnd: isize, visible: bool) {
     }
 }
 
+/// Write `content` to `path` atomically (temp file + rename) so a crash or
+/// disk-full mid-write cannot leave daemon.toml / cli.toml truncated and brick
+/// the daemon on next start. On rename failure the temp file is removed.
+fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let temp = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&temp, content) {
+        return Err(format!("Failed to write {}: {}", path.display(), e));
+    }
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("Failed to rename {}: {}", path.display(), e));
+    }
+    Ok(())
+}
+
 /// Save raw TOML content to daemon.toml.
 ///
 /// Validation rules (from knowledge base P0 bugs):
@@ -917,7 +932,7 @@ fn save_daemon_toml(content: &str) -> Result<(), String> {
     };
 
     let _ = std::fs::create_dir_all(&config_dir);
-    std::fs::write(&path, content).map_err(|e| format!("Failed to write daemon.toml: {}", e))?;
+    atomic_write(&path, content)?;
 
     if let Some(warning) = id_change_warning {
         // Return success with machine-id change warning baked in.
@@ -937,7 +952,7 @@ fn save_cli_toml(content: &str) -> Result<(), String> {
     };
     let _ = std::fs::create_dir_all(&config_dir);
     let path = config_dir.join("cli.toml");
-    std::fs::write(&path, content).map_err(|e| format!("Failed to write cli.toml: {}", e))
+    atomic_write(&path, content)
 }
 
 /// Populate the config editor TextBox with daemon.toml or cli.toml content,

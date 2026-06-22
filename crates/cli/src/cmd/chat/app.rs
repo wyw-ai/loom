@@ -280,7 +280,7 @@ impl App {
 
     /// Rebuild `agent_statuses` from `run_cache`. Groups runs by actor,
     /// picks the highest-priority non-terminal run for each, computes a
-    /// Chinese label, and writes into `agent_statuses`. Terminal runs
+    /// status label, and writes into `agent_statuses`. Terminal runs
     /// linger for `TTL_TERMINAL_SECS` after closing so the user can see
     /// "Failed" / "Canceled" briefly.
     pub fn recompute_agent_statuses(&mut self) {
@@ -746,8 +746,8 @@ fn timeout_for(s: RunStatus) -> i64 {
     }
 }
 
-/// Produce a Chinese status label for a cached run, mirroring
-/// gui-web V3 `runStatusFullLabel()`.
+/// Produce an English status label for a cached run. (The GUI side keeps
+/// its own labels in `gui-web/src/lib/agent-utils.ts`.)
 pub fn compute_run_status_label(cr: &CachedRun, is_stale: bool) -> String {
     let base = match cr.status {
         RunStatus::Queued => "Queued".to_string(),

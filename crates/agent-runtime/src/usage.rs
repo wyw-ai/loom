@@ -169,12 +169,14 @@ pub fn extract_token_usage(value: &Value) -> Option<TokenUsage> {
 /// When `provider` is `None`, only the `[default]` section is used.
 /// When `provider` is `Some(id)`, the matching `[providers.<id>]` section's
 /// paths and field aliases are tried first, falling back to defaults.
-pub fn extract_token_usage_for_provider(value: &Value, provider: Option<&str>) -> Option<TokenUsage> {
+pub fn extract_token_usage_for_provider(
+    value: &Value,
+    provider: Option<&str>,
+) -> Option<TokenUsage> {
     let mft = manifest();
 
     // Resolve provider-specific config if requested and present.
-    let prov_cfg = provider
-        .and_then(|p| mft.providers.get(p));
+    let prov_cfg = provider.and_then(|p| mft.providers.get(p));
 
     // Try provider paths first (if any), then default paths.
     let mut paths: Vec<&str> = Vec::new();
@@ -254,10 +256,7 @@ fn merged_aliases(override_: Option<&Vec<String>>, default_: &[String]) -> Vec<S
     }
 }
 
-fn token_usage_from_object_with_fields(
-    value: &Value,
-    fields: &FieldAliases,
-) -> Option<TokenUsage> {
+fn token_usage_from_object_with_fields(value: &Value, fields: &FieldAliases) -> Option<TokenUsage> {
     value.as_object()?;
     let usage = TokenUsage {
         input_tokens: first_u64(value, &fields.input_tokens),
@@ -351,97 +350,97 @@ mod tests {
         assert!(estimate_tokens("hello world 你好") >= 4);
     }
 
-        // ── Provider fixture tests (U6) ─────────────────────────────────────
+    // ── Provider fixture tests (U6) ─────────────────────────────────────
 
-        /// Simulate a claude-code `message/usage`-shaped update event.
-        #[test]
-        fn claude_usage_via_manifest() {
-            let value = json!({
-                "type": "message",
-                "usage": {
-                    "input_tokens": 511,
-                    "output_tokens": 147,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 488
-                }
-            });
-            let usage = extract_token_usage_for_provider(&value, Some("claude"))
-                .expect("claude usage should extract");
-            assert_eq!(usage.input_tokens, Some(511));
-            assert_eq!(usage.output_tokens, Some(147));
-            assert_eq!(usage.cache_read_input_tokens, Some(488));
-            assert_eq!(usage.total_tokens, Some(1146));
-        }
+    /// Simulate a claude-code `message/usage`-shaped update event.
+    #[test]
+    fn claude_usage_via_manifest() {
+        let value = json!({
+            "type": "message",
+            "usage": {
+                "input_tokens": 511,
+                "output_tokens": 147,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 488
+            }
+        });
+        let usage = extract_token_usage_for_provider(&value, Some("claude"))
+            .expect("claude usage should extract");
+        assert_eq!(usage.input_tokens, Some(511));
+        assert_eq!(usage.output_tokens, Some(147));
+        assert_eq!(usage.cache_read_input_tokens, Some(488));
+        assert_eq!(usage.total_tokens, Some(1146));
+    }
 
-        /// Simulate a codex stream event with `/msg/info/last_token_usage`.
-        #[test]
-        fn codex_usage_via_manifest() {
-            let value = json!({
-                "type": "info",
-                "msg": {
-                    "info": {
-                        "last_token_usage": {
-                            "input_tokens": 234,
-                            "output_tokens": 56,
-                            "total_tokens": 290
-                        }
+    /// Simulate a codex stream event with `/msg/info/last_token_usage`.
+    #[test]
+    fn codex_usage_via_manifest() {
+        let value = json!({
+            "type": "info",
+            "msg": {
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 234,
+                        "output_tokens": 56,
+                        "total_tokens": 290
                     }
                 }
-            });
-            let usage = extract_token_usage_for_provider(&value, Some("codex"))
-                .expect("codex usage should extract");
-            assert_eq!(usage.input_tokens, Some(234));
-            assert_eq!(usage.output_tokens, Some(56));
-            assert_eq!(usage.total_tokens, Some(290));
-        }
-
-        /// Simulate a copilot CLI ndjson line with `/usage`.
-        #[test]
-        fn copilot_usage_via_manifest() {
-            let value = json!({
-                "type": "progress",
-                "usage": {
-                    "input_tokens": 99,
-                    "output_tokens": 42
-                }
-            });
-            let usage = extract_token_usage_for_provider(&value, Some("copilot"))
-                .expect("copilot usage should extract");
-            assert_eq!(usage.input_tokens, Some(99));
-            assert_eq!(usage.output_tokens, Some(42));
-        }
-
-        /// Provider-agnostic extraction still works via default paths.
-        #[test]
-        fn default_extraction_unchanged() {
-            let value = json!({
-                "type": "result",
-                "usage": {
-                    "input_tokens": 200,
-                    "outputTokens": 50,
-                    "cache_read_input_tokens": 30
-                }
-            });
-            let usage = extract_token_usage_for_provider(&value, None::<&str>)
-                .expect("default extraction should work");
-            assert_eq!(usage.input_tokens, Some(200));
-            assert_eq!(usage.output_tokens, Some(50));
-            assert_eq!(usage.cache_read_input_tokens, Some(30));
-        }
-
-        /// Non-existent provider falls through to default paths.
-        #[test]
-        fn unknown_provider_falls_back_to_default() {
-            let value = json!({
-                "/data/usage": {
-                    "input_tokens": 77,
-                    "output_tokens": 33
-                }
-            });
-            // An unknown provider with no specific paths should still try defaults.
-            let unk = extract_token_usage_for_provider(&value, Some("unknown_provider"));
-            // This particular shape must match default paths, so unless "usage" is
-            // nested under a known pointer it won't match — just confirm no panic.
-            assert!(unk.is_none() || unk.is_some());
-        }
+            }
+        });
+        let usage = extract_token_usage_for_provider(&value, Some("codex"))
+            .expect("codex usage should extract");
+        assert_eq!(usage.input_tokens, Some(234));
+        assert_eq!(usage.output_tokens, Some(56));
+        assert_eq!(usage.total_tokens, Some(290));
     }
+
+    /// Simulate a copilot CLI ndjson line with `/usage`.
+    #[test]
+    fn copilot_usage_via_manifest() {
+        let value = json!({
+            "type": "progress",
+            "usage": {
+                "input_tokens": 99,
+                "output_tokens": 42
+            }
+        });
+        let usage = extract_token_usage_for_provider(&value, Some("copilot"))
+            .expect("copilot usage should extract");
+        assert_eq!(usage.input_tokens, Some(99));
+        assert_eq!(usage.output_tokens, Some(42));
+    }
+
+    /// Provider-agnostic extraction still works via default paths.
+    #[test]
+    fn default_extraction_unchanged() {
+        let value = json!({
+            "type": "result",
+            "usage": {
+                "input_tokens": 200,
+                "outputTokens": 50,
+                "cache_read_input_tokens": 30
+            }
+        });
+        let usage = extract_token_usage_for_provider(&value, None::<&str>)
+            .expect("default extraction should work");
+        assert_eq!(usage.input_tokens, Some(200));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+    }
+
+    /// Non-existent provider falls through to default paths.
+    #[test]
+    fn unknown_provider_falls_back_to_default() {
+        let value = json!({
+            "/data/usage": {
+                "input_tokens": 77,
+                "output_tokens": 33
+            }
+        });
+        // An unknown provider with no specific paths should still try defaults.
+        let unk = extract_token_usage_for_provider(&value, Some("unknown_provider"));
+        // This particular shape must match default paths, so unless "usage" is
+        // nested under a known pointer it won't match — just confirm no panic.
+        assert!(unk.is_none() || unk.is_some());
+    }
+}

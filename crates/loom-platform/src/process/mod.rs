@@ -31,10 +31,10 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 
-#[cfg(windows)]
-mod windows;
 #[cfg(not(windows))]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(windows)]
 pub use self::windows::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};

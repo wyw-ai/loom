@@ -37,7 +37,11 @@ fn command_new_executes_a_simple_program() {
         .wait_with_output()
         .expect("wait_with_output");
 
-    assert!(output.status.success(), "child exited non-zero: {}", output.status);
+    assert!(
+        output.status.success(),
+        "child exited non-zero: {}",
+        output.status
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("loom_platform_process_ok"),
@@ -80,7 +84,11 @@ async fn tokio_command_new_executes_a_simple_program() {
 
     let child = cmd.spawn().expect("spawn child");
     let output = child.wait_with_output().await.expect("wait_with_output");
-    assert!(output.status.success(), "child exited non-zero: {}", output.status);
+    assert!(
+        output.status.success(),
+        "child exited non-zero: {}",
+        output.status
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("loom_platform_tokio_ok"),

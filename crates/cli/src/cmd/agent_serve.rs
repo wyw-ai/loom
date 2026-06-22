@@ -6168,10 +6168,7 @@ async fn translate_one(
                 tracing::debug!(actor = %actor_id, %status, "adapter status (no active turn)");
             }
         }
-        AdapterEvent::UsageUpdate {
-            scope: _,
-            usage,
-        } => {
+        AdapterEvent::UsageUpdate { scope: _, usage } => {
             // Streaming token-usage snapshot. Snapshot semantics: each event
             // REPLACES the latest per-scope in-flight usage; do NOT feed into
             // the cross-turn `accumulate_usage` (which is delta semantics,

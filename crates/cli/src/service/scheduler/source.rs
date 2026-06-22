@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use loom_platform::process::TokioCommand as Command;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
-use loom_platform::process::TokioCommand as Command;
 
 use super::spec::Source;
 

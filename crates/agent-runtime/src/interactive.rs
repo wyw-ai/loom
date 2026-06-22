@@ -29,8 +29,8 @@ use uuid::Uuid;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
 use crate::acp::create_dir_all_unc;
-use loom_platform::path::unc_prefix_path;
 use crate::usage::extract_token_usage_from_text;
+use loom_platform::path::unc_prefix_path;
 
 #[derive(Debug, Clone)]
 pub struct InteractiveCommandConfig {

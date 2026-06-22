@@ -66,15 +66,12 @@ async fn double_bind_rejected() {
     let name = local_socket_name(&test_stem()).expect("local_socket_name");
     let _ = cleanup_stale(&name);
 
-    let _listener =
-        LocalListener::bind(&name).await.expect("first bind should succeed");
+    let _listener = LocalListener::bind(&name)
+        .await
+        .expect("first bind should succeed");
 
     let result = LocalListener::bind(&name).await;
-    assert!(
-        result.is_err(),
-        "second bind should fail, got {:?}",
-        result
-    );
+    assert!(result.is_err(), "second bind should fail, got {:?}", result);
 }
 
 /// Connecting to a non-existent name must fail with a connection

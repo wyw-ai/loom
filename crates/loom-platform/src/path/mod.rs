@@ -16,10 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-mod windows;
 #[cfg(not(windows))]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 /// Prefix a path with the Windows `\\?\` UNC prefix to bypass the 260-char
 /// `MAX_PATH` limit.

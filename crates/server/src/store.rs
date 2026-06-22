@@ -194,12 +194,6 @@ impl Store {
     pub fn upsert_actor(&self, actor: Actor) -> StoreResult<Actor> {
         self.journal.append(&Mutation::ActorUpsert(actor.clone()))?;
         let mut inner = self.inner.write();
-        // Remove then re-insert to move this actor to the end of the
-        // HashMap iteration order so resolve_actor_alias prefers the
-        // most-recently-upserted actor when multiple actors share the
-        // same display_name (e.g. after a daemon restart with a new
-        // machine_id creates a new agent ID).
-        inner.actors.remove(&actor.id);
         inner.actors.insert(actor.id.clone(), actor.clone());
         Ok(actor)
     }
@@ -3981,22 +3975,23 @@ impl Store {
     fn resolve_actor_alias(&self, raw: &str) -> Option<String> {
         let key = raw.trim().trim_start_matches('@').to_ascii_lowercase();
         let inner = self.inner.read();
-        // Collect all matches; return the *last* one in HashMap iteration
-        // order, which is the most-recently-upserted actor (upsert_actor
-        // does a remove-then-insert to ensure this). This avoids picking
-        // a zombie actor left over from a prior daemon restart that
-        // produced a different machine_id / actor ID.
-        inner
-            .actors
-            .values()
-            .filter(|actor| {
-                let id_lower = actor.id.to_ascii_lowercase();
-                let display_lower = actor.display_name.to_ascii_lowercase();
-                let short = short_actor_alias(&actor.id).to_ascii_lowercase();
-                key == id_lower || key == display_lower || key == short
-            })
-            .last()
-            .map(|actor| actor.id.clone())
+        // NOTE: there is intentionally no "most-recent" tie-break here. The
+        // `Actor` model carries no timestamp, and Rust's `HashMap` iteration
+        // order is *not* insertion order (a prior revision relied on that
+        // false assumption to pick the latest upsert). Stale "zombie" actors
+        // left over from a daemon restart with a new machine_id are pruned
+        // by the daemon's `reconcile_agents` before they can coexist with
+        // their replacement, so a plain first-match is correct in practice.
+        inner.actors.values().find_map(|actor| {
+            let id_lower = actor.id.to_ascii_lowercase();
+            let display_lower = actor.display_name.to_ascii_lowercase();
+            let short = short_actor_alias(&actor.id).to_ascii_lowercase();
+            if key == id_lower || key == display_lower || key == short {
+                Some(actor.id.clone())
+            } else {
+                None
+            }
+        })
     }
 
     fn resolve_actor_group_alias(&self, scope: &ScopeRef, raw: &str) -> Option<ActorGroup> {

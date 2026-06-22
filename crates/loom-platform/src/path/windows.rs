@@ -11,6 +11,13 @@ pub(super) fn unc_prefix_path(path: PathBuf) -> PathBuf {
     if normalized.starts_with(r"\\?\") {
         return PathBuf::from(normalized);
     }
+    // UNC share path (\\server\share\...) needs the verbatim UNC form
+    // \\?\UNC\server\share\... — naively prepending \\?\ would yield the
+    // invalid \\?\server\share\... which CreateFileW / CreateDirectoryW
+    // reject (ERROR_BAD_PATHNAME).
+    if let Some(rest) = normalized.strip_prefix(r"\\") {
+        return PathBuf::from(format!(r"\\?\UNC\{}", rest));
+    }
     PathBuf::from(format!(r"\\?\{}", normalized))
 }
 

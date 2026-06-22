@@ -67,7 +67,9 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $RepoRoot
 
 if (-not $env:LOOM_MATRIX_TARGET_DIR) {
-    $env:LOOM_MATRIX_TARGET_DIR = 'F:\pj\loom-test\target'
+    # Portable per-user cache dir (mirrors run-matrix.sh's logic) so the
+    # pre-push hook works for any contributor, not just one author's machine.
+    $env:LOOM_MATRIX_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'loom-test\target'
 }
 $env:CARGO_TARGET_DIR = $env:LOOM_MATRIX_TARGET_DIR
 

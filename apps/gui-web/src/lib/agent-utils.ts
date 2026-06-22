@@ -216,12 +216,12 @@ export function getActorRunContext(runs: Record<string, Run>, actorId: string): 
 }
 
 export const runStatusLabel: Record<string, string> = {
-  queued: "排队中",
-  preparing_context: "准备上下文",
-  running: "思考中",
-  waiting_tool: "执行工具",
-  failed: "运行失败",
-  canceled: "已取消",
+  queued: "Queued",
+  preparing_context: "Preparing",
+  running: "Thinking",
+  waiting_tool: "Running tool",
+  failed: "Failed",
+  canceled: "Canceled",
 };
 
 /**
@@ -248,12 +248,12 @@ export function runStatusPhrase(ctx: ActorRunContext | null): string | undefined
   const reason = ctx.run.startReason;
   const meta = ctx.run.metadata ?? {};
 
-  if (ctx.status === "queued" && reason) return `排队中 · ${reason}`;
-  if (ctx.status === "preparing_context" && reason) return `准备上下文 · ${reason}`;
-  if (ctx.status === "running" && reason) return `思考中 · ${reason}`;
+  if (ctx.status === "queued" && reason) return `Queued · ${reason}`;
+  if (ctx.status === "preparing_context" && reason) return `Preparing · ${reason}`;
+  if (ctx.status === "running" && reason) return `Thinking · ${reason}`;
   if (ctx.status === "waiting_tool") {
     const toolName = typeof meta.toolName === "string" ? meta.toolName : undefined;
-    if (toolName) return `执行工具 · ${toolName}`;
+    if (toolName) return `Running tool · ${toolName}`;
   }
 
   return base;
@@ -262,10 +262,10 @@ export function runStatusPhrase(ctx: ActorRunContext | null): string | undefined
 /**
  * Full status label with 3-tier health suffix (Iter#5 Part C §C3 AC-S2).
  *
- * Replaces the old `⚠ {base} (超时)` bracket pattern with:
+ * Replaces the old `⚠ {base} (timeout)` bracket pattern with:
  * - (a) normal: `{base}` (no suffix)
- * - (b) slow: `{base} · 已等 {min}m · 较慢` (isStale && elapsed < threshold*1.5)
- * - (c) stuck: `{base} · 已等 {min}m · 可能卡住` (isStale && elapsed >= threshold*1.5)
+ * - (b) slow: `{base} · waiting {min}m · slow` (isStale && elapsed < threshold*1.5)
+ * - (c) stuck: `{base} · waiting {min}m · possibly stuck` (isStale && elapsed >= threshold*1.5)
  * - (d) server-confirmed timeout: terminal failed/canceled with timeout reason
  */
 export function runStatusFullLabel(ctx: ActorRunContext | null): string | undefined {
@@ -287,9 +287,9 @@ export function runStatusFullLabel(ctx: ActorRunContext | null): string | undefi
     const minutes = Math.floor(elapsedSec / 60);
     const elapsedLabel = minutes > 0 ? `${minutes}m` : `${Math.floor(elapsedSec)}s`;
     if (elapsedSec >= ctx.staleThresholdSec * 1.5) {
-      return `${base} · 已等 ${elapsedLabel} · 可能卡住`;
+      return `${base} · waiting ${elapsedLabel} · possibly stuck`;
     }
-    return `${base} · 已等 ${elapsedLabel} · 较慢`;
+    return `${base} · waiting ${elapsedLabel} · slow`;
   }
 
   return base;

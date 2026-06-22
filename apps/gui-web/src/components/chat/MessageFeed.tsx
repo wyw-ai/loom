@@ -60,6 +60,13 @@ export function MessageFeed({
     [messages],
   );
 
+  // Map rootMessageId -> thread so the per-row lookup in Virtuoso's
+  // itemContent is O(1) instead of an O(n) `find` re-run on every visible row.
+  const threadByRoot = useMemo(
+    () => new Map(channelThreads.map((t) => [t.rootMessageId, t])),
+    [channelThreads],
+  );
+
   const visibleMessages = useMemo(
     () => messages.filter((m) => !isHiddenProtocolMessage(m)),
     [messages],
@@ -108,8 +115,7 @@ export function MessageFeed({
             );
           }
           const message = item.message;
-          const threadSummary =
-            channelThreads.find((t) => t.rootMessageId === message.id) ?? null;
+          const threadSummary = threadByRoot.get(message.id) ?? null;
           const sourceTask =
             message.scope.kind === "channel"
               ? tasksBySourceMessageId[message.id] ?? null

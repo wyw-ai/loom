@@ -4,7 +4,9 @@
 //! `agent-runtime/tests/unc_path_integration.rs` and adds a
 //! `display_path` regression to lock in the dunce-based UNC stripping.
 
-use loom_platform::path::{create_dir_all, display_path, normalize_path_separators, unc_prefix_path};
+use loom_platform::path::{
+    create_dir_all, display_path, normalize_path_separators, unc_prefix_path,
+};
 use std::path::PathBuf;
 
 #[test]

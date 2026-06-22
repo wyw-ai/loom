@@ -152,9 +152,8 @@ pub async fn start_proxy(socket: PathBuf, server_url: String) -> Result<JoinHand
     // exist when the discovery file is created.
     if let Some(parent) = socket.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create daemon socket dir {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create daemon socket dir {}", parent.display()))?;
         }
     }
 

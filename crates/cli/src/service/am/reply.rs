@@ -16,10 +16,10 @@
 //! Pure functions where possible; subprocess + filesystem live in
 //! [`send_via_am`] and [`spawn_detached_async_reply`].
 
+use loom_platform::process::Command;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use loom_platform::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};

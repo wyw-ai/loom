@@ -69,12 +69,8 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use interprocess::local_socket::tokio::{
-    Listener as IpcListener, Stream as IpcStream,
-};
-use interprocess::local_socket::traits::tokio::{
-    Listener as ListenerTrait, Stream as StreamTrait,
-};
+use interprocess::local_socket::tokio::{Listener as IpcListener, Stream as IpcStream};
+use interprocess::local_socket::traits::tokio::{Listener as ListenerTrait, Stream as StreamTrait};
 use interprocess::local_socket::ListenerOptions;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -138,9 +134,7 @@ impl LocalSocketName {
     ///   only in directory therefore alias to the same pipe — fine in
     ///   practice because the daemon and its clients always derive the
     ///   path from one shared per-user config function.
-    pub fn from_path(
-        path: impl Into<std::path::PathBuf>,
-    ) -> io::Result<Self> {
+    pub fn from_path(path: impl Into<std::path::PathBuf>) -> io::Result<Self> {
         let path = path.into();
         #[cfg(unix)]
         {
@@ -163,10 +157,7 @@ impl LocalSocketName {
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!(
-                            "cannot derive pipe stem from path {}",
-                            path.display()
-                        ),
+                        format!("cannot derive pipe stem from path {}", path.display()),
                     )
                 })?;
             let name = windows::default_pipe_name(stem)?;
@@ -227,9 +218,7 @@ pub fn cleanup_stale(name: &LocalSocketName) -> io::Result<()> {
     }
 }
 
-fn build_borrowed_name(
-    name: &LocalSocketName,
-) -> io::Result<interprocess::local_socket::Name<'_>> {
+fn build_borrowed_name(name: &LocalSocketName) -> io::Result<interprocess::local_socket::Name<'_>> {
     match &name.inner {
         #[cfg(unix)]
         NameRepr::Fs(p) => {
@@ -372,17 +361,11 @@ impl AsyncWrite for LocalStream {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

@@ -15,9 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{
-    Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio,
-};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,10 +111,10 @@ struct AcpShared {
     /// response. Some ACP agents report usage as a session/update rather than
     /// on the prompt response itself.
     usage_by_session: Mutex<HashMap<String, TokenUsage>>,
-        /// session id → last emitted UsageUpdate snapshot, used for emission-side
-        /// dedup so we don't flood the event channel with identical snapshots.
-        last_emitted_usage: Mutex<HashMap<String, TokenUsage>>,
-        action_namespace: String,
+    /// session id → last emitted UsageUpdate snapshot, used for emission-side
+    /// dedup so we don't flood the event channel with identical snapshots.
+    last_emitted_usage: Mutex<HashMap<String, TokenUsage>>,
+    action_namespace: String,
     /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
     /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
     mcp_servers: Vec<Value>,
@@ -609,8 +607,8 @@ fn start_blocking(
         sessions_by_id: Mutex::new(HashMap::new()),
         model_options_by_session: Mutex::new(HashMap::new()),
         usage_by_session: Mutex::new(HashMap::new()),
-                last_emitted_usage: Mutex::new(HashMap::new()),
-                action_namespace: Uuid::new_v4().to_string(),
+        last_emitted_usage: Mutex::new(HashMap::new()),
+        action_namespace: Uuid::new_v4().to_string(),
         mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
     });
@@ -1561,7 +1559,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         );
         if let Some(error) = message.get("error") {
             shared.usage_by_session.lock().remove(&session_id);
-                    shared.last_emitted_usage.lock().remove(&session_id);
+            shared.last_emitted_usage.lock().remove(&session_id);
             let _ = shared.event_sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: json_value_to_string(error),

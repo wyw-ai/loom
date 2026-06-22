@@ -3776,8 +3776,8 @@ mod tests {
             &tx,
             r#"{"type":"text","text":"legacy ndjson would stream this"}"#,
             &mut collected,
-                    &mut None,
-                );
+            &mut None,
+        );
 
         assert!(!events.emitted_text);
         assert!(rx.try_recv().is_err());

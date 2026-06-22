@@ -2,8 +2,10 @@
 mod imp {
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
+
+    use loom_platform::process::Command;
 
     const DEV_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 5173);
     const ENV_NO_DEV_SERVER: &str = "LOOM_GUI_NO_DEV_SERVER";
@@ -23,13 +25,13 @@ mod imp {
             }
 
             let frontend_dir = frontend_dir();
-            // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3 /
-            // PM-Arbitration-002 — dev-mode `pnpm dev` keeps stdout/stderr
-            // inherited; deferring the migration to `loom_platform::process`
-            // until P1-Cmd-Sweep verifies that the newtype's default flags
-            // don't disturb the inherited handles. P0-D's
-            // `clippy::disallowed_methods` is also deferred; bare comment
-            // suffices.
+            // PAL-4c (PM-Arbitration-003 [G3: dev-mode helper]): pnpm dev is a
+            // developer-only helper process — its console window is NOT the
+            // intended GUI surface, so the loom-platform spawn defaults
+            // (CREATE_NO_WINDOW, process group isolation) are correct. The
+            // stdout/stderr inheritance below is preserved verbatim; the
+            // newtype only adds spawn flags, so the inherited handles
+            // continue to behave as before.
             let mut command = Command::new("pnpm");
             command
                 .arg("--dir")

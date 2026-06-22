@@ -92,3 +92,12 @@ paths = [
 ]
 
 [providers.opencode.fields]
+
+[providers.qoder]
+# [NEEDS VERIFICATION] — qoder usage schema TBD. Placeholder so the manifest
+# enumerates the full provider set called out in ARCH design D4. Until a real
+# fixture lands, qoder falls back to the [default] paths + field aliases.
+paths = []
+
+[providers.qoder.fields]
+

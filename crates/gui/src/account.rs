@@ -395,8 +395,9 @@ async fn decode_json_response<T: for<'de> Deserialize<'de>>(
 }
 
 fn open_browser(url: &str) -> Result<()> {
-    // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3 /
-    // PM-Arbitration-002 — these user-facing browser launchers must NOT use
+    // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3
+    // [G1: OS shell visibility] (PM-Arbitration-003 judgement).
+    // These user-facing browser launchers must NOT use
     // `loom_platform::process::Command` until P1-Cmd-Sweep verifies that the
     // newtype's default Windows flags (CREATE_NO_WINDOW |
     // CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP) do not break the

@@ -107,6 +107,14 @@ if (-not $SkipFmt) {
 }
 
 if (-not $SkipClippy) {
+    # P0-Lint PAL guardrail — runs across the FULL workspace (including loom-gui)
+    # with only `clippy::disallowed_methods` denied. Catches any new
+    # `std::process::Command::new` / `tokio::process::Command::new` regression
+    # in gui/ without forcing the broader baseline rewrite that is still
+    # excluded for loom-gui (see Iter#3 §8.9 Known Limitation).
+    Write-Stage 'cargo clippy --workspace --all-targets -- -D clippy::disallowed_methods  [PAL guardrail]'
+    Invoke-Stage 'clippy-pal' { cargo clippy --workspace --all-targets -- -D clippy::disallowed_methods } 3
+
     if ($StrictClippy) {
         Write-Stage 'cargo clippy --workspace --exclude loom-gui --all-targets -- -D warnings  [strict]'
         Invoke-Stage 'clippy' { cargo clippy --workspace --exclude loom-gui --all-targets -- -D warnings } 3

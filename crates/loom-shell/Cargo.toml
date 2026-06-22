@@ -31,3 +31,6 @@ windows-sys = { version = "0.59", features = [
 
 # Non-Windows stub target so `cargo check` can still resolve the crate name
 [target.'cfg(not(windows))'.dependencies]
+
+[lints]
+workspace = true

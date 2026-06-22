@@ -6172,12 +6172,19 @@ async fn translate_one(
             scope: _,
             usage,
         } => {
-            // Streaming token-usage snapshot. Snapshot semantics: each
-            // event REPLACES the latest per-scope in-flight usage; do NOT
-            // feed into the cross-turn `accumulate_usage` (which is delta
-            // semantics, owned by `Finished`). U4 wires this through the
-            // `agent.usage` WS broadcast; for now we only surface a trace
-            // so adapters can be exercised end-to-end.
+            // Streaming token-usage snapshot. Snapshot semantics: each event
+            // REPLACES the latest per-scope in-flight usage; do NOT feed into
+            // the cross-turn `accumulate_usage` (which is delta semantics,
+            // owned by `Finished`).
+            //
+            // U4 wiring: `append_trace` writes a trace frame against the
+            // active run. The store emits `RunUpdated`, which the WS layer
+            // broadcasts as a `stream/update kind=run.updated` to every
+            // connection subscribed to the run's scope. That IS the
+            // `agent.usage` channel B per ARCH design art_f822814f9124 —
+            // delivered over the same WS path the GUI already consumes for
+            // run trace frames. The message-meta channel is dual-written by
+            // the `Finished` handler below via `build_turn_meta`.
             if let Some(active) = active {
                 if active.cancel_requested {
                     return Ok(());
@@ -6247,6 +6254,24 @@ async fn translate_one(
                     )
                     .await?;
                 }
+            }
+            // U4 finalization: emit a terminal `agent.usage` trace frame so
+            // GUI clients consuming the trace stream receive the authoritative
+            // final snapshot via channel B (run.updated/trace frames),
+            // mirroring the dual-write into the message metadata. Skip when
+            // the adapter did not report any usage for this turn.
+            if let Some(final_usage) = usage.as_ref() {
+                append_trace(
+                    client,
+                    &active.run_id,
+                    TraceKind::Status,
+                    json!({
+                        "kind": "agent.usage",
+                        "usage": final_usage,
+                        "isFinal": true,
+                    }),
+                )
+                .await?;
             }
             let run_status = if active.cancel_requested {
                 RunStatus::Canceled

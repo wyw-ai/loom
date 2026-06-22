@@ -267,9 +267,8 @@ impl LocalListener {
         // their last handle closes, so no equivalent step exists.
         #[cfg(unix)]
         {
-            if let NameRepr::Fs(p) = &name.inner {
-                unix::cleanup_stale(p)?;
-            }
+            let NameRepr::Fs(p) = &name.inner;
+            unix::cleanup_stale(p)?;
         }
 
         let borrowed = build_borrowed_name(name)?;

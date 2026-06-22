@@ -286,10 +286,16 @@ What to edit first:
 Prompt flow in this template:
   - Loom first composes standard prompt parts such as actor_context, agent_instructions, scope_bootstrap, runtime_context, and user_message.
   - AgentSpec.promptAssembly decides how those parts and agent-owned prompt files become prompt.system, prompt.user, and prompt.full.
+  - On each agent turn Loom writes prompt.system to {{loom_agent_home}}/AGENTS.md, replacing the file only when the content changes.
+  - Loom projects the current scope's skills into {{agent.skillWorkspace}} under the agent home, using symlinks to the external bundle paths.
+  - Providers that support extra workspace dirs should add {{agent.skillWorkspace}} so their native skill discovery can see skills/, .agents/skills, .claude/skills, .qoder/skills, or .opencode/skills there.
   - ProviderManifest only declares how the provider CLI receives those rendered prompt outputs.
-  - args finally passes "{{prompt.full}}" to the provider CLI.
+  - Simple providers can pass "{{prompt.full}}" directly; providers that read AGENTS.md usually point their instruction/home setting at {{loom_agent_home}} and pass "{{prompt.user}}" per turn.
 
 Common runtime path variables:
+  - {{loom_agent_home}} points at the current agent's runtime home. Loom writes AGENTS.md there.
+  - {{agent.skillWorkspace}} points at the current scope's agent-local skill mount workspace.
+  - {{agent.skills}} and {{scope.skills}} point at {{agent.skillWorkspace}}/skills.
   - {{agent.configDir}} points at the current agent's config directory, normally $LOOM_CONFIG_DIR/agents/<actor_id>.
   - {{agent.specPath}} points at that agent's spec.json.
   - {{loom.configDir}} remains available for advanced providers that intentionally need daemon-level config, but built-in providers avoid exposing it by default.

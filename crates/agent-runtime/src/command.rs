@@ -29,6 +29,8 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::TokenUsage;
+
 use proto::ansi::strip_ansi;
 
 use loom_platform::process::Command;
@@ -48,7 +50,7 @@ use tokio::sync::mpsc;
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 use crate::acp::create_dir_all_unc;
 use crate::provider::ProviderRuntimeEvent;
-use crate::usage::extract_token_usage_from_text;
+use crate::usage::{extract_token_usage_from_text, observe_usage_line};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -936,6 +938,7 @@ fn spawn_and_collect(
     let mut collected_stderr = String::new();
     let mut emitted_text = false;
     let mut emitted_finish = false;
+    let mut last_usage: Option<TokenUsage> = None;
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
@@ -967,6 +970,7 @@ fn spawn_and_collect(
                 &mut collected_stdout,
                 &mut collected_stderr,
                 &mut early_runtime_error,
+                &mut last_usage,
             );
             emitted_text |= events.emitted_text;
             emitted_finish |= events.emitted_finish;
@@ -1045,6 +1049,7 @@ fn spawn_and_collect(
                     &mut collected_stdout,
                     &mut collected_stderr,
                     &mut early_runtime_error,
+                    &mut last_usage,
                 );
                 emitted_text |= events.emitted_text;
                 emitted_finish |= events.emitted_finish;
@@ -1097,6 +1102,7 @@ fn spawn_and_collect(
             &mut collected_stdout,
             &mut collected_stderr,
             &mut early_runtime_error,
+            &mut last_usage,
         );
         emitted_text |= events.emitted_text;
         emitted_finish |= events.emitted_finish;
@@ -1254,10 +1260,17 @@ fn collect_stdout_line(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     line: &str,
     collected_stdout: &mut String,
+    last_emitted_usage: &mut Option<TokenUsage>,
 ) -> OutputLineEvents {
     let clean = strip_ansi(line);
     collected_stdout.push_str(&clean);
     let parsed_line = clean.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(usage) = observe_usage_line(parsed_line, last_emitted_usage) {
+        let _ = sender.send(AdapterEvent::UsageUpdate {
+            scope: Some(prompt.scope.clone()),
+            usage,
+        });
+    }
     if let Some(decoder) = cfg.decoder.as_ref() {
         return collect_provider_decoder_line(decoder, parsed_line, &prompt.scope, sender);
     }
@@ -1272,11 +1285,17 @@ fn collect_process_output(
     collected_stdout: &mut String,
     collected_stderr: &mut String,
     early_runtime_error: &mut Option<String>,
+    last_emitted_usage: &mut Option<TokenUsage>,
 ) -> OutputLineEvents {
     match output {
-        ProcessOutput::Stdout(line) => {
-            collect_stdout_line(cfg, prompt, sender, &line, collected_stdout)
-        }
+        ProcessOutput::Stdout(line) => collect_stdout_line(
+            cfg,
+            prompt,
+            sender,
+            &line,
+            collected_stdout,
+            last_emitted_usage,
+        ),
         ProcessOutput::Stderr(line) => {
             collected_stderr.push_str(&line);
             if early_runtime_error.is_none() {
@@ -3713,6 +3732,7 @@ mod tests {
             &tx,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"from decoder"}]}}"#,
             &mut collected,
+            &mut None,
         );
 
         assert!(events.emitted_text);
@@ -3756,7 +3776,8 @@ mod tests {
             &tx,
             r#"{"type":"text","text":"legacy ndjson would stream this"}"#,
             &mut collected,
-        );
+                    &mut None,
+                );
 
         assert!(!events.emitted_text);
         assert!(rx.try_recv().is_err());

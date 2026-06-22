@@ -45,6 +45,18 @@
 //! - `NotFound` — connect to a name with no listener.
 //! - `PermissionDenied` — Windows DACL rejected the open (running as a
 //!   different user / SID).
+//!
+//! # D4 — empty `LOOM_DAEMON_SOCKET` ⇒ WebSocket fallback
+//!
+//! The daemon's transport selection lives one layer up
+//! (`loom-cli::daemon_ipc::env_socket_path` filters out empty strings;
+//! `connect_client` then falls back to `Client::connect_ws`). This
+//! module deliberately stays out of that decision: callers pass a
+//! resolved [`LocalSocketName`] only when they have decided to use
+//! local IPC. So on Windows, an unset or empty `LOOM_DAEMON_SOCKET`
+//! never reaches the named-pipe path at all — the CLI quietly opens
+//! a WebSocket to the server URL instead. This is the intended D4
+//! contract; do not move the empty-string check into this crate.
 
 #![allow(clippy::needless_return)]
 
@@ -107,6 +119,68 @@ impl LocalSocketName {
     pub fn as_fs_path(&self) -> &std::path::Path {
         match &self.inner {
             NameRepr::Fs(p) => p.as_path(),
+        }
+    }
+
+    /// Construct a [`LocalSocketName`] from an explicit filesystem path.
+    ///
+    /// This is the bridge for legacy call sites — the daemon proxy,
+    /// the server's `--unix-socket` CLI flag, the `unix://` URL scheme
+    /// — that pick a path independently of [`local_socket_name`] (for
+    /// example via `config::config_dir()/daemon/daemon.sock`).
+    ///
+    /// - **Unix**: the path is used verbatim as the socket file
+    ///   location. An empty path is rejected.
+    /// - **Windows**: a Named Pipe has no filesystem backing, so the
+    ///   path's file *stem* (e.g. `daemon` from `…/daemon.sock`) is
+    ///   taken as the pipe stem and run through the same per-user
+    ///   SID-suffixing as [`local_socket_name`]. Two paths that differ
+    ///   only in directory therefore alias to the same pipe — fine in
+    ///   practice because the daemon and its clients always derive the
+    ///   path from one shared per-user config function.
+    pub fn from_path(
+        path: impl Into<std::path::PathBuf>,
+    ) -> io::Result<Self> {
+        let path = path.into();
+        #[cfg(unix)]
+        {
+            if path.as_os_str().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "socket path must not be empty",
+                ));
+            }
+            Ok(Self {
+                inner: NameRepr::Fs(path),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "cannot derive pipe stem from path {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            let name = windows::default_pipe_name(stem)?;
+            Ok(Self {
+                inner: NameRepr::Ns(name),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "loom-platform::ipc is not supported on this target",
+            ))
         }
     }
 }
@@ -324,5 +398,22 @@ mod tests {
         let dbg = format!("{name:?}");
         assert!(dbg.contains("LocalSocketName"));
         assert!(!name.display().is_empty());
+    }
+
+    #[test]
+    fn from_path_accepts_explicit_path() {
+        let path = std::env::temp_dir().join("loom-platform-ipc-from-path.sock");
+        let name = LocalSocketName::from_path(&path).expect("build name from path");
+        // Display must round-trip something non-empty regardless of
+        // platform (Unix: path string; Windows: pipe stem).
+        assert!(!name.display().is_empty());
+    }
+
+    #[test]
+    fn from_path_rejects_unstemmable_input() {
+        // On Unix this is an "empty path"; on Windows it has no file
+        // stem. Either way `from_path` should refuse.
+        let result = LocalSocketName::from_path(std::path::PathBuf::new());
+        assert!(result.is_err(), "from_path('') should fail, got {result:?}");
     }
 }

@@ -2,18 +2,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use loom_platform::ipc::{LocalSocketName, LocalStream};
 use proto::methods::method;
 use proto::{Notification, Request, Response, RpcEnvelope};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
-#[cfg(unix)]
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -97,12 +95,13 @@ impl Client {
         Ok(Self::new(out_tx, pending, notif_rx))
     }
 
-    #[cfg(unix)]
     pub async fn connect_daemon_socket(path: &Path) -> Result<Arc<Self>> {
-        let stream = tokio::net::UnixStream::connect(path)
+        let name = LocalSocketName::from_path(path.to_path_buf())
+            .with_context(|| format!("build socket name from {}", path.display()))?;
+        let stream = LocalStream::connect(&name)
             .await
-            .with_context(|| format!("connect daemon socket {}", path.display()))?;
-        let (reader, mut writer) = stream.into_split();
+            .with_context(|| format!("connect daemon socket {}", name.display()))?;
+        let (reader, mut writer) = tokio::io::split(stream);
         let (out_tx, mut out_rx) = mpsc::channel::<String>(4096);
         let (notif_tx, notif_rx) = mpsc::channel::<Notification>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -137,26 +136,11 @@ impl Client {
         Ok(Self::new(out_tx, pending, notif_rx))
     }
 
-    #[cfg(unix)]
     async fn connect_unix_url(path: &str) -> Result<Arc<Self>> {
         if path.is_empty() {
             return Err(anyhow!("unix server URL is missing a socket path"));
         }
         Self::connect_daemon_socket(Path::new(path)).await
-    }
-
-    #[cfg(not(unix))]
-    async fn connect_unix_url(_path: &str) -> Result<Arc<Self>> {
-        Err(anyhow!(
-            "unix server URLs are only supported on Unix platforms"
-        ))
-    }
-
-    #[cfg(not(unix))]
-    pub async fn connect_daemon_socket(_path: &Path) -> Result<Arc<Self>> {
-        Err(anyhow!(
-            "loom-daemon IPC is only supported on Unix platforms"
-        ))
     }
 
     async fn connect_file_rpc(path: &str) -> Result<Arc<Self>> {

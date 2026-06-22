@@ -2135,15 +2135,17 @@ fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // G1 OS shell (PM-Arbitration-003) — see body
 fn open_path_with_system(path: &Path) -> anyhow::Result<()> {
     // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3
     // [G1: OS shell visibility] (PM-Arbitration-003 judgement).
     // These user-facing file-manager launchers must NOT use
     // `loom_platform::process::Command` until P1-Cmd-Sweep verifies that
     // the newtype's default Windows flags don't break Explorer's popup
-    // behavior (ARCH-flagged risk for `explorer`). P0-D's
-    // `clippy::disallowed_methods` lint is also deferred; the bare comment is
-    // sufficient signaling until then.
+    // behavior (ARCH-flagged risk for `explorer`). P0-Lint
+    // (`clippy::disallowed_methods`) is active workspace-wide; the fn-level
+    // allow above is the documented G1 exemption (covers all three platform
+    // branches below).
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = std::process::Command::new("open");

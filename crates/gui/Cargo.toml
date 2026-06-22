@@ -33,3 +33,6 @@ url = { workspace = true }
 [features]
 # Tauri 2 capability to open devtools, opt-in in dev builds.
 devtools = ["tauri/devtools"]
+
+[lints]
+workspace = true

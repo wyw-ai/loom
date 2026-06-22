@@ -30,3 +30,6 @@ futures-util = { workspace = true }
 rusqlite = { workspace = true }
 loom-platform = { workspace = true }
 dirs = { workspace = true }
+
+[lints]
+workspace = true

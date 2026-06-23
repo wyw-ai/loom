@@ -8,7 +8,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
+
+use loom_platform::process::Command;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +28,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
+use crate::acp::create_dir_all_unc;
 use crate::usage::extract_token_usage_from_text;
+use loom_platform::path::unc_prefix_path;
 
 #[derive(Debug, Clone)]
 pub struct InteractiveCommandConfig {
@@ -239,7 +244,7 @@ fn run_prompt(
     sender: mpsc::UnboundedSender<AdapterEvent>,
     slot: Arc<Mutex<InFlight>>,
 ) -> Result<(), String> {
-    let outcome = run_prompt_inner(&cfg, &prompt, &slot);
+    let outcome = run_prompt_inner(&cfg, &prompt, &slot, &sender);
     match outcome {
         Ok(outcome) => {
             if !outcome.stderr.trim().is_empty() {
@@ -318,8 +323,9 @@ fn run_prompt_inner(
     cfg: &InteractiveCommandConfig,
     prompt: &AdapterPrompt,
     slot: &Arc<Mutex<InFlight>>,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
 ) -> Result<RunOutcome, String> {
-    std::fs::create_dir_all(&prompt.cwd).map_err(|e| {
+    crate::acp::create_dir_all_unc(&prompt.cwd).map_err(|e| {
         format!(
             "failed to create interactive command cwd `{}`: {}",
             prompt.cwd.display(),
@@ -408,6 +414,7 @@ fn run_prompt_inner(
     let mut found_done = false;
     let summary: String;
     let mut success = false;
+    let mut last_emitted_usage: Option<crate::TokenUsage> = None;
 
     loop {
         if slot.lock().cancel_requested {
@@ -422,8 +429,26 @@ fn run_prompt_inner(
         }
         match stdout_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
-                if append_stdout_chunk(&mut collected, chunk, cfg.spec.output.strip_ansi, &sentinel)
-                {
+                let sentinel_hit = append_stdout_chunk(
+                    &mut collected,
+                    chunk,
+                    cfg.spec.output.strip_ansi,
+                    &sentinel,
+                );
+                // Streaming UsageUpdate: rescan the full collected text for the
+                // latest token-usage snapshot. The text-extractor walks the
+                // collected blob and returns the most recent usage object;
+                // we emit only when it changed from the last snapshot.
+                if let Some(usage) = extract_token_usage_from_text(&collected) {
+                    if last_emitted_usage.as_ref() != Some(&usage) {
+                        let _ = sender.send(AdapterEvent::UsageUpdate {
+                            scope: Some(prompt.scope.clone()),
+                            usage: usage.clone(),
+                        });
+                        last_emitted_usage = Some(usage);
+                    }
+                }
+                if sentinel_hit {
                     final_text = text_before_sentinel(&collected, &sentinel);
                     if cfg.spec.completion.strip_sentinel {
                         final_text = final_text.trim_end().to_string();
@@ -499,7 +524,7 @@ fn append_stdout_chunk(
     sentinel: &str,
 ) -> bool {
     let chunk = if strip_output_ansi {
-        strip_ansi(&chunk)
+        proto::ansi::strip_ansi(&chunk)
     } else {
         chunk
     };
@@ -540,15 +565,25 @@ fn spawn_child(
     prompt: &AdapterPrompt,
     argv: &[String],
 ) -> Result<Child, String> {
+    // On Windows, prefix the cwd with UNC prefix to bypass MAX_PATH (260
+    // char) limit.  Do NOT UNC-prefix the command path — `\\?\` bypasses
+    // PATHEXT resolution in CreateProcessW, so e.g.
+    // `\\?\D:\nodejs\claude` would fail to resolve to `claude.cmd`.
+    // `unc_prefix_path` is a no-op on Unix so the call site stays cfg-free.
+    let spawn_cwd = unc_prefix_path(prompt.cwd.clone());
+
     let mut cmd = Command::new(&cfg.command);
     cmd.args(argv)
-        .current_dir(&prompt.cwd)
+        .current_dir(&spawn_cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in expanded_env(cfg, prompt) {
         cmd.env(k, v);
     }
+    // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
+    // `loom_platform::process::Command::new` automatically — no cfg block.
     cmd.spawn()
         .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))
 }
@@ -638,7 +673,7 @@ fn resolve_claude_settings(
         ClaudeSettingsMode::ActorProfile => {
             let path = cfg.profile_dir.join("claude").join("settings.json");
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                create_dir_all_unc(parent).map_err(|e| {
                     format!(
                         "failed to create claude settings dir `{}`: {e}",
                         parent.display()
@@ -802,7 +837,7 @@ fn save_session(
 ) -> std::io::Result<()> {
     let path = session_path(cfg, scope);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     let now = chrono::Utc::now().to_rfc3339();
     let existing = load_session(cfg, scope);
@@ -847,26 +882,6 @@ fn text_before_sentinel(text: &str, sentinel: &str) -> String {
         }
         out.push_str(line);
         out.push('\n');
-    }
-    out
-}
-
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                let _ = chars.next();
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-        out.push(ch);
     }
     out
 }
@@ -1059,11 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn ansi_stripper_removes_csi_sequences() {
-        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
-    }
-
-    #[test]
     fn truncate_is_char_boundary_safe() {
         let text = "修复 delivery 中文 stderr 截断 panic";
         let truncated = truncate(text, 10);
@@ -1103,6 +1113,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn signed_thinking_replay_error_drops_saved_interactive_session() {
         let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
@@ -1125,6 +1136,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn successful_done_requires_sentinel_and_saves_session() {
         let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
@@ -1162,6 +1174,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn process_exit_without_sentinel_is_failed_done() {
         let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));

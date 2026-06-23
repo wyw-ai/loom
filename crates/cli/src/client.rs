@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use loom_platform::ipc::{LocalSocketName, LocalStream};
 use proto::methods::method;
 use proto::{Notification, Request, Response, RpcEnvelope};
 use serde::de::DeserializeOwned;
@@ -17,13 +18,18 @@ use tokio_tungstenite::tungstenite::Message;
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>;
 
 pub struct Client {
-    out_tx: mpsc::UnboundedSender<String>,
+    out_tx: mpsc::Sender<String>,
     pending: Pending,
     next_id: Arc<std::sync::atomic::AtomicU64>,
-    pub notifications: Mutex<mpsc::UnboundedReceiver<Notification>>,
+    pub notifications: Mutex<mpsc::Receiver<Notification>>,
+    /// Per-call RPC timeout in milliseconds. Defaults to 30_000 (30 s).
+    /// Use `set_rpc_timeout_ms` to change it.
+    rpc_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Client {
+    /// Default RPC call timeout (30 seconds in milliseconds).
+    pub const DEFAULT_RPC_TIMEOUT_MS: u64 = 30_000;
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
         if let Some(path) = file_rpc_url_path(url) {
             return Self::connect_file_rpc(path).await;
@@ -39,15 +45,31 @@ impl Client {
             .await
             .with_context(|| format!("ws connect {}", url))?;
         let (mut sink, mut stream) = ws.split();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(4096);
+        let (notif_tx, notif_rx) = mpsc::channel::<Notification>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
-        // Writer task
+        // Writer task — sends RPC frames and periodic WebSocket pings to keep
+        // the connection alive through NAT/firewall timeouts and long idle periods.
         tokio::spawn(async move {
-            while let Some(frame) = out_rx.recv().await {
-                if sink.send(Message::Text(frame)).await.is_err() {
-                    break;
+            let mut ping_ticker = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    frame = out_rx.recv() => {
+                        match frame {
+                            Some(f) => {
+                                if sink.send(Message::Text(f)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = ping_ticker.tick() => {
+                        if sink.send(Message::Ping(vec![])).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             let _ = sink.close().await;
@@ -73,14 +95,15 @@ impl Client {
         Ok(Self::new(out_tx, pending, notif_rx))
     }
 
-    #[cfg(unix)]
     pub async fn connect_daemon_socket(path: &Path) -> Result<Arc<Self>> {
-        let stream = tokio::net::UnixStream::connect(path)
+        let name = LocalSocketName::from_path(path.to_path_buf())
+            .with_context(|| format!("build socket name from {}", path.display()))?;
+        let stream = LocalStream::connect(&name)
             .await
-            .with_context(|| format!("connect daemon socket {}", path.display()))?;
-        let (reader, mut writer) = stream.into_split();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
+            .with_context(|| format!("connect daemon socket {}", name.display()))?;
+        let (reader, mut writer) = tokio::io::split(stream);
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(4096);
+        let (notif_tx, notif_rx) = mpsc::channel::<Notification>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(async move {
@@ -113,26 +136,11 @@ impl Client {
         Ok(Self::new(out_tx, pending, notif_rx))
     }
 
-    #[cfg(unix)]
     async fn connect_unix_url(path: &str) -> Result<Arc<Self>> {
         if path.is_empty() {
             return Err(anyhow!("unix server URL is missing a socket path"));
         }
         Self::connect_daemon_socket(Path::new(path)).await
-    }
-
-    #[cfg(not(unix))]
-    async fn connect_unix_url(_path: &str) -> Result<Arc<Self>> {
-        Err(anyhow!(
-            "unix server URLs are only supported on Unix platforms"
-        ))
-    }
-
-    #[cfg(not(unix))]
-    pub async fn connect_daemon_socket(_path: &Path) -> Result<Arc<Self>> {
-        Err(anyhow!(
-            "loom-daemon IPC is only supported on Unix platforms"
-        ))
     }
 
     async fn connect_file_rpc(path: &str) -> Result<Arc<Self>> {
@@ -156,8 +164,8 @@ impl Client {
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("create file-rpc output dir {}", out_dir.display()))?;
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(4096);
+        let (notif_tx, notif_rx) = mpsc::channel::<Notification>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(async move {
@@ -205,16 +213,27 @@ impl Client {
     }
 
     fn new(
-        out_tx: mpsc::UnboundedSender<String>,
+        out_tx: mpsc::Sender<String>,
         pending: Pending,
-        notif_rx: mpsc::UnboundedReceiver<Notification>,
+        notif_rx: mpsc::Receiver<Notification>,
     ) -> Arc<Self> {
         Arc::new(Self {
             out_tx,
             pending,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             notifications: Mutex::new(notif_rx),
+            rpc_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                Self::DEFAULT_RPC_TIMEOUT_MS,
+            )),
         })
+    }
+
+    /// Set the per-call RPC timeout in milliseconds (applies to all subsequent
+    /// `call_raw` calls). Use this to tolerate slow commands or long-running
+    /// machine operations without false timeouts.
+    pub fn set_rpc_timeout_ms(&self, timeout_ms: u64) {
+        self.rpc_timeout_ms
+            .store(timeout_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn call_raw(&self, method: &str, params: Option<Value>) -> Result<Value> {
@@ -229,8 +248,12 @@ impl Client {
         let frame = serde_json::to_string(&req)?;
         self.out_tx
             .send(frame)
+            .await
             .map_err(|_| anyhow!("rpc writer closed"))?;
-        let resp = tokio::time::timeout(Duration::from_secs(30), rx)
+        let timeout_ms = self
+            .rpc_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let resp = tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
             .await
             .map_err(|_| anyhow!("rpc `{}` timed out", method))?
             .map_err(|_| anyhow!("rpc `{}` channel closed", method))?;
@@ -342,11 +365,7 @@ fn id_to_key(v: &Value) -> String {
     }
 }
 
-async fn dispatch_frame(
-    text: String,
-    pending: &Pending,
-    notif_tx: &mpsc::UnboundedSender<Notification>,
-) {
+async fn dispatch_frame(text: String, pending: &Pending, notif_tx: &mpsc::Sender<Notification>) {
     let envelope: RpcEnvelope = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
@@ -362,7 +381,13 @@ async fn dispatch_frame(
             }
         }
         RpcEnvelope::Notification(n) => {
-            let _ = notif_tx.send(n);
+            // The bounded notification channel (capacity 1024) protects the
+            // reader task if the consumer falls behind, but a *silent* drop
+            // loses events like `run.updated` and freezes the agent-status
+            // display. Surface backpressure as a warning instead of `let _ =`.
+            if let Err(e) = notif_tx.try_send(n) {
+                tracing::warn!(error = %e, "notification channel full or closed; event dropped");
+            }
         }
         RpcEnvelope::Request(_) => {
             // Server doesn't send requests in v0.

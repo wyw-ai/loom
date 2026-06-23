@@ -7,6 +7,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::acp::create_dir_all_unc;
+
 #[derive(Debug)]
 pub struct ProfileScaffold<'a> {
     pub profile_dir: &'a Path,
@@ -15,10 +17,10 @@ pub struct ProfileScaffold<'a> {
 }
 
 pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
-    std::fs::create_dir_all(params.profile_dir)?;
+    create_dir_all_unc(params.profile_dir)?;
 
     let memory_root = resolve_relative(params.profile_dir, params.memory_root);
-    std::fs::create_dir_all(&memory_root)?;
+    create_dir_all_unc(&memory_root)?;
 
     // Drop a memory/meta.json marker next to records/ so the dir layout is
     // self-describing. Same convention as AgentX.
@@ -28,7 +30,7 @@ pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
         .join("meta.json");
     if !memory_meta.exists() {
         if let Some(parent) = memory_meta.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_all_unc(parent)?;
         }
         let meta = serde_json::json!({
             "schemaVersion": 1,

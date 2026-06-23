@@ -86,6 +86,7 @@ RUNTIME_TARGETS=(
   "universal-apple-darwin"
   "aarch64-unknown-linux-musl"
   "x86_64-unknown-linux-musl"
+  "x86_64-pc-windows-msvc"
 )
 
 log() {
@@ -111,7 +112,11 @@ ensure_file() {
 runtime_target_available() {
   local target="$1"
   local src_dir="$DIST_DIR/$PROFILE/$target"
-  [[ -f "$src_dir/loom" && -f "$src_dir/loom-daemon" && -f "$src_dir/loom-server" ]]
+  if [[ "$target" == *windows* ]]; then
+    [[ -f "$src_dir/loom.exe" && -f "$src_dir/loom-daemon.exe" && -f "$src_dir/loom-server.exe" ]]
+  else
+    [[ -f "$src_dir/loom" && -f "$src_dir/loom-daemon" && -f "$src_dir/loom-server" ]]
+  fi
 }
 
 checksum_cmd() {
@@ -129,19 +134,61 @@ package_runtime_target() {
   local target="$1"
   local src_dir="$DIST_DIR/$PROFILE/$target"
   local package_name="loom-runtime-$VERSION-$target"
-  local stage_dir="$TMP_DIR/$package_name"
-  local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
 
-  ensure_file "$src_dir/loom"
-  ensure_file "$src_dir/loom-daemon"
-  ensure_file "$src_dir/loom-server"
+  if [[ "$target" == *windows* ]]; then
+    local stage_dir="$TMP_DIR/$package_name"
+    local archive="$PACKAGE_OUT_DIR/$package_name.zip"
+    local archive_ext="zip"
+  else
+    local stage_dir="$TMP_DIR/$package_name"
+    local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
+    local archive_ext="tar.gz"
+  fi
+
+  if [[ "$target" == *windows* ]]; then
+    ensure_file "$src_dir/loom.exe"
+    ensure_file "$src_dir/loom-daemon.exe"
+    ensure_file "$src_dir/loom-server.exe"
+  else
+    ensure_file "$src_dir/loom"
+    ensure_file "$src_dir/loom-daemon"
+    ensure_file "$src_dir/loom-server"
+  fi
 
   rm -rf "$stage_dir"
   mkdir -p "$stage_dir/bin"
-  cp "$src_dir/loom" "$stage_dir/bin/loom"
-  cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
-  cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
-  chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
+
+  if [[ "$target" == *windows* ]]; then
+    cp "$src_dir/loom.exe"        "$stage_dir/bin/loom.exe"
+    cp "$src_dir/loom-daemon.exe" "$stage_dir/bin/loom-daemon.exe"
+    cp "$src_dir/loom-server.exe" "$stage_dir/bin/loom-server.exe"
+
+    # Bundle loom-shell GUI management tool
+    if [[ -f "$src_dir/loom-shell.exe" ]]; then
+      cp "$src_dir/loom-shell.exe" "$stage_dir/bin/loom-shell.exe"
+    fi
+
+    # Bundle winsw Windows Service wrapper files
+    if [[ -f "$src_dir/WinSW-x64.exe" ]]; then
+      cp "$src_dir/WinSW-x64.exe" "$stage_dir/bin/WinSW-x64.exe"
+    fi
+    if [[ -f "$src_dir/install.ps1" ]]; then
+      cp "$src_dir/install.ps1" "$stage_dir/bin/install.ps1"
+    fi
+    if [[ -f "$src_dir/uninstall.ps1" ]]; then
+      cp "$src_dir/uninstall.ps1" "$stage_dir/bin/uninstall.ps1"
+    fi
+    if [[ -d "$src_dir/config" ]]; then
+      mkdir -p "$stage_dir/config"
+      cp "$src_dir/config/loom-server.xml" "$stage_dir/config/loom-server.xml" 2>/dev/null || true
+      cp "$src_dir/config/loom-daemon.xml" "$stage_dir/config/loom-daemon.xml" 2>/dev/null || true
+    fi
+  else
+    cp "$src_dir/loom" "$stage_dir/bin/loom"
+    cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
+    cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
+    chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
+  fi
 
   cat >"$stage_dir/README.txt" <<EOF
 Loom runtime package
@@ -151,12 +198,45 @@ Git SHA: $GIT_SHA
 Target: $target
 
 Contents:
-- bin/loom: operator CLI.
-- bin/loom-daemon: machine-scoped agent and service host.
-- bin/loom-server: WebSocket collaboration server.
+- bin/loom$( [[ "$target" == *windows* ]] && echo .exe ): operator CLI.
+- bin/loom-daemon$( [[ "$target" == *windows* ]] && echo .exe ): machine-scoped agent and service host.
+- bin/loom-server$( [[ "$target" == *windows* ]] && echo .exe ): WebSocket collaboration server.
 EOF
 
-  tar -C "$TMP_DIR" -czf "$archive" "$package_name"
+  if [[ "$target" == *windows* ]]; then
+    cat >>"$stage_dir/README.txt" <<'EOF'
+
+Windows Service deployment
+--------------------------
+To install Loom as a Windows Service (auto-start, crash recovery):
+
+  Run PowerShell as Administrator, then:
+    cd bin
+    .\install.ps1
+
+  Manage services:
+    sc start  LoomServer
+    sc stop   LoomServer
+    sc query  LoomServer
+    sc start  LoomDaemon
+    sc stop   LoomDaemon
+    sc query  LoomDaemon
+
+  Or use the GUI management tool:
+    .\loom-shell.exe
+
+  Uninstall:
+    .\uninstall.ps1
+
+  Logs: %LOCALAPPDATA%\loom\logs\
+EOF
+  fi
+
+  if [[ "$archive_ext" == "zip" ]]; then
+    (cd "$TMP_DIR" && zip -qr "$archive" "$package_name")
+  else
+    tar -C "$TMP_DIR" -czf "$archive" "$package_name"
+  fi
   log "wrote $archive"
 }
 
@@ -246,7 +326,7 @@ write_manifest() {
     [[ -f "$path" ]] || continue
     name="$(basename "$path")"
     case "$name" in
-      *.tar.gz | *.dmg | install.sh)
+      *.tar.gz | *.zip | *.dmg | install.sh)
         artifacts+=("$name")
         ;;
     esac
@@ -288,14 +368,17 @@ write_installer() {
   local runtime_mac="loom-runtime-$VERSION-universal-apple-darwin.tar.gz"
   local runtime_linux_x86="loom-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
   local runtime_linux_arm="loom-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
-  local sha_mac sha_linux_x86 sha_linux_arm
+  local runtime_windows_x86="loom-runtime-$VERSION-x86_64-pc-windows-msvc.zip"
+  local sha_mac sha_linux_x86 sha_linux_arm sha_windows_x86
 
   runtime_mac="$(archive_name_if_exists "$runtime_mac")"
   runtime_linux_x86="$(archive_name_if_exists "$runtime_linux_x86")"
   runtime_linux_arm="$(archive_name_if_exists "$runtime_linux_arm")"
+  runtime_windows_x86="$(archive_name_if_exists "$runtime_windows_x86")"
   sha_mac="$(archive_sha_if_exists "$runtime_mac")"
   sha_linux_x86="$(archive_sha_if_exists "$runtime_linux_x86")"
   sha_linux_arm="$(archive_sha_if_exists "$runtime_linux_arm")"
+  sha_windows_x86="$(archive_sha_if_exists "$runtime_windows_x86")"
 
   cat >"$installer" <<EOF
 #!/usr/bin/env sh
@@ -313,6 +396,8 @@ PKG_X86_64_UNKNOWN_LINUX_MUSL='$runtime_linux_x86'
 SHA_X86_64_UNKNOWN_LINUX_MUSL='$sha_linux_x86'
 PKG_AARCH64_UNKNOWN_LINUX_MUSL='$runtime_linux_arm'
 SHA_AARCH64_UNKNOWN_LINUX_MUSL='$sha_linux_arm'
+PKG_X86_64_PC_WINDOWS_MSVC='$runtime_windows_x86'
+SHA_X86_64_PC_WINDOWS_MSVC='$sha_windows_x86'
 
 usage() {
   cat <<'USAGE'
@@ -326,7 +411,8 @@ Options:
   -t, --target TARGET   Override target package:
                         universal-apple-darwin,
                         x86_64-unknown-linux-musl,
-                        aarch64-unknown-linux-musl.
+                        aarch64-unknown-linux-musl,
+                        x86_64-pc-windows-msvc.
       --package-dir DIR Directory containing loom-runtime-*.tar.gz.
                         Default: the directory containing install.sh.
       --bin-dir DIR     Install binaries into DIR. Default: \$HOME/.local/bin.
@@ -354,6 +440,7 @@ detect_target() {
     Darwin:*) printf '%s\n' universal-apple-darwin ;;
     Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-musl ;;
     Linux:aarch64|Linux:arm64) printf '%s\n' aarch64-unknown-linux-musl ;;
+    MINGW64_NT:*|MSYS_NT:*|CYGWIN_NT:*) printf '%s\n' x86_64-pc-windows-msvc ;;
     *) die "unsupported platform: \$os \$arch; pass --target explicitly" ;;
   esac
 }
@@ -363,6 +450,7 @@ runtime_package_name() {
     universal-apple-darwin) printf '%s\n' "\$PKG_UNIVERSAL_APPLE_DARWIN" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$PKG_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$PKG_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "\$PKG_X86_64_PC_WINDOWS_MSVC" ;;
     *) die "unknown target: \$1" ;;
   esac
 }
@@ -372,6 +460,7 @@ runtime_sha256() {
     universal-apple-darwin) printf '%s\n' "\$SHA_UNIVERSAL_APPLE_DARWIN" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$SHA_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$SHA_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "\$SHA_X86_64_PC_WINDOWS_MSVC" ;;
     *) die "unknown target: \$1" ;;
   esac
 }
@@ -539,7 +628,15 @@ actual_sha="\$(sha256_file "\$package_path")"
 [ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$package_path"
 
 extract_tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
-tar -xzf "\$package_path" -C "\$extract_tmp_dir"
+case "\$package_name" in
+  *.zip)
+    command -v unzip >/dev/null 2>&1 || die "missing required command: unzip"
+    unzip -q "\$package_path" -d "\$extract_tmp_dir"
+    ;;
+  *)
+    tar -xzf "\$package_path" -C "\$extract_tmp_dir"
+    ;;
+esac
 package_root=""
 for candidate in "\$extract_tmp_dir"/loom-runtime-*; do
   [ -d "\$candidate" ] || continue
@@ -567,7 +664,7 @@ write_checksums() {
     for path in *; do
       [[ -f "$path" ]] || continue
       case "$path" in
-        *.tar.gz | *.dmg | install.sh)
+        *.tar.gz | *.zip | *.dmg | install.sh)
           artifacts+=("$path")
           ;;
       esac
@@ -587,6 +684,7 @@ write_checksums() {
 
 mkdir -p "$PACKAGE_OUT_DIR"
 rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
+  "$PACKAGE_OUT_DIR"/loom-runtime-*.zip \
   "$PACKAGE_OUT_DIR"/loom-gui-*.dmg \
   "$PACKAGE_OUT_DIR"/install.sh \
   "$PACKAGE_OUT_DIR"/SHA256SUMS \
@@ -595,6 +693,8 @@ rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   log "building CLI/daemon/server release binaries for macOS and Linux targets"
   run_make all-release
+  log "assembling Windows Service (winsw) package"
+  run_make windows-service-package
 else
   log "skipping binary build; using existing $DIST_DIR/$PROFILE artifacts"
 fi

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use agent_runtime::discovery::DetectedAgentProvider;
 use proto::methods::method;
-use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec};
+use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec, ServiceSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
@@ -1282,8 +1282,10 @@ pub struct MachineInfo {
     pub config_dir: String,
     pub agent_count: usize,
     pub online_agent_count: usize,
+    pub service_count: usize,
     pub providers: Vec<MachineAgentProviderInfo>,
     pub agents: Vec<MachineAgentInfo>,
+    pub services: Vec<ServiceSpec>,
     pub serve_command: String,
     pub setup_script: String,
 }
@@ -1568,6 +1570,8 @@ struct RemoteMachineMeta {
     providers: Vec<DetectedAgentProvider>,
     #[serde(default, rename = "agentSpecs")]
     agent_specs: Vec<AgentSpec>,
+    #[serde(default, rename = "serviceSpecs")]
+    service_specs: Vec<ServiceSpec>,
     capabilities: Vec<String>,
     revision: u64,
     observed_at: String,
@@ -1792,6 +1796,7 @@ fn server_machine_info_from_actor(
             }
         })
         .collect();
+    let services = meta.service_specs.clone();
     let setup_status = if providers.is_empty() {
         "noCli"
     } else if agents.is_empty() {
@@ -1835,8 +1840,10 @@ fn server_machine_info_from_actor(
         config_dir: meta.config_dir,
         agent_count: agents.len(),
         online_agent_count: 0,
+        service_count: services.len(),
         providers,
         agents,
+        services,
         serve_command,
         setup_script,
     })
@@ -1956,8 +1963,10 @@ fn pending_machine_registration(
         config_dir: config_dir.display().to_string(),
         agent_count: 0,
         online_agent_count: 0,
+        service_count: 0,
         providers: Vec::new(),
         agents: Vec::new(),
+        services: Vec::new(),
         serve_command,
         setup_script,
     })
@@ -2101,8 +2110,10 @@ fn pending_machine_info_from_registration(
         config_dir: registration.config_dir.clone(),
         agent_count: 0,
         online_agent_count: 0,
+        service_count: 0,
         providers: Vec::new(),
         agents: Vec::new(),
+        services: Vec::new(),
         serve_command,
         setup_script,
     }

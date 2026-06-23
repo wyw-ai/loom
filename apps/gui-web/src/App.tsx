@@ -188,6 +188,10 @@ type AgentMemberEntry = {
   machine: MachineInfo;
   agent: MachineInfo["agents"][number];
 };
+type ServiceMemberEntry = {
+  machine: MachineInfo;
+  service: MachineInfo["services"][number];
+};
 type ProviderAvailabilityGroup = {
   key: string;
   id: string;
@@ -202,6 +206,7 @@ type ProviderAvailabilityGroup = {
 };
 type ActorWorkspaceSection = "agents" | "hosts" | "services";
 type AgentDetailTab = "profile" | "prompt" | "settings";
+type ServiceDetailTab = "overview" | "spec" | "config";
 type PromptTemplateDraft = {
   system: string;
   user: string;
@@ -5512,6 +5517,7 @@ function SettingsView({
   const [activeSection, setActiveSection] = useState<ActorWorkspaceSection>("hosts");
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
+  const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
   const [createAgentMachineId, setCreateAgentMachineId] = useState<string | null>(null);
   const [hostRegisterOpen, setHostRegisterOpen] = useState(false);
   const [providerAddOpen, setProviderAddOpen] = useState(false);
@@ -5519,6 +5525,7 @@ function SettingsView({
   const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
   const handledTargetAgentIdRef = useRef<string | null>(null);
   const memberEntries = agentMemberEntries(machines);
+  const serviceEntries = serviceMemberEntries(machines);
   const onlineAgents = memberEntries.filter((entry) => entry.agent.status === "online").length;
   const canCreateAgentFromAnyHost = machines.some(
     (machine) => machineCanCreateAgent(machine) && machine.providers.length > 0,
@@ -5535,12 +5542,16 @@ function SettingsView({
   }> = [
     { id: "hosts", label: "Registered Hosts", count: machines.length, icon: Server },
     { id: "agents", label: "Agents", count: memberEntries.length, icon: Bot },
-    { id: "services", label: "Services", count: 0, icon: Split },
+    { id: "services", label: "Services", count: serviceEntries.length, icon: Split },
   ];
   const selectedMemberEntry =
     selectedAgentId === null
       ? null
       : memberEntries.find((entry) => entry.agent.spec.actor.id === selectedAgentId) ?? null;
+  const selectedServiceEntry =
+    selectedServiceId === null
+      ? null
+      : serviceEntries.find((entry) => entry.service.id === selectedServiceId) ?? null;
   const selectedMachine =
     selectedMemberEntry?.machine ??
     machines.find((machine) => machine.id === selectedMachineId) ??
@@ -5572,6 +5583,15 @@ function SettingsView({
       setSelectedAgentId(null);
     }
   }, [memberEntries, selectedAgentId]);
+
+  useEffect(() => {
+    if (
+      selectedServiceId &&
+      !serviceEntries.some((entry) => entry.service.id === selectedServiceId)
+    ) {
+      setSelectedServiceId(null);
+    }
+  }, [selectedServiceId, serviceEntries]);
 
   useEffect(() => {
     if (!targetAgentId) {
@@ -5617,6 +5637,7 @@ function SettingsView({
     setActiveSection("hosts");
     setSelectedMachineId(machine.id);
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, machine));
   }
 
@@ -5624,7 +5645,15 @@ function SettingsView({
     setActiveSection("agents");
     setSelectedMachineId(entry.machine.id);
     setSelectedAgentId(entry.agent.spec.actor.id);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, entry.machine));
+  }
+
+  function selectService(entry: ServiceMemberEntry) {
+    setActiveSection("services");
+    setSelectedMachineId(entry.machine.id);
+    setSelectedAgentId(null);
+    setSelectedServiceId(entry.service.id);
   }
 
   function openCreateAgentDialog(machine?: MachineInfo | null) {
@@ -5661,9 +5690,15 @@ function SettingsView({
     setSelectedAgentId(null);
   }
 
+  function showServiceRoster() {
+    setActiveSection("services");
+    setSelectedServiceId(null);
+  }
+
   function openRegisterHostDialog() {
     setActiveSection("hosts");
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setHostRegisterOpen(true);
   }
 
@@ -5671,6 +5706,7 @@ function SettingsView({
     setActiveSection("hosts");
     setSelectedMachineId(machine.id);
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, machine));
   }
 
@@ -5678,13 +5714,16 @@ function SettingsView({
     setActiveSection(section);
     if (section === "agents") {
       setSelectedAgentId(null);
+      setSelectedServiceId(null);
       return;
     }
     if (section === "hosts") {
       setSelectedAgentId(null);
+      setSelectedServiceId(null);
       return;
     }
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
   }
 
   const detailContent =
@@ -5723,7 +5762,18 @@ function SettingsView({
         />
       )
     ) : (
-      <ServiceRosterOverview />
+      selectedServiceEntry ? (
+        <ServiceMemberDetail
+          entry={selectedServiceEntry}
+          onBack={showServiceRoster}
+        />
+      ) : (
+        <ServiceRosterOverview
+          entries={serviceEntries}
+          machines={machines}
+          onSelectService={selectService}
+        />
+      )
     );
 
   return (
@@ -5934,11 +5984,24 @@ function SettingsView({
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
                     Services
                   </div>
-                  <span className="count-badge">0</span>
+                  <span className="count-badge">{serviceEntries.length}</span>
                 </div>
-                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
-                  No services registered.
-                </div>
+                {serviceEntries.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
+                    No services registered.
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {serviceEntries.map((entry) => (
+                      <ServiceListItem
+                        key={`${entry.machine.id}:${entry.service.id}`}
+                        entry={entry}
+                        selected={selectedServiceEntry?.service.id === entry.service.id}
+                        onSelect={() => selectService(entry)}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
               )}
             </div>
@@ -6238,6 +6301,46 @@ function MemberListItem({
         </span>
         <span className="mt-0.5 block truncate text-xs text-[#667085]">
           {entry.machine.name}
+        </span>
+      </span>
+    </button>
+  );
+}
+
+function ServiceListItem({
+  entry,
+  selected,
+  onSelect,
+}: {
+  entry: ServiceMemberEntry;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const service = entry.service;
+
+  return (
+    <button
+      type="button"
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors",
+        selected
+          ? "border-[#bdb7ff] bg-[#f6f4ff] shadow-sm"
+          : "border-transparent bg-transparent hover:border-[#dfe3ec] hover:bg-white",
+      )}
+      onClick={onSelect}
+    >
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+        <Split size={16} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="truncate text-sm font-bold text-[#111827]">
+            {serviceDisplayName(service)}
+          </span>
+          <span className={cn("h-2 w-2 shrink-0 rounded-full", serviceStatusDotClass(service))} />
+        </span>
+        <span className="mt-0.5 block truncate text-xs text-[#667085]">
+          {service.kind} / {entry.machine.name}
         </span>
       </span>
     </button>
@@ -6842,18 +6945,328 @@ function ProviderAddDialog({
   );
 }
 
-function ServiceRosterOverview() {
+function ServiceRosterOverview({
+  entries,
+  machines,
+  onSelectService,
+}: {
+  entries: ServiceMemberEntry[];
+  machines: MachineInfo[];
+  onSelectService: (entry: ServiceMemberEntry) => void;
+}) {
+  const schedulerCount = entries.filter((entry) => entry.service.kind === "scheduler").length;
+  const autostartCount = entries.filter((entry) => entry.service.autostart !== false).length;
+  const hostCount = new Set(entries.map((entry) => entry.machine.id)).size;
+
   return (
     <div className="min-h-full bg-white">
       <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
-        <h2 className="text-xl font-bold text-[#111827]">Services</h2>
-        <div className="mt-2 text-sm text-[#667085]">0 registered</div>
+        <div className="flex flex-wrap items-start justify-between gap-6">
+          <div className="min-w-0">
+            <h2 className="text-xl font-bold text-[#111827]">Services</h2>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+              <span>{entries.length} registered</span>
+              <span className="text-[#a0a6b3]">/</span>
+              <span>{schedulerCount} scheduler</span>
+              <span className="text-[#a0a6b3]">/</span>
+              <span>{hostCount} hosts</span>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-start gap-6">
+            <HostMetric label="Services" value={entries.length} />
+            <HostMetric label="Autostart" value={autostartCount} />
+            <HostMetric label="Hosts" value={hostCount} />
+          </div>
+        </div>
       </section>
-      <HostDetailSection title="Service Roster" count={0}>
-        <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-          No services registered.
+
+      <HostDetailSection title="Service Roster" count={entries.length}>
+        {entries.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+            No services registered.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {entries.map((entry) => (
+              <button
+                key={`${entry.machine.id}:${entry.service.id}`}
+                type="button"
+                className="w-full rounded-xl border border-[#edf0f5] bg-[#fbfbfd] px-4 py-3 text-left transition-colors hover:border-[#c8c1ff] hover:bg-white"
+                onClick={() => onSelectService(entry)}
+              >
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_160px_160px_110px] lg:items-center">
+                  <div className="min-w-0 flex items-start gap-3">
+                    <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+                      <Split size={16} />
+                    </span>
+                    <div className="min-w-0">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="truncate text-sm font-bold text-[#111827]">
+                          {serviceDisplayName(entry.service)}
+                        </span>
+                        <Badge variant="secondary">{entry.service.kind}</Badge>
+                        <Badge variant={entry.service.autostart === false ? "warning" : "success"}>
+                          {entry.service.autostart === false ? "manual" : "autostart"}
+                        </Badge>
+                      </div>
+                      <div className="mt-1 truncate font-mono text-xs text-[#667085]">
+                        {entry.service.id}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-[#9aa1ae]">
+                      Host
+                    </div>
+                    <div className="mt-1 truncate text-sm font-semibold text-[#303849]">
+                      {entry.machine.name}
+                    </div>
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-[#9aa1ae]">
+                      Lifecycle
+                    </div>
+                    <div className="mt-1 truncate text-sm font-semibold text-[#303849]">
+                      {serviceLifecycleLabel(entry.service)}
+                    </div>
+                  </div>
+                  <div className="text-right text-xs font-semibold text-[#503ed4] lg:text-left">
+                    Inspect
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </HostDetailSection>
+
+      <HostDetailSection title="Host Coverage" count={machines.length}>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {machines.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+              No registered hosts.
+            </div>
+          ) : (
+            machines.map((machine) => (
+              <div
+                key={machine.id}
+                className="rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-4"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-bold text-[#111827]">
+                      {machine.name}
+                    </div>
+                    <div className="mt-1 truncate text-xs text-[#667085]">
+                      {machine.providers.length} runtimes / {machine.agentCount} agents
+                    </div>
+                  </div>
+                  <Badge variant={machine.serviceCount > 0 ? "success" : "outline"}>
+                    {machine.serviceCount} services
+                  </Badge>
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </HostDetailSection>
+    </div>
+  );
+}
+
+function ServiceMemberDetail({
+  entry,
+  onBack,
+}: {
+  entry: ServiceMemberEntry;
+  onBack: () => void;
+}) {
+  const { machine, service } = entry;
+  const [activeTab, setActiveTab] = useState<ServiceDetailTab>("overview");
+  const serviceKey = `${machine.id}:${service.id}`;
+  const tabs: Array<{
+    id: ServiceDetailTab;
+    label: string;
+    icon: ComponentType<{ size?: string | number; className?: string }>;
+  }> = [
+    { id: "overview", label: "Overview", icon: Split },
+    { id: "spec", label: "Spec", icon: FileText },
+    { id: "config", label: "Config", icon: Settings },
+  ];
+
+  useEffect(() => {
+    setActiveTab("overview");
+  }, [serviceKey]);
+
+  return (
+    <div className="min-h-full bg-white">
+      <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onBack}
+          className="mb-4 rounded-lg px-2 text-[#596174] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+        >
+          <ArrowLeft size={15} />
+          All Services
+        </Button>
+        <div className="flex flex-wrap items-start justify-between gap-6">
+          <div className="flex min-w-0 items-start gap-4">
+            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[#6f83f7] to-[#4e3ad5] text-white shadow-sm">
+              <Split size={25} />
+            </div>
+            <div className="min-w-0">
+              <h2 className="truncate text-xl font-bold text-[#111827]">
+                {serviceDisplayName(service)}
+              </h2>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
+                <span className={cn("h-2 w-2 rounded-full", serviceStatusDotClass(service))} />
+                <span>{service.autostart === false ? "Manual" : "Autostart"}</span>
+                <span className="text-[#a0a6b3]">/</span>
+                <span className="font-mono text-xs">{service.id}</span>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="secondary">{service.kind}</Badge>
+                <Badge variant="outline">{serviceLifecycleLabel(service)}</Badge>
+                <Badge variant={service.autostart === false ? "warning" : "success"}>
+                  {service.autostart === false ? "manual" : "autostart"}
+                </Badge>
+                <Badge variant="secondary">{machine.name}</Badge>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-start gap-6">
+            <HostMetric label="Jobs" value={serviceJobCount(service)} />
+            <HostMetric label="Config Keys" value={serviceConfigKeyCount(service)} />
+            <HostMetric label="Host Services" value={machine.serviceCount} />
+          </div>
+        </div>
+      </section>
+
+      <div className="border-b border-[#dfe3ec] bg-[#fbfbfd] px-6 pt-4 lg:px-8">
+        <div className="flex flex-wrap gap-2">
+          {tabs.map((tab) => {
+            const Icon = tab.icon;
+            const selected = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                className={cn(
+                  "flex h-10 items-center gap-2 rounded-t-lg border border-b-0 px-3 text-sm font-semibold transition-colors",
+                  selected
+                    ? "border-[#dfe3ec] bg-white text-[#503ed4]"
+                    : "border-transparent text-[#596174] hover:border-[#dfe3ec] hover:bg-white",
+                )}
+                onClick={() => setActiveTab(tab.id)}
+              >
+                <Icon size={15} />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {activeTab === "overview" && (
+        <>
+          <HostDetailSection title="Runtime Summary">
+            <div className="divide-y divide-[#edf0f5]">
+              <HostInfoRow label="Display Name">
+                {serviceDisplayName(service)}
+              </HostInfoRow>
+              <HostInfoRow label="Service ID" mono>
+                {service.id}
+              </HostInfoRow>
+              <HostInfoRow label="Actor ID" mono>
+                {service.actor?.id || "Not set"}
+              </HostInfoRow>
+              <HostInfoRow label="Kind">
+                {service.kind || "Not set"}
+              </HostInfoRow>
+              <HostInfoRow label="Lifecycle">
+                {serviceLifecycleLabel(service)}
+              </HostInfoRow>
+              <HostInfoRow label="Autostart">
+                {service.autostart === false ? "Off" : "On"}
+              </HostInfoRow>
+              <HostInfoRow label="Host">
+                {machine.name}
+              </HostInfoRow>
+            </div>
+          </HostDetailSection>
+
+          <HostDetailSection title="Scheduler Jobs" count={serviceJobs(service).length}>
+            {serviceJobs(service).length === 0 ? (
+              <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
+                No scheduler jobs declared in this service config.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {serviceJobs(service).map((job, index) => (
+                  <div
+                    key={serviceJobId(job, index)}
+                    className="rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-4"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-bold text-[#111827]">
+                          {serviceJobId(job, index)}
+                        </div>
+                        <div className="mt-1 truncate font-mono text-xs text-[#667085]">
+                          {serviceJobCommand(job) || "No command source"}
+                        </div>
+                      </div>
+                      <Badge variant="outline">
+                        {serviceJobSchedule(job) || "unscheduled"}
+                      </Badge>
+                    </div>
+                    <div className="mt-3 grid gap-2 text-xs text-[#667085] md:grid-cols-3">
+                      <div>
+                        <div className="font-semibold uppercase tracking-wide text-[#9aa1ae]">
+                          Target
+                        </div>
+                        <div className="mt-1 truncate font-medium text-[#303849]">
+                          {serviceJobTarget(job) || "Not set"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="font-semibold uppercase tracking-wide text-[#9aa1ae]">
+                          Scope
+                        </div>
+                        <div className="mt-1 truncate font-medium text-[#303849]">
+                          {serviceJobScope(job) || "Not set"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="font-semibold uppercase tracking-wide text-[#9aa1ae]">
+                          Dedupe
+                        </div>
+                        <div className="mt-1 truncate font-medium text-[#303849]">
+                          {serviceJobDedupe(job) || "Not set"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </HostDetailSection>
+        </>
+      )}
+
+      {activeTab === "spec" && (
+        <HostDetailSection title="Service Spec">
+          <JsonInspector value={service} />
+        </HostDetailSection>
+      )}
+
+      {activeTab === "config" && (
+        <HostDetailSection title="Config Payload">
+          <JsonInspector value={serviceConfigValue(service)} />
+        </HostDetailSection>
+      )}
     </div>
   );
 }
@@ -9519,6 +9932,90 @@ function agentMemberEntries(machines: MachineInfo[]): AgentMemberEntry[] {
   return machines.flatMap((machine) =>
     machine.agents.map((agent) => ({ machine, agent })),
   );
+}
+
+function serviceMemberEntries(machines: MachineInfo[]): ServiceMemberEntry[] {
+  return machines.flatMap((machine) =>
+    (machine.services || []).map((service) => ({ machine, service })),
+  );
+}
+
+function serviceDisplayName(service: MachineInfo["services"][number]) {
+  return service.displayName || service.actor?.displayName || service.id;
+}
+
+function serviceLifecycleLabel(service: MachineInfo["services"][number]) {
+  const value = typeof service.lifecycle === "string" ? service.lifecycle : "";
+  return value || "default";
+}
+
+function serviceStatusDotClass(service: MachineInfo["services"][number]) {
+  return service.autostart === false ? "bg-amber-500" : "bg-emerald-500";
+}
+
+function serviceConfigValue(service: MachineInfo["services"][number]) {
+  return service.config ?? {};
+}
+
+function serviceConfigKeyCount(service: MachineInfo["services"][number]) {
+  const config = serviceConfigValue(service);
+  return isPlainObject(config) ? Object.keys(config).length : 0;
+}
+
+function serviceJobs(service: MachineInfo["services"][number]): Record<string, unknown>[] {
+  const config = serviceConfigValue(service);
+  if (!isPlainObject(config)) return [];
+  const jobs = config.jobs;
+  if (!Array.isArray(jobs)) return [];
+  return jobs.filter(isPlainObject);
+}
+
+function serviceJobCount(service: MachineInfo["services"][number]) {
+  return serviceJobs(service).length;
+}
+
+function serviceJobId(job: Record<string, unknown>, index: number) {
+  return typeof job.id === "string" && job.id.trim() ? job.id : `job_${index + 1}`;
+}
+
+function serviceJobSchedule(job: Record<string, unknown>) {
+  return typeof job.schedule === "string" ? job.schedule : "";
+}
+
+function serviceJobTarget(job: Record<string, unknown>) {
+  return typeof job.targetAgent === "string" ? job.targetAgent : "";
+}
+
+function serviceJobDedupe(job: Record<string, unknown>) {
+  const dedupeBy = typeof job.dedupeBy === "string" ? job.dedupeBy : "";
+  const cursorBy = typeof job.cursorBy === "string" ? job.cursorBy : "";
+  return [dedupeBy, cursorBy].filter(Boolean).join(" / ");
+}
+
+function serviceJobScope(job: Record<string, unknown>) {
+  const scope = job.scope;
+  if (!isPlainObject(scope)) return "";
+  const kind = typeof scope.kind === "string" ? scope.kind : "";
+  const id = typeof scope.id === "string" ? scope.id : "";
+  return [kind, id].filter(Boolean).join(":");
+}
+
+function serviceJobCommand(job: Record<string, unknown>) {
+  const source = job.source;
+  if (!isPlainObject(source)) return "";
+  return typeof source.command === "string" ? source.command : "";
+}
+
+function JsonInspector({ value }: { value: unknown }) {
+  return (
+    <pre className="max-h-[520px] overflow-auto rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-4 font-mono text-xs leading-5 text-[#303849] soft-scrollbar">
+      {JSON.stringify(value, null, 2)}
+    </pre>
+  );
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function providerAvailabilityGroups(machines: MachineInfo[]): ProviderAvailabilityGroup[] {

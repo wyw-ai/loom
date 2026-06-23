@@ -7,12 +7,12 @@
 //!
 //! ## Mapping
 //!
-//! | [`Signal`] variant | Unix          | Windows                                                              |
-//! |--------------------|---------------|----------------------------------------------------------------------|
-//! | [`Signal::Term`]   | `SIGTERM` (15)| `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
-//! | [`Signal::Kill`]   | `SIGKILL` (9) | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
-//! | [`Signal::Quit`]   | `SIGQUIT` (3) | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
-//! | [`Signal::Interrupt`] | `SIGINT` (2) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` with a short delivery-verification wait, then `TerminateProcess(1)` fallback if the child doesn't exit in time |
+//! | [`Signal`] variant | Unix                          | Windows                                                              |
+//! |--------------------|-------------------------------|----------------------------------------------------------------------|
+//! | [`Signal::Term`]   | `kill(-pgid, SIGTERM)` (15)   | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
+//! | [`Signal::Kill`]   | `kill(-pgid, SIGKILL)` (9)    | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
+//! | [`Signal::Quit`]   | `kill(-pgid, SIGQUIT)` (3)    | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
+//! | [`Signal::Interrupt`] | `kill(-pgid, SIGINT)` (2)  | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` with a short delivery-verification wait, then `TerminateProcess(1)` fallback if the child doesn't exit in time |
 //!
 //! Windows has no per-signal granularity for `TerminateProcess`; the three
 //! "forced" variants therefore collapse to the same handle-based call.
@@ -35,6 +35,13 @@
 //!   therefore do not need a manual [`force_kill_pid`] fallback for the
 //!   common case; they may still call it explicitly when they need to
 //!   skip the grace window.
+//! - On Unix the same process-group setup (`process_group(0)` →
+//!   `setpgid(0, 0)`, see `process/unix.rs`) makes the child its own pgid
+//!   leader, so the backend targets `kill(-pgid, sig)` to reach the whole
+//!   subtree (leader + grandchildren holding the stdout pipe) and falls
+//!   back to `kill(pid, sig)` only when the group-targeted call fails
+//!   (e.g. the target was not spawned through our `process` module and
+//!   owns no group). This mirrors the Windows `CTRL_BREAK_EVENT` reach.
 //! - All functions are *fire-and-forget*: they do not wait for the child
 //!   to exit. Wait on the owned `Child` separately when ordering matters.
 //!

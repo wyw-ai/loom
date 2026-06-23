@@ -367,8 +367,7 @@ fn signal_child(pid: u32) -> Result<(), String> {
 /// Windows arm was an unconditional `Err` no-op, which left timed-out /
 /// cancelled agent subprocesses (and their grandchildren) running.
 fn force_kill_child(pid: u32) -> Result<(), String> {
-    loom_platform::signal::force_kill_pid(pid)
-        .map_err(|e| format!("force_kill({pid}) failed: {e}"))
+    loom_platform::signal::force_kill_pid(pid).map_err(|e| format!("force_kill({pid}) failed: {e}"))
 }
 
 fn run_prompt(

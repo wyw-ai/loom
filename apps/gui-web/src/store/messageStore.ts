@@ -67,7 +67,7 @@ export interface MessageStore {
   setDirectDraft: (draft: string | ((prev: string) => string)) => void;
 }
 
-export const useMessageStore = create<MessageStore>((set, get) => ({
+export const useMessageStore = create<MessageStore>((set) => ({
   messages: [],
   threadMessages: [],
   directMessages: [],

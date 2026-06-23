@@ -394,7 +394,17 @@ async fn decode_json_response<T: for<'de> Deserialize<'de>>(
     serde_json::from_str(&text).with_context(|| format!("parsing {label} response"))
 }
 
+#[allow(clippy::disallowed_methods)] // G1 OS shell (PM-Arbitration-003) — see body
 fn open_browser(url: &str) -> Result<()> {
+    // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3
+    // [G1: OS shell visibility] (PM-Arbitration-003 judgement).
+    // These user-facing browser launchers must NOT use
+    // `loom_platform::process::Command` until P1-Cmd-Sweep verifies that the
+    // newtype's default Windows flags (CREATE_NO_WINDOW |
+    // CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP) do not break the
+    // browser/explorer launch UX. P0-Lint (`clippy::disallowed_methods`) is
+    // active workspace-wide; the fn-level allow above is the documented G1
+    // exemption (covers all three platform branches below).
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut cmd = Command::new("open");

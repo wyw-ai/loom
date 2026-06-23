@@ -11,7 +11,7 @@ mod ws;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::routing::get;
 use axum::Router;
 use clap::Parser;
@@ -47,7 +47,31 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    loom_platform::console::init();
+    agent_runtime::tracing_setup::init_file_tracing("server", "info");
+
+    // Install a panic hook that logs panics to the tracing system.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        tracing::error!(
+            location = %location,
+            payload = %payload,
+            "loom-server PANIC"
+        );
+        default_hook(info);
+    }));
+
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
@@ -121,38 +145,29 @@ async fn serve_file_rpc(state: AppState, root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 async fn serve_unix(state: AppState, socket: PathBuf) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
+    use loom_platform::ipc::{LocalListener, LocalSocketName};
 
     if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create unix socket dir {}", parent.display()))?;
-    }
-    if socket.exists() {
-        let file_type = std::fs::symlink_metadata(&socket)
-            .with_context(|| format!("stat unix socket {}", socket.display()))?
-            .file_type();
-        if !file_type.is_socket() {
-            bail!("{} exists and is not a unix socket", socket.display());
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create local socket dir {}", parent.display()))?;
         }
-        std::fs::remove_file(&socket)
-            .with_context(|| format!("remove stale unix socket {}", socket.display()))?;
     }
 
-    let listener = tokio::net::UnixListener::bind(&socket)
-        .with_context(|| format!("bind unix socket {}", socket.display()))?;
-    tracing::info!(socket = %socket.display(), "loom-server listening on unix socket");
+    let name = LocalSocketName::from_path(socket.clone())
+        .with_context(|| format!("build socket name from {}", socket.display()))?;
+    let listener = LocalListener::bind(&name)
+        .await
+        .with_context(|| format!("bind local socket {}", name.display()))?;
+    tracing::info!(socket = %name.display(), "loom-server listening on local socket");
     loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(ws::handle_unix_socket(state.clone(), stream));
+        let stream = listener
+            .accept()
+            .await
+            .with_context(|| format!("accept local socket {}", name.display()))?;
+        tokio::spawn(ws::handle_local_socket(state.clone(), stream));
     }
-}
-
-#[cfg(not(unix))]
-async fn serve_unix(_state: AppState, socket: PathBuf) -> Result<()> {
-    let _ = socket;
-    bail!("unix sockets are only supported on Unix platforms");
 }
 
 fn spawn_reminder_worker(state: AppState) {
@@ -160,19 +175,12 @@ fn spawn_reminder_worker(state: AppState) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
+            // fire_due_reminders is infallible (returns Vec, not Result).
+            // RwLock poisoning is handled by rc4 mutex-poisoning fixes.
             let fired = state.store.fire_due_reminders();
             for reminder in fired {
                 tracing::debug!(reminder = %reminder.id, "reminder processed");
             }
         }
     });
-}
-
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
 }

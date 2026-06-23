@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use proto::types::{Actor, ActorKind, Channel, ChannelVisibility, Thread};
+use proto::types::{Actor, ActorKind, Channel, ChannelVisibility, RunStatus, Thread};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
+
+use super::app::AgentStatusInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarFocus {
@@ -17,6 +19,10 @@ pub enum SidebarFocus {
 /// Render-friendly snapshot of a channel member. Built from `actor/list` +
 /// `channel/members` so the pane can show a display name and an actor-kind
 /// glyph without re-resolving on every redraw.
+///
+/// V4: agent run status is looked up from `App::agent_statuses` at render
+/// time (not stored on the row), ensuring the sidebar always reflects the
+/// latest `recompute_agent_statuses()` output.
 #[derive(Debug, Clone)]
 pub struct MemberRow {
     pub actor_id: String,
@@ -392,7 +398,12 @@ impl Sidebar {
         }
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect) {
+    pub fn render(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        agent_statuses: &HashMap<String, AgentStatusInfo>,
+    ) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -409,7 +420,7 @@ impl Sidebar {
             .split(inner);
         self.render_channels(f, layout[0]);
         self.render_threads(f, layout[1]);
-        self.render_members(f, layout[2]);
+        self.render_members(f, layout[2], agent_statuses);
     }
 
     fn render_channels(&mut self, f: &mut Frame, area: Rect) {
@@ -508,7 +519,12 @@ impl Sidebar {
         f.render_stateful_widget(list, area, &mut self.threads_state);
     }
 
-    fn render_members(&mut self, f: &mut Frame, area: Rect) {
+    fn render_members(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        agent_statuses: &HashMap<String, AgentStatusInfo>,
+    ) {
         let focused = matches!(self.focus, SidebarFocus::Members);
         let title = if focused {
             " ▸ Members  [i=invite · I=by-id · x=remove] "
@@ -557,6 +573,24 @@ impl Sidebar {
                     spans.push(Span::styled(kind_glyph, kind_style));
                 }
                 spans.push(Span::raw(m.display.clone()));
+                // ── V4: agent run-status dot + label (from agent_statuses) ──
+                if m.kind == ActorKind::Agent {
+                    if let Some(info) = agent_statuses.get(&m.actor_id) {
+                        if let Some(status) = info.status {
+                            let dot_color = run_status_color(status, info.is_stale);
+                            spans.push(Span::raw(" "));
+                            spans.push(Span::styled("●", Style::default().fg(dot_color)));
+                        }
+                        if !info.label.is_empty() {
+                            spans.push(Span::raw(" "));
+                            spans.push(Span::styled(
+                                info.label.clone(),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                    }
+                }
+                // ── end V4 ────────────────────────────────────────────
                 if is_me {
                     spans.push(Span::styled(
                         "  (you)",
@@ -599,6 +633,23 @@ fn highlight_style(focused: bool) -> Style {
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
+    }
+}
+
+/// Colour dot for an agent's run status, matching gui-web V3 conventions.
+/// Stale (timeout) runs get a bright-yellow glow effect via bold modifier.
+fn run_status_color(status: RunStatus, is_stale: bool) -> Color {
+    if is_stale {
+        return Color::Yellow;
+    }
+    match status {
+        RunStatus::Running => Color::Magenta,
+        RunStatus::WaitingTool => Color::Rgb(255, 165, 0), // orange
+        RunStatus::PreparingContext => Color::Blue,
+        RunStatus::Queued => Color::Gray,
+        RunStatus::Failed => Color::Red,
+        RunStatus::Canceled => Color::DarkGray,
+        RunStatus::Completed => Color::DarkGray, // shouldn't appear; just in case
     }
 }
 

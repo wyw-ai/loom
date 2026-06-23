@@ -12,7 +12,7 @@
 //! | [`Signal::Term`]   | `SIGTERM` (15)| `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
 //! | [`Signal::Kill`]   | `SIGKILL` (9) | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
 //! | [`Signal::Quit`]   | `SIGQUIT` (3) | `OpenProcess(PROCESS_TERMINATE \| SYNCHRONIZE)` + `TerminateProcess(1)` |
-//! | [`Signal::Interrupt`] | `SIGINT` (2) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` then fallback to `TerminateProcess(1)` if it fails |
+//! | [`Signal::Interrupt`] | `SIGINT` (2) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` with a short delivery-verification wait, then `TerminateProcess(1)` fallback if the child doesn't exit in time |
 //!
 //! Windows has no per-signal granularity for `TerminateProcess`; the three
 //! "forced" variants therefore collapse to the same handle-based call.
@@ -26,9 +26,15 @@
 //!   [`crate::process::TokioCommand`] satisfy the [Windows process-group
 //!   requirement] for `GenerateConsoleCtrlEvent` automatically
 //!   (`CREATE_NEW_PROCESS_GROUP` is applied by `apply_*_defaults`). Sending
-//!   [`Signal::Interrupt`] to a PID that is **not** the leader of its own
-//!   console process group returns an `Err` on Windows; the caller may
-//!   then fall back to [`force_kill_pid`].
+//!   [`Signal::Interrupt`] on Windows always *attempts* to behave like a
+//!   `SIGINT`-with-kill-fallback: the Win32 backend first queues
+//!   `CTRL_BREAK_EVENT`, waits a short grace period to verify the child
+//!   actually exited (the `GenerateConsoleCtrlEvent` API returns success
+//!   even when the event has nowhere to land — e.g. `CREATE_NO_WINDOW`
+//!   children), and otherwise escalates to `TerminateProcess`. Callers
+//!   therefore do not need a manual [`force_kill_pid`] fallback for the
+//!   common case; they may still call it explicitly when they need to
+//!   skip the grace window.
 //! - All functions are *fire-and-forget*: they do not wait for the child
 //!   to exit. Wait on the owned `Child` separately when ordering matters.
 //!
@@ -56,8 +62,9 @@ pub enum Signal {
     /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` (`CTRL_BREAK_EVENT`
     /// is the event that honours per-process-group delivery for a
     /// `CREATE_NEW_PROCESS_GROUP` child; `CTRL_C_EVENT` would broadcast to
-    /// the whole console and ignore the group id), with a
-    /// `TerminateProcess` fallback if the call fails.
+    /// the whole console and ignore the group id), followed by a short
+    /// delivery-verification wait and a `TerminateProcess` fallback if
+    /// the child has not exited by then.
     Interrupt,
     /// Quit with optional core dump. Unix: `SIGQUIT`. Windows:
     /// `TerminateProcess` (no native equivalent).

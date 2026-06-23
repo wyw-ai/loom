@@ -4143,7 +4143,7 @@ mod tests {
         cfg.prompt_via = PromptVia::Stdin;
         cfg.resume_args = Some(vec![
             "-c".into(),
-            "printf '%s\\n' 'API Error: 400 messages.7.content.3: thinking or redacted_thinking blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.' >&2; exit 1".into(),
+            "cat >/dev/null; printf '%s\\n' 'API Error: 400 messages.7.content.3: thinking or redacted_thinking blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.' >&2; exit 1".into(),
         ]);
         let request = prompt("ignored");
         let signature = command_signature_for_prompt(&cfg, &request);

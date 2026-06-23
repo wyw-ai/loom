@@ -1830,7 +1830,7 @@ pub struct ActorGroupMemberResult {
 
 // ---- agent/* ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentTransport {
     /// `"acp_stdio"` (default) or `"command"` (see docs/command-transport-v0.md).
     pub kind: String,
@@ -1914,32 +1914,6 @@ pub struct AgentTransport {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-}
-
-impl Default for AgentTransport {
-    fn default() -> Self {
-        Self {
-            kind: String::new(),
-            command: String::new(),
-            args: Vec::new(),
-            arg_specs: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            auth_method: None,
-            model: None,
-            model_args: Vec::new(),
-            session: None,
-            output_format: None,
-            decoder: None,
-            stderr_decoder: None,
-            prompt_via: PromptVia::default(),
-            prompt: None,
-            stdin: None,
-            timeout_ms: None,
-            idle_timeout_ms: None,
-            interactive: None,
-            provider: None,
-        }
-    }
 }
 
 impl AgentTransport {
@@ -2378,7 +2352,7 @@ pub enum ProviderSessionIdSource {
     ProviderCapture,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractiveCommandSpec {
     #[serde(default)]
@@ -2393,19 +2367,7 @@ pub struct InteractiveCommandSpec {
     pub kill: InteractiveKillSpec,
 }
 
-impl Default for InteractiveCommandSpec {
-    fn default() -> Self {
-        Self {
-            session: InteractiveSessionSpec::default(),
-            prompt: InteractivePromptSpec::default(),
-            completion: InteractiveCompletionSpec::default(),
-            output: InteractiveOutputSpec::default(),
-            kill: InteractiveKillSpec::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractiveSessionSpec {
     #[serde(default)]
@@ -2420,19 +2382,6 @@ pub struct InteractiveSessionSpec {
     pub on_signature_changed: InteractiveSignatureChangedPolicy,
     #[serde(default)]
     pub on_resume_failed: InteractiveResumeFailedPolicy,
-}
-
-impl Default for InteractiveSessionSpec {
-    fn default() -> Self {
-        Self {
-            id_strategy: InteractiveSessionIdStrategy::default(),
-            new_args: Vec::new(),
-            resume_args: Vec::new(),
-            on_missing: InteractiveSessionMissingPolicy::default(),
-            on_signature_changed: InteractiveSignatureChangedPolicy::default(),
-            on_resume_failed: InteractiveResumeFailedPolicy::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

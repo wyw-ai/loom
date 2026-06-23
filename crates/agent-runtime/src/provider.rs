@@ -206,6 +206,17 @@ impl ProviderRegistry {
         &self,
         provider_ref: &AgentProviderRef,
     ) -> Result<ProviderRuntimePlan, String> {
+        self.resolve_runtime_plan_with_path(
+            provider_ref,
+            std::env::var_os("PATH").unwrap_or_default(),
+        )
+    }
+
+    pub fn resolve_runtime_plan_with_path(
+        &self,
+        provider_ref: &AgentProviderRef,
+        path: OsString,
+    ) -> Result<ProviderRuntimePlan, String> {
         let manifest = self
             .get(&provider_ref.id)
             .ok_or_else(|| format!("provider `{}` not found", provider_ref.id))?;
@@ -219,7 +230,6 @@ impl ProviderRegistry {
                 provider_ref.id
             )
         })?;
-        let path = std::env::var_os("PATH").unwrap_or_default();
         let bin = find_command_in_path(&manifest.detect.candidates, &path)
             .or_else(|| command_candidate_from_mode(mode))
             .ok_or_else(|| {
@@ -4012,7 +4022,9 @@ mod tests {
     fn extended_provider_mode_patch_merges_args_env_and_runtime_settings() {
         let config = temp_dir("extends");
         let providers = providers_dir(&config);
+        let path_dir = temp_dir("extends-path");
         std::fs::create_dir_all(&providers).expect("providers dir");
+        make_executable(&path_dir.join("codex"));
         std::fs::write(
             providers.join("codex_budgeted.json"),
             r#"{
@@ -4054,12 +4066,15 @@ mod tests {
         assert!(!mode.env.contains_key("LOOM_NO_DAEMON"));
         assert!(mode.prompt.is_none());
         let plan = registry
-            .resolve_runtime_plan(&AgentProviderRef {
-                id: "codex_budgeted".into(),
-                mode: Some("print".into()),
-                model: None,
-                reasoning_effort: None,
-            })
+            .resolve_runtime_plan_with_path(
+                &AgentProviderRef {
+                    id: "codex_budgeted".into(),
+                    mode: Some("print".into()),
+                    model: None,
+                    reasoning_effort: None,
+                },
+                path_dir.into_os_string(),
+            )
             .expect("runtime plan");
         assert!(plan.prompt.is_none());
         assert_eq!(

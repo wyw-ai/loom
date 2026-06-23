@@ -12,6 +12,7 @@
 #   2  fmt failed
 #   3  clippy failed
 #   4  test failed
+#   5  frontend-lint failed
 #
 # Pair script: scripts/ci/run-matrix.ps1 (PowerShell for Windows).
 # See docs/ci/local-matrix.md for the design rationale.
@@ -22,16 +23,18 @@ set -o pipefail
 SKIP_FMT=0
 SKIP_CLIPPY=0
 SKIP_TEST=0
+SKIP_FRONTEND=0
 QUICK=0
 STRICT_CLIPPY=0
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/ci/run-matrix.sh [--skip-fmt] [--skip-clippy] [--skip-test] [--quick] [--strict-clippy] [-h|--help]
+Usage: scripts/ci/run-matrix.sh [--skip-fmt] [--skip-clippy] [--skip-test] [--skip-frontend] [--quick] [--strict-clippy] [-h|--help]
 
   --skip-fmt        skip cargo fmt --check
   --skip-clippy     skip cargo clippy
   --skip-test       skip cargo test
+  --skip-frontend   skip apps/gui-web frontend-lint (npm run lint)
   --quick           alias for --skip-clippy (faster local iteration)
   --strict-clippy   promote clippy warnings to errors (-D warnings); target end-state
   -h, --help        show this help
@@ -43,6 +46,7 @@ while [ $# -gt 0 ]; do
         --skip-fmt) SKIP_FMT=1 ;;
         --skip-clippy) SKIP_CLIPPY=1 ;;
         --skip-test) SKIP_TEST=1 ;;
+        --skip-frontend) SKIP_FRONTEND=1 ;;
         --quick) QUICK=1 ;;
         --strict-clippy) STRICT_CLIPPY=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -131,6 +135,23 @@ if [ "$SKIP_TEST" -eq 0 ]; then
     run_stage test 4 cargo test --workspace --exclude loom-gui --no-fail-fast
 else
     printf '%sSKIP test%s\n' "$c_ylw" "$c_rst"
+fi
+
+if [ "$SKIP_FRONTEND" -eq 0 ]; then
+    frontend_dir="$REPO_ROOT/apps/gui-web"
+    if [ ! -f "$frontend_dir/package.json" ]; then
+        printf '%s[SKIP] frontend-lint (no apps/gui-web/package.json)%s\n' "$c_ylw" "$c_rst"
+    elif ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        printf '%s[SKIP] frontend-lint (no node/npm)%s\n' "$c_ylw" "$c_rst"
+    else
+        stage 'npm run lint  [apps/gui-web : tsc --noEmit]'
+        (
+            cd "$frontend_dir"
+            run_stage frontend-lint 5 npm run lint
+        )
+    fi
+else
+    printf '%sSKIP frontend-lint%s\n' "$c_ylw" "$c_rst"
 fi
 
 total_end=$(date +%s)

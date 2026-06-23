@@ -14,6 +14,7 @@
         2  fmt failed
         3  clippy failed
         4  test failed
+        5  frontend-lint failed
 
 .PARAMETER SkipFmt
     Skip cargo fmt --check.
@@ -23,6 +24,11 @@
 
 .PARAMETER SkipTest
     Skip cargo test.
+
+.PARAMETER SkipFrontend
+    Skip the frontend-lint stage (`npm run lint` in apps/gui-web). The stage is
+    automatically skipped when node/npm are unavailable or apps/gui-web is
+    missing; use this switch to opt out even when the toolchain is present.
 
 .PARAMETER Quick
     Equivalent to -SkipClippy (clippy is the slowest stage). Use during
@@ -57,6 +63,7 @@ param(
     [switch]$SkipFmt,
     [switch]$SkipClippy,
     [switch]$SkipTest,
+    [switch]$SkipFrontend,
     [switch]$Quick,
     [switch]$StrictClippy
 )
@@ -133,6 +140,28 @@ if (-not $SkipTest) {
     Invoke-Stage 'test' { cargo test --workspace --exclude loom-gui --no-fail-fast } 4
 } else {
     Write-Host 'SKIP test' -ForegroundColor Yellow
+}
+
+if (-not $SkipFrontend) {
+    $frontendDir = Join-Path $RepoRoot 'apps\gui-web'
+    $frontendPkg = Join-Path $frontendDir 'package.json'
+    $hasNode = [bool](Get-Command node -ErrorAction SilentlyContinue)
+    $hasNpm  = [bool](Get-Command npm  -ErrorAction SilentlyContinue)
+    if (-not (Test-Path $frontendPkg)) {
+        Write-Host '[SKIP] frontend-lint (no apps/gui-web/package.json)' -ForegroundColor Yellow
+    } elseif (-not ($hasNode -and $hasNpm)) {
+        Write-Host '[SKIP] frontend-lint (no node/npm)' -ForegroundColor Yellow
+    } else {
+        Write-Stage 'npm run lint  [apps/gui-web : tsc --noEmit]'
+        Push-Location $frontendDir
+        try {
+            Invoke-Stage 'frontend-lint' { npm run lint } 5
+        } finally {
+            Pop-Location
+        }
+    }
+} else {
+    Write-Host 'SKIP frontend-lint' -ForegroundColor Yellow
 }
 
 $total.Stop()

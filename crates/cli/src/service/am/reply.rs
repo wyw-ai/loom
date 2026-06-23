@@ -16,10 +16,10 @@
 //! Pure functions where possible; subprocess + filesystem live in
 //! [`send_via_am`] and [`spawn_detached_async_reply`].
 
+use loom_platform::process::Command;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -240,7 +240,6 @@ pub fn spawn_detached_async_reply(
     payload: &Value,
     log_path: &Path,
 ) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
     if let Some(parent) = log_path.parent() {
@@ -266,16 +265,19 @@ pub fn spawn_detached_async_reply(
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::from(log))
-    .stderr(Stdio::from(log_err))
-    .process_group(0);
+    .stderr(Stdio::from(log_err));
+    // `process_group(0)` is applied automatically by
+    // `loom_platform::process::Command::new` on Unix; on Windows the newtype
+    // applies CREATE_NEW_PROCESS_GROUP (also part of the default flag set).
     cmd.spawn().context("spawn detached async-reply child")?;
     Ok(())
 }
 
-/// Windows fallback — no `process_group(0)`. Spawns the child without
-/// detachment; the parent is expected to exit quickly so the OS treats
-/// the child as a normal background process. Untested on Windows in
-/// S2; flagged here so we don't promise behavior we don't deliver.
+/// Windows fallback — `loom_platform::process::Command::new` applies the
+/// Windows default `CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+/// CREATE_NEW_PROCESS_GROUP` flag set; the child is therefore detached from
+/// the parent's console and job object. Untested on Windows in S2; flagged
+/// here so we don't promise behavior we don't deliver.
 #[cfg(not(unix))]
 pub fn spawn_detached_async_reply(
     binary_path: &Path,
@@ -293,19 +295,19 @@ pub fn spawn_detached_async_reply(
         .open(log_path)?;
     let log_err = log.try_clone()?;
     let payload_str = serde_json::to_string(payload)?;
-    Command::new(binary_path)
-        .args([
-            "service",
-            "am-handler",
-            "--service-id",
-            service_id,
-            "--async-reply",
-            &payload_str,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .spawn()
+    let mut cmd = Command::new(binary_path);
+    cmd.args([
+        "service",
+        "am-handler",
+        "--service-id",
+        service_id,
+        "--async-reply",
+        &payload_str,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(log))
+    .stderr(Stdio::from(log_err));
+    cmd.spawn()
         .context("spawn detached async-reply child (windows)")?;
     Ok(())
 }

@@ -1,3 +1,4 @@
+pub mod ansi;
 pub mod jsonrpc;
 pub mod marketplace;
 pub mod methods;

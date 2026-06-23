@@ -12,12 +12,12 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use proto::methods::{
-    AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport, ClaudeSettingsMode,
-    ClaudeSettingsSpec, CommandOutputFormat, CommandSession, CommandSessionIdSource,
-    InteractiveCommandSpec, InteractiveCompletionContractSpec, InteractiveCompletionSpec,
-    InteractiveKillAction, InteractiveKillKind, InteractiveKillSpec, InteractiveOutputSpec,
-    InteractivePromptSpec, InteractiveProviderSpec, InteractiveSessionSpec, PromptVia,
-    ProviderArgSpec, ProviderConditionalArgSpec, ProviderDecoderCaptureSpec,
+    default_instructions_via, AgentModelChoice, AgentModelSpec, AgentProviderRef, AgentTransport,
+    ClaudeSettingsMode, ClaudeSettingsSpec, CommandOutputFormat, CommandSession,
+    CommandSessionIdSource, InteractiveCommandSpec, InteractiveCompletionContractSpec,
+    InteractiveCompletionSpec, InteractiveKillAction, InteractiveKillKind, InteractiveKillSpec,
+    InteractiveOutputSpec, InteractivePromptSpec, InteractiveProviderSpec, InteractiveSessionSpec,
+    PromptVia, ProviderArgSpec, ProviderConditionalArgSpec, ProviderDecoderCaptureSpec,
     ProviderDecoderEmitSpec, ProviderDecoderEventSpec, ProviderDecoderSpec, ProviderDetectSpec,
     ProviderJsonConditionSpec, ProviderJsonlReduceSpec, ProviderJsonlTextReducerSpec,
     ProviderManifest, ProviderModeSpec, ProviderPromptOutputSpec, ProviderPromptRoleHint,
@@ -81,6 +81,9 @@ pub struct ProviderRuntimePlan {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// How instructions are injected. "prompt" or "agents_md".
+    #[serde(default)]
+    pub instructions_via: String,
 }
 
 /// Transport-neutral events produced by provider output decoders before Loom
@@ -124,13 +127,18 @@ impl ProviderRuntimePlan {
             output_format: Some(output_format),
             decoder: self.decoder,
             stderr_decoder: self.stderr_decoder,
-            prompt_via: PromptVia::Args,
+            prompt_via: if self.stdin.is_some() {
+                PromptVia::Stdin
+            } else {
+                PromptVia::Args
+            },
             prompt: self.prompt,
             stdin: self.stdin,
             timeout_ms: self.timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
             interactive: self.interactive,
             provider: self.provider,
+            instructions_via: Some(self.instructions_via),
         }
     }
 }
@@ -1910,11 +1918,15 @@ fn runtime_plan_from_manifest(
     } else {
         flatten_args_for_inventory(&resume_arg_specs)
     };
-    let env = mode
+    let mut env: BTreeMap<String, String> = mode
         .env
         .iter()
         .map(|(key, value)| (key.clone(), expand_static_template(value, bin)))
-        .collect::<BTreeMap<_, _>>();
+        .collect();
+    // Merge agent-spec env overrides — agent spec wins over provider manifest.
+    for (key, value) in &provider_ref.env {
+        env.insert(key.clone(), value.clone());
+    }
     let model_args = mode
         .model_args
         .iter()
@@ -1966,6 +1978,7 @@ fn runtime_plan_from_manifest(
         idle_timeout_ms: mode.idle_timeout_ms,
         interactive: mode.interactive.clone(),
         provider: mode.provider.clone(),
+        instructions_via: mode.instructions_via.clone(),
     };
     output_format(&mode.stdout)?;
     validate_manifest(manifest)?;
@@ -2124,6 +2137,7 @@ fn mode(
         env: BTreeMap::new(),
         stdin: None,
         prompt: None,
+        instructions_via: default_instructions_via(),
         stdout: ProviderDecoderSpec {
             format: "builtin".into(),
             name: Some(stdout_name.into()),
@@ -2333,6 +2347,7 @@ fn claude_manifest() -> ProviderManifest {
         env: BTreeMap::new(),
         stdin: None,
         prompt: None,
+        instructions_via: default_instructions_via(),
         stdout: ProviderDecoderSpec {
             format: "text".into(),
             ..Default::default()
@@ -2479,7 +2494,27 @@ fn qoder_manifest() -> ProviderManifest {
 }
 
 fn copilot_manifest() -> ProviderManifest {
-    let args = vec![
+    // Prompt is delivered via stdin (not -p) to avoid Windows command-line
+    // length limits (MAX_PATH / 32,768 chars).  When the full user prompt is
+    // in argv, long prompts cause os error 206 (ERROR_FILENAME_EXCED_RANGE)
+    // on Windows.  stdin delivery is cross-platform safe.
+    let first_run_args = vec![
+        lit("--add-dir"),
+        lit("{agent.configDir}"),
+        lit("--yolo"),
+        lit("--output-format"),
+        lit("json"),
+        lit("--stream"),
+        lit("off"),
+        lit("--session-id"),
+        lit("{session.id}"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("--effort"), lit("{reasoningEffort}")],
+        ),
+    ];
+    let resume_args = vec![
         lit("--add-dir"),
         lit("{agent.configDir}"),
         lit("--yolo"),
@@ -2494,12 +2529,10 @@ fn copilot_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--effort"), lit("{reasoningEffort}")],
         ),
-        lit("-p"),
-        lit("{prompt.full}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
-        resume_args: args.clone(),
+        resume_args,
         scope: Some("actor_scope".into()),
     };
     manifest(
@@ -2507,8 +2540,17 @@ fn copilot_manifest() -> ProviderManifest {
         "GitHub Copilot CLI",
         &["copilot", "copilotcli"],
         BTreeMap::from([("print".into(), {
-            let mut mode = mode("{bin}", args, "copilot_jsonl_final_text", Some(session));
+            let mut mode = mode(
+                "{bin}",
+                first_run_args,
+                "copilot_jsonl_final_text",
+                Some(session),
+            );
             mode.stdout = copilot_jsonl_decoder();
+            mode.instructions_via = "agents_md".into();
+            // Deliver prompt via stdin to avoid Windows command-line length
+            // limits.  Copilot reads from stdin when no -p flag is present.
+            mode.stdin = Some("{prompt.full}".into());
             mode
         })]),
         &[
@@ -2672,12 +2714,53 @@ fn find_command_in_path(candidates: &[String], path: &OsString) -> Option<PathBu
         }
         for dir in &path_dirs {
             let path = dir.join(candidate);
-            if is_executable(&path) {
-                return Some(path);
+            if let Some(resolved) = resolve_command_with_pathext(&path) {
+                return Some(resolved);
             }
         }
     }
     None
+}
+
+/// On Windows, a command name like `copilot` may exist as `copilot` (shell
+/// script), `copilot.cmd`, `copilot.exe`, etc.  We must try PATHEXT
+/// extensions in order so we don't pick a non-executable file (e.g. a
+/// `#!/bin/sh` wrapper) that `CreateProcessW` cannot run.
+#[cfg(windows)]
+fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
+    // If the path already has an extension, check it directly.
+    if path.extension().is_some() {
+        return if is_executable(path) {
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
+    }
+    // Try each PATHEXT extension in order.
+    let pathext = std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT"));
+    for ext in std::env::split_paths(&pathext) {
+        let mut with_ext = path.as_os_str().to_os_string();
+        with_ext.push(&ext);
+        let candidate = PathBuf::from(with_ext);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    // Fallback: check the extensionless path (may be a valid PE without
+    // extension, or a shell script — is_executable checks the PE header).
+    if is_executable(path) {
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_command_with_pathext(path: &Path) -> Option<PathBuf> {
+    if is_executable(path) {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn fallback_command_dirs() -> Vec<PathBuf> {
@@ -2720,7 +2803,32 @@ fn is_executable(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         meta.permissions().mode() & 0o111 != 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Files with a PATHEXT-recognized extension (.exe, .cmd, .bat,
+        // .ps1, etc.) are executable by CreateProcessW.
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let pathext = std::env::var_os("PATHEXT")
+                .unwrap_or_else(|| std::ffi::OsString::from(".EXE;.CMD;.BAT"));
+            let ext_dot = format!(".{ext}");
+            return std::env::split_paths(&pathext)
+                .filter_map(|e| {
+                    e.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_ascii_lowercase())
+                })
+                .any(|n| n == ext_dot.to_ascii_lowercase());
+        }
+        // Extensionless files: must be PE images (MZ header).
+        // This rejects Unix shell scripts like `#!/bin/sh` wrappers.
+        if meta.len() < 2 {
+            return false;
+        }
+        std::fs::read(path).map_or(false, |bytes| {
+            bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z'
+        })
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         true
     }
@@ -2751,6 +2859,18 @@ mod tests {
         let mut perms = std::fs::metadata(path).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(path: &Path) {
+        // On Windows, extensionless files require a PE (MZ) header to pass
+        // is_executable().  Append .cmd so resolve_command_with_pathext()
+        // finds the stub via PATHEXT resolution — this mirrors how .cmd
+        // wrappers (e.g. copilot.CMD) are the Windows equivalent of Unix
+        // shell scripts.
+        let mut cmd_path = path.to_path_buf();
+        cmd_path.set_extension("cmd");
+        std::fs::write(&cmd_path, "@echo off\r\n").expect("write executable");
     }
 
     fn prompt_part(key: &'static str, content: &'static str) -> PromptPart {
@@ -3634,6 +3754,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("sonnet".into()),
                 reasoning_effort: None,
+                ..Default::default()
             },
         )
         .expect("transport");
@@ -3673,6 +3794,7 @@ mod tests {
                 mode: Some("nonprint".into()),
                 model: Some("sonnet".into()),
                 reasoning_effort: None,
+                ..Default::default()
             },
         )
         .expect("transport");
@@ -3732,6 +3854,7 @@ mod tests {
             mode: Some("print".into()),
             model: Some("opencode/big-pickle".into()),
             reasoning_effort: None,
+            ..Default::default()
         };
         let plan = runtime_plan_from_manifest(
             &provider.manifest,
@@ -3785,6 +3908,7 @@ mod tests {
             mode: Some("print".into()),
             model: Some("auto".into()),
             reasoning_effort: Some("high".into()),
+            ..Default::default()
         };
         let plan = runtime_plan_from_manifest(
             &provider.manifest,
@@ -3886,6 +4010,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("demo-model".into()),
                 reasoning_effort: None,
+                ..Default::default()
             },
         )
         .expect("runtime plan");
@@ -4026,6 +4151,7 @@ mod tests {
                     mode: Some("print".into()),
                     model: None,
                     reasoning_effort: None,
+                    ..Default::default()
                 },
                 path_dir.into_os_string(),
             )
@@ -4189,5 +4315,67 @@ mod tests {
 
         let err = ProviderRegistry::load(&config).expect_err("shadow should fail");
         assert!(err.contains("conflicts with an existing provider id"));
+    }
+
+    #[test]
+    fn agent_provider_ref_env_overrides_mode_env() {
+        let bin = Path::new("/usr/local/bin/fake-cli");
+        let mode = ProviderModeSpec {
+            transport: "command".into(),
+            command: "/usr/local/bin/fake-cli".into(),
+            args: vec![lit("{prompt.full}")],
+            env: BTreeMap::from([
+                ("BASE_KEY".into(), "from-mode".into()),
+                ("OVERRIDE_ME".into(), "from-mode".into()),
+            ]),
+            stdout: ProviderDecoderSpec {
+                format: "text".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manifest = manifest(
+            "test-provider",
+            "Test Provider",
+            &["fake-cli"],
+            BTreeMap::from([("print".into(), mode.clone())]),
+            &[],
+        );
+
+        let provider_ref = AgentProviderRef {
+            id: "test-provider".into(),
+            mode: Some("print".into()),
+            model: None,
+            reasoning_effort: None,
+            env: BTreeMap::from([
+                ("OVERRIDE_ME".into(), "from-agent-spec".into()),
+                ("AGENT_ONLY".into(), "from-agent-spec".into()),
+            ]),
+        };
+
+        let plan = runtime_plan_from_manifest(
+            &manifest,
+            "print",
+            manifest.modes.get("print").unwrap(),
+            bin,
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        // agent spec env overrides mode's same-name keys
+        assert_eq!(
+            plan.env.get("OVERRIDE_ME").map(String::as_str),
+            Some("from-agent-spec")
+        );
+        // mode-only keys are kept
+        assert_eq!(
+            plan.env.get("BASE_KEY").map(String::as_str),
+            Some("from-mode")
+        );
+        // agent-spec-only keys are added
+        assert_eq!(
+            plan.env.get("AGENT_ONLY").map(String::as_str),
+            Some("from-agent-spec")
+        );
     }
 }

@@ -22,6 +22,7 @@ pub mod memory;
 pub mod profile;
 pub mod provider;
 pub mod server_url;
+pub mod tracing_setup;
 pub mod usage;
 
 pub use adapter::{

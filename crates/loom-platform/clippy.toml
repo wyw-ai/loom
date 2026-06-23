@@ -1,0 +1,8 @@
+# loom-platform is the PAL: it is the *only* crate allowed to call the raw
+# std/tokio process and fs primitives that the workspace `clippy.toml`
+# forbids in business crates. This file intentionally leaves
+# `disallowed-methods` empty so the workspace-wide deny does not apply
+# inside this crate.
+#
+# (The workspace-wide `clippy.toml` is introduced by P0-Lint.)
+disallowed-methods = []

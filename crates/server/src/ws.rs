@@ -140,11 +140,27 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         tx: tx.clone(),
     });
 
-    // Outbound writer.
+    // Outbound writer — sends RPC frames and periodic WebSocket pings to keep
+    // client connections alive through NAT/firewall timeouts and long idle periods.
     let writer = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if sink.send(Message::Text(frame)).await.is_err() {
-                break;
+        let mut ping_ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                frame = rx.recv() => {
+                    match frame {
+                        Some(f) => {
+                            if sink.send(Message::Text(f)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_ticker.tick() => {
+                    if sink.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = sink.send(Message::Close(None)).await;
@@ -169,12 +185,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;
 }
 
-#[cfg(unix)]
-pub async fn handle_unix_socket(state: AppState, socket: tokio::net::UnixStream) {
+pub async fn handle_local_socket(state: AppState, socket: loom_platform::ipc::LocalStream) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let connection_id = new_connection_id();
-    let (reader, mut writer) = socket.into_split();
+    let (reader, mut writer) = tokio::io::split(socket);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     state.subscriptions.add_connection(Connection {
@@ -201,7 +216,7 @@ pub async fn handle_unix_socket(state: AppState, socket: tokio::net::UnixStream)
             Ok(Some(text)) => handle_text_frame(&state, &connection_id, &tx, text).await,
             Ok(None) => break,
             Err(err) => {
-                tracing::warn!(error = %err, "unix rpc socket read failed");
+                tracing::warn!(error = %err, "local socket read failed");
                 break;
             }
         }

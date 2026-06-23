@@ -1,0 +1,37 @@
+<service>
+  <id>LoomDaemon</id>
+  <name>Loom Daemon</name>
+  <description>Loom machine-scoped agent host</description>
+
+  <executable>%BASE%\..\bin\loom-daemon.exe</executable>
+  <arguments></arguments>
+
+  <!-- Crash restart with exponential back-off -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="20 sec"/>
+  <onfailure action="restart" delay="40 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Log rolling: 10 MB or daily -->
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10240</sizeThreshold>
+    <pattern>yyyy-MM-dd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+  </log>
+  <logpath>%LOCALAPPDATA%\loom\logs\daemon</logpath>
+
+  <!-- Auto-start after network is ready -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Environment -->
+  <env name="LOOM_AGENT_DATA_ROOT" value="%LOCALAPPDATA%\loom\agents"/>
+  <env name="RUST_LOG" value="warn"/>
+
+  <!-- Daemon depends on server being up first -->
+  <depend>LoomServer</depend>
+
+  <!-- Graceful stop: wait 15 s then force-kill -->
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <stoptimeout>15 sec</stoptimeout>
+</service>

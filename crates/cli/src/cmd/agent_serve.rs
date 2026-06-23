@@ -43,7 +43,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, sleep, Duration};
 
-use agent_runtime::acp::{AcpAdapter, AcpConfig};
+use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
 use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 use agent_runtime::usage;
@@ -69,10 +69,10 @@ pub async fn run(
     allow_actors: Vec<String>,
 ) -> Result<()> {
     let specs_dir = specs_dir_opt.unwrap_or_else(default_specs_dir);
-    std::fs::create_dir_all(&specs_dir)
+    create_dir_all_unc(&specs_dir)
         .with_context(|| format!("create specs dir {}", specs_dir.display()))?;
     let data_root = default_data_root();
-    std::fs::create_dir_all(&data_root)
+    create_dir_all_unc(&data_root)
         .with_context(|| format!("create data dir {}", data_root.display()))?;
 
     let mut specs = load_specs(&specs_dir)?;
@@ -91,7 +91,7 @@ pub async fn run(
     }
     ensure_agent_config_dirs(&specs)?;
 
-    eprintln!(
+    tracing::info!(
         "loom agent serve: loaded {} agent(s) from {}",
         specs.len(),
         specs_dir.display()
@@ -116,7 +116,7 @@ pub async fn run(
                     }
                     Ok(None) => last_spec.clone(),
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[{actor}] failed to re-read spec ({e}); continuing with last-known spec"
                         );
                         last_spec.clone()
@@ -136,7 +136,7 @@ pub async fn run(
                         sleep(Duration::from_millis(1000)).await;
                         let cur = crate::cmd::reload::read_epoch(&watcher_marker);
                         if cur > baseline_epoch {
-                            eprintln!(
+                            tracing::info!(
                                 "[{actor_for_watch}] reload requested (epoch_ms={cur}); restarting worker"
                             );
                             worker_abort.abort();
@@ -151,24 +151,24 @@ pub async fn run(
                 match join_result {
                     Ok(Ok(())) => {
                         attempt = 0;
-                        eprintln!(
+                        tracing::info!(
                             "[{actor}] worker disconnected; reconnecting in {}s",
                             delay.as_secs()
                         );
                     }
                     Ok(Err(e)) => {
-                        eprintln!(
+                        tracing::error!(
                             "[{actor}] worker exited with error: {e}; reconnecting in {}s",
                             delay.as_secs()
                         );
                     }
                     Err(join_err) if join_err.is_cancelled() => {
                         attempt = 0;
-                        eprintln!("[{actor}] worker aborted for reload; respawning");
+                        tracing::info!("[{actor}] worker aborted for reload; respawning");
                         continue;
                     }
                     Err(join_err) => {
-                        eprintln!(
+                        tracing::error!(
                             "[{actor}] worker task panicked: {join_err}; reconnecting in {}s",
                             delay.as_secs()
                         );
@@ -203,13 +203,13 @@ pub fn spawn_agent_worker_loop(
             match run_agent_worker(spec.clone(), server_url.clone(), data_root.clone()).await {
                 Ok(()) => {
                     attempt = 0;
-                    eprintln!(
+                    tracing::info!(
                         "[{actor}] worker disconnected; reconnecting in {}s",
                         delay.as_secs()
                     );
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[{actor}] worker exited with error: {e}; reconnecting in {}s",
                         delay.as_secs()
                     );
@@ -341,7 +341,7 @@ fn agent_config_dir(actor_id: &str) -> PathBuf {
 fn ensure_agent_config_dirs(specs: &[AgentSpec]) -> Result<()> {
     for spec in specs {
         let dir = agent_config_dir(&spec.actor.id);
-        std::fs::create_dir_all(&dir)
+        create_dir_all_unc(&dir)
             .with_context(|| format!("create agent config dir {}", dir.display()))?;
     }
     Ok(())
@@ -473,14 +473,14 @@ async fn run_machine_host_loop(host: MachineHostSpec, server_url: String) {
         match run_machine_host_once(&host, &server_url).await {
             Ok(()) => {
                 attempt = 0;
-                eprintln!(
+                tracing::info!(
                     "[{}] machine host disconnected; reconnecting in {}s",
                     host.machine_id,
                     delay.as_secs()
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[{}] machine host exited with error: {e:#}; reconnecting in {}s",
                     host.machine_id,
                     delay.as_secs()
@@ -498,9 +498,11 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     client
         .open_connection_as(&host.actor_id, "service", Some(&host.display_name))
         .await?;
-    eprintln!(
+    tracing::info!(
         "[{}] machine host connected to {} as {}",
-        host.machine_id, server_url, host.actor_id
+        host.machine_id,
+        server_url,
+        host.actor_id
     );
 
     let mut notifications = client.notifications.lock().await;
@@ -731,10 +733,12 @@ impl AgentPaths {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| data_root.join("workspaces"));
+        let bundle_root_val = agent_root.join("bundles");
+        let bundle_current_val = bundle_root_val.join("current");
         Self {
             profile: agent_root.join("profile"),
-            bundle_root: agent_root.join("bundles"),
-            bundle_current: agent_root.join("bundles").join("current"),
+            bundle_root: bundle_root_val,
+            bundle_current: bundle_current_val,
             root: agent_root,
             sessions: data_root.join("sessions"),
             scope_workspaces_root,
@@ -764,8 +768,24 @@ impl AgentPaths {
         spec: &AgentSpec,
         bundle_paths: &BundlePaths,
     ) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.profile)?;
-        std::fs::create_dir_all(&self.sessions)?;
+        create_dir_all_unc(&self.profile).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %self.profile.display(),
+                %e,
+                "ensure: create_dir_all_unc profile failed"
+            );
+            e
+        })?;
+        create_dir_all_unc(&self.sessions).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %self.sessions.display(),
+                %e,
+                "ensure: create_dir_all_unc sessions failed"
+            );
+            e
+        })?;
         ensure_bundle(actor_id, spec, bundle_paths, self)?;
         if spec.memory.is_some() {
             let memory_root = spec
@@ -797,12 +817,12 @@ impl AgentPaths {
         let root = if bundle.root.trim().is_empty() {
             self.bundle_root.clone()
         } else {
-            PathBuf::from(self.expand_base(&bundle.root))
+            normalize_path_separators(PathBuf::from(self.expand_base(&bundle.root)))
         };
         let current = if bundle.current.trim().is_empty() {
             self.bundle_current.clone()
         } else {
-            PathBuf::from(self.expand_base(&bundle.current))
+            normalize_path_separators(PathBuf::from(self.expand_base(&bundle.current)))
         };
         BundlePaths {
             root,
@@ -828,13 +848,62 @@ impl AgentPaths {
         actor_id: &str,
         channel_id: &str,
         scope_ref: &ScopeRef,
+        agent_instructions: Option<&str>,
+        actor_context: Option<&str>,
     ) -> std::io::Result<ScopePaths> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
-        std::fs::create_dir_all(&scope.workspace)?;
-        std::fs::create_dir_all(&scope.logs)?;
-        std::fs::create_dir_all(&scope.channel_artifacts)?;
-        ensure_scope_skills_link(&scope.workspace, &scope.skills)?;
-        agent_runtime::ensure_agents_md(&scope.workspace, actor_id)?;
+        create_dir_all_unc(&scope.workspace).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %scope.workspace.display(),
+                %e,
+                "ensure_scope: create_dir_all_unc workspace failed"
+            );
+            e
+        })?;
+        create_dir_all_unc(&scope.logs).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %scope.logs.display(),
+                %e,
+                "ensure_scope: create_dir_all_unc logs failed"
+            );
+            e
+        })?;
+        create_dir_all_unc(&scope.channel_artifacts).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                path = %scope.channel_artifacts.display(),
+                %e,
+                "ensure_scope: create_dir_all_unc channel_artifacts failed"
+            );
+            e
+        })?;
+        ensure_scope_skills_link(&scope.workspace, &scope.skills).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                workspace = %scope.workspace.display(),
+                skills_target = %scope.skills.display(),
+                %e,
+                "ensure_scope: ensure_scope_skills_link failed"
+            );
+            e
+        })?;
+        agent_runtime::ensure_agents_md(
+            &scope.workspace,
+            actor_id,
+            agent_instructions,
+            actor_context,
+        )
+        .map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                workspace = %scope.workspace.display(),
+                %e,
+                "ensure_scope: ensure_agents_md failed"
+            );
+            e
+        })?;
         Ok(scope)
     }
 
@@ -1058,15 +1127,60 @@ fn run_no_reply_file(logs_dir: &Path, run_id: &str) -> PathBuf {
 }
 
 fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(skills_target)?;
+    create_dir_all_unc(skills_target).map_err(|e| {
+        tracing::error!(
+            target = %skills_target.display(),
+            %e,
+            "ensure_scope_skills_link: create_dir_all_unc skills_target failed"
+        );
+        e
+    })?;
     let link_path = workspace.join("skills");
     match std::fs::read_link(&link_path) {
         Ok(existing) if existing == skills_target => return Ok(()),
-        Ok(_) => remove_path_if_exists(&link_path)?,
+        Ok(existing) => {
+            tracing::debug!(
+                link = %link_path.display(),
+                existing = %existing.display(),
+                new_target = %skills_target.display(),
+                "ensure_scope_skills_link: symlink target mismatch, removing old link"
+            );
+            remove_path_if_exists(&link_path).map_err(|e| {
+                tracing::error!(
+                    link = %link_path.display(),
+                    %e,
+                    "ensure_scope_skills_link: remove_path_if_exists failed"
+                );
+                e
+            })?;
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => remove_path_if_exists(&link_path)?,
+        Err(err) => {
+            tracing::debug!(
+                link = %link_path.display(),
+                %err,
+                "ensure_scope_skills_link: read_link error, attempting remove_path_if_exists"
+            );
+            remove_path_if_exists(&link_path).map_err(|e| {
+                tracing::error!(
+                    link = %link_path.display(),
+                    read_link_err = %err,
+                    remove_err = %e,
+                    "ensure_scope_skills_link: remove_path_if_exists after read_link failure"
+                );
+                e
+            })?;
+        }
     }
-    symlink_path(skills_target, &link_path)
+    symlink_path(skills_target, &link_path).map_err(|e| {
+        tracing::error!(
+            target = %skills_target.display(),
+            link = %link_path.display(),
+            %e,
+            "ensure_scope_skills_link: symlink_path failed"
+        );
+        e
+    })
 }
 
 fn ensure_bundle(
@@ -1075,14 +1189,31 @@ fn ensure_bundle(
     paths: &BundlePaths,
     agent_paths: &AgentPaths,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(&paths.root)?;
+    create_dir_all_unc(&paths.root).map_err(|e| {
+        tracing::error!(
+            path = %paths.root.display(),
+            %e,
+            "ensure_bundle: create_dir_all_unc failed for bundle root"
+        );
+        e
+    })?;
     let current = validate_bundle_current(
         &agent_paths.root,
         &agent_paths.profile,
         &agent_paths.root.join("logs"),
         &paths.root,
         &paths.current,
-    )?;
+    )
+    .map_err(|e| {
+        tracing::error!(
+            actor_root = %agent_paths.root.display(),
+            current = %paths.current.display(),
+            bundle_root = %paths.root.display(),
+            %e,
+            "ensure_bundle: validate_bundle_current failed"
+        );
+        e
+    })?;
     let Some(bundle) = spec.bundle.as_ref() else {
         reset_bundle_current_dir(&current)?;
         return Ok(());
@@ -1110,7 +1241,7 @@ fn install_bundle_dir(
     }
     remove_path_if_exists(target)?;
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     match mode {
         BundleInstallMode::Copy => copy_recursively(source, target),
@@ -1121,26 +1252,77 @@ fn install_bundle_dir(
 fn link_current_bundle(installed: &Path, current: &Path) -> std::io::Result<()> {
     remove_path_if_exists(current)?;
     if let Some(parent) = current.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     symlink_path(installed, current)
 }
 
 fn reset_bundle_current_dir(current: &Path) -> std::io::Result<()> {
     remove_path_if_exists(current)?;
-    std::fs::create_dir_all(current)
+    create_dir_all_unc(current)
 }
 
 fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+        Err(err) => {
+            tracing::error!(
+                path = %path.display(),
+                %err,
+                "remove_path_if_exists: symlink_metadata failed"
+            );
+            return Err(err);
+        }
     };
-    if meta.file_type().is_symlink() || meta.is_file() {
-        std::fs::remove_file(path)
+    if meta.file_type().is_symlink() {
+        // On Unix, symlinks are removed via unlink(2) (remove_file).
+        // On Windows, directory symlinks require RemoveDirectoryW (remove_dir),
+        // not DeleteFileW (remove_file). Try remove_dir first for symlinks
+        // since they typically point to directories; fall back to remove_file
+        // for file symlinks.
+        #[cfg(unix)]
+        let result = std::fs::remove_file(path);
+        #[cfg(windows)]
+        let result = std::fs::remove_dir(path).or_else(|e| {
+            if e.raw_os_error() == Some(5) {
+                // os error 5 on remove_dir for a file symlink — try remove_file
+                std::fs::remove_file(path)
+            } else {
+                tracing::error!(
+                    path = %path.display(),
+                    %e,
+                    "remove_path_if_exists: remove_dir failed on symlink"
+                );
+                Err(e)
+            }
+        });
+        result.map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: failed to remove symlink"
+            );
+            e
+        })
+    } else if meta.is_file() {
+        std::fs::remove_file(path).map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: remove_file failed"
+            );
+            e
+        })
     } else {
-        std::fs::remove_dir_all(path)
+        std::fs::remove_dir_all(path).map_err(|e| {
+            tracing::error!(
+                path = %path.display(),
+                %e,
+                "remove_path_if_exists: remove_dir_all failed"
+            );
+            e
+        })
     }
 }
 
@@ -1152,12 +1334,12 @@ fn copy_recursively(source: &Path, target: &Path) -> std::io::Result<()> {
     }
     if meta.is_file() {
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_all_unc(parent)?;
         }
         std::fs::copy(source, target)?;
         return Ok(());
     }
-    std::fs::create_dir_all(target)?;
+    create_dir_all_unc(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         copy_recursively(&entry.path(), &target.join(entry.file_name()))?;
@@ -1172,6 +1354,33 @@ fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn symlink_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    match symlink_path_impl(source, target) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if err.raw_os_error() == Some(1314) || err.raw_os_error() == Some(5) {
+                tracing::warn!(
+                    "loom-daemon: symlink requires administrator privileges on Windows; \
+                     falling back to copy: {} -> {}",
+                    source.display(),
+                    target.display()
+                );
+                if source.is_dir() {
+                    copy_recursively(source, target)
+                } else {
+                    if let Some(parent) = target.parent() {
+                        create_dir_all_unc(parent)?;
+                    }
+                    std::fs::copy(source, target).map(|_| ())
+                }
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn symlink_path_impl(source: &Path, target: &Path) -> std::io::Result<()> {
     if source.is_dir() {
         std::os::windows::fs::symlink_dir(source, target)
     } else {
@@ -1274,7 +1483,20 @@ fn reply_target_for_message(message: &Message) -> String {
         {
             format!("#{}:{}", message.scope.id, message.id)
         }
-        ScopeKind::Channel => message.target.clone(),
+        ScopeKind::Channel => {
+            // Message carries thread context (parent_message_id or
+            // thread_root_message_id is set). Derive the correct thread
+            // reply target instead of returning the bare channel target.
+            let root_or_parent = message
+                .thread_root_message_id
+                .as_ref()
+                .or(message.parent_message_id.as_ref());
+            if let Some(id) = root_or_parent {
+                format!("#{}:{}", message.scope.id, id)
+            } else {
+                message.target.clone()
+            }
+        }
     }
 }
 
@@ -1412,6 +1634,8 @@ struct WorkerState {
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
+    /// How instructions are injected (copied from provider manifest). "prompt" or "agents_md".
+    instructions_via: String,
 }
 
 #[derive(Clone)]
@@ -1514,6 +1738,7 @@ fn test_command_transport() -> AgentTransport {
         session: None,
         output_format: None,
         decoder: None,
+        instructions_via: None,
         stderr_decoder: None,
         prompt_via: proto::methods::PromptVia::default(),
         prompt: None,
@@ -1576,6 +1801,11 @@ impl WorkerState {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
+        let instructions_via = transport
+            .instructions_via
+            .as_deref()
+            .unwrap_or("prompt")
+            .to_string();
         Self {
             actor_id,
             spec,
@@ -1594,13 +1824,14 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             selected_model: Mutex::new(selected_model),
+            instructions_via,
         }
     }
 
     fn current_turn(&self, scope_id: &str) -> Option<ActiveTurn> {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(scope_id)
             .cloned()
     }
@@ -1608,12 +1839,12 @@ impl WorkerState {
     fn set_turn(&self, turn: ActiveTurn) {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(turn.scope.id.clone(), turn);
     }
 
     fn mark_cancel_requested(&self, scope_id: &str, turn_id: &str) -> Option<ActiveTurn> {
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         let turn = active.get_mut(scope_id)?;
         if turn.id != turn_id {
             return None;
@@ -1623,7 +1854,7 @@ impl WorkerState {
     }
 
     fn mark_no_reply_requested(&self, run_id: &str) -> Option<ActiveTurn> {
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         let turn = active.values_mut().find(|turn| turn.run_id == run_id)?;
         turn.no_reply_requested = true;
         Some(turn.clone())
@@ -1633,10 +1864,13 @@ impl WorkerState {
     /// that same scope (if any). Test-only; production uses `finish_and_next`.
     #[cfg(test)]
     fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
-        let mut active = self.active_turns.lock().expect("active_turns poisoned");
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         active.remove(scope_id);
         drop(active);
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let next = match pending.get_mut(scope_id) {
             Some(queue) => queue.pop_front(),
             None => None,
@@ -1653,7 +1887,10 @@ impl WorkerState {
 
     #[cfg(test)]
     fn enqueue(&self, scope_id: &str, trigger: AgentTrigger) {
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Self::enqueue_locked(&mut pending, scope_id, trigger);
     }
 
@@ -1689,9 +1926,12 @@ impl WorkerState {
     /// is what previously let a burst of wakes spawn several overlapping turns
     /// for the same scope.
     fn begin_or_enqueue(&self, scope_id: &str, trigger: AgentTrigger) -> bool {
-        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
+        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
         if busy.contains(scope_id) {
-            let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+            let mut pending = self
+                .pending_triggers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             Self::enqueue_locked(&mut pending, scope_id, trigger);
             false
         } else {
@@ -1709,10 +1949,13 @@ impl WorkerState {
     fn finish_and_next(&self, scope_id: &str) -> Option<AgentTrigger> {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(scope_id);
-        let mut busy = self.scope_busy.lock().expect("scope_busy poisoned");
-        let mut pending = self.pending_triggers.lock().expect("pending poisoned");
+        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(queue) = pending.get_mut(scope_id) {
             let next = queue.pop_front();
             if queue.is_empty() {
@@ -1726,10 +1969,62 @@ impl WorkerState {
         None
     }
 
+    /// Cancel all active turns and queued triggers whose scope belongs to
+    /// `channel_id`. Returns the scopes that had active turns so the caller
+    /// can cancel the adapter for each. Called when a CHANNEL_DELETED stream
+    /// update arrives — the agent must stop working in the deleted channel
+    /// immediately to prevent error-looping and resource waste.
+    fn cancel_channel_work(&self, channel_id: &str) -> Vec<ScopeRef> {
+        // Snapshot the thread→channel cache first so we don't hold two locks.
+        let channel_for_thread: HashMap<String, String> = self
+            .scope_channel_cache
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scopes: Vec<ScopeRef> = Vec::new();
+
+        for turn in active.values_mut() {
+            let belongs = match &turn.scope.kind {
+                ScopeKind::Channel => turn.scope.id == channel_id,
+                ScopeKind::Thread => channel_for_thread
+                    .get(&turn.scope.id)
+                    .map(|c| c == channel_id)
+                    .unwrap_or(false),
+            };
+            if belongs {
+                turn.cancel_requested = true;
+                scopes.push(turn.scope.clone());
+            }
+        }
+        drop(active);
+
+        // Clear pending triggers for scopes in the deleted channel so queued
+        // work doesn't re-dispatch after the adapter finishes.
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for scope in &scopes {
+            pending.remove(&scope.id);
+        }
+        drop(pending);
+
+        // Release the scope-busy gate so the worker doesn't think these scopes
+        // are still occupied.
+        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
+        for scope in &scopes {
+            busy.remove(&scope.id);
+        }
+
+        scopes
+    }
+
     fn has_pending_source(&self, source_id: &str) -> bool {
         self.pending_triggers
             .lock()
-            .expect("pending poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|queue| queue.iter().any(|trigger| trigger.id() == source_id))
     }
@@ -1737,7 +2032,7 @@ impl WorkerState {
     fn has_active_trigger(&self, source_id: &str) -> bool {
         self.active_turns
             .lock()
-            .expect("active_turns poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|turn| turn.trigger_source_id == source_id)
     }
@@ -1748,19 +2043,19 @@ impl WorkerState {
         }
         self.text_buffer
             .lock()
-            .expect("text_buffer poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .entry(turn_id.to_string())
             .or_default()
             .push_str(chunk);
     }
 
     fn take_text(&self, turn_id: &str) -> Option<String> {
-        let mut buf = self.text_buffer.lock().expect("text_buffer poisoned");
+        let mut buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.remove(turn_id).filter(|s| !s.is_empty())
     }
 
     fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
-        let mut totals = self.usage_totals.lock().expect("usage_totals poisoned");
+        let mut totals = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
         let total = totals.entry(scope_id.to_string()).or_default();
         usage::add_usage(total, increment);
         usage::normalized_usage(total.clone())
@@ -1769,21 +2064,21 @@ impl WorkerState {
     fn take_seed_slot(&self, scope_id: &str) -> bool {
         self.seeded
             .lock()
-            .expect("seeded poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id.to_string())
     }
 
     fn record_action_request(&self, message_id: String, request_id: String) {
         self.action_map
             .lock()
-            .expect("action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(message_id, request_id);
     }
 
     fn lookup_action_request(&self, message_id: &str) -> Option<String> {
         self.action_map
             .lock()
-            .expect("action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(message_id)
             .cloned()
     }
@@ -1792,14 +2087,14 @@ impl WorkerState {
         let _ = self
             .action_map
             .lock()
-            .expect("action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(message_id);
     }
 
     fn current_model(&self) -> Option<String> {
         self.selected_model
             .lock()
-            .expect("selected_model poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -1829,21 +2124,24 @@ impl WorkerState {
             return Err(anyhow!("model cannot be empty for {}", self.actor_id));
         }
         persist_model_state(&self.profile_dir, &model)?;
-        *self.selected_model.lock().expect("selected_model poisoned") = Some(model);
+        *self
+            .selected_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(model);
         Ok(())
     }
 
     fn record_model_action_request(&self, message_id: String, request: ModelActionRequest) {
         self.model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(message_id, request);
     }
 
     fn lookup_model_action_request(&self, message_id: &str) -> Option<ModelActionRequest> {
         self.model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(message_id)
             .cloned()
     }
@@ -1851,7 +2149,7 @@ impl WorkerState {
     fn is_model_action_request(&self, message_id: &str) -> bool {
         self.model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .contains_key(message_id)
     }
 
@@ -1859,14 +2157,14 @@ impl WorkerState {
         let _ = self
             .model_action_map
             .lock()
-            .expect("model_action_map poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(message_id);
     }
 
     fn remember_source(&self, source_id: &str) -> bool {
         self.seen_sources
             .lock()
-            .expect("seen_sources poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(source_id.to_string())
     }
 }
@@ -1893,7 +2191,7 @@ fn load_model_state(profile_dir: &Path) -> Option<String> {
 }
 
 fn persist_model_state(profile_dir: &Path, model: &str) -> Result<()> {
-    std::fs::create_dir_all(profile_dir)
+    create_dir_all_unc(profile_dir)
         .with_context(|| format!("create profile dir {}", profile_dir.display()))?;
     let path = model_state_path(profile_dir);
     let text = serde_json::to_string_pretty(&ModelStateFile {
@@ -1994,7 +2292,7 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
 
 async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
     let transport = resolve_transport_for_spec(&spec)
-        .map_err(|e| anyhow!("resolve transport for {}: {e}", spec.actor.id))?;
+        .with_context(|| format!("resolve transport for agent {}", spec.actor.id))?;
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -2003,10 +2301,17 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
     };
     let paths = AgentPaths::new(&data_root, &actor_id);
     let bundle_paths = paths.bundle_paths(&spec);
-    paths.ensure(&actor_id, &spec, &bundle_paths)?;
+    paths
+        .ensure(&actor_id, &spec, &bundle_paths)
+        .with_context(|| format!("ensure agent dirs for {}", actor_id))?;
 
-    let client = Client::connect(&server_url).await?;
-    client.initialize().await?;
+    let client = Client::connect(&server_url)
+        .await
+        .with_context(|| format!("connect to {server_url} for {actor_id}"))?;
+    client
+        .initialize()
+        .await
+        .with_context(|| format!("rpc initialize for {actor_id}"))?;
     // Pre-register the actor row before opening our agent-bound connection.
     // `connection/open` would auto-upsert under the hood, but it can't carry
     // the spec's full `Actor` (display name, kind, capabilities) — explicitly
@@ -2026,14 +2331,14 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         .await?;
     let agent_config_version_id =
         publish_runtime_agent_config(&client, &actor_id, &spec, &transport).await?;
-    eprintln!(
+    tracing::info!(
         "[{actor_id}] connected to {server_url} as {:?}",
         spec.actor.kind
     );
 
     let agent_server_url = agent_child_server_url(&server_url);
     if agent_server_url != server_url {
-        eprintln!(
+        tracing::info!(
             "[{actor_id}] injecting LOOM_SERVER={} for child agents (agent-client connected via {})",
             agent_server_url, server_url
         );
@@ -2048,7 +2353,8 @@ async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBu
         agent_config_version_id,
     ));
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AdapterEvent>();
-    let adapter = build_adapter(&spec, &transport, &paths, &bundle_paths, &agent_server_url)?;
+    let adapter = build_adapter(&spec, &transport, &paths, &bundle_paths, &agent_server_url)
+        .with_context(|| format!("build adapter for {actor_id}"))?;
 
     // Translator: AdapterEvent → server RPC. Drains until adapter drops the
     // sender (worker exit) — at which point the loop falls out and the task
@@ -2305,7 +2611,7 @@ async fn notification_loop(
                     &mut started,
                     actor_id,
                 ).await {
-                    eprintln!("[{actor_id}] failed to drain pending inbox: {e}");
+                    tracing::error!("[{actor_id}] failed to drain pending inbox: {e}");
                 }
                 continue;
             }
@@ -2315,7 +2621,7 @@ async fn notification_loop(
             } => next,
         };
         let Some(n) = next else {
-            eprintln!("[{actor_id}] server disconnected, worker exiting");
+            tracing::info!("[{actor_id}] server disconnected, worker exiting");
             return Ok(());
         };
 
@@ -2348,7 +2654,7 @@ async fn notification_loop(
                 if let Err(e) =
                     handle_action_response_message(&client, &state, &adapter, &message).await
                 {
-                    eprintln!("[{actor_id}] failed to handle action.response message: {e}");
+                    tracing::error!("[{actor_id}] failed to handle action.response message: {e}");
                 } else if let Err(e) =
                     record_delivery_seen_by_id(&client, actor_id, &message.id).await
                 {
@@ -2374,7 +2680,7 @@ async fn notification_loop(
             {
                 Ok(TriggerOutcome::Dispatched) => {}
                 Ok(TriggerOutcome::Queued) => {}
-                Err(e) => eprintln!("[{actor_id}] failed to handle message trigger: {e}"),
+                Err(e) => tracing::error!("[{actor_id}] failed to handle message trigger: {e}"),
             }
             continue;
         }
@@ -2404,7 +2710,7 @@ async fn notification_loop(
             {
                 Ok(TriggerOutcome::Dispatched) => {}
                 Ok(TriggerOutcome::Queued) => {}
-                Err(e) => eprintln!("[{actor_id}] failed to handle event trigger: {e}"),
+                Err(e) => tracing::error!("[{actor_id}] failed to handle event trigger: {e}"),
             }
             continue;
         }
@@ -2417,6 +2723,39 @@ async fn notification_loop(
             };
             if run.actor_id == actor_id && run_requests_no_reply(&run) {
                 let _ = state.mark_no_reply_requested(&run.id);
+            }
+            continue;
+        }
+        if kind == stream_kind::CHANNEL_DELETED {
+            let Some(channel_id) = params
+                .get("data")
+                .and_then(|d| d.get("channelId"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let scopes = state.cancel_channel_work(channel_id);
+            if !scopes.is_empty() {
+                tracing::info!(
+                    "[{actor_id}] channel {channel_id} deleted — canceling {} active turn(s)",
+                    scopes.len()
+                );
+                for scope in &scopes {
+                    if let Err(e) = adapter.cancel(scope.clone()).await {
+                        tracing::warn!(
+                            actor = %actor_id,
+                            channel = %channel_id,
+                            scope = %scope.id,
+                            %e,
+                            "adapter cancel failed for deleted channel",
+                        );
+                    }
+                    // Discard any buffered text for the canceled turn so it
+                    // won't be published later when the adapter finishes.
+                    if let Some(turn) = state.current_turn(&scope.id) {
+                        state.take_text(&turn.id);
+                    }
+                }
             }
             continue;
         }
@@ -2452,9 +2791,10 @@ async fn handle_model_action_response_message(
         .trim()
         .to_string();
     if option_id.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[{}] model action.response message {} ignored: missing metadata.optionId",
-            state.actor_id, message.id
+            state.actor_id,
+            message.id
         );
         return Ok(());
     }
@@ -2474,9 +2814,11 @@ async fn handle_model_action_response_message(
         .or_else(|| state.model_choice(&option_id));
 
     let Some(choice) = choice else {
-        eprintln!(
+        tracing::warn!(
             "[{}] model action.response message {} ignored: unknown model `{}`",
-            state.actor_id, message.id, option_id
+            state.actor_id,
+            message.id,
+            option_id
         );
         state.forget_model_action_request(request_message_id);
         return Ok(());
@@ -2489,9 +2831,12 @@ async fn handle_model_action_response_message(
         state.forget_model_action_request(request_message_id);
         append_model_selection_failure_message(client, state, message, &choice, &option_id, &err)
             .await?;
-        eprintln!(
+        tracing::error!(
             "[{}] failed to select model `{}` via {}: {}",
-            state.actor_id, option_id, message.id, err
+            state.actor_id,
+            option_id,
+            message.id,
+            err
         );
         return Ok(());
     }
@@ -2510,9 +2855,11 @@ async fn handle_model_action_response_message(
         Meta::default(),
     )
     .await?;
-    eprintln!(
+    tracing::info!(
         "[{}] selected model `{}` via {}",
-        state.actor_id, option_id, message.id
+        state.actor_id,
+        option_id,
+        message.id
     );
     Ok(())
 }
@@ -2788,9 +3135,10 @@ async fn handle_action_response_message(
         })
         .filter(|value| !value.trim().is_empty());
     let Some(request_message_id) = request_message_id else {
-        eprintln!(
+        tracing::warn!(
             "[{}] action.response message {} ignored: missing parentMessageId",
-            state.actor_id, message.id
+            state.actor_id,
+            message.id
         );
         return Ok(());
     };
@@ -2799,7 +3147,7 @@ async fn handle_action_response_message(
         .as_deref()
         .is_some_and(is_loom_tool_request_id)
     {
-        eprintln!(
+        tracing::info!(
             "[{}] action.response message {} is for a loom human-interaction tool {}; leaving it for the waiting tool process",
             state.actor_id, message.id, request_message_id
         );
@@ -2818,17 +3166,21 @@ async fn handle_action_response_message(
         Some(id) => id,
         None => match echoed_request_id {
             Some(id) => {
-                eprintln!(
+                tracing::info!(
                     "[{}] action.response message {} used echoed ACP request id for {}",
-                    state.actor_id, message.id, request_message_id
+                    state.actor_id,
+                    message.id,
+                    request_message_id
                 );
                 id
             }
             None => {
-                eprintln!(
+                tracing::warn!(
                     "[{}] action.response message {} ignored: no pending ACP request for {} \
                      (loom-daemon may have restarted after the action.request)",
-                    state.actor_id, message.id, request_message_id
+                    state.actor_id,
+                    message.id,
+                    request_message_id
                 );
                 return Ok(());
             }
@@ -2841,15 +3193,19 @@ async fn handle_action_response_message(
         .unwrap_or("")
         .to_string();
     if option_id.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[{}] action.response message {} ignored: missing metadata.optionId",
-            state.actor_id, message.id
+            state.actor_id,
+            message.id
         );
         return Ok(());
     }
-    eprintln!(
+    tracing::info!(
         "[{}] action.response message {} -> ACP request {} option {}",
-        state.actor_id, message.id, request_id, option_id
+        state.actor_id,
+        message.id,
+        request_id,
+        option_id
     );
     adapter
         .respond_action(request_id.clone(), option_id)
@@ -3111,20 +3467,21 @@ async fn try_ensure_adapter_started(
     if *started {
         return None;
     }
-    eprintln!(
+    tracing::info!(
         "[{}] starting adapter for control command (ACP cold-start can take 30-60s)…",
         state.actor_id
     );
     match adapter.start(event_tx.clone()).await {
         Ok(_) => {
             *started = true;
-            eprintln!("[{}] adapter ready", state.actor_id);
+            tracing::info!("[{}] adapter ready", state.actor_id);
             None
         }
         Err(err) => {
-            eprintln!(
+            tracing::error!(
                 "[{}] adapter start failed for control command: {}",
-                state.actor_id, err
+                state.actor_id,
+                err
             );
             Some(err)
         }
@@ -3146,9 +3503,10 @@ async fn open_model_picker(
             Ok(prompt) => match adapter.list_model_options(prompt).await {
                 Ok(options) => options,
                 Err(err) => {
-                    eprintln!(
+                    tracing::error!(
                         "[{}] failed to load ACP model options: {}",
-                        state.actor_id, err
+                        state.actor_id,
+                        err
                     );
                     adapter_error = Some(err);
                     None
@@ -3210,13 +3568,14 @@ async fn open_model_picker(
         payload,
         trigger.is_message().then(|| trigger.id().to_string()),
         None,
+        trigger.reply_target(),
     )
     .await?;
     state.record_model_action_request(
         sent.message.id.clone(),
         ModelActionRequest { source, choices },
     );
-    eprintln!(
+    tracing::info!(
         "[{}] opened model picker {} for {}",
         state.actor_id,
         sent.message.id,
@@ -3406,9 +3765,15 @@ async fn build_adapter_prompt(
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
         .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
-    let scope_paths = state
-        .paths
-        .ensure_scope(&state.actor_id, &channel_id, scope)?;
+    let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let agent_instructions = agent_instructions_manifest(&state.spec);
+    let scope_paths = state.paths.ensure_scope(
+        &state.actor_id,
+        &channel_id,
+        scope,
+        Some(&agent_instructions),
+        Some(&actor_context),
+    )?;
     let mut template_vars = state
         .paths
         .template_vars(&state.actor_id, &channel_id, scope);
@@ -3913,7 +4278,7 @@ async fn no_reply_file_for_turn(
     let channel_id = resolve_channel_for_scope(client, state, scope).await?;
     let paths = state
         .paths
-        .ensure_scope(&state.actor_id, &channel_id, scope)
+        .ensure_scope(&state.actor_id, &channel_id, scope, None, None)
         .ok()?;
     Some(run_no_reply_file(&paths.logs, run_id))
 }
@@ -3923,7 +4288,7 @@ async fn subscribe_scope(client: &Arc<Client>, state: &WorkerState, scope: &Scop
         .call::<_, Value>(method::SCOPE_SUBSCRIBE, json!({ "scope": scope }))
         .await
     {
-        eprintln!(
+        tracing::error!(
             "[{}] scope/subscribe {}:{} failed: {e}",
             state.actor_id,
             match scope.kind {
@@ -4649,8 +5014,15 @@ async fn compose_envelope_prompt(
 ) -> PromptTelemetry {
     let scope = trigger.scope();
     let first_turn = state.take_seed_slot(&scope.id);
-    let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
-    let agent_instructions = agent_instructions_manifest(&state.spec);
+    let mut actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
+    let mut agent_instructions = agent_instructions_manifest(&state.spec);
+    // For providers that inject instructions via AGENTS.md (e.g. Copilot CLI),
+    // skip the fixed instruction sections from the prompt to avoid bloating
+    // the provider's session context (events.jsonl) with repeated 40KB payloads.
+    if state.instructions_via == "agents_md" {
+        actor_context.clear();
+        agent_instructions.clear();
+    }
     let conversation_context = recent_conversation_context(client, state, trigger).await;
     let members_context = current_scope_members_context(client, state, scope).await;
     let runtime_context = join_prompt_sections([
@@ -5636,13 +6008,13 @@ async fn translate_events(
         // across awaits.
         let Some(ev) = rx.recv().await else { return };
         if let Err(e) = translate_one(&client, &state, &adapter, &actor_id, ev).await {
-            eprintln!("[{actor_id}] translate failed: {e}");
+            tracing::error!("[{actor_id}] translate failed: {e}");
         }
         loop {
             match rx.try_recv() {
                 Ok(ev) => {
                     if let Err(e) = translate_one(&client, &state, &adapter, &actor_id, ev).await {
-                        eprintln!("[{actor_id}] translate failed: {e}");
+                        tracing::error!("[{actor_id}] translate failed: {e}");
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -5767,12 +6139,15 @@ async fn translate_one(
                     .trigger_is_message
                     .then(|| active.trigger_source_id.clone()),
                 Some(active.run_id.clone()),
+                active.reply_target.clone(),
             )
             .await?;
             state.record_action_request(sent.message.id.clone(), id.clone());
-            eprintln!(
+            tracing::info!(
                 "[{actor_id}] action.request {} -> trigger {} (ACP request {})",
-                sent.message.id, active.trigger_actor, id
+                sent.message.id,
+                active.trigger_actor,
+                id
             );
         }
         AdapterEvent::StatusChange { scope: _, status } => {
@@ -5791,6 +6166,42 @@ async fn translate_one(
                 .await?;
             } else {
                 tracing::debug!(actor = %actor_id, %status, "adapter status (no active turn)");
+            }
+        }
+        AdapterEvent::UsageUpdate { scope: _, usage } => {
+            // Streaming token-usage snapshot. Snapshot semantics: each event
+            // REPLACES the latest per-scope in-flight usage; do NOT feed into
+            // the cross-turn `accumulate_usage` (which is delta semantics,
+            // owned by `Finished`).
+            //
+            // U4 wiring: `append_trace` writes a trace frame against the
+            // active run. The store emits `RunUpdated`, which the WS layer
+            // broadcasts as a `stream/update kind=run.updated` to every
+            // connection subscribed to the run's scope. That IS the
+            // `agent.usage` channel B per ARCH design art_f822814f9124 —
+            // delivered over the same WS path the GUI already consumes for
+            // run trace frames. The message-meta channel is dual-written by
+            // the `Finished` handler below via `build_turn_meta`.
+            if let Some(active) = active {
+                if active.cancel_requested {
+                    return Ok(());
+                }
+                append_trace(
+                    client,
+                    &active.run_id,
+                    TraceKind::Status,
+                    json!({
+                        "kind": "agent.usage",
+                        "usage": usage,
+                        "isFinal": false,
+                    }),
+                )
+                .await?;
+            } else {
+                tracing::debug!(
+                    actor = %actor_id,
+                    "UsageUpdate without active turn; dropping"
+                );
             }
         }
         AdapterEvent::Finished {
@@ -5841,6 +6252,24 @@ async fn translate_one(
                     .await?;
                 }
             }
+            // U4 finalization: emit a terminal `agent.usage` trace frame so
+            // GUI clients consuming the trace stream receive the authoritative
+            // final snapshot via channel B (run.updated/trace frames),
+            // mirroring the dual-write into the message metadata. Skip when
+            // the adapter did not report any usage for this turn.
+            if let Some(final_usage) = usage.as_ref() {
+                append_trace(
+                    client,
+                    &active.run_id,
+                    TraceKind::Status,
+                    json!({
+                        "kind": "agent.usage",
+                        "usage": final_usage,
+                        "isFinal": true,
+                    }),
+                )
+                .await?;
+            }
             let run_status = if active.cancel_requested {
                 RunStatus::Canceled
             } else if success {
@@ -5878,7 +6307,9 @@ async fn translate_one(
             if let Some(next) = next_trigger {
                 match dispatch_trigger(client, state, adapter, next).await {
                     Ok(_) => {}
-                    Err(e) => eprintln!("[{actor_id}] failed to dispatch queued trigger: {e}"),
+                    Err(e) => {
+                        tracing::error!("[{actor_id}] failed to dispatch queued trigger: {e}")
+                    }
                 }
             }
         }
@@ -5892,7 +6323,7 @@ async fn translate_one(
                 )
                 .await?;
             } else {
-                eprintln!("[{actor_id}] adapter error (agent-wide): {message}");
+                tracing::error!("[{actor_id}] adapter error (agent-wide): {message}");
             }
         }
     }
@@ -6202,7 +6633,7 @@ async fn append_run_started_ack(
         send_agent_message(
             client,
             target,
-            "已收到，正在处理。".into(),
+            "Received, processing.".into(),
             parent_message_id,
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,
@@ -6215,7 +6646,7 @@ async fn append_run_started_ack(
         send_scope_message(
             client,
             &active.scope,
-            "已收到，正在处理。".into(),
+            "Received, processing.".into(),
             trigger.is_message().then(|| trigger.id().to_string()),
             Some(trigger.actor_id().to_string()),
             MessageIntent::StatusUpdate,
@@ -6343,15 +6774,27 @@ async fn send_action_request_message(
     payload: Value,
     parent_message_id: Option<String>,
     run_id: Option<String>,
+    reply_target_override: Option<String>,
 ) -> Result<MessageSendResult> {
     let mut metadata = action_request_metadata(payload)?;
     if let Some(run_id) = run_id.filter(|value| !value.trim().is_empty()) {
         metadata.insert("runId".into(), json!(run_id));
     }
     let body = format_action_request_body(&metadata);
-    send_scope_message(
+    // Prefer the explicit reply target (which carries the correct thread
+    // root for channel-scoped messages) over deriving from scope alone.
+    let target = match (
+        reply_target_override.as_deref(),
+        scope.kind,
+        &parent_message_id,
+    ) {
+        (Some(ovr), _, _) => ovr.to_string(),
+        (None, ScopeKind::Channel, Some(parent)) => format!("#{}:{}", scope.id, parent),
+        _ => message_target_for_scope(client, scope).await?,
+    };
+    send_agent_message(
         client,
-        scope,
+        &target,
         body,
         parent_message_id,
         Some(target_actor),
@@ -6504,6 +6947,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: false,
             models: None,
@@ -6681,6 +7125,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_bundle_without_bundle_replaces_stale_current_symlink() {
         let root = temp_path("bundle-cleanup");
@@ -6789,6 +7234,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_scope_links_scope_specific_skills_into_workspace() {
         let root = temp_path("scope-skills-link");
@@ -6799,7 +7245,7 @@ mod tests {
         };
 
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope)
+            .ensure_scope("actor_demo", "chan_demo", &scope, None, None)
             .expect("ensure scope");
 
         assert_eq!(
@@ -6902,8 +7348,10 @@ mod tests {
     #[test]
     fn inject_loom_cli_env_sets_absolute_cli_and_prepends_path() {
         let mut env = BTreeMap::new();
-        env.insert("PATH".into(), "/usr/bin:/bin".into());
-        let loom = Path::new("/opt/loom/bin").join("loom");
+        let path_list =
+            std::env::join_paths(&[PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+        env.insert("PATH".into(), path_list.into_string().unwrap());
+        let loom = PathBuf::from("/opt/loom/bin/loom");
 
         inject_loom_cli_env(&mut env, Some(&loom));
 
@@ -6911,8 +7359,9 @@ mod tests {
             env.get(LOOM_CLI_ENV).map(String::as_str),
             Some("/opt/loom/bin/loom")
         );
-        let paths = std::env::split_paths(env.get("PATH").expect("PATH")).collect::<Vec<_>>();
-        assert_eq!(paths.first(), Some(&PathBuf::from("/opt/loom/bin")));
+        let path_val = env.get("PATH").expect("PATH");
+        let paths = std::env::split_paths(path_val).collect::<Vec<_>>();
+        assert!(paths.contains(&PathBuf::from("/opt/loom/bin")));
         assert!(paths.contains(&PathBuf::from("/usr/bin")));
         assert!(paths.contains(&PathBuf::from("/bin")));
     }
@@ -6963,6 +7412,42 @@ mod tests {
         );
 
         assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn candidate1_channel_message_with_thread_root_returns_thread_target() {
+        // Channel-scoped message that carries thread_root_message_id:
+        // the reply must go to the correct thread, not the bare channel.
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+
+        assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_root");
+    }
+
+    #[test]
+    fn candidate1_channel_message_with_only_parent_returns_parent_target() {
+        // Channel-scoped message with only parent_message_id set
+        // (fallback when thread_root_message_id is absent).
+        let message = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            Some("msg_parent"),
+            None,
+        );
+
+        assert_eq!(reply_target_for_message(&message), "#chan_demo:msg_parent");
     }
 
     #[test]
@@ -8319,12 +8804,16 @@ mod tests {
         assert!(vars
             .get("workspace.dir")
             .is_some_and(|value| value.contains("chan_demo")));
-        assert!(vars
-            .get("agent.configDir")
-            .is_some_and(|value| value.ends_with("agents/actor_demo")));
+        assert!(vars.get("agent.configDir").is_some_and(
+            |value| value.ends_with(&format!("agents{}actor_demo", std::path::MAIN_SEPARATOR))
+        ));
         assert!(vars
             .get("agent.specPath")
-            .is_some_and(|value| value.ends_with("agents/actor_demo/spec.json")));
+            .is_some_and(|value| value.ends_with(&format!(
+                "agents{}actor_demo{}spec.json",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            ))));
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -119,6 +119,7 @@
           }
         }
       },
+      "stdin": "{prompt.full}",
       "session": {
         "idSource": "loom_uuid",
         "resumeArgs": [

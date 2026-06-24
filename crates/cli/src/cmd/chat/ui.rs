@@ -118,7 +118,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if let Some(sidebar_rect) = sidebar_area {
         if let Some(s) = app.sidebar.as_mut() {
-            s.render(f, sidebar_rect);
+            s.render(f, sidebar_rect, &app.agent_statuses);
         }
     }
 

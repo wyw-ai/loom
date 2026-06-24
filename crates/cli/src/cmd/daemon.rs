@@ -68,7 +68,11 @@ pub async fn run(
     let selected_machine_id = machine.id.clone();
     let mut selected_machine = machine.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
-    std::fs::create_dir_all(&data_root)
+    let data_root = abs_path(data_root);
+    // Use the UNC-aware wrapper so a deep data root (%USERPROFILE% + machine
+    // id + agent/scope tree) does not trip the 260-char MAX_PATH limit on
+    // Windows. `data_root` is absolute (abs_path), so UNC prefixing is safe.
+    loom_platform::path::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
@@ -121,13 +125,13 @@ pub async fn run(
         let proxy_handle = daemon_ipc::start_proxy(socket_path.clone(), server_url.clone()).await?;
         std::env::set_var(daemon_ipc::ENV_DAEMON_SOCKET, &socket_path);
         if let Err(err) = daemon_ipc::write_discovery(&socket_path, &server_url) {
-            eprintln!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
+            tracing::warn!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
         }
         (Some(socket_path), Some(proxy_handle))
     };
 
     if no_services {
-        eprintln!("loom-daemon: service host disabled by --no-services");
+        tracing::info!("loom-daemon: service host disabled by --no-services");
     } else {
         spawn_service_host(services_dir, server_url.clone(), allow_services);
     }
@@ -137,7 +141,7 @@ pub async fn run(
     let mut running_agents = HashMap::new();
     let mut warned_missing = HashSet::new();
 
-    eprintln!(
+    tracing::info!(
         "loom-daemon: machine={} providers={} data={} reload={}s",
         machine.id,
         providers.len(),
@@ -145,60 +149,123 @@ pub async fn run(
         CONFIG_RELOAD_INTERVAL.as_secs()
     );
     if let Some(socket_path) = socket_path.as_ref() {
-        eprintln!("loom-daemon: socket={}", socket_path.display());
+        tracing::info!("loom-daemon: socket={}", socket_path.display());
     } else {
-        eprintln!("loom-daemon: socket disabled");
+        tracing::info!("loom-daemon: socket disabled");
     }
-    eprintln!("loom-daemon: ready (ctrl-c to stop)");
+    tracing::info!("loom-daemon: ready (ctrl-c to stop)");
 
     loop {
-        match refresh_machine_runtime(
-            &selected_machine_id,
-            &mut selected_machine,
-            &allow_actors,
-            &data_root,
-            &server_url,
-            &machine_inventory,
-            &mut inventory_revision,
-            &mut inventory_fingerprint,
-            &mut running_agents,
-            &mut warned_missing,
-        ) {
-            Ok(()) => {}
-            Err(e) => eprintln!("loom-daemon: reload failed: {e:#}"),
+        // Wrap config reload in a panic guard so a single reload failure
+        // (e.g., from corrupted spec file parsing) doesn't kill the daemon.
+        let reload_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refresh_machine_runtime(
+                &selected_machine_id,
+                &mut selected_machine,
+                &allow_actors,
+                &data_root,
+                &server_url,
+                &machine_inventory,
+                &mut inventory_revision,
+                &mut inventory_fingerprint,
+                &mut running_agents,
+                &mut warned_missing,
+            )
+        }));
+        match reload_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("loom-daemon: reload failed: {e:#}"),
+            Err(panic_err) => {
+                let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("loom-daemon: reload panicked: {msg}");
+                // Sleep a bit after a panic to avoid tight panic loops.
+                sleep(Duration::from_secs(5)).await;
+            }
         }
 
         tokio::select! {
             _ = shutdown_signal() => break,
             maybe_command = machine_command_rx.recv() => {
                 let Some(command) = maybe_command else {
-                    eprintln!("loom-daemon: machine command channel closed");
+                    // Channel closed — the server-side machine command sender was
+                    // dropped. Log once and add a sleep so we don't tight-loop
+                    // on disk I/O from refresh_machine_runtime above.
+                    tracing::warn!("loom-daemon: machine command channel closed; will keep polling config");
+                    sleep(Duration::from_secs(15)).await;
                     continue;
                 };
-                let result = handle_machine_command(
-                    &selected_machine_id,
-                    &mut selected_machine,
-                    command.payload,
-                );
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    if let Err(err) = refresh_machine_runtime(
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_machine_command(
                         &selected_machine_id,
                         &mut selected_machine,
-                        &allow_actors,
-                        &data_root,
-                        &server_url,
-                        &machine_inventory,
-                        &mut inventory_revision,
-                        &mut inventory_fingerprint,
-                        &mut running_agents,
-                        &mut warned_missing,
-                    ) {
-                        let fallback = machine_command_error_from_result(
-                            &result,
-                            format!("machine command applied but runtime refresh failed: {err:#}"),
+                        command.payload,
+                    )
+                }));
+                let result = match result {
+                    Ok(r) => r,
+                    Err(panic_err) => {
+                        let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!("loom-daemon: machine command handler panicked: {msg}");
+                        let fallback = machine_command_error(
+                            json!({}),
+                            format!("internal panic handling machine command: {msg}"),
                         );
                         let _ = command.reply.send(fallback);
                         continue;
+                    }
+                };
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let refresh_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        refresh_machine_runtime(
+                            &selected_machine_id,
+                            &mut selected_machine,
+                            &allow_actors,
+                            &data_root,
+                            &server_url,
+                            &machine_inventory,
+                            &mut inventory_revision,
+                            &mut inventory_fingerprint,
+                            &mut running_agents,
+                            &mut warned_missing,
+                        )
+                    }));
+                    match refresh_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            let fallback = machine_command_error_from_result(
+                                &result,
+                                format!("machine command applied but runtime refresh failed: {err:#}"),
+                            );
+                            let _ = command.reply.send(fallback);
+                            continue;
+                        }
+                        Err(panic_err) => {
+                            let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            let fallback = machine_command_error_from_result(
+                                &result,
+                                format!("machine command applied but refresh panicked: {msg}"),
+                            );
+                            let _ = command.reply.send(fallback);
+                            continue;
+                        }
                     }
                 }
                 let _ = command.reply.send(result);
@@ -207,7 +274,7 @@ pub async fn run(
         }
     }
 
-    eprintln!("\nloom-daemon: shutting down");
+    tracing::info!("loom-daemon: shutting down");
     if let Some(proxy_handle) = proxy_handle {
         proxy_handle.abort();
     }
@@ -318,7 +385,7 @@ fn load_machine_specs(
         .is_none_or(|machine| machine.id != selected_machine_id);
     let restored_context = if was_missing {
         if warned_missing.insert(format!("machine:{selected_machine_id}")) {
-            eprintln!(
+            tracing::warn!(
                 "loom-daemon: selected machine {selected_machine_id} is missing from daemon.toml; restoring live runtime snapshot"
             );
         }
@@ -441,8 +508,14 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create agent spec dir {}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(spec)?;
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    // Strip _meta before writing to disk — _meta is runtime-injected daemon
+    // metadata (machineId, workspaceId, etc.) and should not be persisted to
+    // spec.json. Otherwise fingerprint mismatches on reload trigger an infinite
+    // restart loop.
+    let mut clean_spec = spec.clone();
+    clean_spec.actor._meta = None;
+    let text = serde_json::to_string_pretty(&clean_spec)?;
+    atomic_write(&path, &text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -525,6 +598,16 @@ fn agent_spec_from_command(
         })
         .transpose()?;
 
+    let env: BTreeMap<String, String> = command
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut meta = BTreeMap::new();
     meta.insert("providerId".into(), json!(provider.id.clone()));
     meta.insert("providerName".into(), json!(provider.display_name.clone()));
@@ -557,6 +640,7 @@ fn agent_spec_from_command(
             mode: Some("print".into()),
             model: model.clone(),
             reasoning_effort,
+            env,
         },
         autostart: command
             .get("autostart")
@@ -682,6 +766,16 @@ fn update_agent_spec_from_command(
             )
         };
     }
+    if let Some(env_value) = command.get("env") {
+        if env_value.is_null() {
+            spec.provider_ref.env.clear();
+        } else if let Some(obj) = env_value.as_object() {
+            spec.provider_ref.env = obj
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect();
+        }
+    }
     if let Some(provider) = selected_provider {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         meta.insert("providerId".into(), json!(provider.id.clone()));
@@ -718,10 +812,41 @@ fn reconcile_agents(
         .filter(|actor_id| !desired.contains_key(*actor_id))
         .cloned()
         .collect::<Vec<_>>();
+
+    // Collect stale IDs for server-side cleanup before removing them
+    // from the running map, so zombie actors (from a prior daemon restart
+    // with a different machine_id) don't shadow newer agents with the
+    // same display_name.
+    let stale_for_cleanup: Vec<String> = stale.clone();
+    if !stale_for_cleanup.is_empty() {
+        let url = server_url.to_string();
+        tokio::spawn(async move {
+            let client = match crate::client::Client::connect(&url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        "loom-daemon: failed to connect for stale actor cleanup: {e:#}"
+                    );
+                    return;
+                }
+            };
+            for id in &stale_for_cleanup {
+                let params = json!({ "actorId": id });
+                match client
+                    .call_raw(proto::methods::method::ACTOR_DELETE, Some(params))
+                    .await
+                {
+                    Ok(_) => tracing::info!("[{id}] cleaned up stale actor on server"),
+                    Err(e) => tracing::warn!("[{id}] failed to clean up stale actor: {e:#}"),
+                }
+            }
+        });
+    }
+
     for actor_id in stale {
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();
-            eprintln!("[{actor_id}] stopped: removed from machine config");
+            tracing::info!("[{actor_id}] stopped: removed from machine config");
         }
     }
 
@@ -735,9 +860,9 @@ fn reconcile_agents(
         }
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();
-            eprintln!("[{actor_id}] restarting: machine config changed");
+            tracing::info!("[{actor_id}] restarting: machine config changed");
         } else {
-            eprintln!("[{actor_id}] starting from machine config");
+            tracing::info!("[{actor_id}] starting from machine config");
         }
         let handle =
             agent_serve::spawn_agent_worker_loop(spec, server_url.to_string(), data_root.clone());
@@ -752,7 +877,13 @@ fn reconcile_agents(
 }
 
 fn spec_fingerprint(spec: &AgentSpec) -> String {
-    serde_json::to_string(spec).unwrap_or_else(|_| format!("{spec:?}"))
+    // Exclude _meta from the fingerprint because it is runtime-injected metadata
+    // and should not be treated as a "config change". Otherwise server-initiated
+    // agent.update commands overwrite the on-disk spec.json (including _meta),
+    // causing every reload to detect a change → infinite restart loop.
+    let mut spec_without_meta = spec.clone();
+    spec_without_meta.actor._meta = None;
+    serde_json::to_string(&spec_without_meta).unwrap_or_else(|_| format!("{spec:?}"))
 }
 
 fn annotate_machine_agent_specs(specs: &mut [AgentSpec], machine: &MachineConfig) {
@@ -788,7 +919,7 @@ fn spawn_service_host(
 ) {
     tokio::spawn(async move {
         if let Err(e) = service::serve(services_dir, server_url, allow_services).await {
-            eprintln!("loom-daemon: service host exited with error: {e:#}");
+            tracing::error!("loom-daemon: service host exited with error: {e:#}");
         }
     });
 }
@@ -1045,7 +1176,7 @@ fn write_local_provider_manifest(
         ));
     }
     let text = serde_json::to_string_pretty(raw).context("serialize provider manifest")?;
-    std::fs::write(&path, text)
+    atomic_write(&path, &text)
         .with_context(|| format!("write provider manifest {}", path.display()))?;
     Ok(path)
 }
@@ -1910,6 +2041,7 @@ fn machine_inventory_meta(
             "inventory.read",
             "connection.status",
             "machine.command",
+            "machine.remove",
             "agent.create",
             "agent.update",
             "agent.remove",
@@ -1968,7 +2100,24 @@ fn save_daemon_config(cfg: &DaemonConfig) -> Result<()> {
             .with_context(|| format!("create config dir {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    std::fs::write(&path, text).with_context(|| format!("write daemon config {}", path.display()))
+    atomic_write(&path, &text).with_context(|| format!("write daemon config {}", path.display()))
+}
+
+/// Write `content` to `path` atomically: write to a temporary file first,
+/// then rename it into place.  This prevents config corruption if the
+/// process crashes mid-write.
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp_path, content)?;
+    // On Windows, `rename` over an existing file fails with `PermissionDenied`
+    // if anything holds the destination open (AV, search indexer, the daemon
+    // re-reading config). Best-effort: remove the orphaned temp file so a flaky
+    // rename under contention does not leak a UUID-named temp file per reload.
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn daemon_config_path() -> PathBuf {
@@ -1976,16 +2125,69 @@ fn daemon_config_path() -> PathBuf {
 }
 
 fn resolve_daemon_server_url(cfg: &mut DaemonConfig, server_url: Option<&str>) -> (String, bool) {
-    let selected = server_url
+    let raw = server_url
         .and_then(trimmed_non_empty)
         .or_else(|| trimmed_non_empty(&cfg.server_url))
         .unwrap_or("ws://127.0.0.1:7878/rpc")
         .to_string();
+    let selected = normalize_daemon_server_url(&raw);
     let changed = cfg.server_url != selected;
     if changed {
         cfg.server_url = selected.clone();
     }
+    tracing::info!(
+        raw = %raw,
+        normalized = %selected,
+        "daemon server URL resolved"
+    );
     (selected, changed)
+}
+
+/// Normalize a daemon server URL so that a WebSocket connection to the
+/// server always succeeds regardless of how the URL was persisted.
+///
+/// - Forces `ws://` scheme (replaces `http://`).
+/// - Appends `/rpc` path when missing so the server can upgrade the
+///   connection to WebSocket (the server only upgrades on `/rpc`).
+fn normalize_daemon_server_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "ws://127.0.0.1:7878/rpc".to_string();
+    }
+
+    // Parse the URL, defaulting to ws:// scheme if missing.
+    let (scheme, rest) = if let Some(idx) = trimmed.find("://") {
+        let scheme = &trimmed[..idx];
+        let rest = &trimmed[idx + 3..];
+        (scheme, rest)
+    } else {
+        ("ws", trimmed)
+    };
+
+    // Force ws:// scheme — http:// cannot be upgraded to WebSocket by
+    // tokio_tungstenite and the server only upgrades on the /rpc route.
+    let scheme = if scheme.eq_ignore_ascii_case("wss") {
+        "wss"
+    } else {
+        "ws"
+    };
+
+    // Split host:port from path.
+    let (authority, path) = if let Some(idx) = rest.find('/') {
+        (&rest[..idx], &rest[idx..])
+    } else {
+        (rest, "/")
+    };
+
+    // Ensure path contains /rpc so the server recognises the WebSocket
+    // upgrade route.
+    let path = if path.contains("/rpc") {
+        path.to_string()
+    } else {
+        format!("/rpc{}", path.trim_end_matches('/'))
+    };
+
+    format!("{}://{}{}", scheme, authority.trim_end_matches('/'), path)
 }
 
 fn select_machine_for_daemon(
@@ -2006,7 +2208,10 @@ fn select_machine_for_daemon(
         .as_deref()
         .map(parse_machine_data_root_context)
         .unwrap_or_default();
-    let requested_id = requested.clone().unwrap_or_else(|| "local".into());
+    let requested_id = requested
+        .clone()
+        .or_else(|| cfg.machine.as_ref().map(|m| m.id.clone()))
+        .unwrap_or_else(|| "local".into());
     let mut machine = cfg.machine.clone().unwrap_or_else(|| MachineConfig {
         workspace_id: context.workspace_id.clone(),
         owner_actor_id: context.owner_actor_id.clone(),
@@ -2175,10 +2380,23 @@ fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineC
 }
 
 fn machine_data_root(machine: &MachineConfig) -> PathBuf {
-    if machine.data_root.trim().is_empty() {
+    let raw = if machine.data_root.trim().is_empty() {
         expand_home(&default_agent_data_root_expr())
     } else {
         expand_home(&machine.data_root)
+    };
+    // Always resolve to an absolute path — relative paths break UNC prefixing
+    // in create_dir_all_unc, causing "os error 3" on agent directory creation.
+    abs_path(raw)
+}
+
+fn abs_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 
@@ -2341,6 +2559,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("gpt-5.5".into()),
                 reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
             },
             autostart: false,
             models: Some(AgentModelSpec {
@@ -2423,6 +2642,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: false,
             models: None,
@@ -2567,6 +2787,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: true,
             models: None,

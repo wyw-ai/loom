@@ -25,9 +25,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::TokenUsage;
+
+use proto::ansi::strip_ansi;
+
+use loom_platform::process::Command;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -42,13 +48,12 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
+use crate::acp::create_dir_all_unc;
 use crate::provider::ProviderRuntimeEvent;
-use crate::usage::extract_token_usage_from_text;
+use crate::usage::{extract_token_usage_from_text, observe_usage_line};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 enum ProcessOutput {
     Stdout(String),
@@ -346,50 +351,23 @@ impl Adapter for CommandAdapter {
     }
 }
 
-/// Send SIGTERM to `pid`. Unix only — Windows builds get a stub error so
-/// callers know cancel isn't wired there yet (loom-server's audience is Unix).
-#[cfg(unix)]
+/// Request graceful termination of `pid`. Cross-platform via
+/// `loom_platform::signal` (`SIGTERM` on Unix, `TerminateProcess` on
+/// Windows). Children spawned through `loom_platform::process::Command` are
+/// their own process-group leader (`process_group(0)` is applied
+/// automatically), so the leader PID is the correct signal target on both
+/// platforms.
 fn signal_child(pid: u32) -> Result<(), String> {
-    signal_child_with(pid, libc::SIGTERM)
+    loom_platform::signal::signal_child(pid, loom_platform::signal::Signal::Term)
+        .map_err(|e| format!("signal_child({pid}, SIGTERM) failed: {e}"))
 }
 
-#[cfg(unix)]
-fn signal_child_with(pid: u32, signal: libc::c_int) -> Result<(), String> {
-    let rc = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
-    let rc = if rc == 0 {
-        rc
-    } else {
-        // Older processes may not have been spawned into their own process
-        // group. Fall back to the direct PID for compatibility.
-        unsafe { libc::kill(pid as libc::pid_t, signal) }
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        let err = std::io::Error::last_os_error();
-        // ESRCH (no such process) means the child already exited — racy but
-        // harmless; treat as a successful no-op.
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(format!("kill({pid}, SIGTERM) failed: {err}"))
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn signal_child(_pid: u32) -> Result<(), String> {
-    Err("command transport cancel is not implemented for this platform".into())
-}
-
-#[cfg(unix)]
+/// Force-kill `pid`. Cross-platform via `loom_platform::signal`
+/// (`SIGKILL` on Unix, `TerminateProcess` on Windows). Previously the
+/// Windows arm was an unconditional `Err` no-op, which left timed-out /
+/// cancelled agent subprocesses (and their grandchildren) running.
 fn force_kill_child(pid: u32) -> Result<(), String> {
-    signal_child_with(pid, libc::SIGKILL)
-}
-
-#[cfg(not(unix))]
-fn force_kill_child(_pid: u32) -> Result<(), String> {
-    Err("command transport timeout kill is not implemented for this platform".into())
+    loom_platform::signal::force_kill_pid(pid).map_err(|e| format!("force_kill({pid}) failed: {e}"))
 }
 
 fn run_prompt(
@@ -613,6 +591,168 @@ struct SpawnOutcome {
     stderr: String,
 }
 
+/// Observes provider subprocess output and emits periodic health-status
+/// `AdapterEvent::StatusChange` events.  Pure observation — never kills.
+struct HealthObserver {
+    scope: ScopeRef,
+    last_activity: Instant,
+    last_health_report: Instant,
+    /// Sliding window of recent line hashes for repetition detection.
+    recent_hashes: std::collections::VecDeque<u64>,
+    /// How many times the same hash can appear in the window before a
+    /// repetition warning fires.
+    repetition_threshold: usize,
+    /// Maximum recent-window size.
+    window_size: usize,
+    /// How long without activity before emitting `"health: idle [N s]"`.
+    idle_warning: Duration,
+    /// Set to Some when a repetition warning has already fired for the current
+    /// dominant hash (avoids spam).
+    repetition_fired_for: Option<u64>,
+    /// Minimum line length for repetition detection (ignore blank/very short lines).
+    min_line_len: usize,
+}
+
+impl HealthObserver {
+    fn new(scope: ScopeRef) -> Self {
+        Self {
+            scope,
+            last_activity: Instant::now(),
+            last_health_report: Instant::now(),
+            recent_hashes: std::collections::VecDeque::with_capacity(128),
+            repetition_threshold: 20,
+            window_size: 100,
+            idle_warning: Duration::from_secs(60),
+            repetition_fired_for: None,
+            min_line_len: 4,
+        }
+    }
+
+    /// Call after each stdout line is processed.  If the line produced
+    /// meaningful output (text/finish), reset the idle timer.
+    fn observe_stdout(&mut self, raw_line: &str, had_output: bool) {
+        if had_output {
+            self.last_activity = Instant::now();
+        }
+        let trimmed = raw_line.trim();
+        if trimmed.len() >= self.min_line_len {
+            let hash = hash_line(trimmed);
+            if self.recent_hashes.len() >= self.window_size {
+                self.recent_hashes.pop_front();
+            }
+            self.recent_hashes.push_back(hash);
+        }
+    }
+
+    /// Call after each stderr line.
+    fn observe_stderr(&mut self, _raw_line: &str) {
+        // Stderr is informational; we track it but it doesn't affect liveness
+        // directly.  Specific error-flood detection can be added here later.
+    }
+
+    /// Call once per read-loop iteration.  Emits `StatusChange` when the
+    /// health picture changes meaningfully, and persists health events to
+    /// the tracing log for audit and diagnostics.
+    fn tick(&mut self, sender: &mpsc::UnboundedSender<AdapterEvent>) {
+        let now = Instant::now();
+        let idle_secs = now.duration_since(self.last_activity).as_secs();
+
+        // 1. Repetition detection (check every tick)
+        if let Some(repeat_msg) = self.check_repetition() {
+            let status = format!("health: warning [{}]", repeat_msg);
+            tracing::warn!(
+                scope = %self.scope.id,
+                "health: warning [{}]", repeat_msg
+            );
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(self.scope.clone()),
+                status,
+            });
+            self.last_health_report = now;
+            return;
+        }
+
+        // 2. Idle escalation — only report when crossing the idle threshold
+        // for the first time, then periodically.
+        if idle_secs >= 300 {
+            if now.duration_since(self.last_health_report) >= Duration::from_secs(120) {
+                tracing::info!(
+                    scope = %self.scope.id,
+                    idle_secs,
+                    "health: idle [{idle_secs}s]"
+                );
+                let _ = sender.send(AdapterEvent::StatusChange {
+                    scope: Some(self.scope.clone()),
+                    status: format!("health: idle [{idle_secs}s]"),
+                });
+                self.last_health_report = now;
+            }
+            return;
+        }
+        if idle_secs >= self.idle_warning.as_secs()
+            && now.duration_since(self.last_health_report) >= Duration::from_secs(60)
+        {
+            tracing::info!(
+                scope = %self.scope.id,
+                idle_secs,
+                "health: idle [{idle_secs}s]"
+            );
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(self.scope.clone()),
+                status: format!("health: idle [{idle_secs}s]"),
+            });
+            self.last_health_report = now;
+            return;
+        }
+
+        // 3. Periodic active reaffirmation (every ~30s when active)
+        if idle_secs == 0 && now.duration_since(self.last_health_report) >= Duration::from_secs(30)
+        {
+            tracing::info!(
+                scope = %self.scope.id,
+                "health: active"
+            );
+            let _ = sender.send(AdapterEvent::StatusChange {
+                scope: Some(self.scope.clone()),
+                status: "health: active".to_string(),
+            });
+            self.last_health_report = now;
+        }
+    }
+
+    fn check_repetition(&mut self) -> Option<String> {
+        if self.recent_hashes.len() < self.repetition_threshold {
+            return None;
+        }
+        let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for &h in &self.recent_hashes {
+            *counts.entry(h).or_insert(0) += 1;
+        }
+        let (dominant, count) = counts.into_iter().max_by_key(|(_, c)| *c).unwrap_or((0, 0));
+        if count as usize >= self.repetition_threshold {
+            let already_fired = self.repetition_fired_for == Some(dominant);
+            if !already_fired {
+                self.repetition_fired_for = Some(dominant);
+                return Some(format!(
+                    "repeating output x{count} in last {} lines",
+                    self.recent_hashes.len()
+                ));
+            }
+        } else {
+            self.repetition_fired_for = None;
+        }
+        None
+    }
+}
+
+/// Fast non-crypto hash for output-line deduplication.
+fn hash_line(line: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut h);
+    h.finish()
+}
+
 fn spawn_and_collect(
     cfg: &CommandConfig,
     prompt: &AdapterPrompt,
@@ -621,21 +761,43 @@ fn spawn_and_collect(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     slot: &Arc<Mutex<InFlight>>,
 ) -> Result<SpawnOutcome, String> {
-    std::fs::create_dir_all(&prompt.cwd).map_err(|e| {
+    crate::acp::create_dir_all_unc(&prompt.cwd).map_err(|e| {
         format!(
             "failed to create command cwd `{}`: {}",
             prompt.cwd.display(),
             e
         )
     })?;
-    let mut cmd = Command::new(&cfg.command);
+    // On Windows, prefix the cwd with UNC prefix to bypass MAX_PATH (260
+    // char) limit (Bug #2 Phase 2).  Do NOT UNC-prefix the command path —
+    // `\\?\` bypasses PATHEXT resolution in CreateProcessW, so e.g.
+    // `\\?\D:\nodejs\copilot` would fail to resolve to `copilot.cmd`.
+    // `unc_prefix_path` is a no-op on Unix so the call site stays cfg-free.
+    let command_path = PathBuf::from(&cfg.command);
+    let spawn_cwd = crate::acp::unc_prefix_path(prompt.cwd.clone());
+
+    // On Windows, `cmd.exe` treats newlines as command separators when
+    // wrapping `.CMD`/`.BAT` file invocations via `cmd.exe /c`. Arguments
+    // containing newlines (e.g. multi-line prompt content) cause "batch file
+    // arguments are invalid" (CreateProcessW error 0xC1). Replace newlines
+    // with spaces to prevent this.
+    let mut sanitized_argv: Vec<String>;
+    let final_argv: &[String] = if cfg!(windows) && is_batch_file(&command_path) {
+        sanitized_argv = argv.to_vec();
+        sanitize_batch_args(&mut sanitized_argv);
+        &sanitized_argv
+    } else {
+        argv
+    };
+
+    let mut cmd = Command::new(&command_path);
     let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
     } else {
         Stdio::null()
     };
-    cmd.args(argv)
-        .current_dir(&prompt.cwd)
+    cmd.args(final_argv)
+        .current_dir(&spawn_cwd)
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -645,10 +807,12 @@ fn spawn_and_collect(
     if matches!(cfg.prompt_via, PromptVia::Env) {
         cmd.env("LOOM_PROMPT", &prompt.content);
     }
-    configure_process_group(&mut cmd);
+    // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
+    // `loom_platform::process::Command::new` automatically — no cfg block here.
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn `{}`: {}", cfg.command, e))?;
+        .map_err(|e| format!("failed to spawn `{}`: {}", command_path.display(), e))?;
     // Register the PID so cancel() can find and signal it. If a cancel call
     // landed BEFORE we got here (cancel_requested already true), kill the
     // child immediately; the wait below will pick up the SIGTERM exit.
@@ -662,21 +826,13 @@ fn spawn_and_collect(
         }
     }
 
-    if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
-        if let Some(mut stdin) = child.stdin.take() {
-            let stdin_body = cfg
-                .stdin_template
-                .as_ref()
-                .map(|template| expand_template(template, cfg, prompt, session_id, &prompt.content))
-                .unwrap_or_else(|| prompt.content.clone());
-            stdin
-                .write_all(stdin_body.as_bytes())
-                .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
-        }
-    }
-    // Drop unused stdin so the child doesn't block on read.
-    drop(child.stdin.take());
-
+    // Take stdout/stderr handles FIRST and start reader threads BEFORE writing
+    // stdin.  This prevents a deadlock where the parent blocks on stdin write
+    // (pipe buffer full because the child hasn't started reading yet) while the
+    // child blocks on stdout/stderr write (pipe buffer full because nobody is
+    // draining).  With readers already draining, the child can complete its
+    // startup output, reach the point where it reads stdin, and unblock the
+    // parent's write.
     let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
     let stderr = child.stderr.take().ok_or("failed to open child stderr")?;
 
@@ -715,10 +871,47 @@ fn spawn_and_collect(
     });
     drop(output_tx);
 
+    // Write stdin AFTER reader threads are draining child output, preventing
+    // the pipe-buffer deadlock described above.  On Windows, write_all for a
+    // large prompt (> pipe buffer) can block; the readers keep the child from
+    // deadlocking on full stdout/stderr pipes.
+    let needs_stdin = cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin);
+    let stdin_handle = if needs_stdin {
+        if let Some(mut stdin_writer) = child.stdin.take() {
+            let stdin_body = cfg
+                .stdin_template
+                .as_ref()
+                .map(|template| {
+                    expand_stdin_template(template, cfg, prompt, session_id, &prompt.content)
+                })
+                .unwrap_or_else(|| prompt.content.clone());
+            // Write stdin on a background thread so a slow write doesn't stall
+            // the foreground polling loop.  The reader threads above guarantee
+            // the child won't deadlock on its own output pipes.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = stdin_writer
+                    .write_all(stdin_body.as_bytes())
+                    .map_err(|e| format!("failed to write prompt to stdin: {e}"));
+                // Drop the writer so the child sees EOF on stdin.
+                drop(stdin_writer);
+                let _ = done_tx.send(result);
+            });
+            Some(done_rx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Drop unused stdin so the child doesn't block on read.
+    drop(child.stdin.take());
+
     let mut collected_stdout = String::new();
     let mut collected_stderr = String::new();
     let mut emitted_text = false;
     let mut emitted_finish = false;
+    let mut last_usage: Option<TokenUsage> = None;
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
@@ -732,10 +925,16 @@ fn spawn_and_collect(
     let mut timed_out = false;
     let mut idle_timed_out = false;
     let mut early_runtime_error: Option<String> = None;
+    let mut health_observer = HealthObserver::new(prompt.scope.clone());
 
     loop {
+        health_observer.tick(sender);
         while let Ok(output) = output_rx.try_recv() {
             last_output_at = Instant::now();
+            let (raw_line, is_stdout) = match &output {
+                ProcessOutput::Stdout(s) => (s.clone(), true),
+                ProcessOutput::Stderr(s) => (s.clone(), false),
+            };
             let events = collect_process_output(
                 cfg,
                 prompt,
@@ -744,9 +943,16 @@ fn spawn_and_collect(
                 &mut collected_stdout,
                 &mut collected_stderr,
                 &mut early_runtime_error,
+                &mut last_usage,
             );
             emitted_text |= events.emitted_text;
             emitted_finish |= events.emitted_finish;
+            if is_stdout {
+                health_observer
+                    .observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
+            } else {
+                health_observer.observe_stderr(&raw_line);
+            }
         }
         if early_runtime_error.is_some() {
             if force_kill_child(child.id()).is_err() {
@@ -804,6 +1010,10 @@ fn spawn_and_collect(
         match output_rx.recv_timeout(wait_for) {
             Ok(output) => {
                 last_output_at = Instant::now();
+                let (raw_line, is_stdout) = match &output {
+                    ProcessOutput::Stdout(s) => (s.clone(), true),
+                    ProcessOutput::Stderr(s) => (s.clone(), false),
+                };
                 let events = collect_process_output(
                     cfg,
                     prompt,
@@ -812,9 +1022,16 @@ fn spawn_and_collect(
                     &mut collected_stdout,
                     &mut collected_stderr,
                     &mut early_runtime_error,
+                    &mut last_usage,
                 );
                 emitted_text |= events.emitted_text;
                 emitted_finish |= events.emitted_finish;
+                if is_stdout {
+                    health_observer
+                        .observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
+                } else {
+                    health_observer.observe_stderr(&raw_line);
+                }
                 if early_runtime_error.is_some() {
                     if force_kill_child(child.id()).is_err() {
                         let _ = child.kill();
@@ -837,7 +1054,19 @@ fn spawn_and_collect(
     };
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
+    // Check the background stdin write result.  If it failed, surface the error
+    // as an early_runtime_error so the caller gets a clear message instead of
+    // a confusing "No prompt provided" from the child.
+    if let Some(done_rx) = stdin_handle {
+        if let Ok(Err(e)) = done_rx.recv() {
+            early_runtime_error = Some(e);
+        }
+    }
     for output in output_rx.try_iter() {
+        let (raw_line, is_stdout) = match &output {
+            ProcessOutput::Stdout(s) => (s.clone(), true),
+            ProcessOutput::Stderr(s) => (s.clone(), false),
+        };
         let events = collect_process_output(
             cfg,
             prompt,
@@ -846,9 +1075,15 @@ fn spawn_and_collect(
             &mut collected_stdout,
             &mut collected_stderr,
             &mut early_runtime_error,
+            &mut last_usage,
         );
         emitted_text |= events.emitted_text;
         emitted_finish |= events.emitted_finish;
+        if is_stdout {
+            health_observer.observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
+        } else {
+            health_observer.observe_stderr(&raw_line);
+        }
     }
     let exit_code = exit.code().unwrap_or(-1);
     // Snapshot + clear the cancel flag now that the child is reaped, before
@@ -968,13 +1203,29 @@ fn spawn_and_collect(
     })
 }
 
-#[cfg(unix)]
-fn configure_process_group(cmd: &mut Command) {
-    cmd.process_group(0);
+/// Check if the command path is a Windows batch file (.CMD or .BAT).
+/// Windows wraps `.CMD`/`.BAT` invocations with `cmd.exe /c`, which
+/// treats newlines as command separators.
+fn is_batch_file(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_ascii_lowercase();
+        lower == "cmd" || lower == "bat"
+    } else {
+        false
+    }
 }
 
-#[cfg(not(unix))]
-fn configure_process_group(_cmd: &mut Command) {}
+/// Replace newlines in arguments with spaces to prevent `cmd.exe` from
+/// treating them as command separators when wrapping `.CMD`/`.BAT`
+/// invocations with `cmd.exe /c`. Without this, multi-line prompt
+/// content triggers "batch file arguments are invalid" (error 0xC1).
+fn sanitize_batch_args(args: &mut [String]) {
+    for arg in args.iter_mut() {
+        if arg.contains('\n') || arg.contains('\r') {
+            *arg = arg.replace('\r', " ").replace('\n', " ");
+        }
+    }
+}
 
 fn collect_stdout_line(
     cfg: &CommandConfig,
@@ -982,9 +1233,17 @@ fn collect_stdout_line(
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     line: &str,
     collected_stdout: &mut String,
+    last_emitted_usage: &mut Option<TokenUsage>,
 ) -> OutputLineEvents {
-    collected_stdout.push_str(line);
-    let parsed_line = line.trim_end_matches(&['\r', '\n'][..]);
+    let clean = strip_ansi(line);
+    collected_stdout.push_str(&clean);
+    let parsed_line = clean.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(usage) = observe_usage_line(parsed_line, last_emitted_usage) {
+        let _ = sender.send(AdapterEvent::UsageUpdate {
+            scope: Some(prompt.scope.clone()),
+            usage,
+        });
+    }
     if let Some(decoder) = cfg.decoder.as_ref() {
         return collect_provider_decoder_line(decoder, parsed_line, &prompt.scope, sender);
     }
@@ -999,11 +1258,17 @@ fn collect_process_output(
     collected_stdout: &mut String,
     collected_stderr: &mut String,
     early_runtime_error: &mut Option<String>,
+    last_emitted_usage: &mut Option<TokenUsage>,
 ) -> OutputLineEvents {
     match output {
-        ProcessOutput::Stdout(line) => {
-            collect_stdout_line(cfg, prompt, sender, &line, collected_stdout)
-        }
+        ProcessOutput::Stdout(line) => collect_stdout_line(
+            cfg,
+            prompt,
+            sender,
+            &line,
+            collected_stdout,
+            last_emitted_usage,
+        ),
         ProcessOutput::Stderr(line) => {
             collected_stderr.push_str(&line);
             if early_runtime_error.is_none() {
@@ -2298,7 +2563,7 @@ fn acquire_session_lock(cfg: &CommandConfig, scope: &ScopeRef) -> Result<Session
 #[cfg(unix)]
 fn acquire_lock_file(path: &Path) -> Result<SessionLockGuard, String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+        create_dir_all_unc(parent).map_err(|e| {
             format!(
                 "failed to create session lock dir `{}`: {e}",
                 parent.display()
@@ -2363,7 +2628,7 @@ fn save_session(
         return Ok(());
     };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_unc(parent)?;
     }
     let now = chrono::Utc::now().to_rfc3339();
     let existing = load_session(cfg, scope);
@@ -2627,7 +2892,11 @@ fn expand_first_run_argv(
     prompt: &str,
 ) -> Vec<String> {
     if !cfg.arg_specs.is_empty() {
-        return expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
+        let mut argv = expand_arg_specs(&cfg.arg_specs, cfg, request, session_id, prompt);
+        if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            strip_prompt_args(&mut argv);
+        }
+        return argv;
     }
     let mut argv: Vec<String> = cfg
         .args
@@ -2638,6 +2907,9 @@ fn expand_first_run_argv(
         let mut model_args = Vec::new();
         append_model_args(&mut model_args, cfg, request, session_id, prompt);
         argv.splice(pos..pos, model_args);
+        if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            strip_prompt_args(&mut argv);
+        }
         return argv;
     }
     if matches!(cfg.prompt_via, PromptVia::Args) {
@@ -2662,7 +2934,28 @@ fn expand_first_run_argv(
             argv.push(prompt.to_string());
         }
     }
+    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        strip_prompt_args(&mut argv);
+    }
     argv
+}
+
+/// Remove `-p <prompt>` or `--prompt <prompt>` from argv when prompt is
+/// delivered via stdin to avoid hitting the Windows command-line length limit.
+fn strip_prompt_args(argv: &mut Vec<String>) {
+    let mut i = 0;
+    while i < argv.len() {
+        if matches!(argv[i].as_str(), "-p" | "--prompt") {
+            if i + 1 < argv.len() {
+                argv.remove(i); // remove -p
+                argv.remove(i); // remove its value
+            } else {
+                argv.remove(i); // trailing -p with no value
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn expand_arg_specs(
@@ -2732,6 +3025,9 @@ fn expand_argv(
         let mut model_args = Vec::new();
         append_model_args(&mut model_args, cfg, request, session_id, prompt);
         argv.splice(pos..pos, model_args);
+        if matches!(cfg.prompt_via, PromptVia::Stdin) {
+            strip_prompt_args(&mut argv);
+        }
         return argv;
     }
     if matches!(cfg.prompt_via, PromptVia::Args) {
@@ -2753,6 +3049,9 @@ fn expand_argv(
         if !already {
             argv.push(prompt.to_string());
         }
+    }
+    if matches!(cfg.prompt_via, PromptVia::Stdin) {
+        strip_prompt_args(&mut argv);
     }
     argv
 }
@@ -2788,23 +3087,52 @@ fn expand_template(
     session_id: Option<&str>,
     prompt: &str,
 ) -> String {
+    expand_template_inner(input, cfg, request, session_id, prompt, false)
+}
+
+/// Like [`expand_template`] but preserves `{prompt}` / `{prompt.full}` even
+/// when [`PromptVia::Stdin`] is set.  Used when expanding the stdin body
+/// template so the prompt content actually reaches the child process.
+fn expand_stdin_template(
+    input: &str,
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> String {
+    expand_template_inner(input, cfg, request, session_id, prompt, true)
+}
+
+fn expand_template_inner(
+    input: &str,
+    cfg: &CommandConfig,
+    request: &AdapterPrompt,
+    session_id: Option<&str>,
+    prompt: &str,
+    for_stdin: bool,
+) -> String {
     let scope_kind = match request.scope.kind {
         proto::types::ScopeKind::Thread => "thread",
         proto::types::ScopeKind::Channel => "channel",
     };
+    let strip_prompt = !for_stdin && matches!(cfg.prompt_via, PromptVia::Stdin);
     let mut out = input
         .replace("{actor.id}", &cfg.actor_id)
         .replace("{scope.id}", &request.scope.id)
         .replace("{scope.kind}", scope_kind)
         .replace("{model}", active_model(request).as_deref().unwrap_or(""))
-        .replace("{prompt}", prompt)
+        .replace("{prompt}", if strip_prompt { "" } else { prompt })
         .replace(
             "{prompt.full}",
-            request
-                .outputs
-                .get("full")
-                .map(String::as_str)
-                .unwrap_or(prompt),
+            if strip_prompt {
+                ""
+            } else {
+                request
+                    .outputs
+                    .get("full")
+                    .map(String::as_str)
+                    .unwrap_or(prompt)
+            },
         )
         .replace(
             "{loom_envelope}",
@@ -2909,7 +3237,7 @@ mod tests {
             prompt_via: PromptVia::Args,
             prompt: None,
             stdin_template: None,
-            sessions_dir: PathBuf::from("/tmp/loom-test-sessions"),
+            sessions_dir: std::env::temp_dir().join("loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
             command_signature: "sha256:test".into(),
@@ -2937,7 +3265,7 @@ mod tests {
             parts: Vec::new(),
             outputs: BTreeMap::from([("full".into(), content.into())]),
             model: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
             template_vars: BTreeMap::new(),
         }
@@ -3377,6 +3705,7 @@ mod tests {
             &tx,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"from decoder"}]}}"#,
             &mut collected,
+            &mut None,
         );
 
         assert!(events.emitted_text);
@@ -3420,6 +3749,7 @@ mod tests {
             &tx,
             r#"{"type":"text","text":"legacy ndjson would stream this"}"#,
             &mut collected,
+            &mut None,
         );
 
         assert!(!events.emitted_text);
@@ -3735,6 +4065,7 @@ mod tests {
         assert_eq!(messages, vec!["First", "Final"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_stream_does_not_duplicate_completed_messages_at_process_end() {
         let mut cfg = cfg();
@@ -3801,6 +4132,7 @@ mod tests {
         assert_eq!(argv, vec!["--input", "hi"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn args_prompt_does_not_pipe_stdin_to_child() {
         let mut cfg = cfg();
@@ -3984,6 +4316,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_prompt_saves_decoder_captured_provider_session() {
         let mut cfg = cfg();
@@ -4025,6 +4358,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_prompt_saves_stderr_decoder_captured_provider_session() {
         let mut cfg = cfg();
@@ -4066,6 +4400,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stderr_decoder_final_text_is_emitted() {
         let mut cfg = cfg();
@@ -4102,6 +4437,7 @@ mod tests {
         assert_eq!(texts, vec!["from stderr"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_prompt_resumes_with_arg_specs_without_legacy_resume_args() {
         let mut cfg = cfg();
@@ -4134,6 +4470,7 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn signed_thinking_replay_error_drops_saved_resume_session() {
         let mut cfg = cfg();

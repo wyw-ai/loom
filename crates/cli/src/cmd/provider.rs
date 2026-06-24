@@ -468,6 +468,7 @@ fn provider_mode_detail(
                 .as_ref()
                 .and_then(|models| models.default.clone()),
             reasoning_effort: None,
+            ..Default::default()
         };
         match registry.resolve_runtime_plan(&provider_ref) {
             Ok(plan) => serde_json::to_value(plan).context("serialize runtime plan")?,

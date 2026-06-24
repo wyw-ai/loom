@@ -11,6 +11,7 @@
 
 pub mod acp;
 pub mod adapter;
+pub mod agents_md;
 pub mod bundle;
 pub mod command;
 pub mod discovery;
@@ -21,12 +22,14 @@ pub mod memory;
 pub mod profile;
 pub mod provider;
 pub mod server_url;
+pub mod tracing_setup;
 pub mod usage;
 
 pub use adapter::{
     ActionChoice, Adapter, AdapterEvent, AdapterModelChoice, AdapterModelOptions, AdapterPrompt,
     AdapterStartInfo, PromptPart, PromptRoleHint, TokenUsage,
 };
+pub use agents_md::ensure_agents_md;
 pub use bundle::{
     prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,
 };

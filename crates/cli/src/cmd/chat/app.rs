@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use proto::types::{Message, ScopeKind, ScopeRef};
+use proto::types::{Message, RunStatus, ScopeKind, ScopeRef};
 
 use super::draft::DraftInput;
 use super::history::History;
@@ -46,6 +46,42 @@ pub struct OpenTurn {
     pub opened_at: DateTime<Utc>,
 }
 
+// ── Agent status display (V4) ──────────────────────────────────────────
+
+/// Snapshot of a run received via `run.updated`, for agent status aggregation.
+/// Separate from `OpenTurn` (which serves cancel / in-flight bar) so terminal
+/// runs can be retained briefly for display without affecting cancel behaviour.
+#[derive(Debug, Clone)]
+pub struct CachedRun {
+    pub actor_id: String,
+    pub status: RunStatus,
+    pub start_reason: Option<String>,
+    pub opened_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    /// `meta.toolName` — used for the WaitingTool label.
+    pub tool_name: Option<String>,
+    /// `meta.error` — used for the Failed label.
+    pub error: Option<String>,
+    /// `meta.noReplyReason` — fallback for the Failed label.
+    pub no_reply_reason: Option<String>,
+}
+
+/// Computed agent status info for the Members pane and @-mention picker.
+#[derive(Debug, Clone)]
+pub struct AgentStatusInfo {
+    pub label: String,             // "Thinking · user mention"
+    pub status: Option<RunStatus>, // for color dot
+    pub is_stale: bool,            // timed out
+}
+
+// ── Timeout thresholds (seconds) per run status ────────────────────────
+const TIMEOUT_QUEUED_SECS: i64 = 300;
+const TIMEOUT_PREPARING_CONTEXT_SECS: i64 = 180;
+const TIMEOUT_RUNNING_SECS: i64 = 600;
+const TIMEOUT_WAITING_TOOL_SECS: i64 = 120;
+/// Terminal runs linger in agent_statuses for this long after closing.
+const TTL_TERMINAL_SECS: i64 = 30;
+
 pub struct App {
     pub history: History,
     pub input: DraftInput,
@@ -76,8 +112,14 @@ pub struct App {
     /// Agent actors from `actor/list`. `@...` is a fast directed-send shortcut and
     /// should not surface every historical human actor.
     pub agent_ids: HashSet<String>,
-    /// Runtime status per agent when a future source provides it.
-    pub agent_statuses: HashMap<String, String>,
+    /// Runtime status per agent, computed from `run_cache` via
+    /// `recompute_agent_statuses()`. Members pane and @-mention picker
+    /// consume this map.
+    pub agent_statuses: HashMap<String, AgentStatusInfo>,
+    /// Raw run snapshots keyed by run_id. Populated by `apply_run_updated`;
+    /// consumed by `recompute_agent_statuses()`. Terminal runs age out
+    /// naturally during recomputation (TTL check).
+    pub run_cache: HashMap<String, CachedRun>,
     pub reply_target: Option<ReplyTarget>,
     /// Runs the server has told us are open and not yet terminal. Keyed by run
     /// id; populated from `run.updated` notifications.
@@ -127,6 +169,7 @@ impl App {
             actor_kinds: HashMap::new(),
             agent_ids: HashSet::new(),
             agent_statuses: HashMap::new(),
+            run_cache: HashMap::new(),
             reply_target: None,
             open_turns: HashMap::new(),
             selected_history_idx: None,
@@ -233,6 +276,56 @@ impl App {
         v
     }
 
+    // ── Agent status computation (V4) ──────────────────────────────────
+
+    /// Rebuild `agent_statuses` from `run_cache`. Groups runs by actor,
+    /// picks the highest-priority non-terminal run for each, computes a
+    /// status label, and writes into `agent_statuses`. Terminal runs
+    /// linger for `TTL_TERMINAL_SECS` after closing so the user can see
+    /// "Failed" / "Canceled" briefly.
+    pub fn recompute_agent_statuses(&mut self) {
+        use std::collections::HashMap;
+        let now = Utc::now();
+
+        // 1. Prune expired terminal runs from run_cache.
+        self.run_cache.retain(|_id, cr| {
+            if let Some(closed) = cr.closed_at {
+                (now - closed).num_seconds() < TTL_TERMINAL_SECS
+            } else {
+                true // still active
+            }
+        });
+
+        // 2. Group active (or recently terminal) runs by actor.
+        let mut by_actor: HashMap<String, Vec<&CachedRun>> = HashMap::new();
+        for cr in self.run_cache.values() {
+            by_actor.entry(cr.actor_id.clone()).or_default().push(cr);
+        }
+
+        // 3. Clear and recompute.
+        self.agent_statuses.clear();
+        for (actor_id, runs) in &by_actor {
+            // Pick the highest-priority run.
+            let Some(best) = runs.iter().max_by_key(|r| run_priority(r.status)) else {
+                continue;
+            };
+
+            let elapsed = (now - best.opened_at).num_seconds();
+            let timeout = timeout_for(best.status);
+            let is_stale = timeout > 0 && elapsed > timeout;
+
+            let label = compute_run_status_label(best, is_stale);
+            self.agent_statuses.insert(
+                actor_id.clone(),
+                AgentStatusInfo {
+                    label,
+                    status: Some(best.status),
+                    is_stale,
+                },
+            );
+        }
+    }
+
     pub fn display_name_for(&self, id: &str) -> String {
         let base = self
             .display_for
@@ -294,11 +387,11 @@ impl App {
     ///
     /// In a private channel the picker is restricted to actors the operator
     /// can actually message without first inviting: members of the
-    /// current channel ∪ "公区" actors (today: union of all Public channel
+    /// current channel ∪ "public area" actors (today: union of all Public channel
     /// memberships). Non-members are deliberately *not* listed — explicit
     /// invitation goes through the dedicated invite picker.
     /// TODO: once the dedicated lobby channel concept lands (in-flight on
-    /// another branch), narrow "公区" from "any Public channel" to that
+    /// another branch), narrow "public area" from "any Public channel" to that
     /// single lobby channel.
     pub fn update_at_menu(&mut self) {
         let input = self.input.display_text();
@@ -331,8 +424,8 @@ impl App {
                         .cloned()
                         .unwrap_or_else(|| id.clone());
                     let mut it = PickerItem::new(id.clone(), display);
-                    if let Some(status) = self.agent_statuses.get(id) {
-                        it = it.with_status(status.clone());
+                    if let Some(info) = self.agent_statuses.get(id) {
+                        it = it.with_status(info.label.clone());
                     }
                     it
                 })
@@ -353,7 +446,7 @@ impl App {
 
     /// Union of member sets across all Public channels currently visible in
     /// the sidebar — actors the operator can address from anywhere because
-    /// they live in the shared "公区". Empty when there's no sidebar yet
+    /// they live in the shared "public area". Empty when there's no sidebar yet
     /// (first frame after launch); the caller's filter falls back to "no
     /// public actors" which is the safe default.
     fn publicly_addressable_actors(&self) -> std::collections::HashSet<String> {
@@ -625,6 +718,85 @@ pub fn slash_command_items() -> Vec<PickerItem> {
     ]
 }
 
+// ── Agent status helpers (V4) ──────────────────────────────────────────
+
+/// Priority value for a run status. Higher = more important.
+fn run_priority(s: RunStatus) -> u8 {
+    match s {
+        RunStatus::Running => 4,
+        RunStatus::WaitingTool => 3,
+        RunStatus::PreparingContext => 2,
+        RunStatus::Queued => 1,
+        // Terminal states: participate only while still in TTL window
+        RunStatus::Failed => 0,
+        RunStatus::Canceled => 0,
+        RunStatus::Completed => 0,
+    }
+}
+
+/// Timeout threshold in seconds for the given status. Returns 0 for
+/// terminal states that have no timeout concept.
+fn timeout_for(s: RunStatus) -> i64 {
+    match s {
+        RunStatus::Queued => TIMEOUT_QUEUED_SECS,
+        RunStatus::PreparingContext => TIMEOUT_PREPARING_CONTEXT_SECS,
+        RunStatus::Running => TIMEOUT_RUNNING_SECS,
+        RunStatus::WaitingTool => TIMEOUT_WAITING_TOOL_SECS,
+        _ => 0,
+    }
+}
+
+/// Produce an English status label for a cached run. (The GUI side keeps
+/// its own labels in `gui-web/src/lib/agent-utils.ts`.)
+pub fn compute_run_status_label(cr: &CachedRun, is_stale: bool) -> String {
+    let base = match cr.status {
+        RunStatus::Queued => "Queued".to_string(),
+        RunStatus::PreparingContext => "Preparing".to_string(),
+        RunStatus::Running => "Thinking".to_string(),
+        RunStatus::WaitingTool => {
+            // GUI V3 uses meta.toolName for tool name; fall back to start_reason.
+            let tool = cr.tool_name.as_deref().or(cr.start_reason.as_deref());
+            if let Some(tool) = tool {
+                format!("Waiting · {}", tool)
+            } else {
+                "Waiting".to_string()
+            }
+        }
+        RunStatus::Failed => {
+            // GUI V3 priority: meta.error || meta.noReplyReason || start_reason.
+            let reason = cr
+                .error
+                .as_deref()
+                .or(cr.no_reply_reason.as_deref())
+                .or(cr.start_reason.as_deref());
+            if let Some(reason) = reason {
+                format!("Failed · {}", reason)
+            } else {
+                "Failed".to_string()
+            }
+        }
+        RunStatus::Canceled => "Canceled".to_string(),
+        RunStatus::Completed => return String::new(), // never show "completed"
+    };
+
+    if is_stale {
+        return format!("⚠ {} (stale)", base);
+    }
+
+    // Append start_reason for non-terminal states (except waiting_tool / failed
+    // which already incorporate a reason above).
+    if let Some(reason) = cr.start_reason.as_ref() {
+        if !matches!(
+            cr.status,
+            RunStatus::WaitingTool | RunStatus::Failed | RunStatus::Canceled | RunStatus::Completed
+        ) {
+            return format!("{} · {}", base, reason);
+        }
+    }
+
+    base.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::App;
@@ -671,7 +843,7 @@ mod tests {
         );
         // Three registered agents:
         //   alpha: member of the current private channel
-        //   gamma: member of a separate Public channel ("公区")
+        //   gamma: member of a separate Public channel ("public area")
         //   beta:  member of nothing visible — should be filtered out
         app.agent_ids.insert("actor_agent_alpha".into());
         app.agent_ids.insert("actor_agent_beta".into());
@@ -728,7 +900,7 @@ mod tests {
 
         let picker = app.at_menu.expect("expected @-menu");
         let ids: Vec<String> = picker.items.iter().map(|it| it.id.clone()).collect();
-        // Alpha (channel member) and Gamma (公区) are listed; Beta is gone.
+        // Alpha (channel member) and Gamma (public area) are listed; Beta is gone.
         assert_eq!(ids, vec!["actor_agent_alpha", "actor_agent_gamma"]);
         // No more `(not in #foo)` hints — non-members don't appear at all.
         assert!(picker.items.iter().all(|it| it.hint.is_none()));
@@ -881,5 +1053,407 @@ mod tests {
         app.select_newer_history();
         assert_eq!(app.selected_history_idx, None);
         assert!(app.auto_follow);
+    }
+
+    // ── V4 agent-status helpers ──────────────────────────────────────────
+
+    use super::*;
+
+    fn cr(status: RunStatus, opened_ago_secs: i64, closed_ago_secs: Option<i64>) -> CachedRun {
+        let now = Utc::now();
+        CachedRun {
+            actor_id: "a".into(),
+            status,
+            start_reason: Some("mention".into()),
+            opened_at: now - chrono::Duration::seconds(opened_ago_secs),
+            closed_at: closed_ago_secs.map(|s| now - chrono::Duration::seconds(s)),
+            tool_name: None,
+            error: None,
+            no_reply_reason: None,
+        }
+    }
+
+    fn cr_tool(status: RunStatus, tool_name: &str) -> CachedRun {
+        CachedRun {
+            actor_id: "a".into(),
+            status,
+            start_reason: Some("mention".into()),
+            opened_at: Utc::now(),
+            closed_at: None,
+            tool_name: Some(tool_name.into()),
+            error: None,
+            no_reply_reason: None,
+        }
+    }
+
+    fn cr_failed(
+        error: Option<&str>,
+        no_reply_reason: Option<&str>,
+        start_reason: Option<&str>,
+    ) -> CachedRun {
+        CachedRun {
+            actor_id: "a".into(),
+            status: RunStatus::Failed,
+            start_reason: start_reason.map(|s| s.into()),
+            opened_at: Utc::now(),
+            closed_at: Some(Utc::now()),
+            tool_name: None,
+            error: error.map(|s| s.into()),
+            no_reply_reason: no_reply_reason.map(|s| s.into()),
+        }
+    }
+
+    #[test]
+    fn run_priority_ordering() {
+        assert!(run_priority(RunStatus::Running) > run_priority(RunStatus::WaitingTool));
+        assert!(run_priority(RunStatus::WaitingTool) > run_priority(RunStatus::PreparingContext));
+        assert!(run_priority(RunStatus::PreparingContext) > run_priority(RunStatus::Queued));
+        assert_eq!(run_priority(RunStatus::Failed), 0);
+        assert_eq!(run_priority(RunStatus::Canceled), 0);
+        assert_eq!(run_priority(RunStatus::Completed), 0);
+    }
+
+    #[test]
+    fn timeout_for_each_status() {
+        assert_eq!(timeout_for(RunStatus::Queued), 300);
+        assert_eq!(timeout_for(RunStatus::PreparingContext), 180);
+        assert_eq!(timeout_for(RunStatus::Running), 600);
+        assert_eq!(timeout_for(RunStatus::WaitingTool), 120);
+        assert_eq!(timeout_for(RunStatus::Failed), 0);
+        assert_eq!(timeout_for(RunStatus::Canceled), 0);
+        assert_eq!(timeout_for(RunStatus::Completed), 0);
+    }
+
+    #[test]
+    fn compute_run_status_label_queued() {
+        let r = cr(RunStatus::Queued, 0, None);
+        assert_eq!(compute_run_status_label(&r, false), "Queued · mention");
+    }
+
+    #[test]
+    fn compute_run_status_label_preparing_context() {
+        let r = cr(RunStatus::PreparingContext, 0, None);
+        assert_eq!(compute_run_status_label(&r, false), "Preparing · mention");
+    }
+
+    #[test]
+    fn compute_run_status_label_running() {
+        let r = cr(RunStatus::Running, 0, None);
+        assert_eq!(compute_run_status_label(&r, false), "Thinking · mention");
+    }
+
+    #[test]
+    fn compute_run_status_label_waiting_tool_with_tool_name() {
+        let r = cr_tool(RunStatus::WaitingTool, "read_file");
+        assert_eq!(compute_run_status_label(&r, false), "Waiting · read_file");
+    }
+
+    #[test]
+    fn compute_run_status_label_waiting_tool_fallback_to_start_reason() {
+        let r = CachedRun {
+            actor_id: "a".into(),
+            status: RunStatus::WaitingTool,
+            start_reason: Some("human_mention".into()),
+            opened_at: Utc::now(),
+            closed_at: None,
+            tool_name: None,
+            error: None,
+            no_reply_reason: None,
+        };
+        assert_eq!(
+            compute_run_status_label(&r, false),
+            "Waiting · human_mention"
+        );
+    }
+
+    #[test]
+    fn compute_run_status_label_waiting_tool_no_reason() {
+        let r = CachedRun {
+            actor_id: "a".into(),
+            status: RunStatus::WaitingTool,
+            start_reason: None,
+            opened_at: Utc::now(),
+            closed_at: None,
+            tool_name: None,
+            error: None,
+            no_reply_reason: None,
+        };
+        assert_eq!(compute_run_status_label(&r, false), "Waiting");
+    }
+
+    #[test]
+    fn compute_run_status_label_failed_with_error() {
+        let r = cr_failed(Some("connection refused"), None, None);
+        assert_eq!(
+            compute_run_status_label(&r, false),
+            "Failed · connection refused"
+        );
+    }
+
+    #[test]
+    fn compute_run_status_label_failed_with_no_reply_reason() {
+        let r = cr_failed(None, Some("rate limited"), None);
+        assert_eq!(compute_run_status_label(&r, false), "Failed · rate limited");
+    }
+
+    #[test]
+    fn compute_run_status_label_failed_with_start_reason_fallback() {
+        let r = cr_failed(None, None, Some("timeout"));
+        assert_eq!(compute_run_status_label(&r, false), "Failed · timeout");
+    }
+
+    #[test]
+    fn compute_run_status_label_failed_error_priority_over_no_reply() {
+        let r = cr_failed(Some("crash"), Some("rate limited"), None);
+        assert_eq!(compute_run_status_label(&r, false), "Failed · crash");
+    }
+
+    #[test]
+    fn compute_run_status_label_failed_no_reason() {
+        let r = cr_failed(None, None, None);
+        assert_eq!(compute_run_status_label(&r, false), "Failed");
+    }
+
+    #[test]
+    fn compute_run_status_label_canceled() {
+        let r = cr(RunStatus::Canceled, 0, None);
+        assert_eq!(compute_run_status_label(&r, false), "Canceled");
+    }
+
+    #[test]
+    fn compute_run_status_label_completed_is_empty() {
+        let r = cr(RunStatus::Completed, 0, Some(1));
+        assert_eq!(compute_run_status_label(&r, false), "");
+    }
+
+    #[test]
+    fn compute_run_status_label_stale_queued() {
+        let r = cr(RunStatus::Queued, 0, None);
+        // stale path returns early before appending start_reason
+        assert_eq!(compute_run_status_label(&r, true), "⚠ Queued (stale)");
+    }
+
+    #[test]
+    fn compute_run_status_label_no_start_reason() {
+        let r = CachedRun {
+            actor_id: "a".into(),
+            status: RunStatus::Running,
+            start_reason: None,
+            opened_at: Utc::now(),
+            closed_at: None,
+            tool_name: None,
+            error: None,
+            no_reply_reason: None,
+        };
+        assert_eq!(compute_run_status_label(&r, false), "Thinking");
+    }
+
+    #[test]
+    fn recompute_agent_statuses_picks_highest_priority() {
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
+        let now = Utc::now();
+
+        // Two runs for same actor: running (priority 4) + queued (priority 1)
+        app.run_cache.insert(
+            "r1".into(),
+            CachedRun {
+                actor_id: "agent_x".into(),
+                status: RunStatus::Queued,
+                start_reason: Some("batch".into()),
+                opened_at: now,
+                closed_at: None,
+                tool_name: None,
+                error: None,
+                no_reply_reason: None,
+            },
+        );
+        app.run_cache.insert(
+            "r2".into(),
+            CachedRun {
+                actor_id: "agent_x".into(),
+                status: RunStatus::Running,
+                start_reason: Some("mention".into()),
+                opened_at: now,
+                closed_at: None,
+                tool_name: None,
+                error: None,
+                no_reply_reason: None,
+            },
+        );
+
+        app.recompute_agent_statuses();
+
+        let info = app
+            .agent_statuses
+            .get("agent_x")
+            .expect("agent_x should have status");
+        assert_eq!(info.status, Some(RunStatus::Running));
+        assert!(!info.is_stale, "not old enough to be stale");
+        assert!(info.label.contains("Thinking"));
+    }
+
+    #[test]
+    fn recompute_agent_statuses_terminal_run_has_ttl() {
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
+        let now = Utc::now();
+
+        // Terminal run closed just now — should still appear
+        app.run_cache.insert(
+            "r1".into(),
+            CachedRun {
+                actor_id: "agent_y".into(),
+                status: RunStatus::Failed,
+                start_reason: None,
+                opened_at: now - chrono::Duration::seconds(10),
+                closed_at: Some(now - chrono::Duration::seconds(5)),
+                tool_name: None,
+                error: Some("crash".into()),
+                no_reply_reason: None,
+            },
+        );
+
+        app.recompute_agent_statuses();
+
+        let info = app
+            .agent_statuses
+            .get("agent_y")
+            .expect("agent_y should have status within TTL");
+        assert_eq!(info.status, Some(RunStatus::Failed));
+        assert!(!info.is_stale);
+        assert!(info.label.contains("Failed"));
+    }
+
+    #[test]
+    fn recompute_agent_statuses_terminal_run_expired_ttl() {
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
+        let now = Utc::now();
+
+        // Terminal run closed 60s ago — beyond 30s TTL
+        app.run_cache.insert(
+            "r1".into(),
+            CachedRun {
+                actor_id: "agent_z".into(),
+                status: RunStatus::Completed,
+                start_reason: None,
+                opened_at: now - chrono::Duration::seconds(70),
+                closed_at: Some(now - chrono::Duration::seconds(60)),
+                tool_name: None,
+                error: None,
+                no_reply_reason: None,
+            },
+        );
+
+        app.recompute_agent_statuses();
+
+        assert!(
+            app.agent_statuses.get("agent_z").is_none(),
+            "agent_z should be evicted after TTL expiry"
+        );
+    }
+
+    #[test]
+    fn recompute_agent_statuses_stale_detection() {
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
+        let now = Utc::now();
+
+        // Queued run opened 400s ago — exceeds 300s timeout
+        app.run_cache.insert(
+            "r1".into(),
+            CachedRun {
+                actor_id: "agent_slow".into(),
+                status: RunStatus::Queued,
+                start_reason: None,
+                opened_at: now - chrono::Duration::seconds(400),
+                closed_at: None,
+                tool_name: None,
+                error: None,
+                no_reply_reason: None,
+            },
+        );
+
+        app.recompute_agent_statuses();
+
+        let info = app
+            .agent_statuses
+            .get("agent_slow")
+            .expect("agent_slow should have status");
+        assert!(
+            info.is_stale,
+            "run open 400s should be stale for Queued (300s)"
+        );
+        assert!(info.label.contains("⚠"));
+    }
+
+    #[test]
+    fn recompute_agent_statuses_removes_stale_entries() {
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
+
+        // Only stale runs — after recompute status_label is stale-marked but
+        // the entry should remain (is_stale is informational, not eviction).
+        app.run_cache.insert(
+            "r1".into(),
+            CachedRun {
+                actor_id: "agent_stale".into(),
+                status: RunStatus::Queued,
+                start_reason: None,
+                opened_at: Utc::now() - chrono::Duration::seconds(400),
+                closed_at: None,
+                tool_name: None,
+                error: None,
+                no_reply_reason: None,
+            },
+        );
+
+        app.recompute_agent_statuses();
+
+        let info = app
+            .agent_statuses
+            .get("agent_stale")
+            .expect("stale entries are retained (not evicted)");
+        assert!(info.is_stale);
+    }
+
+    #[test]
+    fn recompute_agent_statuses_idle_actor_no_entry() {
+        let mut app = App::new(
+            "me".into(),
+            "t1".into(),
+            proto::types::ScopeKind::Thread,
+            "demo".into(),
+        );
+        app.run_cache.clear();
+        app.agent_statuses.clear();
+
+        app.recompute_agent_statuses();
+
+        assert!(
+            app.agent_statuses.is_empty(),
+            "no status for actors without runs"
+        );
     }
 }

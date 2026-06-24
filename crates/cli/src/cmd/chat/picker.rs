@@ -277,6 +277,28 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn status_color(status: &str) -> Color {
+    if status.starts_with("⚠") {
+        return Color::Yellow;
+    }
+    if status.contains("Thinking") {
+        return Color::Magenta;
+    }
+    if status.contains("Waiting") {
+        return Color::Rgb(255, 165, 0); // orange
+    }
+    if status.contains("Preparing") {
+        return Color::Blue;
+    }
+    if status.contains("Queued") {
+        return Color::Gray;
+    }
+    if status.contains("Failed") {
+        return Color::Red;
+    }
+    if status.contains("Canceled") {
+        return Color::DarkGray;
+    }
+    // Legacy fallback for old status strings
     match status {
         "running" => Color::Green,
         "idle" => Color::Yellow,

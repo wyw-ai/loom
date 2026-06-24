@@ -115,6 +115,7 @@
       "env": {
         "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "{loom_agent_home}"
       },
+      "stdin": "{prompt.full}",
       "session": {
         "idSource": "loom_uuid",
         "resumeArgs": [

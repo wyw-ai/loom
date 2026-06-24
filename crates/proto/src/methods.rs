@@ -1914,6 +1914,13 @@ pub struct AgentTransport {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// How instructions are injected (copied from ProviderModeSpec). "prompt" or "agents_md".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "instructionsVia"
+    )]
+    pub instructions_via: Option<String>,
 }
 
 impl AgentTransport {
@@ -2046,6 +2053,14 @@ pub struct ProviderModeSpec {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// How instructions are injected: "prompt" (default, injected into prompt text) or
+    /// "agents_md" (written to workspace AGENTS.md, auto-loaded by provider).
+    #[serde(default = "default_instructions_via", rename = "instructionsVia")]
+    pub instructions_via: String,
+}
+
+pub fn default_instructions_via() -> String {
+    "prompt".into()
 }
 
 fn default_provider_transport() -> String {
@@ -2725,6 +2740,10 @@ pub struct AgentProviderRef {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-agent environment variables injected into the provider child process.
+    /// Keys here override same-named keys from the provider manifest's mode.env.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.

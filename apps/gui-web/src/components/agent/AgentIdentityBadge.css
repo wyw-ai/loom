@@ -55,6 +55,150 @@
   content: "";
 }
 
+.agent-identity-badge__status--working {
+  background: #fef3c7;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--working::after {
+  background: #f59e0b;
+}
+
+/* ---- 排队中 (Queued) - 灰色脉冲 ---- */
+.agent-identity-badge__status--queued {
+  background: #f3f4f6;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+  animation: agent-status-pulse 1.8s ease-in-out infinite;
+}
+
+.agent-identity-badge__status--queued::after {
+  background: #9ca3af;
+  animation: agent-status-blink 1.8s ease-in-out infinite;
+}
+
+/* ---- 准备中 (PreparingContext) - 蓝色旋转 ---- */
+.agent-identity-badge__status--preparing-context {
+  background: #dbeafe;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--preparing-context::after {
+  background: #3b82f6;
+  animation: agent-status-spin 1s linear infinite;
+}
+
+/* ---- 思考中 (Running) - 紫色脉冲 ---- */
+.agent-identity-badge__status--running {
+  background: #f3e8ff;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+  animation: agent-status-pulse 1.2s ease-in-out infinite;
+}
+
+.agent-identity-badge__status--running::after {
+  background: #a855f7;
+  animation: agent-status-blink 1.2s ease-in-out infinite;
+}
+
+/* ---- 等待工具 (WaitingTool) - 橙色闪烁 ---- */
+.agent-identity-badge__status--waiting-tool {
+  background: #fff7ed;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--waiting-tool::after {
+  background: #f97316;
+  animation: agent-status-blink-fast 0.6s ease-in-out infinite;
+}
+
+/* ---- 运行失败 (Failed) - 红色静态 ---- */
+.agent-identity-badge__status--failed {
+  background: #fef2f2;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--failed::after {
+  background: #ef4444;
+}
+
+/* ---- 已取消 (Canceled) - 灰色静态 ---- */
+.agent-identity-badge__status--canceled {
+  background: #f9fafb;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+}
+
+.agent-identity-badge__status--canceled::after {
+  background: #9ca3af;
+}
+
+/* ---- 超时警告 (Stale Warning) - 黄色动画 ---- */
+.agent-identity-badge__status--stale-warning {
+  background: #fef9c3;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
+  animation: agent-status-pulse 1.5s ease-in-out infinite;
+}
+
+.agent-identity-badge__status--stale-warning::after {
+  background: #eab308;
+  animation: agent-status-blink 1.5s ease-in-out infinite;
+}
+
+@keyframes agent-status-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.12); }
+}
+
+@keyframes agent-status-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes agent-status-blink-fast {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes agent-status-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* ---- MemberListItem inline animation keyframes ---- */
+@keyframes agent-status-queued {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+@keyframes agent-status-preparing-context {
+  0% { transform: rotate(0deg) scale(1); }
+  50% { transform: rotate(180deg) scale(1.1); }
+  100% { transform: rotate(360deg) scale(1); }
+}
+
+@keyframes agent-status-running {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+@keyframes agent-status-waiting-tool {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes agent-status-failed {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.1); }
+}
+
+@keyframes agent-status-canceled {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+@keyframes agent-status-stale-warning {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
 .agent-identity-badge__avatar {
   display: block;
   width: 186px;
@@ -369,6 +513,99 @@
   background: #18a64d;
 }
 
+.agent-detail-card__active--working {
+  border-color: #fcd34d;
+  background: linear-gradient(180deg, #fffbeb 0%, #fef3c7 100%);
+  color: #b45309;
+}
+
+.agent-detail-card__active--working span {
+  background: #f59e0b;
+  animation: agent-status-blink 1.2s ease-in-out infinite;
+}
+
+/* ---- Detail card: 排队中 (Queued) ---- */
+.agent-detail-card__active--queued {
+  border-color: #d1d5db;
+  background: linear-gradient(180deg, #f9fafb 0%, #f3f4f6 100%);
+  color: #6b7280;
+}
+
+.agent-detail-card__active--queued span {
+  background: #9ca3af;
+  animation: agent-status-blink 1.8s ease-in-out infinite;
+}
+
+/* ---- Detail card: 准备中 (PreparingContext) ---- */
+.agent-detail-card__active--preparing-context {
+  border-color: #93c5fd;
+  background: linear-gradient(180deg, #eff6ff 0%, #dbeafe 100%);
+  color: #2563eb;
+}
+
+.agent-detail-card__active--preparing-context span {
+  background: #3b82f6;
+  animation: agent-status-spin 1s linear infinite;
+}
+
+/* ---- Detail card: 思考中 (Running) ---- */
+.agent-detail-card__active--running {
+  border-color: #c4b5fd;
+  background: linear-gradient(180deg, #faf5ff 0%, #f3e8ff 100%);
+  color: #7c3aed;
+}
+
+.agent-detail-card__active--running span {
+  background: #a855f7;
+  animation: agent-status-blink 1.2s ease-in-out infinite;
+}
+
+/* ---- Detail card: 等待工具 (WaitingTool) ---- */
+.agent-detail-card__active--waiting-tool {
+  border-color: #fdba74;
+  background: linear-gradient(180deg, #fff7ed 0%, #ffedd5 100%);
+  color: #ea580c;
+}
+
+.agent-detail-card__active--waiting-tool span {
+  background: #f97316;
+  animation: agent-status-blink-fast 0.6s ease-in-out infinite;
+}
+
+/* ---- Detail card: 运行失败 (Failed) ---- */
+.agent-detail-card__active--failed {
+  border-color: #fca5a5;
+  background: linear-gradient(180deg, #fef2f2 0%, #fee2e2 100%);
+  color: #dc2626;
+}
+
+.agent-detail-card__active--failed span {
+  background: #ef4444;
+}
+
+/* ---- Detail card: 已取消 (Canceled) ---- */
+.agent-detail-card__active--canceled {
+  border-color: #d1d5db;
+  background: linear-gradient(180deg, #f9fafb 0%, #f3f4f6 100%);
+  color: #6b7280;
+}
+
+.agent-detail-card__active--canceled span {
+  background: #9ca3af;
+}
+
+/* ---- Detail card: 超时警告 (Stale Warning) ---- */
+.agent-detail-card__active--stale-warning {
+  border-color: #fde047;
+  background: linear-gradient(180deg, #fefce8 0%, #fef9c3 100%);
+  color: #a16207;
+}
+
+.agent-detail-card__active--stale-warning span {
+  background: #eab308;
+  animation: agent-status-blink 1.5s ease-in-out infinite;
+}
+
 .agent-detail-section {
   border: 1px solid #dfe3ec;
   border-radius: 13px;
@@ -419,32 +656,6 @@
   padding-left: 49px;
 }
 
-.agent-detail-traits__chips {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 14px;
-  margin-top: 13px;
-  color: #1d2635;
-  font-size: 17px;
-  font-weight: 650;
-  line-height: 1.35;
-}
-
-.agent-detail-traits__dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-}
-
-.agent-detail-traits__dot-orange {
-  background: #ff9b28;
-}
-
-.agent-detail-traits__dot-green {
-  background: #69c863;
-}
-
 .agent-detail-traits__copy p {
   max-width: 385px;
   margin: 12px 0 0;
@@ -452,20 +663,6 @@
   font-size: 16px;
   font-weight: 500;
   line-height: 1.42;
-}
-
-.agent-detail-traits__link {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 0;
-  background: transparent;
-  color: #443cff;
-  cursor: pointer;
-  margin-top: 18px;
-  padding: 0;
-  font-size: 16px;
-  font-weight: 650;
 }
 
 .agent-detail-traits__brain {
@@ -481,45 +678,6 @@
 .agent-detail-traits__brain svg {
   fill: rgb(224 219 249 / 0.45);
   filter: drop-shadow(0 2px 1px rgb(137 122 190 / 0.08));
-}
-
-.agent-detail-traits__spark {
-  position: absolute;
-  width: 13px;
-  height: 13px;
-  color: #d9d2f4;
-}
-
-.agent-detail-traits__spark::before,
-.agent-detail-traits__spark::after {
-  position: absolute;
-  inset: 0;
-  border-radius: 2px;
-  background: currentColor;
-  content: "";
-  clip-path: polygon(50% 0, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0 50%, 38% 38%);
-}
-
-.agent-detail-traits__spark::after {
-  transform: rotate(45deg) scale(0.54);
-  opacity: 0.72;
-}
-
-.agent-detail-traits__spark-one {
-  top: 26px;
-  left: 28px;
-}
-
-.agent-detail-traits__spark-two {
-  top: 16px;
-  right: 41px;
-  transform: scale(0.76);
-}
-
-.agent-detail-traits__spark-three {
-  right: 7px;
-  bottom: 23px;
-  transform: scale(1.05);
 }
 
 .agent-detail-context {
@@ -890,4 +1048,68 @@
 .agent-identity-badge-workbench__stage > .agent-detail-card .agent-detail-hp__bottom {
   align-items: center;
   flex-direction: row;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Iteration #4 — dynamic token-usage UI                                    */
+/* ------------------------------------------------------------------------ */
+
+.agent-detail-traits__stats {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-detail-traits__stats li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.agent-detail-traits__stats-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.agent-detail-traits__stats strong {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-detail-traits__empty,
+.agent-detail-context__empty {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.55);
+  font-style: italic;
+}
+
+.agent-detail-traits__estimated {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255, 215, 130, 0.85);
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 215, 130, 0.35);
+}
+
+/* PRD AC-4: ~ prefix already in label; dim values when estimated. */
+.agent-identity-badge__meter--estimated,
+.agent-detail-context__meter--estimated {
+  opacity: 0.78;
+}
+
+.agent-identity-badge__usage--estimated {
+  color: rgba(255, 255, 255, 0.75);
+  font-style: italic;
 }

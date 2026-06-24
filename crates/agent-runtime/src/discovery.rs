@@ -95,6 +95,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
                             mode: Some("print".into()),
                             model: default_model.clone(),
                             reasoning_effort: None,
+                            ..Default::default()
                         },
                         runtime_path.clone(),
                     )
@@ -145,7 +146,14 @@ mod tests {
 
     #[cfg(not(unix))]
     fn make_executable(path: &Path) {
-        std::fs::write(path, "").expect("write executable");
+        // On Windows, extensionless files require a PE (MZ) header to pass
+        // is_executable().  Append .cmd so resolve_command_with_pathext()
+        // finds the stub via PATHEXT resolution — this mirrors how .cmd
+        // wrappers (e.g. copilot.CMD) are the Windows equivalent of Unix
+        // shell scripts.
+        let mut cmd_path = path.to_path_buf();
+        cmd_path.set_extension("cmd");
+        std::fs::write(&cmd_path, "@echo off\r\n").expect("write executable");
     }
 
     #[test]
@@ -220,9 +228,20 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "copilot")
             .expect("copilot provider");
-        assert!(copilot.args.contains(&"--resume".into()));
-        assert!(copilot.args.contains(&"{prompt.user}".into()));
+        assert!(copilot.args.contains(&"--session-id".into()));
         assert!(copilot.args.contains(&"{agent.skillWorkspace}".into()));
+        // Copilot delivers prompt via stdin (not args) to avoid Windows
+        // command-line length limits (error 206 / MAX_PATH).
+        let copilot_plan = copilot.runtime_plan.as_ref().expect("copilot runtime plan");
+        assert!(
+            copilot_plan.stdin.as_deref() == Some("{prompt.full}"),
+            "copilot must deliver prompt via stdin, got {:?}",
+            copilot_plan.stdin
+        );
+        assert_eq!(
+            copilot.transport().output_format,
+            Some(CommandOutputFormat::NdjsonLines)
+        );
         assert_eq!(
             copilot
                 .transport()
@@ -230,10 +249,6 @@ mod tests {
                 .get("COPILOT_CUSTOM_INSTRUCTIONS_DIRS")
                 .map(String::as_str),
             Some("{loom_agent_home}")
-        );
-        assert_eq!(
-            copilot.transport().output_format,
-            Some(CommandOutputFormat::NdjsonLines)
         );
         assert!(copilot
             .transport()
@@ -246,7 +261,7 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "codex")
             .expect("codex provider");
-        assert!(codex.args.contains(&"{prompt.user}".into()));
+        assert!(codex.args.contains(&"{prompt.full}".into()));
         assert!(codex.args.contains(&"{agent.skillWorkspace}".into()));
         assert_eq!(
             codex.transport().output_format,
@@ -268,7 +283,7 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "opencode")
             .expect("opencode provider");
-        assert!(opencode.args.contains(&"{prompt.user}".into()));
+        assert!(opencode.args.contains(&"{prompt.full}".into()));
         assert_eq!(
             opencode
                 .transport()

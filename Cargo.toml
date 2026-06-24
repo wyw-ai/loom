@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui"]
+members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui", "crates/loom-platform", "crates/loom-shell"]
 # GUI crate pulls a sizable native dep tree (Tauri + system webkit on macOS, webkit2gtk
 # on Linux). Keep it out of the default `cargo build` the CI uses by excluding it
 # from `default-members`; developers opt in via `make gui-dev` / `cargo tauri dev`.
@@ -15,6 +15,8 @@ authors = ["bojun.cbj"]
 [workspace.dependencies]
 proto = { path = "crates/proto" }
 agent-runtime = { path = "crates/agent-runtime" }
+loom-platform = { path = "crates/loom-platform" }
+dunce = "1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -24,7 +26,8 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
@@ -46,6 +49,25 @@ async-trait = "0.1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3"
+interprocess = { version = "2.2", features = ["tokio"] }
+
+# P0-Lint: Workspace-wide clippy lints. Crates opt in via
+# `[lints] workspace = true` in their own Cargo.toml.
+#
+# `disallowed_methods` is the PAL migration guardrail: any direct
+# `std::process::Command::new` or `tokio::process::Command::new` call is
+# a hard error (the list lives in the workspace-root `clippy.toml`).
+# All non-`loom_platform` crates must spawn via `loom_platform::process::Command`,
+# which applies the platform spawn defaults (CREATE_NO_WINDOW |
+# CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP on Windows,
+# `process_group(0)` on Unix). Legitimate exceptions (G1 OS-shell launchers in
+# gui/, and loom_platform's own implementation) must carry an explicit
+# `#[allow(clippy::disallowed_methods)]` with a comment referencing
+# PM-Arbitration-003. See `clippy.toml` for the disallowed-methods list and the
+# exception inventory.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
 
 [profile.release]
 lto = "thin"

@@ -175,6 +175,21 @@ pub enum AdapterEvent {
         summary: String,
         usage: Option<TokenUsage>,
     },
+    /// Streaming token-usage snapshot emitted during an in-flight turn.
+    ///
+    /// Each `UsageUpdate` carries the current cumulative snapshot for `scope`
+    /// as reported by the provider (or estimated, in which case
+    /// `usage.estimated == true`). Consumers MUST treat it as a snapshot
+    /// replace, NOT a delta — providers may revise figures mid-turn
+    /// (e.g. cache_read tokens surfacing on the second segment).
+    ///
+    /// `Finished{usage}` is the authoritative final value; UsageUpdate is
+    /// best-effort progress for UX. If `Finished.usage` arrives while
+    /// UsageUpdates are still in-flight, the Finished value wins.
+    UsageUpdate {
+        scope: Option<ScopeRef>,
+        usage: TokenUsage,
+    },
     Error {
         scope: Option<ScopeRef>,
         message: String,
@@ -191,6 +206,7 @@ impl AdapterEvent {
             | AdapterEvent::ActionRequest { scope, .. }
             | AdapterEvent::StatusChange { scope, .. }
             | AdapterEvent::Finished { scope, .. }
+            | AdapterEvent::UsageUpdate { scope, .. }
             | AdapterEvent::Error { scope, .. } => scope.as_ref(),
         }
     }

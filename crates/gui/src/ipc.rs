@@ -923,6 +923,8 @@ pub struct AgentCreateArgs {
     pub autostart: bool,
     #[serde(default)]
     pub avatar_url: String,
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[tauri::command]
@@ -997,6 +999,8 @@ pub struct AgentUpdateArgs {
     pub avatar_url: Option<String>,
     #[serde(default)]
     pub prompt_assembly: Option<Value>,
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[tauri::command]
@@ -1046,6 +1050,7 @@ pub async fn agent_update(
         "reasoningEffort": args.reasoning_effort,
         "autostart": args.autostart,
         "avatarUrl": args.avatar_url,
+        "env": args.env,
     });
     if let Some(prompt_assembly) = args.prompt_assembly {
         command["promptAssembly"] = prompt_assembly;
@@ -1388,13 +1393,65 @@ pub struct MachineRemoveArgs {
 
 #[tauri::command]
 pub async fn machine_remove(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     args: MachineRemoveArgs,
 ) -> Result<MachineListResult, String> {
-    Err(format!(
-        "host `{}` is daemon-owned; stop or reconfigure the daemon instead of deleting it from GUI local state",
-        args.machine_id
-    ))
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let machine_id = args.machine_id.trim();
+    // `machine_id` is joined into a filesystem path and remove_dir_all'd
+    // below, so it must be a plain identifier. Reject anything that could
+    // escape the daemon-configs/ directory (path traversal → arbitrary
+    // directory deletion). Since no path separators are allowed, traversal
+    // via `..` segments is impossible; `.`/`..` alone are rejected too
+    // (they would delete the daemon-configs dir itself).
+    if machine_id.is_empty()
+        || machine_id.contains('\\')
+        || machine_id.contains('/')
+        || machine_id.contains('\0')
+        || machine_id == "."
+        || machine_id == ".."
+    {
+        return Err("invalid machine id".into());
+    }
+
+    // Try to find this machine on the server and delete its actor.
+    // Server machines are registered as service actors with _meta.role == "machine".
+    if let Some(client) = state.try_client().await {
+        if let Ok(value) = client.call_raw(method::ACTOR_LIST, None).await {
+            if let Some(actors) = value.get("actors").and_then(Value::as_array) {
+                for actor in actors {
+                    let meta = actor.get("_meta");
+                    let machine_meta_id = meta
+                        .and_then(|m| m.get("machineId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let is_service = actor
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(|k| k == "service")
+                        .unwrap_or(false);
+                    if is_service && machine_meta_id == machine_id {
+                        if let Some(actor_id) = actor.get("id").and_then(Value::as_str) {
+                            delete_actors_from_server(
+                                Some(client.clone()),
+                                &[actor_id.to_string()],
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up local daemon config directory.
+    let config_dir = config::config_dir().join("daemon-configs").join(machine_id);
+    if config_dir.exists() {
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    // Return updated machine list.
+    machines_from_config(&cfg, state.try_client().await).await
 }
 #[tauri::command]
 pub async fn machine_agent_create(
@@ -1436,6 +1493,7 @@ pub async fn machine_agent_create(
                 "reasoningEffort": args.reasoning_effort,
                 "autostart": args.autostart,
                 "avatarUrl": args.avatar_url,
+                "env": args.env,
             }),
         )
         .await?;
@@ -2252,7 +2310,17 @@ fn normalize_local_path(path: PathBuf) -> anyhow::Result<PathBuf> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // G1 OS shell (PM-Arbitration-003) — see body
 fn open_path_with_system(path: &Path) -> anyhow::Result<()> {
+    // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3
+    // [G1: OS shell visibility] (PM-Arbitration-003 judgement).
+    // These user-facing file-manager launchers must NOT use
+    // `loom_platform::process::Command` until P1-Cmd-Sweep verifies that
+    // the newtype's default Windows flags don't break Explorer's popup
+    // behavior (ARCH-flagged risk for `explorer`). P0-Lint
+    // (`clippy::disallowed_methods`) is active workspace-wide; the fn-level
+    // allow above is the documented G1 exemption (covers all three platform
+    // branches below).
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = std::process::Command::new("open");
@@ -2327,22 +2395,24 @@ fn daemon_start_commands(
         .unwrap_or_else(|| "loom-daemon".into());
     let serve_command = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
         format!(
-            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
+            "LOOM_CONFIG_DIR={} LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}{}",
             config_dir_arg,
             data_root_arg,
             daemon_bin,
             shell_arg(server_url),
             shell_arg(machine_id),
             shell_arg(machine_name),
+            if cfg!(windows) { " --no-ipc" } else { "" },
         )
     } else {
         format!(
-            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}",
+            "LOOM_AGENT_DATA_ROOT={} {} --server {} --machine-id {} --machine-name {}{}",
             data_root_arg,
             daemon_bin,
             shell_arg(server_url),
             shell_arg(machine_id),
             shell_arg(machine_name),
+            if cfg!(windows) { " --no-ipc" } else { "" },
         )
     };
     let mkdir_args = if let Some(config_dir_arg) = config_dir_arg.as_ref() {
@@ -2355,7 +2425,7 @@ fn daemon_start_commands(
         .map(|config_dir_arg| format!("export LOOM_CONFIG_DIR={config_dir_arg}\n"))
         .unwrap_or_default();
     let setup_script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {} --machine-name {}\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p {}\n{}export LOOM_AGENT_DATA_ROOT={}\nif [[ -z \"${{LOOM_DAEMON_BIN:-}}\" ]]; then\n  LOOM_DAEMON_BIN={}\nfi\nif [[ ! -x \"$LOOM_DAEMON_BIN\" ]]; then\n  if command -v \"$LOOM_DAEMON_BIN\" >/dev/null 2>&1; then\n    LOOM_DAEMON_BIN=\"$(command -v \"$LOOM_DAEMON_BIN\")\"\n  else\n    LOOM_DAEMON_BIN=\"$(command -v loom-daemon)\"\n  fi\nfi\nexec \"$LOOM_DAEMON_BIN\" --server {} --machine-id {} --machine-name {}{}\n",
         mkdir_args,
         config_export,
         shell_path_arg(data_root),
@@ -2363,6 +2433,7 @@ fn daemon_start_commands(
         shell_arg(server_url),
         shell_arg(machine_id),
         shell_arg(machine_name),
+        if cfg!(windows) { " --no-ipc" } else { "" },
     );
     (serve_command, setup_script)
 }
@@ -2891,7 +2962,12 @@ mod tests {
         assert_eq!(machine.agents[0].info.spec.actor.id, "actor_remote_agent");
         assert_eq!(
             machine.agents[0].profile_path,
-            "/home/canfeng/.agentx/machine_remote/agents/actor_remote_agent/profile"
+            format!(
+                "/home/canfeng/.agentx/machine_remote{}agents{}actor_remote_agent{}profile",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            )
         );
     }
 

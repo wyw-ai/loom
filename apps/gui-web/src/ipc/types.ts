@@ -321,10 +321,22 @@ export interface MachineInfo {
   configDir: string;
   agentCount: number;
   onlineAgentCount: number;
+  serviceCount: number;
   providers: MachineAgentProviderInfo[];
   agents: MachineAgentInfo[];
+  services: MachineServiceInfo[];
   serveCommand: string;
   setupScript: string;
+}
+
+export interface MachineServiceInfo {
+  id: string;
+  kind: string;
+  displayName?: string;
+  actor: Actor;
+  lifecycle?: string;
+  autostart?: boolean;
+  [key: string]: unknown;
 }
 
 export interface MachineListResult {

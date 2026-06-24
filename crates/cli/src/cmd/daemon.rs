@@ -17,6 +17,7 @@ use agent_runtime::provider::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     AgentModelSpec, AgentPromptAssemblySpec, AgentProviderRef, AgentSpec, ProviderManifest,
+    ServiceSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -85,13 +86,25 @@ pub async fn run(
         initial_specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
     let mut inventory_revision = 1u64;
-    let mut inventory_fingerprint =
-        machine_inventory_fingerprint(&machine, &data_root, &providers, &initial_specs);
+    let initial_service_specs = load_config_service_specs().unwrap_or_else(|err| {
+        eprintln!("loom-daemon: warning: failed to load ServiceSpecs for inventory: {err:#}");
+        Vec::new()
+    });
+    let mut annotated_initial_service_specs = initial_service_specs;
+    annotate_machine_service_specs(&mut annotated_initial_service_specs, &machine);
+    let mut inventory_fingerprint = machine_inventory_fingerprint(
+        &machine,
+        &data_root,
+        &providers,
+        &initial_specs,
+        &annotated_initial_service_specs,
+    );
     let machine_inventory = Arc::new(Mutex::new(machine_inventory_meta(
         &machine,
         &data_root,
         &providers,
         &initial_specs,
+        &annotated_initial_service_specs,
         inventory_revision,
     )));
     let (machine_command_tx, mut machine_command_rx) = mpsc::unbounded_channel();
@@ -309,6 +322,7 @@ struct MachineSpecs {
     machine: MachineConfig,
     providers: Vec<DetectedAgentProvider>,
     specs: Vec<AgentSpec>,
+    service_specs: Vec<ServiceSpec>,
 }
 
 struct RunningAgent {
@@ -340,6 +354,7 @@ fn refresh_machine_runtime(
         data_root,
         &snapshot.providers,
         &snapshot.specs,
+        &snapshot.service_specs,
     );
     if next_fingerprint != *inventory_fingerprint {
         *inventory_revision = inventory_revision.saturating_add(1);
@@ -350,6 +365,7 @@ fn refresh_machine_runtime(
         data_root,
         &snapshot.providers,
         &snapshot.specs,
+        &snapshot.service_specs,
         *inventory_revision,
     );
     reconcile_agents(running_agents, snapshot.specs, server_url, data_root);
@@ -389,6 +405,7 @@ fn load_machine_specs(
         .ok_or_else(|| anyhow!("daemon machine config is missing"))?;
     let mut specs = load_config_agent_specs()?;
     annotate_machine_agent_specs(&mut specs, &machine);
+    let mut service_specs = load_config_service_specs()?;
 
     if !allow_actors.is_empty() {
         let allow = allow_actors
@@ -397,11 +414,13 @@ fn load_machine_specs(
             .collect::<HashSet<_>>();
         specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
+    annotate_machine_service_specs(&mut service_specs, &machine);
 
     Ok(MachineSpecs {
         machine,
         providers,
         specs,
+        service_specs,
     })
 }
 
@@ -411,6 +430,14 @@ fn load_config_agent_specs() -> Result<Vec<AgentSpec>> {
         return Ok(Vec::new());
     }
     agent_serve::load_specs(&dir).with_context(|| format!("load AgentSpecs from {}", dir.display()))
+}
+
+fn load_config_service_specs() -> Result<Vec<ServiceSpec>> {
+    let dir = crate::config::service_specs_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    service::load_specs(&dir).with_context(|| format!("load ServiceSpecs from {}", dir.display()))
 }
 
 fn agent_specs_dir() -> PathBuf {
@@ -860,6 +887,19 @@ fn spec_fingerprint(spec: &AgentSpec) -> String {
 }
 
 fn annotate_machine_agent_specs(specs: &mut [AgentSpec], machine: &MachineConfig) {
+    for spec in specs {
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        meta.insert("machineId".into(), json!(machine.id.clone()));
+        if let Some(workspace_id) = machine.workspace_id.as_deref() {
+            meta.insert("workspaceId".into(), json!(workspace_id));
+        }
+        if let Some(owner_actor_id) = machine.owner_actor_id.as_deref() {
+            meta.insert("ownerActorId".into(), json!(owner_actor_id));
+        }
+    }
+}
+
+fn annotate_machine_service_specs(specs: &mut [ServiceSpec], machine: &MachineConfig) {
     for spec in specs {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         meta.insert("machineId".into(), json!(machine.id.clone()));
@@ -1981,6 +2021,7 @@ fn machine_inventory_meta(
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
     specs: &[AgentSpec],
+    service_specs: &[ServiceSpec],
     revision: u64,
 ) -> serde_json::Value {
     json!({
@@ -2013,6 +2054,7 @@ fn machine_inventory_meta(
         ],
         "providers": providers,
         "agentSpecs": specs,
+        "serviceSpecs": service_specs,
     })
 }
 
@@ -2021,6 +2063,7 @@ fn machine_inventory_fingerprint(
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
     specs: &[AgentSpec],
+    service_specs: &[ServiceSpec],
 ) -> String {
     serde_json::to_string(&json!({
         "machineId": &machine.id,
@@ -2032,6 +2075,7 @@ fn machine_inventory_fingerprint(
         "configDir": config::config_dir().display().to_string(),
         "providers": providers,
         "agentSpecs": specs,
+        "serviceSpecs": service_specs,
     }))
     .unwrap_or_default()
 }
@@ -2756,8 +2800,14 @@ mod tests {
         };
         annotate_machine_agent_specs(std::slice::from_mut(&mut spec), &machine);
 
-        let meta =
-            machine_inventory_meta(&machine, &PathBuf::from("/tmp/loom-data"), &[], &[spec], 7);
+        let meta = machine_inventory_meta(
+            &machine,
+            &PathBuf::from("/tmp/loom-data"),
+            &[],
+            &[spec],
+            &[],
+            7,
+        );
 
         assert!(meta.get("agents").is_none());
         let capabilities = meta

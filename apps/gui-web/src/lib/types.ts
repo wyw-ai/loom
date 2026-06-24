@@ -98,6 +98,10 @@ export type AgentMemberEntry = {
   machine: MachineInfo;
   agent: MachineInfo["agents"][number];
 };
+export type ServiceMemberEntry = {
+  machine: MachineInfo;
+  service: MachineInfo["services"][number];
+};
 export type ProviderAvailabilityGroup = {
   key: string;
   id: string;
@@ -112,6 +116,7 @@ export type ProviderAvailabilityGroup = {
 };
 export type ActorWorkspaceSection = "agents" | "hosts" | "services";
 export type AgentDetailTab = "profile" | "prompt" | "settings";
+export type ServiceDetailTab = "overview" | "spec" | "config";
 export type PromptTemplateDraft = {
   system: string;
   user: string;

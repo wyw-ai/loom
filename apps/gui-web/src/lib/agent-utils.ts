@@ -11,6 +11,7 @@ import type {
   ChannelMemberPresence,
   ChannelPanelTab,
   ProviderAvailabilityGroup,
+  ServiceMemberEntry,
 } from "@/lib/types";
 import { agentAvatarIndexes, avatarCount } from "@/lib/constants";
 import { metadataString, metadataNumber } from "@/lib/message-utils";
@@ -27,6 +28,12 @@ import {
 export function agentMemberEntries(machines: MachineInfo[]): AgentMemberEntry[] {
   return machines.flatMap((machine) =>
     machine.agents.map((agent) => ({ machine, agent })),
+  );
+}
+
+export function serviceMemberEntries(machines: MachineInfo[]): ServiceMemberEntry[] {
+  return machines.flatMap((machine) =>
+    (machine.services || []).map((service) => ({ machine, service })),
   );
 }
 

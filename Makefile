@@ -17,6 +17,10 @@ CROSS          ?= cross
 LIPO           ?= lipo
 DIST_DIR       ?= dist
 PACKAGE_OUT_DIR ?= $(DIST_DIR)/packages
+WINSW_VERSION  ?= $(shell cat .winsw-version 2>/dev/null || echo v2.12.0)
+WINSW_URL      := https://github.com/winsw/winsw/releases/download/$(WINSW_VERSION)/WinSW-x64.exe
+WINSW_CACHE    := .cache/WinSW-x64.exe
+SHELL_PKG      := -p loom-shell
 # Default to native cargo + musl-cross toolchain; cross+Docker is broken on
 # Apple Silicon (rustc segfaults under QEMU). Override with LINUX_BUILDER=cross
 # if you actually have a working cross container setup.
@@ -28,16 +32,18 @@ GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 PKG_FLAGS := -p loom-cli -p loom-server
 BINS      := loom loom-daemon loom-server
 
-TRIPLE_MAC_ARM   := aarch64-apple-darwin
-TRIPLE_MAC_X86   := x86_64-apple-darwin
-TRIPLE_LINUX_X86 := x86_64-unknown-linux-musl
-TRIPLE_LINUX_ARM := aarch64-unknown-linux-musl
+TRIPLE_MAC_ARM     := aarch64-apple-darwin
+TRIPLE_MAC_X86     := x86_64-apple-darwin
+TRIPLE_LINUX_X86   := x86_64-unknown-linux-musl
+TRIPLE_LINUX_ARM   := aarch64-unknown-linux-musl
+TRIPLE_WINDOWS_X86 := x86_64-pc-windows-msvc
 
 ALL_TRIPLES := \
   $(TRIPLE_MAC_ARM) \
   $(TRIPLE_MAC_X86) \
   $(TRIPLE_LINUX_X86) \
-  $(TRIPLE_LINUX_ARM)
+  $(TRIPLE_LINUX_ARM) \
+  $(TRIPLE_WINDOWS_X86)
 
 .DEFAULT_GOAL := help
 
@@ -57,12 +63,15 @@ help:
 	@echo "  mac-universal-{...}         lipo of mac-arm + mac-x86"
 	@echo "  linux-x86-{debug,release}   $(TRIPLE_LINUX_X86)"
 	@echo "  linux-arm-{debug,release}   $(TRIPLE_LINUX_ARM)"
+	@echo "  windows-x86-{debug,release} $(TRIPLE_WINDOWS_X86)"
+	@echo "  windows-shell-{debug,release}  loom-shell.exe (Windows only)"
 	@echo ""
 	@echo "Bulk:"
 	@echo "  all-debug                   every target, debug"
 	@echo "  all-release                 every target, release"
 	@echo "  all                         debug + release"
 	@echo "  package-release             one-shot runtime archives + mac arm64 GUI dmg"
+	@echo "  windows-service-package     assemble winsw Windows Service zip (requires windows-x86-release)"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  install-targets             rustup target add (all triples)"
@@ -121,6 +130,55 @@ $(eval $(call define-target,mac-x86,$(TRIPLE_MAC_X86),$(CARGO)))
 $(eval $(call define-target,linux-x86,$(TRIPLE_LINUX_X86),$(LINUX_BUILDER)))
 $(eval $(call define-target,linux-arm,$(TRIPLE_LINUX_ARM),$(LINUX_BUILDER)))
 
+# Windows target — binaries carry .exe extension; keep it so Windows
+# users get native executables.
+.PHONY: windows-x86-debug windows-x86-release
+
+windows-x86-debug:
+	$(CARGO) build --target $(TRIPLE_WINDOWS_X86) $(PKG_FLAGS)
+	@mkdir -p $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom.exe        $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-daemon.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-daemon.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-server.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-server.exe
+
+windows-x86-release:
+	$(CARGO) build --release --target $(TRIPLE_WINDOWS_X86) $(PKG_FLAGS)
+	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom.exe        $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-daemon.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-daemon.exe
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-server.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-server.exe
+
+# ---- Windows Shell GUI (NWG) ---------------------------------------------
+
+.PHONY: windows-shell-debug windows-shell-release
+
+windows-shell-debug:
+	$(CARGO) build --target $(TRIPLE_WINDOWS_X86) $(SHELL_PKG)
+	@mkdir -p $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)
+	cp target/$(TRIPLE_WINDOWS_X86)/debug/loom-shell.exe $(DIST_DIR)/debug/$(TRIPLE_WINDOWS_X86)/loom-shell.exe
+
+windows-shell-release:
+	$(CARGO) build --release --target $(TRIPLE_WINDOWS_X86) $(SHELL_PKG)
+	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)
+	cp target/$(TRIPLE_WINDOWS_X86)/release/loom-shell.exe $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/loom-shell.exe
+
+# ---- Windows Service package (winsw) ------------------------------------
+
+$(WINSW_CACHE):
+	@mkdir -p .cache
+	curl -fsSL $(WINSW_URL) -o $(WINSW_CACHE)
+	@echo "downloaded winsw $(WINSW_VERSION)"
+
+.PHONY: windows-service-package
+windows-service-package: windows-x86-release windows-shell-release $(WINSW_CACHE)
+	@mkdir -p $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config
+	cp scripts/windows/loom-server.xml  $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config/
+	cp scripts/windows/loom-daemon.xml  $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/config/
+	cp scripts/windows/install.ps1      $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/
+	cp scripts/windows/uninstall.ps1    $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/
+	cp $(WINSW_CACHE)                   $(DIST_DIR)/release/$(TRIPLE_WINDOWS_X86)/WinSW-x64.exe
+	@echo "windows-service-package: assembled winsw service files for $(TRIPLE_WINDOWS_X86)"
+
 # ---- macOS universal binary (lipo) ---------------------------------------
 
 UNIVERSAL_DIR := universal-apple-darwin
@@ -158,14 +216,16 @@ all-debug: \
   mac-x86-debug \
   mac-universal-debug \
   linux-x86-debug \
-  linux-arm-debug
+  linux-arm-debug \
+  windows-x86-debug
 
 all-release: \
   mac-arm-release \
   mac-x86-release \
   mac-universal-release \
   linux-x86-release \
-  linux-arm-release
+  linux-arm-release \
+  windows-x86-release
 
 all: all-debug all-release
 

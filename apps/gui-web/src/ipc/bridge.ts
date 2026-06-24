@@ -344,6 +344,7 @@ export async function machineAgentCreate(args: {
   reasoningEffort?: string;
   autostart?: boolean;
   avatarUrl?: string;
+  env?: Record<string, string>;
 }): Promise<MachineListResult> {
   return invoke("machine_agent_create", { args });
 }
@@ -360,6 +361,7 @@ export async function agentUpdate(args: {
   reasoningEffort?: string;
   autostart?: boolean;
   avatarUrl?: string;
+  env?: Record<string, string>;
 }): Promise<AgentInfo> {
   return invoke("agent_update", { args });
 }

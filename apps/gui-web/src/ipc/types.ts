@@ -216,6 +216,7 @@ export interface AgentProviderRef {
   mode?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  env?: Record<string, string>;
 }
 
 export interface MachineAgentProviderInfo {
@@ -354,6 +355,73 @@ export interface StreamUpdate {
   kind: string;
   scope: ScopeRef;
   data: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Token usage (Iteration #4 — agent self-monitoring)
+//
+// Mirrors `crates/agent-runtime/src/adapter.rs::TokenUsage` (rename_all =
+// snake_case). The agent worker (`crates/cli/src/cmd/agent_serve.rs::
+// build_turn_meta`) attaches `TokenUsageMeta { increment, cumulative }` onto
+// every assistant message under `metadata.token_usage`, plus a prompt
+// breakdown under `metadata.prompt_breakdown`.
+// ---------------------------------------------------------------------------
+
+export interface TokenUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_cost_usd?: number | null;
+  estimated?: boolean;
+}
+
+export interface MessageTokenUsageMeta {
+  increment: TokenUsage;
+  cumulative: TokenUsage;
+}
+
+export interface PromptBreakdownSection {
+  key: string;
+  label: string;
+  char_count?: number;
+  byte_count?: number;
+  approx_token_count: number;
+  percentage?: number;
+}
+
+export interface PromptBreakdown {
+  sections: PromptBreakdownSection[];
+}
+
+export function readMessageTokenUsage(
+  meta: Record<string, unknown> | undefined | null,
+): MessageTokenUsageMeta | null {
+  if (!meta || typeof meta !== "object") return null;
+  const raw = (meta as Record<string, unknown>)["token_usage"];
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const increment = obj["increment"];
+  const cumulative = obj["cumulative"];
+  if (!increment || typeof increment !== "object") return null;
+  if (!cumulative || typeof cumulative !== "object") return null;
+  return {
+    increment: increment as TokenUsage,
+    cumulative: cumulative as TokenUsage,
+  };
+}
+
+export function readMessagePromptBreakdown(
+  meta: Record<string, unknown> | undefined | null,
+): PromptBreakdown | null {
+  if (!meta || typeof meta !== "object") return null;
+  const raw = (meta as Record<string, unknown>)["prompt_breakdown"];
+  if (!raw || typeof raw !== "object") return null;
+  const sections = (raw as Record<string, unknown>)["sections"];
+  if (!Array.isArray(sections)) return null;
+  return { sections: sections as PromptBreakdownSection[] };
 }
 
 export function scopeKey(scope: ScopeRef): string {

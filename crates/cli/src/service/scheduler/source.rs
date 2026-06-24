@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use loom_platform::process::TokioCommand as Command;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
-use tokio::process::Command;
 
 use super::spec::Source;
 
@@ -164,6 +164,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_returns_stdout() {
         let body = exec_source(&cmd("echo", &["hello", "world"]))
@@ -172,6 +173,7 @@ mod tests {
         assert_eq!(String::from_utf8(body).unwrap().trim(), "hello world");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_propagates_nonzero_exit() {
         // `false` is the canonical exit-1 unix utility.
@@ -180,6 +182,7 @@ mod tests {
         assert!(msg.contains("exited with status"), "{msg}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_passes_env() {
         let mut env = BTreeMap::new();
@@ -194,6 +197,7 @@ mod tests {
         assert_eq!(String::from_utf8(body).unwrap().trim(), "loom-scheduler");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_respects_timeout() {
         let s = Source::Command {

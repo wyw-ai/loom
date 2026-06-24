@@ -15,12 +15,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{
-    Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
-};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use loom_platform::process::Command;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -111,6 +111,9 @@ struct AcpShared {
     /// response. Some ACP agents report usage as a session/update rather than
     /// on the prompt response itself.
     usage_by_session: Mutex<HashMap<String, TokenUsage>>,
+    /// session id → last emitted UsageUpdate snapshot, used for emission-side
+    /// dedup so we don't flood the event channel with identical snapshots.
+    last_emitted_usage: Mutex<HashMap<String, TokenUsage>>,
     action_namespace: String,
     /// Forwarded verbatim as the `mcpServers` array on every `session/new`.
     /// Populated at start from `AcpConfig.mcp_servers`; immutable thereafter.
@@ -240,7 +243,7 @@ impl AcpAdapter {
         let mcp_servers = shared.mcp_servers.clone();
         let model = requested_model.clone();
         let new_sid = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            std::fs::create_dir_all(&cwd).map_err(|e| {
+            crate::acp::create_dir_all_unc(&cwd).map_err(|e| {
                 format!(
                     "Failed to create ACP session cwd `{}`: {}",
                     cwd.display(),
@@ -519,19 +522,32 @@ fn start_blocking(
             .map_err(|e| e.to_string())?
             .join(&cfg.process_cwd)
     };
-    std::fs::create_dir_all(&process_cwd).map_err(|e| {
+    crate::acp::create_dir_all_unc(&process_cwd).map_err(|e| {
         format!(
             "Failed to create ACP workdir `{}`: {}",
             process_cwd.display(),
             e
         )
     })?;
-    let mut cmd = Command::new(&cfg.command);
+    // On Windows, prefix cwd with UNC prefix to bypass MAX_PATH (260 char)
+    // limit, fixing os error 206 (ERROR_FILENAME_EXCED_RANGE).
+    // Do NOT UNC-prefix the command path — `\\?\` bypasses PATHEXT
+    // resolution in CreateProcessW, so e.g. `\\?\D:\nodejs\copilot`
+    // would fail to resolve to `copilot.cmd`.
+    // `unc_prefix_path` is a no-op on Unix so the call site stays cfg-free.
+    let process_cwd = unc_prefix_path(process_cwd);
+    let command_path = std::path::PathBuf::from(&cfg.command);
+
+    let mut cmd = Command::new(&command_path);
     cmd.args(&cfg.args)
         .current_dir(&process_cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
+    // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
+    // `loom_platform::process::Command::new` automatically — no cfg block.
+
     let mut path_for_error = std::env::var("PATH").unwrap_or_default();
     let mut process_env = BTreeMap::new();
     if should_capture_shell_env() {
@@ -558,9 +574,24 @@ fn start_blocking(
         process_env.insert(k.clone(), v.clone());
     }
     cmd.envs(&process_env);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| spawn_error_message(&cfg.command, &process_cwd, &path_for_error, e))?;
+
+    // Diagnostic: log spawn details for debugging (was eprintln!, which
+    // fired on every ACP turn and polluted stderr).
+    tracing::debug!(
+        command = %command_path.display(),
+        args = cfg.args.len(),
+        cwd = %process_cwd.display(),
+        "acp spawn"
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        spawn_error_message(
+            &command_path.to_string_lossy(),
+            &process_cwd,
+            &path_for_error,
+            e,
+        )
+    })?;
     let stdin = child.stdin.take().ok_or("Failed to open agent stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to open agent stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to open agent stderr")?;
@@ -577,6 +608,7 @@ fn start_blocking(
         sessions_by_id: Mutex::new(HashMap::new()),
         model_options_by_session: Mutex::new(HashMap::new()),
         usage_by_session: Mutex::new(HashMap::new()),
+        last_emitted_usage: Mutex::new(HashMap::new()),
         action_namespace: Uuid::new_v4().to_string(),
         mcp_servers: cfg.mcp_servers.clone(),
         event_sender: event_sender.clone(),
@@ -1013,28 +1045,48 @@ fn is_auth_required_error(err: &str) -> bool {
         .is_some_and(|message| message == "Authentication required")
 }
 
+// UNC path utilities re-exported from `loom_platform::path` (P0-PAL-4b).
+// External consumers of `agent_runtime::acp::*` keep the historical
+// `create_dir_all_unc` name through this rename re-export.
+pub use loom_platform::path::{
+    create_dir_all as create_dir_all_unc, normalize_path_separators, unc_prefix_path,
+};
+
 fn spawn_error_message(command: &str, cwd: &Path, path: &str, err: std::io::Error) -> String {
+    let raw_code = err.raw_os_error();
+    let raw_info = raw_code
+        .map(|c| format!(" (os error {c})"))
+        .unwrap_or_default();
     if err.kind() == ErrorKind::NotFound {
         return format!(
             "Failed to start ACP command `{command}`: command not found on PATH \
-             (cwd `{}`, PATH `{}`)",
+             (cwd `{}`, PATH `{}`){raw_info}",
             cwd.display(),
             truncate_for_log(&path, 500),
         );
     }
     format!(
-        "Failed to start ACP command `{command}` in `{}`: {err}",
+        "Failed to start ACP command `{command}` in `{}`: {err}{raw_info}",
         cwd.display()
     )
 }
 
 fn should_capture_shell_env() -> bool {
-    match std::env::var("LOOM_ACP_SHELL_ENV") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
+    // Shell env capture is Unix-only; on Windows it always fails and costs an
+    // 8-second timeout per agent start, so skip it unconditionally.
+    #[cfg(not(unix))]
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        match std::env::var("LOOM_ACP_SHELL_ENV") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            Err(_) => true,
+        }
     }
 }
 
@@ -1056,14 +1108,15 @@ fn capture_login_shell_env(
         end
     );
 
-    let child = Command::new(&shell)
-        .arg("-l")
+    let mut cmd = Command::new(&shell);
+    cmd.arg("-l")
         .arg("-i")
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
         .spawn()
         .map_err(|e| format!("failed to start `{}`: {e}", shell.display()))?;
 
@@ -1128,15 +1181,21 @@ fn wait_status_with_timeout(mut child: Child, timeout: Duration) -> Result<ExitS
     }
 }
 
-#[cfg(unix)]
 fn kill_process(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    // PAL-6: closed the cfg(windows) / cfg(unix) split here by delegating
+    // forced termination to `loom_platform::signal::force_kill_pid`. The
+    // Unix side calls `libc::kill(pid, SIGKILL)`; the Windows side does
+    // `OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE) + TerminateProcess(1)
+    // + CloseHandle`. See ARCH D5 and the PAL signal module for the
+    // rationale (exit-code-1 standardisation, SYNCHRONIZE so a future
+    // wait does not need to re-open the handle).
+    //
+    // We deliberately swallow the error: callers reach this path because
+    // the child is already considered hung/abandoned, and there is
+    // nothing actionable to do with an `ESRCH`/`ACCESS_DENIED` other than
+    // log it. The previous implementation was also infallible.
+    let _ = loom_platform::signal::force_kill_pid(pid);
 }
-
-#[cfg(not(unix))]
-fn kill_process(_pid: u32) {}
 
 fn parse_env_output(
     stdout: &[u8],
@@ -1419,10 +1478,31 @@ fn handle_agent_notification(shared: &Arc<AcpShared>, method: &str, message: Val
     if let Some(session_id) = session_id.as_deref() {
         update_model_options_for_session(shared, session_id, &update);
         if let Some(usage) = extract_token_usage(&update) {
+            let normalized = normalized_usage(usage);
             shared
                 .usage_by_session
                 .lock()
-                .insert(session_id.to_string(), normalized_usage(usage));
+                .insert(session_id.to_string(), normalized.clone());
+            // Emission-side dedup: only fire UsageUpdate when the snapshot
+            // actually changes for this session. Avoids flooding the event
+            // channel with identical snapshots when providers echo the same
+            // cache_read totals on every chunk.
+            let should_emit = {
+                let mut last = shared.last_emitted_usage.lock();
+                match last.get(session_id) {
+                    Some(prev) if *prev == normalized => false,
+                    _ => {
+                        last.insert(session_id.to_string(), normalized.clone());
+                        true
+                    }
+                }
+            };
+            if should_emit {
+                let _ = shared.event_sender.send(AdapterEvent::UsageUpdate {
+                    scope: scope.clone(),
+                    usage: normalized,
+                });
+            }
         }
     }
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
@@ -1480,6 +1560,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         );
         if let Some(error) = message.get("error") {
             shared.usage_by_session.lock().remove(&session_id);
+            shared.last_emitted_usage.lock().remove(&session_id);
             let _ = shared.event_sender.send(AdapterEvent::Error {
                 scope: Some(scope.clone()),
                 message: json_value_to_string(error),
@@ -1494,6 +1575,7 @@ fn handle_agent_response(shared: &Arc<AcpShared>, message: Value) {
         }
         let result = message.get("result").cloned().unwrap_or(Value::Null);
         let update_usage = shared.usage_by_session.lock().remove(&session_id);
+        shared.last_emitted_usage.lock().remove(&session_id);
         let usage = extract_token_usage(&result)
             .map(normalized_usage)
             .or(update_usage);

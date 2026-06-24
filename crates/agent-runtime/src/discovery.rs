@@ -200,6 +200,7 @@ mod tests {
         assert!(resume_args.contains(&"--resume".into()));
         assert!(resume_args.contains(&"{session_id}".into()));
         assert!(resume_args.contains(&"{prompt.user}".into()));
+        assert!(resume_args.contains(&"{agent.skillWorkspace}".into()));
         assert!(claude_session.resume_arg_specs.iter().any(|arg| matches!(
             arg,
             ProviderArgSpec::Conditional(spec) if spec.when == "model"
@@ -228,6 +229,7 @@ mod tests {
             .find(|provider| provider.id == "copilot")
             .expect("copilot provider");
         assert!(copilot.args.contains(&"--session-id".into()));
+        assert!(copilot.args.contains(&"{agent.skillWorkspace}".into()));
         // Copilot delivers prompt via stdin (not args) to avoid Windows
         // command-line length limits (error 206 / MAX_PATH).
         let copilot_plan = copilot.runtime_plan.as_ref().expect("copilot runtime plan");
@@ -239,6 +241,14 @@ mod tests {
         assert_eq!(
             copilot.transport().output_format,
             Some(CommandOutputFormat::NdjsonLines)
+        );
+        assert_eq!(
+            copilot
+                .transport()
+                .env
+                .get("COPILOT_CUSTOM_INSTRUCTIONS_DIRS")
+                .map(String::as_str),
+            Some("{loom_agent_home}")
         );
         assert!(copilot
             .transport()
@@ -252,6 +262,7 @@ mod tests {
             .find(|provider| provider.id == "codex")
             .expect("codex provider");
         assert!(codex.args.contains(&"{prompt.full}".into()));
+        assert!(codex.args.contains(&"{agent.skillWorkspace}".into()));
         assert_eq!(
             codex.transport().output_format,
             Some(CommandOutputFormat::CodexStreamJson)
@@ -264,11 +275,23 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            codex.transport().env.get("CODEX_HOME").map(String::as_str),
+            Some("{loom_agent_home}")
+        );
         let opencode = providers
             .iter()
             .find(|provider| provider.id == "opencode")
             .expect("opencode provider");
         assert!(opencode.args.contains(&"{prompt.full}".into()));
+        assert_eq!(
+            opencode
+                .transport()
+                .env
+                .get("OPENCODE_CONFIG")
+                .map(String::as_str),
+            Some("{agent.skillWorkspace}/.opencode/opencode.json")
+        );
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
     }

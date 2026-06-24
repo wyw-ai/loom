@@ -81,24 +81,28 @@ ScopeRef =
 
 agent 进程仍由 `loom agent serve` 托管。`interactive_command` 只是在 agent runtime 里新增一种 adapter。
 
-### 2.3 Scope skills 是 workspace 能力，不是 provider session 状态
+### 2.3 Scope skills 是 agent-local workspace 能力，不是 provider session 状态
 
-为了兼容 classroom / 多 agent 场景，Loom server 可以把 channel 成员 actor 的已发布 bundle 投影到 scope 级 `skills/` 目录：
-
-```text
-data/workspaces/channel/{channel_id}/skills/{actor_id} -> data/agents/{actor_id}/bundle source
-data/workspaces/thread/{thread_id}/skills/{actor_id}  -> data/agents/{actor_id}/bundle source
-```
-
-当前实现采用 file-backed 方案：server 读取 `data/agents/{actor_id}/bundle-release.json` 的 `source` 字段作为 symlink target。这个数据源被隔离在 actor skill source 解析层，未来可以扩展为 agent serve 通过 RPC 上报的 registry-backed 方案，而不需要重写 scope projection 规则。
-
-`loom agent serve` 在创建 scope workspace 时会把对应 scope skills 桥接进 agent 当前工作目录：
+为了兼容 classroom / 多 agent 场景，`loom agent serve` 在每轮运行前读取当前 channel 成员的已发布 bundle，并把它们挂到当前 agent 自己的 skill workspace：
 
 ```text
-{agent workspace}/skills -> {scope workspaces root}/{scope.kind}/{scope.id}/skills
+data/agents/{current_actor}/workspace/scopes/{scope.kind}/{scope.id}/skills/{actor_id}
+  -> data/agents/{actor_id}/bundle source
 ```
 
-默认 `{scope workspaces root}` 是 `LOOM_AGENT_DATA_ROOT/workspaces`。当 `loom-server --data-dir` 和 `LOOM_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `LOOM_SCOPE_WORKSPACES_ROOT` 显式指向 server 的 `data/workspaces`。这保证 `interactive_command` provider 从 `cwd` 看见的是当前 scope 的 skills，而 provider session record 仍按 `(actor, scope)` 独立管理。
+当前实现采用 file-backed 方案：runtime 读取 `data/agents/{actor_id}/bundle-release.json` 的 `source` 字段作为 symlink target。这个数据源被隔离在 actor skill source 解析层，未来可以扩展为 agent serve 通过 RPC 上报的 registry-backed 方案，而不需要重写 mount 规则。
+
+同一个 skill workspace 里还会维护 provider-native 目录：
+
+```text
+skills/
+.agents/skills/
+.claude/skills/
+.qoder/skills/
+.opencode/skills/
+```
+
+Provider 支持外挂 workspace 的，通过 `--add-dir {agent.skillWorkspace}` 接入这个路径；OpenCode 这类需要 config 文件的 provider 使用 `{agent.skillWorkspace}/.opencode/opencode.json`。当 `loom-server --data-dir` 和 `LOOM_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `LOOM_SCOPE_WORKSPACES_ROOT` 指向 server 的 `data/workspaces`，runtime 会用它推导同级 `data/agents` registry。Provider session record 仍按 `(actor, scope)` 独立管理。
 
 ### 2.4 完成信号必须显式
 

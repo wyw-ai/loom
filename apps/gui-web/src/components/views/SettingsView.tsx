@@ -8,14 +8,14 @@ import { PageHeader } from "@/components/shared/PageComponents";
 import { ProviderAddDialog } from "@/components/settings/ProviderComponents";
 import { HostListItem, RegisteredHostsEmpty, HostRegisterDialog, MachineCard } from "@/components/settings/MachineComponents";
 import { MemberListItem, AgentRosterOverview, AgentCreateDialog, AgentMemberDetail } from "@/components/settings/AgentComponents";
-import { ServiceRosterOverview } from "@/components/settings/ServiceComponents";
+import { ServiceListItem, ServiceMemberDetail, ServiceRosterOverview } from "@/components/settings/ServiceComponents";
 import { Button } from "@/components/ui/button";
-import { agentMemberEntries } from "@/lib/agent-utils";
+import { agentMemberEntries, serviceMemberEntries } from "@/lib/agent-utils";
 import { agentFormForMachine, findAgentMemberEntry, machineCanCreateAgent } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Bot, ChevronDown, ListChecks, Loader2, Plus, RefreshCw, Server, Split } from "lucide-react";
 import type { MachineInfo, Run } from "@/ipc/types";
-import type { ActorWorkspaceSection, AgentFormState, AgentMemberEntry, AgentUpdatePatch } from "@/lib/types";
+import type { ActorWorkspaceSection, AgentFormState, AgentMemberEntry, AgentUpdatePatch, ServiceMemberEntry } from "@/lib/types";
 
 
 export function SettingsView({
@@ -55,6 +55,7 @@ export function SettingsView({
   const [activeSection, setActiveSection] = useState<ActorWorkspaceSection>("hosts");
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
+  const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
   const [createAgentMachineId, setCreateAgentMachineId] = useState<string | null>(null);
   const [hostRegisterOpen, setHostRegisterOpen] = useState(false);
   const [providerAddOpen, setProviderAddOpen] = useState(false);
@@ -62,6 +63,7 @@ export function SettingsView({
   const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
   const handledTargetAgentIdRef = useRef<string | null>(null);
   const memberEntries = agentMemberEntries(machines);
+  const serviceEntries = serviceMemberEntries(machines);
   const onlineAgents = memberEntries.filter((entry) => entry.agent.status === "online").length;
   const canCreateAgentFromAnyHost = machines.some(
     (machine) => machineCanCreateAgent(machine) && machine.providers.length > 0,
@@ -78,14 +80,19 @@ export function SettingsView({
   }> = [
     { id: "hosts", label: "Registered Hosts", count: machines.length, icon: Server },
     { id: "agents", label: "Agents", count: memberEntries.length, icon: Bot },
-    { id: "services", label: "Services", count: 0, icon: Split },
+    { id: "services", label: "Services", count: serviceEntries.length, icon: Split },
   ];
   const selectedMemberEntry =
     selectedAgentId === null
       ? null
       : memberEntries.find((entry) => entry.agent.spec.actor.id === selectedAgentId) ?? null;
+  const selectedServiceEntry =
+    selectedServiceId === null
+      ? null
+      : serviceEntries.find((entry) => entry.service.id === selectedServiceId) ?? null;
   const selectedMachine =
     selectedMemberEntry?.machine ??
+    selectedServiceEntry?.machine ??
     machines.find((machine) => machine.id === selectedMachineId) ??
     machines.find((machine) => machine.id === agentForm.machineId) ??
     machines[0];
@@ -115,6 +122,15 @@ export function SettingsView({
       setSelectedAgentId(null);
     }
   }, [memberEntries, selectedAgentId]);
+
+  useEffect(() => {
+    if (
+      selectedServiceId &&
+      !serviceEntries.some((entry) => entry.service.id === selectedServiceId)
+    ) {
+      setSelectedServiceId(null);
+    }
+  }, [selectedServiceId, serviceEntries]);
 
   useEffect(() => {
     if (!targetAgentId) {
@@ -160,6 +176,7 @@ export function SettingsView({
     setActiveSection("hosts");
     setSelectedMachineId(machine.id);
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, machine));
   }
 
@@ -167,7 +184,15 @@ export function SettingsView({
     setActiveSection("agents");
     setSelectedMachineId(entry.machine.id);
     setSelectedAgentId(entry.agent.spec.actor.id);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, entry.machine));
+  }
+
+  function selectService(entry: ServiceMemberEntry) {
+    setActiveSection("services");
+    setSelectedMachineId(entry.machine.id);
+    setSelectedAgentId(null);
+    setSelectedServiceId(entry.service.id);
   }
 
   function openCreateAgentDialog(machine?: MachineInfo | null) {
@@ -186,6 +211,7 @@ export function SettingsView({
     setActiveSection("agents");
     setSelectedMachineId(nextMachine.id);
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, nextMachine));
     setCreateAgentMachineId(nextMachine.id);
     setMemberCreateMenuOpen(false);
@@ -202,11 +228,18 @@ export function SettingsView({
   function showAgentRoster() {
     setActiveSection("agents");
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
+  }
+
+  function showServiceRoster() {
+    setActiveSection("services");
+    setSelectedServiceId(null);
   }
 
   function openRegisterHostDialog() {
     setActiveSection("hosts");
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setHostRegisterOpen(true);
   }
 
@@ -214,6 +247,7 @@ export function SettingsView({
     setActiveSection("hosts");
     setSelectedMachineId(machine.id);
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
     setAgentForm(agentFormForMachine(agentForm, machine));
   }
 
@@ -221,13 +255,16 @@ export function SettingsView({
     setActiveSection(section);
     if (section === "agents") {
       setSelectedAgentId(null);
+      setSelectedServiceId(null);
       return;
     }
     if (section === "hosts") {
       setSelectedAgentId(null);
+      setSelectedServiceId(null);
       return;
     }
     setSelectedAgentId(null);
+    setSelectedServiceId(null);
   }
 
   const detailContent =
@@ -266,14 +303,25 @@ export function SettingsView({
         />
       )
     ) : (
-      <ServiceRosterOverview />
+      selectedServiceEntry ? (
+        <ServiceMemberDetail
+          entry={selectedServiceEntry}
+          onBack={showServiceRoster}
+        />
+      ) : (
+        <ServiceRosterOverview
+          entries={serviceEntries}
+          machines={machines}
+          onSelectService={selectService}
+        />
+      )
     );
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <PageHeader
         title="Actors"
-        detail={`${onlineAgents}/${memberEntries.length} agents online / ${machines.length} hosts / ${providerCount} providers`}
+        detail={`${onlineAgents}/${memberEntries.length} agents online / ${machines.length} hosts / ${providerCount} providers / ${serviceEntries.length} services`}
       />
       <div className="min-h-0 flex-1 overflow-hidden bg-white">
         <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(208px,224px)_minmax(0,1fr)]">
@@ -478,11 +526,24 @@ export function SettingsView({
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
                     Services
                   </div>
-                  <span className="count-badge">0</span>
+                  <span className="count-badge">{serviceEntries.length}</span>
                 </div>
-                <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
-                  No services registered.
-                </div>
+                {serviceEntries.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
+                    No services registered.
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {serviceEntries.map((entry) => (
+                      <ServiceListItem
+                        key={`${entry.machine.id}:${entry.service.id}`}
+                        entry={entry}
+                        selected={selectedServiceEntry?.service.id === entry.service.id}
+                        onSelect={() => selectService(entry)}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
               )}
             </div>

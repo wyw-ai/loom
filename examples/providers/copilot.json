@@ -85,6 +85,8 @@
       "args": [
         "--add-dir",
         "{agent.configDir}",
+        "--add-dir",
+        "{agent.skillWorkspace}",
         "--yolo",
         "--output-format",
         "json",
@@ -107,17 +109,11 @@
           "when": "reasoningEffort"
         },
         "-p",
-        "{prompt.full}"
+        "{prompt.user}"
       ],
       "command": "{bin}",
-      "prompt": {
-        "outputs": {
-          "full": {
-            "include": [],
-            "preset": "loom_full",
-            "required": []
-          }
-        }
+      "env": {
+        "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "{loom_agent_home}"
       },
       "stdin": "{prompt.full}",
       "session": {
@@ -125,6 +121,8 @@
         "resumeArgs": [
           "--add-dir",
           "{agent.configDir}",
+          "--add-dir",
+          "{agent.skillWorkspace}",
           "--yolo",
           "--output-format",
           "json",
@@ -147,7 +145,7 @@
             "when": "reasoningEffort"
           },
           "-p",
-          "{prompt.full}"
+          "{prompt.user}"
         ],
         "scope": "actor_scope"
       },

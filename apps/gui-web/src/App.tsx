@@ -225,6 +225,8 @@ export function App() {
     autostart: true,
     env: {},
   });
+  const [accountAuthStatus, setAccountAuthStatus] =
+    useState<ipc.AccountAuthStatus | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -380,6 +382,14 @@ export function App() {
     }
   }, [applyConfig, loadMachines]);
 
+  const loadAccountAuthStatus = useCallback(async () => {
+    try {
+      setAccountAuthStatus(await ipc.accountAuthStatus());
+    } catch {
+      setAccountAuthStatus({ providers: [] });
+    }
+  }, []);
+
   const loadWorkspaceData = useCallback(
     async (current: Workspace) => {
       actorIdRef.current = current.actorId;
@@ -479,6 +489,7 @@ export function App() {
     let unlistenConnection: (() => void) | null = null;
 
     void loadConfig();
+    void loadAccountAuthStatus();
     void ipc.onStream((update) => handleStream(update)).then((off) => {
       unlistenStream = off;
     });
@@ -502,7 +513,7 @@ export function App() {
       unlistenStream?.();
       unlistenConnection?.();
     };
-  }, [loadConfig, loadMachines]);
+  }, [loadAccountAuthStatus, loadConfig, loadMachines]);
 
   useEffect(() => {
     workspaceRef.current = workspace;
@@ -955,6 +966,15 @@ export function App() {
   }
 
   async function login(provider: ipc.LoginProvider) {
+    const providerStatus = accountAuthStatus?.providers.find(
+      (item) => item.provider === provider,
+    );
+    if (providerStatus && !providerStatus.available) {
+      setError(
+        `${providerStatus.displayName} login is not configured for this desktop build.`,
+      );
+      return;
+    }
     setBusy(`login:${provider}`);
     setError(null);
     try {
@@ -2032,6 +2052,7 @@ export function App() {
             <ErrorBanner error={error} />
             <AccountView
               account={account}
+              authStatus={accountAuthStatus}
               busy={busy}
               onLogin={login}
               onLogout={logout}

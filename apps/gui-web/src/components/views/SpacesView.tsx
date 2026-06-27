@@ -7,10 +7,11 @@ import { localServerCommand } from "@/lib/constants";
 import { connectionLabel, workspaceInitials } from "@/lib/format-utils";
 import {
   normalizeWorkspaceFormServerUrl,
+  serverUrlPreviewPlaceholder,
   workspaceFormFromServerUrl,
 } from "@/lib/server-url";
 import { cn } from "@/lib/utils";
-import { Check, Link2, Loader2, Lock, Plus, Trash2 } from "lucide-react";
+import { Check, Link2, Loader2, Plus, Trash2 } from "lucide-react";
 import type { Workspace } from "@/ipc/types";
 import type { ConnectionState, WorkspaceFormState } from "@/lib/types";
 
@@ -35,17 +36,21 @@ export function SpacesView({
   onRemoveWorkspace: (id: string) => void;
   onSelectWorkspace: (workspaceId: string) => void;
 }) {
-  let serverUrlPreview = "";
+  const hasServerTarget = Boolean(
+    workspaceForm.advanced
+      ? workspaceForm.serverUrl.trim()
+      : workspaceForm.host.trim(),
+  );
+  let serverUrlPreview = serverUrlPreviewPlaceholder;
   let hasValidServerUrl = false;
-  try {
-    serverUrlPreview = normalizeWorkspaceFormServerUrl(workspaceForm);
-    hasValidServerUrl = true;
-  } catch {
-    serverUrlPreview = "Invalid server target";
+  if (hasServerTarget) {
+    try {
+      serverUrlPreview = normalizeWorkspaceFormServerUrl(workspaceForm);
+      hasValidServerUrl = true;
+    } catch {
+      serverUrlPreview = "Invalid server target";
+    }
   }
-  const hasServerTarget = workspaceForm.advanced
-    ? workspaceForm.serverUrl.trim()
-    : workspaceForm.host.trim();
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
@@ -63,9 +68,7 @@ export function SpacesView({
               <div
                 className={cn(
                   "grid gap-3",
-                  workspaceForm.advanced
-                    ? "lg:grid-cols-[180px_minmax(0,1fr)_auto_auto]"
-                    : "lg:grid-cols-[180px_minmax(0,1fr)_96px_auto_auto_auto]",
+                  "lg:grid-cols-[180px_minmax(0,1fr)_auto_auto]",
                 )}
               >
                 <Input
@@ -83,63 +86,26 @@ export function SpacesView({
                     onChange={(event) =>
                       setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
                     }
-                    placeholder="ws://127.0.0.1:7878/rpc"
+                    placeholder="ws://your-server-host:7878/rpc"
                   />
                 ) : (
-                  <>
-                    <Input
-                      value={workspaceForm.host}
-                      aria-label="Server host"
-                      onChange={(event) => {
-                        const host = event.target.value;
-                        try {
-                          const url = new URL(`ws://${host}`);
-                          if (url.hostname && url.port && url.pathname === "/") {
-                            setWorkspaceForm({
-                              ...workspaceForm,
-                              host: url.hostname,
-                              port: url.port,
-                            });
-                            return;
-                          }
-                        } catch {
-                          // Keep raw input while the user is still typing.
-                        }
-                        setWorkspaceForm({ ...workspaceForm, host });
-                      }}
-                      placeholder="127.0.0.1"
-                    />
-                    <Input
-                      value={workspaceForm.port}
-                      aria-label="Server port"
-                      inputMode="numeric"
-                      onChange={(event) =>
-                        setWorkspaceForm({ ...workspaceForm, port: event.target.value })
-                      }
-                      placeholder="7878"
-                    />
-                    <label className="flex h-9 items-center gap-2 rounded-md border border-input bg-background px-3 text-sm font-medium shadow-sm">
-                      <input
-                        type="checkbox"
-                        aria-label="Use WSS"
-                        className="h-4 w-4 accent-[#5843d7]"
-                        checked={workspaceForm.secure}
-                        onChange={(event) =>
-                          setWorkspaceForm({
-                            ...workspaceForm,
-                            secure: event.target.checked,
-                          })
-                        }
-                      />
-                      <Lock size={14} />
-                      WSS
-                    </label>
-                  </>
+                  <Input
+                    value={workspaceForm.host}
+                    aria-label="Server host"
+                    onChange={(event) =>
+                      setWorkspaceForm({ ...workspaceForm, host: event.target.value })
+                    }
+                    placeholder="your server host"
+                  />
                 )}
                 <Button
                   variant={workspaceForm.advanced ? "default" : "outline"}
                   onClick={() => {
                     if (workspaceForm.advanced) {
+                      if (!workspaceForm.serverUrl.trim()) {
+                        setWorkspaceForm({ ...workspaceForm, advanced: false });
+                        return;
+                      }
                       try {
                         setWorkspaceForm(
                           workspaceFormFromServerUrl(
@@ -155,9 +121,7 @@ export function SpacesView({
                     setWorkspaceForm({
                       ...workspaceForm,
                       advanced: true,
-                      serverUrl: hasValidServerUrl
-                        ? serverUrlPreview
-                        : workspaceForm.serverUrl,
+                      serverUrl: hasValidServerUrl ? serverUrlPreview : "",
                     });
                   }}
                 >
@@ -184,7 +148,7 @@ export function SpacesView({
               <div
                 className={cn(
                   "flex min-h-9 items-center gap-2 rounded-md border px-3 py-2 text-xs",
-                  hasValidServerUrl
+                  !hasServerTarget || hasValidServerUrl
                     ? "border-[#dfe3ec] bg-[#fbfbfd] text-[#667085]"
                     : "border-[#fecaca] bg-[#fff7f7] text-[#b42318]",
                 )}

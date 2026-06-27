@@ -36,11 +36,14 @@ import {
   defaultAgentPromptAssembly,
   detailPanelBreakpoint,
   localServerCommand,
-  localServerUrl,
   machineStatusPollIntervalMs,
   mainMinWidth,
   ungroupedChannelGroupId
 } from "@/lib/constants";
+import {
+  defaultWorkspaceForm,
+  normalizeWorkspaceFormServerUrl,
+} from "@/lib/server-url";
 
 import {
   channelGroupStorageKey,
@@ -325,7 +328,7 @@ export function App() {
   }, []);
 
   const prepareLocalServerSpace = useCallback(() => {
-    setWorkspaceForm({ name: "Local", serverUrl: localServerUrl });
+    setWorkspaceForm(defaultWorkspaceForm());
     setView("spaces");
     if (navigator.clipboard?.writeText) {
       void navigator.clipboard
@@ -990,18 +993,22 @@ export function App() {
   }
 
   async function addWorkspace() {
-    if (!workspaceForm.name.trim() || !workspaceForm.serverUrl.trim()) return;
+    const hasTarget = workspaceForm.advanced
+      ? workspaceForm.serverUrl.trim()
+      : workspaceForm.host.trim();
+    if (!workspaceForm.name.trim() || !hasTarget) return;
     setBusy("workspace:add");
     setError(null);
     try {
+      const serverUrl = normalizeWorkspaceFormServerUrl(workspaceForm);
       const next = await ipc.workspaceAdd({
         name: workspaceForm.name.trim(),
-        serverUrl: workspaceForm.serverUrl.trim(),
+        serverUrl,
         activate: true,
       });
       applyConfig(next);
       await loadMachines();
-      setWorkspaceForm({ name: "Local", serverUrl: "ws://127.0.0.1:7878/rpc" });
+      setWorkspaceForm(defaultWorkspaceForm());
       pushNotice(`Space ${workspaceForm.name.trim()} added`);
     } catch (err) {
       setError(errorText(err));

@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { DesktopConfig, Workspace } from "@/ipc/types";
-import { localServerUrl } from "@/lib/constants";
-import type { ConnectionState } from "@/lib/types";
+import { defaultWorkspaceForm } from "@/lib/server-url";
+import type { ConnectionState, WorkspaceFormState } from "@/lib/types";
 
 export interface ConnectionStore {
   // State
@@ -11,7 +11,7 @@ export interface ConnectionStore {
   error: string | null;
   notice: string | null;
   busy: string | null;
-  workspaceForm: { name: string; serverUrl: string };
+  workspaceForm: WorkspaceFormState;
 
   // Setters
   setConfig: (config: DesktopConfig | ((prev: DesktopConfig) => DesktopConfig)) => void;
@@ -20,7 +20,7 @@ export interface ConnectionStore {
   setError: (error: string | null | ((prev: string | null) => string | null)) => void;
   setNotice: (notice: string | null | ((prev: string | null) => string | null)) => void;
   setBusy: (busy: string | null | ((prev: string | null) => string | null)) => void;
-  setWorkspaceForm: (form: { name: string; serverUrl: string } | ((prev: { name: string; serverUrl: string }) => { name: string; serverUrl: string })) => void;
+  setWorkspaceForm: (form: WorkspaceFormState | ((prev: WorkspaceFormState) => WorkspaceFormState)) => void;
 }
 
 export const useConnectionStore = create<ConnectionStore>((set) => ({
@@ -33,10 +33,7 @@ export const useConnectionStore = create<ConnectionStore>((set) => ({
   error: null,
   notice: null,
   busy: null,
-  workspaceForm: {
-    name: "Local",
-    serverUrl: localServerUrl,
-  },
+  workspaceForm: defaultWorkspaceForm(),
 
   setConfig: (config) => set((state) => ({ config: typeof config === 'function' ? config(state.config) : config })),
   setWorkspace: (workspace) => set((state) => ({ workspace: typeof workspace === 'function' ? workspace(state.workspace) : workspace })),

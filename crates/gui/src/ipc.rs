@@ -136,7 +136,7 @@ pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, Stri
     let ws = Workspace {
         id: id.clone(),
         name: args.name,
-        server_url: args.server_url,
+        server_url: config::normalize_workspace_server_url(&args.server_url).map_err(stringify)?,
         actor_id: actor_id.clone(),
         display_name,
     };
@@ -1963,7 +1963,7 @@ fn active_server_url(cfg: &DesktopConfig) -> &str {
     config::active_workspace_id(cfg)
         .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
         .map(|workspace| workspace.server_url.as_str())
-        .unwrap_or("ws://127.0.0.1:7878/rpc")
+        .unwrap_or(config::DEFAULT_SERVER_URL)
 }
 
 fn pending_machine_registration(

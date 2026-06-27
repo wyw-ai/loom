@@ -70,6 +70,14 @@ export type AgentFormState = {
   autostart: boolean;
   env: Record<string, string>;
 };
+export type WorkspaceFormState = {
+  name: string;
+  host: string;
+  port: string;
+  secure: boolean;
+  advanced: boolean;
+  serverUrl: string;
+};
 export type AgentUpdatePatch = {
   machineId: string;
   actorId: string;

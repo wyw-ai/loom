@@ -73,8 +73,6 @@ export type AgentFormState = {
 export type WorkspaceFormState = {
   name: string;
   host: string;
-  port: string;
-  secure: boolean;
   advanced: boolean;
   serverUrl: string;
 };

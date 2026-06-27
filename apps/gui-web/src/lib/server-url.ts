@@ -1,8 +1,9 @@
 import { localServerUrl } from "@/lib/constants";
 import type { WorkspaceFormState } from "@/lib/types";
 
-export const defaultServerHost = "127.0.0.1";
 export const defaultServerPort = "7878";
+export const serverHostPlaceholder = "your-server-host";
+export const serverUrlPreviewPlaceholder = `ws://${serverHostPlaceholder}:${defaultServerPort}/rpc`;
 
 function hasScheme(value: string) {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
@@ -30,18 +31,6 @@ function websocketCandidate(value: string) {
   }
   const protocol = coerceProtocol(`${schemeMatch[1]}:`);
   return `${protocol}//${value.slice(schemeMatch[0].length)}`;
-}
-
-function normalizePort(port: string) {
-  const value = port.trim() || defaultServerPort;
-  if (!/^\d+$/.test(value)) {
-    throw new Error("Server port must be a number");
-  }
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
-    throw new Error("Server port must be between 1 and 65535");
-  }
-  return String(parsed);
 }
 
 function ensureRpcPath(url: URL) {
@@ -84,12 +73,13 @@ export function normalizeWorkspaceFormServerUrl(form: WorkspaceFormState) {
     return normalizeServerUrl(host);
   }
 
-  const protocol = form.secure ? "wss" : "ws";
-  const url = new URL(`${protocol}://${host}`);
+  const url = new URL(`ws://${host}`);
   if (!url.hostname) {
     throw new Error("Server host is required");
   }
-  url.port = normalizePort(form.port);
+  if (!url.port) {
+    url.port = defaultServerPort;
+  }
   ensureRpcPath(url);
   return url.toString();
 }
@@ -102,14 +92,17 @@ export function workspaceFormFromServerUrl(
   const url = new URL(normalized);
   return {
     name,
-    host: url.hostname || defaultServerHost,
-    port: url.port || defaultServerPort,
-    secure: url.protocol === "wss:",
+    host: url.host,
     advanced: false,
     serverUrl: normalized,
   };
 }
 
 export function defaultWorkspaceForm(): WorkspaceFormState {
-  return workspaceFormFromServerUrl("Local", localServerUrl);
+  return {
+    name: "Local",
+    host: "",
+    advanced: false,
+    serverUrl: "",
+  };
 }

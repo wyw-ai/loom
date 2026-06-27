@@ -51,6 +51,39 @@ pub async fn account_get() -> Result<Option<HumanAccount>, String> {
     Ok(config::load_or_init().map_err(stringify)?.account)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginProviderStatus {
+    pub provider: String,
+    pub display_name: String,
+    pub available: bool,
+    pub missing_env: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountAuthStatus {
+    pub providers: Vec<AccountLoginProviderStatus>,
+}
+
+#[tauri::command]
+pub async fn account_auth_status() -> Result<AccountAuthStatus, String> {
+    Ok(AccountAuthStatus {
+        providers: account::OAuthProvider::all()
+            .into_iter()
+            .map(|provider| {
+                let available = provider.has_client_id();
+                AccountLoginProviderStatus {
+                    provider: provider.id().into(),
+                    display_name: provider.display().into(),
+                    available,
+                    missing_env: (!available).then(|| provider.client_id_env_name().into()),
+                }
+            })
+            .collect(),
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginArgs {
@@ -3159,8 +3192,10 @@ mod tests {
             config_dir: "/tmp/loom-config".into(),
             agent_count: 1,
             online_agent_count: 0,
+            service_count: 0,
             providers: Vec::new(),
             agents: Vec::new(),
+            services: Vec::new(),
             serve_command: String::new(),
             setup_script: String::new(),
         };

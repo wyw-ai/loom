@@ -36,6 +36,7 @@ fn main() {
             ipc::workspaces_list,
             ipc::workspaces_save,
             ipc::account_get,
+            ipc::account_auth_status,
             ipc::account_login,
             ipc::account_logout,
             ipc::avatar_cached_url,

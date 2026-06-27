@@ -38,12 +38,15 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
 pub const ENV_CONFIG_DIR: &str = "LOOM_GUI_CONFIG_DIR";
 const LEGACY_ENV_CONFIG_DIR: &str = "JOI_GUI_CONFIG_DIR";
+pub const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:7878/rpc";
+pub const DEFAULT_SERVER_PORT: u16 = 7878;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -202,6 +205,47 @@ pub fn generate_id() -> String {
     format!("ws_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
 
+pub fn normalize_workspace_server_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_SERVER_URL.to_string());
+    }
+
+    let candidate = if let Some(idx) = trimmed.find("://") {
+        let scheme = trimmed[..idx].to_ascii_lowercase();
+        let rest = &trimmed[idx + 3..];
+        match scheme.as_str() {
+            "wss" | "https" | "rpcs" => format!("wss://{rest}"),
+            "ws" | "http" | "rpc" => format!("ws://{rest}"),
+            other => return Err(anyhow!("server URL scheme `{other}` is not supported")),
+        }
+    } else {
+        format!("ws://{trimmed}")
+    };
+
+    let mut url =
+        Url::parse(&candidate).map_err(|err| anyhow!("invalid server URL `{raw}`: {err}"))?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        other => return Err(anyhow!("server URL scheme `{other}` is not supported")),
+    }
+    if url.host_str().is_none() {
+        return Err(anyhow!("server host is required"));
+    }
+    if url.port().is_none() {
+        url.set_port(Some(DEFAULT_SERVER_PORT))
+            .map_err(|_| anyhow!("invalid server port"))?;
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/rpc");
+    } else if !url.path().contains("/rpc") {
+        let path = format!("/rpc{}", url.path().trim_end_matches('/'));
+        url.set_path(&path);
+    }
+
+    Ok(url.to_string())
+}
+
 pub fn account_display_name(account: &HumanAccount) -> String {
     first_non_empty([
         account.nickname.as_str(),
@@ -341,8 +385,13 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
             changed = true;
         }
         if workspace.server_url.trim().is_empty() {
-            workspace.server_url = "ws://127.0.0.1:7878/rpc".into();
+            workspace.server_url = DEFAULT_SERVER_URL.into();
             changed = true;
+        } else if let Ok(normalized) = normalize_workspace_server_url(&workspace.server_url) {
+            if workspace.server_url != normalized {
+                workspace.server_url = normalized;
+                changed = true;
+            }
         }
         if workspace.actor_id.trim().is_empty() {
             if let Some(actor_id) = account_actor_id.as_ref() {
@@ -439,6 +488,30 @@ mod tests {
     }
 
     #[test]
+    fn server_url_normalization_accepts_bare_host_inputs() {
+        assert_eq!(
+            normalize_workspace_server_url("loom.example.com").expect("normalize host"),
+            "ws://loom.example.com:7878/rpc"
+        );
+        assert_eq!(
+            normalize_workspace_server_url("192.168.1.20:9000").expect("normalize host port"),
+            "ws://192.168.1.20:9000/rpc"
+        );
+    }
+
+    #[test]
+    fn server_url_normalization_maps_friendly_schemes_to_websocket_rpc() {
+        assert_eq!(
+            normalize_workspace_server_url("rpc://loom.example.com").expect("normalize rpc alias"),
+            "ws://loom.example.com:7878/rpc"
+        );
+        assert_eq!(
+            normalize_workspace_server_url("https://loom.example.com:9443").expect("normalize https"),
+            "wss://loom.example.com:9443/rpc"
+        );
+    }
+
+    #[test]
     fn workspace_fields_default_when_daemon_saved_lossy_config() {
         let cfg: DesktopConfig = toml::from_str(
             r#"
@@ -456,6 +529,23 @@ id = "default"
         assert_eq!(cfg.workspaces[0].server_url, "ws://127.0.0.1:7878/rpc");
         assert_eq!(cfg.workspaces[0].actor_id, "actor_human_local_default");
         assert_eq!(cfg.workspaces[0].display_name, "actor_human_local_default");
+    }
+
+    #[test]
+    fn workspace_fields_normalize_non_empty_server_urls() {
+        let mut cfg = DesktopConfig {
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "loom.example.com".into(),
+                actor_id: "actor_human_local_default".into(),
+                display_name: "Local".into(),
+            }],
+            ..DesktopConfig::default()
+        };
+
+        assert!(repair_workspace_fields(&mut cfg));
+        assert_eq!(cfg.workspaces[0].server_url, "ws://loom.example.com:7878/rpc");
     }
 
     #[test]

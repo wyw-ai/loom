@@ -5,10 +5,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { localServerCommand } from "@/lib/constants";
 import { connectionLabel, workspaceInitials } from "@/lib/format-utils";
+import {
+  normalizeWorkspaceFormServerUrl,
+  workspaceFormFromServerUrl,
+} from "@/lib/server-url";
 import { cn } from "@/lib/utils";
-import { Check, Loader2, Plus, Trash2 } from "lucide-react";
+import { Check, Link2, Loader2, Lock, Plus, Trash2 } from "lucide-react";
 import type { Workspace } from "@/ipc/types";
-import type { ConnectionState } from "@/lib/types";
+import type { ConnectionState, WorkspaceFormState } from "@/lib/types";
 
 export function SpacesView({
   busy,
@@ -24,13 +28,25 @@ export function SpacesView({
   busy: string | null;
   connection: ConnectionState;
   workspace: Workspace | null;
-  workspaceForm: { name: string; serverUrl: string };
-  setWorkspaceForm: (form: { name: string; serverUrl: string }) => void;
+  workspaceForm: WorkspaceFormState;
+  setWorkspaceForm: (form: WorkspaceFormState) => void;
   workspaces: Workspace[];
   onAddWorkspace: () => void;
   onRemoveWorkspace: (id: string) => void;
   onSelectWorkspace: (workspaceId: string) => void;
 }) {
+  let serverUrlPreview = "";
+  let hasValidServerUrl = false;
+  try {
+    serverUrlPreview = normalizeWorkspaceFormServerUrl(workspaceForm);
+    hasValidServerUrl = true;
+  } catch {
+    serverUrlPreview = "Invalid server target";
+  }
+  const hasServerTarget = workspaceForm.advanced
+    ? workspaceForm.serverUrl.trim()
+    : workspaceForm.host.trim();
+
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <PageHeader title="Spaces" detail="Choose or add a server connection" />
@@ -38,41 +54,146 @@ export function SpacesView({
         <div className="mx-auto max-w-4xl space-y-4">
           <SettingsSection title="Add Space" detail="Save a connection target in the side rail.">
             <form
-              className="grid gap-3 sm:grid-cols-[180px_1fr_auto]"
+              className="space-y-3"
               onSubmit={(event) => {
                 event.preventDefault();
                 onAddWorkspace();
               }}
             >
-              <Input
-                value={workspaceForm.name}
-                onChange={(event) =>
-                  setWorkspaceForm({ ...workspaceForm, name: event.target.value })
-                }
-                placeholder="Name"
-              />
-              <Input
-                value={workspaceForm.serverUrl}
-                onChange={(event) =>
-                  setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
-                }
-                placeholder="ws://127.0.0.1:7878/rpc"
-              />
-              <Button
-                type="submit"
-                disabled={
-                  busy === "workspace:add" ||
-                  !workspaceForm.name.trim() ||
-                  !workspaceForm.serverUrl.trim()
-                }
-              >
-                {busy === "workspace:add" ? (
-                  <Loader2 className="animate-spin" size={15} />
-                ) : (
-                  <Plus size={15} />
+              <div
+                className={cn(
+                  "grid gap-3",
+                  workspaceForm.advanced
+                    ? "lg:grid-cols-[180px_minmax(0,1fr)_auto_auto]"
+                    : "lg:grid-cols-[180px_minmax(0,1fr)_96px_auto_auto_auto]",
                 )}
-                Add Space
-              </Button>
+              >
+                <Input
+                  value={workspaceForm.name}
+                  aria-label="Space name"
+                  onChange={(event) =>
+                    setWorkspaceForm({ ...workspaceForm, name: event.target.value })
+                  }
+                  placeholder="Name"
+                />
+                {workspaceForm.advanced ? (
+                  <Input
+                    value={workspaceForm.serverUrl}
+                    aria-label="Server URL"
+                    onChange={(event) =>
+                      setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
+                    }
+                    placeholder="ws://127.0.0.1:7878/rpc"
+                  />
+                ) : (
+                  <>
+                    <Input
+                      value={workspaceForm.host}
+                      aria-label="Server host"
+                      onChange={(event) => {
+                        const host = event.target.value;
+                        try {
+                          const url = new URL(`ws://${host}`);
+                          if (url.hostname && url.port && url.pathname === "/") {
+                            setWorkspaceForm({
+                              ...workspaceForm,
+                              host: url.hostname,
+                              port: url.port,
+                            });
+                            return;
+                          }
+                        } catch {
+                          // Keep raw input while the user is still typing.
+                        }
+                        setWorkspaceForm({ ...workspaceForm, host });
+                      }}
+                      placeholder="127.0.0.1"
+                    />
+                    <Input
+                      value={workspaceForm.port}
+                      aria-label="Server port"
+                      inputMode="numeric"
+                      onChange={(event) =>
+                        setWorkspaceForm({ ...workspaceForm, port: event.target.value })
+                      }
+                      placeholder="7878"
+                    />
+                    <label className="flex h-9 items-center gap-2 rounded-md border border-input bg-background px-3 text-sm font-medium shadow-sm">
+                      <input
+                        type="checkbox"
+                        aria-label="Use WSS"
+                        className="h-4 w-4 accent-[#5843d7]"
+                        checked={workspaceForm.secure}
+                        onChange={(event) =>
+                          setWorkspaceForm({
+                            ...workspaceForm,
+                            secure: event.target.checked,
+                          })
+                        }
+                      />
+                      <Lock size={14} />
+                      WSS
+                    </label>
+                  </>
+                )}
+                <Button
+                  variant={workspaceForm.advanced ? "default" : "outline"}
+                  onClick={() => {
+                    if (workspaceForm.advanced) {
+                      try {
+                        setWorkspaceForm(
+                          workspaceFormFromServerUrl(
+                            workspaceForm.name,
+                            workspaceForm.serverUrl,
+                          ),
+                        );
+                      } catch {
+                        setWorkspaceForm({ ...workspaceForm, advanced: false });
+                      }
+                      return;
+                    }
+                    setWorkspaceForm({
+                      ...workspaceForm,
+                      advanced: true,
+                      serverUrl: hasValidServerUrl
+                        ? serverUrlPreview
+                        : workspaceForm.serverUrl,
+                    });
+                  }}
+                >
+                  <Link2 size={15} />
+                  Advanced
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={
+                    busy === "workspace:add" ||
+                    !workspaceForm.name.trim() ||
+                    !hasServerTarget ||
+                    !hasValidServerUrl
+                  }
+                >
+                  {busy === "workspace:add" ? (
+                    <Loader2 className="animate-spin" size={15} />
+                  ) : (
+                    <Plus size={15} />
+                  )}
+                  Add Space
+                </Button>
+              </div>
+              <div
+                className={cn(
+                  "flex min-h-9 items-center gap-2 rounded-md border px-3 py-2 text-xs",
+                  hasValidServerUrl
+                    ? "border-[#dfe3ec] bg-[#fbfbfd] text-[#667085]"
+                    : "border-[#fecaca] bg-[#fff7f7] text-[#b42318]",
+                )}
+              >
+                <span className="shrink-0 font-semibold uppercase tracking-wide">
+                  RPC
+                </span>
+                <code className="min-w-0 truncate font-mono">{serverUrlPreview}</code>
+              </div>
             </form>
           </SettingsSection>
 

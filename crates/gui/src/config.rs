@@ -506,7 +506,8 @@ mod tests {
             "ws://loom.example.com:7878/rpc"
         );
         assert_eq!(
-            normalize_workspace_server_url("https://loom.example.com:9443").expect("normalize https"),
+            normalize_workspace_server_url("https://loom.example.com:9443")
+                .expect("normalize https"),
             "wss://loom.example.com:9443/rpc"
         );
     }
@@ -545,7 +546,10 @@ id = "default"
         };
 
         assert!(repair_workspace_fields(&mut cfg));
-        assert_eq!(cfg.workspaces[0].server_url, "ws://loom.example.com:7878/rpc");
+        assert_eq!(
+            cfg.workspaces[0].server_url,
+            "ws://loom.example.com:7878/rpc"
+        );
     }
 
     #[test]

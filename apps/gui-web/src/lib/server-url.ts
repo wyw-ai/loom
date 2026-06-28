@@ -9,6 +9,15 @@ function hasScheme(value: string) {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
 }
 
+function schemeOf(value: string) {
+  return value.match(/^([a-z][a-z0-9+.-]*):\/\//i)?.[1]?.toLowerCase() ?? "";
+}
+
+function hasExplicitWebsocketScheme(value: string) {
+  const scheme = schemeOf(value);
+  return scheme === "ws" || scheme === "wss";
+}
+
 function coerceProtocol(protocol: string) {
   switch (protocol.toLowerCase()) {
     case "wss:":
@@ -47,6 +56,14 @@ export function normalizeServerUrl(input: string) {
   const trimmed = input.trim();
   if (!trimmed) return localServerUrl;
 
+  if (hasExplicitWebsocketScheme(trimmed)) {
+    const url = new URL(trimmed);
+    if (!url.hostname) {
+      throw new Error("Server host is required");
+    }
+    return url.toString();
+  }
+
   const candidate = websocketCandidate(trimmed);
   const url = new URL(candidate);
   if (!url.hostname) {
@@ -84,16 +101,21 @@ export function normalizeWorkspaceFormServerUrl(form: WorkspaceFormState) {
   return url.toString();
 }
 
+function canRepresentInHostMode(url: URL) {
+  return url.protocol === "ws:" && url.pathname === "/rpc" && !url.search && !url.hash;
+}
+
 export function workspaceFormFromServerUrl(
   name: string,
   serverUrl: string,
 ): WorkspaceFormState {
   const normalized = normalizeServerUrl(serverUrl);
   const url = new URL(normalized);
+  const hostMode = canRepresentInHostMode(url);
   return {
     name,
     host: url.host,
-    advanced: false,
+    advanced: !hostMode,
     serverUrl: normalized,
   };
 }

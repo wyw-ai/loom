@@ -211,6 +211,7 @@ pub fn normalize_workspace_server_url(raw: &str) -> Result<String> {
         return Ok(DEFAULT_SERVER_URL.to_string());
     }
 
+    let preserve_endpoint = has_explicit_websocket_scheme(trimmed);
     let candidate = if let Some(idx) = trimmed.find("://") {
         let scheme = trimmed[..idx].to_ascii_lowercase();
         let rest = &trimmed[idx + 3..];
@@ -232,6 +233,9 @@ pub fn normalize_workspace_server_url(raw: &str) -> Result<String> {
     if url.host_str().is_none() {
         return Err(anyhow!("server host is required"));
     }
+    if preserve_endpoint {
+        return Ok(url.to_string());
+    }
     if url.port().is_none() {
         url.set_port(Some(DEFAULT_SERVER_PORT))
             .map_err(|_| anyhow!("invalid server port"))?;
@@ -244,6 +248,11 @@ pub fn normalize_workspace_server_url(raw: &str) -> Result<String> {
     }
 
     Ok(url.to_string())
+}
+
+fn has_explicit_websocket_scheme(raw: &str) -> bool {
+    raw.find("://")
+        .is_some_and(|idx| matches!(raw[..idx].to_ascii_lowercase().as_str(), "ws" | "wss"))
 }
 
 pub fn account_display_name(account: &HumanAccount) -> String {
@@ -387,10 +396,12 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
         if workspace.server_url.trim().is_empty() {
             workspace.server_url = DEFAULT_SERVER_URL.into();
             changed = true;
-        } else if let Ok(normalized) = normalize_workspace_server_url(&workspace.server_url) {
-            if workspace.server_url != normalized {
-                workspace.server_url = normalized;
-                changed = true;
+        } else if !has_explicit_websocket_scheme(workspace.server_url.trim()) {
+            if let Ok(normalized) = normalize_workspace_server_url(&workspace.server_url) {
+                if workspace.server_url != normalized {
+                    workspace.server_url = normalized;
+                    changed = true;
+                }
             }
         }
         if workspace.actor_id.trim().is_empty() {
@@ -513,6 +524,20 @@ mod tests {
     }
 
     #[test]
+    fn server_url_normalization_preserves_explicit_websocket_endpoints() {
+        assert_eq!(
+            normalize_workspace_server_url("wss://loom.example.com:9443/custom?x=1")
+                .expect("preserve websocket endpoint"),
+            "wss://loom.example.com:9443/custom?x=1"
+        );
+
+        let normalized =
+            normalize_workspace_server_url("wss://loom.example.com").expect("preserve host URL");
+        assert!(!normalized.contains(":7878"));
+        assert!(!normalized.ends_with("/rpc"));
+    }
+
+    #[test]
     fn workspace_fields_default_when_daemon_saved_lossy_config() {
         let cfg: DesktopConfig = toml::from_str(
             r#"
@@ -549,6 +574,26 @@ id = "default"
         assert_eq!(
             cfg.workspaces[0].server_url,
             "ws://loom.example.com:7878/rpc"
+        );
+    }
+
+    #[test]
+    fn workspace_fields_preserve_explicit_websocket_server_urls() {
+        let mut cfg = DesktopConfig {
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "wss://loom.example.com:9443/custom?x=1".into(),
+                actor_id: "actor_human_local_default".into(),
+                display_name: "Local".into(),
+            }],
+            ..DesktopConfig::default()
+        };
+
+        assert!(!repair_workspace_fields(&mut cfg));
+        assert_eq!(
+            cfg.workspaces[0].server_url,
+            "wss://loom.example.com:9443/custom?x=1"
         );
     }
 

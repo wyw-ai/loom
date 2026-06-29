@@ -51,6 +51,39 @@ pub async fn account_get() -> Result<Option<HumanAccount>, String> {
     Ok(config::load_or_init().map_err(stringify)?.account)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginProviderStatus {
+    pub provider: String,
+    pub display_name: String,
+    pub available: bool,
+    pub missing_env: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountAuthStatus {
+    pub providers: Vec<AccountLoginProviderStatus>,
+}
+
+#[tauri::command]
+pub async fn account_auth_status() -> Result<AccountAuthStatus, String> {
+    Ok(AccountAuthStatus {
+        providers: account::OAuthProvider::all()
+            .into_iter()
+            .map(|provider| {
+                let available = provider.has_client_id();
+                AccountLoginProviderStatus {
+                    provider: provider.id().into(),
+                    display_name: provider.display().into(),
+                    available,
+                    missing_env: (!available).then(|| provider.client_id_env_name().into()),
+                }
+            })
+            .collect(),
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginArgs {
@@ -136,7 +169,7 @@ pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, Stri
     let ws = Workspace {
         id: id.clone(),
         name: args.name,
-        server_url: args.server_url,
+        server_url: config::normalize_workspace_server_url(&args.server_url).map_err(stringify)?,
         actor_id: actor_id.clone(),
         display_name,
     };
@@ -1963,7 +1996,7 @@ fn active_server_url(cfg: &DesktopConfig) -> &str {
     config::active_workspace_id(cfg)
         .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
         .map(|workspace| workspace.server_url.as_str())
-        .unwrap_or("ws://127.0.0.1:7878/rpc")
+        .unwrap_or(config::DEFAULT_SERVER_URL)
 }
 
 fn pending_machine_registration(
@@ -3159,8 +3192,10 @@ mod tests {
             config_dir: "/tmp/loom-config".into(),
             agent_count: 1,
             online_agent_count: 0,
+            service_count: 0,
             providers: Vec::new(),
             agents: Vec::new(),
+            services: Vec::new(),
             serve_command: String::new(),
             setup_script: String::new(),
         };

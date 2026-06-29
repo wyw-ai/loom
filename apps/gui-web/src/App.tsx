@@ -36,11 +36,14 @@ import {
   defaultAgentPromptAssembly,
   detailPanelBreakpoint,
   localServerCommand,
-  localServerUrl,
   machineStatusPollIntervalMs,
   mainMinWidth,
   ungroupedChannelGroupId
 } from "@/lib/constants";
+import {
+  defaultWorkspaceForm,
+  normalizeWorkspaceFormServerUrl,
+} from "@/lib/server-url";
 
 import {
   channelGroupStorageKey,
@@ -222,6 +225,8 @@ export function App() {
     autostart: true,
     env: {},
   });
+  const [accountAuthStatus, setAccountAuthStatus] =
+    useState<ipc.AccountAuthStatus | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -325,7 +330,7 @@ export function App() {
   }, []);
 
   const prepareLocalServerSpace = useCallback(() => {
-    setWorkspaceForm({ name: "Local", serverUrl: localServerUrl });
+    setWorkspaceForm(defaultWorkspaceForm());
     setView("spaces");
     if (navigator.clipboard?.writeText) {
       void navigator.clipboard
@@ -376,6 +381,14 @@ export function App() {
       setError(errorText(err));
     }
   }, [applyConfig, loadMachines]);
+
+  const loadAccountAuthStatus = useCallback(async () => {
+    try {
+      setAccountAuthStatus(await ipc.accountAuthStatus());
+    } catch {
+      setAccountAuthStatus({ providers: [] });
+    }
+  }, []);
 
   const loadWorkspaceData = useCallback(
     async (current: Workspace) => {
@@ -476,6 +489,7 @@ export function App() {
     let unlistenConnection: (() => void) | null = null;
 
     void loadConfig();
+    void loadAccountAuthStatus();
     void ipc.onStream((update) => handleStream(update)).then((off) => {
       unlistenStream = off;
     });
@@ -499,7 +513,7 @@ export function App() {
       unlistenStream?.();
       unlistenConnection?.();
     };
-  }, [loadConfig, loadMachines]);
+  }, [loadAccountAuthStatus, loadConfig, loadMachines]);
 
   useEffect(() => {
     workspaceRef.current = workspace;
@@ -952,6 +966,15 @@ export function App() {
   }
 
   async function login(provider: ipc.LoginProvider) {
+    const providerStatus = accountAuthStatus?.providers.find(
+      (item) => item.provider === provider,
+    );
+    if (providerStatus && !providerStatus.available) {
+      setError(
+        `${providerStatus.displayName} login is not configured for this desktop build.`,
+      );
+      return;
+    }
     setBusy(`login:${provider}`);
     setError(null);
     try {
@@ -990,18 +1013,22 @@ export function App() {
   }
 
   async function addWorkspace() {
-    if (!workspaceForm.name.trim() || !workspaceForm.serverUrl.trim()) return;
+    const hasTarget = workspaceForm.advanced
+      ? workspaceForm.serverUrl.trim()
+      : workspaceForm.host.trim();
+    if (!workspaceForm.name.trim() || !hasTarget) return;
     setBusy("workspace:add");
     setError(null);
     try {
+      const serverUrl = normalizeWorkspaceFormServerUrl(workspaceForm);
       const next = await ipc.workspaceAdd({
         name: workspaceForm.name.trim(),
-        serverUrl: workspaceForm.serverUrl.trim(),
+        serverUrl,
         activate: true,
       });
       applyConfig(next);
       await loadMachines();
-      setWorkspaceForm({ name: "Local", serverUrl: "ws://127.0.0.1:7878/rpc" });
+      setWorkspaceForm(defaultWorkspaceForm());
       pushNotice(`Space ${workspaceForm.name.trim()} added`);
     } catch (err) {
       setError(errorText(err));
@@ -2025,6 +2052,7 @@ export function App() {
             <ErrorBanner error={error} />
             <AccountView
               account={account}
+              authStatus={accountAuthStatus}
               busy={busy}
               onLogin={login}
               onLogout={logout}

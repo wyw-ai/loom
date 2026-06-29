@@ -35,7 +35,9 @@
     "nonprint": {
       "args": [
         "--add-dir",
-        "{agent.configDir}"
+        "{agent.configDir}",
+        "--add-dir",
+        "{agent.skillWorkspace}"
       ],
       "command": "{bin}",
       "interactive": {
@@ -113,6 +115,8 @@
       "args": [
         "--add-dir",
         "{agent.configDir}",
+        "--add-dir",
+        "{agent.skillWorkspace}",
         "--permission-mode",
         "bypassPermissions",
         "--output-format",
@@ -133,30 +137,13 @@
         "{prompt.user}"
       ],
       "command": "{bin}",
-      "prompt": {
-        "outputs": {
-          "full": {
-            "include": [],
-            "preset": "loom_full",
-            "required": []
-          },
-          "system": {
-            "include": [],
-            "preset": "loom_system",
-            "required": []
-          },
-          "user": {
-            "include": [],
-            "preset": "loom_turn",
-            "required": []
-          }
-        }
-      },
       "session": {
         "idSource": "loom_uuid",
         "resumeArgs": [
           "--add-dir",
           "{agent.configDir}",
+          "--add-dir",
+          "{agent.skillWorkspace}",
           "--permission-mode",
           "bypassPermissions",
           "--output-format",

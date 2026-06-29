@@ -3879,6 +3879,18 @@ impl Store {
         channel_id: &str,
         root_message_id: &str,
     ) -> StoreResult<Thread> {
+        // Hold the write lock across existence check + creation to prevent
+        // TOCTOU: concurrent resolve_hash_message_target calls can both pass
+        // find_thread_by_root before either acquires the write lock here,
+        // creating duplicate threads for the same root message.
+        let mut inner = self.inner.write();
+        if let Some(existing) = inner
+            .threads
+            .values()
+            .find(|t| t.channel_id == channel_id && t.root_message_id == root_message_id)
+        {
+            return Ok(existing.clone());
+        }
         let thread = Thread {
             id: format!("thread_{}", short_id()),
             channel_id: channel_id.to_string(),
@@ -3889,10 +3901,8 @@ impl Store {
         };
         self.journal
             .append(&Mutation::ThreadCreate(thread.clone()))?;
-        self.inner
-            .write()
-            .threads
-            .insert(thread.id.clone(), thread.clone());
+        inner.threads.insert(thread.id.clone(), thread.clone());
+        drop(inner);
         self.emit(StoreEvent::ThreadCreated(thread.clone()));
         Ok(thread)
     }
@@ -3989,6 +3999,13 @@ impl Store {
     fn resolve_actor_alias(&self, raw: &str) -> Option<String> {
         let key = raw.trim().trim_start_matches('@').to_ascii_lowercase();
         let inner = self.inner.read();
+        // NOTE: there is intentionally no "most-recent" tie-break here. The
+        // `Actor` model carries no timestamp, and Rust's `HashMap` iteration
+        // order is *not* insertion order (a prior revision relied on that
+        // false assumption to pick the latest upsert). Stale "zombie" actors
+        // left over from a daemon restart with a new machine_id are pruned
+        // by the daemon's `reconcile_agents` before they can coexist with
+        // their replacement, so a plain first-match is correct in practice.
         inner.actors.values().find_map(|actor| {
             let id_lower = actor.id.to_ascii_lowercase();
             let display_lower = actor.display_name.to_ascii_lowercase();
@@ -4626,6 +4643,7 @@ impl Store {
         msg_id: Option<String>,
         fire_at: Timestamp,
         repeat: Option<String>,
+        meta: Option<Meta>,
     ) -> StoreResult<Reminder> {
         if title.trim().is_empty() {
             return Err(StoreError::InvalidState("reminder title is empty".into()));
@@ -4646,7 +4664,7 @@ impl Store {
             created_at: now,
             updated_at: now,
             last_fired_at: None,
-            _meta: None,
+            _meta: meta,
         };
         self.put_reminder(reminder)
     }
@@ -4776,7 +4794,7 @@ impl Store {
                     None,
                     payload,
                     relations,
-                    None,
+                    reminder._meta.clone(),
                 ) {
                     tracing::warn!(
                         reminder = %reminder.id,
@@ -4866,6 +4884,9 @@ impl Store {
 fn apply(inner: &mut Inner, m: Mutation) {
     match m {
         Mutation::ActorUpsert(a) => {
+            // Remove then re-insert so the most recently upserted
+            // actor appears last in iteration order (see upsert_actor).
+            inner.actors.remove(&a.id);
             inner.actors.insert(a.id.clone(), a);
         }
         Mutation::ActorDelete { actor_id } => {
@@ -6119,6 +6140,54 @@ mod tests {
         assert!(!has_more);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, reply.id);
+    }
+
+    #[test]
+    fn fired_reminder_preserves_reply_target_meta_on_event() {
+        let store = fresh_store();
+        let channel = store
+            .create_channel("private".into(), Some("actor_agent_dm".into()))
+            .expect("create channel");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let mut meta = Meta::default();
+        meta.insert(
+            "loomReplyTarget".into(),
+            serde_json::json!("#chan_demo:msg_root"),
+        );
+
+        store
+            .schedule_reminder(
+                "actor_agent_dm".into(),
+                "recheck".into(),
+                Some(scope.clone()),
+                None,
+                Utc::now() - ChronoDuration::seconds(1),
+                None,
+                Some(meta),
+            )
+            .expect("schedule reminder");
+
+        let fired = store.fire_due_reminders();
+        assert_eq!(fired.len(), 1);
+
+        let inner = store.inner.read();
+        let event_id = inner
+            .events_by_scope
+            .get(&scope)
+            .and_then(|ids| ids.last())
+            .expect("event id");
+        let event = inner.events.get(event_id).expect("event");
+        assert_eq!(
+            event
+                ._meta
+                .as_ref()
+                .and_then(|meta| meta.get("loomReplyTarget"))
+                .and_then(serde_json::Value::as_str),
+            Some("#chan_demo:msg_root")
+        );
     }
 
     #[test]

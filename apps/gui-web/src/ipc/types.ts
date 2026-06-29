@@ -241,6 +241,7 @@ export interface AgentProviderRef {
   mode?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  env?: Record<string, string>;
 }
 
 export interface MachineAgentProviderInfo {
@@ -260,6 +261,7 @@ export interface AgentSpec {
   providerRef: AgentProviderRef;
   models?: AgentModelSpec | null;
   autostart?: boolean | null;
+  promptAssembly?: Record<string, unknown> | null;
   _meta?: Record<string, unknown>;
 }
 
@@ -272,6 +274,55 @@ export interface AgentInfo {
 
 export interface MachineAgentInfo extends AgentInfo {
   profilePath: string;
+}
+
+export type AgentFileRoot = "profile" | "scopeWorkspace" | "scope-workspace";
+
+export interface AgentFileEntry {
+  path: string;
+  bytes: number;
+  modified?: string | null;
+}
+
+export interface AgentFileListResult {
+  root: string;
+  prefix: string;
+  files: AgentFileEntry[];
+}
+
+export interface AgentFileReadResult {
+  root: string;
+  path: string;
+  content: string;
+}
+
+export interface AgentFileWriteResult {
+  root: string;
+  path: string;
+  bytes: number;
+}
+
+export interface AgentPromptPreviewPart {
+  key: string;
+  title: string;
+  source: string;
+  bytes: number;
+  empty: boolean;
+  missing: boolean;
+  content: string;
+}
+
+export interface AgentPromptPreviewResult {
+  actorId: string;
+  scope: Record<string, unknown>;
+  parts: AgentPromptPreviewPart[];
+  outputs: {
+    system: string;
+    user: string;
+    full: string;
+  };
+  bindings: Record<string, unknown>;
+  warnings: string[];
 }
 
 export interface MachineInfo {
@@ -295,10 +346,22 @@ export interface MachineInfo {
   configDir: string;
   agentCount: number;
   onlineAgentCount: number;
+  serviceCount: number;
   providers: MachineAgentProviderInfo[];
   agents: MachineAgentInfo[];
+  services: MachineServiceInfo[];
   serveCommand: string;
   setupScript: string;
+}
+
+export interface MachineServiceInfo {
+  id: string;
+  kind: string;
+  displayName?: string;
+  actor: Actor;
+  lifecycle?: string;
+  autostart?: boolean;
+  [key: string]: unknown;
 }
 
 export interface MachineListResult {
@@ -317,6 +380,73 @@ export interface StreamUpdate {
   kind: string;
   scope: ScopeRef;
   data: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Token usage (Iteration #4 — agent self-monitoring)
+//
+// Mirrors `crates/agent-runtime/src/adapter.rs::TokenUsage` (rename_all =
+// snake_case). The agent worker (`crates/cli/src/cmd/agent_serve.rs::
+// build_turn_meta`) attaches `TokenUsageMeta { increment, cumulative }` onto
+// every assistant message under `metadata.token_usage`, plus a prompt
+// breakdown under `metadata.prompt_breakdown`.
+// ---------------------------------------------------------------------------
+
+export interface TokenUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_cost_usd?: number | null;
+  estimated?: boolean;
+}
+
+export interface MessageTokenUsageMeta {
+  increment: TokenUsage;
+  cumulative: TokenUsage;
+}
+
+export interface PromptBreakdownSection {
+  key: string;
+  label: string;
+  char_count?: number;
+  byte_count?: number;
+  approx_token_count: number;
+  percentage?: number;
+}
+
+export interface PromptBreakdown {
+  sections: PromptBreakdownSection[];
+}
+
+export function readMessageTokenUsage(
+  meta: Record<string, unknown> | undefined | null,
+): MessageTokenUsageMeta | null {
+  if (!meta || typeof meta !== "object") return null;
+  const raw = (meta as Record<string, unknown>)["token_usage"];
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const increment = obj["increment"];
+  const cumulative = obj["cumulative"];
+  if (!increment || typeof increment !== "object") return null;
+  if (!cumulative || typeof cumulative !== "object") return null;
+  return {
+    increment: increment as TokenUsage,
+    cumulative: cumulative as TokenUsage,
+  };
+}
+
+export function readMessagePromptBreakdown(
+  meta: Record<string, unknown> | undefined | null,
+): PromptBreakdown | null {
+  if (!meta || typeof meta !== "object") return null;
+  const raw = (meta as Record<string, unknown>)["prompt_breakdown"];
+  if (!raw || typeof raw !== "object") return null;
+  const sections = (raw as Record<string, unknown>)["sections"];
+  if (!Array.isArray(sections)) return null;
+  return { sections: sections as PromptBreakdownSection[] };
 }
 
 export function scopeKey(scope: ScopeRef): string {

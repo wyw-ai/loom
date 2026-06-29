@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# loom pre-push hook — local matrix gate.
+#
+# Activated by:    git config core.hooksPath .githooks
+#
+# On Windows this runs under Git for Windows' bundled bash; the hook then
+# delegates to PowerShell's run-matrix.ps1 so Windows developers get the
+# native PowerShell experience.
+#
+# Honored env vars:
+#   LOOM_SKIP_PREPUSH=1     bypass the hook entirely (escape hatch)
+#   LOOM_PREPUSH_QUICK=1    delegate as --quick / -Quick (skip clippy)
+#
+# Exit:
+#   0       matrix green, allow push
+#   non-0   block push
+#
+# Founder policy reminder: this iteration's organizational rule is "local
+# commits only, do NOT push to origin." This hook is a belt-and-braces
+# guard. It runs the local matrix on push attempts; the primary discipline
+# is still the human commitment not to push.
+
+set -u
+
+if [ "${LOOM_SKIP_PREPUSH:-0}" = "1" ]; then
+    echo "[pre-push] LOOM_SKIP_PREPUSH=1 — bypassing matrix gate." >&2
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+QUICK_FLAG=""
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*)
+        if [ "${LOOM_PREPUSH_QUICK:-0}" = "1" ]; then
+            QUICK_FLAG="-Quick"
+        fi
+        # Resolve PowerShell — prefer pwsh (PS 7+), fall back to Windows PowerShell.
+        # `which` lookup is unreliable inside Git Bash, so probe known paths too.
+        ps_exe=""
+        for candidate in pwsh.exe powershell.exe \
+            "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" \
+            "/c/Program Files/PowerShell/7/pwsh.exe"; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                ps_exe="$candidate"
+                break
+            fi
+            if [ -x "$candidate" ]; then
+                ps_exe="$candidate"
+                break
+            fi
+        done
+        if [ -z "$ps_exe" ]; then
+            echo "[pre-push] could not locate powershell.exe or pwsh.exe — install PowerShell or add it to PATH." >&2
+            exit 1
+        fi
+        echo "[pre-push] running scripts/ci/run-matrix.ps1 $QUICK_FLAG (via $ps_exe) ..." >&2
+        "$ps_exe" -NoProfile -ExecutionPolicy Bypass \
+            -File "scripts/ci/run-matrix.ps1" $QUICK_FLAG
+        rc=$?
+        ;;
+    *)
+        if [ "${LOOM_PREPUSH_QUICK:-0}" = "1" ]; then
+            QUICK_FLAG="--quick"
+        fi
+        echo "[pre-push] running scripts/ci/run-matrix.sh $QUICK_FLAG ..." >&2
+        bash scripts/ci/run-matrix.sh $QUICK_FLAG
+        rc=$?
+        ;;
+esac
+
+if [ $rc -ne 0 ]; then
+    cat >&2 <<EOF
+
+[pre-push] local matrix FAILED (exit $rc). Push blocked.
+
+Reminder: this iteration's policy is "local commits only" — pushes should be
+deliberate. To bypass once (emergency only):  LOOM_SKIP_PREPUSH=1 git push ...
+For faster iteration on subsequent attempts:  LOOM_PREPUSH_QUICK=1 git push ...
+
+EOF
+    exit $rc
+fi
+
+echo "[pre-push] matrix green — push allowed." >&2
+exit 0

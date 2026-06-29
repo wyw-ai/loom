@@ -1546,6 +1546,11 @@ enum MachineAgentCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    // On Windows: if the binary was double-clicked (no arguments), show a
+    // friendly help dialog instead of flashing a terminal and disappearing.
+    if loom_platform::console::show_double_click_help() {
+        return Ok(());
+    }
     let args = Args::parse();
     render::set_output_mode(if args.json {
         OutputMode::Json

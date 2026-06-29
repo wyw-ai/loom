@@ -29,6 +29,15 @@ import type {
 } from "./types";
 
 export type LoginProvider = "google" | "github";
+export type AccountLoginProviderStatus = {
+  provider: LoginProvider;
+  displayName: string;
+  available: boolean;
+  missingEnv?: string | null;
+};
+export type AccountAuthStatus = {
+  providers: AccountLoginProviderStatus[];
+};
 
 function hasTauriRuntime() {
   return (
@@ -80,6 +89,10 @@ export async function setActiveWorkspace(id: string): Promise<DesktopConfig> {
 
 export async function accountGet(): Promise<HumanAccount | null> {
   return invoke("account_get");
+}
+
+export async function accountAuthStatus(): Promise<AccountAuthStatus> {
+  return invoke("account_auth_status");
 }
 
 export async function accountLogin(provider: LoginProvider): Promise<{

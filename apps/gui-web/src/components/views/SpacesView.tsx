@@ -5,10 +5,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { localServerCommand } from "@/lib/constants";
 import { connectionLabel, workspaceInitials } from "@/lib/format-utils";
+import {
+  normalizeWorkspaceFormServerUrl,
+  serverUrlPreviewPlaceholder,
+  workspaceFormFromServerUrl,
+} from "@/lib/server-url";
 import { cn } from "@/lib/utils";
-import { Check, Loader2, Plus, Trash2 } from "lucide-react";
+import { Check, Link2, Loader2, Plus, Trash2 } from "lucide-react";
 import type { Workspace } from "@/ipc/types";
-import type { ConnectionState } from "@/lib/types";
+import type { ConnectionState, WorkspaceFormState } from "@/lib/types";
 
 export function SpacesView({
   busy,
@@ -24,13 +29,29 @@ export function SpacesView({
   busy: string | null;
   connection: ConnectionState;
   workspace: Workspace | null;
-  workspaceForm: { name: string; serverUrl: string };
-  setWorkspaceForm: (form: { name: string; serverUrl: string }) => void;
+  workspaceForm: WorkspaceFormState;
+  setWorkspaceForm: (form: WorkspaceFormState) => void;
   workspaces: Workspace[];
   onAddWorkspace: () => void;
   onRemoveWorkspace: (id: string) => void;
   onSelectWorkspace: (workspaceId: string) => void;
 }) {
+  const hasServerTarget = Boolean(
+    workspaceForm.advanced
+      ? workspaceForm.serverUrl.trim()
+      : workspaceForm.host.trim(),
+  );
+  let serverUrlPreview = serverUrlPreviewPlaceholder;
+  let hasValidServerUrl = false;
+  if (hasServerTarget) {
+    try {
+      serverUrlPreview = normalizeWorkspaceFormServerUrl(workspaceForm);
+      hasValidServerUrl = true;
+    } catch {
+      serverUrlPreview = "Invalid server target";
+    }
+  }
+
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <PageHeader title="Spaces" detail="Choose or add a server connection" />
@@ -38,41 +59,105 @@ export function SpacesView({
         <div className="mx-auto max-w-4xl space-y-4">
           <SettingsSection title="Add Space" detail="Save a connection target in the side rail.">
             <form
-              className="grid gap-3 sm:grid-cols-[180px_1fr_auto]"
+              className="space-y-3"
               onSubmit={(event) => {
                 event.preventDefault();
                 onAddWorkspace();
               }}
             >
-              <Input
-                value={workspaceForm.name}
-                onChange={(event) =>
-                  setWorkspaceForm({ ...workspaceForm, name: event.target.value })
-                }
-                placeholder="Name"
-              />
-              <Input
-                value={workspaceForm.serverUrl}
-                onChange={(event) =>
-                  setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
-                }
-                placeholder="ws://127.0.0.1:7878/rpc"
-              />
-              <Button
-                type="submit"
-                disabled={
-                  busy === "workspace:add" ||
-                  !workspaceForm.name.trim() ||
-                  !workspaceForm.serverUrl.trim()
-                }
-              >
-                {busy === "workspace:add" ? (
-                  <Loader2 className="animate-spin" size={15} />
-                ) : (
-                  <Plus size={15} />
+              <div
+                className={cn(
+                  "grid gap-3",
+                  "lg:grid-cols-[180px_minmax(0,1fr)_auto_auto]",
                 )}
-                Add Space
-              </Button>
+              >
+                <Input
+                  value={workspaceForm.name}
+                  aria-label="Space name"
+                  onChange={(event) =>
+                    setWorkspaceForm({ ...workspaceForm, name: event.target.value })
+                  }
+                  placeholder="Name"
+                />
+                {workspaceForm.advanced ? (
+                  <Input
+                    value={workspaceForm.serverUrl}
+                    aria-label="Server URL"
+                    onChange={(event) =>
+                      setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
+                    }
+                    placeholder="ws://your-server-host:7878/rpc"
+                  />
+                ) : (
+                  <Input
+                    value={workspaceForm.host}
+                    aria-label="Server host"
+                    onChange={(event) =>
+                      setWorkspaceForm({ ...workspaceForm, host: event.target.value })
+                    }
+                    placeholder="your server host"
+                  />
+                )}
+                <Button
+                  variant={workspaceForm.advanced ? "default" : "outline"}
+                  onClick={() => {
+                    if (workspaceForm.advanced) {
+                      if (!workspaceForm.serverUrl.trim()) {
+                        setWorkspaceForm({ ...workspaceForm, advanced: false });
+                        return;
+                      }
+                      try {
+                        setWorkspaceForm(
+                          workspaceFormFromServerUrl(
+                            workspaceForm.name,
+                            workspaceForm.serverUrl,
+                          ),
+                        );
+                      } catch {
+                        setWorkspaceForm({ ...workspaceForm, advanced: false });
+                      }
+                      return;
+                    }
+                    setWorkspaceForm({
+                      ...workspaceForm,
+                      advanced: true,
+                      serverUrl: hasValidServerUrl ? serverUrlPreview : "",
+                    });
+                  }}
+                >
+                  <Link2 size={15} />
+                  Advanced
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={
+                    busy === "workspace:add" ||
+                    !workspaceForm.name.trim() ||
+                    !hasServerTarget ||
+                    !hasValidServerUrl
+                  }
+                >
+                  {busy === "workspace:add" ? (
+                    <Loader2 className="animate-spin" size={15} />
+                  ) : (
+                    <Plus size={15} />
+                  )}
+                  Add Space
+                </Button>
+              </div>
+              <div
+                className={cn(
+                  "flex min-h-9 items-center gap-2 rounded-md border px-3 py-2 text-xs",
+                  !hasServerTarget || hasValidServerUrl
+                    ? "border-[#dfe3ec] bg-[#fbfbfd] text-[#667085]"
+                    : "border-[#fecaca] bg-[#fff7f7] text-[#b42318]",
+                )}
+              >
+                <span className="shrink-0 font-semibold uppercase tracking-wide">
+                  RPC
+                </span>
+                <code className="min-w-0 truncate font-mono">{serverUrlPreview}</code>
+              </div>
             </form>
           </SettingsSection>
 

@@ -117,7 +117,7 @@ impl Default for AmConfig {
             send_retry_backoff: 1.8,
             send_fallback_chat: true,
             reply_strict: false,
-            pending_text: "收到，正在处理。".into(),
+            pending_text: "Received, processing...".into(),
             dry_run: false,
             async_log_path: None,
         }

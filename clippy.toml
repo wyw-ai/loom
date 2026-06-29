@@ -1,0 +1,17 @@
+# P0-Lint: Permanent guardrail for the PAL migration (PAL-1 through PAL-9).
+# All crates except loom-platform itself must use loom_platform::process::Command
+# instead of raw std::process::Command or tokio::process::Command.
+#
+# Legitimate exceptions (each MUST carry #[allow(clippy::disallowed_methods)]):
+# 1. G1 OS shell visibility (PM-Arbitration-003 judgement):
+#    - gui/src/account.rs::open_browser        — OS browser launch
+#    - gui/src/ipc.rs::open_path_with_system    — OS file manager
+# 2. loom_platform crate itself (overridden by crates/loom-platform/clippy.toml,
+#    which sets disallowed-methods = [])
+# 3. Integration tests that exercise raw Win32 spawn flags
+#    (e.g. agent-runtime/tests/windows_spawn_integration.rs)
+
+disallowed-methods = [
+    "std::process::Command::new",
+    "tokio::process::Command::new",
+]

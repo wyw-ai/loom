@@ -1494,6 +1494,8 @@ pub struct ReminderScheduleParams {
     pub fire_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    pub _meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1828,7 +1830,7 @@ pub struct ActorGroupMemberResult {
 
 // ---- agent/* ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentTransport {
     /// `"acp_stdio"` (default) or `"command"` (see docs/command-transport-v0.md).
     pub kind: String,
@@ -1912,32 +1914,13 @@ pub struct AgentTransport {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-}
-
-impl Default for AgentTransport {
-    fn default() -> Self {
-        Self {
-            kind: String::new(),
-            command: String::new(),
-            args: Vec::new(),
-            arg_specs: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            auth_method: None,
-            model: None,
-            model_args: Vec::new(),
-            session: None,
-            output_format: None,
-            decoder: None,
-            stderr_decoder: None,
-            prompt_via: PromptVia::default(),
-            prompt: None,
-            stdin: None,
-            timeout_ms: None,
-            idle_timeout_ms: None,
-            interactive: None,
-            provider: None,
-        }
-    }
+    /// How instructions are injected (copied from ProviderModeSpec). "prompt" or "agents_md".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "instructionsVia"
+    )]
+    pub instructions_via: Option<String>,
 }
 
 impl AgentTransport {
@@ -2070,6 +2053,14 @@ pub struct ProviderModeSpec {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
+    /// How instructions are injected: "prompt" (default, injected into prompt text) or
+    /// "agents_md" (written to workspace AGENTS.md, auto-loaded by provider).
+    #[serde(default = "default_instructions_via", rename = "instructionsVia")]
+    pub instructions_via: String,
+}
+
+pub fn default_instructions_via() -> String {
+    "prompt".into()
 }
 
 fn default_provider_transport() -> String {
@@ -2186,6 +2177,67 @@ pub enum ProviderRenderTitle {
 pub enum ProviderPromptRoleHint {
     System,
     User,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPromptAssemblySpec {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vars: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<AgentPromptFileSpec>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub outputs: std::collections::BTreeMap<String, AgentPromptOutputSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPromptFileSpec {
+    pub key: String,
+    pub root: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "roleHint")]
+    pub role_hint: Option<AgentPromptRoleHint>,
+    #[serde(default = "default_agent_prompt_file_optional")]
+    pub optional: bool,
+    #[serde(default = "default_agent_prompt_file_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_agent_prompt_file_optional() -> bool {
+    true
+}
+
+fn default_agent_prompt_file_max_bytes() -> u64 {
+    32 * 1024
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptRoleHint {
+    System,
+    User,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPromptOutputSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(default)]
+    pub required: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2315,7 +2367,7 @@ pub enum ProviderSessionIdSource {
     ProviderCapture,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractiveCommandSpec {
     #[serde(default)]
@@ -2330,19 +2382,7 @@ pub struct InteractiveCommandSpec {
     pub kill: InteractiveKillSpec,
 }
 
-impl Default for InteractiveCommandSpec {
-    fn default() -> Self {
-        Self {
-            session: InteractiveSessionSpec::default(),
-            prompt: InteractivePromptSpec::default(),
-            completion: InteractiveCompletionSpec::default(),
-            output: InteractiveOutputSpec::default(),
-            kill: InteractiveKillSpec::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractiveSessionSpec {
     #[serde(default)]
@@ -2357,19 +2397,6 @@ pub struct InteractiveSessionSpec {
     pub on_signature_changed: InteractiveSignatureChangedPolicy,
     #[serde(default)]
     pub on_resume_failed: InteractiveResumeFailedPolicy,
-}
-
-impl Default for InteractiveSessionSpec {
-    fn default() -> Self {
-        Self {
-            id_strategy: InteractiveSessionIdStrategy::default(),
-            new_args: Vec::new(),
-            resume_args: Vec::new(),
-            on_missing: InteractiveSessionMissingPolicy::default(),
-            on_signature_changed: InteractiveSignatureChangedPolicy::default(),
-            on_resume_failed: InteractiveResumeFailedPolicy::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2656,8 +2683,10 @@ pub struct AgentSpec {
     pub models: Option<AgentModelSpec>,
     /// Optional actor-local bundle configuration. When present, the runtime
     /// ensures a skill / tool bundle is available under the actor home before
-    /// the transport is started, then exposes its resolved paths through
-    /// template variables / env injection.
+    /// the transport is started. Each turn projects the current scope's
+    /// bundles into provider-native skill directories under the agent
+    /// workspace, then exposes the resolved paths through template variables /
+    /// env injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<AgentBundleSpec>,
     /// Optional per-actor memory configuration. Defines where records live
@@ -2678,6 +2707,16 @@ pub struct AgentSpec {
     /// `/delivery` or `/discovery`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TriggerSpec>,
+    /// Optional per-agent prompt assembly. This is the agent-owned rule that
+    /// turns Loom prompt parts and controlled profile/workspace files into the
+    /// named outputs providers consume through `{prompt.system}`,
+    /// `{prompt.user}`, and `{prompt.full}`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "promptAssembly"
+    )]
+    pub prompt_assembly: Option<AgentPromptAssemblySpec>,
     /// Optional per-actor prompt template (design §5). Wraps the trigger
     /// event content with `everyTurnPrefix`, `firstTurnPrefix` (first
     /// turn per scope only), and `everyTurnSuffix` lines, with template
@@ -2701,6 +2740,10 @@ pub struct AgentProviderRef {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-agent environment variables injected into the provider child process.
+    /// Keys here override same-named keys from the provider manifest's mode.env.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.

@@ -48,22 +48,14 @@
           ],
           "when": "reasoningEffort"
         },
-        "{prompt.full}"
+        "{prompt.user}"
       ],
       "command": "{bin}",
       "env": {
+        "OPENCODE_CONFIG": "{agent.skillWorkspace}/.opencode/opencode.json",
         "XDG_CACHE_HOME": "{agent.profile}/opencode/cache",
         "XDG_DATA_HOME": "{agent.profile}/opencode/data",
         "XDG_STATE_HOME": "{agent.profile}/opencode/state"
-      },
-      "prompt": {
-        "outputs": {
-          "full": {
-            "include": [],
-            "preset": "loom_full",
-            "required": []
-          }
-        }
       },
       "session": {
         "idSource": "provider_capture",
@@ -88,7 +80,7 @@
             ],
             "when": "reasoningEffort"
           },
-          "{prompt.full}"
+          "{prompt.user}"
         ],
         "scope": "actor_scope"
       },

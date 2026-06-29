@@ -22,6 +22,33 @@ struct Inner {
     conn_scopes: HashMap<String, HashSet<ScopeRef>>,
     /// actor id -> connection id (last one wins; v0 is single-connection-per-actor)
     actor_conn: HashMap<String, String>,
+    /// actor id -> kind, learned at `bind_actor`. An actor's kind is stable, so
+    /// this is keyed by actor (not connection) and never needs per-connection
+    /// upkeep. Used to suppress duplicate agent/service wakes.
+    actor_kind: HashMap<String, ActorKind>,
+}
+
+impl Inner {
+    /// True when `conn` is an agent/service worker connection that is NOT the
+    /// canonical inbox owner for its actor. Such a connection belongs to a
+    /// stale or duplicate runtime; delivering scope wakes to it would make two
+    /// workers drive the same actor concurrently (duplicate turns, conflicting
+    /// coordination). Human connections are never suppressed — a person may run
+    /// several clients that all want live updates.
+    fn is_noncanonical_agent_worker(&self, conn: &Connection) -> bool {
+        let Some(actor) = conn.actor_id.as_deref() else {
+            return false;
+        };
+        if !matches!(
+            self.actor_kind.get(actor),
+            Some(ActorKind::Agent) | Some(ActorKind::Service)
+        ) {
+            return false;
+        }
+        self.actor_conn
+            .get(actor)
+            .is_some_and(|owner| owner != &conn.id)
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +107,19 @@ impl Subscriptions {
         let mut inner = self.inner.write();
         if let Some(c) = inner.connections.get_mut(connection_id) {
             c.actor_id = Some(actor_id.clone());
+        }
+        // Never downgrade a previously-learned Agent/Service kind to Human.
+        // Short-lived CLI subcommands shelled from inside an agent turn default
+        // to actor_kind=Human and must not overwrite the stable long-lived kind;
+        // doing so would break is_noncanonical_agent_worker / wake suppression.
+        if !matches!(
+            (inner.actor_kind.get(&actor_id), actor_kind),
+            (
+                Some(ActorKind::Agent | ActorKind::Service),
+                ActorKind::Human
+            )
+        ) {
+            inner.actor_kind.insert(actor_id.clone(), actor_kind);
         }
         if !claim_inbox {
             tracing::debug!(
@@ -188,6 +228,19 @@ impl Subscriptions {
             .and_then(|c| c.actor_id.clone())
     }
 
+    /// True when `connection_id` is a stale/duplicate agent worker connection
+    /// (an agent/service connection that is no longer its actor's canonical
+    /// inbox owner). Scope-wake fan-out must skip such connections so only one
+    /// runtime drives each agent even when two daemons are connected. Returns
+    /// false for unknown connections and for human connections.
+    pub fn is_suppressed_wake_target(&self, connection_id: &str) -> bool {
+        let inner = self.inner.read();
+        inner
+            .connections
+            .get(connection_id)
+            .is_some_and(|c| inner.is_noncanonical_agent_worker(c))
+    }
+
     pub fn connected_actor_ids(&self, actor_ids: &[String]) -> Vec<String> {
         let inner = self.inner.read();
         let mut out = if actor_ids.is_empty() {
@@ -245,6 +298,9 @@ impl Subscriptions {
         };
         for id in set {
             if let Some(c) = inner.connections.get(id) {
+                if inner.is_noncanonical_agent_worker(c) {
+                    continue;
+                }
                 let _ = c.tx.send(frame.clone());
             }
         }
@@ -405,6 +461,72 @@ mod tests {
     }
 
     #[test]
+    fn human_bind_does_not_downgrade_agent_kind_for_wake_suppression() {
+        // Regression: a short-lived CLI command shelled from inside an agent turn
+        // calls bind_actor with actor_kind=Human.  Before the fix this overwrote
+        // the agent's actor_kind entry, so is_noncanonical_agent_worker returned
+        // false for the stale conn and it started receiving scope-wake messages
+        // again (duplicate-runtime risk).
+        let subs = Subscriptions::new();
+        let (tx_stale, mut rx_stale) = mpsc::unbounded_channel();
+        let (tx_live, mut rx_live) = mpsc::unbounded_channel();
+        let (tx_shell, _rx_shell) = mpsc::unbounded_channel();
+
+        subs.add_connection(Connection {
+            id: "conn_stale".into(),
+            actor_id: None,
+            tx: tx_stale,
+        });
+        subs.add_connection(Connection {
+            id: "conn_live".into(),
+            actor_id: None,
+            tx: tx_live,
+        });
+        subs.add_connection(Connection {
+            id: "conn_shell".into(),
+            actor_id: None,
+            tx: tx_shell,
+        });
+
+        // Long-lived daemon binds first, then restarts and the new conn takes over.
+        subs.bind_actor("conn_stale", "actor_agent".into(), ActorKind::Agent, true);
+        subs.bind_actor("conn_live", "actor_agent".into(), ActorKind::Agent, true);
+
+        // Simulate a CLI subcommand shelled from inside the agent turn (kind=Human).
+        subs.bind_actor("conn_shell", "actor_agent".into(), ActorKind::Human, true);
+
+        // conn_shell must not have stolen the inbox.
+        assert_eq!(
+            subs.inbox_owner("actor_agent").as_deref(),
+            Some("conn_live"),
+            "Human bind must not preempt the live agent connection",
+        );
+
+        // The stale agent worker must still be suppressed even after the Human bind.
+        let scope = ScopeRef {
+            kind: proto::types::ScopeKind::Channel,
+            id: "chan_test".into(),
+        };
+        for c in ["conn_stale", "conn_live", "conn_shell"] {
+            assert!(subs.subscribe(c, scope.clone()));
+        }
+        subs.broadcast_to_scope(
+            &scope,
+            "stream/update",
+            serde_json::json!({ "kind": "message.created" }),
+        );
+
+        assert!(
+            rx_live.try_recv().is_ok(),
+            "canonical agent worker must be woken"
+        );
+        assert!(
+            rx_stale.try_recv().is_err(),
+            "stale agent worker must NOT be woken after a Human re-bind"
+        );
+    }
+
+    #[test]
     fn human_kind_does_not_preempt_live_binding() {
         // A short-lived `loom --as svc_xxx message send` defaults to actor_kind=Human
         // (see client::open_connection). It must NOT yank the long-lived
@@ -509,5 +631,80 @@ mod tests {
         assert!(rx_a.try_recv().is_ok());
         assert!(rx_b.try_recv().is_ok());
         assert!(rx_other.try_recv().is_err());
+    }
+
+    #[test]
+    fn scope_wake_skips_noncanonical_agent_workers_but_not_humans() {
+        // Two daemons can each hold a worker connection for the same agent
+        // actor (e.g. a stale daemon overlapping a fresh one). Only the
+        // canonical inbox owner should be woken by a scope broadcast, so the
+        // agent is driven by exactly one runtime. Humans, by contrast, may run
+        // several clients that all want the live update.
+        let subs = Subscriptions::new();
+        let (tx_stale, mut rx_stale) = mpsc::unbounded_channel();
+        let (tx_live, mut rx_live) = mpsc::unbounded_channel();
+        let (tx_human1, mut rx_human1) = mpsc::unbounded_channel();
+        let (tx_human2, mut rx_human2) = mpsc::unbounded_channel();
+
+        subs.add_connection(Connection {
+            id: "conn_stale".into(),
+            actor_id: None,
+            tx: tx_stale,
+        });
+        subs.add_connection(Connection {
+            id: "conn_live".into(),
+            actor_id: None,
+            tx: tx_live,
+        });
+        subs.add_connection(Connection {
+            id: "conn_human1".into(),
+            actor_id: None,
+            tx: tx_human1,
+        });
+        subs.add_connection(Connection {
+            id: "conn_human2".into(),
+            actor_id: None,
+            tx: tx_human2,
+        });
+
+        // The second agent bind preempts: conn_live becomes canonical, conn_stale
+        // keeps the actor identity but is no longer the inbox owner.
+        subs.bind_actor("conn_stale", "actor_agent".into(), ActorKind::Agent, true);
+        subs.bind_actor("conn_live", "actor_agent".into(), ActorKind::Agent, true);
+        // Two human clients of the same person; the second never preempts the
+        // inbox but must still receive live updates.
+        subs.bind_actor("conn_human1", "actor_human".into(), ActorKind::Human, true);
+        subs.bind_actor("conn_human2", "actor_human".into(), ActorKind::Human, true);
+
+        let scope = ScopeRef {
+            kind: proto::types::ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+        for c in ["conn_stale", "conn_live", "conn_human1", "conn_human2"] {
+            assert!(subs.subscribe(c, scope.clone()));
+        }
+
+        subs.broadcast_to_scope(
+            &scope,
+            "stream/update",
+            serde_json::json!({ "kind": "message.created" }),
+        );
+
+        assert!(
+            rx_live.try_recv().is_ok(),
+            "canonical agent worker must be woken",
+        );
+        assert!(
+            rx_stale.try_recv().is_err(),
+            "stale/duplicate agent worker must NOT be woken",
+        );
+        assert!(
+            rx_human1.try_recv().is_ok(),
+            "human client must receive live updates",
+        );
+        assert!(
+            rx_human2.try_recv().is_ok(),
+            "a second human client must also receive live updates",
+        );
     }
 }

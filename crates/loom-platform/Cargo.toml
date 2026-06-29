@@ -1,0 +1,40 @@
+[package]
+name = "loom-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# loom-platform is the workspace-level Platform Abstraction Layer (PAL).
+# All cross-platform differences (path/process/signal/fs/ipc/console/env/time)
+# are centralised here so business crates do not scatter `#[cfg(windows)]`.
+#
+# Skeleton crate (P0-PAL-1): only the `console` module is fully populated
+# (merged from the former `windows-console` crate). The remaining 7 modules
+# are stubs that subsequent work units (P0-PAL-2..8) fill in.
+
+[features]
+default = ["ipc-interprocess"]
+# Default IPC backend uses the `interprocess` crate (Win Named Pipe / Unix UDS).
+# `ipc-native` is the rollback path: hand-rolled tokio::net::windows::named_pipe /
+# tokio::net::UnixListener implementation. Toggled in P0-PAL-7/8.
+ipc-interprocess = ["dep:interprocess"]
+ipc-native = []
+
+[dependencies]
+tokio = { workspace = true }
+interprocess = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Authorization"] }
+widestring = "1"
+dunce = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

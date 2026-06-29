@@ -19,10 +19,10 @@ use tokio_tungstenite::tungstenite::Message;
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Response>>>>;
 
 pub struct Client {
-    out_tx: mpsc::UnboundedSender<String>,
+    out_tx: mpsc::Sender<String>,
     pending: Pending,
     next_id: Arc<std::sync::atomic::AtomicU64>,
-    pub notifications: Mutex<Option<mpsc::UnboundedReceiver<Notification>>>,
+    pub notifications: Mutex<Option<mpsc::Receiver<Notification>>>,
 }
 
 impl Client {
@@ -31,8 +31,8 @@ impl Client {
             .await
             .with_context(|| format!("ws connect {}", url))?;
         let (mut sink, mut stream) = ws.split();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(4096);
+        let (notif_tx, notif_rx) = mpsc::channel::<Notification>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(async move {
@@ -65,9 +65,9 @@ impl Client {
     }
 
     fn new(
-        out_tx: mpsc::UnboundedSender<String>,
+        out_tx: mpsc::Sender<String>,
         pending: Pending,
-        notif_rx: mpsc::UnboundedReceiver<Notification>,
+        notif_rx: mpsc::Receiver<Notification>,
     ) -> Arc<Self> {
         Arc::new(Self {
             out_tx,
@@ -77,7 +77,7 @@ impl Client {
         })
     }
 
-    pub async fn take_notifications(&self) -> Option<mpsc::UnboundedReceiver<Notification>> {
+    pub async fn take_notifications(&self) -> Option<mpsc::Receiver<Notification>> {
         self.notifications.lock().await.take()
     }
 
@@ -93,6 +93,7 @@ impl Client {
         let frame = serde_json::to_string(&req)?;
         self.out_tx
             .send(frame)
+            .await
             .map_err(|_| anyhow!("ws writer closed"))?;
         let resp = tokio::time::timeout(Duration::from_secs(30), rx)
             .await
@@ -143,11 +144,7 @@ impl Client {
     }
 }
 
-async fn dispatch_frame(
-    text: String,
-    pending: &Pending,
-    notif_tx: &mpsc::UnboundedSender<Notification>,
-) {
+async fn dispatch_frame(text: String, pending: &Pending, notif_tx: &mpsc::Sender<Notification>) {
     let envelope: RpcEnvelope = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
@@ -163,7 +160,7 @@ async fn dispatch_frame(
             }
         }
         RpcEnvelope::Notification(n) => {
-            let _ = notif_tx.send(n);
+            let _ = notif_tx.try_send(n);
         }
         RpcEnvelope::Request(_) => {
             // Server doesn't send requests in v0.

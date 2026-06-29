@@ -73,6 +73,7 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
     config_dir: &Path,
 ) -> Vec<DetectedAgentProvider> {
     let registry = ProviderRegistry::load(config_dir).ok();
+    let runtime_path = path.clone();
     crate::provider::detect_agent_cli_providers_with_config_dir_and_path(config_dir, path)
         .unwrap_or_default()
         .into_iter()
@@ -88,12 +89,16 @@ fn detect_agent_cli_providers_in_path_with_config_dir(
             let manifest_id = provider.manifest.id;
             let runtime_plan = registry.as_ref().and_then(|registry| {
                 registry
-                    .resolve_runtime_plan(&AgentProviderRef {
-                        id: manifest_id,
-                        mode: Some("print".into()),
-                        model: default_model.clone(),
-                        reasoning_effort: None,
-                    })
+                    .resolve_runtime_plan_with_path(
+                        &AgentProviderRef {
+                            id: manifest_id,
+                            mode: Some("print".into()),
+                            model: default_model.clone(),
+                            reasoning_effort: None,
+                            ..Default::default()
+                        },
+                        runtime_path.clone(),
+                    )
                     .ok()
             });
             DetectedAgentProvider {
@@ -141,7 +146,14 @@ mod tests {
 
     #[cfg(not(unix))]
     fn make_executable(path: &Path) {
-        std::fs::write(path, "").expect("write executable");
+        // On Windows, extensionless files require a PE (MZ) header to pass
+        // is_executable().  Append .cmd so resolve_command_with_pathext()
+        // finds the stub via PATHEXT resolution — this mirrors how .cmd
+        // wrappers (e.g. copilot.CMD) are the Windows equivalent of Unix
+        // shell scripts.
+        let mut cmd_path = path.to_path_buf();
+        cmd_path.set_extension("cmd");
+        std::fs::write(&cmd_path, "@echo off\r\n").expect("write executable");
     }
 
     #[test]
@@ -188,6 +200,7 @@ mod tests {
         assert!(resume_args.contains(&"--resume".into()));
         assert!(resume_args.contains(&"{session_id}".into()));
         assert!(resume_args.contains(&"{prompt.user}".into()));
+        assert!(resume_args.contains(&"{agent.skillWorkspace}".into()));
         assert!(claude_session.resume_arg_specs.iter().any(|arg| matches!(
             arg,
             ProviderArgSpec::Conditional(spec) if spec.when == "model"
@@ -215,11 +228,27 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "copilot")
             .expect("copilot provider");
-        assert!(copilot.args.contains(&"--resume".into()));
-        assert!(copilot.args.contains(&"{prompt.full}".into()));
+        assert!(copilot.args.contains(&"--session-id".into()));
+        assert!(copilot.args.contains(&"{agent.skillWorkspace}".into()));
+        // Copilot delivers prompt via stdin (not args) to avoid Windows
+        // command-line length limits (error 206 / MAX_PATH).
+        let copilot_plan = copilot.runtime_plan.as_ref().expect("copilot runtime plan");
+        assert!(
+            copilot_plan.stdin.as_deref() == Some("{prompt.full}"),
+            "copilot must deliver prompt via stdin, got {:?}",
+            copilot_plan.stdin
+        );
         assert_eq!(
             copilot.transport().output_format,
             Some(CommandOutputFormat::NdjsonLines)
+        );
+        assert_eq!(
+            copilot
+                .transport()
+                .env
+                .get("COPILOT_CUSTOM_INSTRUCTIONS_DIRS")
+                .map(String::as_str),
+            Some("{loom_agent_home}")
         );
         assert!(copilot
             .transport()
@@ -233,6 +262,7 @@ mod tests {
             .find(|provider| provider.id == "codex")
             .expect("codex provider");
         assert!(codex.args.contains(&"{prompt.full}".into()));
+        assert!(codex.args.contains(&"{agent.skillWorkspace}".into()));
         assert_eq!(
             codex.transport().output_format,
             Some(CommandOutputFormat::CodexStreamJson)
@@ -245,11 +275,23 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            codex.transport().env.get("CODEX_HOME").map(String::as_str),
+            Some("{loom_agent_home}")
+        );
         let opencode = providers
             .iter()
             .find(|provider| provider.id == "opencode")
             .expect("opencode provider");
         assert!(opencode.args.contains(&"{prompt.full}".into()));
+        assert_eq!(
+            opencode
+                .transport()
+                .env
+                .get("OPENCODE_CONFIG")
+                .map(String::as_str),
+            Some("{agent.skillWorkspace}/.opencode/opencode.json")
+        );
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(config_dir).ok();
     }

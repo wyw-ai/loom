@@ -35,7 +35,7 @@ hex = "0.4"
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.21", features = ["connect"] }
+tokio-tungstenite = { version = "0.21", features = ["connect", "rustls-tls-native-roots"] }
 url = "2"
 dirs = "5"
 toml = "0.8"

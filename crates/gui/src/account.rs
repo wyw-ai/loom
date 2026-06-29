@@ -26,6 +26,10 @@ pub enum OAuthProvider {
 }
 
 impl OAuthProvider {
+    pub fn all() -> [Self; 2] {
+        [Self::GitHub, Self::Google]
+    }
+
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "google" => Ok(Self::Google),
@@ -34,7 +38,14 @@ impl OAuthProvider {
         }
     }
 
-    fn display(self) -> &'static str {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::GitHub => "github",
+        }
+    }
+
+    pub fn display(self) -> &'static str {
         match self {
             Self::Google => "Google",
             Self::GitHub => "GitHub",
@@ -62,28 +73,54 @@ impl OAuthProvider {
         }
     }
 
-    fn client_id(self) -> Result<String> {
-        let env_name = match self {
+    pub fn client_id_env_name(self) -> &'static str {
+        match self {
             Self::Google => "LOOM_GOOGLE_CLIENT_ID",
             Self::GitHub => "LOOM_GITHUB_CLIENT_ID",
-        };
-        std::env::var(env_name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        }
+    }
+
+    pub fn has_client_id(self) -> bool {
+        self.configured_client_id().is_some()
+    }
+
+    fn client_id(self) -> Result<String> {
+        let env_name = self.client_id_env_name();
+        self.configured_client_id()
             .ok_or_else(|| anyhow!("{env_name} is required for {} login", self.display()))
     }
 
+    fn configured_client_id(self) -> Option<String> {
+        configured_env_value(self.client_id_env_name()).or_else(|| bundled_client_id(self))
+    }
+
     fn client_secret(self) -> Option<String> {
-        let env_name = match self {
+        configured_env_value(self.client_secret_env_name())
+    }
+
+    fn client_secret_env_name(self) -> &'static str {
+        match self {
             Self::Google => "LOOM_GOOGLE_CLIENT_SECRET",
             Self::GitHub => "LOOM_GITHUB_CLIENT_SECRET",
-        };
-        std::env::var(env_name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        }
     }
+}
+
+fn configured_env_value(env_name: &str) -> Option<String> {
+    std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn bundled_client_id(provider: OAuthProvider) -> Option<String> {
+    let value = match provider {
+        OAuthProvider::Google => option_env!("LOOM_GOOGLE_CLIENT_ID"),
+        OAuthProvider::GitHub => option_env!("LOOM_GITHUB_CLIENT_ID"),
+    };
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub async fn login_oauth(provider: &str) -> Result<HumanAccount> {
@@ -394,7 +431,17 @@ async fn decode_json_response<T: for<'de> Deserialize<'de>>(
     serde_json::from_str(&text).with_context(|| format!("parsing {label} response"))
 }
 
+#[allow(clippy::disallowed_methods)] // G1 OS shell (PM-Arbitration-003) — see body
 fn open_browser(url: &str) -> Result<()> {
+    // FIXME(windows-compat-iter): GUI surface deferred per PRD §2.3
+    // [G1: OS shell visibility] (PM-Arbitration-003 judgement).
+    // These user-facing browser launchers must NOT use
+    // `loom_platform::process::Command` until P1-Cmd-Sweep verifies that the
+    // newtype's default Windows flags (CREATE_NO_WINDOW |
+    // CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP) do not break the
+    // browser/explorer launch UX. P0-Lint (`clippy::disallowed_methods`) is
+    // active workspace-wide; the fn-level allow above is the documented G1
+    // exemption (covers all three platform branches below).
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut cmd = Command::new("open");

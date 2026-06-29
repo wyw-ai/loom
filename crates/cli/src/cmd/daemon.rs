@@ -5,7 +5,7 @@
 //! agent worker implementation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::discovery::{
@@ -15,7 +15,10 @@ use agent_runtime::provider::{
     builtin_provider_manifests, providers_dir, validate_manifest, ProviderRegistry,
 };
 use anyhow::{anyhow, Context, Result};
-use proto::methods::{AgentModelSpec, AgentProviderRef, AgentSpec, ProviderManifest};
+use proto::methods::{
+    AgentModelSpec, AgentPromptAssemblySpec, AgentProviderRef, AgentSpec, ProviderManifest,
+    ServiceSpec,
+};
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -65,7 +68,11 @@ pub async fn run(
     let selected_machine_id = machine.id.clone();
     let mut selected_machine = machine.clone();
     let data_root = data_root.unwrap_or_else(|| machine_data_root(&machine));
-    std::fs::create_dir_all(&data_root)
+    let data_root = abs_path(data_root);
+    // Use the UNC-aware wrapper so a deep data root (%USERPROFILE% + machine
+    // id + agent/scope tree) does not trip the 260-char MAX_PATH limit on
+    // Windows. `data_root` is absolute (abs_path), so UNC prefixing is safe.
+    loom_platform::path::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
@@ -79,13 +86,25 @@ pub async fn run(
         initial_specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
     let mut inventory_revision = 1u64;
-    let mut inventory_fingerprint =
-        machine_inventory_fingerprint(&machine, &data_root, &providers, &initial_specs);
+    let initial_service_specs = load_config_service_specs().unwrap_or_else(|err| {
+        eprintln!("loom-daemon: warning: failed to load ServiceSpecs for inventory: {err:#}");
+        Vec::new()
+    });
+    let mut annotated_initial_service_specs = initial_service_specs;
+    annotate_machine_service_specs(&mut annotated_initial_service_specs, &machine);
+    let mut inventory_fingerprint = machine_inventory_fingerprint(
+        &machine,
+        &data_root,
+        &providers,
+        &initial_specs,
+        &annotated_initial_service_specs,
+    );
     let machine_inventory = Arc::new(Mutex::new(machine_inventory_meta(
         &machine,
         &data_root,
         &providers,
         &initial_specs,
+        &annotated_initial_service_specs,
         inventory_revision,
     )));
     let (machine_command_tx, mut machine_command_rx) = mpsc::unbounded_channel();
@@ -106,13 +125,13 @@ pub async fn run(
         let proxy_handle = daemon_ipc::start_proxy(socket_path.clone(), server_url.clone()).await?;
         std::env::set_var(daemon_ipc::ENV_DAEMON_SOCKET, &socket_path);
         if let Err(err) = daemon_ipc::write_discovery(&socket_path, &server_url) {
-            eprintln!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
+            tracing::warn!("loom-daemon: warning: failed to write daemon discovery: {err:#}");
         }
         (Some(socket_path), Some(proxy_handle))
     };
 
     if no_services {
-        eprintln!("loom-daemon: service host disabled by --no-services");
+        tracing::info!("loom-daemon: service host disabled by --no-services");
     } else {
         spawn_service_host(services_dir, server_url.clone(), allow_services);
     }
@@ -122,7 +141,7 @@ pub async fn run(
     let mut running_agents = HashMap::new();
     let mut warned_missing = HashSet::new();
 
-    eprintln!(
+    tracing::info!(
         "loom-daemon: machine={} providers={} data={} reload={}s",
         machine.id,
         providers.len(),
@@ -130,60 +149,123 @@ pub async fn run(
         CONFIG_RELOAD_INTERVAL.as_secs()
     );
     if let Some(socket_path) = socket_path.as_ref() {
-        eprintln!("loom-daemon: socket={}", socket_path.display());
+        tracing::info!("loom-daemon: socket={}", socket_path.display());
     } else {
-        eprintln!("loom-daemon: socket disabled");
+        tracing::info!("loom-daemon: socket disabled");
     }
-    eprintln!("loom-daemon: ready (ctrl-c to stop)");
+    tracing::info!("loom-daemon: ready (ctrl-c to stop)");
 
     loop {
-        match refresh_machine_runtime(
-            &selected_machine_id,
-            &mut selected_machine,
-            &allow_actors,
-            &data_root,
-            &server_url,
-            &machine_inventory,
-            &mut inventory_revision,
-            &mut inventory_fingerprint,
-            &mut running_agents,
-            &mut warned_missing,
-        ) {
-            Ok(()) => {}
-            Err(e) => eprintln!("loom-daemon: reload failed: {e:#}"),
+        // Wrap config reload in a panic guard so a single reload failure
+        // (e.g., from corrupted spec file parsing) doesn't kill the daemon.
+        let reload_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refresh_machine_runtime(
+                &selected_machine_id,
+                &mut selected_machine,
+                &allow_actors,
+                &data_root,
+                &server_url,
+                &machine_inventory,
+                &mut inventory_revision,
+                &mut inventory_fingerprint,
+                &mut running_agents,
+                &mut warned_missing,
+            )
+        }));
+        match reload_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("loom-daemon: reload failed: {e:#}"),
+            Err(panic_err) => {
+                let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("loom-daemon: reload panicked: {msg}");
+                // Sleep a bit after a panic to avoid tight panic loops.
+                sleep(Duration::from_secs(5)).await;
+            }
         }
 
         tokio::select! {
             _ = shutdown_signal() => break,
             maybe_command = machine_command_rx.recv() => {
                 let Some(command) = maybe_command else {
-                    eprintln!("loom-daemon: machine command channel closed");
+                    // Channel closed — the server-side machine command sender was
+                    // dropped. Log once and add a sleep so we don't tight-loop
+                    // on disk I/O from refresh_machine_runtime above.
+                    tracing::warn!("loom-daemon: machine command channel closed; will keep polling config");
+                    sleep(Duration::from_secs(15)).await;
                     continue;
                 };
-                let result = handle_machine_command(
-                    &selected_machine_id,
-                    &mut selected_machine,
-                    command.payload,
-                );
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    if let Err(err) = refresh_machine_runtime(
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_machine_command(
                         &selected_machine_id,
                         &mut selected_machine,
-                        &allow_actors,
-                        &data_root,
-                        &server_url,
-                        &machine_inventory,
-                        &mut inventory_revision,
-                        &mut inventory_fingerprint,
-                        &mut running_agents,
-                        &mut warned_missing,
-                    ) {
-                        let fallback = machine_command_error_from_result(
-                            &result,
-                            format!("machine command applied but runtime refresh failed: {err:#}"),
+                        command.payload,
+                    )
+                }));
+                let result = match result {
+                    Ok(r) => r,
+                    Err(panic_err) => {
+                        let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!("loom-daemon: machine command handler panicked: {msg}");
+                        let fallback = machine_command_error(
+                            json!({}),
+                            format!("internal panic handling machine command: {msg}"),
                         );
                         let _ = command.reply.send(fallback);
                         continue;
+                    }
+                };
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let refresh_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        refresh_machine_runtime(
+                            &selected_machine_id,
+                            &mut selected_machine,
+                            &allow_actors,
+                            &data_root,
+                            &server_url,
+                            &machine_inventory,
+                            &mut inventory_revision,
+                            &mut inventory_fingerprint,
+                            &mut running_agents,
+                            &mut warned_missing,
+                        )
+                    }));
+                    match refresh_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            let fallback = machine_command_error_from_result(
+                                &result,
+                                format!("machine command applied but runtime refresh failed: {err:#}"),
+                            );
+                            let _ = command.reply.send(fallback);
+                            continue;
+                        }
+                        Err(panic_err) => {
+                            let msg = if let Some(s) = panic_err.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            let fallback = machine_command_error_from_result(
+                                &result,
+                                format!("machine command applied but refresh panicked: {msg}"),
+                            );
+                            let _ = command.reply.send(fallback);
+                            continue;
+                        }
                     }
                 }
                 let _ = command.reply.send(result);
@@ -192,7 +274,7 @@ pub async fn run(
         }
     }
 
-    eprintln!("\nloom-daemon: shutting down");
+    tracing::info!("loom-daemon: shutting down");
     if let Some(proxy_handle) = proxy_handle {
         proxy_handle.abort();
     }
@@ -240,6 +322,7 @@ struct MachineSpecs {
     machine: MachineConfig,
     providers: Vec<DetectedAgentProvider>,
     specs: Vec<AgentSpec>,
+    service_specs: Vec<ServiceSpec>,
 }
 
 struct RunningAgent {
@@ -271,6 +354,7 @@ fn refresh_machine_runtime(
         data_root,
         &snapshot.providers,
         &snapshot.specs,
+        &snapshot.service_specs,
     );
     if next_fingerprint != *inventory_fingerprint {
         *inventory_revision = inventory_revision.saturating_add(1);
@@ -281,6 +365,7 @@ fn refresh_machine_runtime(
         data_root,
         &snapshot.providers,
         &snapshot.specs,
+        &snapshot.service_specs,
         *inventory_revision,
     );
     reconcile_agents(running_agents, snapshot.specs, server_url, data_root);
@@ -300,7 +385,7 @@ fn load_machine_specs(
         .is_none_or(|machine| machine.id != selected_machine_id);
     let restored_context = if was_missing {
         if warned_missing.insert(format!("machine:{selected_machine_id}")) {
-            eprintln!(
+            tracing::warn!(
                 "loom-daemon: selected machine {selected_machine_id} is missing from daemon.toml; restoring live runtime snapshot"
             );
         }
@@ -320,6 +405,7 @@ fn load_machine_specs(
         .ok_or_else(|| anyhow!("daemon machine config is missing"))?;
     let mut specs = load_config_agent_specs()?;
     annotate_machine_agent_specs(&mut specs, &machine);
+    let mut service_specs = load_config_service_specs()?;
 
     if !allow_actors.is_empty() {
         let allow = allow_actors
@@ -328,11 +414,13 @@ fn load_machine_specs(
             .collect::<HashSet<_>>();
         specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
+    annotate_machine_service_specs(&mut service_specs, &machine);
 
     Ok(MachineSpecs {
         machine,
         providers,
         specs,
+        service_specs,
     })
 }
 
@@ -342,6 +430,14 @@ fn load_config_agent_specs() -> Result<Vec<AgentSpec>> {
         return Ok(Vec::new());
     }
     agent_serve::load_specs(&dir).with_context(|| format!("load AgentSpecs from {}", dir.display()))
+}
+
+fn load_config_service_specs() -> Result<Vec<ServiceSpec>> {
+    let dir = crate::config::service_specs_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    service::load_specs(&dir).with_context(|| format!("load ServiceSpecs from {}", dir.display()))
 }
 
 fn agent_specs_dir() -> PathBuf {
@@ -363,6 +459,28 @@ fn validate_agent_actor_id(actor_id: &str) -> Result<()> {
 fn validate_machine_id(machine_id: &str) -> Result<()> {
     proto::path_component::validate_path_component(machine_id, "machine_id")
         .map_err(|err| anyhow!(err))
+}
+
+fn validate_provider_id_for_path(provider_id: &str) -> Result<()> {
+    proto::path_component::validate_path_component(provider_id, "provider_id")
+        .map_err(|err| anyhow!(err))?;
+    let mut chars = provider_id.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("provider id is required"));
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(anyhow!(
+            "provider id `{provider_id}` must start with a lowercase ascii letter or digit"
+        ));
+    }
+    if chars.any(|ch| {
+        !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.'))
+    }) {
+        return Err(anyhow!(
+            "provider id `{provider_id}` may only contain lowercase ascii letters, digits, `_`, `-`, or `.`"
+        ));
+    }
+    Ok(())
 }
 
 fn load_config_agent_spec(actor_id: &str) -> Result<Option<AgentSpec>> {
@@ -390,8 +508,14 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create agent spec dir {}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(spec)?;
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    // Strip _meta before writing to disk — _meta is runtime-injected daemon
+    // metadata (machineId, workspaceId, etc.) and should not be persisted to
+    // spec.json. Otherwise fingerprint mismatches on reload trigger an infinite
+    // restart loop.
+    let mut clean_spec = spec.clone();
+    clean_spec.actor._meta = None;
+    let text = serde_json::to_string_pretty(&clean_spec)?;
+    atomic_write(&path, &text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -446,8 +570,7 @@ fn agent_spec_from_command(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| description.clone());
+        .map(ToString::to_string);
     let model = command
         .get("model")
         .and_then(Value::as_str)
@@ -466,6 +589,24 @@ fn agent_spec_from_command(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let prompt_assembly = command
+        .get("promptAssembly")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<AgentPromptAssemblySpec>(value.clone())
+                .context("parse promptAssembly")
+        })
+        .transpose()?;
+
+    let env: BTreeMap<String, String> = command
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut meta = BTreeMap::new();
     meta.insert("providerId".into(), json!(provider.id.clone()));
@@ -499,6 +640,7 @@ fn agent_spec_from_command(
             mode: Some("print".into()),
             model: model.clone(),
             reasoning_effort,
+            env,
         },
         autostart: command
             .get("autostart")
@@ -512,6 +654,7 @@ fn agent_spec_from_command(
         memory: None,
         announcement: None,
         trigger: None,
+        prompt_assembly,
         prompt_template: None,
     })
 }
@@ -562,10 +705,8 @@ fn update_agent_spec_from_command(
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         if description.trim().is_empty() {
             meta.remove("description");
-            spec.instructions = None;
         } else {
             meta.insert("description".into(), json!(description));
-            spec.instructions = Some(description);
         }
     }
     if let Some(instructions) = optional_trimmed_str(command, "instructions") {
@@ -615,6 +756,26 @@ fn update_agent_spec_from_command(
             meta.insert("avatarUrl".into(), json!(avatar_url));
         }
     }
+    if let Some(value) = command.get("promptAssembly") {
+        spec.prompt_assembly = if value.is_null() {
+            None
+        } else {
+            Some(
+                serde_json::from_value::<AgentPromptAssemblySpec>(value.clone())
+                    .context("parse promptAssembly")?,
+            )
+        };
+    }
+    if let Some(env_value) = command.get("env") {
+        if env_value.is_null() {
+            spec.provider_ref.env.clear();
+        } else if let Some(obj) = env_value.as_object() {
+            spec.provider_ref.env = obj
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect();
+        }
+    }
     if let Some(provider) = selected_provider {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         meta.insert("providerId".into(), json!(provider.id.clone()));
@@ -651,10 +812,41 @@ fn reconcile_agents(
         .filter(|actor_id| !desired.contains_key(*actor_id))
         .cloned()
         .collect::<Vec<_>>();
+
+    // Collect stale IDs for server-side cleanup before removing them
+    // from the running map, so zombie actors (from a prior daemon restart
+    // with a different machine_id) don't shadow newer agents with the
+    // same display_name.
+    let stale_for_cleanup: Vec<String> = stale.clone();
+    if !stale_for_cleanup.is_empty() {
+        let url = server_url.to_string();
+        tokio::spawn(async move {
+            let client = match crate::client::Client::connect(&url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        "loom-daemon: failed to connect for stale actor cleanup: {e:#}"
+                    );
+                    return;
+                }
+            };
+            for id in &stale_for_cleanup {
+                let params = json!({ "actorId": id });
+                match client
+                    .call_raw(proto::methods::method::ACTOR_DELETE, Some(params))
+                    .await
+                {
+                    Ok(_) => tracing::info!("[{id}] cleaned up stale actor on server"),
+                    Err(e) => tracing::warn!("[{id}] failed to clean up stale actor: {e:#}"),
+                }
+            }
+        });
+    }
+
     for actor_id in stale {
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();
-            eprintln!("[{actor_id}] stopped: removed from machine config");
+            tracing::info!("[{actor_id}] stopped: removed from machine config");
         }
     }
 
@@ -668,9 +860,9 @@ fn reconcile_agents(
         }
         if let Some(agent) = running.remove(&actor_id) {
             agent.handle.abort();
-            eprintln!("[{actor_id}] restarting: machine config changed");
+            tracing::info!("[{actor_id}] restarting: machine config changed");
         } else {
-            eprintln!("[{actor_id}] starting from machine config");
+            tracing::info!("[{actor_id}] starting from machine config");
         }
         let handle =
             agent_serve::spawn_agent_worker_loop(spec, server_url.to_string(), data_root.clone());
@@ -685,10 +877,29 @@ fn reconcile_agents(
 }
 
 fn spec_fingerprint(spec: &AgentSpec) -> String {
-    serde_json::to_string(spec).unwrap_or_else(|_| format!("{spec:?}"))
+    // Exclude _meta from the fingerprint because it is runtime-injected metadata
+    // and should not be treated as a "config change". Otherwise server-initiated
+    // agent.update commands overwrite the on-disk spec.json (including _meta),
+    // causing every reload to detect a change → infinite restart loop.
+    let mut spec_without_meta = spec.clone();
+    spec_without_meta.actor._meta = None;
+    serde_json::to_string(&spec_without_meta).unwrap_or_else(|_| format!("{spec:?}"))
 }
 
 fn annotate_machine_agent_specs(specs: &mut [AgentSpec], machine: &MachineConfig) {
+    for spec in specs {
+        let meta = spec.actor._meta.get_or_insert_with(Default::default);
+        meta.insert("machineId".into(), json!(machine.id.clone()));
+        if let Some(workspace_id) = machine.workspace_id.as_deref() {
+            meta.insert("workspaceId".into(), json!(workspace_id));
+        }
+        if let Some(owner_actor_id) = machine.owner_actor_id.as_deref() {
+            meta.insert("ownerActorId".into(), json!(owner_actor_id));
+        }
+    }
+}
+
+fn annotate_machine_service_specs(specs: &mut [ServiceSpec], machine: &MachineConfig) {
     for spec in specs {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         meta.insert("machineId".into(), json!(machine.id.clone()));
@@ -708,7 +919,7 @@ fn spawn_service_host(
 ) {
     tokio::spawn(async move {
         if let Err(e) = service::serve(services_dir, server_url, allow_services).await {
-            eprintln!("loom-daemon: service host exited with error: {e:#}");
+            tracing::error!("loom-daemon: service host exited with error: {e:#}");
         }
     });
 }
@@ -854,6 +1065,34 @@ fn apply_machine_command(
             }
             Err(anyhow!("daemon-configured agent not found: {actor_id}"))
         }
+        "agent.prompt.preview" => {
+            let actor_id = required_str(command, "actorId")?;
+            let spec = load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            render_agent_prompt_preview(&spec, command, &data_root)
+        }
+        "agent.file.list" => {
+            let actor_id = required_str(command, "actorId")?;
+            load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            list_agent_files(actor_id, command, &data_root)
+        }
+        "agent.file.read" => {
+            let actor_id = required_str(command, "actorId")?;
+            load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            read_agent_file(actor_id, command, &data_root)
+        }
+        "agent.file.write" => {
+            let actor_id = required_str(command, "actorId")?;
+            load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let data_root = machine_data_root(selected_machine);
+            write_agent_file(actor_id, command, &data_root)
+        }
         "provider.add" => {
             let manifest_value = command
                 .get("manifest")
@@ -937,12 +1176,13 @@ fn write_local_provider_manifest(
         ));
     }
     let text = serde_json::to_string_pretty(raw).context("serialize provider manifest")?;
-    std::fs::write(&path, text)
+    atomic_write(&path, &text)
         .with_context(|| format!("write provider manifest {}", path.display()))?;
     Ok(path)
 }
 
 fn remove_local_provider_manifest(provider_id: &str) -> Result<PathBuf> {
+    validate_provider_id_for_path(provider_id)?;
     if builtin_provider_manifests()
         .iter()
         .any(|builtin| builtin.id == provider_id)
@@ -961,6 +1201,759 @@ fn remove_local_provider_manifest(provider_id: &str) -> Result<PathBuf> {
     std::fs::remove_file(&path)
         .with_context(|| format!("remove provider manifest {}", path.display()))?;
     Ok(path)
+}
+
+const AGENT_FILE_MAX_BYTES: u64 = 128 * 1024;
+
+fn render_agent_prompt_preview(
+    spec: &AgentSpec,
+    command: &Value,
+    data_root: &Path,
+) -> Result<Value> {
+    let scope = command.get("scope").cloned().unwrap_or_else(|| {
+        json!({
+            "kind": "channel",
+            "id": command
+                .get("channelId")
+                .and_then(Value::as_str)
+                .unwrap_or("preview")
+        })
+    });
+    let sample_message = command
+        .get("sampleMessage")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let assembly_value = if let Some(value) = command.get("promptAssembly") {
+        if value.is_null() {
+            None
+        } else {
+            Some(value.clone())
+        }
+    } else {
+        spec.prompt_assembly
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .context("serialize agent promptAssembly")?
+    };
+    let assembly = assembly_value.as_ref();
+    let mut warnings = Vec::<String>::new();
+    let mut parts = default_prompt_preview_parts(spec, &scope, sample_message, data_root);
+    parts.extend(load_prompt_assembly_files(
+        &spec.actor.id,
+        assembly,
+        command,
+        data_root,
+        &mut warnings,
+    )?);
+    let outputs = render_prompt_assembly_outputs(assembly, &parts, &mut warnings);
+    let bindings = provider_prompt_bindings(spec)?;
+    Ok(json!({
+        "actorId": spec.actor.id,
+        "scope": scope,
+        "parts": parts,
+        "outputs": outputs,
+        "bindings": bindings,
+        "warnings": warnings,
+    }))
+}
+
+fn default_prompt_preview_parts(
+    spec: &AgentSpec,
+    scope: &Value,
+    sample_message: &str,
+    data_root: &Path,
+) -> Vec<Value> {
+    let mut parts = Vec::new();
+    parts.push(prompt_preview_part(
+        "actor_context",
+        "Actor context",
+        "builtin",
+        format!("Actor: {} ({})", spec.actor.display_name, spec.actor.id),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "agent_instructions",
+        "Agent instructions",
+        "agentSpec.instructions",
+        spec.instructions.clone().unwrap_or_default(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "bootstrap_memory",
+        "Bootstrap memory",
+        "memory",
+        String::new(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "turn_memory",
+        "Turn memory",
+        "memory",
+        String::new(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "scope_bootstrap",
+        "Scope bootstrap",
+        "builtin",
+        format!(
+            "Scope: {} {}",
+            scope
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("channel"),
+            scope.get("id").and_then(Value::as_str).unwrap_or("preview")
+        ),
+        false,
+    ));
+    let profile_prompt_files =
+        profile_prompt_files_preview_content(&spec.actor.id, data_root).unwrap_or_default();
+    parts.push(prompt_preview_part(
+        "profile_prompt_files",
+        "Profile prompt files",
+        "profile:prompts",
+        profile_prompt_files,
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "runtime_context",
+        "Runtime context",
+        "builtin",
+        format!(
+            "Scope: {} {}",
+            scope
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("channel"),
+            scope.get("id").and_then(Value::as_str).unwrap_or("preview")
+        ),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "assignment_context",
+        "Assignment context",
+        "sample",
+        String::new(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "user_message",
+        "User message",
+        "sampleMessage",
+        sample_message.to_string(),
+        false,
+    ));
+    parts.push(prompt_preview_part(
+        "latest_message",
+        "Latest message",
+        "sampleMessage",
+        sample_message.to_string(),
+        false,
+    ));
+    parts
+}
+
+fn profile_prompt_files_preview_content(actor_id: &str, data_root: &Path) -> Result<String> {
+    let profile_root = agent_file_root(actor_id, "profile", &Value::Null, data_root)?;
+    let prompts_dir = profile_root.join("prompts");
+    let metadata = match std::fs::symlink_metadata(&prompts_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(err) => return Err(anyhow!("read metadata {}: {err}", prompts_dir.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(String::new());
+    }
+    let mut file_names = Vec::new();
+    for entry in std::fs::read_dir(&prompts_dir)
+        .with_context(|| format!("read {}", prompts_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().trim().to_string();
+        if !file_name.is_empty() {
+            file_names.push(file_name);
+        }
+    }
+    file_names.sort();
+    let sections = file_names
+        .into_iter()
+        .filter_map(|file_name| {
+            let relative = Path::new("prompts").join(&file_name);
+            match read_safe_text_file(&profile_root, &relative, AGENT_FILE_MAX_BYTES) {
+                Ok(content) => {
+                    let content = content.trim_end_matches(['\r', '\n']);
+                    if content.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!("=== Profile prompt: {file_name} ===\n{content}"))
+                    }
+                }
+                Err(_) => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(sections.join("\n\n"))
+}
+
+fn prompt_preview_part(
+    key: &str,
+    title: &str,
+    source: &str,
+    content: String,
+    missing: bool,
+) -> Value {
+    json!({
+        "key": key,
+        "title": title,
+        "source": source,
+        "bytes": content.len(),
+        "empty": content.trim().is_empty(),
+        "missing": missing,
+        "content": content,
+    })
+}
+
+fn load_prompt_assembly_files(
+    actor_id: &str,
+    assembly: Option<&Value>,
+    command: &Value,
+    data_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Value>> {
+    let Some(files) = assembly
+        .and_then(|value| value.get("files"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut parts = Vec::new();
+    for file in files {
+        let key = file
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("promptAssembly.files[].key is required"))?;
+        let root = file
+            .get("root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("profile");
+        let path = file
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("promptAssembly.files[].path is required"))?;
+        let optional = file
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let max_bytes = file
+            .get("maxBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(AGENT_FILE_MAX_BYTES)
+            .min(AGENT_FILE_MAX_BYTES);
+        let root_dir = agent_file_root(actor_id, root, command, data_root)?;
+        let relative = validated_relative_path(path, "path")?;
+        let source = format!("{root}:{}", relative.display());
+        match read_safe_text_file(&root_dir, &relative, max_bytes) {
+            Ok(content) => {
+                parts.push(prompt_preview_part(
+                    &format!("file.{key}"),
+                    file.get("title").and_then(Value::as_str).unwrap_or(key),
+                    &source,
+                    content,
+                    false,
+                ));
+            }
+            Err(err) if optional => {
+                let _ = err;
+                warnings.push(format!(
+                    "optional prompt file `{source}` is missing or unreadable"
+                ));
+                parts.push(prompt_preview_part(
+                    &format!("file.{key}"),
+                    file.get("title").and_then(Value::as_str).unwrap_or(key),
+                    &source,
+                    String::new(),
+                    true,
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(parts)
+}
+
+fn render_prompt_assembly_outputs(
+    assembly: Option<&Value>,
+    parts: &[Value],
+    warnings: &mut Vec<String>,
+) -> Value {
+    let mut part_map = parts
+        .iter()
+        .filter_map(|part| {
+            Some((
+                part.get("key")?.as_str()?.to_string(),
+                part.get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some(vars) = assembly
+        .and_then(|value| value.get("vars"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in vars {
+            if let Some(value) = value.as_str() {
+                part_map.insert(format!("var.{key}"), value.to_string());
+            }
+        }
+    }
+    let outputs = assembly
+        .and_then(|value| value.get("outputs"))
+        .and_then(Value::as_object);
+    let system = outputs
+        .and_then(|outputs| outputs.get("system"))
+        .map(|spec| render_prompt_output_preview(spec, &part_map, warnings))
+        .unwrap_or_else(|| {
+            join_prompt_preview_parts(
+                &part_map,
+                &[
+                    "actor_context",
+                    "agent_instructions",
+                    "bootstrap_memory",
+                    "scope_bootstrap",
+                    "profile_prompt_files",
+                ],
+                "\n\n",
+                warnings,
+            )
+        });
+    let user = outputs
+        .and_then(|outputs| outputs.get("user"))
+        .map(|spec| render_prompt_output_preview(spec, &part_map, warnings))
+        .unwrap_or_else(|| {
+            join_prompt_preview_parts(
+                &part_map,
+                &[
+                    "turn_memory",
+                    "runtime_context",
+                    "assignment_context",
+                    "user_message",
+                ],
+                "\n\n",
+                warnings,
+            )
+        });
+    let full = outputs
+        .and_then(|outputs| outputs.get("full"))
+        .map(|spec| {
+            let mut prompt_map = part_map.clone();
+            prompt_map.insert("prompt.system".into(), system.clone());
+            prompt_map.insert("prompt.user".into(), user.clone());
+            render_prompt_output_preview(spec, &prompt_map, warnings)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| join_non_empty([system.as_str(), user.as_str()], "\n\n"));
+    json!({
+        "system": system,
+        "user": user,
+        "full": full,
+    })
+}
+
+fn render_prompt_output_preview(
+    spec: &Value,
+    parts: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> String {
+    if let Some(template) = spec.get("template").and_then(Value::as_str) {
+        return render_prompt_template_preview(template, parts, warnings);
+    }
+    let join = spec.get("join").and_then(Value::as_str).unwrap_or("\n\n");
+    let include = prompt_output_preview_include(spec, warnings);
+    join_prompt_preview_parts(
+        parts,
+        &include.iter().map(String::as_str).collect::<Vec<_>>(),
+        join,
+        warnings,
+    )
+}
+
+fn prompt_output_preview_include(spec: &Value, warnings: &mut Vec<String>) -> Vec<String> {
+    if let Some(items) = spec.get("include").and_then(Value::as_array) {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+    }
+    match spec.get("preset").and_then(Value::as_str) {
+        Some("loom_system") => [
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+            "profile_prompt_files",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        Some("loom_turn") => [
+            "turn_memory",
+            "runtime_context",
+            "assignment_context",
+            "user_message",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        Some("loom_full") => [
+            "actor_context",
+            "agent_instructions",
+            "bootstrap_memory",
+            "scope_bootstrap",
+            "profile_prompt_files",
+            "turn_memory",
+            "runtime_context",
+            "assignment_context",
+            "user_message",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect(),
+        Some(other) => {
+            warnings.push(format!("unknown prompt preset `{other}`"));
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+fn render_prompt_template_preview(
+    template: &str,
+    parts: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> String {
+    let mut out = template.to_string();
+    for key in template_placeholders(template) {
+        if let Some(value) = parts.get(&key) {
+            out = out.replace(&format!("{{{key}}}"), value);
+        } else {
+            warnings.push(format!("unknown prompt template variable `{key}`"));
+            out = out.replace(&format!("{{{key}}}"), "");
+        }
+    }
+    out
+}
+
+fn template_placeholders(value: &str) -> impl Iterator<Item = String> + '_ {
+    let mut rest = value;
+    std::iter::from_fn(move || loop {
+        let start = rest.find('{')?;
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('}') else {
+            rest = "";
+            return None;
+        };
+        let key = &after_open[..end];
+        rest = &after_open[end + 1..];
+        if !key.trim().is_empty() {
+            return Some(key.to_string());
+        }
+    })
+}
+
+fn join_prompt_preview_parts(
+    parts: &BTreeMap<String, String>,
+    include: &[&str],
+    join: &str,
+    warnings: &mut Vec<String>,
+) -> String {
+    let mut values = Vec::new();
+    for key in include {
+        match parts.get(*key) {
+            Some(value) if !value.trim().is_empty() => values.push(value.as_str()),
+            Some(_) => {}
+            None => warnings.push(format!("unknown prompt part `{key}`")),
+        }
+    }
+    join_non_empty(values, join)
+}
+
+fn join_non_empty<'a>(values: impl IntoIterator<Item = &'a str>, join: &str) -> String {
+    values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(join)
+}
+
+fn provider_prompt_bindings(spec: &AgentSpec) -> Result<Value> {
+    let registry = ProviderRegistry::load(&config::config_dir()).map_err(|err| anyhow!(err))?;
+    let transport = registry
+        .resolve_transport(&spec.provider_ref)
+        .map_err(|err| anyhow!(err))?;
+    let mut refs = BTreeMap::<String, Vec<String>>::new();
+    refs.insert(
+        "args".into(),
+        transport
+            .args
+            .iter()
+            .flat_map(|value| prompt_binding_refs(value))
+            .collect(),
+    );
+    refs.insert(
+        "env".into(),
+        transport
+            .env
+            .values()
+            .flat_map(|value| prompt_binding_refs(value))
+            .collect(),
+    );
+    refs.insert(
+        "stdin".into(),
+        transport
+            .stdin
+            .as_deref()
+            .into_iter()
+            .flat_map(prompt_binding_refs)
+            .collect(),
+    );
+    Ok(json!({
+        "providerId": spec.provider_ref.id,
+        "mode": spec.provider_ref.mode,
+        "transport": transport.kind,
+        "promptRefs": refs,
+    }))
+}
+
+fn prompt_binding_refs(value: &str) -> Vec<String> {
+    template_placeholders(value)
+        .filter(|key| key == "prompt" || key.starts_with("prompt."))
+        .collect()
+}
+
+fn list_agent_files(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
+    let root_name = required_str(command, "root")?;
+    let root = agent_file_root(actor_id, root_name, command, data_root)?;
+    let prefix = command
+        .get("prefix")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let prefix = validated_relative_path(prefix, "prefix")?;
+    let dir = root.join(&prefix);
+    let mut files = Vec::new();
+    if dir.exists() {
+        let dir_metadata = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("read metadata {}", dir.display()))?;
+        if dir_metadata.file_type().is_symlink() {
+            return Err(anyhow!("{} must not be a symlink", dir.display()));
+        }
+        if !dir_metadata.is_dir() {
+            return Err(anyhow!("{} is not a directory", dir.display()));
+        }
+        ensure_inside_root(&root, &dir)?;
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("read metadata {}", path.display()))?;
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            files.push(json!({
+                "path": relative,
+                "bytes": metadata.len(),
+                "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+            }));
+        }
+    }
+    files.sort_by(|a, b| {
+        a.get("path")
+            .and_then(Value::as_str)
+            .cmp(&b.get("path").and_then(Value::as_str))
+    });
+    Ok(json!({ "root": root_name, "prefix": prefix.display().to_string(), "files": files }))
+}
+
+fn read_agent_file(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
+    let root_name = required_str(command, "root")?;
+    let root = agent_file_root(actor_id, root_name, command, data_root)?;
+    let path = validated_relative_path(required_str(command, "path")?, "path")?;
+    let max_bytes = command
+        .get("maxBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(AGENT_FILE_MAX_BYTES)
+        .min(AGENT_FILE_MAX_BYTES);
+    let content = read_safe_text_file(&root, &path, max_bytes)?;
+    Ok(json!({
+        "root": root_name,
+        "path": path.display().to_string(),
+        "content": content,
+    }))
+}
+
+fn write_agent_file(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
+    let root_name = required_str(command, "root")?;
+    let root = agent_file_root(actor_id, root_name, command, data_root)?;
+    let path = validated_relative_path(required_str(command, "path")?, "path")?;
+    let content = command
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("content is required"))?;
+    if content.len() as u64 > AGENT_FILE_MAX_BYTES {
+        return Err(anyhow!(
+            "content is {} bytes, above maxBytes {}",
+            content.len(),
+            AGENT_FILE_MAX_BYTES
+        ));
+    }
+    write_safe_text_file(&root, &path, content)?;
+    Ok(json!({
+        "root": root_name,
+        "path": path.display().to_string(),
+        "bytes": content.len(),
+    }))
+}
+
+fn agent_file_root(
+    actor_id: &str,
+    root: &str,
+    command: &Value,
+    data_root: &Path,
+) -> Result<PathBuf> {
+    validate_agent_actor_id(actor_id)?;
+    match root {
+        "profile" => Ok(data_root.join("agents").join(actor_id).join("profile")),
+        "scopeWorkspace" | "scope-workspace" => {
+            let channel_id = command
+                .get("channelId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    command
+                        .get("scope")
+                        .and_then(|scope| scope.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("channelId is required for scopeWorkspace files"))?;
+            proto::path_component::validate_path_component(channel_id, "channel_id")
+                .map_err(|err| anyhow!(err))?;
+            Ok(data_root
+                .join("channels")
+                .join(channel_id)
+                .join("agents")
+                .join(actor_id)
+                .join("workspace"))
+        }
+        other => Err(anyhow!("unsupported agent file root `{other}`")),
+    }
+}
+
+fn validated_relative_path(value: &str, field: &str) -> Result<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(anyhow!("{field} must be relative"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "{field} must not contain parent or root components"
+                ));
+            }
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn read_safe_text_file(root: &Path, relative: &Path, max_bytes: u64) -> Result<String> {
+    let path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("read metadata {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("{} must not be a symlink", path.display()));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(anyhow!(
+            "{} is {} bytes, above maxBytes {}",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        ));
+    }
+    ensure_inside_root(root, &path)?;
+    std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+}
+
+fn write_safe_text_file(root: &Path, relative: &Path, content: &str) -> Result<()> {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("read metadata {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!("{} must not be a symlink", path.display()));
+        }
+    }
+    ensure_inside_root(root, path.parent().unwrap_or(root))?;
+    std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+}
+
+fn ensure_inside_root(root: &Path, path: &Path) -> Result<()> {
+    let root = if root.exists() {
+        std::fs::canonicalize(root).with_context(|| format!("resolve {}", root.display()))?
+    } else {
+        root.to_path_buf()
+    };
+    let path = if path.exists() {
+        std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    if !path.starts_with(&root) {
+        return Err(anyhow!(
+            "{} resolves outside {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn system_time_rfc3339(time: std::time::SystemTime) -> Option<String> {
+    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+    Some(datetime.to_rfc3339())
 }
 
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -1028,6 +2021,7 @@ fn machine_inventory_meta(
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
     specs: &[AgentSpec],
+    service_specs: &[ServiceSpec],
     revision: u64,
 ) -> serde_json::Value {
     json!({
@@ -1047,13 +2041,20 @@ fn machine_inventory_meta(
             "inventory.read",
             "connection.status",
             "machine.command",
+            "machine.remove",
             "agent.create",
+            "agent.update",
             "agent.remove",
+            "agent.prompt.preview",
+            "agent.file.list",
+            "agent.file.read",
+            "agent.file.write",
             "provider.add",
             "provider.remove"
         ],
         "providers": providers,
         "agentSpecs": specs,
+        "serviceSpecs": service_specs,
     })
 }
 
@@ -1062,6 +2063,7 @@ fn machine_inventory_fingerprint(
     data_root: &PathBuf,
     providers: &[DetectedAgentProvider],
     specs: &[AgentSpec],
+    service_specs: &[ServiceSpec],
 ) -> String {
     serde_json::to_string(&json!({
         "machineId": &machine.id,
@@ -1073,6 +2075,7 @@ fn machine_inventory_fingerprint(
         "configDir": config::config_dir().display().to_string(),
         "providers": providers,
         "agentSpecs": specs,
+        "serviceSpecs": service_specs,
     }))
     .unwrap_or_default()
 }
@@ -1097,7 +2100,24 @@ fn save_daemon_config(cfg: &DaemonConfig) -> Result<()> {
             .with_context(|| format!("create config dir {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(cfg)?;
-    std::fs::write(&path, text).with_context(|| format!("write daemon config {}", path.display()))
+    atomic_write(&path, &text).with_context(|| format!("write daemon config {}", path.display()))
+}
+
+/// Write `content` to `path` atomically: write to a temporary file first,
+/// then rename it into place.  This prevents config corruption if the
+/// process crashes mid-write.
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp_path, content)?;
+    // On Windows, `rename` over an existing file fails with `PermissionDenied`
+    // if anything holds the destination open (AV, search indexer, the daemon
+    // re-reading config). Best-effort: remove the orphaned temp file so a flaky
+    // rename under contention does not leak a UUID-named temp file per reload.
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn daemon_config_path() -> PathBuf {
@@ -1105,16 +2125,69 @@ fn daemon_config_path() -> PathBuf {
 }
 
 fn resolve_daemon_server_url(cfg: &mut DaemonConfig, server_url: Option<&str>) -> (String, bool) {
-    let selected = server_url
+    let raw = server_url
         .and_then(trimmed_non_empty)
         .or_else(|| trimmed_non_empty(&cfg.server_url))
         .unwrap_or("ws://127.0.0.1:7878/rpc")
         .to_string();
+    let selected = normalize_daemon_server_url(&raw);
     let changed = cfg.server_url != selected;
     if changed {
         cfg.server_url = selected.clone();
     }
+    tracing::info!(
+        raw = %raw,
+        normalized = %selected,
+        "daemon server URL resolved"
+    );
     (selected, changed)
+}
+
+/// Normalize a daemon server URL so that a WebSocket connection to the
+/// server always succeeds regardless of how the URL was persisted.
+///
+/// - Forces `ws://` scheme (replaces `http://`).
+/// - Appends `/rpc` path when missing so the server can upgrade the
+///   connection to WebSocket (the server only upgrades on `/rpc`).
+fn normalize_daemon_server_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "ws://127.0.0.1:7878/rpc".to_string();
+    }
+
+    // Parse the URL, defaulting to ws:// scheme if missing.
+    let (scheme, rest) = if let Some(idx) = trimmed.find("://") {
+        let scheme = &trimmed[..idx];
+        let rest = &trimmed[idx + 3..];
+        (scheme, rest)
+    } else {
+        ("ws", trimmed)
+    };
+
+    // Force ws:// scheme — http:// cannot be upgraded to WebSocket by
+    // tokio_tungstenite and the server only upgrades on the /rpc route.
+    let scheme = if scheme.eq_ignore_ascii_case("wss") {
+        "wss"
+    } else {
+        "ws"
+    };
+
+    // Split host:port from path.
+    let (authority, path) = if let Some(idx) = rest.find('/') {
+        (&rest[..idx], &rest[idx..])
+    } else {
+        (rest, "/")
+    };
+
+    // Ensure path contains /rpc so the server recognises the WebSocket
+    // upgrade route.
+    let path = if path.contains("/rpc") {
+        path.to_string()
+    } else {
+        format!("/rpc{}", path.trim_end_matches('/'))
+    };
+
+    format!("{}://{}{}", scheme, authority.trim_end_matches('/'), path)
 }
 
 fn select_machine_for_daemon(
@@ -1135,7 +2208,10 @@ fn select_machine_for_daemon(
         .as_deref()
         .map(parse_machine_data_root_context)
         .unwrap_or_default();
-    let requested_id = requested.clone().unwrap_or_else(|| "local".into());
+    let requested_id = requested
+        .clone()
+        .or_else(|| cfg.machine.as_ref().map(|m| m.id.clone()))
+        .unwrap_or_else(|| "local".into());
     let mut machine = cfg.machine.clone().unwrap_or_else(|| MachineConfig {
         workspace_id: context.workspace_id.clone(),
         owner_actor_id: context.owner_actor_id.clone(),
@@ -1304,10 +2380,23 @@ fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineC
 }
 
 fn machine_data_root(machine: &MachineConfig) -> PathBuf {
-    if machine.data_root.trim().is_empty() {
+    let raw = if machine.data_root.trim().is_empty() {
         expand_home(&default_agent_data_root_expr())
     } else {
         expand_home(&machine.data_root)
+    };
+    // Always resolve to an absolute path — relative paths break UNC prefixing
+    // in create_dir_all_unc, causing "os error 3" on agent directory creation.
+    abs_path(raw)
+}
+
+fn abs_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 
@@ -1363,6 +2452,7 @@ fn trimmed_non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn machine(id: &str, owner: Option<&str>) -> MachineConfig {
         MachineConfig {
@@ -1373,6 +2463,14 @@ mod tests {
             kind: default_machine_kind(),
             data_root: String::new(),
         }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("loom-daemon-{name}-{nanos}"))
     }
 
     #[test]
@@ -1461,6 +2559,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: Some("gpt-5.5".into()),
                 reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
             },
             autostart: false,
             models: Some(AgentModelSpec {
@@ -1471,6 +2570,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         }];
         let machine = machine("machine_2eabfd47", Some("actor_human_88084"));
@@ -1502,7 +2602,8 @@ mod tests {
                 "providerId": "claude",
                 "actorId": "actor_agent_writer",
                 "name": "Writer",
-                "description": "Writes concise updates",
+                "description": "Concise writing agent",
+                "instructions": "Writes concise updates",
                 "model": "opus",
                 "reasoningEffort": "high",
                 "autostart": true
@@ -1541,6 +2642,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: false,
             models: None,
@@ -1548,9 +2650,112 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         };
         assert!(write_config_agent_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn provider_remove_rejects_unsafe_provider_ids() {
+        for provider_id in [
+            "../daemon",
+            "provider/slash",
+            ".hidden",
+            "foo..bar",
+            "Claude",
+        ] {
+            assert!(
+                validate_provider_id_for_path(provider_id).is_err(),
+                "{provider_id}"
+            );
+        }
+
+        assert!(validate_provider_id_for_path("claude.local").is_ok());
+        assert!(validate_provider_id_for_path("my-provider_1").is_ok());
+    }
+
+    #[test]
+    fn prompt_preview_understands_profile_prompt_files_variable() {
+        let parts = vec![prompt_preview_part(
+            "profile_prompt_files",
+            "Profile prompt files",
+            "profile:prompts",
+            "Profile prompt content".into(),
+            false,
+        )];
+        let assembly = json!({
+            "outputs": {
+                "system": { "template": "{profile_prompt_files}" },
+                "user": { "template": "" },
+                "full": { "include": ["prompt.system", "prompt.user"] }
+            }
+        });
+        let mut warnings = Vec::new();
+
+        let outputs = render_prompt_assembly_outputs(Some(&assembly), &parts, &mut warnings);
+
+        assert_eq!(outputs["system"], json!("Profile prompt content"));
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("profile_prompt_files")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_preview_understands_prompt_assembly_vars() {
+        let assembly = json!({
+            "vars": {
+                "style": "concise"
+            },
+            "outputs": {
+                "system": { "template": "{var.style}" },
+                "user": { "template": "" },
+                "full": { "include": ["prompt.system", "prompt.user"] }
+            }
+        });
+        let mut warnings = Vec::new();
+
+        let outputs = render_prompt_assembly_outputs(Some(&assembly), &[], &mut warnings);
+
+        assert_eq!(outputs["system"], json!("concise"));
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("var.style")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_preview_warning_redacts_absolute_prompt_file_path() {
+        let data_root = temp_path("prompt-preview-redaction");
+        let actor_id = "actor_agent_demo";
+        let command = json!({});
+        let assembly = json!({
+            "files": [{
+                "key": "persona",
+                "root": "profile",
+                "path": "prompts/persona.md",
+                "optional": true
+            }]
+        });
+        let mut warnings = Vec::new();
+
+        let parts = load_prompt_assembly_files(
+            actor_id,
+            Some(&assembly),
+            &command,
+            &data_root,
+            &mut warnings,
+        )
+        .expect("load prompt assembly files");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["source"], json!("profile:prompts/persona.md"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("profile:prompts/persona.md"));
+        assert!(!warnings[0].contains(&data_root.display().to_string()));
     }
 
     #[test]
@@ -1582,6 +2787,7 @@ mod tests {
                 mode: Some("print".into()),
                 model: None,
                 reasoning_effort: None,
+                ..Default::default()
             },
             autostart: true,
             models: None,
@@ -1589,12 +2795,19 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            prompt_assembly: None,
             prompt_template: None,
         };
         annotate_machine_agent_specs(std::slice::from_mut(&mut spec), &machine);
 
-        let meta =
-            machine_inventory_meta(&machine, &PathBuf::from("/tmp/loom-data"), &[], &[spec], 7);
+        let meta = machine_inventory_meta(
+            &machine,
+            &PathBuf::from("/tmp/loom-data"),
+            &[],
+            &[spec],
+            &[],
+            7,
+        );
 
         assert!(meta.get("agents").is_none());
         let capabilities = meta

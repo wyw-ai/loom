@@ -2,7 +2,12 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
+  AgentFileListResult,
+  AgentFileReadResult,
+  AgentFileRoot,
+  AgentFileWriteResult,
   AgentInfo,
+  AgentPromptPreviewResult,
   Actor,
   AudienceRef,
   Artifact,
@@ -26,6 +31,15 @@ import type {
 } from "./types";
 
 export type LoginProvider = "google" | "github";
+export type AccountLoginProviderStatus = {
+  provider: LoginProvider;
+  displayName: string;
+  available: boolean;
+  missingEnv?: string | null;
+};
+export type AccountAuthStatus = {
+  providers: AccountLoginProviderStatus[];
+};
 
 function hasTauriRuntime() {
   return (
@@ -77,6 +91,10 @@ export async function setActiveWorkspace(id: string): Promise<DesktopConfig> {
 
 export async function accountGet(): Promise<HumanAccount | null> {
   return invoke("account_get");
+}
+
+export async function accountAuthStatus(): Promise<AccountAuthStatus> {
+  return invoke("account_auth_status");
 }
 
 export async function accountLogin(provider: LoginProvider): Promise<{
@@ -356,10 +374,13 @@ export async function machineAgentCreate(args: {
   actorId?: string;
   name: string;
   description?: string;
+  instructions?: string;
+  promptAssembly?: Record<string, unknown>;
   model?: string;
   reasoningEffort?: string;
   autostart?: boolean;
   avatarUrl?: string;
+  env?: Record<string, string>;
 }): Promise<MachineListResult> {
   return invoke("machine_agent_create", { args });
 }
@@ -369,13 +390,77 @@ export async function agentUpdate(args: {
   actorId: string;
   displayName?: string;
   description?: string;
+  instructions?: string;
+  promptAssembly?: Record<string, unknown> | null;
   providerId?: string;
   model?: string;
   reasoningEffort?: string;
   autostart?: boolean;
   avatarUrl?: string;
+  env?: Record<string, string>;
 }): Promise<AgentInfo> {
   return invoke("agent_update", { args });
+}
+
+export async function agentPromptPreview(args: {
+  machineId: string;
+  actorId: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+  sampleMessage?: string;
+  promptAssembly?: Record<string, unknown>;
+}): Promise<AgentPromptPreviewResult> {
+  return invoke("agent_prompt_preview", { args });
+}
+
+export async function agentFileList(args: {
+  machineId: string;
+  actorId: string;
+  root: AgentFileRoot;
+  prefix?: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+}): Promise<AgentFileListResult> {
+  return invoke("agent_file_list", { args });
+}
+
+export async function agentFileRead(args: {
+  machineId: string;
+  actorId: string;
+  root: AgentFileRoot;
+  path: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+  maxBytes?: number;
+}): Promise<AgentFileReadResult> {
+  return invoke("agent_file_read", { args });
+}
+
+export async function agentFileWrite(args: {
+  machineId: string;
+  actorId: string;
+  root: AgentFileRoot;
+  path: string;
+  content: string;
+  channelId?: string;
+  scope?: Record<string, unknown>;
+}): Promise<AgentFileWriteResult> {
+  return invoke("agent_file_write", { args });
+}
+
+export async function providerAdd(args: {
+  machineId: string;
+  manifest: Record<string, unknown>;
+  replace?: boolean;
+}): Promise<unknown> {
+  return invoke("provider_add", { args });
+}
+
+export async function providerRemove(args: {
+  machineId: string;
+  providerId: string;
+}): Promise<unknown> {
+  return invoke("provider_remove", { args });
 }
 
 export async function machineAgentRemove(params: {

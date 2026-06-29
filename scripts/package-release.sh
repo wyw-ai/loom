@@ -10,34 +10,22 @@ PNPM="${PNPM:-pnpm}"
 LINUX_BUILDER="${LINUX_BUILDER:-$CARGO}"
 DIST_DIR="${DIST_DIR:-dist}"
 PACKAGE_OUT_DIR="${PACKAGE_OUT_DIR:-$DIST_DIR/packages}"
-OSS_BASE_URL="${OSS_BASE_URL:-https://pre-ai.aone.alibaba-inc.com}"
-OSS_GROUP="${OSS_GROUP:-}"
 DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
-PORTAL_DOWNLOAD_BASE_URL="${PORTAL_DOWNLOAD_BASE_URL:-}"
-PORTAL_RELEASE_DATA="${PORTAL_RELEASE_DATA:-pages/portal/release-downloads.js}"
 PROFILE="release"
 SKIP_BUILD=0
 SKIP_GUI=0
-SKIP_UPLOAD=1
-WRITE_RELEASE_DATA=0
 
 usage() {
   cat <<'EOF'
 Usage: scripts/package-release.sh [options]
 
-Build and package Loom release artifacts in one command.
+Build and package Loom release artifacts into a local directory.
 
 Options:
   --skip-build       Package existing dist/release binaries without rebuilding.
   --skip-gui         Do not build/copy the macOS arm64 GUI dmg.
-  --upload, --publish Upload release artifacts to pre-ai grouped storage and refresh portal release data.
-  --skip-upload      Do not upload release artifacts. This is the default.
-  --write-release-data
-                      Write portal release data using DOWNLOAD_BASE_URL-derived URLs.
   --dist-dir DIR     Source dist directory. Defaults to $DIST_DIR or dist.
   --out-dir DIR      Package output directory. Defaults to $PACKAGE_OUT_DIR or dist/packages.
-  --oss-base-url URL OSS manager origin. Defaults to $OSS_BASE_URL or pre-ai.
-  --oss-group GROUP  OSS group. Defaults to loom-releases-<version>-<git-sha>.
   -h, --help         Show this help.
 
 Environment:
@@ -47,12 +35,7 @@ Environment:
   LINUX_BUILDER      Builder for Linux Rust targets. Defaults to $CARGO.
   DIST_DIR           Dist directory. Defaults to dist.
   PACKAGE_OUT_DIR    Package output directory. Defaults to dist/packages.
-  OSS_BASE_URL       pre-ai grouped upload origin.
-  OSS_GROUP          OSS grouped upload path.
-  DOWNLOAD_BASE_URL  Public artifact URL prefix used by --write-release-data and install.sh.
-  PORTAL_DOWNLOAD_BASE_URL
-                      Public artifact URL prefix used only by --write-release-data.
-  PORTAL_RELEASE_DATA Portal release data JS path.
+  DOWNLOAD_BASE_URL  Optional release URL embedded into install.sh for remote downloads.
 EOF
 }
 
@@ -66,32 +49,12 @@ while [[ $# -gt 0 ]]; do
       SKIP_GUI=1
       shift
       ;;
-    --skip-upload)
-      SKIP_UPLOAD=1
-      shift
-      ;;
-    --upload | --publish)
-      SKIP_UPLOAD=0
-      shift
-      ;;
-    --write-release-data)
-      WRITE_RELEASE_DATA=1
-      shift
-      ;;
     --dist-dir)
       DIST_DIR="${2:?missing value for --dist-dir}"
       shift 2
       ;;
     --out-dir)
       PACKAGE_OUT_DIR="${2:?missing value for --out-dir}"
-      shift 2
-      ;;
-    --oss-base-url)
-      OSS_BASE_URL="${2:?missing value for --oss-base-url}"
-      shift 2
-      ;;
-    --oss-group)
-      OSS_GROUP="${2:?missing value for --oss-group}"
       shift 2
       ;;
     -h | --help)
@@ -116,13 +79,6 @@ GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GENERATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/loom-package.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
-sanitize_oss_group_part() {
-  printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-'
-}
-
-if [[ -z "$OSS_GROUP" ]]; then
-  OSS_GROUP="loom-releases-$(sanitize_oss_group_part "$VERSION")-$(sanitize_oss_group_part "$GIT_SHA")"
-fi
 
 RUNTIME_TARGETS=(
   "aarch64-apple-darwin"
@@ -130,6 +86,7 @@ RUNTIME_TARGETS=(
   "universal-apple-darwin"
   "aarch64-unknown-linux-musl"
   "x86_64-unknown-linux-musl"
+  "x86_64-pc-windows-msvc"
 )
 
 log() {
@@ -152,6 +109,16 @@ ensure_file() {
   fi
 }
 
+runtime_target_available() {
+  local target="$1"
+  local src_dir="$DIST_DIR/$PROFILE/$target"
+  if [[ "$target" == *windows* ]]; then
+    [[ -f "$src_dir/loom.exe" && -f "$src_dir/loom-daemon.exe" && -f "$src_dir/loom-server.exe" ]]
+  else
+    [[ -f "$src_dir/loom" && -f "$src_dir/loom-daemon" && -f "$src_dir/loom-server" ]]
+  fi
+}
+
 checksum_cmd() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$@"
@@ -167,19 +134,61 @@ package_runtime_target() {
   local target="$1"
   local src_dir="$DIST_DIR/$PROFILE/$target"
   local package_name="loom-runtime-$VERSION-$target"
-  local stage_dir="$TMP_DIR/$package_name"
-  local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
 
-  ensure_file "$src_dir/loom"
-  ensure_file "$src_dir/loom-daemon"
-  ensure_file "$src_dir/loom-server"
+  if [[ "$target" == *windows* ]]; then
+    local stage_dir="$TMP_DIR/$package_name"
+    local archive="$PACKAGE_OUT_DIR/$package_name.zip"
+    local archive_ext="zip"
+  else
+    local stage_dir="$TMP_DIR/$package_name"
+    local archive="$PACKAGE_OUT_DIR/$package_name.tar.gz"
+    local archive_ext="tar.gz"
+  fi
+
+  if [[ "$target" == *windows* ]]; then
+    ensure_file "$src_dir/loom.exe"
+    ensure_file "$src_dir/loom-daemon.exe"
+    ensure_file "$src_dir/loom-server.exe"
+  else
+    ensure_file "$src_dir/loom"
+    ensure_file "$src_dir/loom-daemon"
+    ensure_file "$src_dir/loom-server"
+  fi
 
   rm -rf "$stage_dir"
   mkdir -p "$stage_dir/bin"
-  cp "$src_dir/loom" "$stage_dir/bin/loom"
-  cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
-  cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
-  chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
+
+  if [[ "$target" == *windows* ]]; then
+    cp "$src_dir/loom.exe"        "$stage_dir/bin/loom.exe"
+    cp "$src_dir/loom-daemon.exe" "$stage_dir/bin/loom-daemon.exe"
+    cp "$src_dir/loom-server.exe" "$stage_dir/bin/loom-server.exe"
+
+    # Bundle loom-shell GUI management tool
+    if [[ -f "$src_dir/loom-shell.exe" ]]; then
+      cp "$src_dir/loom-shell.exe" "$stage_dir/bin/loom-shell.exe"
+    fi
+
+    # Bundle winsw Windows Service wrapper files
+    if [[ -f "$src_dir/WinSW-x64.exe" ]]; then
+      cp "$src_dir/WinSW-x64.exe" "$stage_dir/bin/WinSW-x64.exe"
+    fi
+    if [[ -f "$src_dir/install.ps1" ]]; then
+      cp "$src_dir/install.ps1" "$stage_dir/bin/install.ps1"
+    fi
+    if [[ -f "$src_dir/uninstall.ps1" ]]; then
+      cp "$src_dir/uninstall.ps1" "$stage_dir/bin/uninstall.ps1"
+    fi
+    if [[ -d "$src_dir/config" ]]; then
+      mkdir -p "$stage_dir/config"
+      cp "$src_dir/config/loom-server.xml" "$stage_dir/config/loom-server.xml" 2>/dev/null || true
+      cp "$src_dir/config/loom-daemon.xml" "$stage_dir/config/loom-daemon.xml" 2>/dev/null || true
+    fi
+  else
+    cp "$src_dir/loom" "$stage_dir/bin/loom"
+    cp "$src_dir/loom-daemon" "$stage_dir/bin/loom-daemon"
+    cp "$src_dir/loom-server" "$stage_dir/bin/loom-server"
+    chmod 0755 "$stage_dir/bin/loom" "$stage_dir/bin/loom-daemon" "$stage_dir/bin/loom-server"
+  fi
 
   cat >"$stage_dir/README.txt" <<EOF
 Loom runtime package
@@ -189,12 +198,45 @@ Git SHA: $GIT_SHA
 Target: $target
 
 Contents:
-- bin/loom: operator CLI.
-- bin/loom-daemon: machine-scoped agent and service host.
-- bin/loom-server: WebSocket collaboration server.
+- bin/loom$( [[ "$target" == *windows* ]] && echo .exe ): operator CLI.
+- bin/loom-daemon$( [[ "$target" == *windows* ]] && echo .exe ): machine-scoped agent and service host.
+- bin/loom-server$( [[ "$target" == *windows* ]] && echo .exe ): WebSocket collaboration server.
 EOF
 
-  tar -C "$TMP_DIR" -czf "$archive" "$package_name"
+  if [[ "$target" == *windows* ]]; then
+    cat >>"$stage_dir/README.txt" <<'EOF'
+
+Windows Service deployment
+--------------------------
+To install Loom as a Windows Service (auto-start, crash recovery):
+
+  Run PowerShell as Administrator, then:
+    cd bin
+    .\install.ps1
+
+  Manage services:
+    sc start  LoomServer
+    sc stop   LoomServer
+    sc query  LoomServer
+    sc start  LoomDaemon
+    sc stop   LoomDaemon
+    sc query  LoomDaemon
+
+  Or use the GUI management tool:
+    .\loom-shell.exe
+
+  Uninstall:
+    .\uninstall.ps1
+
+  Logs: %LOCALAPPDATA%\loom\logs\
+EOF
+  fi
+
+  if [[ "$archive_ext" == "zip" ]]; then
+    (cd "$TMP_DIR" && zip -qr "$archive" "$package_name")
+  else
+    tar -C "$TMP_DIR" -czf "$archive" "$package_name"
+  fi
   log "wrote $archive"
 }
 
@@ -233,19 +275,22 @@ package_gui_dmg() {
     codesign --force --deep --sign - "$app"
   fi
 
-  local stage_dir
-  stage_dir="$(mktemp -d "/private/tmp/loom-gui-dmg.XXXXXX")"
+  local stage_dir tmp_dmg dmg_dir dmg
+  stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/loom-gui-dmg.XXXXXX")"
+  tmp_dmg="$(mktemp "${TMPDIR:-/tmp}/loom-gui-dmg-output.XXXXXX").dmg"
+  rm -f "$tmp_dmg"
   if command -v ditto >/dev/null 2>&1; then
     ditto "$app" "$stage_dir/Loom Desktop.app"
   else
     cp -R "$app" "$stage_dir/Loom Desktop.app"
   fi
   ln -s /Applications "$stage_dir/Applications"
-  local dmg_dir="target/$target/release/bundle/dmg"
-  local dmg="$dmg_dir/Loom Desktop_${VERSION}_aarch64.dmg"
-  local tmp_dmg="/private/tmp/loom-gui-dmg-output-${VERSION}-$$.dmg"
+
+  dmg_dir="target/$target/release/bundle/dmg"
+  dmg="$dmg_dir/Loom Desktop_${VERSION}_aarch64.dmg"
   mkdir -p "$dmg_dir"
-  rm -f "$dmg" "$out" "$tmp_dmg"
+  rm -f "$dmg" "$out"
+
   local attempt=1
   local max_attempts=5
   until hdiutil create \
@@ -255,6 +300,7 @@ package_gui_dmg() {
       -format UDRO \
       "$tmp_dmg"; do
     if [[ "$attempt" -ge "$max_attempts" ]]; then
+      rm -rf "$stage_dir"
       rm -f "$tmp_dmg"
       echo "hdiutil create failed after $max_attempts attempts" >&2
       exit 1
@@ -263,6 +309,7 @@ package_gui_dmg() {
     sleep "$((attempt * 2))"
     attempt=$((attempt + 1))
   done
+
   cp "$tmp_dmg" "$dmg"
   cp "$tmp_dmg" "$out"
   rm -rf "$stage_dir"
@@ -272,34 +319,48 @@ package_gui_dmg() {
 
 write_manifest() {
   local manifest="$PACKAGE_OUT_DIR/manifest.txt"
+  local artifacts=()
+  local path name
+
+  for path in "$PACKAGE_OUT_DIR"/*; do
+    [[ -f "$path" ]] || continue
+    name="$(basename "$path")"
+    case "$name" in
+      *.tar.gz | *.zip | *.dmg | install.sh)
+        artifacts+=("$name")
+        ;;
+    esac
+  done
+
   {
     printf 'version=%s\n' "$VERSION"
     printf 'git_sha=%s\n' "$GIT_SHA"
     printf 'generated_at=%s\n' "$GENERATED_AT"
     printf 'profile=%s\n' "$PROFILE"
+    printf 'package_dir=%s\n' "$PACKAGE_OUT_DIR"
+    if [[ -n "$DOWNLOAD_BASE_URL" ]]; then
+      printf 'download_base_url=%s\n' "$DOWNLOAD_BASE_URL"
+    fi
     printf '\nartifacts:\n'
-    find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' \) \
-      -exec basename {} \; | sort | sed 's/^/- /'
+    if [[ "${#artifacts[@]}" -gt 0 ]]; then
+      printf '%s\n' "${artifacts[@]}" | sort | sed 's/^/- /'
+    fi
   } >"$manifest"
   log "wrote $manifest"
 }
 
-artifact_download_url() {
-  local file_name="$1"
-  if [[ -n "$DOWNLOAD_BASE_URL" ]]; then
-    printf '%s/%s' "${DOWNLOAD_BASE_URL%/}" "$file_name"
-    return
+archive_name_if_exists() {
+  local name="$1"
+  if [[ -f "$PACKAGE_OUT_DIR/$name" ]]; then
+    printf '%s' "$name"
   fi
-  printf '%s/api/v1/%s/%s' "${OSS_BASE_URL%/}" "$OSS_GROUP" "$file_name"
 }
 
-portal_artifact_download_url() {
-  local file_name="$1"
-  if [[ -n "$PORTAL_DOWNLOAD_BASE_URL" ]]; then
-    printf '%s/%s' "${PORTAL_DOWNLOAD_BASE_URL%/}" "$file_name"
-    return
+archive_sha_if_exists() {
+  local name="$1"
+  if [[ -n "$name" && -f "$PACKAGE_OUT_DIR/$name" ]]; then
+    checksum_cmd "$PACKAGE_OUT_DIR/$name" | awk '{print $1}'
   fi
-  artifact_download_url "$file_name"
 }
 
 write_installer() {
@@ -307,15 +368,17 @@ write_installer() {
   local runtime_mac="loom-runtime-$VERSION-universal-apple-darwin.tar.gz"
   local runtime_linux_x86="loom-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
   local runtime_linux_arm="loom-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
-  local sha_mac sha_linux_x86 sha_linux_arm
+  local runtime_windows_x86="loom-runtime-$VERSION-x86_64-pc-windows-msvc.zip"
+  local sha_mac sha_linux_x86 sha_linux_arm sha_windows_x86
 
-  ensure_file "$PACKAGE_OUT_DIR/$runtime_mac"
-  ensure_file "$PACKAGE_OUT_DIR/$runtime_linux_x86"
-  ensure_file "$PACKAGE_OUT_DIR/$runtime_linux_arm"
-
-  sha_mac="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_mac" | awk '{print $1}')"
-  sha_linux_x86="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_linux_x86" | awk '{print $1}')"
-  sha_linux_arm="$(checksum_cmd "$PACKAGE_OUT_DIR/$runtime_linux_arm" | awk '{print $1}')"
+  runtime_mac="$(archive_name_if_exists "$runtime_mac")"
+  runtime_linux_x86="$(archive_name_if_exists "$runtime_linux_x86")"
+  runtime_linux_arm="$(archive_name_if_exists "$runtime_linux_arm")"
+  runtime_windows_x86="$(archive_name_if_exists "$runtime_windows_x86")"
+  sha_mac="$(archive_sha_if_exists "$runtime_mac")"
+  sha_linux_x86="$(archive_sha_if_exists "$runtime_linux_x86")"
+  sha_linux_arm="$(archive_sha_if_exists "$runtime_linux_arm")"
+  sha_windows_x86="$(archive_sha_if_exists "$runtime_windows_x86")"
 
   cat >"$installer" <<EOF
 #!/usr/bin/env sh
@@ -323,20 +386,24 @@ set -eu
 
 VERSION='$VERSION'
 GIT_SHA='$GIT_SHA'
+DOWNLOAD_BASE_URL='$DOWNLOAD_BASE_URL'
 DEFAULT_BIN_DIR="\${HOME}/.local/bin"
+DEFAULT_PACKAGE_DIR="\$(CDPATH= cd "\$(dirname "\$0")" && pwd)"
 
-URL_UNIVERSAL_APPLE_DARWIN='$(artifact_download_url "$runtime_mac")'
+PKG_UNIVERSAL_APPLE_DARWIN='$runtime_mac'
 SHA_UNIVERSAL_APPLE_DARWIN='$sha_mac'
-URL_X86_64_UNKNOWN_LINUX_MUSL='$(artifact_download_url "$runtime_linux_x86")'
+PKG_X86_64_UNKNOWN_LINUX_MUSL='$runtime_linux_x86'
 SHA_X86_64_UNKNOWN_LINUX_MUSL='$sha_linux_x86'
-URL_AARCH64_UNKNOWN_LINUX_MUSL='$(artifact_download_url "$runtime_linux_arm")'
+PKG_AARCH64_UNKNOWN_LINUX_MUSL='$runtime_linux_arm'
 SHA_AARCH64_UNKNOWN_LINUX_MUSL='$sha_linux_arm'
+PKG_X86_64_PC_WINDOWS_MSVC='$runtime_windows_x86'
+SHA_X86_64_PC_WINDOWS_MSVC='$sha_windows_x86'
 
 usage() {
   cat <<'USAGE'
 Usage: install.sh [options]
 
-Install Loom runtime binaries from the current release.
+Install Loom runtime binaries from a local package directory.
 
 Options:
   -m, --module MODULE   Module to install: all, loom, loom-daemon, loom-server.
@@ -344,10 +411,12 @@ Options:
   -t, --target TARGET   Override target package:
                         universal-apple-darwin,
                         x86_64-unknown-linux-musl,
-                        aarch64-unknown-linux-musl.
+                        aarch64-unknown-linux-musl,
+                        x86_64-pc-windows-msvc.
+      --package-dir DIR Directory containing loom-runtime-*.tar.gz.
+                        Default: the directory containing install.sh.
       --bin-dir DIR     Install binaries into DIR. Default: \$HOME/.local/bin.
       --dry-run         Print the selected package and modules without installing.
-      --print-url       Print the selected runtime package URL and exit.
   -y, --yes             Accepted for non-interactive automation.
   -h, --help            Show this help.
 
@@ -355,17 +424,13 @@ Examples:
   sh install.sh
   sh install.sh --module loom
   sh install.sh --module loom-server --bin-dir /usr/local/bin
-  sh install.sh --target x86_64-unknown-linux-musl --module loom,loom-daemon,loom-server -y
+  sh install.sh --package-dir ./dist/packages --target x86_64-unknown-linux-musl -y
 USAGE
 }
 
 die() {
   printf 'install.sh: %s\n' "\$*" >&2
   exit 1
-}
-
-need_cmd() {
-  command -v "\$1" >/dev/null 2>&1 || die "missing required command: \$1"
 }
 
 detect_target() {
@@ -375,15 +440,17 @@ detect_target() {
     Darwin:*) printf '%s\n' universal-apple-darwin ;;
     Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-musl ;;
     Linux:aarch64|Linux:arm64) printf '%s\n' aarch64-unknown-linux-musl ;;
+    MINGW64_NT:*|MSYS_NT:*|CYGWIN_NT:*) printf '%s\n' x86_64-pc-windows-msvc ;;
     *) die "unsupported platform: \$os \$arch; pass --target explicitly" ;;
   esac
 }
 
-runtime_url() {
+runtime_package_name() {
   case "\$1" in
-    universal-apple-darwin) printf '%s\n' "\$URL_UNIVERSAL_APPLE_DARWIN" ;;
-    x86_64-unknown-linux-musl) printf '%s\n' "\$URL_X86_64_UNKNOWN_LINUX_MUSL" ;;
-    aarch64-unknown-linux-musl) printf '%s\n' "\$URL_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    universal-apple-darwin) printf '%s\n' "\$PKG_UNIVERSAL_APPLE_DARWIN" ;;
+    x86_64-unknown-linux-musl) printf '%s\n' "\$PKG_X86_64_UNKNOWN_LINUX_MUSL" ;;
+    aarch64-unknown-linux-musl) printf '%s\n' "\$PKG_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "\$PKG_X86_64_PC_WINDOWS_MSVC" ;;
     *) die "unknown target: \$1" ;;
   esac
 }
@@ -393,6 +460,7 @@ runtime_sha256() {
     universal-apple-darwin) printf '%s\n' "\$SHA_UNIVERSAL_APPLE_DARWIN" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$SHA_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$SHA_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+    x86_64-pc-windows-msvc) printf '%s\n' "\$SHA_X86_64_PC_WINDOWS_MSVC" ;;
     *) die "unknown target: \$1" ;;
   esac
 }
@@ -410,13 +478,12 @@ sha256_file() {
 download_file() {
   url="\$1"
   out="\$2"
-  need_cmd curl
-  if [ "\${LOOM_INSTALL_KEEP_PROXY:-}" = "1" ]; then
-    curl -fL --retry 3 --connect-timeout 20 -o "\$out" "\$url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "\$url" -o "\$out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "\$out" "\$url"
   else
-    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \\
-      -u http_proxy -u https_proxy -u all_proxy \\
-      curl -fL --retry 3 --connect-timeout 20 -o "\$out" "\$url"
+    die "missing downloader: install curl or wget"
   fi
 }
 
@@ -449,8 +516,8 @@ install_one() {
 target=""
 module_spec="all"
 bin_dir="\$DEFAULT_BIN_DIR"
+package_dir="\$DEFAULT_PACKAGE_DIR"
 dry_run=0
-print_url=0
 
 while [ "\$#" -gt 0 ]; do
   case "\$1" in
@@ -473,6 +540,15 @@ while [ "\$#" -gt 0 ]; do
       target="\${1#*=}"
       shift
       ;;
+    --package-dir)
+      [ "\$#" -ge 2 ] || die "missing value for \$1"
+      package_dir="\$2"
+      shift 2
+      ;;
+    --package-dir=*)
+      package_dir="\${1#*=}"
+      shift
+      ;;
     --bin-dir)
       [ "\$#" -ge 2 ] || die "missing value for \$1"
       bin_dir="\$2"
@@ -484,10 +560,6 @@ while [ "\$#" -gt 0 ]; do
       ;;
     --dry-run)
       dry_run=1
-      shift
-      ;;
-    --print-url)
-      print_url=1
       shift
       ;;
     -y|--yes)
@@ -504,40 +576,77 @@ while [ "\$#" -gt 0 ]; do
 done
 
 [ -n "\$target" ] || target="\$(detect_target)"
-url="\$(runtime_url "\$target")"
+package_name="\$(runtime_package_name "\$target")"
+package_path="\$package_dir/\$package_name"
 expected_sha="\$(runtime_sha256 "\$target")"
 modules="\$(normalize_modules "\$module_spec")"
+download_url=""
 
-if [ "\$print_url" -eq 1 ]; then
-  printf '%s\n' "\$url"
-  exit 0
+[ -n "\$package_name" ] || die "no runtime package is available for target \$target"
+[ -n "\$expected_sha" ] || die "no checksum is available for target \$target"
+
+if [ -n "\$DOWNLOAD_BASE_URL" ]; then
+  download_url="\${DOWNLOAD_BASE_URL%/}/\$package_name"
 fi
 
 printf 'Loom %s (%s)\n' "\$VERSION" "\$GIT_SHA"
 printf 'target: %s\n' "\$target"
 printf 'modules:%s\n' "\$modules"
 printf 'bin dir: %s\n' "\$bin_dir"
-printf 'package: %s\n' "\$url"
+printf 'package: %s\n' "\$package_path"
+if [ -n "\$download_url" ]; then
+  printf 'download: %s\n' "\$download_url"
+fi
 
 if [ "\$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-need_cmd tar
-tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
-trap 'rm -rf "\$tmp_dir"' EXIT INT TERM
-archive="\$tmp_dir/loom-runtime.tar.gz"
+command -v tar >/dev/null 2>&1 || die "missing required command: tar"
 
-download_file "\$url" "\$archive"
-actual_sha="\$(sha256_file "\$archive")"
-[ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$url"
+download_tmp_dir=""
+extract_tmp_dir=""
+cleanup() {
+  if [ -n "\$download_tmp_dir" ]; then
+    rm -rf "\$download_tmp_dir"
+  fi
+  if [ -n "\$extract_tmp_dir" ]; then
+    rm -rf "\$extract_tmp_dir"
+  fi
+}
+trap cleanup EXIT INT TERM
 
-tar -xzf "\$archive" -C "\$tmp_dir"
-package_dir="\$(find "\$tmp_dir" -maxdepth 1 -type d -name "loom-runtime-*" | head -1)"
-[ -n "\$package_dir" ] || die "runtime package did not extract correctly"
+if [ ! -f "\$package_path" ]; then
+  [ -n "\$download_url" ] || die "missing runtime package: \$package_path"
+  download_tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install-download.XXXXXX")"
+  package_path="\$download_tmp_dir/\$package_name"
+  printf 'downloading %s\n' "\$download_url"
+  download_file "\$download_url" "\$package_path"
+fi
+
+actual_sha="\$(sha256_file "\$package_path")"
+[ "\$actual_sha" = "\$expected_sha" ] || die "checksum mismatch for \$package_path"
+
+extract_tmp_dir="\$(mktemp -d "\${TMPDIR:-/tmp}/loom-install.XXXXXX")"
+case "\$package_name" in
+  *.zip)
+    command -v unzip >/dev/null 2>&1 || die "missing required command: unzip"
+    unzip -q "\$package_path" -d "\$extract_tmp_dir"
+    ;;
+  *)
+    tar -xzf "\$package_path" -C "\$extract_tmp_dir"
+    ;;
+esac
+package_root=""
+for candidate in "\$extract_tmp_dir"/loom-runtime-*; do
+  [ -d "\$candidate" ] || continue
+  package_root="\$candidate"
+  break
+done
+[ -n "\$package_root" ] || die "runtime package did not extract correctly"
 
 for module in \$modules; do
-  install_one "\$module" "\$package_dir/bin/\$module" "\$bin_dir"
+  install_one "\$module" "\$package_root/bin/\$module" "\$bin_dir"
 done
 
 printf 'done. Add %s to PATH if needed.\n' "\$bin_dir"
@@ -552,226 +661,30 @@ write_checksums() {
   (
     cd "$PACKAGE_OUT_DIR"
     artifacts=()
-    while IFS= read -r artifact; do
-      artifacts+=("$artifact")
-    done < <(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' \) \
-      -exec basename {} \; | sort)
+    for path in *; do
+      [[ -f "$path" ]] || continue
+      case "$path" in
+        *.tar.gz | *.zip | *.dmg | install.sh)
+          artifacts+=("$path")
+          ;;
+      esac
+    done
 
     if [[ "${#artifacts[@]}" -eq 0 ]]; then
       echo "no package artifacts found for checksum generation" >&2
       exit 1
     fi
 
-    checksum_cmd "${artifacts[@]}"
+    printf '%s\n' "${artifacts[@]}" | sort | while IFS= read -r artifact; do
+      checksum_cmd "$artifact"
+    done
   ) >"$sums"
   log "wrote $sums"
 }
 
-upload_one_artifact() {
-  local path="$1"
-  local file_name
-  file_name="$(basename "$path")"
-
-  log "uploading $file_name to OSS group $OSS_GROUP"
-  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-    -u http_proxy -u https_proxy -u all_proxy \
-    curl -fsSL \
-      -F "file=@$path" \
-      -F "group=$OSS_GROUP" \
-      -F "downloadFileName=$file_name" \
-      "$OSS_BASE_URL/api/v1/oss/grouped/upload" \
-    >"$TMP_DIR/upload-$file_name.json"
-
-  python3 - "$TMP_DIR/upload-$file_name.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    payload = json.load(f)
-
-if isinstance(payload, dict) and payload.get("success") is False:
-    raise SystemExit(payload.get("message") or "upload failed")
-
-data = payload.get("data", payload) if isinstance(payload, dict) else payload
-if not isinstance(data, dict):
-    raise SystemExit("upload response is not an object")
-
-url = data.get("downloadUrl")
-if not url:
-    raise SystemExit("upload response missing downloadUrl")
-
-print(url)
-PY
-}
-
-artifact_kind() {
-  case "$1" in
-    loom-runtime-*.tar.gz) printf 'runtime' ;;
-    loom-gui-*.dmg) printf 'gui' ;;
-    install.sh) printf 'installer' ;;
-    SHA256SUMS) printf 'checksums' ;;
-    manifest.txt) printf 'manifest' ;;
-    *) printf 'file' ;;
-  esac
-}
-
-artifact_label() {
-  local file_name="$1"
-  local label="$file_name"
-  label="${label#loom-runtime-$VERSION-}"
-  label="${label#loom-gui-$VERSION-}"
-  label="${label%.tar.gz}"
-  label="${label%.dmg}"
-  case "$file_name" in
-    install.sh) label="Install script" ;;
-    SHA256SUMS) label="SHA256 checksums" ;;
-    manifest.txt) label="Release manifest" ;;
-  esac
-  printf '%s' "$label"
-}
-
-write_portal_release_data() {
-  local uploads_json="$1"
-  mkdir -p "$(dirname "$PORTAL_RELEASE_DATA")"
-  python3 - "$uploads_json" "$PORTAL_RELEASE_DATA" "$VERSION" "$GIT_SHA" "$GENERATED_AT" "$OSS_GROUP" <<'PY'
-import json
-import sys
-
-uploads_path, out_path, version, git_sha, generated_at, group = sys.argv[1:7]
-with open(uploads_path, "r", encoding="utf-8") as f:
-    uploads = json.load(f)
-
-payload = {
-    "version": version,
-    "gitSha": git_sha,
-    "generatedAt": generated_at,
-    "group": group,
-    "artifacts": uploads,
-}
-
-with open(out_path, "w", encoding="utf-8") as f:
-    f.write("window.LOOM_RELEASE_DOWNLOADS = ")
-    json.dump(payload, f, ensure_ascii=False, indent=2)
-    f.write(";\n")
-PY
-  log "wrote $PORTAL_RELEASE_DATA"
-  if [[ -d pages/build ]]; then
-    cp "$PORTAL_RELEASE_DATA" pages/build/release-downloads.js
-    log "updated pages/build/release-downloads.js"
-  fi
-}
-
-write_release_data_from_local_artifacts() {
-  local uploads_json="$TMP_DIR/local-uploads.json"
-  local first=1
-  printf '[\n' >"$uploads_json"
-
-  local artifacts=()
-  while IFS= read -r artifact; do
-    artifacts+=("$artifact")
-  done < <(find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \
-    \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' -o -name 'SHA256SUMS' -o -name 'manifest.txt' \) \
-    | sort)
-
-  if [[ "${#artifacts[@]}" -eq 0 ]]; then
-    echo "no package artifacts found for release data" >&2
-    exit 1
-  fi
-
-  for artifact in "${artifacts[@]}"; do
-    local file_name url size sha kind label
-    file_name="$(basename "$artifact")"
-    url="$(portal_artifact_download_url "$file_name")"
-    size="$(wc -c <"$artifact" | tr -d ' ')"
-    sha="$(checksum_cmd "$artifact" | awk '{print $1}')"
-    kind="$(artifact_kind "$file_name")"
-    label="$(artifact_label "$file_name")"
-
-    if [[ "$first" -eq 0 ]]; then
-      printf ',\n' >>"$uploads_json"
-    fi
-    first=0
-    python3 - "$uploads_json" "$file_name" "$label" "$kind" "$size" "$sha" "$url" <<'PY'
-import json
-import sys
-
-_, uploads_json, file_name, label, kind, size, sha, url = sys.argv
-item = {
-    "fileName": file_name,
-    "label": label,
-    "kind": kind,
-    "size": int(size),
-    "sha256": sha,
-    "downloadUrl": url,
-}
-with open(uploads_json, "a", encoding="utf-8") as f:
-    f.write("  ")
-    json.dump(item, f, ensure_ascii=False)
-PY
-  done
-
-  printf '\n]\n' >>"$uploads_json"
-  write_portal_release_data "$uploads_json"
-}
-
-upload_artifacts() {
-  local uploads_json="$TMP_DIR/uploads.json"
-  local first=1
-  printf '[\n' >"$uploads_json"
-
-  local artifacts=()
-  while IFS= read -r artifact; do
-    artifacts+=("$artifact")
-  done < <(find "$PACKAGE_OUT_DIR" -maxdepth 1 -type f \
-    \( -name '*.tar.gz' -o -name '*.dmg' -o -name 'install.sh' -o -name 'SHA256SUMS' -o -name 'manifest.txt' \) \
-    | sort)
-
-  if [[ "${#artifacts[@]}" -eq 0 ]]; then
-    echo "no package artifacts found for upload" >&2
-    exit 1
-  fi
-
-  for artifact in "${artifacts[@]}"; do
-    local file_name url size sha kind label
-    file_name="$(basename "$artifact")"
-    url="$(upload_one_artifact "$artifact")"
-    size="$(wc -c <"$artifact" | tr -d ' ')"
-    sha="$(checksum_cmd "$artifact" | awk '{print $1}')"
-    kind="$(artifact_kind "$file_name")"
-    label="$(artifact_label "$file_name")"
-
-    if [[ "$first" -eq 0 ]]; then
-      printf ',\n' >>"$uploads_json"
-    fi
-    first=0
-    python3 - "$uploads_json" "$file_name" "$label" "$kind" "$size" "$sha" "$url" <<'PY'
-import json
-import sys
-
-_, uploads_json, file_name, label, kind, size, sha, url = sys.argv
-item = {
-    "fileName": file_name,
-    "label": label,
-    "kind": kind,
-    "size": int(size),
-    "sha256": sha,
-    "downloadUrl": url,
-}
-with open(uploads_json, "a", encoding="utf-8") as f:
-    f.write("  ")
-    json.dump(item, f, ensure_ascii=False)
-PY
-  done
-
-  printf '\n]\n' >>"$uploads_json"
-  write_portal_release_data "$uploads_json"
-  if [[ -f "$PORTAL_RELEASE_DATA" ]]; then
-    upload_one_artifact "$PORTAL_RELEASE_DATA" >/dev/null
-  fi
-}
-
 mkdir -p "$PACKAGE_OUT_DIR"
 rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
+  "$PACKAGE_OUT_DIR"/loom-runtime-*.zip \
   "$PACKAGE_OUT_DIR"/loom-gui-*.dmg \
   "$PACKAGE_OUT_DIR"/install.sh \
   "$PACKAGE_OUT_DIR"/SHA256SUMS \
@@ -780,13 +693,26 @@ rm -f "$PACKAGE_OUT_DIR"/loom-runtime-*.tar.gz \
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   log "building CLI/daemon/server release binaries for macOS and Linux targets"
   run_make all-release
+  log "assembling Windows Service (winsw) package"
+  run_make windows-service-package
 else
   log "skipping binary build; using existing $DIST_DIR/$PROFILE artifacts"
 fi
 
+runtime_package_count=0
 for target in "${RUNTIME_TARGETS[@]}"; do
+  if ! runtime_target_available "$target"; then
+    log "skipping $target; missing runtime artifacts"
+    continue
+  fi
   package_runtime_target "$target"
+  runtime_package_count=$((runtime_package_count + 1))
 done
+
+if [[ "$runtime_package_count" -eq 0 ]]; then
+  echo "no runtime artifacts found under $DIST_DIR/$PROFILE" >&2
+  exit 1
+fi
 
 if [[ "$SKIP_GUI" -eq 0 ]]; then
   package_gui_dmg
@@ -797,13 +723,5 @@ fi
 write_installer
 write_manifest
 write_checksums
-
-if [[ "$SKIP_UPLOAD" -eq 0 ]]; then
-  upload_artifacts
-elif [[ "$WRITE_RELEASE_DATA" -eq 1 ]]; then
-  write_release_data_from_local_artifacts
-else
-  log "skipping OSS upload"
-fi
 
 log "done: $PACKAGE_OUT_DIR"

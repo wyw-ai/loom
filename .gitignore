@@ -11,10 +11,21 @@
 __pycache__/
 /docs/*
 !/docs/README.md
+!/docs/gui-actor-provider-management-design.md
 !/docs/loom-refactor-plan.md
+!/docs/loop-engineering.md
 !/docs/am-loom-bridge.md
+!/docs/article-loom-current-design.md
+!/docs/article-loom-image-1.md
+!/docs/article-loom-image-2.md
+!/docs/article-loom-image-3.md
+!/docs/ISSUES.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
+!/docs/superpowers/
+!/docs/windows-build-guide.md
+!/docs/ci/
+!/docs/ci/local-matrix.md
 data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/
@@ -25,3 +36,5 @@ data
 /apps/gui-web/vite.config.js
 /crates/gui/gen/
 /crates/gui/target/
+/logs/
+/tmp/

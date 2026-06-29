@@ -1,4 +1,4 @@
-//! `loom spec apply --action <message_id>` — classroom教学循环最后一公里
+//! `loom spec apply --action <message_id>` — classroom teaching loop final step
 //! (design §4.4 / §7.1, e2e-readiness-review M5).
 //!
 //! Consumes an `action.response` message whose parent request has

@@ -1,0 +1,34 @@
+<service>
+  <id>LoomServer</id>
+  <name>Loom Server</name>
+  <description>Loom multi-actor collaboration server</description>
+
+  <executable>%BASE%\..\bin\loom-server.exe</executable>
+  <arguments>--bind 127.0.0.1:7878</arguments>
+
+  <!-- Crash restart with exponential back-off -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="20 sec"/>
+  <onfailure action="restart" delay="40 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Log rolling: 10 MB or daily -->
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10240</sizeThreshold>
+    <pattern>yyyy-MM-dd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+  </log>
+  <logpath>%LOCALAPPDATA%\loom\logs\server</logpath>
+
+  <!-- Auto-start after network is ready -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Environment -->
+  <env name="LOOM_DATA_DIR" value="%LOCALAPPDATA%\loom\server"/>
+  <env name="RUST_LOG" value="info"/>
+
+  <!-- Graceful stop: wait 15 s then force-kill -->
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <stoptimeout>15 sec</stoptimeout>
+</service>

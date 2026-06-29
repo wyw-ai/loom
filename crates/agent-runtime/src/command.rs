@@ -1061,12 +1061,13 @@ fn spawn_and_collect(
     };
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
-    // Check the background stdin write result.  If it failed, surface the error
-    // as an early_runtime_error so the caller gets a clear message instead of
-    // a confusing "No prompt provided" from the child.
+    // Check the background stdin write result. If the child exits early after
+    // emitting a provider/runtime error, the writer can see BrokenPipe; keep
+    // that as a fallback so it does not mask the more actionable child output.
+    let mut stdin_write_error = None;
     if let Some(done_rx) = stdin_handle {
         if let Ok(Err(e)) = done_rx.recv() {
-            early_runtime_error = Some(e);
+            stdin_write_error = Some(e);
         }
     }
     for output in output_rx.try_iter() {
@@ -1114,6 +1115,7 @@ fn spawn_and_collect(
         early_runtime_error
             .or_else(|| extract_runtime_error_from_text(&collected_stdout))
             .or_else(|| extract_runtime_error_from_text(&collected_stderr))
+            .or(stdin_write_error)
     };
     let summary = if was_cancelled {
         "cancelled".into()
@@ -4103,6 +4105,52 @@ mod tests {
         assert!(summary.contains("FreeUsageLimitError"));
         assert!(summary.contains("Rate limit exceeded"));
         assert!(summary.contains("retry-after: 59140s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_command_summary_prefers_runtime_error_over_stdin_write_error() {
+        let error_line = serde_json::json!({
+            "statusCode": 429,
+            "responseHeaders": { "retry-after": "59140" },
+            "responseBody": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}"
+        })
+        .to_string();
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "exec 0<&-; printf '%s\n' \"$ERROR_JSON\"; exit 1".into(),
+        ];
+        cfg.env.insert("ERROR_JSON".into(), error_line);
+        cfg.output_format = CommandOutputFormat::OpencodeJson;
+        cfg.prompt_via = PromptVia::Stdin;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+        let long_prompt = "ignored".repeat(256 * 1024);
+
+        let outcome = spawn_and_collect(&cfg, &prompt(&long_prompt), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert_ne!(outcome.exit_code, 0);
+        let mut summary = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success,
+                summary: value,
+                ..
+            } = event
+            {
+                assert!(!success);
+                summary = Some(value);
+                break;
+            }
+        }
+        let summary = summary.expect("missing Finished event");
+        assert!(summary.contains("429"), "{summary}");
+        assert!(summary.contains("FreeUsageLimitError"), "{summary}");
+        assert!(summary.contains("Rate limit exceeded"), "{summary}");
+        assert!(summary.contains("retry-after: 59140s"), "{summary}");
     }
 
     #[test]

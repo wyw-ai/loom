@@ -10,12 +10,15 @@ import type {
   AgentPromptPreviewResult,
   Actor,
   AudienceRef,
+  Artifact,
+  ArtifactReadResult,
   Channel,
   DesktopConfig,
   DeliveryPolicy,
   DeliveryState,
   HumanAccount,
   InboxListEntry,
+  MachineAgentProviderInfo,
   MachineListResult,
   Message,
   MessageIntent,
@@ -37,6 +40,11 @@ export type AccountLoginProviderStatus = {
 };
 export type AccountAuthStatus = {
   providers: AccountLoginProviderStatus[];
+};
+export type AccountLocalDefaults = {
+  userId: string;
+  nickname: string;
+  actorId: string;
 };
 
 function hasTauriRuntime() {
@@ -95,11 +103,26 @@ export async function accountAuthStatus(): Promise<AccountAuthStatus> {
   return invoke("account_auth_status");
 }
 
+export async function accountLocalDefaults(): Promise<AccountLocalDefaults> {
+  return invoke("account_local_defaults");
+}
+
 export async function accountLogin(provider: LoginProvider): Promise<{
   account: HumanAccount;
   config: DesktopConfig;
 }> {
   return invoke("account_login", { args: { provider } });
+}
+
+export async function accountSetLocal(args: {
+  userId: string;
+  nickname: string;
+  actorId: string;
+}): Promise<{
+  account: HumanAccount;
+  config: DesktopConfig;
+}> {
+  return invoke("account_set_local", { args });
 }
 
 export async function accountLogout(): Promise<DesktopConfig> {
@@ -287,6 +310,27 @@ export async function deliveryAck(params: {
   return invoke("delivery_ack", { params });
 }
 
+export async function artifactGet(params: {
+  artifactId?: string;
+  artifactUri?: string;
+}): Promise<{ artifact: Artifact }> {
+  return invoke("artifact_get", { params });
+}
+
+export async function artifactRead(params: {
+  artifactId: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<ArtifactReadResult> {
+  return invoke("artifact_read", {
+    params: {
+      artifactId: params.artifactId,
+      offset: params.offset ?? 0,
+      maxBytes: params.maxBytes ?? 65536,
+    },
+  });
+}
+
 export async function taskList(params?: {
   channelId?: string;
   sourceMessageId?: string;
@@ -334,11 +378,23 @@ export async function machineCheck(): Promise<MachineListResult> {
   return invoke("machine_check");
 }
 
+export async function localProviderCheck(): Promise<{
+  providers: MachineAgentProviderInfo[];
+}> {
+  return invoke("local_provider_check");
+}
+
 export async function machineCreate(args: {
   name: string;
   dataRoot?: string;
 }): Promise<MachineListResult> {
   return invoke("machine_create", { args });
+}
+
+export async function machineStart(machineId: string): Promise<MachineListResult & {
+  pid: number;
+}> {
+  return invoke("machine_start", { args: { machineId } });
 }
 
 export async function machineRemove(machineId: string): Promise<MachineListResult> {

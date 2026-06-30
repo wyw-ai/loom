@@ -275,9 +275,9 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            codex.transport().env.get("CODEX_HOME").map(String::as_str),
-            Some("{loom_agent_home}")
+        assert!(
+            !codex.transport().env.contains_key("CODEX_HOME"),
+            "Codex should inherit the user's default auth home"
         );
         let opencode = providers
             .iter()

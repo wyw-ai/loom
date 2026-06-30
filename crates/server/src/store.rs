@@ -3641,9 +3641,19 @@ impl Store {
         if self
             .find_thread_by_root(channel_id, root_message_id)
             .is_some()
+            || self
+                .get_thread(root_message_id)
+                .is_some_and(|thread| thread.channel_id == channel_id)
         {
             return Ok(None);
         }
+        let thread = self
+            .get_thread(root_message_id)
+            .filter(|thread| thread.channel_id == channel_id);
+        let root_message_id = thread
+            .as_ref()
+            .map(|thread| thread.root_message_id.as_str())
+            .unwrap_or(root_message_id);
         let root = self
             .get_message(root_message_id)
             .ok_or_else(|| StoreError::NotFound(format!("message {root_message_id}")))?;
@@ -3764,24 +3774,38 @@ impl Store {
                 "invalid thread target `#{raw}`"
             )));
         }
-        let root = self
-            .get_message(root_message_id)
-            .ok_or_else(|| StoreError::NotFound(format!("message {root_message_id}")))?;
-        if root.scope.kind != ScopeKind::Channel || root.scope.id != channel_id {
-            return Err(StoreError::InvalidState(format!(
-                "thread root message {root_message_id} must belong to channel {channel_id}"
-            )));
-        }
-        let thread = match self.find_thread_by_root(channel_id, root_message_id) {
-            Some(thread) => thread,
-            None if create_thread => {
-                self.create_thread_for_message_root(channel_id, root_message_id)?
-            }
-            None => {
-                return Err(StoreError::NotFound(format!(
-                    "thread #{channel_id}:{root_message_id}"
+        let thread_by_id = self.get_thread(root_message_id);
+        let canonical_root_message_id = match thread_by_id.as_ref() {
+            Some(thread) if thread.channel_id == channel_id => thread.root_message_id.clone(),
+            Some(thread) => {
+                return Err(StoreError::InvalidState(format!(
+                    "thread {} must belong to channel {channel_id}",
+                    thread.id
                 )));
             }
+            None => root_message_id.to_string(),
+        };
+        let root = self
+            .get_message(&canonical_root_message_id)
+            .ok_or_else(|| StoreError::NotFound(format!("message {canonical_root_message_id}")))?;
+        if root.scope.kind != ScopeKind::Channel || root.scope.id != channel_id {
+            return Err(StoreError::InvalidState(format!(
+                "thread root message {canonical_root_message_id} must belong to channel {channel_id}"
+            )));
+        }
+        let thread = match thread_by_id {
+            Some(thread) => thread,
+            None => match self.find_thread_by_root(channel_id, &canonical_root_message_id) {
+                Some(thread) => thread,
+                None if create_thread => {
+                    self.create_thread_for_message_root(channel_id, &canonical_root_message_id)?
+                }
+                None => {
+                    return Err(StoreError::NotFound(format!(
+                        "thread #{channel_id}:{canonical_root_message_id}"
+                    )));
+                }
+            },
         };
         let thread_id = thread.id.clone();
         Ok(ResolvedMessageTarget {
@@ -3789,8 +3813,8 @@ impl Store {
                 kind: ScopeKind::Thread,
                 id: thread_id.clone(),
             },
-            target: format!("#{channel_id}:{root_message_id}"),
-            thread_root_message_id: Some(root_message_id.to_string()),
+            target: format!("#{channel_id}:{canonical_root_message_id}"),
+            thread_root_message_id: Some(canonical_root_message_id),
             direct_actor: None,
             task_id: self.task_id_for_canonical_thread(&thread_id),
         })
@@ -6081,6 +6105,41 @@ mod tests {
                 None,
             )
             .expect("append message")
+    }
+
+    #[test]
+    fn hash_thread_id_target_resolves_to_thread_root_target() {
+        let store = fresh_store();
+        let channel = store
+            .create_channel("thread alias".into(), Some("actor_owner".into()))
+            .unwrap();
+        let root_message_id = append_channel_root(&store, &channel.id, "actor_owner", "root");
+        let thread = store
+            .create_thread(channel.id.clone(), "root".into(), root_message_id.clone())
+            .unwrap();
+        let alias_target = format!("#{}:{}", channel.id, thread.id);
+
+        let reply = send_test_message(&store, "actor_owner", &alias_target, "thread reply");
+
+        assert_eq!(
+            reply.scope,
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: thread.id.clone(),
+            }
+        );
+        assert_eq!(reply.target, format!("#{}:{}", channel.id, root_message_id));
+        assert_eq!(
+            reply.thread_root_message_id.as_deref(),
+            Some(root_message_id.as_str())
+        );
+
+        let (messages, has_more) = store
+            .read_messages_for_target("actor_owner", &alias_target, 10, None)
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, reply.id);
     }
 
     #[test]

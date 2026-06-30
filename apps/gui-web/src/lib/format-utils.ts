@@ -373,6 +373,15 @@ export function accountToActor(account: HumanAccount): Actor {
   };
 }
 
+export function uniqueActorsById(actors: Actor[]) {
+  const seen = new Set<string>();
+  return actors.filter((actor) => {
+    if (seen.has(actor.id)) return false;
+    seen.add(actor.id);
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Online presence & status
 // ---------------------------------------------------------------------------

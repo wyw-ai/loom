@@ -5,6 +5,7 @@ import {
   useState,
 } from "react";
 import type { CSSProperties, PointerEvent } from "react";
+import { Loader2 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import {
@@ -98,6 +99,7 @@ import {
   sortTasks,
   sortThreads,
   uniqueAudience,
+  uniqueActorsById,
   upsert,
 } from "@/lib/format-utils";
 
@@ -131,6 +133,7 @@ import { TasksView } from "@/components/views/TasksView";
 import { SpacesView } from "@/components/views/SpacesView";
 import { AccountView } from "@/components/views/AccountView";
 import { SettingsView } from "@/components/views/SettingsView";
+import { OnboardingView } from "@/components/views/OnboardingView";
 import { ChannelPanel } from "@/components/panels/ChannelPanels";
 
 
@@ -225,8 +228,8 @@ export function App() {
     autostart: true,
     env: {},
   });
-  const [accountAuthStatus, setAccountAuthStatus] =
-    useState<ipc.AccountAuthStatus | null>(null);
+  const [configLoaded, setConfigLoaded] = useState(false);
+  const [onboardingActive, setOnboardingActive] = useState(false);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -236,6 +239,7 @@ export function App() {
   const targetRef = useRef<string | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
   const autoReconnectRef = useRef(false);
+  const hasOpenedConnectionRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
   const panelResizeDragRef = useRef<PanelResizeDrag | null>(null);
@@ -282,7 +286,9 @@ export function App() {
         directScopesByActorId[activeDirectActor.id] ??
         null
       : null;
-  const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
+  const memberCandidates = uniqueActorsById(
+    actorList.filter((actor) => actor.kind !== "service"),
+  );
   const channelAgentActors = activeChannel
     ? channelMentionAgentActors(activeChannel, actors)
     : [];
@@ -376,19 +382,16 @@ export function App() {
     try {
       const next = await ipc.workspacesList();
       applyConfig(next);
+      if (!next.account || next.workspaces.length === 0) {
+        setOnboardingActive(true);
+      }
       void loadMachines().catch(() => {});
     } catch (err) {
       setError(errorText(err));
+    } finally {
+      setConfigLoaded(true);
     }
   }, [applyConfig, loadMachines]);
-
-  const loadAccountAuthStatus = useCallback(async () => {
-    try {
-      setAccountAuthStatus(await ipc.accountAuthStatus());
-    } catch {
-      setAccountAuthStatus({ providers: [] });
-    }
-  }, []);
 
   const loadWorkspaceData = useCallback(
     async (current: Workspace) => {
@@ -433,10 +436,16 @@ export function App() {
   const connectWorkspace = useCallback(
     async (
       workspaceId: string,
-      options: { automatic?: boolean; quiet?: boolean } = {},
+      options: { automatic?: boolean; quiet?: boolean; reconnect?: boolean } = {},
     ): Promise<Workspace | null> => {
       const automatic = options.automatic === true;
       const quiet = options.quiet === true;
+      const reconnecting =
+        options.reconnect === true ||
+        (automatic && hasOpenedConnectionRef.current && autoReconnectRef.current);
+      if (workspaceRef.current?.id === workspaceId && connection === "open") {
+        return workspaceRef.current;
+      }
       if (!automatic) {
         autoReconnectRef.current = true;
         reconnectAttemptRef.current = 0;
@@ -444,13 +453,15 @@ export function App() {
       clearReconnectTimer();
       if (!automatic && !quiet) setBusy(`connect:${workspaceId}`);
       setConnection("connecting");
-      setError(automatic ? "Connection lost. Reconnecting..." : null);
+      setError(reconnecting ? "Connection lost. Reconnecting..." : null);
       try {
         const result = await ipc.connect(workspaceId);
         workspaceRef.current = result.workspace;
+        hasOpenedConnectionRef.current = true;
         autoReconnectRef.current = true;
         setWorkspace(result.workspace);
         setConnection("open");
+        setError(null);
         reconnectAttemptRef.current = 0;
         await loadWorkspaceData(result.workspace);
         if (!quiet) {
@@ -463,46 +474,48 @@ export function App() {
         return result.workspace;
       } catch (err) {
         setConnection("error");
-        setError(automatic ? "Connection lost. Reconnecting..." : errorText(err));
+        if (reconnecting) {
+          setError("Connection lost. Reconnecting...");
+        } else {
+          autoReconnectRef.current = false;
+          setError(automatic || quiet ? null : errorText(err));
+        }
         return null;
       } finally {
         if (!automatic && !quiet) setBusy(null);
       }
     },
-    [clearReconnectTimer, loadWorkspaceData, pushNotice],
+    [clearReconnectTimer, connection, loadWorkspaceData, pushNotice],
   );
-
-  const disconnect = useCallback(async () => {
-    autoReconnectRef.current = false;
-    reconnectAttemptRef.current = 0;
-    clearReconnectTimer();
-    try {
-      await ipc.disconnect();
-    } catch {
-      /* local state still closes */
-    }
-    setConnection("closed");
-  }, [clearReconnectTimer]);
 
   useEffect(() => {
     let unlistenStream: (() => void) | null = null;
     let unlistenConnection: (() => void) | null = null;
 
     void loadConfig();
-    void loadAccountAuthStatus();
     void ipc.onStream((update) => handleStream(update)).then((off) => {
       unlistenStream = off;
     });
     void ipc.onConnection((event) => {
       if (event.state === "closed") {
-        autoReconnectRef.current = true;
         setConnection("closed");
-        setError("Connection lost. Reconnecting...");
+        if (
+          hasOpenedConnectionRef.current &&
+          autoReconnectRef.current &&
+          workspaceRef.current
+        ) {
+          setError("Connection lost. Reconnecting...");
+        } else {
+          autoReconnectRef.current = false;
+          setError(null);
+        }
         void loadMachines(true).catch(() => {});
       } else {
+        hasOpenedConnectionRef.current = true;
         if (workspaceRef.current) autoReconnectRef.current = true;
         reconnectAttemptRef.current = 0;
         setConnection("open");
+        setError(null);
         void loadMachines(true).catch(() => {});
       }
     }).then((off) => {
@@ -513,18 +526,19 @@ export function App() {
       unlistenStream?.();
       unlistenConnection?.();
     };
-  }, [loadAccountAuthStatus, loadConfig, loadMachines]);
+  }, [loadConfig, loadMachines]);
 
   useEffect(() => {
     workspaceRef.current = workspace;
   }, [workspace]);
 
   useEffect(() => {
-    if (!activeWorkspaceId || connection !== "idle") return;
-    autoReconnectRef.current = true;
+    if (!account || !activeWorkspaceId || connection !== "idle") return;
+    autoReconnectRef.current = false;
+    hasOpenedConnectionRef.current = false;
     reconnectAttemptRef.current = 0;
     void connectWorkspace(activeWorkspaceId, { automatic: true, quiet: true });
-  }, [activeWorkspaceId, connectWorkspace, connection]);
+  }, [account, activeWorkspaceId, connectWorkspace, connection]);
 
   useEffect(() => {
     activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
@@ -566,7 +580,9 @@ export function App() {
 
   useEffect(() => {
     if (
+      !account ||
       !autoReconnectRef.current ||
+      !hasOpenedConnectionRef.current ||
       !workspace ||
       (connection !== "closed" && connection !== "error")
     ) {
@@ -578,7 +594,7 @@ export function App() {
     const delay = reconnectDelayMs(attempt);
     const timer = window.setTimeout(() => {
       reconnectTimerRef.current = null;
-      void connectWorkspace(workspace.id, { automatic: true });
+      void connectWorkspace(workspace.id, { automatic: true, reconnect: true });
     }, delay);
     reconnectTimerRef.current = timer;
 
@@ -588,7 +604,7 @@ export function App() {
         reconnectTimerRef.current = null;
       }
     };
-  }, [connectWorkspace, connection, workspace]);
+  }, [account, connectWorkspace, connection, workspace]);
 
   useEffect(() => {
     if (connection !== "open") return;
@@ -965,24 +981,39 @@ export function App() {
     }
   }
 
-  async function login(provider: ipc.LoginProvider) {
-    const providerStatus = accountAuthStatus?.providers.find(
-      (item) => item.provider === provider,
-    );
-    if (providerStatus && !providerStatus.available) {
-      setError(
-        `${providerStatus.displayName} login is not configured for this desktop build.`,
-      );
-      return;
-    }
-    setBusy(`login:${provider}`);
+  async function setLocalIdentity(args: {
+    userId: string;
+    nickname: string;
+    actorId: string;
+  }): Promise<boolean> {
+    setBusy("account:set-local");
     setError(null);
     try {
-      const result = await ipc.accountLogin(provider);
+      const result = await ipc.accountSetLocal(args);
+      autoReconnectRef.current = false;
+      hasOpenedConnectionRef.current = false;
+      reconnectAttemptRef.current = 0;
+      clearReconnectTimer();
       applyConfig(result.config);
+      workspaceRef.current = null;
+      actorIdRef.current = null;
+      setConnection("idle");
+      setChannels([]);
+      setActors({});
+      setRuns({});
+      setInbox([]);
+      setTasks([]);
+      setMessages([]);
+      setThreadMessages([]);
+      setDirectMessages([]);
+      setDirectDraft("");
+      setActiveDirectActorId(null);
+      setDirectScopesByActorId({});
       pushNotice(`Signed in as ${accountName(result.account)}`);
+      return true;
     } catch (err) {
       setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -992,6 +1023,7 @@ export function App() {
     setBusy("logout");
     try {
       autoReconnectRef.current = false;
+      hasOpenedConnectionRef.current = false;
       reconnectAttemptRef.current = 0;
       clearReconnectTimer();
       applyConfig(await ipc.accountLogout());
@@ -999,12 +1031,17 @@ export function App() {
       setWorkspace(null);
       setConnection("idle");
       setChannels([]);
+      setActors({});
+      setRuns({});
+      setInbox([]);
+      setTasks([]);
       setMessages([]);
       setThreadMessages([]);
       setDirectMessages([]);
       setDirectDraft("");
       setActiveDirectActorId(null);
       setDirectScopesByActorId({});
+      setOnboardingActive(true);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -1012,11 +1049,11 @@ export function App() {
     }
   }
 
-  async function addWorkspace() {
+  async function addWorkspace(): Promise<Workspace | null> {
     const hasTarget = workspaceForm.advanced
       ? workspaceForm.serverUrl.trim()
       : workspaceForm.host.trim();
-    if (!workspaceForm.name.trim() || !hasTarget) return;
+    if (!workspaceForm.name.trim() || !hasTarget) return null;
     setBusy("workspace:add");
     setError(null);
     try {
@@ -1029,9 +1066,20 @@ export function App() {
       applyConfig(next);
       await loadMachines();
       setWorkspaceForm(defaultWorkspaceForm());
-      pushNotice(`Space ${workspaceForm.name.trim()} added`);
+      const saved =
+        next.workspaces.find((item) => item.serverUrl === serverUrl) ??
+        next.workspaces.find((item) => item.id === next.active) ??
+        null;
+      if (saved) {
+        await connectWorkspace(saved.id, { quiet: true });
+        pushNotice(`Connected to ${saved.name}`);
+      } else {
+        pushNotice(`Server ${workspaceForm.name.trim()} added`);
+      }
+      return saved;
     } catch (err) {
       setError(errorText(err));
+      return null;
     } finally {
       setBusy(null);
     }
@@ -1045,7 +1093,13 @@ export function App() {
       applyConfig(next);
       await loadMachines();
       if (workspace?.id === id) {
+        try {
+          await ipc.disconnect();
+        } catch {
+          /* local state still closes */
+        }
         autoReconnectRef.current = false;
+        hasOpenedConnectionRef.current = false;
         reconnectAttemptRef.current = 0;
         clearReconnectTimer();
         workspaceRef.current = null;
@@ -1100,6 +1154,45 @@ export function App() {
     } catch (err) {
       setError(errorText(err));
       return null;
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function startLocalHost(): Promise<boolean> {
+    if (connection !== "open" || !workspaceRef.current) {
+      setError("Connect to a server before starting a local host.");
+      return false;
+    }
+    const liveHost = machines.find(
+      (machine) =>
+        machine.source === "server_inventory" && machine.connectionStatus === "online",
+    );
+    if (liveHost) {
+      pushNotice(`${liveHost.name} is already online`);
+      return true;
+    }
+
+    let machine =
+      machines.find((item) => item.source === "local_registration") ?? null;
+    if (!machine) {
+      machine = await createMachine({ name: "Local Host" });
+      if (!machine) return false;
+    }
+
+    setBusy("machine:start");
+    setError(null);
+    try {
+      const result = await ipc.machineStart(machine.id);
+      applyMachines(result.machines);
+      pushNotice(`Local host started (pid ${result.pid})`);
+      window.setTimeout(() => {
+        void loadMachines(true).catch(() => {});
+      }, 1200);
+      return true;
+    } catch (err) {
+      setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -1781,13 +1874,56 @@ export function App() {
       return fitPanelSizes(next, viewportWidth, detailVisibleInGrid);
     });
   };
-  const selectWorkspace = (workspaceId: string) => {
+  const selectWorkspace = async (workspaceId: string): Promise<Workspace | null> => {
     setView("chat");
     setChannelPanelTab(null);
     if (workspace?.id !== workspaceId || connection !== "open") {
-      void connectWorkspace(workspaceId);
+      return connectWorkspace(workspaceId);
+    }
+    return workspaceRef.current ?? workspace ?? null;
+  };
+
+  const finishOnboarding = () => {
+    setOnboardingActive(false);
+    setView("chat");
+    if (connection === "open") {
+      void loadMachines(true).catch(() => {});
     }
   };
+
+  if (!configLoaded) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-[#f5f6fa] text-[#303849]">
+        <div className="flex items-center gap-3 rounded-xl border border-[#dfe3ec] bg-white px-4 py-3 text-sm font-semibold shadow-sm">
+          <Loader2 className="animate-spin text-[#5843d7]" size={18} />
+          Loading Loom
+        </div>
+      </div>
+    );
+  }
+
+  if (onboardingActive) {
+    return (
+      <OnboardingView
+        account={account}
+        busy={busy}
+        connection={connection}
+        error={error}
+        machines={machines}
+        workspace={workspace}
+        workspaceForm={workspaceForm}
+        setWorkspaceForm={setWorkspaceForm}
+        workspaces={workspaces}
+        onSaveIdentity={setLocalIdentity}
+        onAddWorkspace={addWorkspace}
+        onSelectWorkspace={selectWorkspace}
+        onRemoveWorkspace={removeWorkspace}
+        onCheckMachines={checkMachines}
+        onStartLocalHost={startLocalHost}
+        onFinish={finishOnboarding}
+      />
+    );
+  }
 
   return (
     <div
@@ -1805,7 +1941,6 @@ export function App() {
         workspace={workspace}
         workspaces={workspaces}
         onSelectWorkspace={selectWorkspace}
-        onDisconnect={disconnect}
         onOpenHome={() => setView("chat")}
         onOpenSpaces={() => setView("spaces")}
         onOpenAccount={() => setView("account")}
@@ -2052,9 +2187,7 @@ export function App() {
             <ErrorBanner error={error} />
             <AccountView
               account={account}
-              authStatus={accountAuthStatus}
               busy={busy}
-              onLogin={login}
               onLogout={logout}
             />
           </>
@@ -2146,4 +2279,3 @@ export function App() {
     </div>
   );
 }
-

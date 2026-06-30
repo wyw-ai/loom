@@ -599,7 +599,7 @@ export function OnboardingView({
                     Start a Host (optional)
                   </h1>
                   <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
-                    A Host is the machine that runs agent CLIs. Start one here if this computer already has supported runtimes, or finish now and configure it later.
+                    A Host is the machine that runs agent CLIs. Start it here if the agents run on this computer. If they run elsewhere, open Loom on that machine, connect to the same server, then run the generated Host command there.
                   </p>
                 </div>
                 <Button variant="outline" onClick={onCheckMachines} disabled={busy === "machine:check"}>
@@ -732,8 +732,8 @@ function PrepStep({ onContinue }: { onContinue: () => void }) {
           <ConceptRow
             icon={MonitorCog}
             title="Host"
-            body="A Host is a computer that runs agents. Connect to a server first, then start the local Host so agents can join that shared space."
-            detail='After connecting, click "Start Local Host"'
+            body="A Host is a computer that runs agents. If this machine runs agents, start the local Host after connecting. If agents live on another machine, connect that machine to the same server and run its generated Host command there."
+            detail="Run locally, or run the Host command on the agent machine"
           />
         </div>
 

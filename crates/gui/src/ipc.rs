@@ -359,6 +359,27 @@ async fn upsert_workspace_actor(
     Ok(())
 }
 
+async fn ensure_active_workspace_connection(
+    client: &Arc<Client>,
+    cfg: &DesktopConfig,
+) -> Result<(), String> {
+    let workspace = active_workspace(cfg)
+        .ok_or_else(|| "select a workspace before sending messages".to_string())?;
+    client
+        .open_connection(&workspace.actor_id, Some(&workspace.display_name))
+        .await
+        .map_err(deep_stringify)?;
+    upsert_workspace_actor(client, cfg.account.as_ref(), workspace)
+        .await
+        .map_err(deep_stringify)
+}
+
+fn active_workspace(cfg: &DesktopConfig) -> Option<&Workspace> {
+    config::active_workspace_id(cfg)
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .or_else(|| cfg.workspaces.first())
+}
+
 // ---- channel / thread / scope passthrough ---------------------------------
 
 #[tauri::command]
@@ -513,9 +534,10 @@ pub async fn message_list(state: State<'_, AppState>, params: Value) -> Result<V
 
 #[tauri::command]
 pub async fn message_send(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
-    state
-        .client()
-        .await?
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let client = state.client().await?;
+    ensure_active_workspace_connection(&client, &cfg).await?;
+    client
         .call_raw(method::MESSAGE_SEND, Some(params))
         .await
         .map_err(stringify)
@@ -2292,6 +2314,7 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
 
 fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
     let mut allowed_agents = HashSet::new();
+    let active_owner = config::active_owner_actor_id(cfg);
 
     if let Some(actors) = value.get("actors").and_then(Value::as_array) {
         for actor in actors {
@@ -2316,13 +2339,14 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if kind != "agent" {
-            return true;
+        let actor_id = actor.get("id").and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            "agent" => allowed_agents.contains(actor_id),
+            "human" => active_owner
+                .as_deref()
+                .is_none_or(|owner| actor_id == owner),
+            _ => true,
         }
-        actor
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| allowed_agents.contains(id))
     });
 
     value
@@ -2836,6 +2860,43 @@ mod tests {
         assert!(!actor_ids.contains(&"actor_agent_mine"));
         assert!(!actor_ids.contains(&"actor_agent_other"));
         assert!(actor_ids.contains(&"actor_service_other"));
+    }
+
+    #[test]
+    fn actor_list_filter_keeps_only_active_human_identity() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+        };
+        let value = json!({
+            "actors": [
+                { "id": account.actor_id, "kind": "human", "displayName": "星楚" },
+                { "id": "actor_human_local_default", "kind": "human", "displayName": "local_default" },
+                { "id": "actor_human_old", "kind": "human", "displayName": "old" },
+                { "id": "actor_service_machine", "kind": "service", "displayName": "Machine" }
+            ]
+        });
+
+        let filtered = filter_actor_list_for_active_context(value, &cfg);
+        let actor_ids = filtered["actors"]
+            .as_array()
+            .expect("actors")
+            .iter()
+            .filter_map(|actor| actor["id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(actor_ids.contains(&account.actor_id.as_str()));
+        assert!(!actor_ids.contains(&"actor_human_local_default"));
+        assert!(!actor_ids.contains(&"actor_human_old"));
+        assert!(actor_ids.contains(&"actor_service_machine"));
     }
 
     #[test]

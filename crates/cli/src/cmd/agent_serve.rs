@@ -1691,6 +1691,71 @@ fn collect_private_to_ids(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+fn turn_key_for_trigger(trigger: &AgentTrigger) -> String {
+    match trigger {
+        AgentTrigger::Message(message) => turn_key_for_message(message),
+        AgentTrigger::Event(event) => format!(
+            "scope:{}:{}",
+            scope_kind_name(event.scope.kind),
+            event.scope.id
+        ),
+    }
+}
+
+fn turn_key_for_message(message: &Message) -> String {
+    if message.target.starts_with("dm:") {
+        return message.target.clone();
+    }
+    if let Some((channel_id, root_message_id)) = thread_target_parts(&message.target) {
+        return format!("thread-root:{channel_id}:{root_message_id}");
+    }
+    if let Some(root_message_id) = message.thread_root_message_id.as_deref() {
+        return format!(
+            "thread-root:{}:{root_message_id}",
+            channel_id_from_target(&message.target).unwrap_or_else(|| message.scope.id.clone())
+        );
+    }
+    match message.scope.kind {
+        ScopeKind::Channel => format!("thread-root:{}:{}", message.scope.id, message.id),
+        ScopeKind::Thread => format!("scope:thread:{}", message.scope.id),
+    }
+}
+
+fn thread_target_parts(target: &str) -> Option<(String, String)> {
+    let raw = target.strip_prefix('#')?;
+    let (channel_id, root_message_id) = raw.split_once(':')?;
+    if channel_id.is_empty() || root_message_id.is_empty() {
+        return None;
+    }
+    Some((channel_id.to_string(), root_message_id.to_string()))
+}
+
+fn channel_id_from_target(target: &str) -> Option<String> {
+    target
+        .strip_prefix('#')
+        .map(|raw| {
+            raw.split_once(':')
+                .map(|(channel, _)| channel)
+                .unwrap_or(raw)
+        })
+        .filter(|channel| !channel.is_empty())
+        .map(ToString::to_string)
+}
+
+fn scope_belongs_to_channel(
+    scope: &ScopeRef,
+    channel_id: &str,
+    channel_for_thread: &HashMap<String, String>,
+) -> bool {
+    match &scope.kind {
+        ScopeKind::Channel => scope.id == channel_id,
+        ScopeKind::Thread => channel_for_thread
+            .get(&scope.id)
+            .map(|channel| channel == channel_id)
+            .unwrap_or(false),
+    }
+}
+
 struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
@@ -1702,22 +1767,18 @@ struct WorkerState {
     paths: AgentPaths,
     agent_server_url: String,
     agent_config_version_id: String,
-    /// In-flight turn per scope. A worker may own one adapter instance, but
-    /// scope/session state is isolated below the adapter boundary, so only
-    /// prompts in the same scope block each other.
+    /// In-flight turn per scope. Adapter events are scoped only by scope id, so
+    /// translation still uses scope as the active-turn lookup key.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
-    /// Per-scope serialization gate. A scope id is present here from the moment a
-    /// turn is *reserved* (before the async `run.open`/prompt-compose work that
-    /// precedes `set_turn`) until the turn finishes with no queued successor.
-    /// This is the single source of truth for "is this scope busy?" and is what
-    /// makes begin-or-enqueue atomic across the two concurrent worker tasks
-    /// (the notification/inbox loop and the adapter-event/Finished loop), which
-    /// otherwise race the `active_turns` check-then-set window and dispatch
-    /// several overlapping turns into the same scope.
-    scope_busy: Mutex<HashSet<String>>,
-    /// Per-scope queues of triggers received while that scope is busy. Human
-    /// triggers are kept ahead of service callbacks within the same scope so
-    /// stale automation cannot starve an explicit user request.
+    /// Root/thread-family serialization gate. A turn key is present here from
+    /// the moment a turn is reserved until it finishes with no queued successor.
+    /// This preserves the mainline atomic begin/finish behavior while grouping
+    /// a channel root and its derived task/thread prompts into one FIFO.
+    busy_turn_keys: Mutex<HashSet<String>>,
+    /// Per-root/thread-family queues of triggers received while that
+    /// conversation is busy. Human triggers are kept ahead of service callbacks
+    /// within the same family so stale automation cannot starve an explicit
+    /// user request.
     pending_triggers: Mutex<HashMap<String, VecDeque<AgentTrigger>>>,
     /// Per-turn streaming text buffer. Token/chunk streams are buffered until
     /// the adapter reports a message boundary; complete assistant messages are
@@ -1756,6 +1817,7 @@ struct ActiveTurn {
     /// moves to Run.
     id: String,
     run_id: String,
+    turn_key: String,
     scope: ScopeRef,
     trigger_source_id: String,
     trigger_is_message: bool,
@@ -1925,7 +1987,7 @@ impl WorkerState {
             agent_server_url,
             agent_config_version_id,
             active_turns: Mutex::new(HashMap::new()),
-            scope_busy: Mutex::new(HashSet::new()),
+            busy_turn_keys: Mutex::new(HashSet::new()),
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
@@ -1948,6 +2010,10 @@ impl WorkerState {
     }
 
     fn set_turn(&self, turn: ActiveTurn) {
+        self.busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(turn.turn_key.clone());
         self.active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1972,42 +2038,25 @@ impl WorkerState {
     }
 
     /// Drop the active turn for `scope_id` and pop the next queued trigger for
-    /// that same scope (if any). Test-only; production uses `finish_and_next`.
+    /// that same root/thread-family key (if any). Test-only; production uses
+    /// `finish_and_next`.
     #[cfg(test)]
     fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
-        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
-        active.remove(scope_id);
-        drop(active);
-        let mut pending = self
-            .pending_triggers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let next = match pending.get_mut(scope_id) {
-            Some(queue) => queue.pop_front(),
-            None => None,
-        };
-        if pending
-            .get(scope_id)
-            .map(|queue| queue.is_empty())
-            .unwrap_or(false)
-        {
-            pending.remove(scope_id);
-        }
-        next
+        self.finish_and_next(scope_id)
     }
 
     #[cfg(test)]
-    fn enqueue(&self, scope_id: &str, trigger: AgentTrigger) {
+    fn enqueue(&self, turn_key: &str, trigger: AgentTrigger) {
         let mut pending = self
             .pending_triggers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        Self::enqueue_locked(&mut pending, scope_id, trigger);
+        Self::enqueue_locked(&mut pending, turn_key, trigger);
     }
 
     fn enqueue_locked(
         pending: &mut HashMap<String, VecDeque<AgentTrigger>>,
-        scope_id: &str,
+        turn_key: &str,
         trigger: AgentTrigger,
     ) {
         if pending
@@ -2016,7 +2065,7 @@ impl WorkerState {
         {
             return;
         }
-        let queue = pending.entry(scope_id.to_string()).or_default();
+        let queue = pending.entry(turn_key.to_string()).or_default();
         if is_priority_trigger(&trigger) {
             let insert_at = queue
                 .iter()
@@ -2030,53 +2079,62 @@ impl WorkerState {
     }
 
     /// Atomically decide whether to dispatch `trigger` now or queue it. Returns
-    /// `true` if the caller acquired the scope and must dispatch; `false` if the
-    /// scope was already busy and the trigger was enqueued. The `scope_busy`
+    /// `true` if the caller acquired the turn key and must dispatch; `false` if
+    /// the conversation was already busy and the trigger was enqueued. The
+    /// `busy_turn_keys`
     /// lock is held across the whole check-or-enqueue so it cannot interleave
     /// with [`Self::finish_and_next`] running on the other worker task — which
     /// is what previously let a burst of wakes spawn several overlapping turns
-    /// for the same scope.
-    fn begin_or_enqueue(&self, scope_id: &str, trigger: AgentTrigger) -> bool {
-        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
-        if busy.contains(scope_id) {
+    /// for the same conversation.
+    fn begin_or_enqueue(&self, turn_key: &str, trigger: AgentTrigger) -> bool {
+        let mut busy = self
+            .busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if busy.contains(turn_key) {
             let mut pending = self
                 .pending_triggers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            Self::enqueue_locked(&mut pending, scope_id, trigger);
+            Self::enqueue_locked(&mut pending, turn_key, trigger);
             false
         } else {
-            busy.insert(scope_id.to_string());
+            busy.insert(turn_key.to_string());
             true
         }
     }
 
     /// Finish the active turn for `scope_id`: drop its metadata, then atomically
-    /// either hand back the next queued trigger for the same scope (the scope
+    /// either hand back the next queued trigger for the same turn key (the key
     /// stays reserved so the successor dispatches without re-racing the gate) or,
-    /// if the queue is empty, release the scope. Locks `scope_busy` before
+    /// if the queue is empty, release the key. Locks `busy_turn_keys` before
     /// `pending`, matching [`Self::begin_or_enqueue`], so the empty-check and the
     /// release are atomic with a concurrent begin-or-enqueue.
     fn finish_and_next(&self, scope_id: &str) -> Option<AgentTrigger> {
-        self.active_turns
+        let turn_key = self
+            .active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(scope_id);
-        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
+            .remove(scope_id)
+            .map(|turn| turn.turn_key)?;
+        let mut busy = self
+            .busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut pending = self
             .pending_triggers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(queue) = pending.get_mut(scope_id) {
+        if let Some(queue) = pending.get_mut(&turn_key) {
             let next = queue.pop_front();
             if queue.is_empty() {
-                pending.remove(scope_id);
+                pending.remove(&turn_key);
             }
             if next.is_some() {
                 return next;
             }
         }
-        busy.remove(scope_id);
+        busy.remove(&turn_key);
         None
     }
 
@@ -2095,38 +2153,43 @@ impl WorkerState {
 
         let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
         let mut scopes: Vec<ScopeRef> = Vec::new();
+        let mut turn_keys: HashSet<String> = HashSet::new();
 
         for turn in active.values_mut() {
-            let belongs = match &turn.scope.kind {
-                ScopeKind::Channel => turn.scope.id == channel_id,
-                ScopeKind::Thread => channel_for_thread
-                    .get(&turn.scope.id)
-                    .map(|c| c == channel_id)
-                    .unwrap_or(false),
-            };
+            let belongs = scope_belongs_to_channel(&turn.scope, channel_id, &channel_for_thread);
             if belongs {
                 turn.cancel_requested = true;
                 scopes.push(turn.scope.clone());
+                turn_keys.insert(turn.turn_key.clone());
             }
         }
         drop(active);
 
-        // Clear pending triggers for scopes in the deleted channel so queued
+        // Clear pending triggers for the deleted channel so queued
         // work doesn't re-dispatch after the adapter finishes.
         let mut pending = self
             .pending_triggers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for scope in &scopes {
-            pending.remove(&scope.id);
-        }
+        pending.retain(|turn_key, queue| {
+            if turn_keys.contains(turn_key) {
+                return false;
+            }
+            queue.retain(|trigger| {
+                !scope_belongs_to_channel(trigger.scope(), channel_id, &channel_for_thread)
+            });
+            !queue.is_empty()
+        });
         drop(pending);
 
-        // Release the scope-busy gate so the worker doesn't think these scopes
+        // Release the busy gate so the worker doesn't think these turn keys
         // are still occupied.
-        let mut busy = self.scope_busy.lock().unwrap_or_else(|e| e.into_inner());
-        for scope in &scopes {
-            busy.remove(&scope.id);
+        let mut busy = self
+            .busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for turn_key in &turn_keys {
+            busy.remove(turn_key);
         }
 
         scopes
@@ -3073,6 +3136,7 @@ fn is_message_for_us_with_delivery(
         AudienceKind::Actor => {
             audience.id == actor_id
                 && (message.delivery_policy == DeliveryPolicy::WakeAgent
+                    || (actor_inbox_delivery && message.delivery_policy != DeliveryPolicy::Silent)
                     || message.metadata.get("kind").and_then(Value::as_str)
                         == Some("action.request"))
         }
@@ -3083,7 +3147,7 @@ fn is_message_for_us_with_delivery(
     }) {
         return true;
     }
-    actor_inbox_delivery && message_counts_as_actor_inbox_attention(message, actor_id)
+    actor_inbox_delivery && message_counts_as_actor_inbox_attention(message)
 }
 
 fn is_actor_inbox_delivery_for(params: &Value, actor_id: &str) -> bool {
@@ -3130,15 +3194,8 @@ fn run_requests_no_reply(run: &Run) -> bool {
             .is_some_and(|value| value == "none" || value == "ignore")
 }
 
-fn message_counts_as_actor_inbox_attention(message: &Message, actor_id: &str) -> bool {
+fn message_counts_as_actor_inbox_attention(message: &Message) -> bool {
     if message.delivery_policy == DeliveryPolicy::Silent {
-        return false;
-    }
-    if message
-        .audience
-        .iter()
-        .any(|audience| audience.kind == AudienceKind::Actor && audience.id == actor_id)
-    {
         return false;
     }
     if message.scope.kind == ScopeKind::Thread {
@@ -3744,12 +3801,12 @@ async fn handle_trigger(
     trigger: AgentTrigger,
 ) -> Result<TriggerOutcome> {
     let trigger = trigger.clone();
-    // Scope FIFO: the same actor can handle independent scopes concurrently,
-    // but prompts in one thread/channel remain ordered. `begin_or_enqueue`
-    // reserves the scope atomically before the async dispatch work so a burst
-    // of wakes cannot race the gate and spawn overlapping turns.
-    let scope_id = trigger.scope().id.clone();
-    if !state.begin_or_enqueue(&scope_id, trigger.clone()) {
+    // Root/thread-family FIFO: the same actor can handle independent
+    // conversations concurrently, but a channel root turn and its derived
+    // thread remain ordered. `begin_or_enqueue` reserves the key atomically
+    // before async dispatch work so bursts cannot race the gate.
+    let turn_key = turn_key_for_trigger(&trigger);
+    if !state.begin_or_enqueue(&turn_key, trigger.clone()) {
         return Ok(TriggerOutcome::Queued);
     }
     dispatch_trigger(client, state, adapter, trigger)
@@ -3769,6 +3826,7 @@ async fn dispatch_trigger(
     mut trigger: AgentTrigger,
 ) -> Result<AgentTrigger> {
     loop {
+        let turn_key = turn_key_for_trigger(&trigger);
         subscribe_scope(client, state, trigger.scope()).await;
         let run_res: RunOpenResult = client
             .call(
@@ -3793,6 +3851,7 @@ async fn dispatch_trigger(
         let active = ActiveTurn {
             id: run_res.run.id.clone(),
             run_id: run_res.run.id.clone(),
+            turn_key: turn_key.clone(),
             scope: trigger.scope().clone(),
             trigger_source_id: trigger.id().to_string(),
             trigger_is_message: trigger.is_message(),
@@ -4960,6 +5019,10 @@ fn trigger_target_ids(trigger: &AgentTrigger) -> Vec<String> {
     let mut targets = Vec::new();
     match trigger {
         AgentTrigger::Message(message) => {
+            let private_actor_ids = private_actor_ids_for_prompt(&message.metadata);
+            if !private_actor_ids.is_empty() {
+                return private_actor_ids;
+            }
             for audience in &message.audience {
                 if audience.kind == AudienceKind::Actor && seen.insert(audience.id.clone()) {
                     targets.push(audience.id.clone());
@@ -6152,11 +6215,13 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          \n\
          <cli>\n\
          Targets: `#<channel_id>` is a channel and `#<channel_id>:<root_message_id>` is a thread (sending to a\n\
-         thread target creates or reuses it). For everything in this activity send to `$LOOM_REPLY_TARGET` (the\n\
+         thread target creates or reuses it). If you only have a thread id, use `--thread <thread_id>` with\n\
+         `message read`, `message send`, or `message ask`; it resolves to the channel/root target. For\n\
+         everything in this activity send to `$LOOM_REPLY_TARGET` (the\n\
          shared thread) — not a bare `#<channel_id>`; `$LOOM_CHANNEL_ID` is for `channel members` only and is\n\
          never a message target. `--private-to @id` stays in this scope and wakes @id; `--to @id`\n\
          opens a separate global DM (not part of this scope) and is rarely what you want. Read with\n\
-         `loom --json message read --target \"$LOOM_REPLY_TARGET\"` (add `--limit <n>` or `--before <message_id>`\n\
+         `loom --json message read --target \"$LOOM_REPLY_TARGET\"` or `loom --json message read --thread <thread_id>` (add `--limit <n>` or `--before <message_id>`\n\
          to page older history beyond the auto-injected window; `loom --json message search \"<text>\"` finds\n\
          messages by content); before sending visible work, re-read the\n\
          latest message and pass `--if-latest <message_id>` so you rebase on current state. For who is present,\n\
@@ -6164,7 +6229,8 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
          `loom actor list` (global and stale). `message ask` is the same as a `message send` carrying an\n\
          explicit @id audience with `--intent request_action --delivery-policy wake_agent`; that audience sets\n\
          who is WOKEN, not who can see it, so a `message ask` on `$LOOM_REPLY_TARGET` is still public — for a\n\
-         hidden recipient use `--private-to` (it wakes too). Use\n\
+         hidden recipient use `--private-to` (it wakes too). Fetch attachments with\n\
+         `loom --json artifact get <art_id|artifact://...>`. Use\n\
          `loom --json ask-user-question` to get a choice/input from the human, and `loom --json request-approval`\n\
          for an approve/reject gate. Run `loom <command> --help` for anything else. Only the text after this\n\
          line is the new user input.\n\
@@ -7265,6 +7331,7 @@ mod tests {
         ActiveTurn {
             id: "turn_failure".into(),
             run_id: "run_failure".into(),
+            turn_key: "thread-root:chan_failure:msg_failure".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Channel,
                 id: "chan_failure".into(),
@@ -7453,6 +7520,7 @@ mod tests {
         let active = ActiveTurn {
             id: "turn_demo".into(),
             run_id: "run_demo".into(),
+            turn_key: "thread-root:chan_demo:msg_trigger".into(),
             scope: scope.clone(),
             trigger_source_id: "msg_trigger".into(),
             trigger_is_message: true,
@@ -7689,6 +7757,39 @@ mod tests {
     }
 
     #[test]
+    fn turn_key_groups_channel_root_with_derived_thread() {
+        let root = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        let reply = sample_message(
+            "msg_reply",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+
+        assert_eq!(
+            turn_key_for_message(&root),
+            "thread-root:chan_demo:msg_root"
+        );
+        assert_eq!(
+            turn_key_for_message(&reply),
+            "thread-root:chan_demo:msg_root"
+        );
+    }
+
+    #[test]
     fn all_wake_message_is_deliverable_to_agent_worker() {
         let mut message = sample_message(
             "msg_all",
@@ -7796,7 +7897,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_notify_only_actor_inbox_delivery_still_does_not_wake_agent_worker() {
+    fn explicit_notify_only_actor_inbox_delivery_wakes_agent_worker() {
         let mut message = sample_message(
             "msg_notify",
             ScopeRef {
@@ -7814,6 +7915,29 @@ mod tests {
             display: None,
         }];
         message.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        assert!(is_inbox_message_for_us(&message, "actor_agent_echo"));
+    }
+
+    #[test]
+    fn explicit_silent_actor_inbox_delivery_does_not_wake_agent_worker() {
+        let mut message = sample_message(
+            "msg_silent",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_parent"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_sender".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_agent_echo".into(),
+            display: None,
+        }];
+        message.delivery_policy = DeliveryPolicy::Silent;
 
         assert!(!is_inbox_message_for_us(&message, "actor_agent_echo"));
     }
@@ -7919,6 +8043,7 @@ mod tests {
         let active = ActiveTurn {
             id: "turn_demo".into(),
             run_id: "run_demo".into(),
+            turn_key: "thread-root:chan_demo:msg_root".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
@@ -7970,6 +8095,7 @@ mod tests {
         let active = ActiveTurn {
             id: "turn_demo".into(),
             run_id: "run_demo".into(),
+            turn_key: "thread-root:chan_demo:msg_root".into(),
             scope: ScopeRef {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
@@ -8075,6 +8201,7 @@ mod tests {
         let mut actor_names = HashMap::new();
         actor_names.insert("actor_agent_coordinator".into(), "Coordinator".into());
         actor_names.insert("actor_agent_recipient".into(), "Recipient".into());
+        actor_names.insert("actor_human_local".into(), "Human".into());
         let mut message = sample_message(
             "msg_private",
             ScopeRef {
@@ -8091,6 +8218,11 @@ mod tests {
         message
             .metadata
             .insert("privateTo".into(), json!(["actor_agent_recipient"]));
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_human_local".into(),
+            display: None,
+        }];
         mark_actor_inbox_delivery(&mut message, "actor_agent_recipient");
 
         let prompt = render_trigger_prompt_with_names(
@@ -8101,6 +8233,9 @@ mod tests {
         );
 
         assert!(prompt.contains("Visibility: private to Recipient (@actor_agent_recipient)"));
+        assert!(prompt.contains("Route target(s): Recipient (@actor_agent_recipient)"));
+        assert!(!prompt.contains("Route target(s): Human (@actor_human_local)"));
+        assert!(!prompt.contains("visible route -> Human"));
         assert!(prompt.contains("Visible message:"));
     }
 
@@ -9067,6 +9202,7 @@ mod tests {
         state.set_turn(ActiveTurn {
             id: "turn_1".into(),
             run_id: "run_1".into(),
+            turn_key: "thread-root:chan_demo:msg_1".into(),
             scope: scope.clone(),
             trigger_source_id: "msg_1".into(),
             trigger_is_message: true,
@@ -9341,7 +9477,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_state_queues_triggers_per_scope_only() {
+    fn worker_state_queues_triggers_by_turn_key() {
         let root = temp_path("scope-queue");
         let paths = AgentPaths::new(&root, "actor_demo");
         let state = WorkerState::new(
@@ -9358,6 +9494,7 @@ mod tests {
         state.set_turn(ActiveTurn {
             id: "turn_channel".into(),
             run_id: "run_channel".into(),
+            turn_key: "thread-root:chan_triage:msg_root".into(),
             scope: active_scope.clone(),
             trigger_source_id: "msg_root".into(),
             trigger_is_message: true,
@@ -9401,11 +9538,11 @@ mod tests {
         assert!(state.current_turn(&active_scope.id).is_some());
         assert!(state.current_turn(&queued_thread.scope.id).is_none());
         state.enqueue(
-            &queued_channel.scope.id,
+            "thread-root:chan_triage:msg_root",
             AgentTrigger::Event(queued_channel.clone()),
         );
         state.enqueue(
-            &queued_thread.scope.id,
+            "scope:thread:thread_task",
             AgentTrigger::Event(queued_thread.clone()),
         );
         assert!(state.has_pending_source(&queued_channel.id));
@@ -9418,12 +9555,7 @@ mod tests {
         );
         assert!(state.current_turn(&active_scope.id).is_none());
         assert!(state.clear_turn(&active_scope.id).is_none());
-        assert_eq!(
-            state
-                .clear_turn(&queued_thread.scope.id)
-                .map(|trigger| trigger.id().to_string()),
-            Some(queued_thread.id)
-        );
+        assert!(state.has_pending_source(&queued_thread.id));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -9445,6 +9577,7 @@ mod tests {
         state.set_turn(ActiveTurn {
             id: "turn_busy".into(),
             run_id: "run_busy".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
             trigger_source_id: "msg_busy".into(),
             trigger_is_message: true,
@@ -9495,36 +9628,96 @@ mod tests {
             _meta: None,
         };
 
-        state.enqueue(&service.scope.id, AgentTrigger::Event(service.clone()));
-        state.enqueue(&human_one.scope.id, AgentTrigger::Event(human_one.clone()));
-        state.enqueue(&human_two.scope.id, AgentTrigger::Event(human_two.clone()));
-        state.enqueue(&human_one.scope.id, AgentTrigger::Event(human_one.clone()));
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(service.clone()),
+        );
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(human_one.clone()),
+        );
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(human_two.clone()),
+        );
+        state.enqueue(
+            "thread-root:chan_demo:msg_busy",
+            AgentTrigger::Event(human_one.clone()),
+        );
 
         assert_eq!(
             state
                 .clear_turn(&active_scope.id)
                 .map(|trigger| trigger.id().to_string()),
-            Some(human_one.id)
+            Some(human_one.id.clone())
         );
+        state.set_turn(ActiveTurn {
+            id: "turn_human_one".into(),
+            run_id: "run_human_one".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
+            scope: active_scope.clone(),
+            trigger_source_id: human_one.id.clone(),
+            trigger_is_message: false,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_123".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
         assert_eq!(
             state
                 .clear_turn(&active_scope.id)
                 .map(|trigger| trigger.id().to_string()),
-            Some(human_two.id)
+            Some(human_two.id.clone())
         );
+        state.set_turn(ActiveTurn {
+            id: "turn_human_two".into(),
+            run_id: "run_human_two".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
+            scope: active_scope.clone(),
+            trigger_source_id: human_two.id.clone(),
+            trigger_is_message: false,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_123".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
         assert_eq!(
             state
                 .clear_turn(&active_scope.id)
                 .map(|trigger| trigger.id().to_string()),
-            Some(service.id)
+            Some(service.id.clone())
         );
+        state.set_turn(ActiveTurn {
+            id: "turn_service".into(),
+            run_id: "run_service".into(),
+            turn_key: "thread-root:chan_demo:msg_busy".into(),
+            scope: active_scope.clone(),
+            trigger_source_id: service.id.clone(),
+            trigger_is_message: false,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "mr-watcher".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
         assert!(state.clear_turn(&active_scope.id).is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn begin_or_enqueue_serializes_one_turn_per_scope_and_drains_in_order() {
-        let root = temp_path("scope-begin-or-enqueue");
+    fn begin_or_enqueue_serializes_one_turn_per_turn_key_and_drains_in_order() {
+        let root = temp_path("turn-key-begin-or-enqueue");
         let paths = AgentPaths::new(&root, "actor_demo");
         let state = WorkerState::new(
             "actor_demo".into(),
@@ -9551,38 +9744,62 @@ mod tests {
                 _meta: None,
             })
         };
+        let turn_key = "thread-root:chan_demo:msg_root";
+        let set_running = |trigger_id: &str| {
+            state.set_turn(ActiveTurn {
+                id: format!("turn_{trigger_id}"),
+                run_id: format!("run_{trigger_id}"),
+                turn_key: turn_key.into(),
+                scope: scope.clone(),
+                trigger_source_id: trigger_id.into(),
+                trigger_is_message: false,
+                reply_target: None,
+                prompt_stats: empty_prompt_stats(),
+                prompt_breakdown: empty_prompt_breakdown(),
+                trigger_actor: "actor_demo".into(),
+                trigger_private_to: Vec::new(),
+                no_reply_file: None,
+                no_reply_requested: false,
+                cancel_requested: false,
+            });
+        };
 
-        // First trigger acquires the scope and must dispatch.
-        assert!(state.begin_or_enqueue(&scope.id, mk("evt_a")));
+        // First trigger acquires the turn key and must dispatch.
+        assert!(state.begin_or_enqueue(turn_key, mk("evt_a")));
+        set_running("evt_a");
         // A burst of further triggers while busy must all enqueue, never dispatch.
-        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_b")));
-        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_c")));
-        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_d")));
+        assert!(!state.begin_or_enqueue(turn_key, mk("evt_b")));
+        assert!(!state.begin_or_enqueue(turn_key, mk("evt_c")));
+        assert!(!state.begin_or_enqueue(turn_key, mk("evt_d")));
 
         // Finishing hands back the queued triggers in FIFO order, keeping the
-        // scope reserved across each successor.
+        // turn key reserved across each successor.
         assert_eq!(
             state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
             Some("evt_b".to_string())
         );
-        // While draining, the scope is still busy, so a new wake enqueues at the back.
-        assert!(!state.begin_or_enqueue(&scope.id, mk("evt_e")));
+        set_running("evt_b");
+        // While draining, the turn key is still busy, so a new wake enqueues at the back.
+        assert!(!state.begin_or_enqueue(turn_key, mk("evt_e")));
         assert_eq!(
             state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
             Some("evt_c".to_string())
         );
+        set_running("evt_c");
         assert_eq!(
             state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
             Some("evt_d".to_string())
         );
+        set_running("evt_d");
         assert_eq!(
             state.finish_and_next(&scope.id).map(|t| t.id().to_string()),
             Some("evt_e".to_string())
         );
-        // Queue empty now: finishing releases the scope.
+        set_running("evt_e");
+        // Queue empty now: finishing releases the turn key.
         assert!(state.finish_and_next(&scope.id).is_none());
-        // Released scope can be acquired again.
-        assert!(state.begin_or_enqueue(&scope.id, mk("evt_f")));
+        // Released turn key can be acquired again.
+        assert!(state.begin_or_enqueue(turn_key, mk("evt_f")));
         std::fs::remove_dir_all(root).ok();
     }
 }

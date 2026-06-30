@@ -292,6 +292,9 @@ recipients (`@actor_a @actor_b`) or `@all`/`@agents` only when every matching\n\
 actor should start a turn. Text such as \"大家\", \"你们几个\", \"当前参与者\", or\n\
 \"participants\" is not a delivery target by itself. Use exact actor ids with\n\
 `message ask`, `--private-to` for hidden same-scope prompts, and plain `message send` only for summaries that require no one to act.\n\
+A literal `@actor_id` mention is an explicit routed delivery and may wake that\n\
+actor; when merely referring to someone, use their display name without `@` or\n\
+send with `--delivery-policy silent`.\n\
 Hidden or private information must stay private even when the current\n\
 conversation is public to the channel. This includes hidden roles or states,\n\
 secrets, credentials, private votes/actions, medical/legal/personal details, and\n\
@@ -384,9 +387,13 @@ commands directly for server or Aone state.\n\
 ```\n\
 loom --json message read --target '#<channel_id>'\n\
 loom --json message read --target '#<channel_id>:<root_message_id>'\n\
+# message read returns the public transcript by default; add --include-private\n\
+# only when you intentionally need private messages addressed to you.\n\
 loom --json message read --target '#<channel_id>:<root_message_id>' --before <message_id>\n\
 loom --json message search --query \"keyword\" --target '#<channel_id>:<root_message_id>'\n\
 loom --json inbox list                                  # drain directed inbox\n\
+# Do not use inbox list --state all during a scoped turn unless explicitly\n\
+# auditing history; it can mix old cross-channel deliveries into the current task.\n\
 loom --json thread list\n\
 loom --json task list [--source-message <message_id>]\n\
 loom --json task show <task_id>\n\

@@ -2,7 +2,7 @@ import { localServerUrl } from "@/lib/constants";
 import type { WorkspaceFormState } from "@/lib/types";
 
 export const defaultServerPort = "7878";
-export const serverHostPlaceholder = "your-server-host";
+export const serverHostPlaceholder = "127.0.0.1";
 export const serverUrlPreviewPlaceholder = `ws://${serverHostPlaceholder}:${defaultServerPort}/rpc`;
 
 function hasScheme(value: string) {

@@ -72,8 +72,7 @@ export function RegisteredHostsEmpty({
         </div>
         <h2 className="mt-4 text-lg font-bold text-[#111827]">Register a Host</h2>
         <p className="mt-2 text-sm leading-6 text-[#667085]">
-          Prepare a daemon registration for this space, then start the generated command so
-          the host can publish its runtime inventory.
+          Prepare a daemon registration for this space, then start the generated command so the host can publish its runtime inventory.
         </p>
         <Button
           className="mt-5 rounded-lg"
@@ -321,7 +320,7 @@ export function MachineCard({
           <HostInfoRow label="Inventory">
             Revision {machine.inventoryRevision}
             {machine.inventoryObservedAt
-              ? ` · observed ${formatTime(machine.inventoryObservedAt)}`
+              ? ` · ${formatTime(machine.inventoryObservedAt)}`
               : ""}
           </HostInfoRow>
         </div>

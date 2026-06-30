@@ -4,7 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { localServerCommand } from "@/lib/constants";
-import { connectionLabel, workspaceInitials } from "@/lib/format-utils";
+import { workspaceInitials } from "@/lib/format-utils";
 import {
   normalizeWorkspaceFormServerUrl,
   serverUrlPreviewPlaceholder,
@@ -77,7 +77,7 @@ export function SpacesView({
                   onChange={(event) =>
                     setWorkspaceForm({ ...workspaceForm, name: event.target.value })
                   }
-                  placeholder="Name"
+                  placeholder="Local"
                 />
                 {workspaceForm.advanced ? (
                   <Input
@@ -86,7 +86,7 @@ export function SpacesView({
                     onChange={(event) =>
                       setWorkspaceForm({ ...workspaceForm, serverUrl: event.target.value })
                     }
-                    placeholder="ws://your-server-host:7878/rpc"
+                    placeholder={serverUrlPreviewPlaceholder}
                   />
                 ) : (
                   <Input
@@ -95,7 +95,7 @@ export function SpacesView({
                     onChange={(event) =>
                       setWorkspaceForm({ ...workspaceForm, host: event.target.value })
                     }
-                    placeholder="your server host"
+                    placeholder="127.0.0.1:7878"
                   />
                 )}
                 <Button
@@ -126,7 +126,7 @@ export function SpacesView({
                   }}
                 >
                   <Link2 size={15} />
-                  Advanced
+                  {workspaceForm.advanced ? "Host Mode" : "Full URL"}
                 </Button>
                 <Button
                   type="submit"
@@ -199,7 +199,7 @@ export function SpacesView({
                               selected && connection === "open" ? "success" : "outline"
                             }
                           >
-                            {selected ? connectionLabel(connection) : "Saved"}
+                            {selected ? spaceConnectionLabel(connection) : "Saved"}
                           </Badge>
                         </div>
                         <div className="mt-1 truncate font-mono text-xs text-[#667085]">
@@ -238,6 +238,14 @@ export function SpacesView({
       </div>
     </section>
   );
+}
+
+function spaceConnectionLabel(connection: ConnectionState) {
+  if (connection === "open") return "Connected";
+  if (connection === "connecting") return "Connecting";
+  if (connection === "error") return "Connection error";
+  if (connection === "closed") return "Disconnected";
+  return "Idle";
 }
 
 

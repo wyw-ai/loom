@@ -25,7 +25,7 @@ import { buildUsageDisplay, type UsageDisplay } from "@/lib/agent-usage-display"
  * - `available`: snapshot exists and `buildUsageDisplay` returns non-null →
  *   render the existing segment bar (no regression).
  * - `no_data`: no snapshot (agent hasn't completed a turn yet) → show
- *   "暂无用量数据" instead of the misleading "Token tracking unavailable..."
+ *   "No usage data yet" instead of the misleading "Token tracking unavailable..."
  * - `estimated_only`: snapshot exists but `cumulative.estimated === true`
  *   (provider doesn't return real token data) → silently hide the usage region.
  */

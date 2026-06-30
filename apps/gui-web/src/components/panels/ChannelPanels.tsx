@@ -366,7 +366,7 @@ export function ChannelMembersPanel({
         channel={channel}
         items={onlineMembers}
         runs={runs}
-        title="在线"
+        title="Online"
         onRemoveMember={onRemoveMember}
       />
       <ChannelMemberGroup
@@ -374,7 +374,7 @@ export function ChannelMembersPanel({
         channel={channel}
         items={offlineMembers}
         runs={runs}
-        title="离线"
+        title="Offline"
         onRemoveMember={onRemoveMember}
       />
       {onlineMembers.length === 0 && offlineMembers.length === 0 && (

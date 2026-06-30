@@ -1,4 +1,4 @@
-import { Loader2, LogOut, Plus, Users } from "lucide-react";
+import { Loader2, Plus, Users } from "lucide-react";
 import type { HumanAccount, Workspace } from "@/ipc/types";
 import type { ConnectionState } from "@/lib/types";
 import { accountName, workspaceInitials } from "@/lib/format-utils";
@@ -12,7 +12,6 @@ export function Rail({
   workspace,
   workspaces,
   onSelectWorkspace,
-  onDisconnect,
   onOpenHome,
   onOpenSpaces,
   onOpenAccount,
@@ -23,7 +22,6 @@ export function Rail({
   workspace: Workspace | null;
   workspaces: Workspace[];
   onSelectWorkspace: (workspaceId: string) => void;
-  onDisconnect: () => void;
   onOpenHome: () => void;
   onOpenSpaces: () => void;
   onOpenAccount: () => void;
@@ -87,16 +85,6 @@ export function Rail({
         )}
       </div>
       <div className="flex flex-col items-center gap-3">
-        {connection === "open" ? (
-          <button
-            type="button"
-            title="Disconnect"
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-white hover:text-[#5843d7]"
-            onClick={onDisconnect}
-          >
-            <LogOut size={16} />
-          </button>
-        ) : null}
         <button
           type="button"
           title={account ? `${accountName(account)} account` : "Account"}

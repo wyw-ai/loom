@@ -273,13 +273,28 @@ pub fn human_actor_id_for_subject(provider: &str, subject: &str) -> String {
     )
 }
 
+pub fn is_supported_actor_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+}
+
 pub fn normalize_human_account(mut account: HumanAccount) -> HumanAccount {
     account.provider = first_non_empty([account.provider.as_str(), "unknown"]).to_string();
     account.staff_id = account.staff_id.trim().to_string();
     account.nickname = account.nickname.trim().to_string();
     account.real_name = account.real_name.trim().to_string();
     account.email = account.email.trim().to_string();
-    account.actor_id = human_actor_id_for_subject(&account.provider, &account.staff_id);
+    let custom_actor_id = account.actor_id.trim().to_string();
+    let generated_actor_id = human_actor_id_for_subject(&account.provider, &account.staff_id);
+    account.actor_id = if account.provider == "local" && is_supported_actor_id(&custom_actor_id) {
+        custom_actor_id
+    } else {
+        generated_actor_id
+    };
     account.avatar_url = account.avatar_url.trim().to_string();
     account
 }
@@ -378,7 +393,7 @@ fn normalize_desktop_config(mut cfg: DesktopConfig) -> DesktopConfig {
         changed = true;
     }
 
-    if changed {
+    if changed && !cfg!(test) {
         save(&cfg).ok();
     }
     cfg
@@ -427,7 +442,12 @@ fn repair_workspace_fields(cfg: &mut DesktopConfig) -> bool {
 }
 
 fn local_actor_id_for_workspace(workspace_id: &str) -> String {
-    format!("actor_human_local_{}", safe_config_key(workspace_id))
+    let _ = workspace_id;
+    default_local_actor_id()
+}
+
+pub fn default_local_actor_id() -> String {
+    "actor_human_local_default".into()
 }
 
 fn safe_config_key(value: &str) -> String {
@@ -469,6 +489,21 @@ mod tests {
         assert_eq!(account.staff_id, "12345");
         assert_eq!(account.actor_id, "actor_human_github_12345");
         assert_eq!(account.avatar_url, "https://example.test/avatar.png");
+    }
+
+    #[test]
+    fn normalize_local_human_account_preserves_custom_actor_id() {
+        let account = normalize_human_account(HumanAccount {
+            provider: "local".into(),
+            staff_id: "canfeng".into(),
+            nickname: "Canfeng".into(),
+            real_name: String::new(),
+            email: String::new(),
+            actor_id: "actor_human_custom:01".into(),
+            avatar_url: String::new(),
+        });
+
+        assert_eq!(account.actor_id, "actor_human_custom:01");
     }
 
     #[test]

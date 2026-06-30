@@ -16,6 +16,7 @@ import type {
   DeliveryState,
   HumanAccount,
   InboxListEntry,
+  MachineAgentProviderInfo,
   MachineListResult,
   Message,
   MessageIntent,
@@ -100,6 +101,17 @@ export async function accountLogin(provider: LoginProvider): Promise<{
   config: DesktopConfig;
 }> {
   return invoke("account_login", { args: { provider } });
+}
+
+export async function accountSetLocal(args: {
+  userId: string;
+  nickname: string;
+  actorId: string;
+}): Promise<{
+  account: HumanAccount;
+  config: DesktopConfig;
+}> {
+  return invoke("account_set_local", { args });
 }
 
 export async function accountLogout(): Promise<DesktopConfig> {
@@ -334,11 +346,23 @@ export async function machineCheck(): Promise<MachineListResult> {
   return invoke("machine_check");
 }
 
+export async function localProviderCheck(): Promise<{
+  providers: MachineAgentProviderInfo[];
+}> {
+  return invoke("local_provider_check");
+}
+
 export async function machineCreate(args: {
   name: string;
   dataRoot?: string;
 }): Promise<MachineListResult> {
   return invoke("machine_create", { args });
+}
+
+export async function machineStart(machineId: string): Promise<MachineListResult & {
+  pid: number;
+}> {
+  return invoke("machine_start", { args: { machineId } });
 }
 
 export async function machineRemove(machineId: string): Promise<MachineListResult> {

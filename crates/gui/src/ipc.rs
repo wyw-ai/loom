@@ -11,9 +11,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
-use agent_runtime::discovery::DetectedAgentProvider;
+use agent_runtime::discovery::{detect_agent_cli_providers, DetectedAgentProvider};
 use proto::methods::method;
 use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec, ServiceSpec};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,14 @@ pub struct AccountAuthStatus {
     pub providers: Vec<AccountLoginProviderStatus>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLocalDefaults {
+    pub user_id: String,
+    pub nickname: String,
+    pub actor_id: String,
+}
+
 #[tauri::command]
 pub async fn account_auth_status() -> Result<AccountAuthStatus, String> {
     Ok(AccountAuthStatus {
@@ -84,6 +93,18 @@ pub async fn account_auth_status() -> Result<AccountAuthStatus, String> {
     })
 }
 
+#[tauri::command]
+pub async fn account_local_defaults() -> Result<AccountLocalDefaults, String> {
+    let nickname = local_account_display_name();
+    let user_id = local_user_id_from_display_name(&nickname);
+    let actor_id = default_actor_id_for_local_user(&user_id);
+    Ok(AccountLocalDefaults {
+        user_id,
+        nickname,
+        actor_id,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginArgs {
@@ -95,6 +116,14 @@ pub struct AccountLoginArgs {
 pub struct AccountLoginResult {
     pub account: HumanAccount,
     pub config: DesktopConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSetLocalArgs {
+    pub user_id: String,
+    pub nickname: String,
+    pub actor_id: String,
 }
 
 #[tauri::command]
@@ -125,12 +154,121 @@ pub async fn account_login(
 }
 
 #[tauri::command]
+pub async fn account_set_local(
+    state: State<'_, AppState>,
+    args: AccountSetLocalArgs,
+) -> Result<AccountLoginResult, String> {
+    let user_id = normalize_local_user_id(&args.user_id)?;
+    let nickname = args.nickname.trim();
+    if nickname.is_empty() {
+        return Err("nickname is required".into());
+    }
+    let actor_id = normalize_local_actor_id(&args.actor_id)?;
+
+    let account = config::normalize_human_account(HumanAccount {
+        provider: "local".into(),
+        staff_id: user_id,
+        nickname: nickname.into(),
+        real_name: String::new(),
+        email: String::new(),
+        actor_id,
+        avatar_url: String::new(),
+    });
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    cfg.account = Some(account.clone());
+    apply_account_identity(&mut cfg);
+    config::save(&cfg).map_err(stringify)?;
+    let cfg = config::load_or_init().map_err(stringify)?;
+    state.set(None).await;
+    Ok(AccountLoginResult {
+        account: cfg.account.clone().unwrap_or(account),
+        config: cfg,
+    })
+}
+
+#[tauri::command]
 pub async fn account_logout(state: State<'_, AppState>) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(stringify)?;
     cfg.account = None;
     config::save(&cfg).map_err(stringify)?;
     state.set(None).await;
     Ok(cfg)
+}
+
+fn normalize_local_user_id(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("user id is required".into());
+    }
+    if value.len() > 48 {
+        return Err("user id must be at most 48 characters".into());
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err("user id can only use letters, numbers, _ and -".into());
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_local_actor_id(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("actor id is required".into());
+    }
+    if !config::is_supported_actor_id(value) {
+        return Err("actor id can use letters, numbers, _, -, . and :, up to 64 characters".into());
+    }
+    Ok(value.to_string())
+}
+
+fn local_account_display_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Local User".into())
+}
+
+fn local_user_id_from_display_name(display_name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = false;
+    for ch in display_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if ch == '_' || ch == '-' || ch.is_whitespace() {
+            if !out.is_empty() && !last_was_separator {
+                out.push('_');
+                last_was_separator = true;
+            }
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "local_user".into()
+    } else {
+        out
+    }
+}
+
+fn default_actor_id_for_local_user(user_id: &str) -> String {
+    const PREFIX: &str = "actor_human_local_";
+    let suffix_len = 64usize.saturating_sub(PREFIX.len());
+    let suffix = user_id.trim();
+    let suffix = if suffix.is_empty() {
+        "local_user"
+    } else if suffix.len() > suffix_len {
+        &suffix[..suffix_len]
+    } else {
+        suffix
+    };
+    format!("{PREFIX}{suffix}")
 }
 
 #[derive(Deserialize)]
@@ -164,12 +302,30 @@ fn default_activate() -> bool {
 #[tauri::command]
 pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let normalized_server_url =
+        config::normalize_workspace_server_url(&args.server_url).map_err(stringify)?;
+    if let Some(existing) = cfg
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.server_url == normalized_server_url)
+    {
+        let name = args.name.trim();
+        if !name.is_empty() && existing.name.trim().is_empty() {
+            existing.name = name.into();
+        }
+        if args.activate {
+            cfg.active = Some(existing.id.clone());
+        }
+        config::save(&cfg).map_err(|e| e.to_string())?;
+        return config::load_or_init().map_err(|e| e.to_string());
+    }
+
     let id = config::generate_id();
     let (actor_id, display_name) = workspace_identity_for_new_workspace(&cfg, &id);
     let ws = Workspace {
         id: id.clone(),
         name: args.name,
-        server_url: config::normalize_workspace_server_url(&args.server_url).map_err(stringify)?,
+        server_url: normalized_server_url,
         actor_id: actor_id.clone(),
         display_name,
     };
@@ -188,9 +344,9 @@ fn workspace_identity_for_new_workspace(
     if let Some(account) = cfg.account.as_ref() {
         return (account.actor_id.clone(), account_display_name(account));
     }
+    let _ = workspace_id;
     let local_name = local_display_name();
-    let actor_id = format!("actor_human_local_{}", local_identity_suffix(workspace_id));
-    (actor_id, local_name)
+    (config::default_local_actor_id(), local_name)
 }
 
 fn local_display_name() -> String {
@@ -200,18 +356,6 @@ fn local_display_name() -> String {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Local".into())
-}
-
-fn local_identity_suffix(value: &str) -> String {
-    let suffix: String = value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-        .collect();
-    if suffix.is_empty() {
-        "workspace".into()
-    } else {
-        suffix
-    }
 }
 
 #[derive(Deserialize)]
@@ -357,6 +501,27 @@ async fn upsert_workspace_actor(
         )
         .await?;
     Ok(())
+}
+
+async fn ensure_active_workspace_connection(
+    client: &Arc<Client>,
+    cfg: &DesktopConfig,
+) -> Result<(), String> {
+    let workspace = active_workspace(cfg)
+        .ok_or_else(|| "select a workspace before sending messages".to_string())?;
+    client
+        .open_connection(&workspace.actor_id, Some(&workspace.display_name))
+        .await
+        .map_err(deep_stringify)?;
+    upsert_workspace_actor(client, cfg.account.as_ref(), workspace)
+        .await
+        .map_err(deep_stringify)
+}
+
+fn active_workspace(cfg: &DesktopConfig) -> Option<&Workspace> {
+    config::active_workspace_id(cfg)
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .or_else(|| cfg.workspaces.first())
 }
 
 // ---- channel / thread / scope passthrough ---------------------------------
@@ -513,9 +678,10 @@ pub async fn message_list(state: State<'_, AppState>, params: Value) -> Result<V
 
 #[tauri::command]
 pub async fn message_send(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
-    state
-        .client()
-        .await?
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let client = state.client().await?;
+    ensure_active_workspace_connection(&client, &cfg).await?;
+    client
         .call_raw(method::MESSAGE_SEND, Some(params))
         .await
         .map_err(stringify)
@@ -1354,6 +1520,22 @@ pub struct MachineListResult {
     pub machines: Vec<MachineInfo>,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalProviderCheckResult {
+    pub providers: Vec<MachineAgentProviderInfo>,
+}
+
+#[tauri::command]
+pub async fn local_provider_check() -> Result<LocalProviderCheckResult, String> {
+    Ok(LocalProviderCheckResult {
+        providers: detect_agent_cli_providers()
+            .iter()
+            .map(detected_provider_summary)
+            .collect(),
+    })
+}
+
 #[tauri::command]
 pub async fn machine_list(state: State<'_, AppState>) -> Result<MachineListResult, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
@@ -1416,6 +1598,44 @@ pub async fn machine_create(
     let mut result = machines_from_config(&cfg, state.try_client().await).await?;
     upsert_server_machine_info(&mut result.machines, machine);
     Ok(result)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineStartArgs {
+    pub machine_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineStartResult {
+    pub pid: u32,
+    pub machines: Vec<MachineInfo>,
+}
+
+#[tauri::command]
+pub async fn machine_start(
+    state: State<'_, AppState>,
+    args: MachineStartArgs,
+) -> Result<MachineStartResult, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    let machine_id = args.machine_id.trim();
+    if machine_id.is_empty() {
+        return Err("machine id is required".into());
+    }
+    let registrations = load_pending_machine_registrations()?;
+    let registration = registrations
+        .iter()
+        .find(|registration| {
+            registration.id == machine_id && pending_machine_visible(&cfg, registration)
+        })
+        .ok_or_else(|| format!("unknown pending local host: {machine_id}"))?;
+    let pid = start_pending_machine_daemon(&cfg, registration)?;
+    let result = machines_from_config(&cfg, state.try_client().await).await?;
+    Ok(MachineStartResult {
+        pid,
+        machines: result.machines,
+    })
 }
 
 #[derive(Deserialize)]
@@ -2210,6 +2430,55 @@ fn pending_machine_info_from_registration(
     }
 }
 
+#[allow(clippy::disallowed_methods)] // G1 OS shell: GUI starts the local loom-daemon helper.
+fn start_pending_machine_daemon(
+    cfg: &DesktopConfig,
+    registration: &PendingMachineRegistration,
+) -> Result<u32, String> {
+    let data_root = PathBuf::from(&registration.data_root);
+    let config_dir = PathBuf::from(&registration.config_dir);
+    std::fs::create_dir_all(&data_root)
+        .map_err(|err| format!("create data root {}: {err}", data_root.display()))?;
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|err| format!("create config directory {}: {err}", config_dir.display()))?;
+
+    let daemon_bin =
+        preferred_daemon_binary().unwrap_or_else(|| PathBuf::from(daemon_binary_name()));
+    let mut command = std::process::Command::new(&daemon_bin);
+    command
+        .arg("--server")
+        .arg(active_server_url(cfg))
+        .arg("--machine-id")
+        .arg(&registration.id)
+        .arg("--machine-name")
+        .arg(&registration.name)
+        .env("LOOM_AGENT_DATA_ROOT", &data_root)
+        .env("LOOM_CONFIG_DIR", &config_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if cfg!(windows) {
+        command.arg("--no-ipc");
+    }
+    configure_background_process(&mut command);
+    let child = command
+        .spawn()
+        .map_err(|err| format!("start loom-daemon with {}: {err}", daemon_bin.display()))?;
+    Ok(child.id())
+}
+
+#[cfg(windows)]
+fn configure_background_process(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_background_process(_command: &mut std::process::Command) {}
+
 fn default_machine_data_root(machine_id: &str) -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(config::config_dir)
@@ -2292,6 +2561,7 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
 
 fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
     let mut allowed_agents = HashSet::new();
+    let active_owner = config::active_owner_actor_id(cfg);
 
     if let Some(actors) = value.get("actors").and_then(Value::as_array) {
         for actor in actors {
@@ -2316,13 +2586,14 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if kind != "agent" {
-            return true;
+        let actor_id = actor.get("id").and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            "agent" => allowed_agents.contains(actor_id),
+            "human" => active_owner
+                .as_deref()
+                .is_none_or(|owner| actor_id == owner),
+            _ => true,
         }
-        actor
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| allowed_agents.contains(id))
     });
 
     value
@@ -2483,14 +2754,14 @@ fn preferred_daemon_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("loom-daemon"));
+            candidates.push(daemon_binary_in_dir(dir));
             if dir.file_name().and_then(|name| name.to_str()) == Some("MacOS") {
                 if let Some(contents_dir) = dir.parent() {
                     candidates.push(
                         contents_dir
                             .join("Resources")
                             .join("bin")
-                            .join("loom-daemon"),
+                            .join(daemon_binary_name()),
                     );
                 }
             }
@@ -2504,11 +2775,23 @@ fn preferred_daemon_binary() -> Option<PathBuf> {
                 .join("dist")
                 .join("release")
                 .join(triple)
-                .join("loom-daemon"),
+                .join(daemon_binary_name()),
         );
     }
 
     candidates.into_iter().find(|path| path.is_file())
+}
+
+fn daemon_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "loom-daemon.exe"
+    } else {
+        "loom-daemon"
+    }
+}
+
+fn daemon_binary_in_dir(dir: &Path) -> PathBuf {
+    dir.join(daemon_binary_name())
 }
 
 fn host_runtime_target_triple() -> Option<&'static str> {
@@ -2676,12 +2959,26 @@ mod tests {
     }
 
     #[test]
+    fn local_account_defaults_are_generic_and_actor_id_safe() {
+        assert_eq!(local_user_id_from_display_name("Jane Doe"), "jane_doe");
+        assert_eq!(local_user_id_from_display_name("!!!"), "local_user");
+        assert_eq!(local_user_id_from_display_name("残风 MacBook"), "macbook");
+
+        let long_user_id = local_user_id_from_display_name(&"A".repeat(80));
+        let actor_id = default_actor_id_for_local_user(&long_user_id);
+
+        assert_eq!(long_user_id.len(), 48);
+        assert!(actor_id.starts_with("actor_human_local_"));
+        assert!(config::is_supported_actor_id(&actor_id));
+    }
+
+    #[test]
     fn local_workspace_identity_does_not_require_oauth_account() {
         let cfg = DesktopConfig::default();
 
         let (actor_id, display_name) = workspace_identity_for_new_workspace(&cfg, "ws_local");
 
-        assert_eq!(actor_id, "actor_human_local_ws_local");
+        assert_eq!(actor_id, "actor_human_local_default");
         assert!(!display_name.trim().is_empty());
     }
 
@@ -2836,6 +3133,43 @@ mod tests {
         assert!(!actor_ids.contains(&"actor_agent_mine"));
         assert!(!actor_ids.contains(&"actor_agent_other"));
         assert!(actor_ids.contains(&"actor_service_other"));
+    }
+
+    #[test]
+    fn actor_list_filter_keeps_only_active_human_identity() {
+        let account = test_account();
+        let cfg = DesktopConfig {
+            active: Some("default".into()),
+            account: Some(account.clone()),
+            workspaces: vec![Workspace {
+                id: "default".into(),
+                name: "Local".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: account.actor_id.clone(),
+                display_name: account_display_name(&account),
+            }],
+        };
+        let value = json!({
+            "actors": [
+                { "id": account.actor_id, "kind": "human", "displayName": "星楚" },
+                { "id": "actor_human_local_default", "kind": "human", "displayName": "local_default" },
+                { "id": "actor_human_old", "kind": "human", "displayName": "old" },
+                { "id": "actor_service_machine", "kind": "service", "displayName": "Machine" }
+            ]
+        });
+
+        let filtered = filter_actor_list_for_active_context(value, &cfg);
+        let actor_ids = filtered["actors"]
+            .as_array()
+            .expect("actors")
+            .iter()
+            .filter_map(|actor| actor["id"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(actor_ids.contains(&account.actor_id.as_str()));
+        assert!(!actor_ids.contains(&"actor_human_local_default"));
+        assert!(!actor_ids.contains(&"actor_human_old"));
+        assert!(actor_ids.contains(&"actor_service_machine"));
     }
 
     #[test]

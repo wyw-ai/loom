@@ -1,9 +1,10 @@
 import type { HumanAccount } from "@/ipc/types";
-import { accountName } from "@/lib/format-utils";
-import { avatarUrlForSeed } from "@/lib/agent-utils";
+import { accountName, accountToActor } from "@/lib/format-utils";
+import { actorAvatarUrl } from "@/lib/agent-utils";
 
 export function Avatar({ account }: { account: HumanAccount }) {
-  const src = account.avatarUrl || avatarUrlForSeed(account.actorId || accountName(account));
+  const actor = accountToActor(account);
+  const src = actorAvatarUrl(actor, account.actorId || accountName(account));
   return (
     <img
       alt=""

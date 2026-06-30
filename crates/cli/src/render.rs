@@ -35,10 +35,30 @@ pub fn render_message(message: &Message) {
     let ts = message.created_at.with_timezone(&Local).format("%H:%M:%S");
     let actor = &message.author_actor_id;
     let target = &message.target;
+    let visibility = if is_private_message(message) {
+        " [private]"
+    } else {
+        ""
+    };
     let body = message.body.trim_end();
     if body.is_empty() {
-        println!("[{ts}] {actor} -> {target}: (attachment)");
+        println!("[{ts}] {actor} -> {target}{visibility}: (attachment)");
     } else {
-        println!("[{ts}] {actor} -> {target}: {body}");
+        println!("[{ts}] {actor} -> {target}{visibility}: {body}");
     }
+}
+
+fn is_private_message(message: &Message) -> bool {
+    message
+        .metadata
+        .get("private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || message
+            .metadata
+            .get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("private"))
+        || message.metadata.contains_key("privateTo")
+        || message.metadata.contains_key("privateActorIds")
 }

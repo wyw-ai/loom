@@ -39,6 +39,11 @@ export type AccountLoginProviderStatus = {
 export type AccountAuthStatus = {
   providers: AccountLoginProviderStatus[];
 };
+export type AccountLocalDefaults = {
+  userId: string;
+  nickname: string;
+  actorId: string;
+};
 
 function hasTauriRuntime() {
   return (
@@ -94,6 +99,10 @@ export async function accountGet(): Promise<HumanAccount | null> {
 
 export async function accountAuthStatus(): Promise<AccountAuthStatus> {
   return invoke("account_auth_status");
+}
+
+export async function accountLocalDefaults(): Promise<AccountLocalDefaults> {
+  return invoke("account_local_defaults");
 }
 
 export async function accountLogin(provider: LoginProvider): Promise<{

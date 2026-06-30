@@ -36,8 +36,12 @@ import type { ConnectionState, WorkspaceFormState } from "@/lib/types";
 
 type OnboardingStep = "prep" | "identity" | "server" | "host";
 
-const defaultUserId = "canfeng";
-const defaultNickname = "Canfeng";
+const localActorPrefix = "actor_human_local_";
+const fallbackIdentityDefaults = {
+  userId: "local_user",
+  nickname: "Local User",
+  actorId: "actor_human_local_local_user",
+};
 const userIdPattern = /^[A-Za-z0-9_-]{1,48}$/;
 const actorIdPattern = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -83,9 +87,27 @@ export function OnboardingView({
   const [userId, setUserId] = useState("");
   const [nickname, setNickname] = useState("");
   const [actorId, setActorId] = useState("");
+  const [identityDefaults, setIdentityDefaults] = useState(fallbackIdentityDefaults);
   const [providers, setProviders] = useState<MachineAgentProviderInfo[]>([]);
   const [localProviderStatus, setLocalProviderStatus] =
     useState<"loading" | "ready" | "error">("loading");
+
+  useEffect(() => {
+    let alive = true;
+    void ipc
+      .accountLocalDefaults()
+      .then((defaults) => {
+        if (!alive) return;
+        setIdentityDefaults(defaults);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setIdentityDefaults(fallbackIdentityDefaults);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -140,11 +162,12 @@ export function OnboardingView({
     setWorkspaceForm({ ...workspaceForm, host: "127.0.0.1:7878" });
   }, [account, setWorkspaceForm, workspaceForm, workspaces.length]);
 
-  const suggestedUserId = account?.staffId || defaultUserId;
-  const suggestedNickname = account?.nickname || account?.realName || defaultNickname;
+  const suggestedUserId = account?.staffId || identityDefaults.userId;
+  const suggestedNickname = account?.nickname || account?.realName || identityDefaults.nickname;
   const effectiveUserId = userId.trim() || suggestedUserId;
   const effectiveNickname = nickname.trim() || suggestedNickname;
-  const suggestedActorId = account?.actorId || `actor_human_local_${effectiveUserId}`;
+  const suggestedActorId =
+    account?.actorId || defaultActorIdForUserId(effectiveUserId, identityDefaults.actorId);
   const effectiveActorId = actorId.trim() || suggestedActorId;
   const userIdValid = !userId.trim() || userIdPattern.test(userId.trim());
   const actorIdValid = !actorId.trim() || actorIdPattern.test(actorId.trim());
@@ -898,4 +921,11 @@ function connectionLabelEn(connection: ConnectionState) {
   if (connection === "error") return "Connection error";
   if (connection === "closed") return "Disconnected";
   return "Idle";
+}
+
+function defaultActorIdForUserId(userId: string, fallbackActorId: string) {
+  const value = userId.trim();
+  if (!value) return fallbackActorId;
+  const suffixLength = 64 - localActorPrefix.length;
+  return `${localActorPrefix}${value.slice(0, suffixLength)}`;
 }

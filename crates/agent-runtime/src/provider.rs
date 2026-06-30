@@ -2643,8 +2643,6 @@ fn codex_manifest() -> ProviderManifest {
     );
     mode.stdout.capture = Some(session_capture("$.session_id"));
     mode.env.insert("LOOM_NO_DAEMON".into(), "1".into());
-    mode.env
-        .insert("CODEX_HOME".into(), "{loom_agent_home}".into());
     manifest(
         "codex",
         "Codex CLI",

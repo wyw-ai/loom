@@ -505,9 +505,15 @@
 
   .attachment-card {
     display: flex;
-    min-height: 58px;
+    width: 100%;
+    min-height: 62px;
+    min-width: 0;
+    max-width: 100%;
+    flex-wrap: wrap;
     align-items: center;
+    box-sizing: border-box;
     gap: 12px;
+    overflow: hidden;
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #ffffff;
@@ -527,22 +533,75 @@
     color: #503ed4;
   }
 
-  .attachment-preview {
-    display: grid;
-    height: 44px;
-    width: 88px;
+  .attachment-file-badge {
+    display: inline-flex;
+    height: 34px;
+    max-width: 84px;
+    min-width: 44px;
     flex: 0 0 auto;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 5px;
+    align-items: center;
+    justify-content: center;
     border-radius: 8px;
     border: 1px solid #e7e9f3;
-    background: linear-gradient(135deg, #fbfbff 0%, #f1efff 100%);
-    padding: 8px;
+    background: #fbfbff;
+    padding: 0 8px;
+    color: #667085;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .attachment-preview span {
-    border-radius: 4px;
-    background: #d8d3ff;
+  .attachment-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .attachment-action {
+    display: inline-flex;
+    height: 32px;
+    width: 32px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    color: #667085;
+    transition:
+      background-color 160ms ease,
+      color 160ms ease;
+  }
+
+  .attachment-action:hover:not(:disabled) {
+    background: #f1efff;
+    color: #503ed4;
+  }
+
+  .attachment-action:disabled {
+    cursor: default;
+    opacity: 0.58;
+  }
+
+  @media (max-width: 640px) {
+    .attachment-card {
+      align-items: flex-start;
+      gap: 8px;
+      padding: 8px;
+    }
+
+    .attachment-file-badge {
+      height: 28px;
+      min-width: 40px;
+      padding: 0 7px;
+    }
+
+    .attachment-actions {
+      width: 100%;
+      justify-content: flex-end;
+    }
   }
 
   .thread-summary-row {

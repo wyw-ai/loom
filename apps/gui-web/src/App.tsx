@@ -98,6 +98,7 @@ import {
   sortTasks,
   sortThreads,
   uniqueAudience,
+  uniqueActorsById,
   upsert,
 } from "@/lib/format-utils";
 
@@ -282,7 +283,9 @@ export function App() {
         directScopesByActorId[activeDirectActor.id] ??
         null
       : null;
-  const memberCandidates = actorList.filter((actor) => actor.kind !== "service");
+  const memberCandidates = uniqueActorsById(
+    actorList.filter((actor) => actor.kind !== "service"),
+  );
   const channelAgentActors = activeChannel
     ? channelMentionAgentActors(activeChannel, actors)
     : [];
@@ -2146,4 +2149,3 @@ export function App() {
     </div>
   );
 }
-

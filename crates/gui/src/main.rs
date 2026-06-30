@@ -37,6 +37,7 @@ fn main() {
             ipc::workspaces_save,
             ipc::account_get,
             ipc::account_auth_status,
+            ipc::account_local_defaults,
             ipc::account_login,
             ipc::account_set_local,
             ipc::account_logout,

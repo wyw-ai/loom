@@ -67,6 +67,14 @@ pub struct AccountAuthStatus {
     pub providers: Vec<AccountLoginProviderStatus>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLocalDefaults {
+    pub user_id: String,
+    pub nickname: String,
+    pub actor_id: String,
+}
+
 #[tauri::command]
 pub async fn account_auth_status() -> Result<AccountAuthStatus, String> {
     Ok(AccountAuthStatus {
@@ -82,6 +90,18 @@ pub async fn account_auth_status() -> Result<AccountAuthStatus, String> {
                 }
             })
             .collect(),
+    })
+}
+
+#[tauri::command]
+pub async fn account_local_defaults() -> Result<AccountLocalDefaults, String> {
+    let nickname = local_account_display_name();
+    let user_id = local_user_id_from_display_name(&nickname);
+    let actor_id = default_actor_id_for_local_user(&user_id);
+    Ok(AccountLocalDefaults {
+        user_id,
+        nickname,
+        actor_id,
     })
 }
 
@@ -201,6 +221,54 @@ fn normalize_local_actor_id(raw: &str) -> Result<String, String> {
         return Err("actor id can use letters, numbers, _, -, . and :, up to 64 characters".into());
     }
     Ok(value.to_string())
+}
+
+fn local_account_display_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Local User".into())
+}
+
+fn local_user_id_from_display_name(display_name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = false;
+    for ch in display_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if ch == '_' || ch == '-' || ch.is_whitespace() {
+            if !out.is_empty() && !last_was_separator {
+                out.push('_');
+                last_was_separator = true;
+            }
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "local_user".into()
+    } else {
+        out
+    }
+}
+
+fn default_actor_id_for_local_user(user_id: &str) -> String {
+    const PREFIX: &str = "actor_human_local_";
+    let suffix_len = 64usize.saturating_sub(PREFIX.len());
+    let suffix = user_id.trim();
+    let suffix = if suffix.is_empty() {
+        "local_user"
+    } else if suffix.len() > suffix_len {
+        &suffix[..suffix_len]
+    } else {
+        suffix
+    };
+    format!("{PREFIX}{suffix}")
 }
 
 #[derive(Deserialize)]
@@ -2864,6 +2932,20 @@ mod tests {
         let err = actor_id_from_input(&id, "G仔", "machine_macbook_01").expect_err("overlong id");
 
         assert!(err.to_string().contains("at most 64"));
+    }
+
+    #[test]
+    fn local_account_defaults_are_generic_and_actor_id_safe() {
+        assert_eq!(local_user_id_from_display_name("Jane Doe"), "jane_doe");
+        assert_eq!(local_user_id_from_display_name("!!!"), "local_user");
+        assert_eq!(local_user_id_from_display_name("残风 MacBook"), "macbook");
+
+        let long_user_id = local_user_id_from_display_name(&"A".repeat(80));
+        let actor_id = default_actor_id_for_local_user(&long_user_id);
+
+        assert_eq!(long_user_id.len(), 48);
+        assert!(actor_id.starts_with("actor_human_local_"));
+        assert!(config::is_supported_actor_id(&actor_id));
     }
 
     #[test]

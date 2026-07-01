@@ -14,12 +14,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { machineDirList } from "@/ipc/bridge";
 import { actorAvatarUrl, agentDisplayName, agentModelValue, agentSettingsDraft, getActorRunContext, providerAvailabilityGroups, providerForAgent, runStatusAnimationName, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { avatarLibraryUrls, reasoningEffortChoices } from "@/lib/constants";
 import { agentFormForMachine, capitalize, machineCanCreateAgent, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { ArrowLeft, Bot, Check, FileText, Loader2, Plus, Settings, Trash2, X } from "lucide-react";
-import type { MachineAgentProviderInfo, MachineInfo, Run } from "@/ipc/types";
+import { ArrowLeft, Bot, Check, FileText, FolderOpen, Loader2, Plus, Settings, Trash2, Wrench, X } from "lucide-react";
+import type { AgentBundleSkillSpec, MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
 import type { AgentDetailTab, AgentFormState, AgentMemberEntry, AgentSettingsDraft, AgentUpdatePatch } from "@/lib/types";
 
 const customModelOptionValue = "__loom_custom_model__";
@@ -771,6 +772,12 @@ export function AgentMemberDetail({
   );
   const [activeTab, setActiveTab] = useState<AgentDetailTab>("profile");
   const [customModelActive, setCustomModelActive] = useState(false);
+  const [skillBrowserPath, setSkillBrowserPath] = useState<string | undefined>();
+  const [skillBrowser, setSkillBrowser] = useState<MachineDirListResult | null>(null);
+  const [skillBrowserLoading, setSkillBrowserLoading] = useState(false);
+  const [skillBrowserError, setSkillBrowserError] = useState<string | null>(null);
+  const [selectedSkillPath, setSelectedSkillPath] = useState("");
+  const [skillIdDraft, setSkillIdDraft] = useState("");
   const handledAgentDetailKeyRef = useRef(agentDetailKey);
   const selectedProvider = providerForAgent(machine, agent, draft.providerId);
   const modelChoices =
@@ -793,6 +800,7 @@ export function AgentMemberDetail({
   }> = [
     { id: "profile", label: "Profile", icon: Bot },
     { id: "prompt", label: "Prompt Studio", icon: FileText },
+    { id: "skills", label: "Skills", icon: Wrench },
     { id: "settings", label: "Settings", icon: Settings },
   ];
 
@@ -801,6 +809,10 @@ export function AgentMemberDetail({
     handledAgentDetailKeyRef.current = agentDetailKey;
     setDraft(agentSettingsDraft(machine, agent));
     setCustomModelActive(false);
+    setSkillBrowserPath(undefined);
+    setSkillBrowser(null);
+    setSelectedSkillPath("");
+    setSkillIdDraft("");
   }, [agentDetailKey, machine, agent]);
 
   useEffect(() => {
@@ -810,6 +822,29 @@ export function AgentMemberDetail({
   function updateDraft(patch: Partial<AgentSettingsDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
   }
+
+  useEffect(() => {
+    if (activeTab !== "skills") return;
+    let cancelled = false;
+    setSkillBrowserLoading(true);
+    setSkillBrowserError(null);
+    machineDirList({ machineId: machine.id, path: skillBrowserPath })
+      .then((result) => {
+        if (cancelled) return;
+        setSkillBrowser(result);
+        setSelectedSkillPath((current) => current || result.path);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setSkillBrowserError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) setSkillBrowserLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, machine.id, skillBrowserPath]);
 
   function addEnvEntry() {
     setDraft((current) => ({
@@ -838,19 +873,53 @@ export function AgentMemberDetail({
 
   const envEntries = Object.entries(draft.env);
 
-  function saveAgent() {
-    onUpdateAgent({
+  function agentPatchFromDraft(nextDraft: AgentSettingsDraft): AgentUpdatePatch {
+    return {
       machineId: machine.id,
       actorId: actor.id,
-      displayName: draft.displayName,
-      description: draft.description,
-      instructions: draft.instructions,
-      providerId: draft.providerId || undefined,
-      model: draft.model,
-      reasoningEffort: draft.reasoningEffort,
-      autostart: draft.autostart,
-      avatarUrl: draft.avatarUrl,
-      env: draft.env,
+      displayName: nextDraft.displayName,
+      description: nextDraft.description,
+      instructions: nextDraft.instructions,
+      providerId: nextDraft.providerId || undefined,
+      model: nextDraft.model,
+      reasoningEffort: nextDraft.reasoningEffort,
+      autostart: nextDraft.autostart,
+      avatarUrl: nextDraft.avatarUrl,
+      env: nextDraft.env,
+      bundleSkills: nextDraft.bundleSkills,
+    };
+  }
+
+  function persistAgent(nextDraft: AgentSettingsDraft) {
+    setDraft(nextDraft);
+    onUpdateAgent(agentPatchFromDraft(nextDraft));
+  }
+
+  function saveAgent() {
+    onUpdateAgent(agentPatchFromDraft(draft));
+  }
+
+  function addSkill() {
+    const source = selectedSkillPath.trim();
+    if (!source || !canEdit) return;
+    const id = (skillIdDraft.trim() || source.split(/[\\/]/).filter(Boolean).pop() || "skill");
+    const nextSkill: AgentBundleSkillSpec = { id, source };
+    const nextDraft = {
+      ...draft,
+      bundleSkills: [
+        ...draft.bundleSkills.filter((skill) => skill.id !== nextSkill.id),
+        nextSkill,
+      ],
+    };
+    setSkillIdDraft("");
+    persistAgent(nextDraft);
+  }
+
+  function removeSkill(skillId: string) {
+    if (!canEdit) return;
+    persistAgent({
+      ...draft,
+      bundleSkills: draft.bundleSkills.filter((skill) => skill.id !== skillId),
     });
   }
 
@@ -1127,6 +1196,136 @@ export function AgentMemberDetail({
         <AgentPromptStudio machine={machine} agent={agent} canEdit={canEdit} />
       )}
 
+      {activeTab === "skills" && (
+        <>
+          <HostDetailSection title="Skills">
+            <div className="space-y-3">
+              {draft.bundleSkills.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6 text-sm text-[#667085]">
+                  No custom skills configured.
+                </div>
+              ) : (
+                draft.bundleSkills.map((skill) => (
+                  <div
+                    key={skill.id}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#dfe3ec] bg-white px-4 py-3"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-sm font-bold text-[#111827]">{skill.id}</div>
+                      <div className="mt-1 truncate font-mono text-xs text-[#667085]">
+                        {skill.source}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeSkill(skill.id)}
+                      disabled={!canEdit || saving}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
+                      title="Remove skill"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </HostDetailSection>
+
+          <HostDetailSection title="Add Skill">
+            <div className="grid gap-4 xl:grid-cols-[minmax(260px,0.45fr)_minmax(0,1fr)]">
+              <div className="space-y-3">
+                <Input
+                  value={selectedSkillPath}
+                  onChange={(event) => setSelectedSkillPath(event.target.value)}
+                  placeholder="Skill directory"
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                  disabled={!canEdit}
+                />
+                <Input
+                  value={skillIdDraft}
+                  onChange={(event) => setSkillIdDraft(event.target.value)}
+                  placeholder="Skill id"
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                  disabled={!canEdit}
+                />
+                <Button
+                  type="button"
+                  onClick={addSkill}
+                  disabled={!canEdit || saving || !selectedSkillPath.trim()}
+                  className="rounded-lg"
+                >
+                  {saving ? <Loader2 className="animate-spin" size={15} /> : <Plus size={15} />}
+                  Add Skill
+                </Button>
+                {skillBrowserError && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    {skillBrowserError}
+                  </div>
+                )}
+              </div>
+
+              <div className="min-h-72 rounded-lg border border-[#dfe3ec] bg-[#fbfbfd]">
+                <div className="flex flex-wrap items-center gap-2 border-b border-[#edf0f5] px-3 py-2">
+                  {skillBrowser?.roots.map((root) => (
+                    <button
+                      key={root.path}
+                      type="button"
+                      onClick={() => setSkillBrowserPath(root.path)}
+                      disabled={!canEdit}
+                      className="rounded-md border border-[#dfe3ec] bg-white px-2 py-1 text-xs text-[#596174] hover:border-[#c8c1ff] hover:text-[#503ed4] disabled:opacity-40"
+                    >
+                      {root.label}
+                    </button>
+                  ))}
+                  {skillBrowser?.parent && (
+                    <button
+                      type="button"
+                      onClick={() => setSkillBrowserPath(skillBrowser.parent ?? undefined)}
+                      disabled={!canEdit}
+                      className="rounded-md border border-[#dfe3ec] bg-white px-2 py-1 text-xs text-[#596174] hover:border-[#c8c1ff] hover:text-[#503ed4] disabled:opacity-40"
+                    >
+                      Parent
+                    </button>
+                  )}
+                </div>
+                <div className="border-b border-[#edf0f5] px-3 py-2 font-mono text-xs text-[#667085]">
+                  {skillBrowser?.path || "Loading..."}
+                </div>
+                <div className="max-h-72 overflow-y-auto p-2 soft-scrollbar">
+                  {skillBrowserLoading ? (
+                    <div className="flex items-center gap-2 px-2 py-3 text-sm text-[#667085]">
+                      <Loader2 className="animate-spin" size={15} />
+                      Loading
+                    </div>
+                  ) : (
+                    skillBrowser?.entries.map((entry) => (
+                      <button
+                        key={entry.path}
+                        type="button"
+                        onClick={() => {
+                          setSelectedSkillPath(entry.path);
+                          setSkillBrowserPath(entry.path);
+                        }}
+                        disabled={!canEdit}
+                        className={cn(
+                          "flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-white disabled:opacity-40",
+                          selectedSkillPath === entry.path
+                            ? "bg-white text-[#503ed4]"
+                            : "text-[#303849]",
+                        )}
+                      >
+                        <FolderOpen size={15} />
+                        <span className="truncate">{entry.name}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </HostDetailSection>
+        </>
+      )}
+
       {activeTab === "settings" && (
         <>
           <HostDetailSection title="Info">
@@ -1167,4 +1366,3 @@ export function AgentMemberDetail({
     </div>
   );
 }
-

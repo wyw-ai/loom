@@ -130,6 +130,115 @@ pub async fn agent_remove(client: Arc<Client>, machine_id: String, actor_id: Str
     Ok(())
 }
 
+pub async fn agent_skill_list(
+    client: Arc<Client>,
+    machine_id: String,
+    actor_id: String,
+) -> Result<()> {
+    let machine = require_machine(&client, &machine_id).await?;
+    let output = run_machine_command(
+        client,
+        machine,
+        json!({
+            "op": "agent.skill.list",
+            "actorId": actor_id,
+        }),
+    )
+    .await?;
+    if render::is_json() {
+        render::print_json(&output);
+        return Ok(());
+    }
+    let skills = output
+        .get("skills")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if skills.is_empty() {
+        println!("(no custom skills)");
+        return Ok(());
+    }
+    for skill in skills {
+        let id = skill.get("id").and_then(Value::as_str).unwrap_or("");
+        let source = skill.get("source").and_then(Value::as_str).unwrap_or("");
+        println!("{id}\t{source}");
+    }
+    Ok(())
+}
+
+pub async fn agent_skill_add(
+    client: Arc<Client>,
+    machine_id: String,
+    actor_id: String,
+    skill_id: Option<String>,
+    source: PathBuf,
+) -> Result<()> {
+    let machine = require_machine(&client, &machine_id).await?;
+    let mut command = json!({
+        "op": "agent.skill.add",
+        "actorId": actor_id,
+        "source": source.display().to_string(),
+    });
+    insert_if_nonempty(&mut command, "skillId", skill_id);
+    let output = run_machine_command(client, machine, command).await?;
+    if render::is_json() {
+        render::print_json(&output);
+    } else {
+        let skills = output
+            .pointer("/agentSpec/bundle/skills")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let added = skills
+            .iter()
+            .find(|skill| {
+                skill
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(|value| value == source.display().to_string())
+                    .unwrap_or(false)
+            })
+            .or_else(|| skills.last());
+        let id = added
+            .and_then(|skill| skill.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        println!("added skill {id}");
+    }
+    Ok(())
+}
+
+pub async fn agent_skill_remove(
+    client: Arc<Client>,
+    machine_id: String,
+    actor_id: String,
+    skill_id: String,
+) -> Result<()> {
+    let machine = require_machine(&client, &machine_id).await?;
+    let output = run_machine_command(
+        client,
+        machine,
+        json!({
+            "op": "agent.skill.remove",
+            "actorId": actor_id,
+            "skillId": skill_id,
+        }),
+    )
+    .await?;
+    if render::is_json() {
+        render::print_json(&output);
+    } else if output
+        .get("removed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("removed skill");
+    } else {
+        println!("skill was not configured");
+    }
+    Ok(())
+}
+
 async fn run_machine_command(
     client: Arc<Client>,
     machine: MachineRow,

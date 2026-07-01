@@ -1239,6 +1239,8 @@ pub struct AgentUpdateArgs {
     pub prompt_assembly: Option<Value>,
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub bundle_skills: Option<Value>,
 }
 
 #[tauri::command]
@@ -1292,6 +1294,9 @@ pub async fn agent_update(
     });
     if let Some(prompt_assembly) = args.prompt_assembly {
         command["promptAssembly"] = prompt_assembly;
+    }
+    if let Some(bundle_skills) = args.bundle_skills {
+        command["bundleSkills"] = bundle_skills;
     }
     let output = run_remote_machine_command(&state, &cfg, &target_machine_id, command).await?;
     agent_info_from_machine_command_output(output)

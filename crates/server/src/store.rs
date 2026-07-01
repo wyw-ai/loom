@@ -334,33 +334,35 @@ impl Store {
     /// Remove `actor_id` from `channel_id`'s member set. Idempotent. Emits
     /// `ChannelRevoked` for the websocket layer.
     pub fn revoke_channel(&self, channel_id: &str, actor_id: &str) -> StoreResult<Channel> {
+        let channel_id = channel_id.to_string();
+        let actor_id = actor_id.to_string();
         let updated = {
             let mut inner = self.inner.write();
             {
                 let ch = inner
                     .channels
-                    .get_mut(channel_id)
+                    .get_mut(&channel_id)
                     .ok_or_else(|| StoreError::NotFound(format!("channel {channel_id}")))?;
-                ch.members.retain(|m| m != actor_id);
+                ch.members.retain(|m| m != &actor_id);
             }
             inner
                 .channels
-                .get(channel_id)
+                .get(&channel_id)
                 .expect("channel exists after revoke")
                 .clone()
         };
         self.journal.append(&Mutation::ChannelRevoke {
-            channel_id: channel_id.to_string(),
-            actor_id: actor_id.to_string(),
+            channel_id: channel_id.clone(),
+            actor_id: actor_id.clone(),
         })?;
         self.inner
             .write()
             .channel_member_configs
-            .remove(&(channel_id.to_string(), actor_id.to_string()));
+            .remove(&(channel_id.clone(), actor_id.clone()));
         self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         self.emit(StoreEvent::ChannelRevoked {
-            channel_id: channel_id.to_string(),
-            actor_id: actor_id.to_string(),
+            channel_id,
+            actor_id,
         });
         Ok(updated)
     }

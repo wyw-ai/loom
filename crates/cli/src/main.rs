@@ -571,6 +571,25 @@ enum ChannelCmd {
     },
     /// Print the resolved member rows for a channel.
     Members { channel_id: String },
+    /// List configured workspace overrides for a channel.
+    MemberConfigList { channel_id: String },
+    /// Show one member's workspace override.
+    MemberConfigGet {
+        channel_id: String,
+        actor_id: String,
+    },
+    /// Set one member's workspace override.
+    MemberConfigSet {
+        channel_id: String,
+        actor_id: String,
+        #[arg(long = "workspace-dir")]
+        workspace_dir: String,
+    },
+    /// Clear one member's workspace override.
+    MemberConfigClear {
+        channel_id: String,
+        actor_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1543,8 +1562,21 @@ enum MachineAgentCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("loom-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async_main())
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("loom main thread panicked"))?
+}
+
+async fn async_main() -> Result<()> {
     init_tracing();
     // On Windows: if the binary was double-clicked (no arguments), show a
     // friendly help dialog instead of flashing a terminal and disappearing.
@@ -1905,6 +1937,24 @@ async fn main() -> Result<()> {
                 actor_id,
             } => cmd::channel::revoke(client, channel_id, actor_id).await?,
             ChannelCmd::Members { channel_id } => cmd::channel::members(client, channel_id).await?,
+            ChannelCmd::MemberConfigList { channel_id } => {
+                cmd::channel::member_config_list(client, channel_id).await?
+            }
+            ChannelCmd::MemberConfigGet {
+                channel_id,
+                actor_id,
+            } => cmd::channel::member_config_get(client, channel_id, actor_id).await?,
+            ChannelCmd::MemberConfigSet {
+                channel_id,
+                actor_id,
+                workspace_dir,
+            } => {
+                cmd::channel::member_config_set(client, channel_id, actor_id, workspace_dir).await?
+            }
+            ChannelCmd::MemberConfigClear {
+                channel_id,
+                actor_id,
+            } => cmd::channel::member_config_clear(client, channel_id, actor_id).await?,
         },
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create {

@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useState,
 } from "react";
 import { ActorAvatar } from "@/components/agent/ActorAvatar";
@@ -7,20 +8,23 @@ import { EmptyState } from "@/components/shared/EmptyState";
 import { MutedLine } from "@/components/shared/MutedLine";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { actorKindLabel, channelPanelDetail, channelPanelTitle, getActorRunContext, memberPresence, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { canAddChannelMember, canRemoveChannelMember, channelTaskGroups, taskProgressPercent } from "@/lib/channel-utils";
-import { displayName, fallbackActor, formatShortDateTime, shortActorAlias, statusDotClass, taskStatusBadgeClass } from "@/lib/format-utils";
-import { metadataText, threadLastReplyLabel, threadParticipants, threadReplyCount } from "@/lib/message-utils";
+import { displayName, errorText, fallbackActor, findAgentMemberEntry, formatShortDateTime, shortActorAlias, statusDotClass, taskStatusBadgeClass } from "@/lib/format-utils";
+import { metadataString, metadataText, threadLastReplyLabel, threadParticipants, threadReplyCount } from "@/lib/message-utils";
 import { cn, formatTime, shortId } from "@/lib/utils";
-import { Check, Clock, Hash, Loader2, Plus, Search, Split, UserPlus, Users, X } from "lucide-react";
-import type { Actor, Channel, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
+import { Check, ChevronLeft, Clock, Folder, FolderCog, HardDrive, Hash, Loader2, Plus, RefreshCw, Search, Split, UserPlus, Users, X } from "lucide-react";
+import type { Actor, Channel, ChannelMemberConfig, MachineDirListResult, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ChannelMemberPanelItem, ChannelMemberPresence, ChannelPanelTab, ThreadActivityStats } from "@/lib/types";
+import * as ipc from "@/ipc/bridge";
 
 export function ChannelPanel({
   actors,
   memberCandidates,
   channel,
   channelMessages,
+  channelMemberConfigs,
   channelTasks,
   channelThreads,
   currentActorId,
@@ -34,11 +38,14 @@ export function ChannelPanel({
   onSelectThread,
   onInviteMember,
   onRemoveMember,
+  onSaveMemberWorkspace,
+  onClearMemberWorkspace,
 }: {
   actors: Record<string, Actor>;
   memberCandidates: Actor[];
   channel: Channel | null;
   channelMessages: Message[];
+  channelMemberConfigs: Record<string, ChannelMemberConfig>;
   channelTasks: Task[];
   channelThreads: Thread[];
   currentActorId: string | null;
@@ -52,6 +59,8 @@ export function ChannelPanel({
   onSelectThread: (thread: Thread) => void;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
+  onSaveMemberWorkspace: (channelId: string, actorId: string, workspaceDir: string) => Promise<boolean>;
+  onClearMemberWorkspace: (channelId: string, actorId: string) => Promise<boolean>;
 }) {
   return (
     <ChannelDetailPanel
@@ -59,6 +68,7 @@ export function ChannelPanel({
       memberCandidates={memberCandidates}
       channel={channel}
       channelMessages={channelMessages}
+      channelMemberConfigs={channelMemberConfigs}
       channelTasks={channelTasks}
       channelThreads={channelThreads}
       currentActorId={currentActorId}
@@ -73,6 +83,8 @@ export function ChannelPanel({
       onSelectThread={onSelectThread}
       onInviteMember={onInviteMember}
       onRemoveMember={onRemoveMember}
+      onSaveMemberWorkspace={onSaveMemberWorkspace}
+      onClearMemberWorkspace={onClearMemberWorkspace}
     />
   );
 }
@@ -83,6 +95,7 @@ export function ChannelDetailPanel({
   memberCandidates,
   channel,
   channelMessages,
+  channelMemberConfigs,
   channelTasks,
   channelThreads,
   currentActorId,
@@ -97,11 +110,14 @@ export function ChannelDetailPanel({
   onSelectThread,
   onInviteMember,
   onRemoveMember,
+  onSaveMemberWorkspace,
+  onClearMemberWorkspace,
 }: {
   actors: Record<string, Actor>;
   memberCandidates: Actor[];
   channel: Channel | null;
   channelMessages: Message[];
+  channelMemberConfigs: Record<string, ChannelMemberConfig>;
   channelTasks: Task[];
   channelThreads: Thread[];
   currentActorId: string | null;
@@ -116,6 +132,8 @@ export function ChannelDetailPanel({
   onSelectThread: (thread: Thread) => void;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
+  onSaveMemberWorkspace: (channelId: string, actorId: string, workspaceDir: string) => Promise<boolean>;
+  onClearMemberWorkspace: (channelId: string, actorId: string) => Promise<boolean>;
 }) {
   const [memberQuery, setMemberQuery] = useState("");
   const members = channel
@@ -216,14 +234,18 @@ export function ChannelDetailPanel({
             availableMembers={availableMembers}
             busy={busy}
             channel={channel}
+            channelMemberConfigs={channelMemberConfigs}
             filteredAvailableMembers={filteredAvailableMembers}
             memberQuery={memberQuery}
+            machines={machines}
             offlineMembers={offlineMembers}
             onlineMembers={onlineMembers}
             runs={runs}
             setMemberQuery={setMemberQuery}
             onInviteMember={onInviteMember}
             onRemoveMember={onRemoveMember}
+            onSaveMemberWorkspace={onSaveMemberWorkspace}
+            onClearMemberWorkspace={onClearMemberWorkspace}
           />
         ) : (
           <ChannelTasksPanel actors={actors} tasks={channelTasks} />
@@ -338,44 +360,57 @@ export function ChannelMembersPanel({
   availableMembers,
   busy,
   channel,
+  channelMemberConfigs,
   filteredAvailableMembers,
   memberQuery,
+  machines,
   offlineMembers,
   onlineMembers,
   runs,
   setMemberQuery,
   onInviteMember,
   onRemoveMember,
+  onSaveMemberWorkspace,
+  onClearMemberWorkspace,
 }: {
   availableMembers: Actor[];
   busy: string | null;
   channel: Channel;
+  channelMemberConfigs: Record<string, ChannelMemberConfig>;
   filteredAvailableMembers: Actor[];
   memberQuery: string;
+  machines: MachineInfo[];
   offlineMembers: ChannelMemberPanelItem[];
   onlineMembers: ChannelMemberPanelItem[];
   runs: Record<string, Run>;
   setMemberQuery: (value: string) => void;
   onInviteMember: (channelId: string, actorId: string) => void;
   onRemoveMember: (channelId: string, actorId: string) => void;
+  onSaveMemberWorkspace: (channelId: string, actorId: string, workspaceDir: string) => Promise<boolean>;
+  onClearMemberWorkspace: (channelId: string, actorId: string) => Promise<boolean>;
 }) {
+  const [editingWorkspaceActor, setEditingWorkspaceActor] = useState<Actor | null>(null);
   return (
     <div className="space-y-4">
       <ChannelMemberGroup
         busy={busy}
         channel={channel}
+        channelMemberConfigs={channelMemberConfigs}
         items={onlineMembers}
         runs={runs}
         title="在线"
         onRemoveMember={onRemoveMember}
+        onEditMemberWorkspace={setEditingWorkspaceActor}
       />
       <ChannelMemberGroup
         busy={busy}
         channel={channel}
+        channelMemberConfigs={channelMemberConfigs}
         items={offlineMembers}
         runs={runs}
         title="离线"
         onRemoveMember={onRemoveMember}
+        onEditMemberWorkspace={setEditingWorkspaceActor}
       />
       {onlineMembers.length === 0 && offlineMembers.length === 0 && (
         <MutedLine>No explicit members.</MutedLine>
@@ -434,6 +469,19 @@ export function ChannelMembersPanel({
           )}
         </div>
       </div>
+      {editingWorkspaceActor && (
+        <ChannelMemberWorkspaceDialog
+          key={`${channel.id}:${editingWorkspaceActor.id}`}
+          actor={editingWorkspaceActor}
+          busy={busy}
+          channel={channel}
+          config={channelMemberConfigs[editingWorkspaceActor.id] ?? null}
+          machines={machines}
+          onCancel={() => setEditingWorkspaceActor(null)}
+          onSave={onSaveMemberWorkspace}
+          onClear={onClearMemberWorkspace}
+        />
+      )}
     </div>
   );
 }
@@ -442,17 +490,21 @@ export function ChannelMembersPanel({
 export function ChannelMemberGroup({
   busy,
   channel,
+  channelMemberConfigs,
   items,
   runs,
   title,
   onRemoveMember,
+  onEditMemberWorkspace,
 }: {
   busy: string | null;
   channel: Channel;
+  channelMemberConfigs: Record<string, ChannelMemberConfig>;
   items: ChannelMemberPanelItem[];
   runs: Record<string, Run>;
   title: string;
   onRemoveMember: (channelId: string, actorId: string) => void;
+  onEditMemberWorkspace: (actor: Actor) => void;
 }) {
   if (items.length === 0) return null;
   return (
@@ -470,9 +522,11 @@ export function ChannelMemberGroup({
             actor={actor}
             busy={busy}
             channel={channel}
+            config={channelMemberConfigs[actor.id] ?? null}
             presence={presence}
             runs={runs}
             onRemoveMember={onRemoveMember}
+            onEditMemberWorkspace={onEditMemberWorkspace}
           />
         ))}
       </div>
@@ -485,18 +539,24 @@ export function ChannelMemberRow({
   actor,
   busy,
   channel,
+  config,
   presence,
   runs,
   onRemoveMember,
+  onEditMemberWorkspace,
 }: {
   actor: Actor;
   busy: string | null;
   channel: Channel;
+  config: ChannelMemberConfig | null;
   presence: ChannelMemberPresence;
   runs: Record<string, Run>;
   onRemoveMember: (channelId: string, actorId: string) => void;
+  onEditMemberWorkspace: (actor: Actor) => void;
 }) {
   const revokeBusy = busy === `channel:revoke:${channel.id}:${actor.id}`;
+  const workspaceBusy = busy === `channel:member-workspace:${channel.id}:${actor.id}`;
+  const hasCustomWorkspace = Boolean(config?.workspaceDir?.trim());
   const ctx = actor.kind === "agent" ? getActorRunContext(runs, actor.id) : null;
   const runLabel = runStatusFullLabel(ctx);
 
@@ -531,6 +591,20 @@ export function ChannelMemberRow({
           )}
         </div>
       </div>
+      {actor.kind === "agent" && (
+        <button
+          type="button"
+          title={`Workspace: ${hasCustomWorkspace ? "Custom" : "Default"}`}
+          disabled={workspaceBusy}
+          onClick={() => onEditMemberWorkspace(actor)}
+          className={cn(
+            "composer-icon h-7 min-w-7 text-[#667085]",
+            hasCustomWorkspace && "bg-[#eefaf4] text-[#087443] hover:bg-[#dcf5e8] hover:text-[#05603a]",
+          )}
+        >
+          {workspaceBusy ? <Loader2 className="animate-spin" size={13} /> : <FolderCog size={13} />}
+        </button>
+      )}
       {canRemoveChannelMember(channel, actor.id) && (
         <button
           type="button"
@@ -542,6 +616,266 @@ export function ChannelMemberRow({
           {revokeBusy ? <Loader2 className="animate-spin" size={13} /> : <X size={13} />}
         </button>
       )}
+    </div>
+  );
+}
+
+function ChannelMemberWorkspaceDialog({
+  actor,
+  busy,
+  channel,
+  config,
+  machines,
+  onCancel,
+  onSave,
+  onClear,
+}: {
+  actor: Actor;
+  busy: string | null;
+  channel: Channel;
+  config: ChannelMemberConfig | null;
+  machines: MachineInfo[];
+  onCancel: () => void;
+  onSave: (channelId: string, actorId: string, workspaceDir: string) => Promise<boolean>;
+  onClear: (channelId: string, actorId: string) => Promise<boolean>;
+}) {
+  const initialPath = config?.workspaceDir?.trim() ?? "";
+  const [mode, setMode] = useState<"default" | "custom">(initialPath ? "custom" : "default");
+  const [path, setPath] = useState(initialPath);
+  const [browser, setBrowser] = useState<MachineDirListResult | null>(null);
+  const [browserBusy, setBrowserBusy] = useState(false);
+  const [browserError, setBrowserError] = useState<string | null>(null);
+  const saving = busy === `channel:member-workspace:${channel.id}:${actor.id}`;
+  const customPath = path.trim();
+  const canSave = mode === "default" || customPath.length > 0;
+  const agentEntry = findAgentMemberEntry(machines, actor.id);
+  const browseMachine = agentEntry?.machine ?? machineForActorMeta(actor, machines);
+  const canBrowseRemote = Boolean(
+    browseMachine?.canCommand && browseMachine.capabilities.includes("fs.dir.list"),
+  );
+
+  useEffect(() => {
+    if (mode !== "default") return;
+    setBrowser(null);
+    setBrowserError(null);
+  }, [mode]);
+
+  async function save() {
+    if (!canSave || saving) return;
+    const ok =
+      mode === "default"
+        ? await onClear(channel.id, actor.id)
+        : await onSave(channel.id, actor.id, customPath);
+    if (ok) onCancel();
+  }
+
+  async function browseDirectory(nextPath?: string | null) {
+    if (!browseMachine || !canBrowseRemote || browserBusy) return;
+    setMode("custom");
+    setBrowserBusy(true);
+    setBrowserError(null);
+    try {
+      const result = await ipc.machineDirList({
+        machineId: browseMachine.id,
+        path: nextPath?.trim() || undefined,
+      });
+      setBrowser(result);
+      setPath(result.path);
+    } catch (err) {
+      setBrowserError(errorText(err));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Workspace for ${displayName(actor)}`}
+      onMouseDown={onCancel}
+    >
+      <div
+        className="w-full max-w-2xl rounded-lg border border-[#dfe3ec] bg-white p-4 shadow-soft"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="mb-4 flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-bold text-[#111827]">Workspace</div>
+            <div className="mt-0.5 truncate text-xs text-[#667085]">
+              {displayName(actor)} · #{channel.title}
+            </div>
+          </div>
+          <button className="composer-icon h-7 min-w-7" type="button" title="Close" onClick={onCancel}>
+            <X size={13} />
+          </button>
+        </div>
+
+        <div className="mb-3 grid h-9 grid-cols-2 overflow-hidden rounded-md border border-[#dfe3ec] bg-[#f8f9fc] p-0.5">
+          {(["default", "custom"] as const).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={cn(
+                "rounded-[5px] text-xs font-bold capitalize text-[#667085]",
+                mode === item && "bg-white text-[#303849] shadow-sm",
+              )}
+              onClick={() => setMode(item)}
+            >
+              {item}
+            </button>
+          ))}
+        </div>
+
+        {mode === "custom" && (
+          <div className="space-y-2">
+            <label className="block">
+              <span className="mb-1 block text-xs font-bold text-[#596174]">Path</span>
+              <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+                <Input
+                  value={path}
+                  onChange={(event) => setPath(event.target.value)}
+                  placeholder="F:\\code\\project"
+                  className="font-mono text-xs"
+                  autoFocus
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  type="button"
+                  disabled={!canBrowseRemote || browserBusy}
+                  title={
+                    canBrowseRemote
+                      ? "Browse remote folders"
+                      : "Remote folder browsing is unavailable"
+                  }
+                  onClick={() => void browseDirectory(customPath || undefined)}
+                >
+                  {browserBusy ? <Loader2 className="animate-spin" size={13} /> : <Folder size={13} />}
+                  Browse
+                </Button>
+              </div>
+            </label>
+            {canBrowseRemote ? (
+              <RemoteDirectoryBrowser
+                browser={browser}
+                busy={browserBusy}
+                error={browserError}
+                onOpenPath={(nextPath) => void browseDirectory(nextPath)}
+              />
+            ) : (
+              <div className="rounded-md border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2 text-xs text-[#667085]">
+                Remote browsing is available after the target daemon supports fs.dir.list.
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button size="sm" disabled={!canSave || saving} onClick={save}>
+            {saving ? <Loader2 className="animate-spin" size={13} /> : null}
+            Save
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function machineForActorMeta(actor: Actor, machines: MachineInfo[]): MachineInfo | null {
+  const machineId = metadataString(actor._meta, ["machineId", "machine_id"]);
+  if (!machineId) return null;
+  return machines.find((machine) => machine.id === machineId) ?? null;
+}
+
+function RemoteDirectoryBrowser({
+  browser,
+  busy,
+  error,
+  onOpenPath,
+}: {
+  browser: MachineDirListResult | null;
+  busy: boolean;
+  error: string | null;
+  onOpenPath: (path?: string | null) => void;
+}) {
+  const entries = browser?.entries ?? [];
+  return (
+    <div className="rounded-lg border border-[#edf0f5] bg-[#fbfbfd] p-2">
+      <div className="mb-2 flex min-w-0 items-center gap-2">
+        <div className="min-w-0 flex-1 truncate rounded-md bg-white px-2 py-1.5 font-mono text-xs text-[#303849]">
+          {browser?.path ?? "No remote folder loaded"}
+        </div>
+        <button
+          type="button"
+          title="Refresh"
+          disabled={busy || !browser}
+          className="composer-icon h-8 min-w-8 text-[#667085]"
+          onClick={() => onOpenPath(browser?.path)}
+        >
+          {busy ? <Loader2 className="animate-spin" size={14} /> : <RefreshCw size={14} />}
+        </button>
+      </div>
+
+      {browser && browser.roots.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-1.5">
+          {browser.roots.map((root) => (
+            <button
+              key={`${root.label}:${root.path}`}
+              type="button"
+              title={root.path}
+              disabled={busy}
+              className="inline-flex h-7 max-w-[180px] items-center gap-1 rounded-md border border-[#dfe3ec] bg-white px-2 text-xs font-semibold text-[#596174] hover:border-[#cdd3e5]"
+              onClick={() => onOpenPath(root.path)}
+            >
+              <HardDrive size={12} />
+              <span className="truncate">{root.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="max-h-56 overflow-y-auto rounded-md border border-[#edf0f5] bg-white p-1 soft-scrollbar">
+        {browser?.parent && (
+          <button
+            type="button"
+            disabled={busy}
+            className="flex h-8 w-full min-w-0 items-center gap-2 rounded px-2 text-left text-xs font-semibold text-[#596174] hover:bg-[#f5f7fb]"
+            onClick={() => onOpenPath(browser.parent)}
+          >
+            <ChevronLeft size={13} />
+            <span className="truncate">..</span>
+          </button>
+        )}
+        {!browser && !busy ? (
+          <div className="px-2 py-6 text-center text-xs text-[#667085]">Open a remote folder.</div>
+        ) : entries.length === 0 && !busy ? (
+          <div className="px-2 py-6 text-center text-xs text-[#667085]">No child folders.</div>
+        ) : (
+          entries.map((entry) => (
+            <button
+              key={entry.path}
+              type="button"
+              disabled={busy}
+              title={entry.path}
+              className="grid h-8 w-full grid-cols-[auto_minmax(0,1fr)] items-center gap-2 rounded px-2 text-left text-xs text-[#303849] hover:bg-[#f5f7fb]"
+              onClick={() => onOpenPath(entry.path)}
+            >
+              <Folder size={13} className="text-[#667085]" />
+              <span className="truncate font-mono">{entry.name}</span>
+            </button>
+          ))
+        )}
+      </div>
+
+      {browser?.truncated && (
+        <div className="mt-1 px-1 text-xs text-[#8a93a5]">Showing the first 500 folders.</div>
+      )}
+      {error && <div className="mt-2 rounded-md bg-[#fff4f4] px-2 py-1.5 text-xs text-[#b42318]">{error}</div>}
     </div>
   );
 }

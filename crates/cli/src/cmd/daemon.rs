@@ -31,6 +31,7 @@ use crate::daemon_ipc;
 use crate::{config, render};
 
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(3);
+const DIR_LIST_MAX_ENTRIES: usize = 500;
 
 pub async fn run(
     machine_id: Option<String>,
@@ -1072,6 +1073,7 @@ fn apply_machine_command(
             let data_root = machine_data_root(selected_machine);
             render_agent_prompt_preview(&spec, command, &data_root)
         }
+        "fs.dir.list" => list_machine_directory(command, selected_machine),
         "agent.file.list" => {
             let actor_id = required_str(command, "actorId")?;
             load_config_agent_spec(actor_id)?
@@ -1743,6 +1745,114 @@ fn prompt_binding_refs(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn list_machine_directory(command: &Value, machine: &MachineConfig) -> Result<Value> {
+    let data_root = abs_path(machine_data_root(machine));
+    let requested = command
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(expand_home);
+    let path = abs_path(requested.unwrap_or_else(|| {
+        dirs::home_dir()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| data_root.clone())
+    }));
+    let metadata =
+        std::fs::symlink_metadata(&path).with_context(|| format!("read {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("{} must not be a symlink", path.display()));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!("{} is not a directory", path.display()));
+    }
+
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let entry_path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&entry_path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        entries.push(json!({
+            "name": name,
+            "path": entry_path.display().to_string(),
+            "kind": "directory",
+            "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+        }));
+    }
+    entries.sort_by(|a, b| {
+        let left = a
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let right = b
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        left.cmp(&right)
+    });
+    let truncated = entries.len() > DIR_LIST_MAX_ENTRIES;
+    entries.truncate(DIR_LIST_MAX_ENTRIES);
+
+    let parent = path.parent().map(|parent| parent.display().to_string());
+    Ok(json!({
+        "path": path.display().to_string(),
+        "parent": parent,
+        "entries": entries,
+        "roots": directory_browser_roots(&data_root),
+        "truncated": truncated,
+    }))
+}
+
+fn directory_browser_roots(data_root: &Path) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    let mut push_root = |label: &str, path: PathBuf| {
+        let display = path.display().to_string();
+        if display.trim().is_empty() || !seen.insert(display.clone()) {
+            return;
+        }
+        roots.push(json!({ "label": label, "path": display }));
+    };
+
+    if let Some(home) = dirs::home_dir() {
+        push_root("Home", home);
+    }
+    push_root("Data root", data_root.to_path_buf());
+
+    #[cfg(windows)]
+    {
+        for letter in b'A'..=b'Z' {
+            let root = format!("{}:\\", letter as char);
+            let path = PathBuf::from(&root);
+            if path.exists() {
+                push_root(&root, path);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        push_root("/", PathBuf::from("/"));
+    }
+
+    roots
+}
+
 fn list_agent_files(actor_id: &str, command: &Value, data_root: &Path) -> Result<Value> {
     let root_name = required_str(command, "root")?;
     let root = agent_file_root(actor_id, root_name, command, data_root)?;
@@ -2046,6 +2156,7 @@ fn machine_inventory_meta(
             "agent.update",
             "agent.remove",
             "agent.prompt.preview",
+            "fs.dir.list",
             "agent.file.list",
             "agent.file.read",
             "agent.file.write",
@@ -2654,6 +2765,50 @@ mod tests {
             prompt_template: None,
         };
         assert!(write_config_agent_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn fs_dir_list_returns_directory_entries_only() {
+        let root = temp_path("fs-dir-list");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("zeta")).expect("create zeta");
+        std::fs::create_dir_all(root.join("alpha").join("nested")).expect("create alpha");
+        std::fs::write(root.join("file.txt"), "not a directory").expect("write file");
+        let data_root = root.join("data-root");
+        let machine = MachineConfig {
+            workspace_id: Some("ws_main".into()),
+            owner_actor_id: Some("actor_human".into()),
+            id: "machine_test".into(),
+            name: "test".into(),
+            kind: default_machine_kind(),
+            data_root: data_root.display().to_string(),
+        };
+
+        let value =
+            list_machine_directory(&json!({ "path": root.display().to_string() }), &machine)
+                .expect("list directory");
+
+        let root_display = root.display().to_string();
+        assert_eq!(
+            value.get("path").and_then(Value::as_str),
+            Some(root_display.as_str())
+        );
+        let names = value
+            .get("entries")
+            .and_then(Value::as_array)
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        assert!(value
+            .get("roots")
+            .and_then(Value::as_array)
+            .expect("roots")
+            .iter()
+            .any(|root| root.get("label").and_then(Value::as_str) == Some("Data root")));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

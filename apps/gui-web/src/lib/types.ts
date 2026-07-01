@@ -1,4 +1,4 @@
-import type { Actor, Channel, MachineAgentProviderInfo, MachineInfo, Thread } from "@/ipc/types";
+import type { Actor, AgentBundleSkillSpec, Channel, MachineAgentProviderInfo, MachineInfo, Thread } from "@/ipc/types";
 
 export type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 export type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "spaces" | "account" | "settings";
@@ -88,6 +88,7 @@ export type AgentUpdatePatch = {
   autostart: boolean;
   avatarUrl: string;
   env: Record<string, string>;
+  bundleSkills: AgentBundleSkillSpec[];
 };
 export type AgentSettingsDraft = {
   displayName: string;
@@ -99,6 +100,7 @@ export type AgentSettingsDraft = {
   autostart: boolean;
   avatarUrl: string;
   env: Record<string, string>;
+  bundleSkills: AgentBundleSkillSpec[];
 };
 export type AgentMemberEntry = {
   machine: MachineInfo;
@@ -121,7 +123,7 @@ export type ProviderAvailabilityGroup = {
   }>;
 };
 export type ActorWorkspaceSection = "agents" | "hosts" | "services";
-export type AgentDetailTab = "profile" | "prompt" | "settings";
+export type AgentDetailTab = "profile" | "prompt" | "skills" | "settings";
 export type ServiceDetailTab = "overview" | "spec" | "config";
 export type PromptTemplateDraft = {
   system: string;

@@ -909,6 +909,37 @@ impl AgentPaths {
         }
     }
 
+    fn actor_bundle_skill_targets(
+        &self,
+        spec: &AgentSpec,
+        bundle_paths: &BundlePaths,
+    ) -> std::io::Result<BTreeMap<String, PathBuf>> {
+        let mut targets = BTreeMap::new();
+        let bundled_skills = bundle_paths.current.join("skills");
+        targets.extend(skill_targets_from_dir(&bundled_skills)?);
+        if let Some(bundle) = spec.bundle.as_ref() {
+            for skill in &bundle.skills {
+                if skill.source.trim().is_empty() {
+                    continue;
+                }
+                let source = PathBuf::from(self.expand(&skill.source, Some(bundle_paths)));
+                let skill_id = if skill.id.trim().is_empty() {
+                    source
+                        .file_name()
+                        .and_then(|part| part.to_str())
+                        .unwrap_or("skill")
+                        .to_string()
+                } else {
+                    skill.id.trim().to_string()
+                };
+                proto::path_component::validate_path_component(&skill_id, "skill_id")
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+                targets.insert(skill_id, source);
+            }
+        }
+        Ok(targets)
+    }
+
     fn expand(&self, input: &str, bundle_paths: Option<&BundlePaths>) -> String {
         let base = self.expand_base(input);
         let bundle_root = bundle_paths
@@ -959,13 +990,23 @@ impl AgentPaths {
             );
             e
         })?;
-        ensure_scope_skills_link(&scope.workspace, &scope.skills).map_err(|e| {
+        write_workspace_projection_manifest(&scope.agent_root, &scope.workspace).map_err(|e| {
+            tracing::error!(
+                actor = %actor_id,
+                agent_root = %scope.agent_root.display(),
+                workspace = %scope.workspace.display(),
+                %e,
+                "ensure_scope: write workspace projection manifest failed"
+            );
+            e
+        })?;
+        ensure_workspace_skill_dirs(&scope.workspace, &scope.skills).map_err(|e| {
             tracing::error!(
                 actor = %actor_id,
                 workspace = %scope.workspace.display(),
                 skills_target = %scope.skills.display(),
                 %e,
-                "ensure_scope: ensure_scope_skills_link failed"
+                "ensure_scope: ensure_workspace_skill_dirs failed"
             );
             e
         })?;
@@ -1277,18 +1318,19 @@ const SCOPE_SKILLS_LINKS: &[&str] = &[
     ".qoder/skills",
     ".opencode/skills",
 ];
+const WORKSPACE_PROJECTION_MANIFEST: &str = "workspace.json";
 
-fn ensure_scope_skills_link(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
+fn ensure_workspace_skill_dirs(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
     create_dir_all_unc(skills_target).map_err(|e| {
         tracing::error!(
             target = %skills_target.display(),
             %e,
-            "ensure_scope_skills_link: create_dir_all_unc skills_target failed"
+            "ensure_workspace_skill_dirs: create_dir_all_unc skills_target failed"
         );
         e
     })?;
     for rel_path in SCOPE_SKILLS_LINKS {
-        ensure_skill_workspace_link(&workspace.join(rel_path), skills_target)?;
+        let _ = ensure_skill_mount_dir(&workspace.join(rel_path))?;
     }
     Ok(())
 }
@@ -1319,6 +1361,241 @@ fn ensure_scope_skill_targets(
     Ok(())
 }
 
+fn scope_skill_targets_from_dir(skills_dir: &Path) -> std::io::Result<BTreeMap<String, PathBuf>> {
+    skill_targets_from_dir(skills_dir)
+}
+
+fn skill_targets_from_dir(skills_dir: &Path) -> std::io::Result<BTreeMap<String, PathBuf>> {
+    let mut targets = BTreeMap::new();
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(targets),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(skill_id) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if proto::path_component::validate_path_component(&skill_id, "skill_id").is_err() {
+            tracing::debug!(
+                skill = %skill_id,
+                path = %entry.path().display(),
+                "scope skill entry has invalid path component"
+            );
+            continue;
+        }
+        targets.insert(skill_id, entry.path());
+    }
+    Ok(targets)
+}
+
+fn ensure_workspace_skill_targets(
+    workspace: &Path,
+    skill_targets: &BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    for rel_path in SCOPE_SKILLS_LINKS {
+        let skills_dir = workspace.join(rel_path);
+        if !ensure_skill_mount_dir(&skills_dir)? {
+            continue;
+        }
+        reconcile_skill_mount_dir(&skills_dir, skill_targets)?;
+        for (skill_id, target) in skill_targets {
+            ensure_skill_workspace_link(&skills_dir.join(skill_id), target)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_actor_bundle_skills_to_existing_workspaces(
+    data_root: &Path,
+    actor_id: &str,
+    old_spec: Option<&AgentSpec>,
+    spec: &AgentSpec,
+) -> std::io::Result<usize> {
+    let paths = AgentPaths::new(data_root, actor_id);
+    let bundle_paths = paths.bundle_paths(spec);
+    let new_targets = paths.actor_bundle_skill_targets(spec, &bundle_paths)?;
+    let old_targets = if let Some(old_spec) = old_spec {
+        let old_bundle_paths = paths.bundle_paths(old_spec);
+        paths.actor_bundle_skill_targets(old_spec, &old_bundle_paths)?
+    } else {
+        BTreeMap::new()
+    };
+    if old_targets.is_empty() && new_targets.is_empty() {
+        return Ok(0);
+    }
+
+    let workspaces = existing_actor_channel_workspaces(data_root, actor_id)?;
+    let workspace_count = workspaces.len();
+    for workspace in workspaces {
+        sync_actor_skill_targets_to_workspace(&workspace, &old_targets, &new_targets)?;
+    }
+    Ok(workspace_count)
+}
+
+fn existing_actor_channel_workspaces(
+    data_root: &Path,
+    actor_id: &str,
+) -> std::io::Result<Vec<PathBuf>> {
+    let channels_dir = data_root.join("channels");
+    let entries = match std::fs::read_dir(&channels_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut seen = BTreeSet::new();
+    let mut workspaces = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let channel_path = entry.path();
+        if !is_existing_real_dir(&channel_path)? {
+            continue;
+        }
+        let agent_root = channel_path.join("agents").join(actor_id);
+        let default_workspace = agent_root.join("workspace");
+        push_existing_workspace(&mut seen, &mut workspaces, default_workspace)?;
+        if let Some(manifest_workspace) = read_workspace_projection_manifest(&agent_root)? {
+            push_existing_workspace(&mut seen, &mut workspaces, manifest_workspace)?;
+        }
+    }
+    Ok(workspaces)
+}
+
+fn push_existing_workspace(
+    seen: &mut BTreeSet<String>,
+    workspaces: &mut Vec<PathBuf>,
+    workspace: PathBuf,
+) -> std::io::Result<()> {
+    if !is_existing_real_dir(&workspace)? {
+        return Ok(());
+    }
+    let key = workspace.display().to_string();
+    if seen.insert(key) {
+        workspaces.push(workspace);
+    }
+    Ok(())
+}
+
+fn is_existing_real_dir(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_dir() && !meta.file_type().is_symlink()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn sync_actor_skill_targets_to_workspace(
+    workspace: &Path,
+    old_targets: &BTreeMap<String, PathBuf>,
+    new_targets: &BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    for rel_path in SCOPE_SKILLS_LINKS {
+        let skills_dir = workspace.join(rel_path);
+        if !ensure_skill_mount_dir(&skills_dir)? {
+            continue;
+        }
+        for (skill_id, old_target) in old_targets {
+            if new_targets.contains_key(skill_id) {
+                continue;
+            }
+            remove_actor_skill_link_if_matches(&skills_dir.join(skill_id), old_target)?;
+        }
+        for (skill_id, target) in new_targets {
+            ensure_skill_workspace_link(&skills_dir.join(skill_id), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_actor_skill_link_if_matches(link_path: &Path, old_target: &Path) -> std::io::Result<()> {
+    match std::fs::read_link(link_path) {
+        Ok(existing) if existing == old_target => remove_path_if_exists(link_path),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn write_workspace_projection_manifest(agent_root: &Path, workspace: &Path) -> std::io::Result<()> {
+    let content = serde_json::to_string_pretty(&json!({
+        "workspace": workspace.display().to_string(),
+    }))
+    .map_err(std::io::Error::other)?;
+    write_text_file_if_changed(&agent_root.join(WORKSPACE_PROJECTION_MANIFEST), &content)
+}
+
+fn read_workspace_projection_manifest(agent_root: &Path) -> std::io::Result<Option<PathBuf>> {
+    let path = agent_root.join(WORKSPACE_PROJECTION_MANIFEST);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::debug!(
+                path = %path.display(),
+                %err,
+                "workspace projection manifest is not valid json"
+            );
+            return Ok(None);
+        }
+    };
+    let Some(workspace) = value
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(normalize_path_separators(PathBuf::from(workspace))))
+}
+
+fn reconcile_skill_mount_dir(
+    skills_dir: &Path,
+    skill_targets: &BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    let desired_ids = skill_targets
+        .keys()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Ok(entries) = std::fs::read_dir(skills_dir) {
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if desired_ids.contains(name.as_str()) {
+                continue;
+            }
+            let meta = match std::fs::symlink_metadata(entry.path()) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if meta.file_type().is_symlink() {
+                remove_path_if_exists(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_skill_mount_dir(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(false),
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => remove_path_if_exists(path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    create_dir_all_unc(path)?;
+    Ok(true)
+}
+
 fn ensure_skill_workspace_link(link_path: &Path, skills_target: &Path) -> std::io::Result<()> {
     if let Some(parent) = link_path.parent() {
         create_dir_all_unc(parent)?;
@@ -1330,13 +1607,13 @@ fn ensure_skill_workspace_link(link_path: &Path, skills_target: &Path) -> std::i
                 link = %link_path.display(),
                 existing = %existing.display(),
                 new_target = %skills_target.display(),
-                "ensure_scope_skills_link: symlink target mismatch, removing old link"
+                "ensure_skill_workspace_link: symlink target mismatch, removing old link"
             );
             remove_path_if_exists(&link_path).map_err(|e| {
                 tracing::error!(
                     link = %link_path.display(),
                     %e,
-                    "ensure_scope_skills_link: remove_path_if_exists failed"
+                    "ensure_skill_workspace_link: remove_path_if_exists failed"
                 );
                 e
             })?;
@@ -1346,14 +1623,14 @@ fn ensure_skill_workspace_link(link_path: &Path, skills_target: &Path) -> std::i
             tracing::debug!(
                 link = %link_path.display(),
                 %err,
-                "ensure_scope_skills_link: read_link error, attempting remove_path_if_exists"
+                "ensure_skill_workspace_link: read_link error, attempting remove_path_if_exists"
             );
             remove_path_if_exists(&link_path).map_err(|e| {
                 tracing::error!(
                     link = %link_path.display(),
                     read_link_err = %err,
                     remove_err = %e,
-                    "ensure_scope_skills_link: remove_path_if_exists after read_link failure"
+                    "ensure_skill_workspace_link: remove_path_if_exists after read_link failure"
                 );
                 e
             })?;
@@ -1364,7 +1641,7 @@ fn ensure_skill_workspace_link(link_path: &Path, skills_target: &Path) -> std::i
             target = %skills_target.display(),
             link = %link_path.display(),
             %e,
-            "ensure_scope_skills_link: symlink_path failed"
+            "ensure_skill_workspace_link: symlink_path failed"
         );
         e
     })
@@ -4105,6 +4382,17 @@ async fn build_adapter_prompt(
     let skill_targets = current_scope_skill_targets(client, state, &channel_id).await;
     ensure_scope_skill_targets(&scope_paths.skills, &skill_targets)
         .with_context(|| format!("ensure scope skill targets for scope {}", scope.id))?;
+    let mut workspace_skill_targets = scope_skill_targets_from_dir(&scope_paths.skills)
+        .with_context(|| format!("read scope skill targets for scope {}", scope.id))?;
+    let bundle_paths = state.paths.bundle_paths(&state.spec);
+    workspace_skill_targets.extend(
+        state
+            .paths
+            .actor_bundle_skill_targets(&state.spec, &bundle_paths)
+            .with_context(|| format!("resolve actor bundle skills for {}", state.actor_id))?,
+    );
+    ensure_workspace_skill_targets(&scope_paths.workspace, &workspace_skill_targets)
+        .with_context(|| format!("project workspace skills for scope {}", scope.id))?;
     let mut template_vars =
         state
             .paths
@@ -7333,9 +7621,9 @@ async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Res
 mod tests {
     use super::*;
     use proto::methods::{
-        AgentBundleSpec, AgentModelChoice, AgentModelSpec, AgentPromptAssemblySpec,
-        AgentPromptFileSpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentProviderRef,
-        ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
+        AgentBundleSkillSpec, AgentBundleSpec, AgentModelChoice, AgentModelSpec,
+        AgentPromptAssemblySpec, AgentPromptFileSpec, AgentPromptOutputSpec, AgentPromptRoleHint,
+        AgentProviderRef, ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
@@ -7644,7 +7932,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ensure_scope_links_scope_specific_skills_into_workspace() {
+    fn ensure_scope_creates_provider_skill_dirs_in_workspace() {
         let root = temp_path("scope-skills-link");
         let paths = AgentPaths::new(&root, "actor_demo");
         let scope = ScopeRef {
@@ -7656,14 +7944,244 @@ mod tests {
             .ensure_scope("actor_demo", "chan_demo", &scope, None, None, None)
             .expect("ensure scope");
 
-        assert_eq!(
-            std::fs::read_link(scope_paths.workspace.join("skills")).expect("skills link"),
-            root.join("workspaces")
-                .join("thread")
-                .join("thread_demo")
-                .join("skills")
-        );
+        assert!(scope_paths.workspace.join("skills").is_dir());
+        assert!(scope_paths
+            .workspace
+            .join(".agents")
+            .join("skills")
+            .is_dir());
         assert!(scope_paths.skills.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_skill_dirs_project_scope_and_actor_skills() {
+        let root = temp_path("workspace-skill-targets");
+        let workspace = root.join("workspace");
+        let scope_skills = root.join("scope").join("skills");
+        let peer_skill = root.join("peer-skill");
+        let local_skill = root.join("local-skill");
+        std::fs::create_dir_all(&peer_skill).expect("peer skill");
+        std::fs::create_dir_all(&local_skill).expect("local skill");
+
+        ensure_workspace_skill_dirs(&workspace, &scope_skills).expect("skill dirs");
+        ensure_scope_skill_targets(
+            &scope_skills,
+            &BTreeMap::from([("peer".into(), peer_skill.clone())]),
+        )
+        .expect("scope skill targets");
+        let mut targets = scope_skill_targets_from_dir(&scope_skills).expect("read scope skills");
+        targets.insert("local".into(), local_skill.clone());
+
+        ensure_workspace_skill_targets(&workspace, &targets).expect("workspace skill targets");
+
+        assert!(workspace.join(".agents").join("skills").is_dir());
+        assert_eq!(
+            std::fs::read_link(workspace.join(".agents").join("skills").join("peer"))
+                .expect("peer link"),
+            scope_skills.join("peer")
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join(".agents").join("skills").join("local"))
+                .expect("local link"),
+            local_skill
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join(".claude").join("skills").join("peer"))
+                .expect("claude peer link"),
+            scope_skills.join("peer")
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_skill_projection_preserves_legacy_mount_symlink() {
+        let root = temp_path("workspace-skill-legacy-symlink");
+        let workspace = root.join("workspace");
+        let legacy_target = root.join("legacy-scope-skills");
+        let new_target = root.join("new-skill");
+        std::fs::create_dir_all(&legacy_target).expect("legacy target");
+        std::fs::create_dir_all(&new_target).expect("new target");
+        std::fs::create_dir_all(workspace.join(".agents")).expect("agents dir");
+        symlink_path(&legacy_target, &workspace.join(".agents").join("skills"))
+            .expect("legacy skills link");
+
+        ensure_workspace_skill_targets(
+            &workspace,
+            &BTreeMap::from([("new".into(), new_target.clone())]),
+        )
+        .expect("project skills");
+
+        assert_eq!(
+            std::fs::read_link(workspace.join(".agents").join("skills")).expect("legacy link"),
+            legacy_target
+        );
+        assert!(!legacy_target.join("new").exists());
+        assert_eq!(
+            std::fs::read_link(workspace.join("skills").join("new")).expect("new link"),
+            new_target
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn actor_bundle_skill_targets_include_bundle_and_external_skills() {
+        let root = temp_path("actor-bundle-skills");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let bundle_current = root.join("bundle-current");
+        let bundled_skill = bundle_current.join("skills").join("bundled");
+        let external_skill = root.join("external-skill");
+        std::fs::create_dir_all(&bundled_skill).expect("bundled skill");
+        std::fs::create_dir_all(&external_skill).expect("external skill");
+        let bundle_paths = BundlePaths {
+            root: root.join("bundles"),
+            current: bundle_current.clone(),
+            version: "v1".into(),
+        };
+        let spec = sample_spec(Some(AgentBundleSpec {
+            skills: vec![AgentBundleSkillSpec {
+                id: "external".into(),
+                source: external_skill.display().to_string(),
+            }],
+            ..Default::default()
+        }));
+
+        let targets = paths
+            .actor_bundle_skill_targets(&spec, &bundle_paths)
+            .expect("actor skills");
+
+        assert_eq!(targets.get("bundled"), Some(&bundled_skill));
+        assert_eq!(targets.get("external"), Some(&external_skill));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actor_skill_sync_projects_new_skill_to_existing_channel_workspace() {
+        let root = temp_path("actor-skill-sync-add");
+        let data_root = root.join("data");
+        let workspace = data_root
+            .join("channels")
+            .join("chan_demo")
+            .join("agents")
+            .join("actor_demo")
+            .join("workspace");
+        let skill = root.join("skill-new");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&skill).expect("skill");
+        let spec = sample_spec(Some(AgentBundleSpec {
+            skills: vec![AgentBundleSkillSpec {
+                id: "new".into(),
+                source: skill.display().to_string(),
+            }],
+            ..Default::default()
+        }));
+
+        let synced =
+            sync_actor_bundle_skills_to_existing_workspaces(&data_root, "actor_demo", None, &spec)
+                .expect("sync workspaces");
+
+        assert_eq!(synced, 1);
+        assert_eq!(
+            std::fs::read_link(workspace.join(".agents").join("skills").join("new"))
+                .expect("new skill link"),
+            skill
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join("skills").join("new"))
+                .expect("legacy skill dir new link"),
+            skill
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actor_skill_sync_removes_old_actor_skill_without_removing_scope_skill() {
+        let root = temp_path("actor-skill-sync-remove");
+        let data_root = root.join("data");
+        let workspace = data_root
+            .join("channels")
+            .join("chan_demo")
+            .join("agents")
+            .join("actor_demo")
+            .join("workspace");
+        let skills_dir = workspace.join(".agents").join("skills");
+        let old_skill = root.join("old-skill");
+        let scope_skill = root.join("scope-skill");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::create_dir_all(&old_skill).expect("old skill");
+        std::fs::create_dir_all(&scope_skill).expect("scope skill");
+        symlink_path(&old_skill, &skills_dir.join("old")).expect("old link");
+        symlink_path(&scope_skill, &skills_dir.join("scope")).expect("scope link");
+        let old_spec = sample_spec(Some(AgentBundleSpec {
+            skills: vec![AgentBundleSkillSpec {
+                id: "old".into(),
+                source: old_skill.display().to_string(),
+            }],
+            ..Default::default()
+        }));
+        let new_spec = sample_spec(None);
+
+        let synced = sync_actor_bundle_skills_to_existing_workspaces(
+            &data_root,
+            "actor_demo",
+            Some(&old_spec),
+            &new_spec,
+        )
+        .expect("sync workspaces");
+
+        assert_eq!(synced, 1);
+        assert!(!skills_dir.join("old").exists());
+        assert_eq!(
+            std::fs::read_link(skills_dir.join("scope")).expect("scope skill link"),
+            scope_skill
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actor_skill_sync_uses_workspace_projection_manifest() {
+        let root = temp_path("actor-skill-sync-manifest");
+        let data_root = root.join("data");
+        let agent_root = data_root
+            .join("channels")
+            .join("chan_demo")
+            .join("agents")
+            .join("actor_demo");
+        let custom_workspace = root.join("custom-workspace");
+        let skill = root.join("skill-new");
+        std::fs::create_dir_all(&custom_workspace).expect("custom workspace");
+        std::fs::create_dir_all(&skill).expect("skill");
+        write_workspace_projection_manifest(&agent_root, &custom_workspace)
+            .expect("write workspace manifest");
+        let spec = sample_spec(Some(AgentBundleSpec {
+            skills: vec![AgentBundleSkillSpec {
+                id: "new".into(),
+                source: skill.display().to_string(),
+            }],
+            ..Default::default()
+        }));
+
+        let synced =
+            sync_actor_bundle_skills_to_existing_workspaces(&data_root, "actor_demo", None, &spec)
+                .expect("sync workspaces");
+
+        assert_eq!(synced, 1);
+        assert_eq!(
+            std::fs::read_link(custom_workspace.join(".agents").join("skills").join("new"))
+                .expect("custom workspace skill link"),
+            skill
+        );
 
         std::fs::remove_dir_all(root).ok();
     }

@@ -1316,6 +1316,7 @@ export function App() {
         autostart: patch.autostart,
         avatarUrl: patch.avatarUrl.trim(),
         env: filterEmptyEnvKeys(patch.env),
+        bundleSkills: patch.bundleSkills,
       });
       await loadMachines();
       if (workspace && connection === "open") {

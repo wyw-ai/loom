@@ -1560,6 +1560,43 @@ enum MachineAgentCmd {
         #[arg(long = "actor-id")]
         actor_id: String,
     },
+    /// View, add, or remove actor-local skill directories on the target daemon.
+    Skill {
+        #[command(subcommand)]
+        sub: MachineAgentSkillCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MachineAgentSkillCmd {
+    /// List custom skill directories configured on an agent.
+    List {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+    },
+    /// Add a skill directory. The target daemon validates that it contains SKILL.md.
+    Add {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+        /// Stable skill id. Defaults to the source directory name.
+        #[arg(long = "skill-id")]
+        skill_id: Option<String>,
+        /// Directory on the target daemon host that contains SKILL.md.
+        source: PathBuf,
+    },
+    /// Remove a custom skill from this agent. The source directory is not deleted.
+    Remove {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+        #[arg(long = "skill-id")]
+        skill_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -2621,6 +2658,28 @@ async fn async_main() -> Result<()> {
                 MachineAgentCmd::Remove { machine, actor_id } => {
                     cmd::machine::agent_remove(client, machine, actor_id).await?
                 }
+                MachineAgentCmd::Skill { sub } => match sub {
+                    MachineAgentSkillCmd::List { machine, actor_id } => {
+                        cmd::machine::agent_skill_list(client, machine, actor_id).await?
+                    }
+                    MachineAgentSkillCmd::Add {
+                        machine,
+                        actor_id,
+                        skill_id,
+                        source,
+                    } => {
+                        cmd::machine::agent_skill_add(client, machine, actor_id, skill_id, source)
+                            .await?
+                    }
+                    MachineAgentSkillCmd::Remove {
+                        machine,
+                        actor_id,
+                        skill_id,
+                    } => {
+                        cmd::machine::agent_skill_remove(client, machine, actor_id, skill_id)
+                            .await?
+                    }
+                },
             },
         },
         Cmd::Actor { sub } => match sub {
@@ -3320,6 +3379,77 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn machine_agent_skill_commands_parse() {
+        let add_args = Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "skill",
+            "add",
+            "--machine",
+            "macmini",
+            "--actor-id",
+            "actor_impl",
+            "--skill-id",
+            "cloud-dev",
+            "/tmp/cloud-dev",
+        ])
+        .expect("parse machine agent skill add");
+
+        match add_args.cmd {
+            Cmd::Machine {
+                sub:
+                    MachineCmd::Agent {
+                        sub:
+                            MachineAgentCmd::Skill {
+                                sub:
+                                    MachineAgentSkillCmd::Add {
+                                        machine,
+                                        actor_id,
+                                        skill_id,
+                                        source,
+                                    },
+                            },
+                    },
+            } => {
+                assert_eq!(machine, "macmini");
+                assert_eq!(actor_id, "actor_impl");
+                assert_eq!(skill_id.as_deref(), Some("cloud-dev"));
+                assert_eq!(source, PathBuf::from("/tmp/cloud-dev"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "skill",
+            "list",
+            "--machine",
+            "macmini",
+            "--actor-id",
+            "actor_impl",
+        ])
+        .expect("parse machine agent skill list");
+
+        Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "skill",
+            "remove",
+            "--machine",
+            "macmini",
+            "--actor-id",
+            "actor_impl",
+            "--skill-id",
+            "cloud-dev",
+        ])
+        .expect("parse machine agent skill remove");
     }
 
     #[test]

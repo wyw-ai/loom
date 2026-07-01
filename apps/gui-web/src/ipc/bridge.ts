@@ -20,6 +20,7 @@ import type {
   HumanAccount,
   InboxListEntry,
   MachineAgentProviderInfo,
+  AgentBundleSkillSpec,
   MachineDirListResult,
   MachineListResult,
   Message,
@@ -461,6 +462,7 @@ export async function agentUpdate(args: {
   autostart?: boolean;
   avatarUrl?: string;
   env?: Record<string, string>;
+  bundleSkills?: AgentBundleSkillSpec[] | null;
 }): Promise<AgentInfo> {
   return invoke("agent_update", { args });
 }

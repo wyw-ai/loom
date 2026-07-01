@@ -20,7 +20,7 @@ import { avatarLibraryUrls, reasoningEffortChoices } from "@/lib/constants";
 import { agentFormForMachine, capitalize, errorText, machineCanCreateAgent, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { ArrowLeft, Bot, Check, ChevronLeft, FileText, Folder, HardDrive, Loader2, Plus, RefreshCw, Settings, Trash2, Wrench, X } from "lucide-react";
-import type { AgentBundleSkillSpec, MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
+import type { MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
 import type { AgentDetailTab, AgentFormState, AgentMemberEntry, AgentSettingsDraft, AgentUpdatePatch } from "@/lib/types";
 
 const customModelOptionValue = "__loom_custom_model__";
@@ -756,12 +756,18 @@ export function AgentMemberDetail({
   busy,
   onBack,
   onUpdateAgent,
+  onAddAgentSkill,
   onRemoveAgent,
 }: {
   entry: AgentMemberEntry;
   busy: string | null;
   onBack: () => void;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
+  onAddAgentSkill: (
+    machineId: string,
+    actorId: string,
+    source: string,
+  ) => Promise<boolean> | boolean;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
   const { machine, agent } = entry;
@@ -786,6 +792,7 @@ export function AgentMemberDetail({
     modelChoices.length === 0 || customModelActive || !modelIsKnown;
   const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
   const saving = busy === `agent:update:${actor.id}`;
+  const skillAdding = busy === `agent:skill:add:${actor.id}`;
   const removing = busy === `agent:remove:${actor.id}`;
   const canEdit = !machine.readOnly;
   const detailTabs: Array<{
@@ -872,17 +879,11 @@ export function AgentMemberDetail({
     onUpdateAgent(agentPatchFromDraft(draft));
   }
 
-  function addSkill(nextSkill: AgentBundleSkillSpec) {
-    if (!canEdit) return;
-    const nextDraft = {
-      ...draft,
-      bundleSkills: [
-        ...draft.bundleSkills.filter((skill) => skill.id !== nextSkill.id),
-        nextSkill,
-      ],
-    };
-    setSkillAddDialogOpen(false);
-    persistAgent(nextDraft);
+  async function addSkill(source: string) {
+    if (!canEdit) return false;
+    const ok = await onAddAgentSkill(machine.id, actor.id, source);
+    if (ok) setSkillAddDialogOpen(false);
+    return ok;
   }
 
   function removeSkill(skillId: string) {
@@ -1176,7 +1177,7 @@ export function AgentMemberDetail({
                 type="button"
                 size="sm"
                 onClick={() => setSkillAddDialogOpen(true)}
-                disabled={!canEdit || saving}
+                disabled={!canEdit || saving || skillAdding}
                 className="rounded-lg"
               >
                 <Plus size={14} />
@@ -1220,7 +1221,7 @@ export function AgentMemberDetail({
             <AgentSkillAddDialog
               machine={machine}
               canEdit={canEdit}
-              saving={saving}
+              saving={skillAdding}
               onCancel={() => setSkillAddDialogOpen(false)}
               onAddSkill={addSkill}
             />
@@ -1280,7 +1281,7 @@ function AgentSkillAddDialog({
   canEdit: boolean;
   saving: boolean;
   onCancel: () => void;
-  onAddSkill: (skill: AgentBundleSkillSpec) => void;
+  onAddSkill: (source: string) => Promise<boolean> | boolean;
 }) {
   const canBrowseRemote = Boolean(
     machine.canCommand && machine.capabilities.includes("fs.dir.list"),
@@ -1292,7 +1293,6 @@ function AgentSkillAddDialog({
   const [browserLoading, setBrowserLoading] = useState(false);
   const [browserError, setBrowserError] = useState<string | null>(null);
   const [selectedSkillPath, setSelectedSkillPath] = useState("");
-  const [skillIdDraft, setSkillIdDraft] = useState("");
   const entries = browser?.entries ?? [];
   const skillSource = selectedSkillPath.trim();
   const canAdd = canEdit && skillSource.length > 0 && !saving;
@@ -1330,10 +1330,7 @@ function AgentSkillAddDialog({
   function submitSkill(event: FormEvent) {
     event.preventDefault();
     if (!canAdd) return;
-    onAddSkill({
-      id: skillIdDraft.trim() || skillIdFromSource(skillSource),
-      source: skillSource,
-    });
+    void onAddSkill(skillSource);
   }
 
   return createPortal(
@@ -1370,16 +1367,6 @@ function AgentSkillAddDialog({
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
                 disabled={!canEdit}
                 autoFocus
-              />
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-xs font-bold text-[#596174]">Skill id</span>
-              <Input
-                value={skillIdDraft}
-                onChange={(event) => setSkillIdDraft(event.target.value)}
-                placeholder={skillSource ? skillIdFromSource(skillSource) : "Derived from directory"}
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canEdit}
               />
             </label>
             {!canBrowseRemote && (
@@ -1528,8 +1515,4 @@ function AgentSkillAddDialog({
     </div>,
     document.body,
   );
-}
-
-function skillIdFromSource(source: string) {
-  return source.split(/[\\/]/).filter(Boolean).pop() || "skill";
 }

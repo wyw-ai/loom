@@ -3036,6 +3036,44 @@ mod tests {
     }
 
     #[test]
+    fn normalize_bundle_skill_requires_skill_md_and_derives_id() {
+        let root = temp_path("bundle-skill-validation");
+        let skill_dir = root.join("demo-skill");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+
+        let err = normalize_bundle_skill(String::new(), skill_dir.display().to_string())
+            .expect_err("missing SKILL.md should be rejected");
+        assert!(
+            err.to_string().contains("does not contain SKILL.md"),
+            "{err}"
+        );
+
+        std::fs::write(skill_dir.join("SKILL.md"), "# Demo\n").expect("write SKILL.md");
+        let skill = normalize_bundle_skill(String::new(), skill_dir.display().to_string())
+            .expect("valid skill");
+        assert_eq!(skill.id, "demo-skill");
+        assert_eq!(skill.source, skill_dir.display().to_string());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_bundle_skills_rejects_missing_skill_md() {
+        let root = temp_path("bundle-skill-parse-validation");
+        let not_a_skill = root.join("not-a-skill");
+        std::fs::create_dir_all(&not_a_skill).expect("create dir");
+
+        let err = parse_bundle_skills(&json!([{ "source": not_a_skill }]))
+            .expect_err("missing SKILL.md should be rejected");
+        assert!(
+            err.to_string().contains("does not contain SKILL.md"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn prompt_preview_understands_profile_prompt_files_variable() {
         let parts = vec![prompt_preview_part(
             "profile_prompt_files",

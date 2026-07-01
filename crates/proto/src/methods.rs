@@ -2913,6 +2913,10 @@ pub struct AgentBundleSpec {
     /// `{agent.root}/bundles/current`.
     #[serde(default = "default_bundle_current")]
     pub current: String,
+    /// Additional actor-local skills to project into each scope workspace's
+    /// provider-native skill directories. Each source is one skill directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<AgentBundleSkillSpec>,
 }
 
 impl Default for AgentBundleSpec {
@@ -2923,6 +2927,7 @@ impl Default for AgentBundleSpec {
             install_mode: BundleInstallMode::default(),
             root: default_bundle_root(),
             current: default_bundle_current(),
+            skills: Vec::new(),
         }
     }
 }
@@ -2941,6 +2946,19 @@ pub enum BundleInstallMode {
     #[default]
     Copy,
     Symlink,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBundleSkillSpec {
+    /// Stable skill directory name under provider-native skills roots.
+    /// Empty means derive from the source basename.
+    #[serde(default)]
+    pub id: String,
+    /// Source skill directory. Supports the same agent path templates as
+    /// bundle source/current, including `{agent.bundle}`.
+    #[serde(default)]
+    pub source: String,
 }
 
 // ---- memory ----

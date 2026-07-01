@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use agent_runtime::acp::normalize_path_separators;
 use agent_runtime::discovery::{
     detect_agent_cli_providers, normalize_model_id_for_provider, DetectedAgentProvider,
 };
@@ -16,8 +17,8 @@ use agent_runtime::provider::{
 };
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
-    AgentModelSpec, AgentPromptAssemblySpec, AgentProviderRef, AgentSpec, ProviderManifest,
-    ServiceSpec,
+    AgentBundleSkillSpec, AgentBundleSpec, AgentModelSpec, AgentPromptAssemblySpec,
+    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -777,6 +778,18 @@ fn update_agent_spec_from_command(
                 .collect();
         }
     }
+    if let Some(skills_value) = command.get("bundleSkills") {
+        if skills_value.is_null() {
+            if let Some(bundle) = spec.bundle.as_mut() {
+                bundle.skills.clear();
+            }
+            prune_empty_bundle(&mut spec);
+        } else {
+            let skills = parse_bundle_skills(skills_value)?;
+            let bundle = spec.bundle.get_or_insert_with(AgentBundleSpec::default);
+            bundle.skills = skills;
+        }
+    }
     if let Some(provider) = selected_provider {
         let meta = spec.actor._meta.get_or_insert_with(Default::default);
         meta.insert("providerId".into(), json!(provider.id.clone()));
@@ -795,6 +808,115 @@ fn update_agent_spec_from_command(
         });
     }
     Ok(spec)
+}
+
+fn agent_bundle_skills_value(spec: &AgentSpec) -> Value {
+    json!(spec
+        .bundle
+        .as_ref()
+        .map(|bundle| bundle.skills.as_slice())
+        .unwrap_or(&[]))
+}
+
+fn bundle_skill_from_command(command: &Value) -> Result<AgentBundleSkillSpec> {
+    let source = required_str(command, "source")?.to_string();
+    let id = optional_trimmed_str(command, "skillId").unwrap_or_default();
+    normalize_bundle_skill(id, source)
+}
+
+fn parse_bundle_skills(value: &Value) -> Result<Vec<AgentBundleSkillSpec>> {
+    let raw = value
+        .as_array()
+        .ok_or_else(|| anyhow!("bundleSkills must be an array"))?;
+    let mut skills = Vec::with_capacity(raw.len());
+    let mut seen = HashSet::new();
+    for item in raw {
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("bundleSkills[].source is required"))?
+            .to_string();
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let skill = normalize_bundle_skill(id, source)?;
+        if !seen.insert(skill.id.clone()) {
+            return Err(anyhow!("duplicate bundle skill id `{}`", skill.id));
+        }
+        skills.push(skill);
+    }
+    Ok(skills)
+}
+
+fn normalize_bundle_skill(id: String, source: String) -> Result<AgentBundleSkillSpec> {
+    let source_path = normalize_path_separators(PathBuf::from(source.trim()));
+    if !source_path.is_dir() {
+        return Err(anyhow!(
+            "skill source `{}` is not a directory",
+            source_path.display()
+        ));
+    }
+    if !source_path.join("SKILL.md").is_file() {
+        return Err(anyhow!(
+            "skill source `{}` does not contain SKILL.md",
+            source_path.display()
+        ));
+    }
+    let skill_id = if id.trim().is_empty() {
+        source_path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .ok_or_else(|| anyhow!("cannot derive skill id from `{}`", source_path.display()))?
+            .to_string()
+    } else {
+        id.trim().to_string()
+    };
+    proto::path_component::validate_path_component(&skill_id, "skill_id")
+        .map_err(|err| anyhow!(err))?;
+    Ok(AgentBundleSkillSpec {
+        id: skill_id,
+        source: source_path.display().to_string(),
+    })
+}
+
+fn prune_empty_bundle(spec: &mut AgentSpec) {
+    let Some(bundle) = spec.bundle.as_ref() else {
+        return;
+    };
+    let default_bundle = AgentBundleSpec::default();
+    if bundle.source.trim().is_empty()
+        && bundle.version.trim().is_empty()
+        && bundle.skills.is_empty()
+        && bundle.install_mode == default_bundle.install_mode
+        && bundle.root == default_bundle.root
+        && bundle.current == default_bundle.current
+    {
+        spec.bundle = None;
+    }
+}
+
+fn sync_agent_bundle_skills_after_spec_change(
+    machine: &MachineConfig,
+    actor_id: &str,
+    old_spec: Option<&AgentSpec>,
+    spec: &AgentSpec,
+) -> Result<usize> {
+    let data_root = abs_path(machine_data_root(machine));
+    agent_serve::sync_actor_bundle_skills_to_existing_workspaces(
+        &data_root, actor_id, old_spec, spec,
+    )
+    .with_context(|| {
+        format!(
+            "sync actor bundle skills to existing workspaces for {} under {}",
+            actor_id,
+            data_root.display()
+        )
+    })
 }
 
 fn reconcile_agents(
@@ -1060,11 +1182,91 @@ fn apply_machine_command(
             let actor_id = required_str(command, "actorId")?;
             let providers = detect_agent_cli_providers();
             if let Some(spec) = load_config_agent_spec(actor_id)? {
+                let old_spec = spec.clone();
+                let sync_skills = command.get("bundleSkills").is_some();
                 let spec = update_agent_spec_from_command(spec, command, &providers)?;
                 let path = write_config_agent_spec(&spec)?;
-                return Ok(json!({ "agentSpec": spec, "path": path.display().to_string() }));
+                let synced_workspaces = if sync_skills {
+                    Some(sync_agent_bundle_skills_after_spec_change(
+                        selected_machine,
+                        actor_id,
+                        Some(&old_spec),
+                        &spec,
+                    )?)
+                } else {
+                    None
+                };
+                return Ok(json!({
+                    "agentSpec": spec,
+                    "path": path.display().to_string(),
+                    "syncedWorkspaces": synced_workspaces,
+                }));
             }
             Err(anyhow!("daemon-configured agent not found: {actor_id}"))
+        }
+        "agent.skill.list" => {
+            let actor_id = required_str(command, "actorId")?;
+            let spec = load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            Ok(json!({
+                "actorId": actor_id,
+                "skills": agent_bundle_skills_value(&spec),
+            }))
+        }
+        "agent.skill.add" => {
+            let actor_id = required_str(command, "actorId")?;
+            let skill = bundle_skill_from_command(command)?;
+            let mut spec = load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let old_spec = spec.clone();
+            let bundle = spec.bundle.get_or_insert_with(AgentBundleSpec::default);
+            bundle.skills.retain(|existing| existing.id != skill.id);
+            bundle.skills.push(skill);
+            let path = write_config_agent_spec(&spec)?;
+            let synced_workspaces = sync_agent_bundle_skills_after_spec_change(
+                selected_machine,
+                actor_id,
+                Some(&old_spec),
+                &spec,
+            )?;
+            Ok(json!({
+                "agentSpec": spec,
+                "path": path.display().to_string(),
+                "syncedWorkspaces": synced_workspaces,
+            }))
+        }
+        "agent.skill.remove" => {
+            let actor_id = required_str(command, "actorId")?;
+            let skill_id = required_str(command, "skillId")?;
+            proto::path_component::validate_path_component(skill_id, "skill_id")
+                .map_err(|err| anyhow!(err))?;
+            let mut spec = load_config_agent_spec(actor_id)?
+                .ok_or_else(|| anyhow!("daemon-configured agent not found: {actor_id}"))?;
+            let old_spec = spec.clone();
+            let mut removed = false;
+            if let Some(bundle) = spec.bundle.as_mut() {
+                let before = bundle.skills.len();
+                bundle.skills.retain(|skill| skill.id != skill_id);
+                removed = bundle.skills.len() != before;
+            }
+            prune_empty_bundle(&mut spec);
+            let path = write_config_agent_spec(&spec)?;
+            let synced_workspaces = if removed {
+                Some(sync_agent_bundle_skills_after_spec_change(
+                    selected_machine,
+                    actor_id,
+                    Some(&old_spec),
+                    &spec,
+                )?)
+            } else {
+                None
+            };
+            Ok(json!({
+                "agentSpec": spec,
+                "path": path.display().to_string(),
+                "removed": removed,
+                "syncedWorkspaces": synced_workspaces,
+            }))
         }
         "agent.prompt.preview" => {
             let actor_id = required_str(command, "actorId")?;
@@ -2155,6 +2357,9 @@ fn machine_inventory_meta(
             "agent.create",
             "agent.update",
             "agent.remove",
+            "agent.skill.list",
+            "agent.skill.add",
+            "agent.skill.remove",
             "agent.prompt.preview",
             "fs.dir.list",
             "agent.file.list",

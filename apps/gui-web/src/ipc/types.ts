@@ -252,6 +252,20 @@ export interface AgentProviderRef {
   env?: Record<string, string>;
 }
 
+export interface AgentBundleSkillSpec {
+  id: string;
+  source: string;
+}
+
+export interface AgentBundleSpec {
+  source?: string;
+  version?: string;
+  installMode?: string;
+  root?: string;
+  current?: string;
+  skills?: AgentBundleSkillSpec[];
+}
+
 export interface MachineAgentProviderInfo {
   id: string;
   name: string;
@@ -269,6 +283,7 @@ export interface AgentSpec {
   providerRef: AgentProviderRef;
   models?: AgentModelSpec | null;
   autostart?: boolean | null;
+  bundle?: AgentBundleSpec | null;
   promptAssembly?: Record<string, unknown> | null;
   _meta?: Record<string, unknown>;
 }

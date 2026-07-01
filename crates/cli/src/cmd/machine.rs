@@ -170,16 +170,14 @@ pub async fn agent_skill_add(
     client: Arc<Client>,
     machine_id: String,
     actor_id: String,
-    skill_id: Option<String>,
     source: PathBuf,
 ) -> Result<()> {
     let machine = require_machine(&client, &machine_id).await?;
-    let mut command = json!({
+    let command = json!({
         "op": "agent.skill.add",
         "actorId": actor_id,
         "source": source.display().to_string(),
     });
-    insert_if_nonempty(&mut command, "skillId", skill_id);
     let output = run_machine_command(client, machine, command).await?;
     if render::is_json() {
         render::print_json(&output);

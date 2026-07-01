@@ -105,6 +105,7 @@ fn main() {
             ipc::agent_list,
             ipc::agent_create,
             ipc::agent_update,
+            ipc::agent_skill_add,
             ipc::agent_prompt_preview,
             ipc::agent_file_list,
             ipc::agent_file_read,

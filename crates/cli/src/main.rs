@@ -1582,9 +1582,6 @@ enum MachineAgentSkillCmd {
         machine: String,
         #[arg(long = "actor-id")]
         actor_id: String,
-        /// Stable skill id. Defaults to the source directory name.
-        #[arg(long = "skill-id")]
-        skill_id: Option<String>,
         /// Directory on the target daemon host that contains SKILL.md.
         source: PathBuf,
     },
@@ -1594,8 +1591,8 @@ enum MachineAgentSkillCmd {
         machine: String,
         #[arg(long = "actor-id")]
         actor_id: String,
-        #[arg(long = "skill-id")]
-        skill_id: String,
+        /// Skill directory name to remove.
+        skill: String,
     },
 }
 
@@ -2665,20 +2662,13 @@ async fn async_main() -> Result<()> {
                     MachineAgentSkillCmd::Add {
                         machine,
                         actor_id,
-                        skill_id,
                         source,
-                    } => {
-                        cmd::machine::agent_skill_add(client, machine, actor_id, skill_id, source)
-                            .await?
-                    }
+                    } => cmd::machine::agent_skill_add(client, machine, actor_id, source).await?,
                     MachineAgentSkillCmd::Remove {
                         machine,
                         actor_id,
-                        skill_id,
-                    } => {
-                        cmd::machine::agent_skill_remove(client, machine, actor_id, skill_id)
-                            .await?
-                    }
+                        skill,
+                    } => cmd::machine::agent_skill_remove(client, machine, actor_id, skill).await?,
                 },
             },
         },
@@ -3393,8 +3383,6 @@ mod tests {
             "macmini",
             "--actor-id",
             "actor_impl",
-            "--skill-id",
-            "cloud-dev",
             "/tmp/cloud-dev",
         ])
         .expect("parse machine agent skill add");
@@ -3409,7 +3397,6 @@ mod tests {
                                     MachineAgentSkillCmd::Add {
                                         machine,
                                         actor_id,
-                                        skill_id,
                                         source,
                                     },
                             },
@@ -3417,7 +3404,6 @@ mod tests {
             } => {
                 assert_eq!(machine, "macmini");
                 assert_eq!(actor_id, "actor_impl");
-                assert_eq!(skill_id.as_deref(), Some("cloud-dev"));
                 assert_eq!(source, PathBuf::from("/tmp/cloud-dev"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -3446,7 +3432,6 @@ mod tests {
             "macmini",
             "--actor-id",
             "actor_impl",
-            "--skill-id",
             "cloud-dev",
         ])
         .expect("parse machine agent skill remove");

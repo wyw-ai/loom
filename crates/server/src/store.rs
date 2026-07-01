@@ -344,9 +344,6 @@ impl Store {
                 ch.members.retain(|m| m != actor_id);
             }
             inner
-                .channel_member_configs
-                .remove(&(channel_id.to_string(), actor_id.to_string()));
-            inner
                 .channels
                 .get(channel_id)
                 .expect("channel exists after revoke")
@@ -356,6 +353,10 @@ impl Store {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
         })?;
+        self.inner
+            .write()
+            .channel_member_configs
+            .remove(&(channel_id.to_string(), actor_id.to_string()));
         self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         self.emit(StoreEvent::ChannelRevoked {
             channel_id: channel_id.to_string(),

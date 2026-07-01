@@ -467,6 +467,14 @@ export async function agentUpdate(args: {
   return invoke("agent_update", { args });
 }
 
+export async function agentSkillAdd(args: {
+  machineId: string;
+  actorId: string;
+  source: string;
+}): Promise<AgentInfo> {
+  return invoke("agent_skill_add", { args });
+}
+
 export async function agentPromptPreview(args: {
   machineId: string;
   actorId: string;

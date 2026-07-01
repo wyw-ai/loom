@@ -1330,6 +1330,29 @@ export function App() {
     }
   }
 
+  async function addAgentSkill(machineId: string, actorId: string, source: string) {
+    setBusy(`agent:skill:add:${actorId}`);
+    setError(null);
+    try {
+      await ipc.agentSkillAdd({
+        machineId,
+        actorId,
+        source: source.trim(),
+      });
+      await loadMachines();
+      if (workspace && connection === "open") {
+        await loadWorkspaceData(workspace);
+      }
+      pushNotice("Skill added");
+      return true;
+    } catch (err) {
+      setError(errorText(err));
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function inviteMemberToChannel(channelId: string, actorId: string) {
     const actor = actors[actorId];
     setBusy(`channel:invite:${channelId}:${actorId}`);
@@ -2291,6 +2314,7 @@ export function App() {
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
               onUpdateAgent={updateAgent}
+              onAddAgentSkill={addAgentSkill}
               onRemoveAgent={removeAgent}
               onOpenLocalPath={openLocalPath}
             />

@@ -53,6 +53,11 @@ pub enum Mutation {
     MessageUpdate(Message),
     EventAppend(Event),
     MembershipUpsert(Membership),
+    ChannelMemberConfigUpsert(ChannelMemberConfig),
+    ChannelMemberConfigDelete {
+        channel_id: String,
+        actor_id: String,
+    },
     DeliveryUpsert(Delivery),
     MachineCommandUpsert(MachineCommand),
     ReminderUpsert(Reminder),

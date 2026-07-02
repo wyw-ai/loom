@@ -13,12 +13,14 @@ import type {
   Artifact,
   ArtifactReadResult,
   Channel,
+  ChannelMemberConfig,
   DesktopConfig,
   DeliveryPolicy,
   DeliveryState,
   HumanAccount,
   InboxListEntry,
   MachineAgentProviderInfo,
+  MachineDirListResult,
   MachineListResult,
   Message,
   MessageIntent,
@@ -182,6 +184,27 @@ export async function channelInvite(params: {
   actorId: string;
 }): Promise<{ channel: Channel }> {
   return invoke("channel_invite", { params });
+}
+
+export async function channelMemberConfigList(
+  channelId: string,
+): Promise<{ configs: ChannelMemberConfig[] }> {
+  return invoke("channel_member_config_list", { params: { channelId } });
+}
+
+export async function channelMemberConfigSet(params: {
+  channelId: string;
+  actorId: string;
+  workspaceDir: string;
+}): Promise<{ config: ChannelMemberConfig }> {
+  return invoke("channel_member_config_set", { params });
+}
+
+export async function channelMemberConfigClear(params: {
+  channelId: string;
+  actorId: string;
+}): Promise<{ cleared: boolean }> {
+  return invoke("channel_member_config_clear", { params });
 }
 
 export async function channelRevoke(params: {
@@ -376,6 +399,13 @@ export async function machineList(): Promise<MachineListResult> {
 
 export async function machineCheck(): Promise<MachineListResult> {
   return invoke("machine_check");
+}
+
+export async function machineDirList(args: {
+  machineId: string;
+  path?: string;
+}): Promise<MachineDirListResult> {
+  return invoke("machine_dir_list", { args });
 }
 
 export async function localProviderCheck(): Promise<{

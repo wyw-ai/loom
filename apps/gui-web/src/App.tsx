@@ -13,6 +13,7 @@ import {
   scopeKey,
   threadTarget,
   type Channel,
+  type ChannelMemberConfig,
   type DesktopConfig,
   type MachineInfo,
   type Message,
@@ -230,6 +231,9 @@ export function App() {
   });
   const [configLoaded, setConfigLoaded] = useState(false);
   const [onboardingActive, setOnboardingActive] = useState(false);
+  const [channelMemberConfigsByChannel, setChannelMemberConfigsByChannel] = useState<
+    Record<string, Record<string, ChannelMemberConfig>>
+  >({});
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -255,6 +259,9 @@ export function App() {
   const channelThreads = activeChannel
     ? threadsByChannel[activeChannel.id] ?? []
     : [];
+  const activeChannelMemberConfigs = activeChannel
+    ? channelMemberConfigsByChannel[activeChannel.id] ?? {}
+    : {};
   const activeThread =
     channelThreads.find((thread) => thread.id === activeThreadId) ?? null;
   const target = activeChannel ? channelTarget(activeChannel.id) : null;
@@ -638,6 +645,18 @@ export function App() {
           for (const actor of result.members) next[actor.id] = actor;
           return next;
         });
+      })
+      .catch(() => {});
+    void ipc
+      .channelMemberConfigList(activeChannel.id)
+      .then((result) => {
+        if (!alive) return;
+        setChannelMemberConfigsByChannel((current) => ({
+          ...current,
+          [activeChannel.id]: Object.fromEntries(
+            result.configs.map((config) => [config.actorId, config]),
+          ),
+        }));
       })
       .catch(() => {});
     void ipc
@@ -1332,9 +1351,73 @@ export function App() {
     try {
       const result = await ipc.channelRevoke({ channelId, actorId });
       setChannels((current) => sortChannels(upsert(current, result.channel)));
+      setChannelMemberConfigsByChannel((current) => {
+        const channelConfigs = current[channelId];
+        if (!channelConfigs) return current;
+        const nextChannelConfigs = { ...channelConfigs };
+        delete nextChannelConfigs[actorId];
+        return { ...current, [channelId]: nextChannelConfigs };
+      });
       pushNotice(`${actor ? displayName(actor) : actorId} removed from channel`);
     } catch (err) {
       setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveMemberWorkspace(
+    channelId: string,
+    actorId: string,
+    workspaceDir: string,
+  ): Promise<boolean> {
+    const value = workspaceDir.trim();
+    if (!value) {
+      setError("Workspace path is required.");
+      return false;
+    }
+    setBusy(`channel:member-workspace:${channelId}:${actorId}`);
+    setError(null);
+    try {
+      const result = await ipc.channelMemberConfigSet({
+        channelId,
+        actorId,
+        workspaceDir: value,
+      });
+      setChannelMemberConfigsByChannel((current) => ({
+        ...current,
+        [channelId]: {
+          ...(current[channelId] ?? {}),
+          [actorId]: result.config,
+        },
+      }));
+      pushNotice("Workspace saved");
+      return true;
+    } catch (err) {
+      setError(errorText(err));
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function clearMemberWorkspace(channelId: string, actorId: string): Promise<boolean> {
+    setBusy(`channel:member-workspace:${channelId}:${actorId}`);
+    setError(null);
+    try {
+      await ipc.channelMemberConfigClear({ channelId, actorId });
+      setChannelMemberConfigsByChannel((current) => {
+        const channelConfigs = current[channelId];
+        if (!channelConfigs) return current;
+        const nextChannelConfigs = { ...channelConfigs };
+        delete nextChannelConfigs[actorId];
+        return { ...current, [channelId]: nextChannelConfigs };
+      });
+      pushNotice("Workspace reset");
+      return true;
+    } catch (err) {
+      setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -2252,6 +2335,7 @@ export function App() {
             memberCandidates={memberCandidates}
             channel={activeChannel}
             channelMessages={messages}
+            channelMemberConfigs={activeChannelMemberConfigs}
             channelTasks={channelTasks}
             channelThreads={channelThreads}
             currentActorId={workspace?.actorId ?? null}
@@ -2268,6 +2352,8 @@ export function App() {
             }}
             onInviteMember={inviteMemberToChannel}
             onRemoveMember={removeMemberFromChannel}
+            onSaveMemberWorkspace={saveMemberWorkspace}
+            onClearMemberWorkspace={clearMemberWorkspace}
           />
         ) : null
       )}

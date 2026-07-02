@@ -19,6 +19,10 @@ pub mod method {
     pub const CHANNEL_INVITE: &str = "channel/invite";
     pub const CHANNEL_REVOKE: &str = "channel/revoke";
     pub const CHANNEL_MEMBERS: &str = "channel/members";
+    pub const CHANNEL_MEMBER_CONFIG_GET: &str = "channel/member_config.get";
+    pub const CHANNEL_MEMBER_CONFIG_LIST: &str = "channel/member_config.list";
+    pub const CHANNEL_MEMBER_CONFIG_SET: &str = "channel/member_config.set";
+    pub const CHANNEL_MEMBER_CONFIG_CLEAR: &str = "channel/member_config.clear";
     pub const THREAD_CREATE: &str = "thread/create";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
@@ -289,6 +293,57 @@ pub struct ChannelMembersResult {
     /// Resolved actor rows, not just ids — the chat sidebar needs the
     /// display name + kind to render rows.
     pub members: Vec<Actor>,
+}
+
+// ---- channel/member_config.* ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberConfigGetParams {
+    pub channel_id: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMemberConfigGetResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ChannelMemberConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberConfigListParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMemberConfigListResult {
+    pub configs: Vec<ChannelMemberConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberConfigSetParams {
+    pub channel_id: String,
+    pub actor_id: String,
+    pub workspace_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMemberConfigSetResult {
+    pub config: ChannelMemberConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberConfigClearParams {
+    pub channel_id: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMemberConfigClearResult {
+    pub cleared: bool,
 }
 
 // ---- channel/update / delete ----

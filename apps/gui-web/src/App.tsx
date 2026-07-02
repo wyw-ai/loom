@@ -1316,6 +1316,7 @@ export function App() {
         autostart: patch.autostart,
         avatarUrl: patch.avatarUrl.trim(),
         env: filterEmptyEnvKeys(patch.env),
+        bundleSkills: patch.bundleSkills,
       });
       await loadMachines();
       if (workspace && connection === "open") {
@@ -1324,6 +1325,29 @@ export function App() {
       pushNotice("Agent settings saved");
     } catch (err) {
       setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function addAgentSkill(machineId: string, actorId: string, source: string) {
+    setBusy(`agent:skill:add:${actorId}`);
+    setError(null);
+    try {
+      await ipc.agentSkillAdd({
+        machineId,
+        actorId,
+        source: source.trim(),
+      });
+      await loadMachines();
+      if (workspace && connection === "open") {
+        await loadWorkspaceData(workspace);
+      }
+      pushNotice("Skill added");
+      return true;
+    } catch (err) {
+      setError(errorText(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -2290,6 +2314,7 @@ export function App() {
               onRemoveMachine={removeMachine}
               onAddAgent={createAgent}
               onUpdateAgent={updateAgent}
+              onAddAgentSkill={addAgentSkill}
               onRemoveAgent={removeAgent}
               onOpenLocalPath={openLocalPath}
             />

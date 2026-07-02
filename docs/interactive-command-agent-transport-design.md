@@ -86,13 +86,13 @@ agent 进程仍由 `loom agent serve` 托管。`interactive_command` 只是在 a
 为了兼容 classroom / 多 agent 场景，`loom agent serve` 在每轮运行前读取当前 channel 成员的已发布 bundle，并把它们挂到当前 agent 自己的 skill workspace：
 
 ```text
-data/agents/{current_actor}/workspace/scopes/{scope.kind}/{scope.id}/skills/{actor_id}
+data/workspaces/{scope.kind}/{scope.id}/skills/{skill_id}
   -> data/agents/{actor_id}/bundle source
 ```
 
 当前实现采用 file-backed 方案：runtime 读取 `data/agents/{actor_id}/bundle-release.json` 的 `source` 字段作为 symlink target。这个数据源被隔离在 actor skill source 解析层，未来可以扩展为 agent serve 通过 RPC 上报的 registry-backed 方案，而不需要重写 mount 规则。
 
-同一个 skill workspace 里还会维护 provider-native 目录：
+每个 agent 的 scope workspace 里会维护真实的 provider-native skills 目录：
 
 ```text
 skills/
@@ -102,7 +102,9 @@ skills/
 .opencode/skills/
 ```
 
-Provider 支持外挂 workspace 的，通过 `--add-dir {agent.skillWorkspace}` 接入这个路径；OpenCode 这类需要 config 文件的 provider 使用 `{agent.skillWorkspace}/.opencode/opencode.json`。当 `loom-server --data-dir` 和 `LOOM_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `LOOM_SCOPE_WORKSPACES_ROOT` 指向 server 的 `data/workspaces`，runtime 会用它推导同级 `data/agents` registry。Provider session record 仍按 `(actor, scope)` 独立管理。
+这些目录本身不是 symlink；runtime 会把 `data/workspaces/{scope.kind}/{scope.id}/skills/*` 和当前 actor 的 `bundle/current/skills/*` / `bundle.skills[]` 外部 skill source 逐个 symlink 到每个 provider-native skills 目录下面。这样 Codex 这类只扫描当前 cwd `.agents/skills` 的 provider 可以直接看到投影后的 skill。
+
+OpenCode 这类需要 config 文件的 provider 使用 `{agent.workspace}/.opencode/opencode.json`。当 `loom-server --data-dir` 和 `LOOM_AGENT_DATA_ROOT` 不是同一个目录时，可以通过 `LOOM_SCOPE_WORKSPACES_ROOT` 指向 server 的 `data/workspaces`，runtime 会用它推导同级 `data/agents` registry。Provider session record 仍按 `(actor, scope)` 独立管理。
 
 ### 2.4 完成信号必须显式
 

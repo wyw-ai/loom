@@ -144,6 +144,7 @@ export function agentSettingsDraft(
     autostart: Boolean(agent.spec.autostart),
     avatarUrl: agentAvatarValue(agent),
     env: { ...(agent.spec.providerRef.env ?? {}) },
+    bundleSkills: [...(agent.spec.bundle?.skills ?? [])],
   };
 }
 

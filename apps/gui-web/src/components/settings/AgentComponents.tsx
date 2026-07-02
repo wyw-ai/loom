@@ -14,12 +14,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { machineDirList } from "@/ipc/bridge";
 import { actorAvatarUrl, agentDisplayName, agentModelValue, agentSettingsDraft, getActorRunContext, providerAvailabilityGroups, providerForAgent, runStatusAnimationName, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { avatarLibraryUrls, reasoningEffortChoices } from "@/lib/constants";
-import { agentFormForMachine, capitalize, machineCanCreateAgent, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
+import { agentFormForMachine, capitalize, errorText, machineCanCreateAgent, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { ArrowLeft, Bot, Check, FileText, Loader2, Plus, Settings, Trash2, X } from "lucide-react";
-import type { MachineAgentProviderInfo, MachineInfo, Run } from "@/ipc/types";
+import { ArrowLeft, Bot, Check, ChevronLeft, FileText, Folder, HardDrive, Loader2, Plus, RefreshCw, Settings, Trash2, Wrench, X } from "lucide-react";
+import type { MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
 import type { AgentDetailTab, AgentFormState, AgentMemberEntry, AgentSettingsDraft, AgentUpdatePatch } from "@/lib/types";
 
 const customModelOptionValue = "__loom_custom_model__";
@@ -755,12 +756,18 @@ export function AgentMemberDetail({
   busy,
   onBack,
   onUpdateAgent,
+  onAddAgentSkill,
   onRemoveAgent,
 }: {
   entry: AgentMemberEntry;
   busy: string | null;
   onBack: () => void;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
+  onAddAgentSkill: (
+    machineId: string,
+    actorId: string,
+    source: string,
+  ) => Promise<boolean> | boolean;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
   const { machine, agent } = entry;
@@ -771,6 +778,7 @@ export function AgentMemberDetail({
   );
   const [activeTab, setActiveTab] = useState<AgentDetailTab>("profile");
   const [customModelActive, setCustomModelActive] = useState(false);
+  const [skillAddDialogOpen, setSkillAddDialogOpen] = useState(false);
   const handledAgentDetailKeyRef = useRef(agentDetailKey);
   const selectedProvider = providerForAgent(machine, agent, draft.providerId);
   const modelChoices =
@@ -784,6 +792,7 @@ export function AgentMemberDetail({
     modelChoices.length === 0 || customModelActive || !modelIsKnown;
   const modelSelectValue = showCustomModel ? customModelOptionValue : modelValue;
   const saving = busy === `agent:update:${actor.id}`;
+  const skillAdding = busy === `agent:skill:add:${actor.id}`;
   const removing = busy === `agent:remove:${actor.id}`;
   const canEdit = !machine.readOnly;
   const detailTabs: Array<{
@@ -793,6 +802,7 @@ export function AgentMemberDetail({
   }> = [
     { id: "profile", label: "Profile", icon: Bot },
     { id: "prompt", label: "Prompt Studio", icon: FileText },
+    { id: "skills", label: "Skills", icon: Wrench },
     { id: "settings", label: "Settings", icon: Settings },
   ];
 
@@ -801,11 +811,16 @@ export function AgentMemberDetail({
     handledAgentDetailKeyRef.current = agentDetailKey;
     setDraft(agentSettingsDraft(machine, agent));
     setCustomModelActive(false);
+    setSkillAddDialogOpen(false);
   }, [agentDetailKey, machine, agent]);
 
   useEffect(() => {
     setActiveTab("profile");
   }, [agentDetailKey]);
+
+  useEffect(() => {
+    if (activeTab !== "skills") setSkillAddDialogOpen(false);
+  }, [activeTab]);
 
   function updateDraft(patch: Partial<AgentSettingsDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -838,19 +853,44 @@ export function AgentMemberDetail({
 
   const envEntries = Object.entries(draft.env);
 
-  function saveAgent() {
-    onUpdateAgent({
+  function agentPatchFromDraft(nextDraft: AgentSettingsDraft): AgentUpdatePatch {
+    return {
       machineId: machine.id,
       actorId: actor.id,
-      displayName: draft.displayName,
-      description: draft.description,
-      instructions: draft.instructions,
-      providerId: draft.providerId || undefined,
-      model: draft.model,
-      reasoningEffort: draft.reasoningEffort,
-      autostart: draft.autostart,
-      avatarUrl: draft.avatarUrl,
-      env: draft.env,
+      displayName: nextDraft.displayName,
+      description: nextDraft.description,
+      instructions: nextDraft.instructions,
+      providerId: nextDraft.providerId || undefined,
+      model: nextDraft.model,
+      reasoningEffort: nextDraft.reasoningEffort,
+      autostart: nextDraft.autostart,
+      avatarUrl: nextDraft.avatarUrl,
+      env: nextDraft.env,
+      bundleSkills: nextDraft.bundleSkills,
+    };
+  }
+
+  function persistAgent(nextDraft: AgentSettingsDraft) {
+    setDraft(nextDraft);
+    onUpdateAgent(agentPatchFromDraft(nextDraft));
+  }
+
+  function saveAgent() {
+    onUpdateAgent(agentPatchFromDraft(draft));
+  }
+
+  async function addSkill(source: string) {
+    if (!canEdit) return false;
+    const ok = await onAddAgentSkill(machine.id, actor.id, source);
+    if (ok) setSkillAddDialogOpen(false);
+    return ok;
+  }
+
+  function removeSkill(skillId: string) {
+    if (!canEdit) return;
+    persistAgent({
+      ...draft,
+      bundleSkills: draft.bundleSkills.filter((skill) => skill.id !== skillId),
     });
   }
 
@@ -1127,6 +1167,68 @@ export function AgentMemberDetail({
         <AgentPromptStudio machine={machine} agent={agent} canEdit={canEdit} />
       )}
 
+      {activeTab === "skills" && (
+        <>
+          <HostDetailSection
+            title="Skills"
+            count={draft.bundleSkills.length}
+            action={
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => setSkillAddDialogOpen(true)}
+                disabled={!canEdit || saving || skillAdding}
+                className="rounded-lg"
+              >
+                <Plus size={14} />
+                Add Skill
+              </Button>
+            }
+          >
+            <div className="space-y-3">
+              {draft.bundleSkills.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6 text-sm text-[#667085]">
+                  No custom skills configured.
+                </div>
+              ) : (
+                draft.bundleSkills.map((skill) => (
+                  <div
+                    key={skill.id}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#dfe3ec] bg-white px-4 py-3"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-sm font-bold text-[#111827]">{skill.id}</div>
+                      <div className="mt-1 truncate font-mono text-xs text-[#667085]">
+                        {skill.source}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeSkill(skill.id)}
+                      disabled={!canEdit || saving}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
+                      title="Remove skill"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </HostDetailSection>
+
+          {skillAddDialogOpen && (
+            <AgentSkillAddDialog
+              machine={machine}
+              canEdit={canEdit}
+              saving={skillAdding}
+              onCancel={() => setSkillAddDialogOpen(false)}
+              onAddSkill={addSkill}
+            />
+          )}
+        </>
+      )}
+
       {activeTab === "settings" && (
         <>
           <HostDetailSection title="Info">
@@ -1168,3 +1270,249 @@ export function AgentMemberDetail({
   );
 }
 
+function AgentSkillAddDialog({
+  machine,
+  canEdit,
+  saving,
+  onCancel,
+  onAddSkill,
+}: {
+  machine: MachineInfo;
+  canEdit: boolean;
+  saving: boolean;
+  onCancel: () => void;
+  onAddSkill: (source: string) => Promise<boolean> | boolean;
+}) {
+  const canBrowseRemote = Boolean(
+    machine.canCommand && machine.capabilities.includes("fs.dir.list"),
+  );
+  const [browserPath, setBrowserPath] = useState<string | undefined>();
+  const [browserReloadKey, setBrowserReloadKey] = useState(0);
+  const [browserPathDraft, setBrowserPathDraft] = useState("");
+  const [browser, setBrowser] = useState<MachineDirListResult | null>(null);
+  const [browserLoading, setBrowserLoading] = useState(false);
+  const [browserError, setBrowserError] = useState<string | null>(null);
+  const [selectedSkillPath, setSelectedSkillPath] = useState("");
+  const entries = browser?.entries ?? [];
+  const skillSource = selectedSkillPath.trim();
+  const canAdd = canEdit && skillSource.length > 0 && !saving;
+
+  useEffect(() => {
+    if (!canBrowseRemote) return;
+    let cancelled = false;
+    setBrowserLoading(true);
+    setBrowserError(null);
+    machineDirList({ machineId: machine.id, path: browserPath })
+      .then((result) => {
+        if (cancelled) return;
+        setBrowser(result);
+        setBrowserPathDraft(result.path);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setBrowserError(errorText(err));
+      })
+      .finally(() => {
+        if (!cancelled) setBrowserLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [browserPath, browserReloadKey, canBrowseRemote, machine.id]);
+
+  function openBrowserPath(path?: string | null) {
+    if (!canBrowseRemote) return;
+    const nextPath = path?.trim() || undefined;
+    if (browserPath === nextPath) setBrowserReloadKey((currentKey) => currentKey + 1);
+    setBrowserPath(nextPath);
+  }
+
+  function submitSkill(event: FormEvent) {
+    event.preventDefault();
+    if (!canAdd) return;
+    void onAddSkill(skillSource);
+  }
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add skill"
+      onMouseDown={onCancel}
+    >
+      <form
+        className="flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-[#dfe3ec] bg-white shadow-soft"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={submitSkill}
+      >
+        <div className="flex min-w-0 items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-4">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-bold text-[#111827]">Add Skill</div>
+            <div className="mt-0.5 truncate text-xs text-[#667085]">{machine.name}</div>
+          </div>
+          <button className="composer-icon h-8 min-w-8" type="button" title="Close" onClick={onCancel}>
+            <X size={14} />
+          </button>
+        </div>
+
+        <div className="grid min-h-0 gap-4 overflow-y-auto px-5 py-4 soft-scrollbar lg:grid-cols-[minmax(260px,0.42fr)_minmax(0,1fr)]">
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-1 block text-xs font-bold text-[#596174]">Skill directory</span>
+              <Input
+                value={selectedSkillPath}
+                onChange={(event) => setSelectedSkillPath(event.target.value)}
+                placeholder="/path/to/skill"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                disabled={!canEdit}
+                autoFocus
+              />
+            </label>
+            {!canBrowseRemote && (
+              <div className="rounded-lg border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2 text-xs text-[#667085]">
+                Directory browsing is unavailable on this host.
+              </div>
+            )}
+          </div>
+
+          <div className="min-h-80 rounded-lg border border-[#dfe3ec] bg-[#fbfbfd]">
+            <div className="flex flex-wrap items-center gap-2 border-b border-[#edf0f5] px-3 py-2">
+              {browser?.roots.map((root) => (
+                <button
+                  key={root.path}
+                  type="button"
+                  title={root.path}
+                  onClick={() => openBrowserPath(root.path)}
+                  disabled={!canBrowseRemote || browserLoading}
+                  className="inline-flex h-8 max-w-[180px] items-center gap-1.5 rounded-md border border-[#dfe3ec] bg-white px-2 text-xs font-semibold text-[#596174] hover:border-[#c8c1ff] hover:text-[#503ed4] disabled:opacity-40"
+                >
+                  <HardDrive size={12} />
+                  <span className="truncate">{root.label}</span>
+                </button>
+              ))}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => openBrowserPath(browser?.parent)}
+                disabled={!canBrowseRemote || browserLoading || !browser?.parent}
+                title="Parent directory"
+                className="h-8 rounded-md"
+              >
+                <ChevronLeft size={13} />
+                Up
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => browser?.path && setSelectedSkillPath(browser.path)}
+                disabled={!canEdit || !browser?.path}
+                title="Use current directory"
+                className="h-8 rounded-md"
+              >
+                <Check size={13} />
+                Use Current
+              </Button>
+            </div>
+
+            <div className="grid gap-2 border-b border-[#edf0f5] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+              <Input
+                value={browserPathDraft}
+                onChange={(event) => setBrowserPathDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  event.preventDefault();
+                  openBrowserPath(browserPathDraft);
+                }}
+                placeholder="Remote directory path"
+                className="h-9 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                disabled={!canBrowseRemote}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => openBrowserPath(browserPathDraft)}
+                disabled={!canBrowseRemote || browserLoading}
+                className="h-9 rounded-lg"
+              >
+                Go
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                onClick={() => openBrowserPath(browser?.path ?? browserPathDraft)}
+                disabled={!canBrowseRemote || browserLoading}
+                title="Refresh"
+                className="h-9 w-9 rounded-lg"
+              >
+                {browserLoading ? <Loader2 className="animate-spin" size={14} /> : <RefreshCw size={14} />}
+              </Button>
+            </div>
+
+            <div className="max-h-72 overflow-y-auto p-2 soft-scrollbar">
+              {browserLoading ? (
+                <div className="flex items-center gap-2 px-2 py-3 text-sm text-[#667085]">
+                  <Loader2 className="animate-spin" size={15} />
+                  Loading
+                </div>
+              ) : !browser ? (
+                <div className="px-2 py-8 text-center text-xs text-[#667085]">
+                  {canBrowseRemote ? "Open a directory." : "Browsing unavailable."}
+                </div>
+              ) : entries.length === 0 ? (
+                <div className="px-2 py-8 text-center text-xs text-[#667085]">No child folders.</div>
+              ) : (
+                entries.map((entry) => (
+                  <button
+                    key={entry.path}
+                    type="button"
+                    onClick={() => {
+                      setSelectedSkillPath(entry.path);
+                      openBrowserPath(entry.path);
+                    }}
+                    disabled={!canEdit || browserLoading}
+                    title={entry.path}
+                    className={cn(
+                      "grid h-9 w-full grid-cols-[auto_minmax(0,1fr)] items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-white disabled:opacity-40",
+                      selectedSkillPath === entry.path
+                        ? "bg-white text-[#503ed4]"
+                        : "text-[#303849]",
+                    )}
+                  >
+                    <Folder size={14} className="text-[#667085]" />
+                    <span className="truncate font-mono text-xs">{entry.name}</span>
+                  </button>
+                ))
+              )}
+            </div>
+            {browser?.truncated && (
+              <div className="border-t border-[#edf0f5] px-3 py-2 text-xs text-[#8a93a5]">
+                Showing the first 500 folders.
+              </div>
+            )}
+            {browserError && (
+              <div className="mx-3 mb-3 rounded-md bg-[#fff4f4] px-2 py-1.5 text-xs text-[#b42318]">
+                {browserError}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-[#edf0f5] px-5 py-4">
+          <Button variant="outline" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button type="submit" size="sm" disabled={!canAdd}>
+            {saving ? <Loader2 className="animate-spin" size={13} /> : <Plus size={13} />}
+            Add Skill
+          </Button>
+        </div>
+      </form>
+    </div>,
+    document.body,
+  );
+}

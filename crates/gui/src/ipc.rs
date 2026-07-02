@@ -1239,6 +1239,8 @@ pub struct AgentUpdateArgs {
     pub prompt_assembly: Option<Value>,
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub bundle_skills: Option<Value>,
 }
 
 #[tauri::command]
@@ -1293,9 +1295,61 @@ pub async fn agent_update(
     if let Some(prompt_assembly) = args.prompt_assembly {
         command["promptAssembly"] = prompt_assembly;
     }
+    if let Some(bundle_skills) = args.bundle_skills {
+        command["bundleSkills"] = bundle_skills;
+    }
     let output = run_remote_machine_command(&state, &cfg, &target_machine_id, command).await?;
     agent_info_from_machine_command_output(output)
         .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSkillAddArgs {
+    pub machine_id: String,
+    pub actor_id: String,
+    pub source: String,
+}
+
+#[tauri::command]
+pub async fn agent_skill_add(
+    state: State<'_, AppState>,
+    args: AgentSkillAddArgs,
+) -> Result<AgentInfo, String> {
+    let machine_id = args.machine_id.trim();
+    if machine_id.is_empty() {
+        return Err("machine id is required".into());
+    }
+    let actor_id = args.actor_id.trim();
+    if actor_id.is_empty() {
+        return Err("actor id is required".into());
+    }
+    let source = args.source.trim();
+    if source.is_empty() {
+        return Err("skill directory is required".into());
+    }
+    let cfg = config::load_or_init().map_err(stringify)?;
+    if server_machine_by_id(&cfg, state.try_client().await, machine_id)
+        .await
+        .is_none()
+    {
+        return Err(format!(
+            "machine `{machine_id}` is not present in daemon inventory; start the daemon before editing agents"
+        ));
+    }
+    let output = run_remote_machine_command(
+        &state,
+        &cfg,
+        machine_id,
+        json!({
+            "op": "agent.skill.add",
+            "actorId": actor_id,
+            "source": source,
+        }),
+    )
+    .await?;
+    agent_info_from_machine_command_output(output)
+        .ok_or_else(|| format!("updated agent not returned by daemon: {actor_id}"))
 }
 
 #[derive(Deserialize)]

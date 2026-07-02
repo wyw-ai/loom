@@ -31,6 +31,7 @@ export function SettingsView({
   onRemoveMachine,
   onAddAgent,
   onUpdateAgent,
+  onAddAgentSkill,
   onRemoveAgent,
   onOpenLocalPath,
 }: {
@@ -49,6 +50,11 @@ export function SettingsView({
   onRemoveMachine: (machineId: string) => void;
   onAddAgent: (form: AgentFormState) => Promise<boolean> | boolean;
   onUpdateAgent: (patch: AgentUpdatePatch) => void;
+  onAddAgentSkill: (
+    machineId: string,
+    actorId: string,
+    source: string,
+  ) => Promise<boolean> | boolean;
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
@@ -275,6 +281,7 @@ export function SettingsView({
           busy={busy}
           onBack={showAgentRoster}
           onUpdateAgent={onUpdateAgent}
+          onAddAgentSkill={onAddAgentSkill}
           onRemoveAgent={onRemoveAgent}
         />
       ) : (

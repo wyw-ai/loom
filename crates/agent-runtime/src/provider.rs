@@ -2345,6 +2345,9 @@ fn claude_manifest() -> ProviderManifest {
         resume_args,
         scope: Some("actor_scope".into()),
     };
+    let mut print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
+    print_mode.timeout_ms = Some(30 * 60 * 1000);
+    print_mode.idle_timeout_ms = Some(5 * 60 * 1000);
     let nonprint_mode = ProviderModeSpec {
         transport: "interactive_command".into(),
         command: "{bin}".into(),
@@ -2429,10 +2432,7 @@ fn claude_manifest() -> ProviderManifest {
         "Claude Code",
         &["claude"],
         BTreeMap::from([
-            (
-                "print".into(),
-                mode("{bin}", first_args, "claude_stream_json", Some(session)),
-            ),
+            ("print".into(), print_mode),
             ("nonprint".into(), nonprint_mode),
         ]),
         &[
@@ -3803,6 +3803,8 @@ mod tests {
             transport.session.as_ref().and_then(|s| s.scope.as_deref()),
             Some("actor_scope")
         );
+        assert_eq!(transport.timeout_ms, Some(30 * 60 * 1000));
+        assert_eq!(transport.idle_timeout_ms, Some(5 * 60 * 1000));
     }
 
     #[test]

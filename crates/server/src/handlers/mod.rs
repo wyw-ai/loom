@@ -1392,6 +1392,7 @@ fn task_assignment_update(
             ),
         ));
     }
+    let previous_status = assignment.status;
     let (assignment, task) = state
         .store
         .update_task_assignment(
@@ -1405,7 +1406,9 @@ fn task_assignment_update(
             p.evidence_refs,
         )
         .map_err(map_store_err)?;
-    if requested_status.is_some_and(is_terminal_assignment_status) {
+    if !is_terminal_assignment_status(previous_status)
+        && is_terminal_assignment_status(assignment.status)
+    {
         emit_assignment_return_message(state, &caller, &task, &assignment);
     }
     ok(TaskAssignmentUpdateResult { assignment, task })
@@ -4182,6 +4185,73 @@ mod tests {
             meta.get("assignmentId").and_then(|value| value.as_str()),
             Some(assigned.assignment.id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn task_assignment_create_does_not_wake_actors_mentioned_in_task_title() {
+        let state = fresh_state("task-assignment-title-mentions");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        let channel = state
+            .store
+            .create_channel("tasks".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_reviewer".into(),
+                kind: ActorKind::Agent,
+                display_name: "Reviewer".into(),
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("upsert reviewer");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_reviewer")
+            .expect("grant reviewer");
+        let source_message_id = append_channel_root(
+            &state,
+            &channel.id,
+            "actor_owner",
+            "@actor_owner please handle this",
+        );
+
+        let created = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_CREATE,
+            Some(json!({
+                "sourceMessageId": source_message_id,
+                "title": "@actor_owner please handle this",
+                "ownerActorId": "actor_owner"
+            })),
+        )
+        .await
+        .expect("task/create");
+        let created: TaskCreateResult = serde_json::from_value(created).unwrap();
+
+        let assigned = dispatch(
+            &state,
+            "conn_owner",
+            method::TASK_ASSIGNMENT_CREATE,
+            Some(json!({
+                "taskId": created.task.id,
+                "toActorId": "actor_reviewer",
+                "type": "review",
+                "instruction": "review the story",
+                "contract": {}
+            })),
+        )
+        .await
+        .expect("task/assignment.create");
+        let assigned: TaskAssignmentCreateResult = serde_json::from_value(assigned).unwrap();
+
+        assert!(assigned.message.mentions.iter().any(|mention| {
+            mention.kind == MessageMentionKind::Actor && mention.actor_or_group_id == "actor_owner"
+        }));
+        assert_eq!(assigned.message.audience.len(), 1);
+        assert_eq!(assigned.message.audience[0].kind, AudienceKind::Actor);
+        assert_eq!(assigned.message.audience[0].id, "actor_reviewer");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

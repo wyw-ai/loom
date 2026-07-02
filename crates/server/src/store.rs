@@ -1827,6 +1827,16 @@ impl Store {
                     "completed assignment already exists for idempotency key {key}"
                 )));
             }
+            if let Some(existing) = inner.assignments.values().find(|a| {
+                a.task_id == task_id
+                    && a.idempotency_key.as_deref() == Some(key)
+                    && is_terminal_assignment_status_for_store(a.status)
+            }) {
+                return Err(StoreError::Conflict(format!(
+                    "terminal assignment {} already exists for idempotency key {key}",
+                    existing.id
+                )));
+            }
         }
         self.validate_assignment_contract(&task, &to_actor_id, contract_value)?;
         let now = Utc::now();
@@ -1910,7 +1920,44 @@ impl Store {
                 return Err(StoreError::NotFound(format!("message {message_id}")));
             }
         }
+        let envelope_status = result_envelope
+            .as_ref()
+            .and_then(result_envelope_assignment_status);
+        let status = match (status, envelope_status) {
+            (Some(explicit), Some(from_envelope)) if explicit != from_envelope => {
+                return Err(StoreError::InvalidState(format!(
+                    "assignment {} status {:?} conflicts with result envelope status {:?}",
+                    assignment.id, explicit, from_envelope
+                )));
+            }
+            (Some(explicit), _) => Some(explicit),
+            (None, inferred) => inferred,
+        };
+        let has_result_payload = result_message_id.is_some()
+            || result_summary.is_some()
+            || result_envelope.is_some()
+            || !result_artifact_ids.is_empty()
+            || !result_fact_ids.is_empty()
+            || !evidence_refs.is_empty();
+        if is_terminal_assignment_status_for_store(assignment.status) {
+            if status == Some(assignment.status) && !has_result_payload {
+                let task = self
+                    .get_task(&assignment.task_id)
+                    .ok_or_else(|| StoreError::NotFound(format!("task {}", assignment.task_id)))?;
+                return Ok((assignment, task));
+            }
+            return Err(StoreError::InvalidState(format!(
+                "terminal assignment {} cannot be updated",
+                assignment.id
+            )));
+        }
         if let Some(next_status) = status {
+            if !assignment_status_transition_allowed(assignment.status, next_status) {
+                return Err(StoreError::InvalidState(format!(
+                    "assignment {} cannot transition from {:?} to {:?}",
+                    assignment.id, assignment.status, next_status
+                )));
+            }
             if next_status == TaskAssignmentStatus::Completed {
                 if assignment.status != TaskAssignmentStatus::Running {
                     return Err(StoreError::InvalidState(format!(
@@ -3142,6 +3189,7 @@ impl Store {
                 Vec::new(),
                 metadata,
                 None,
+                true,
             )?),
             None => None,
         };
@@ -3332,6 +3380,7 @@ impl Store {
             attachments,
             metadata,
             if_latest_message_id,
+            true,
         )
     }
 
@@ -3351,6 +3400,7 @@ impl Store {
         attachments: Vec<String>,
         metadata: Meta,
         if_latest_message_id: Option<String>,
+        merge_mention_audience: bool,
     ) -> StoreResult<Message> {
         if body.trim().is_empty() && attachments.is_empty() {
             return Err(StoreError::InvalidState("message body is empty".into()));
@@ -3397,7 +3447,9 @@ impl Store {
         let mut mentions = self.parse_mentions(&resolved.scope, &body)?;
         merge_mentions(&mut mentions, explicit_mentions);
         let mut audience = explicit_audience;
-        merge_audience_from_mentions(&mut audience, &mentions);
+        if merge_mention_audience {
+            merge_audience_from_mentions(&mut audience, &mentions);
+        }
         self.validate_message_mentions(&resolved.scope, &mentions)?;
         self.validate_message_audience(&resolved.scope, &audience)?;
         let task_context = resolved
@@ -4441,6 +4493,7 @@ impl Store {
             Vec::new(),
             metadata,
             None,
+            false,
         )
     }
 
@@ -5639,6 +5692,37 @@ fn is_terminal_assignment_status_for_store(status: TaskAssignmentStatus) -> bool
             | TaskAssignmentStatus::Failed
             | TaskAssignmentStatus::Canceled
     )
+}
+
+fn result_envelope_assignment_status(value: &serde_json::Value) -> Option<TaskAssignmentStatus> {
+    let raw = value.get("status")?.as_str()?;
+    match raw {
+        "pending" => Some(TaskAssignmentStatus::Pending),
+        "running" => Some(TaskAssignmentStatus::Running),
+        "completed" => Some(TaskAssignmentStatus::Completed),
+        "failed" => Some(TaskAssignmentStatus::Failed),
+        "canceled" | "cancelled" => Some(TaskAssignmentStatus::Canceled),
+        _ => None,
+    }
+}
+
+fn assignment_status_transition_allowed(
+    current: TaskAssignmentStatus,
+    next: TaskAssignmentStatus,
+) -> bool {
+    if current == next {
+        return true;
+    }
+    if is_terminal_assignment_status_for_store(current) {
+        return false;
+    }
+    match next {
+        TaskAssignmentStatus::Pending => false,
+        TaskAssignmentStatus::Running => current == TaskAssignmentStatus::Pending,
+        TaskAssignmentStatus::Completed
+        | TaskAssignmentStatus::Failed
+        | TaskAssignmentStatus::Canceled => true,
+    }
 }
 
 fn normalize_task_ref(value: &str) -> String {
@@ -7498,6 +7582,331 @@ mod tests {
             .expect("replayed assignment");
         assert_eq!(replayed_assignment.result_summary, "looks good");
         assert_eq!(replayed_assignment.status, TaskAssignmentStatus::Completed);
+    }
+
+    #[test]
+    fn task_assignment_update_infers_status_from_result_envelope() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("review".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_reviewer").unwrap();
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let task = store
+            .create_task(
+                root_message_id,
+                Some("story".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (assignment, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story".into(),
+                Some(serde_json::json!({})),
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Running),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let (updated, _) = store
+            .update_task_assignment(
+                &assignment.id,
+                None,
+                None,
+                Some("done".into()),
+                Some(serde_json::json!({
+                    "assignment_id": assignment.id,
+                    "status": "completed",
+                    "summary": "done",
+                    "evidence_refs": ["manual:evidence"]
+                })),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(updated.status, TaskAssignmentStatus::Completed);
+    }
+
+    #[test]
+    fn task_assignment_update_rejects_status_conflicting_with_result_envelope() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("review".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_reviewer").unwrap();
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let task = store
+            .create_task(
+                root_message_id,
+                Some("story".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (assignment, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story".into(),
+                Some(serde_json::json!({})),
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Running),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let err = store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Running),
+                None,
+                None,
+                Some(serde_json::json!({
+                    "assignment_id": assignment.id,
+                    "status": "completed"
+                })),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicts with result envelope status"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn terminal_task_assignment_cannot_be_restarted_by_stale_delivery() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("review".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_reviewer").unwrap();
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let task = store
+            .create_task(
+                root_message_id,
+                Some("story".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (assignment, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story".into(),
+                Some(serde_json::json!({})),
+                None,
+            )
+            .unwrap();
+        let (updated, _) = store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Canceled),
+                None,
+                Some("duplicate".into()),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(updated.status, TaskAssignmentStatus::Canceled);
+
+        let err = store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Running),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("stale delivery cannot restart canceled assignment");
+        assert!(matches!(err, StoreError::InvalidState(_)));
+        assert_eq!(
+            store.get_assignment(&assignment.id).unwrap().status,
+            TaskAssignmentStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn terminal_task_assignment_rejects_late_result_payload() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("review".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_reviewer").unwrap();
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let task = store
+            .create_task(
+                root_message_id,
+                Some("story".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (assignment, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story".into(),
+                Some(serde_json::json!({})),
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Canceled),
+                None,
+                Some("duplicate".into()),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let err = store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Canceled),
+                None,
+                Some("late workspace result".into()),
+                None,
+                Vec::new(),
+                vec!["fact_late".into()],
+                Vec::new(),
+            )
+            .expect_err("late result payload cannot update canceled assignment");
+        assert!(
+            err.to_string().contains("terminal assignment")
+                && err.to_string().contains("cannot be updated"),
+            "{err}"
+        );
+        let stored = store.get_assignment(&assignment.id).unwrap();
+        assert!(stored.result_fact_ids.is_empty());
+        assert_eq!(stored.result_summary, "duplicate");
+    }
+
+    #[test]
+    fn terminal_task_assignment_idempotency_key_cannot_be_recreated() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("review".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&ch.id, "actor_reviewer").unwrap();
+        let root_message_id = append_channel_root(&store, &ch.id, "actor_owner", "story");
+        let task = store
+            .create_task(
+                root_message_id,
+                Some("story".into()),
+                String::new(),
+                "actor_owner".into(),
+                Some("actor_owner".into()),
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (assignment, _, _) = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story".into(),
+                Some(serde_json::json!({})),
+                Some("story-review-once".into()),
+            )
+            .unwrap();
+        store
+            .update_task_assignment(
+                &assignment.id,
+                Some(TaskAssignmentStatus::Canceled),
+                None,
+                Some("superseded".into()),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let err = store
+            .create_task_assignment(
+                &task.id,
+                "actor_owner".into(),
+                "actor_reviewer".into(),
+                TaskAssignmentType::Review,
+                "review story again".into(),
+                Some(serde_json::json!({})),
+                Some("story-review-once".into()),
+            )
+            .expect_err("terminal idempotency key cannot be recreated");
+        assert!(
+            err.to_string()
+                .contains("already exists for idempotency key story-review-once"),
+            "{err}"
+        );
     }
 
     #[test]

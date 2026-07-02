@@ -109,6 +109,7 @@ impl StoreEvent {
 struct Inner {
     actors: HashMap<String, Actor>,
     channels: HashMap<String, Channel>,
+    channel_member_configs: HashMap<(String, String), ChannelMemberConfig>,
     actor_groups: HashMap<String, ActorGroup>,
     actor_presences: HashMap<(String, String), ActorPresence>,
     threads: HashMap<String, Thread>,
@@ -333,23 +334,35 @@ impl Store {
     /// Remove `actor_id` from `channel_id`'s member set. Idempotent. Emits
     /// `ChannelRevoked` for the websocket layer.
     pub fn revoke_channel(&self, channel_id: &str, actor_id: &str) -> StoreResult<Channel> {
+        let channel_id = channel_id.to_string();
+        let actor_id = actor_id.to_string();
         let updated = {
             let mut inner = self.inner.write();
-            let ch = inner
+            {
+                let ch = inner
+                    .channels
+                    .get_mut(&channel_id)
+                    .ok_or_else(|| StoreError::NotFound(format!("channel {channel_id}")))?;
+                ch.members.retain(|m| m != &actor_id);
+            }
+            inner
                 .channels
-                .get_mut(channel_id)
-                .ok_or_else(|| StoreError::NotFound(format!("channel {channel_id}")))?;
-            ch.members.retain(|m| m != actor_id);
-            ch.clone()
+                .get(&channel_id)
+                .expect("channel exists after revoke")
+                .clone()
         };
         self.journal.append(&Mutation::ChannelRevoke {
-            channel_id: channel_id.to_string(),
-            actor_id: actor_id.to_string(),
+            channel_id: channel_id.clone(),
+            actor_id: actor_id.clone(),
         })?;
+        self.inner
+            .write()
+            .channel_member_configs
+            .remove(&(channel_id.clone(), actor_id.clone()));
         self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         self.emit(StoreEvent::ChannelRevoked {
-            channel_id: channel_id.to_string(),
-            actor_id: actor_id.to_string(),
+            channel_id,
+            actor_id,
         });
         Ok(updated)
     }
@@ -360,6 +373,101 @@ impl Store {
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
         self.inner.read().channels.get(id).cloned()
+    }
+
+    pub fn get_channel_member_config(
+        &self,
+        channel_id: &str,
+        actor_id: &str,
+    ) -> Option<ChannelMemberConfig> {
+        self.inner
+            .read()
+            .channel_member_configs
+            .get(&(channel_id.to_string(), actor_id.to_string()))
+            .cloned()
+    }
+
+    pub fn list_channel_member_configs(
+        &self,
+        channel_id: &str,
+    ) -> StoreResult<Vec<ChannelMemberConfig>> {
+        let inner = self.inner.read();
+        if !inner.channels.contains_key(channel_id) {
+            return Err(StoreError::NotFound(format!("channel {channel_id}")));
+        }
+        let mut configs = inner
+            .channel_member_configs
+            .values()
+            .filter(|config| config.channel_id == channel_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        configs.sort_by(|a, b| a.actor_id.cmp(&b.actor_id));
+        Ok(configs)
+    }
+
+    pub fn set_channel_member_workspace_dir(
+        &self,
+        channel_id: &str,
+        actor_id: &str,
+        workspace_dir: String,
+    ) -> StoreResult<ChannelMemberConfig> {
+        let workspace_dir = workspace_dir.trim().to_string();
+        if workspace_dir.is_empty() {
+            return Err(StoreError::InvalidState(
+                "workspaceDir cannot be empty".into(),
+            ));
+        }
+        if workspace_dir.contains('\0') {
+            return Err(StoreError::InvalidState(
+                "workspaceDir cannot contain NUL bytes".into(),
+            ));
+        }
+        {
+            let inner = self.inner.read();
+            if !inner.channels.contains_key(channel_id) {
+                return Err(StoreError::NotFound(format!("channel {channel_id}")));
+            }
+            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+        }
+        let config = ChannelMemberConfig {
+            channel_id: channel_id.to_string(),
+            actor_id: actor_id.to_string(),
+            workspace_dir: Some(workspace_dir),
+            updated_at: Utc::now(),
+            _meta: None,
+        };
+        self.journal
+            .append(&Mutation::ChannelMemberConfigUpsert(config.clone()))?;
+        self.inner.write().channel_member_configs.insert(
+            (channel_id.to_string(), actor_id.to_string()),
+            config.clone(),
+        );
+        Ok(config)
+    }
+
+    pub fn clear_channel_member_config(
+        &self,
+        channel_id: &str,
+        actor_id: &str,
+    ) -> StoreResult<bool> {
+        {
+            let inner = self.inner.read();
+            if !inner.channels.contains_key(channel_id) {
+                return Err(StoreError::NotFound(format!("channel {channel_id}")));
+            }
+            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+        }
+        let mutation = Mutation::ChannelMemberConfigDelete {
+            channel_id: channel_id.to_string(),
+            actor_id: actor_id.to_string(),
+        };
+        self.journal.append(&mutation)?;
+        let mut inner = self.inner.write();
+        let existed = inner
+            .channel_member_configs
+            .remove(&(channel_id.to_string(), actor_id.to_string()))
+            .is_some();
+        Ok(existed)
     }
 
     // -------- Actor groups --------
@@ -4906,6 +5014,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .memberships
                 .retain(|(member_actor_id, _), _| member_actor_id != &actor_id);
             inner
+                .channel_member_configs
+                .retain(|(_, config_actor_id), _| config_actor_id != &actor_id);
+            inner
                 .actor_presences
                 .retain(|(presence_actor_id, _), _| presence_actor_id != &actor_id);
             inner
@@ -4917,6 +5028,17 @@ fn apply(inner: &mut Inner, m: Mutation) {
         }
         Mutation::ChannelCreate(c) => {
             inner.channels.insert(c.id.clone(), c);
+        }
+        Mutation::ChannelMemberConfigUpsert(config) => {
+            inner
+                .channel_member_configs
+                .insert((config.channel_id.clone(), config.actor_id.clone()), config);
+        }
+        Mutation::ChannelMemberConfigDelete {
+            channel_id,
+            actor_id,
+        } => {
+            inner.channel_member_configs.remove(&(channel_id, actor_id));
         }
         Mutation::ActorGroupUpsert(group) => {
             inner.actor_groups.insert(group.id.clone(), group);
@@ -5083,6 +5205,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::ChannelDelete { channel_id } => {
             inner.channels.remove(&channel_id);
             inner
+                .channel_member_configs
+                .retain(|(config_channel_id, _), _| config_channel_id != &channel_id);
+            inner
                 .actor_groups
                 .retain(|_, group| group.channel_id != channel_id);
             inner
@@ -5152,6 +5277,9 @@ fn apply(inner: &mut Inner, m: Mutation) {
             if let Some(c) = inner.channels.get_mut(&channel_id) {
                 c.members.retain(|m| m != &actor_id);
             }
+            inner
+                .channel_member_configs
+                .remove(&(channel_id.clone(), actor_id.clone()));
             inner.actor_presences.retain(|_, presence| {
                 !(presence.channel_id == channel_id && presence.actor_id == actor_id)
             });
@@ -5327,6 +5455,24 @@ fn validate_explicit_channel_actor_inner(
     if !is_explicit_channel_member_inner(inner, channel_id, actor_id) {
         return Err(StoreError::InvalidState(format!(
             "actor {actor_id} is not an explicit actor in channel {channel_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_channel_member_workspace_actor_inner(
+    inner: &Inner,
+    channel_id: &str,
+    actor_id: &str,
+) -> StoreResult<()> {
+    validate_explicit_channel_actor_inner(inner, channel_id, actor_id)?;
+    let actor = inner
+        .actors
+        .get(actor_id)
+        .ok_or_else(|| StoreError::NotFound(format!("actor {actor_id}")))?;
+    if actor.kind != ActorKind::Agent {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not an agent"
         )));
     }
     Ok(())
@@ -6004,6 +6150,62 @@ mod tests {
         let replayed = Store::open(journal).unwrap();
         assert!(replayed.get_actor("actor_agent_qa").is_none());
         assert!(!replayed.is_channel_member(&channel.id, "actor_agent_qa"));
+    }
+
+    #[test]
+    fn channel_member_workspace_config_replays_and_clears_on_revoke() {
+        let store = fresh_store();
+        store
+            .upsert_actor(Actor {
+                id: "actor_owner".into(),
+                kind: ActorKind::Human,
+                display_name: "Owner".into(),
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("owner");
+        store
+            .upsert_actor(Actor {
+                id: "actor_agent".into(),
+                kind: ActorKind::Agent,
+                display_name: "Agent".into(),
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("agent");
+        let channel = store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        store
+            .grant_channel(&channel.id, "actor_agent")
+            .expect("grant agent");
+
+        let config = store
+            .set_channel_member_workspace_dir(&channel.id, "actor_agent", "F:/work/demo".into())
+            .expect("set config");
+        assert_eq!(config.workspace_dir.as_deref(), Some("F:/work/demo"));
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        assert_eq!(
+            replayed
+                .get_channel_member_config(&channel.id, "actor_agent")
+                .and_then(|config| config.workspace_dir),
+            Some("F:/work/demo".into())
+        );
+
+        replayed
+            .revoke_channel(&channel.id, "actor_agent")
+            .expect("revoke agent");
+        assert!(replayed
+            .get_channel_member_config(&channel.id, "actor_agent")
+            .is_none());
+
+        let journal = Journal::open(replayed.journal.path().to_path_buf()).unwrap();
+        let replayed_again = Store::open(journal).unwrap();
+        assert!(replayed_again
+            .get_channel_member_config(&channel.id, "actor_agent")
+            .is_none());
     }
 
     fn append_channel_root(

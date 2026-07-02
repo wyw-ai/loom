@@ -117,3 +117,103 @@ pub async fn members(client: Arc<Client>, channel_id: String) -> Result<()> {
     }
     Ok(())
 }
+
+pub async fn member_config_list(client: Arc<Client>, channel_id: String) -> Result<()> {
+    let res: ChannelMemberConfigListResult = client
+        .call(
+            method::CHANNEL_MEMBER_CONFIG_LIST,
+            json!({ "channelId": channel_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    if res.configs.is_empty() {
+        println!("(no member workspace overrides)");
+        return Ok(());
+    }
+    for config in res.configs {
+        println!(
+            "{}\t{}",
+            config.actor_id,
+            config.workspace_dir.as_deref().unwrap_or("(default)")
+        );
+    }
+    Ok(())
+}
+
+pub async fn member_config_get(
+    client: Arc<Client>,
+    channel_id: String,
+    actor_id: String,
+) -> Result<()> {
+    let res: ChannelMemberConfigGetResult = client
+        .call(
+            method::CHANNEL_MEMBER_CONFIG_GET,
+            json!({ "channelId": channel_id, "actorId": actor_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    match res.config {
+        Some(config) => println!(
+            "{}\t{}",
+            config.actor_id,
+            config.workspace_dir.as_deref().unwrap_or("(default)")
+        ),
+        None => println!("(default)"),
+    }
+    Ok(())
+}
+
+pub async fn member_config_set(
+    client: Arc<Client>,
+    channel_id: String,
+    actor_id: String,
+    workspace_dir: String,
+) -> Result<()> {
+    let res: ChannelMemberConfigSetResult = client
+        .call(
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            json!({
+                "channelId": channel_id,
+                "actorId": actor_id,
+                "workspaceDir": workspace_dir,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "workspace override set for {}: {}",
+            res.config.actor_id,
+            res.config.workspace_dir.as_deref().unwrap_or("(default)")
+        );
+    }
+    Ok(())
+}
+
+pub async fn member_config_clear(
+    client: Arc<Client>,
+    channel_id: String,
+    actor_id: String,
+) -> Result<()> {
+    let res: ChannelMemberConfigClearResult = client
+        .call(
+            method::CHANNEL_MEMBER_CONFIG_CLEAR,
+            json!({ "channelId": channel_id, "actorId": actor_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.cleared {
+        println!("workspace override cleared");
+    } else {
+        println!("workspace override was already default");
+    }
+    Ok(())
+}

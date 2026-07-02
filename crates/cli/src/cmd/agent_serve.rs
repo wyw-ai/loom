@@ -25,9 +25,9 @@ use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
     AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
-    BundleInstallMode, ChannelMembersResult, InboxListResult, MessageListResult, MessageSendResult,
-    PromptTemplateSpec, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    BundleInstallMode, ChannelMemberConfigGetResult, ChannelMembersResult, InboxListResult,
+    MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult, RunCloseResult,
+    RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -747,19 +747,96 @@ impl AgentPaths {
     }
 
     fn scope(&self, actor_id: &str, channel_id: &str, scope_ref: &ScopeRef) -> ScopePaths {
+        self.scope_with_workspace_override(actor_id, channel_id, scope_ref, None)
+    }
+
+    fn scope_with_workspace_override(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+        workspace_override: Option<&Path>,
+    ) -> ScopePaths {
         let channel_root = self.data_root.join("channels").join(channel_id);
         let channel_shared = channel_root.join("shared");
         let channel_artifacts = channel_shared.join("artifacts");
         let agent_root = channel_root.join("agents").join(actor_id);
+        let workspace = workspace_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| agent_root.join("workspace"));
         ScopePaths {
             channel_root,
             channel_shared,
             channel_artifacts,
             skills: self.scope_skills_dir(scope_ref),
-            workspace: agent_root.join("workspace"),
+            workspace,
             logs: agent_root.join("logs"),
             agent_root,
         }
+    }
+
+    fn configured_workspace_path(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+        raw: &str,
+    ) -> Result<PathBuf> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(anyhow!("workspaceDir cannot be empty"));
+        }
+        let default_scope = self.scope(actor_id, channel_id, scope_ref);
+        let expanded =
+            self.expand_scope_path_template(raw, actor_id, channel_id, scope_ref, &default_scope);
+        let path = normalize_path_separators(PathBuf::from(expanded));
+        if path.as_os_str().is_empty() {
+            return Err(anyhow!("workspaceDir resolved to an empty path"));
+        }
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        for comp in path.components() {
+            match comp {
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                    return Err(anyhow!(
+                        "relative workspaceDir must stay under channel root: {}",
+                        raw
+                    ));
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+        Ok(default_scope.channel_root.join(path))
+    }
+
+    fn expand_scope_path_template(
+        &self,
+        input: &str,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+        scope: &ScopePaths,
+    ) -> String {
+        self.expand_base(input)
+            .replace("{actor.id}", actor_id)
+            .replace("{scope.id}", &scope_ref.id)
+            .replace("{scope.kind}", scope_kind_name(scope_ref.kind))
+            .replace("{channel.id}", channel_id)
+            .replace("{workspace.dir}", &scope.workspace.display().to_string())
+            .replace("{agent.workspace}", &scope.workspace.display().to_string())
+            .replace("{agent.root}", &scope.agent_root.display().to_string())
+            .replace("{agent.logs}", &scope.logs.display().to_string())
+            .replace("{agent.skills}", &scope.skills.display().to_string())
+            .replace("{channel.root}", &scope.channel_root.display().to_string())
+            .replace(
+                "{channel.shared}",
+                &scope.channel_shared.display().to_string(),
+            )
+            .replace(
+                "{channel.sharedArtifacts}",
+                &scope.channel_artifacts.display().to_string(),
+            )
     }
 
     fn ensure(
@@ -849,10 +926,12 @@ impl AgentPaths {
         actor_id: &str,
         channel_id: &str,
         scope_ref: &ScopeRef,
+        workspace_override: Option<&Path>,
         agent_instructions: Option<&str>,
         actor_context: Option<&str>,
     ) -> std::io::Result<ScopePaths> {
-        let scope = self.scope(actor_id, channel_id, scope_ref);
+        let scope =
+            self.scope_with_workspace_override(actor_id, channel_id, scope_ref, workspace_override);
         create_dir_all_unc(&scope.workspace).map_err(|e| {
             tracing::error!(
                 actor = %actor_id,
@@ -939,6 +1018,16 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
+        self.template_vars_for_scope(actor_id, channel_id, scope_ref, &scope)
+    }
+
+    fn template_vars_for_scope(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+        scope: &ScopePaths,
+    ) -> BTreeMap<String, String> {
         let scope_kind = scope_kind_name(scope_ref.kind).to_string();
         let mut vars = BTreeMap::new();
         vars.insert("actor.id".into(), actor_id.to_string());
@@ -1006,6 +1095,7 @@ impl AgentPaths {
         vars
     }
 
+    #[cfg(test)]
     fn scope_env(
         &self,
         actor_id: &str,
@@ -1015,6 +1105,18 @@ impl AgentPaths {
         active: Option<&ActiveTurn>,
     ) -> BTreeMap<String, String> {
         let scope = self.scope(actor_id, channel_id, scope_ref);
+        self.scope_env_for_scope(actor_id, channel_id, scope_ref, server_url, active, &scope)
+    }
+
+    fn scope_env_for_scope(
+        &self,
+        actor_id: &str,
+        channel_id: &str,
+        scope_ref: &ScopeRef,
+        server_url: &str,
+        active: Option<&ActiveTurn>,
+        scope: &ScopePaths,
+    ) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         env.insert("LOOM_SERVER".into(), server_url.to_string());
         inject_loom_cli_env(&mut env, resolve_loom_cli_binary().as_deref());
@@ -3924,6 +4026,59 @@ async fn dispatch_trigger(
     }
 }
 
+async fn channel_member_workspace_override(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    channel_id: &str,
+    scope: &ScopeRef,
+) -> Result<Option<PathBuf>> {
+    let result: Result<ChannelMemberConfigGetResult> = client
+        .call(
+            method::CHANNEL_MEMBER_CONFIG_GET,
+            json!({
+                "channelId": channel_id,
+                "actorId": &state.actor_id,
+            }),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "channel/member_config.get channelId={} actorId={}",
+                channel_id, state.actor_id
+            )
+        });
+    match result {
+        Ok(result) => {
+            let Some(config) = result.config else {
+                return Ok(None);
+            };
+            let Some(raw) = config.workspace_dir.as_deref() else {
+                return Ok(None);
+            };
+            let resolved =
+                state
+                    .paths
+                    .configured_workspace_path(&state.actor_id, channel_id, scope, raw)?;
+            tracing::info!(
+                actor = %state.actor_id,
+                channel = %channel_id,
+                workspace = %resolved.display(),
+                "using configured channel member workspace"
+            );
+            Ok(Some(resolved))
+        }
+        Err(err) if err.to_string().contains("code -32601") => {
+            tracing::warn!(
+                actor = %state.actor_id,
+                channel = %channel_id,
+                "server does not support channel member workspace config; using default workspace"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn build_adapter_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -3935,21 +4090,25 @@ async fn build_adapter_prompt(
     let channel_id = resolve_channel_for_scope(client, state, scope)
         .await
         .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
+    let workspace_override =
+        channel_member_workspace_override(client, state, &channel_id, scope).await?;
     let actor_context = actor_context_manifest(&state.actor_id, &state.spec.actor.display_name);
     let agent_instructions = agent_instructions_manifest(&state.spec);
     let scope_paths = state.paths.ensure_scope(
         &state.actor_id,
         &channel_id,
         scope,
+        workspace_override.as_deref(),
         Some(&agent_instructions),
         Some(&actor_context),
     )?;
     let skill_targets = current_scope_skill_targets(client, state, &channel_id).await;
     ensure_scope_skill_targets(&scope_paths.skills, &skill_targets)
         .with_context(|| format!("ensure scope skill targets for scope {}", scope.id))?;
-    let mut template_vars = state
-        .paths
-        .template_vars(&state.actor_id, &channel_id, scope);
+    let mut template_vars =
+        state
+            .paths
+            .template_vars_for_scope(&state.actor_id, &channel_id, scope, &scope_paths);
     extend_prompt_template_vars(&mut template_vars, state, trigger);
     template_vars.insert("loom.actor".into(), state.actor_id.clone());
     template_vars.insert("loom.scope.id".into(), scope.id.clone());
@@ -3992,13 +4151,14 @@ async fn build_adapter_prompt(
         parts,
         outputs,
         model: state.current_model(),
-        cwd: scope_paths.workspace,
-        env: state.paths.scope_env(
+        cwd: scope_paths.workspace.clone(),
+        env: state.paths.scope_env_for_scope(
             &state.actor_id,
             &channel_id,
             scope,
             &state.agent_server_url,
             active,
+            &scope_paths,
         ),
         template_vars,
     })
@@ -4451,7 +4611,7 @@ async fn no_reply_file_for_turn(
     let channel_id = resolve_channel_for_scope(client, state, scope).await?;
     let paths = state
         .paths
-        .ensure_scope(&state.actor_id, &channel_id, scope, None, None)
+        .ensure_scope(&state.actor_id, &channel_id, scope, None, None, None)
         .ok()?;
     Some(run_no_reply_file(&paths.logs, run_id))
 }
@@ -7493,7 +7653,7 @@ mod tests {
         };
 
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None, None)
+            .ensure_scope("actor_demo", "chan_demo", &scope, None, None, None)
             .expect("ensure scope");
 
         assert_eq!(
@@ -7504,6 +7664,29 @@ mod tests {
                 .join("skills")
         );
         assert!(scope_paths.skills.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn configured_workspace_relative_paths_stay_under_channel_root() {
+        let root = temp_path("configured-workspace-relative");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+
+        let resolved = paths
+            .configured_workspace_path("actor_demo", "chan_demo", &scope, "project-a")
+            .expect("resolve workspace");
+        assert_eq!(
+            resolved,
+            root.join("channels").join("chan_demo").join("project-a")
+        );
+        assert!(paths
+            .configured_workspace_path("actor_demo", "chan_demo", &scope, "../outside")
+            .is_err());
 
         std::fs::remove_dir_all(root).ok();
     }

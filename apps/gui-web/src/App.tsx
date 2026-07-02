@@ -1049,6 +1049,27 @@ export function App() {
     }
   }
 
+  async function updateAccountAvatar(avatarUrl: string) {
+    setBusy("account:avatar");
+    setError(null);
+    try {
+      const next = await ipc.accountUpdateAvatar(avatarUrl);
+      applyConfig(next);
+      const updatedAccount = next.account ?? null;
+      if (updatedAccount) {
+        setActors((current) => ({
+          ...current,
+          [updatedAccount.actorId]: accountToActor(updatedAccount),
+        }));
+      }
+      pushNotice("Account avatar updated");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function addWorkspace(): Promise<Workspace | null> {
     const hasTarget = workspaceForm.advanced
       ? workspaceForm.serverUrl.trim()
@@ -2189,6 +2210,7 @@ export function App() {
               account={account}
               busy={busy}
               onLogout={logout}
+              onAvatarChange={updateAccountAvatar}
             />
           </>
         ) : (

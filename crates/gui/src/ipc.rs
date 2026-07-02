@@ -10,6 +10,7 @@
 //!   debuggable on the TypeScript side.
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -269,6 +270,57 @@ fn default_actor_id_for_local_user(user_id: &str) -> String {
         suffix
     };
     format!("{PREFIX}{suffix}")
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUpdateAvatarArgs {
+    pub avatar_url: String,
+}
+
+#[tauri::command]
+pub async fn account_update_avatar(
+    state: State<'_, AppState>,
+    args: AccountUpdateAvatarArgs,
+) -> Result<DesktopConfig, String> {
+    let avatar_url = args.avatar_url.trim().to_string();
+    let mut cfg = config::load_or_init().map_err(stringify)?;
+    let active_workspace = cfg
+        .active
+        .as_deref()
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .or_else(|| cfg.workspaces.first())
+        .cloned();
+    if cfg.account.is_none() {
+        let workspace = active_workspace
+            .as_ref()
+            .ok_or_else(|| "create a workspace before setting an account avatar".to_string())?;
+        let staff_id = workspace
+            .actor_id
+            .strip_prefix("actor_human_local_")
+            .unwrap_or(workspace.actor_id.as_str())
+            .to_string();
+        cfg.account = Some(HumanAccount {
+            provider: "local".into(),
+            staff_id,
+            nickname: workspace.display_name.clone(),
+            real_name: String::new(),
+            email: String::new(),
+            actor_id: workspace.actor_id.clone(),
+            avatar_url: avatar_url.clone(),
+        });
+    } else if let Some(account) = cfg.account.as_mut() {
+        account.avatar_url = avatar_url.clone();
+    }
+    apply_account_identity(&mut cfg);
+    config::save(&cfg).map_err(stringify)?;
+    let cfg = config::load_or_init().map_err(stringify)?;
+    if let (Some(client), Some(account)) = (state.try_client().await, cfg.account.as_ref()) {
+        upsert_human_actor(&client, account)
+            .await
+            .map_err(deep_stringify)?;
+    }
+    Ok(cfg)
 }
 
 #[derive(Deserialize)]
@@ -1859,8 +1911,80 @@ async fn machines_from_config(
         machines: pending_machine_infos(cfg)?,
     };
     merge_server_machine_inventory(&mut result, cfg, client.as_ref(), server_url).await?;
+    merge_local_service_specs(&mut result);
     apply_connection_status(&mut result, client).await;
     Ok(result)
+}
+
+fn merge_local_service_specs(result: &mut MachineListResult) {
+    let specs = load_local_service_specs();
+    if specs.is_empty() {
+        return;
+    }
+    let machine_index = result
+        .machines
+        .iter()
+        .position(|machine| machine.can_open_local_path)
+        .or_else(|| {
+            result
+                .machines
+                .iter()
+                .position(|machine| machine.kind == "local")
+        });
+    if let Some(index) = machine_index {
+        let machine = &mut result.machines[index];
+        merge_service_specs(&mut machine.services, specs);
+        machine.service_count = machine.services.len();
+    }
+}
+
+fn load_local_service_specs() -> Vec<ServiceSpec> {
+    let dir = cli_config_dir().join("services");
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            push_service_spec(&path.join("service.json"), &mut out);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            push_service_spec(&path, &mut out);
+        }
+    }
+    out
+}
+
+fn cli_config_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("LOOM_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".loom"))
+        .unwrap_or_else(|| PathBuf::from(".loom"))
+}
+
+fn push_service_spec(path: &Path, out: &mut Vec<ServiceSpec>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut spec) = serde_json::from_str::<ServiceSpec>(&text) else {
+        return;
+    };
+    spec.normalize();
+    if spec.validate().is_ok() {
+        out.push(spec);
+    }
+}
+
+fn merge_service_specs(existing: &mut Vec<ServiceSpec>, specs: Vec<ServiceSpec>) {
+    for spec in specs {
+        if let Some(slot) = existing.iter_mut().find(|current| current.id == spec.id) {
+            *slot = spec;
+        } else {
+            existing.push(spec);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

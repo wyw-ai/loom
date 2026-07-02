@@ -129,6 +129,10 @@ export async function accountLogout(): Promise<DesktopConfig> {
   return invoke("account_logout");
 }
 
+export async function accountUpdateAvatar(avatarUrl: string): Promise<DesktopConfig> {
+  return invoke("account_update_avatar", { args: { avatarUrl } });
+}
+
 export async function avatarCachedUrl(url: string): Promise<string> {
   return invoke("avatar_cached_url", { args: { url } });
 }

@@ -22,7 +22,8 @@ use anyhow::{Context, Result};
 use proto::methods::{
     method, ActorUpsertParams, ActorUpsertResult, ArtifactIngress, ArtifactPublishParams,
     ArtifactPublishResult, InboxListParams, InboxListResult, InlineTextIngress, MessageSendResult,
-    ThreadCreateParams, ThreadCreateResult, ThreadListParams, ThreadListResult,
+    TaskFactAppendResult, ThreadCreateParams, ThreadCreateResult, ThreadListParams,
+    ThreadListResult,
 };
 use proto::types::{Actor, DeliveryState, Message, Meta, Relation, ScopeKind, ScopeRef, Thread};
 use serde_json::json;
@@ -274,6 +275,48 @@ impl ServiceRuntime {
             .await
             .context("message.send status.update")?;
         Ok(res.message.id)
+    }
+
+    /// Record service output as a durable task fact. Scheduler jobs use
+    /// this when their JSON payload carries both `schema` and `taskId`.
+    pub async fn append_task_fact(
+        &self,
+        task_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+        artifact_id: Option<&str>,
+        summary: impl Into<String>,
+        source_cursor: Option<&str>,
+    ) -> Result<String> {
+        let res: TaskFactAppendResult = self
+            .client
+            .call(
+                method::TASK_FACT_APPEND,
+                json!({
+                    "taskId": task_id,
+                    "targetKey": payload.get("mrId")
+                        .or_else(|| payload.get("workitemId"))
+                        .and_then(|v| {
+                            v.as_str()
+                                .map(ToString::to_string)
+                                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                        })
+                        .unwrap_or_default(),
+                    "kind": kind,
+                    "factType": "status",
+                    "status": "active",
+                    "producerId": &self.actor_id,
+                    "summary": summary.into(),
+                    "artifactId": artifact_id,
+                    "payloadSchema": kind,
+                    "payload": payload,
+                    "sourceCursor": source_cursor,
+                }),
+            )
+            .await
+            .context("task/fact.append")?;
+        Ok(res.fact.id)
     }
 
     /// Publish a `service.self_complete` message into `scope` carrying the

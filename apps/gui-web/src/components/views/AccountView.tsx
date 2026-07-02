@@ -2,8 +2,10 @@ import { Avatar } from "@/components/layout/Avatar";
 import { PageHeader } from "@/components/shared/PageComponents";
 import { SettingsSection } from "@/components/settings/SettingsSection";
 import { Button } from "@/components/ui/button";
+import { avatarLibraryUrls } from "@/lib/constants";
 import { accountName, capitalize } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
+import { useEffect, useState } from "react";
 import { Github, LogOut } from "lucide-react";
 import type { HumanAccount } from "@/ipc/types";
 
@@ -11,11 +13,19 @@ export function AccountView({
   account,
   busy,
   onLogout,
+  onAvatarChange,
 }: {
   account: HumanAccount | null;
   busy: string | null;
   onLogout: () => void;
+  onAvatarChange: (avatarUrl: string) => void;
 }) {
+  const [customAvatarUrl, setCustomAvatarUrl] = useState(account?.avatarUrl ?? "");
+  useEffect(() => {
+    setCustomAvatarUrl(account?.avatarUrl ?? "");
+  }, [account?.avatarUrl]);
+  const savingAvatar = busy === "account:avatar";
+
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <PageHeader title="Account" detail="Identity and sign-in" />
@@ -48,6 +58,54 @@ export function AccountView({
                   <AccountField label="Actor ID" value={account.actorId} mono />
                   <AccountField label="User ID" value={account.staffId || "-"} />
                   <AccountField label="Email" value={account.email || "-"} />
+                </div>
+                <div className="space-y-3 rounded-lg border border-[#edf0f5] bg-[#fbfbfd] p-3">
+                  <div>
+                    <div className="text-sm font-bold text-[#303849]">Avatar</div>
+                    <div className="text-xs text-[#667085]">
+                      Used for presence and local ownership.
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-6 gap-2 sm:grid-cols-8">
+                    {avatarLibraryUrls.map((url) => {
+                      const selected = account.avatarUrl === url;
+                      return (
+                        <button
+                          key={url}
+                          type="button"
+                          className={cn(
+                            "h-10 w-10 rounded-full border bg-white p-0.5 transition",
+                            selected ? "border-[#2563eb] ring-2 ring-[#bfdbfe]" : "border-[#dfe3ec]",
+                          )}
+                          onClick={() => onAvatarChange(url)}
+                          disabled={savingAvatar}
+                          title="Use this avatar"
+                        >
+                          <img
+                            src={url}
+                            alt=""
+                            className="h-full w-full rounded-full object-cover"
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      className="min-w-0 flex-1 rounded-md border border-[#dfe3ec] bg-white px-3 py-2 text-sm outline-none focus:border-[#2563eb]"
+                      value={customAvatarUrl}
+                      onChange={(event) => setCustomAvatarUrl(event.target.value)}
+                      placeholder="Custom avatar URL"
+                      disabled={savingAvatar}
+                    />
+                    <Button
+                      variant="outline"
+                      disabled={savingAvatar}
+                      onClick={() => onAvatarChange(customAvatarUrl.trim())}
+                    >
+                      Save
+                    </Button>
+                  </div>
                 </div>
               </div>
             ) : (
@@ -112,5 +170,4 @@ export function AccountField({
     </div>
   );
 }
-
 

@@ -577,6 +577,45 @@ pub async fn channel_invite(state: State<'_, AppState>, params: Value) -> Result
 }
 
 #[tauri::command]
+pub async fn channel_member_config_list(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_MEMBER_CONFIG_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_member_config_set(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_MEMBER_CONFIG_SET, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_member_config_clear(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_MEMBER_CONFIG_CLEAR, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn channel_revoke(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
@@ -1403,6 +1442,33 @@ pub async fn agent_file_write(
             "content": args.content,
             "channelId": args.channel_id,
             "scope": args.scope,
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineDirListArgs {
+    pub machine_id: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[tauri::command]
+pub async fn machine_dir_list(
+    state: State<'_, AppState>,
+    args: MachineDirListArgs,
+) -> Result<Value, String> {
+    let cfg = config::load_or_init().map_err(stringify)?;
+    ensure_server_machine_present(&cfg, &state, &args.machine_id).await?;
+    run_remote_machine_command(
+        &state,
+        &cfg,
+        &args.machine_id,
+        json!({
+            "op": "fs.dir.list",
+            "path": args.path,
         }),
     )
     .await

@@ -73,6 +73,18 @@ pub async fn dispatch(
         method::CHANNEL_INVITE => channel_invite(state, connection_id, params),
         method::CHANNEL_REVOKE => channel_revoke(state, connection_id, params),
         method::CHANNEL_MEMBERS => channel_members(state, connection_id, params),
+        method::CHANNEL_MEMBER_CONFIG_GET => {
+            channel_member_config_get(state, connection_id, params)
+        }
+        method::CHANNEL_MEMBER_CONFIG_LIST => {
+            channel_member_config_list(state, connection_id, params)
+        }
+        method::CHANNEL_MEMBER_CONFIG_SET => {
+            channel_member_config_set(state, connection_id, params)
+        }
+        method::CHANNEL_MEMBER_CONFIG_CLEAR => {
+            channel_member_config_clear(state, connection_id, params)
+        }
         method::THREAD_CREATE => thread_create(state, connection_id, params),
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
@@ -462,6 +474,111 @@ fn channel_members(state: &AppState, connection_id: &str, params: Option<Value>)
         .filter_map(|id| state.store.get_actor(id))
         .collect();
     ok(ChannelMembersResult { members })
+}
+
+fn ensure_channel_config_reader(
+    state: &AppState,
+    connection_id: &str,
+    channel_id: &str,
+) -> Result<String, ErrorObject> {
+    let caller = caller_actor(state, connection_id)?;
+    if state.store.get_channel(channel_id).is_none() {
+        return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"));
+    }
+    if !state.store.is_channel_member(channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot read member config for channel {channel_id}"),
+        ));
+    }
+    Ok(caller)
+}
+
+fn channel_member_config_get(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMemberConfigGetParams = parse_params(params)?;
+    ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    ok(ChannelMemberConfigGetResult {
+        config: state
+            .store
+            .get_channel_member_config(&p.channel_id, &p.actor_id),
+    })
+}
+
+fn channel_member_config_list(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMemberConfigListParams = parse_params(params)?;
+    ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    let configs = state
+        .store
+        .list_channel_member_configs(&p.channel_id)
+        .map_err(map_store_err)?;
+    ok(ChannelMemberConfigListResult { configs })
+}
+
+fn channel_member_config_set(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMemberConfigSetParams = parse_params(params)?;
+    let caller = ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    if p.workspace_dir.trim().is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "workspaceDir cannot be empty",
+        ));
+    }
+    if p.workspace_dir.contains('\0') {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "workspaceDir cannot contain NUL bytes",
+        ));
+    }
+    if state.store.get_actor(&p.actor_id).is_none() {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_NOT_FOUND,
+            format!("actor {}", p.actor_id),
+        ));
+    }
+    let config = state
+        .store
+        .set_channel_member_workspace_dir(&p.channel_id, &p.actor_id, p.workspace_dir)
+        .map_err(map_store_err)?;
+    tracing::info!(
+        channel = %p.channel_id,
+        actor = %p.actor_id,
+        caller = %caller,
+        "channel member workspace config updated"
+    );
+    ok(ChannelMemberConfigSetResult { config })
+}
+
+fn channel_member_config_clear(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMemberConfigClearParams = parse_params(params)?;
+    let caller = ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    let cleared = state
+        .store
+        .clear_channel_member_config(&p.channel_id, &p.actor_id)
+        .map_err(map_store_err)?;
+    tracing::info!(
+        channel = %p.channel_id,
+        actor = %p.actor_id,
+        caller = %caller,
+        cleared,
+        "channel member workspace config cleared"
+    );
+    ok(ChannelMemberConfigClearResult { cleared })
 }
 
 fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
@@ -3117,6 +3234,26 @@ mod tests {
         .expect("connection/open");
     }
 
+    async fn open_agent_conn(state: &AppState, connection_id: &str, actor_id: &str) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: connection_id.into(),
+            actor_id: None,
+            tx,
+        });
+        dispatch(
+            state,
+            connection_id,
+            method::CONNECTION_OPEN,
+            Some(json!({
+                "actorId": actor_id,
+                "actorKind": "agent",
+            })),
+        )
+        .await
+        .expect("connection/open agent");
+    }
+
     #[tokio::test]
     async fn legacy_event_rpc_names_are_not_public_methods() {
         let state = fresh_state("legacy_event_rpc_names_are_not_public_methods");
@@ -3128,6 +3265,195 @@ mod tests {
                 .expect_err("legacy method should be rejected");
             assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn channel_member_config_rpc_set_list_get_and_clear() {
+        let state = fresh_state("channel_member_config_rpc_set_list_get_and_clear");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_agent_conn(&state, "conn_agent", "actor_agent").await;
+
+        let channel_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "backend" })),
+        )
+        .await
+        .expect("channel/create");
+        let created: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel create result");
+
+        dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_INVITE,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+            })),
+        )
+        .await
+        .expect("channel/invite");
+
+        let set_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+                "workspaceDir": "F:/work/backend",
+            })),
+        )
+        .await
+        .expect("member config set");
+        let set: ChannelMemberConfigSetResult =
+            serde_json::from_value(set_value).expect("set result");
+        assert_eq!(set.config.workspace_dir.as_deref(), Some("F:/work/backend"));
+
+        let list_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_LIST,
+            Some(json!({ "channelId": &created.channel.id })),
+        )
+        .await
+        .expect("member config list");
+        let list: ChannelMemberConfigListResult =
+            serde_json::from_value(list_value).expect("list result");
+        assert_eq!(list.configs.len(), 1);
+
+        let get_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_MEMBER_CONFIG_GET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+            })),
+        )
+        .await
+        .expect("member config get");
+        let get: ChannelMemberConfigGetResult =
+            serde_json::from_value(get_value).expect("get result");
+        assert_eq!(
+            get.config.and_then(|config| config.workspace_dir),
+            Some("F:/work/backend".into())
+        );
+
+        let clear_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_CLEAR,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+            })),
+        )
+        .await
+        .expect("member config clear");
+        let clear: ChannelMemberConfigClearResult =
+            serde_json::from_value(clear_value).expect("clear result");
+        assert!(clear.cleared);
+        assert!(state
+            .store
+            .get_channel_member_config(&created.channel.id, "actor_agent")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_member_config_rpc_rejects_empty_path_and_non_members() {
+        let state = fresh_state("channel_member_config_rpc_rejects_empty_path_and_non_members");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_agent_conn(&state, "conn_agent", "actor_agent").await;
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+        open_conn(&state, "conn_human", "actor_human").await;
+
+        let channel_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "backend" })),
+        )
+        .await
+        .expect("channel/create");
+        let created: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel create result");
+        dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_INVITE,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+            })),
+        )
+        .await
+        .expect("channel/invite");
+        dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_INVITE,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_human",
+            })),
+        )
+        .await
+        .expect("channel/invite human");
+
+        let empty_err = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+                "workspaceDir": "   ",
+            })),
+        )
+        .await
+        .expect_err("empty path rejected");
+        assert_eq!(empty_err.code, ErrorCode::INVALID_PARAMS);
+
+        let intruder_err = dispatch(
+            &state,
+            "conn_intruder",
+            method::CHANNEL_MEMBER_CONFIG_LIST,
+            Some(json!({ "channelId": &created.channel.id })),
+        )
+        .await
+        .expect_err("non-member rejected");
+        assert_eq!(intruder_err.code, ErrorCode::APP_INVALID_STATE);
+
+        let target_err = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_intruder",
+                "workspaceDir": "F:/work/backend",
+            })),
+        )
+        .await
+        .expect_err("target must be explicit member");
+        assert_eq!(target_err.code, ErrorCode::APP_INVALID_STATE);
+
+        let human_err = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_human",
+                "workspaceDir": "F:/work/backend",
+            })),
+        )
+        .await
+        .expect_err("target must be an agent");
+        assert_eq!(human_err.code, ErrorCode::APP_INVALID_STATE);
     }
 
     async fn open_service_conn(

@@ -19,6 +19,14 @@ export interface Channel {
   _meta?: Record<string, unknown>;
 }
 
+export interface ChannelMemberConfig {
+  channelId: string;
+  actorId: string;
+  workspaceDir?: string | null;
+  updatedAt: string;
+  _meta?: Record<string, unknown>;
+}
+
 export type ScopeKind = "channel" | "thread";
 
 export interface ScopeRef {
@@ -366,6 +374,26 @@ export interface MachineServiceInfo {
 
 export interface MachineListResult {
   machines: MachineInfo[];
+}
+
+export interface MachineDirRoot {
+  label: string;
+  path: string;
+}
+
+export interface MachineDirEntry {
+  name: string;
+  path: string;
+  kind: "directory";
+  modified?: string | null;
+}
+
+export interface MachineDirListResult {
+  path: string;
+  parent?: string | null;
+  roots: MachineDirRoot[];
+  entries: MachineDirEntry[];
+  truncated?: boolean;
 }
 
 export type TaskAssignmentType =

@@ -1059,8 +1059,13 @@ fn spawn_and_collect(
             .wait()
             .map_err(|e| format!("failed to wait on child: {e}"))?,
     };
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
+    // Some provider CLIs spawn detached helpers that inherit stdout/stderr.
+    // Joining the reader threads here can block forever even after the direct
+    // child exits, which consumes the Loom delivery without ever emitting a
+    // Finished event. Detach the readers and drain whatever they already sent.
+    drop(stdout_handle);
+    drop(stderr_handle);
+    std::thread::sleep(Duration::from_millis(50));
     // Check the background stdin write result. If the child exits early after
     // emitting a provider/runtime error, the writer can see BrokenPipe; keep
     // that as a fallback so it does not mask the more actionable child output.
@@ -1108,7 +1113,7 @@ fn spawn_and_collect(
     // already pushed partial Text frames inline; we only need the final flush
     // + Finished here. The Text format never pushed anything, so we emit the
     // whole stdout as a single Text and then Finished.
-    let success = exit_code == 0 && !was_cancelled && !timed_out && !idle_timed_out;
+    let mut success = exit_code == 0 && !was_cancelled && !timed_out && !idle_timed_out;
     let runtime_error = if success {
         None
     } else {
@@ -1117,7 +1122,7 @@ fn spawn_and_collect(
             .or_else(|| extract_runtime_error_from_text(&collected_stderr))
             .or(stdin_write_error)
     };
-    let summary = if was_cancelled {
+    let mut summary = if was_cancelled {
         "cancelled".into()
     } else if timed_out {
         match cfg.timeout_ms {
@@ -1139,10 +1144,13 @@ fn spawn_and_collect(
         format!("exited with code {exit_code}")
     };
 
+    let mut emitted_any_text = emitted_text;
     if let Some(event) =
         configured_decoder_final_text_event(cfg, &collected_stdout, &collected_stderr)
     {
-        let _ = emit_provider_runtime_event(event, &prompt.scope, sender);
+        let events = emit_provider_runtime_event(event, &prompt.scope, sender);
+        emitted_any_text |= events.emitted_text;
+        emitted_finish |= events.emitted_finish;
     } else {
         match cfg.output_format {
             CommandOutputFormat::Text => {
@@ -1152,6 +1160,7 @@ fn spawn_and_collect(
                         content: collected_stdout.clone(),
                         is_partial: false,
                     });
+                    emitted_any_text = true;
                 }
             }
             CommandOutputFormat::CopilotJson => {
@@ -1161,6 +1170,7 @@ fn spawn_and_collect(
                         content,
                         is_partial: false,
                     });
+                    emitted_any_text = true;
                 }
             }
             CommandOutputFormat::OpencodeJson => {
@@ -1170,6 +1180,7 @@ fn spawn_and_collect(
                         content,
                         is_partial: false,
                     });
+                    emitted_any_text = true;
                 }
             }
             CommandOutputFormat::CodexStreamJson if !emitted_text => {
@@ -1179,6 +1190,7 @@ fn spawn_and_collect(
                         content,
                         is_partial: false,
                     });
+                    emitted_any_text = true;
                 }
             }
             CommandOutputFormat::CodexStreamJson => {}
@@ -1191,8 +1203,17 @@ fn spawn_and_collect(
                     content: String::new(),
                     is_partial: false,
                 });
+                emitted_any_text = true;
             }
         }
+    }
+    if success
+        && !emitted_any_text
+        && !emitted_finish
+        && cfg.output_format != CommandOutputFormat::Text
+    {
+        success = false;
+        summary = "command provider exited successfully but produced no assistant output".into();
     }
     let usage = extract_token_usage_from_text(&collected_stdout)
         .or_else(|| extract_token_usage_from_text(&collected_stderr));
@@ -4371,6 +4392,75 @@ mod tests {
             }
         }
         assert_eq!(messages, vec!["First", "Final"]);
+    }
+
+    #[test]
+    fn codex_stream_success_without_assistant_output_reports_failure() {
+        let mut cfg = cfg();
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' \
+             '{\"type\":\"thread.started\",\"thread_id\":\"t1\"}' \
+             '{\"type\":\"turn.started\"}' \
+             '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}'"
+                .into(),
+        ];
+        cfg.output_format = CommandOutputFormat::CodexStreamJson;
+        cfg.prompt_via = PromptVia::Args;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert_eq!(outcome.exit_code, 0);
+        let mut finished = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                finished = Some((success, summary));
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((
+                false,
+                "command provider exited successfully but produced no assistant output".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn child_exit_does_not_wait_for_detached_stdout_holder() {
+        let mut cfg = cfg();
+        cfg.command = "/bin/sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "(sleep 2) & printf '%s\\n' \
+             '{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"Done\"}}'"
+                .into(),
+        ];
+        cfg.output_format = CommandOutputFormat::CodexStreamJson;
+        cfg.prompt_via = PromptVia::Args;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let started = std::time::Instant::now();
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert_eq!(outcome.exit_code, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let mut saw_text = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Text { content, .. } = event {
+                saw_text |= content == "Done";
+            }
+        }
+        assert!(saw_text);
     }
 
     #[test]

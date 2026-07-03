@@ -41,6 +41,7 @@ fn main() {
             ipc::account_login,
             ipc::account_set_local,
             ipc::account_logout,
+            ipc::account_update_avatar,
             ipc::avatar_cached_url,
             ipc::workspace_add,
             ipc::workspace_remove,

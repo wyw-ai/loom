@@ -2200,6 +2200,7 @@ struct ActiveTurn {
     scope: ScopeRef,
     trigger_source_id: String,
     trigger_is_message: bool,
+    assignment_id: Option<String>,
     reply_target: Option<String>,
     prompt_stats: PromptStats,
     prompt_breakdown: PromptBreakdown,
@@ -3148,7 +3149,13 @@ async fn notification_loop(
     actor_id: &str,
 ) -> Result<()> {
     let mut started = false;
-    let mut inbox_poll = interval(Duration::from_secs(15));
+    let inbox_poll_every = Duration::from_secs(15);
+    let mut inbox_poll = interval(inbox_poll_every);
+    if let Err(e) =
+        drain_pending_inbox(&client, &state, &adapter, &event_tx, &mut started, actor_id).await
+    {
+        eprintln!("[{actor_id}] failed to drain pending inbox on startup: {e}");
+    }
     loop {
         // Drain pending notifications. We pop them one by one and dispatch
         // each on its own; the borrow on `notifications` is released between
@@ -3628,12 +3635,56 @@ async fn handle_message_trigger(
             return Err(e);
         }
     }
+    if assignment_delivery_is_terminal(client, actor_id, &trigger).await? {
+        record_delivery_seen_by_id(client, actor_id, trigger.id()).await?;
+        return Ok(TriggerOutcome::Dispatched);
+    }
     if let Some(err) = try_ensure_adapter_started(state, adapter, event_tx, started).await {
         return Err(anyhow!(
             "adapter start failed while handling message trigger: {err}"
         ));
     }
     handle_trigger(client, state, adapter, trigger).await
+}
+
+async fn assignment_delivery_is_terminal(
+    client: &Arc<Client>,
+    actor_id: &str,
+    trigger: &AgentTrigger,
+) -> Result<bool> {
+    let Some(assignment_id) = trigger
+        .meta_value("assignmentId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    let ctx: TaskAssignmentContextResult = client
+        .call(
+            method::TASK_ASSIGNMENT_CONTEXT,
+            json!({ "assignmentId": assignment_id }),
+        )
+        .await
+        .with_context(|| format!("task/assignment.context assignment={assignment_id}"))?;
+    Ok(terminal_assignment_delivery_is_stale_for_actor(
+        actor_id,
+        &ctx.assignment.to_actor_id,
+        &ctx.assignment.status,
+    ))
+}
+
+fn terminal_assignment_delivery_is_stale_for_actor(
+    actor_id: &str,
+    assignment_to_actor_id: &str,
+    status: &TaskAssignmentStatus,
+) -> bool {
+    let is_terminal = matches!(
+        status,
+        TaskAssignmentStatus::Completed
+            | TaskAssignmentStatus::Failed
+            | TaskAssignmentStatus::Canceled
+    );
+    is_terminal && assignment_to_actor_id == actor_id
 }
 
 async fn handle_event_trigger(
@@ -4234,6 +4285,7 @@ async fn dispatch_trigger(
             scope: trigger.scope().clone(),
             trigger_source_id: trigger.id().to_string(),
             trigger_is_message: trigger.is_message(),
+            assignment_id: assignment_id_for_start(&trigger).map(str::to_owned),
             reply_target,
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
@@ -6456,9 +6508,23 @@ fn seed_manifest(actor_id: &str, scope: &ScopeRef) -> String {
              with a phase half-resolved and nothing able to wake you again — if you are still waiting on\n\
              others, schedule a re-check with `loom --json reminder schedule --title recheck --delay-seconds\n\
              180` so a timer brings you back.\n\
-           - One owner. Claim the triggering message before substantive work; if another owner already exists,\n\
-             do not start a competing plan. Call `loom --json task complete <id> --result ...` once when the\n\
-             activity's goal is met.\n\
+           - One owner. When a top-level message starts real work, claim the triggering message before\n\
+             substantive work with `loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"` and\n\
+             keep the returned task id as the work contract. If another owner already exists, do not start a\n\
+             competing plan. For delegated workflow steps, prefer `loom --json task assign <task_id> --to\n\
+             <actor_id> --type <fix|review|other> --instruction \"...\" --contract-json '{{...}}'\n\
+             --idempotency-key <stable-key>` over free-form `message ask`; assignments keep all work in the\n\
+             canonical task thread and make duplicate prompts visible to the server. A status message that\n\
+             says \"I will assign @someone\" or merely mentions them is not a hand-off, does not create an\n\
+             assignment, and is incomplete until the `task assign` command has succeeded. Call `loom --json\n\
+             task complete <id> --result ...` once when the activity's goal is met.\n\
+           - Assignment rechecks are quiet. If a reminder wakes you while a task assignment is still\n\
+             pending or running, do not post a status update, do not ask the assignee for progress, and do\n\
+             not create another assignment. Read `task show` and the thread; if no completed facts/results\n\
+             exist yet, either silently schedule one later reminder or end with `run ignore`. Do not call it\n\
+             a timeout and do not post a no-progress message until at least 30 minutes have elapsed and\n\
+             `task show` still proves there are no completed facts/results. Escalate only after that threshold\n\
+             or a real failed assignment, and report the exact observed state instead of inventing elapsed time.\n\
          </coordinator>\n\
          \n\
          <privacy>\n\
@@ -6935,6 +7001,7 @@ async fn translate_one(
                     usage.as_ref(),
                 )
                 .await;
+                mark_assignment_failed_if_needed(client, state, &active, &summary).await;
             }
             if !success {
                 if let Some(text) = failed_turn_text(&summary) {
@@ -7098,7 +7165,11 @@ async fn flush_failure_text(
     meta: Option<Meta>,
 ) -> Result<()> {
     let notice = failure_notice_for_turn(actor_id, active, text);
-    if let Some(target) = active.reply_target.as_deref() {
+    let target_override = failure_notice_target(active);
+    if let Some(target) = target_override
+        .as_deref()
+        .or(active.reply_target.as_deref())
+    {
         let parent_message_id = parent_message_id_for_reply_target(
             &active.trigger_source_id,
             target,
@@ -7151,6 +7222,23 @@ async fn flush_failure_text(
         );
         e
     })
+}
+
+fn failure_notice_target(active: &ActiveTurn) -> Option<String> {
+    if active.scope.kind != ScopeKind::Channel || !active.trigger_is_message {
+        return None;
+    }
+    if active.assignment_id.is_some() {
+        return None;
+    }
+    if active
+        .reply_target
+        .as_deref()
+        .is_some_and(|target| target.starts_with("dm:") || !target.contains(':'))
+    {
+        return None;
+    }
+    Some(format!("#{}", active.scope.id))
 }
 
 fn parent_message_id_for_reply_target(
@@ -7306,6 +7394,43 @@ async fn mark_assignment_running_if_needed(
             assignment = %assignment_id,
             %e,
             "failed to mark assignment running"
+        );
+    }
+}
+
+async fn mark_assignment_failed_if_needed(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    active: &ActiveTurn,
+    summary: &str,
+) {
+    let Some(assignment_id) = active.assignment_id.as_deref() else {
+        return;
+    };
+    let result_summary = failed_turn_text(summary).unwrap_or_else(|| "Agent run failed".into());
+    let result: Result<TaskAssignmentUpdateResult> = client
+        .call(
+            method::TASK_ASSIGNMENT_UPDATE,
+            json!({
+                "assignmentId": assignment_id,
+                "status": TaskAssignmentStatus::Failed,
+                "resultSummary": result_summary,
+                "resultEnvelope": {
+                    "status": "failed",
+                    "assignmentId": assignment_id,
+                    "runtimeFailure": true,
+                    "summary": summary,
+                },
+            }),
+        )
+        .await
+        .with_context(|| format!("task/assignment.update failed assignment={assignment_id}"));
+    if let Err(e) = result {
+        tracing::warn!(
+            actor = %state.actor_id,
+            assignment = %assignment_id,
+            %e,
+            "failed to mark assignment failed after runtime failure"
         );
     }
 }
@@ -7786,6 +7911,7 @@ mod tests {
             },
             trigger_source_id: "msg_failure".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_failure".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -8225,6 +8351,7 @@ mod tests {
             scope: scope.clone(),
             trigger_source_id: "msg_trigger".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_demo".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -8491,6 +8618,27 @@ mod tests {
     }
 
     #[test]
+    fn runtime_failure_for_channel_root_uses_channel_target_without_threading() {
+        let mut active = sample_active_turn("actor_human");
+        active.scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+        active.trigger_source_id = "msg_root".into();
+        active.trigger_is_message = true;
+        active.assignment_id = None;
+        active.reply_target = Some("#chan_demo:msg_root".into());
+
+        assert_eq!(
+            failure_notice_target(&active).as_deref(),
+            Some("#chan_demo")
+        );
+
+        active.assignment_id = Some("asgn_demo".into());
+        assert_eq!(failure_notice_target(&active), None);
+    }
+
+    #[test]
     fn all_wake_message_is_deliverable_to_agent_worker() {
         let mut message = sample_message(
             "msg_all",
@@ -8751,6 +8899,7 @@ mod tests {
             },
             trigger_source_id: "msg_trigger".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_demo:msg_root".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -8803,6 +8952,7 @@ mod tests {
             },
             trigger_source_id: "msg_trigger".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_demo:msg_root".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -9907,6 +10057,7 @@ mod tests {
             scope: scope.clone(),
             trigger_source_id: "msg_1".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_demo".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10199,6 +10350,7 @@ mod tests {
             scope: active_scope.clone(),
             trigger_source_id: "msg_root".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_triage".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10282,6 +10434,7 @@ mod tests {
             scope: active_scope.clone(),
             trigger_source_id: "msg_busy".into(),
             trigger_is_message: true,
+            assignment_id: None,
             reply_target: Some("#chan_demo:msg_busy".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10502,5 +10655,24 @@ mod tests {
         // Released turn key can be acquired again.
         assert!(state.begin_or_enqueue(turn_key, mk("evt_f")));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn terminal_assignment_delivery_only_drops_for_assignee() {
+        assert!(terminal_assignment_delivery_is_stale_for_actor(
+            "actor_engineering",
+            "actor_engineering",
+            &TaskAssignmentStatus::Completed,
+        ));
+        assert!(!terminal_assignment_delivery_is_stale_for_actor(
+            "actor_coordinator",
+            "actor_engineering",
+            &TaskAssignmentStatus::Completed,
+        ));
+        assert!(!terminal_assignment_delivery_is_stale_for_actor(
+            "actor_engineering",
+            "actor_engineering",
+            &TaskAssignmentStatus::Running,
+        ));
     }
 }

@@ -105,9 +105,14 @@ impl DedupeStore {
                 if trimmed.is_empty() {
                     continue;
                 }
-                let v: serde_json::Value = serde_json::from_str(trimmed).with_context(|| {
-                    format!("parse dedupe line {} in {}", lineno + 1, path.display())
-                })?;
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        line = lineno + 1,
+                        "skipping malformed dedupe entry"
+                    );
+                    continue;
+                };
                 if let Some(k) = v.get("key").and_then(|v| v.as_str()) {
                     seen.insert(k.to_string());
                 }
@@ -218,6 +223,23 @@ mod tests {
         assert!(store2.contains("k1"), "key survives reopen");
         assert!(!store2.record("k1").expect("dup after reopen"));
         assert!(store2.record("k2").expect("new key"));
+    }
+
+    #[test]
+    fn dedupe_skips_malformed_lines_on_reopen() {
+        let root = temp_root();
+        let dir = ensure_state_dir(&root, "svc_x").expect("ensure");
+        fs::write(
+            dir.join("dedupe.jsonl"),
+            "{\"key\":\"k1\"}\nnot-json\n{\"key\":\"k2\"}\n",
+        )
+        .expect("seed dedupe");
+
+        let reopened = DedupeStore::open(&dir).expect("open with malformed line");
+        assert!(reopened.contains("k1"));
+        assert!(reopened.contains("k2"));
+        assert!(!reopened.record("k1").expect("dup"));
+        assert!(reopened.record("k3").expect("new"));
     }
 
     #[test]

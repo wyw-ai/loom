@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -8,9 +10,14 @@ use proto::types::{
     AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, Message, MessageIntent,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::client::Client;
+use crate::config;
 use crate::render;
+
+const LONG_MESSAGE_BODY_CHAR_LIMIT: usize = 6_000;
+const ENV_LONG_MESSAGE_DIR: &str = "LOOM_LONG_MESSAGE_DIR";
 
 pub async fn send(
     client: Arc<Client>,
@@ -707,6 +714,7 @@ pub async fn read(
         res.messages
             .retain(|message| !is_same_scope_private(message));
     }
+    spill_long_message_bodies(&mut res.messages)?;
     if render::is_json() {
         render::print_json(&res);
         return Ok(());
@@ -755,6 +763,82 @@ fn is_same_scope_private(message: &Message) -> bool {
         || message.metadata.contains_key("privateActorIds")
 }
 
+fn spill_long_message_bodies(messages: &mut [Message]) -> Result<()> {
+    let dir = long_message_dir();
+    spill_long_message_bodies_to_dir(messages, &dir)
+}
+
+fn spill_long_message_bodies_to_dir(messages: &mut [Message], dir: &Path) -> Result<()> {
+    for message in messages {
+        let char_count = message.body.chars().count();
+        if char_count <= LONG_MESSAGE_BODY_CHAR_LIMIT {
+            continue;
+        }
+        let byte_count = message.body.len();
+        let path = save_long_message_body(message, dir)?;
+        let path_text = path.display().to_string();
+        message
+            .metadata
+            .insert("bodySavedTo".into(), json!(path_text));
+        message
+            .metadata
+            .insert("bodySavedChars".into(), json!(char_count));
+        message
+            .metadata
+            .insert("bodySavedBytes".into(), json!(byte_count));
+        message.metadata.insert(
+            "bodyOmittedReason".into(),
+            json!("message body exceeded loom CLI query inline limit"),
+        );
+        message.body = format!(
+            "[long message body omitted: {char_count} chars / {byte_count} bytes saved to {}]",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn save_long_message_body(message: &Message, dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create long message dir {}", dir.display()))?;
+    let hash = Sha256::digest(message.body.as_bytes());
+    let hash = hex::encode(hash);
+    let filename = format!(
+        "{}-{}.txt",
+        sanitize_filename_component(&message.id),
+        &hash[..12]
+    );
+    let path = dir.join(filename);
+    fs::write(&path, &message.body)
+        .with_context(|| format!("write long message body {}", path.display()))?;
+    Ok(path)
+}
+
+fn long_message_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os(ENV_LONG_MESSAGE_DIR).filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    config::config_dir().join("message-bodies")
+}
+
+fn sanitize_filename_component(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "message".into()
+    } else {
+        sanitized
+    }
+}
+
 #[cfg(test)]
 mod read_tests {
     use super::*;
@@ -796,6 +880,48 @@ mod read_tests {
 
         assert!(is_same_scope_private(&message));
     }
+
+    #[test]
+    fn long_message_bodies_are_saved_and_replaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let original_body = "x".repeat(LONG_MESSAGE_BODY_CHAR_LIMIT + 1);
+        let mut message = sample_read_message();
+        message.body = original_body.clone();
+
+        spill_long_message_bodies_to_dir(std::slice::from_mut(&mut message), dir.path())
+            .expect("spill long message");
+
+        assert!(message.body.contains("long message body omitted"));
+        let saved_to = message
+            .metadata
+            .get("bodySavedTo")
+            .and_then(Value::as_str)
+            .expect("bodySavedTo");
+        assert!(Path::new(saved_to).starts_with(dir.path()));
+        assert_eq!(
+            fs::read_to_string(saved_to).expect("saved body"),
+            original_body
+        );
+        assert_eq!(
+            message
+                .metadata
+                .get("bodySavedChars")
+                .and_then(Value::as_u64),
+            Some((LONG_MESSAGE_BODY_CHAR_LIMIT + 1) as u64)
+        );
+    }
+
+    #[test]
+    fn short_message_bodies_stay_inline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut message = sample_read_message();
+
+        spill_long_message_bodies_to_dir(std::slice::from_mut(&mut message), dir.path())
+            .expect("spill long message");
+
+        assert_eq!(message.body, "hello");
+        assert!(message.metadata.get("bodySavedTo").is_none());
+    }
 }
 
 pub async fn reaction_toggle(
@@ -836,7 +962,12 @@ pub async fn inbox_list(
     if let Some(state_filter) = state_filter {
         params["state"] = serde_json::to_value(state_filter)?;
     }
-    let res: InboxListResult = client.call(method::INBOX_LIST, params).await?;
+    let mut res: InboxListResult = client.call(method::INBOX_LIST, params).await?;
+    for entry in &mut res.deliveries {
+        if let Some(message) = entry.message.as_mut() {
+            spill_long_message_bodies(std::slice::from_mut(message))?;
+        }
+    }
     if render::is_json() {
         render::print_json(&res);
     } else if res.deliveries.is_empty() {
@@ -894,7 +1025,7 @@ pub async fn search(
     target: Option<String>,
     limit: u32,
 ) -> Result<()> {
-    let res: MessageSearchResult = client
+    let mut res: MessageSearchResult = client
         .call(
             method::MESSAGE_SEARCH,
             json!({
@@ -904,6 +1035,7 @@ pub async fn search(
             }),
         )
         .await?;
+    spill_long_message_bodies(&mut res.messages)?;
     if render::is_json() {
         render::print_json(&res);
     } else if res.messages.is_empty() {

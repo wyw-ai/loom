@@ -919,6 +919,7 @@ fn spawn_and_collect(
     let mut collected_stderr = String::new();
     let mut emitted_text = false;
     let mut emitted_finish = false;
+    let mut deferred_finished: Option<DeferredFinished> = None;
     let mut last_usage: Option<TokenUsage> = None;
     let deadline = cfg
         .timeout_ms
@@ -955,6 +956,9 @@ fn spawn_and_collect(
             );
             emitted_text |= events.emitted_text;
             emitted_finish |= events.emitted_finish;
+            if let Some(finished) = events.finished {
+                deferred_finished = Some(finished);
+            }
             if is_stdout {
                 health_observer
                     .observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
@@ -1034,6 +1038,9 @@ fn spawn_and_collect(
                 );
                 emitted_text |= events.emitted_text;
                 emitted_finish |= events.emitted_finish;
+                if let Some(finished) = events.finished {
+                    deferred_finished = Some(finished);
+                }
                 if is_stdout {
                     health_observer
                         .observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
@@ -1093,6 +1100,9 @@ fn spawn_and_collect(
         );
         emitted_text |= events.emitted_text;
         emitted_finish |= events.emitted_finish;
+        if let Some(finished) = events.finished {
+            deferred_finished = Some(finished);
+        }
         if is_stdout {
             health_observer.observe_stdout(&raw_line, events.emitted_text || events.emitted_finish);
         } else {
@@ -1152,6 +1162,9 @@ fn spawn_and_collect(
         let events = emit_provider_runtime_event(event, &prompt.scope, sender);
         emitted_any_text |= events.emitted_text;
         emitted_finish |= events.emitted_finish;
+        if let Some(finished) = events.finished {
+            deferred_finished = Some(finished);
+        }
     } else {
         match cfg.output_format {
             CommandOutputFormat::Text => {
@@ -1216,17 +1229,23 @@ fn spawn_and_collect(
         success = false;
         summary = "command provider exited successfully but produced no assistant output".into();
     }
+    if let Some(finished) = deferred_finished {
+        if success || !finished.success {
+            success = success && finished.success;
+            if !finished.summary.trim().is_empty() {
+                summary = finished.summary;
+            }
+        }
+    }
     let usage = extract_token_usage_from_text(&collected_stdout)
         .or_else(|| extract_token_usage_from_text(&collected_stderr));
     release_run_slot(slot);
-    if !emitted_finish || !success {
-        let _ = sender.send(AdapterEvent::Finished {
-            scope: Some(prompt.scope.clone()),
-            success,
-            summary,
-            usage,
-        });
-    }
+    let _ = sender.send(AdapterEvent::Finished {
+        scope: Some(prompt.scope.clone()),
+        success,
+        summary,
+        usage,
+    });
 
     Ok(SpawnOutcome {
         exit_code,
@@ -1327,14 +1346,17 @@ fn collect_legacy_output_line(
         CommandOutputFormat::NdjsonLines => OutputLineEvents {
             emitted_text: translate_ndjson_line(parsed_line, scope, sender),
             emitted_finish: false,
+            ..Default::default()
         },
         CommandOutputFormat::ClaudeStreamJson => OutputLineEvents {
             emitted_text: translate_claude_stream_line(parsed_line, scope, sender),
             emitted_finish: false,
+            ..Default::default()
         },
         CommandOutputFormat::CodexStreamJson => OutputLineEvents {
             emitted_text: translate_codex_event_line(parsed_line, scope, sender),
             emitted_finish: false,
+            ..Default::default()
         },
         CommandOutputFormat::Text
         | CommandOutputFormat::CopilotJson
@@ -1356,14 +1378,17 @@ fn collect_provider_decoder_line(
         ("builtin", Some("claude_stream_json" | "qoder_stream_json")) => OutputLineEvents {
             emitted_text: translate_claude_stream_line(parsed_line, scope, sender),
             emitted_finish: false,
+            ..Default::default()
         },
         ("builtin", Some("codex_stream_json")) => OutputLineEvents {
             emitted_text: translate_codex_event_line(parsed_line, scope, sender),
             emitted_finish: false,
+            ..Default::default()
         },
         ("builtin", Some("ndjson_lines")) => OutputLineEvents {
             emitted_text: translate_ndjson_line(parsed_line, scope, sender),
             emitted_finish: false,
+            ..Default::default()
         },
         _ => OutputLineEvents::default(),
     }
@@ -1624,10 +1649,17 @@ fn balanced_json_object_prefix(input: &str) -> Option<&str> {
 
 // ---------------- provider and legacy output translators ----------------
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
+struct DeferredFinished {
+    success: bool,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Default)]
 struct OutputLineEvents {
     emitted_text: bool,
     emitted_finish: bool,
+    finished: Option<DeferredFinished>,
 }
 
 fn emit_provider_runtime_events(
@@ -1640,6 +1672,9 @@ fn emit_provider_runtime_events(
         let next = emit_provider_runtime_event(event, scope, sender);
         emitted.emitted_text |= next.emitted_text;
         emitted.emitted_finish |= next.emitted_finish;
+        if let Some(finished) = next.finished {
+            emitted.finished = Some(finished);
+        }
     }
     emitted
 }
@@ -1662,6 +1697,7 @@ fn emit_provider_runtime_event(
             OutputLineEvents {
                 emitted_text: true,
                 emitted_finish: false,
+                finished: None,
             }
         }
         ProviderRuntimeEvent::ToolUse { tool_name, input } => {
@@ -1687,15 +1723,10 @@ fn emit_provider_runtime_event(
             OutputLineEvents::default()
         }
         ProviderRuntimeEvent::Finished { success, summary } => {
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success,
-                summary,
-                usage: None,
-            });
             OutputLineEvents {
                 emitted_text: false,
                 emitted_finish: true,
+                finished: Some(DeferredFinished { success, summary }),
             }
         }
         ProviderRuntimeEvent::Session { .. } => OutputLineEvents::default(),
@@ -3600,13 +3631,20 @@ mod tests {
         assert!(text.emitted_text);
         assert!(!status.emitted_text && !tool.emitted_text && !error.emitted_text);
         assert!(finish.emitted_finish);
+        assert!(matches!(
+            finish.finished.as_ref(),
+            Some(DeferredFinished {
+                success: true,
+                summary,
+            }) if summary == "ok"
+        ));
 
         let mut rx = rx;
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 4);
         assert!(matches!(
             &events[0],
             AdapterEvent::Text {
@@ -3630,14 +3668,6 @@ mod tests {
         assert!(matches!(
             &events[3],
             AdapterEvent::Error { message, .. } if message == "bad"
-        ));
-        assert!(matches!(
-            &events[4],
-            AdapterEvent::Finished {
-                success: true,
-                summary,
-                ..
-            } if summary == "ok"
         ));
     }
 

@@ -368,7 +368,7 @@ async fn fire_once(
     // scheduler can tear the instance down when `auto_stop_on` opts in.
     let (body_vec, self_complete_signal) = strip_self_complete(&raw_body);
     let body = body_vec.as_slice();
-    let body_hash = sha256_hex(body);
+    let body_hash = stable_body_hash(body);
 
     let scope = scope_ref(&job.scope);
     let mut message_id: Option<String> = None;
@@ -553,17 +553,52 @@ fn scope_ref(s: &ScopeBinding) -> ScopeRef {
 fn build_dedupe_key(
     service_id: &str,
     job: &JobSpec,
-    fire_time: DateTime<Utc>,
+    _fire_time: DateTime<Utc>,
     body_hash: &str,
 ) -> Option<String> {
     match job.dedupe_by {
         DedupeBy::None => None,
         DedupeBy::PayloadHash | DedupeBy::SourceMessageId => Some(format!(
-            "service:{service_id}:job:{}:fire:{}:hash:{}",
-            job.id,
-            fire_time.to_rfc3339_opts(SecondsFormat::Secs, true),
-            body_hash
+            "service:{service_id}:job:{}:hash:{}",
+            job.id, body_hash
         )),
+    }
+}
+
+fn stable_body_hash(body: &[u8]) -> String {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(mut value) => {
+            strip_volatile_observation_fields(&mut value);
+            serde_json::to_vec(&value)
+                .map(|stable| sha256_hex(&stable))
+                .unwrap_or_else(|_| sha256_hex(body))
+        }
+        Err(_) => sha256_hex(body),
+    }
+}
+
+fn strip_volatile_observation_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "observedAt",
+                "checkedAt",
+                "generatedAt",
+                "polledAt",
+                "fireTimeUtc",
+            ] {
+                map.remove(key);
+            }
+            for child in map.values_mut() {
+                strip_volatile_observation_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_volatile_observation_fields(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -663,6 +698,23 @@ async fn emit_per_line(
             )
             .await
             .with_context(|| format!("publish_artifact for job `{}`", job.id))?;
+        if let (Some(task_id), Some(schema)) = (
+            payload.get("taskId").and_then(Value::as_str),
+            payload.get("schema").and_then(Value::as_str),
+        ) {
+            let summary = service_fact_summary(schema, &payload);
+            runtime
+                .append_task_fact(
+                    task_id,
+                    schema,
+                    payload.clone(),
+                    Some(&artifact_id),
+                    summary,
+                    Some(body_hash),
+                )
+                .await
+                .with_context(|| format!("append_task_fact for job `{}`", job.id))?;
+        }
         let mut meta = build_meta(job, fire_time, body_hash);
         meta.insert("artifactName".into(), Value::String(name.clone()));
         let message_id = runtime
@@ -694,6 +746,45 @@ async fn emit_per_line(
         return Ok(id);
     }
     Ok(last_message_id.expect("emitted > 0 implies last_message_id set"))
+}
+
+fn service_fact_summary(schema: &str, payload: &Value) -> String {
+    if schema == "a1-platform-gates.v1" {
+        let ready = payload
+            .get("readyToMerge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let failed_checks = payload
+            .get("failedChecks")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let failed_ci = payload
+            .get("failedCi")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let unresolved = payload
+            .get("unresolvedComments")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mr = payload
+            .get("mrId")
+            .map(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_else(|| "unknown".into());
+        return format!(
+            "MR {mr} platform gates: readyToMerge={ready}, failedChecks={failed_checks}, failedCi={failed_ci}, unresolvedComments={unresolved}"
+        );
+    }
+    payload
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{schema} service observation"))
 }
 
 /// Substitute `{key}` tokens in `template` with the matching top-level
@@ -869,14 +960,20 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_key_includes_service_job_fire_hash() {
+    fn stable_body_hash_ignores_observation_timestamps() {
+        let a = br#"{"schema":"x","observedAt":"2026-06-18T08:20:00Z","items":[{"checkedAt":"a","state":"pass"}]}"#;
+        let b = br#"{"schema":"x","observedAt":"2026-06-18T08:22:00Z","items":[{"checkedAt":"b","state":"pass"}]}"#;
+        let c = br#"{"schema":"x","observedAt":"2026-06-18T08:22:00Z","items":[{"checkedAt":"b","state":"fail"}]}"#;
+        assert_eq!(stable_body_hash(a), stable_body_hash(b));
+        assert_ne!(stable_body_hash(a), stable_body_hash(c));
+    }
+
+    #[test]
+    fn dedupe_key_uses_service_job_and_stable_payload_hash() {
         let j = job("ci_watch");
         let t = Utc.with_ymd_and_hms(2026, 4, 24, 9, 0, 0).unwrap();
         let key = build_dedupe_key("svc_scheduler", &j, t, "deadbeef").unwrap();
-        assert_eq!(
-            key,
-            "service:svc_scheduler:job:ci_watch:fire:2026-04-24T09:00:00Z:hash:deadbeef"
-        );
+        assert_eq!(key, "service:svc_scheduler:job:ci_watch:hash:deadbeef");
     }
 
     #[test]

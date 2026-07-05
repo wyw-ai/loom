@@ -5,6 +5,7 @@
 #   make build               # native debug
 #   make release             # native release
 #   make mac-arm-release     # one specific target
+#   make linux-x86-gnu-release # glibc Linux runtime for container DNS compatibility
 #   make all-release         # every target, release
 #   make all                 # debug + release
 #
@@ -34,13 +35,15 @@ BINS      := loom loom-daemon loom-server
 
 TRIPLE_MAC_ARM     := aarch64-apple-darwin
 TRIPLE_MAC_X86     := x86_64-apple-darwin
-TRIPLE_LINUX_X86   := x86_64-unknown-linux-musl
-TRIPLE_LINUX_ARM   := aarch64-unknown-linux-musl
+TRIPLE_LINUX_X86_GNU := x86_64-unknown-linux-gnu
+TRIPLE_LINUX_X86     := x86_64-unknown-linux-musl
+TRIPLE_LINUX_ARM     := aarch64-unknown-linux-musl
 TRIPLE_WINDOWS_X86 := x86_64-pc-windows-msvc
 
 ALL_TRIPLES := \
   $(TRIPLE_MAC_ARM) \
   $(TRIPLE_MAC_X86) \
+  $(TRIPLE_LINUX_X86_GNU) \
   $(TRIPLE_LINUX_X86) \
   $(TRIPLE_LINUX_ARM) \
   $(TRIPLE_WINDOWS_X86)
@@ -61,7 +64,8 @@ help:
 	@echo "  mac-arm-{debug,release}     $(TRIPLE_MAC_ARM)"
 	@echo "  mac-x86-{debug,release}     $(TRIPLE_MAC_X86)"
 	@echo "  mac-universal-{...}         lipo of mac-arm + mac-x86"
-	@echo "  linux-x86-{debug,release}   $(TRIPLE_LINUX_X86)"
+	@echo "  linux-x86-gnu-{debug,release}  $(TRIPLE_LINUX_X86_GNU) (glibc, preferred for containers)"
+	@echo "  linux-x86-{debug,release}   $(TRIPLE_LINUX_X86) (static musl fallback)"
 	@echo "  linux-arm-{debug,release}   $(TRIPLE_LINUX_ARM)"
 	@echo "  windows-x86-{debug,release} $(TRIPLE_WINDOWS_X86)"
 	@echo "  windows-shell-{debug,release}  loom-shell.exe (Windows only)"
@@ -127,6 +131,7 @@ endef
 
 $(eval $(call define-target,mac-arm,$(TRIPLE_MAC_ARM),$(CARGO)))
 $(eval $(call define-target,mac-x86,$(TRIPLE_MAC_X86),$(CARGO)))
+$(eval $(call define-target,linux-x86-gnu,$(TRIPLE_LINUX_X86_GNU),$(CARGO)))
 $(eval $(call define-target,linux-x86,$(TRIPLE_LINUX_X86),$(LINUX_BUILDER)))
 $(eval $(call define-target,linux-arm,$(TRIPLE_LINUX_ARM),$(LINUX_BUILDER)))
 

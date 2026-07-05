@@ -57,11 +57,10 @@
           ],
           "when": "model"
         },
-        "{prompt.user}"
+        "{prompt.full}"
       ],
       "command": "{bin}",
       "env": {
-        "CODEX_HOME": "{loom_agent_home}",
         "LOOM_NO_DAEMON": "1"
       },
       "session": {
@@ -87,7 +86,7 @@
             ],
             "when": "model"
           },
-          "{prompt.user}"
+          "{prompt.full}"
         ],
         "scope": "actor_scope"
       },

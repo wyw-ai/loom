@@ -145,6 +145,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: ProviderCmd,
     },
+    /// Read or update the official Loom operating guide.
+    Guide {
+        #[command(subcommand)]
+        sub: GuideCmd,
+    },
     /// Manage daemon machines through server-routed machine commands.
     Machine {
         #[command(subcommand)]
@@ -1520,6 +1525,18 @@ enum ProviderCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum GuideCmd {
+    /// List available guide topics.
+    List,
+    /// Show one guide topic.
+    Show { topic: String },
+    /// Search guide topics.
+    Search { query: String },
+    /// Refresh the local guide cache from the official repository.
+    Update,
+}
+
+#[derive(Subcommand, Debug)]
 enum MachineCmd {
     /// List daemon machines visible from the current server.
     List,
@@ -1772,6 +1789,16 @@ async fn async_main() -> Result<()> {
             ProviderCmd::Show { provider_id } => cmd::provider::show(provider_id)?,
             ProviderCmd::Remove { provider_id } => cmd::provider::remove(provider_id)?,
             ProviderCmd::Doctor { provider_id } => cmd::provider::doctor(provider_id)?,
+        }
+        return Ok(());
+    }
+
+    if let Cmd::Guide { sub } = &args.cmd {
+        match sub {
+            GuideCmd::List => cmd::guide::list()?,
+            GuideCmd::Show { topic } => cmd::guide::show(topic)?,
+            GuideCmd::Search { query } => cmd::guide::search(query)?,
+            GuideCmd::Update => cmd::guide::update()?,
         }
         return Ok(());
     }
@@ -2622,6 +2649,7 @@ async fn async_main() -> Result<()> {
         }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
+        Cmd::Guide { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Machine { sub } => match sub {

@@ -29,7 +29,7 @@ jobs:
       - name: Checkout official Loom runtime content
         run: |
           git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
-          git clone --depth 1 https://github.com/wyw-ai/loom-skill.git ../loom-skill
+          git clone --depth 1 https://github.com/wyw-ai/loom-skills.git ../loom-skills
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

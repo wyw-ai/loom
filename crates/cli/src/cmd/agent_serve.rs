@@ -1303,7 +1303,15 @@ const SCOPE_SKILLS_LINKS: &[&str] = &[
     ".opencode/skills",
 ];
 const DEFAULT_LOOM_SKILL_ID: &str = "loom";
-const DEFAULT_LOOM_SKILL_MD: &str = include_str!(concat!(env!("OUT_DIR"), "/loom-skill/SKILL.md"));
+
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedSkillFile {
+    path: &'static str,
+    content: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/loom_skill_embedded.rs"));
+
 const WORKSPACE_PROJECTION_MANIFEST: &str = "workspace.json";
 
 fn ensure_workspace_skill_dirs(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {
@@ -1382,8 +1390,78 @@ fn ensure_default_loom_skill(data_root: &Path) -> std::io::Result<PathBuf> {
         .join("skills")
         .join(DEFAULT_LOOM_SKILL_ID);
     create_dir_all_unc(&skill_dir)?;
-    write_text_file_if_changed(&skill_dir.join("SKILL.md"), DEFAULT_LOOM_SKILL_MD)?;
+    sync_embedded_skill_dir(&skill_dir, EMBEDDED_LOOM_SKILL_FILES)?;
     Ok(skill_dir)
+}
+
+fn sync_embedded_skill_dir(root: &Path, files: &[EmbeddedSkillFile]) -> std::io::Result<()> {
+    let mut expected = BTreeSet::new();
+    for file in files {
+        let rel_path = embedded_skill_relative_path(file.path)?;
+        write_text_file_if_changed(&root.join(&rel_path), file.content)?;
+        expected.insert(rel_path);
+    }
+    prune_embedded_skill_dir(root, root, &expected)
+}
+
+fn embedded_skill_relative_path(value: &str) -> std::io::Result<PathBuf> {
+    let path = Path::new(value);
+    if value.is_empty() || path.is_absolute() {
+        return Err(invalid_embedded_skill_path(value));
+    }
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            _ => return Err(invalid_embedded_skill_path(value)),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(invalid_embedded_skill_path(value));
+    }
+    Ok(out)
+}
+
+fn invalid_embedded_skill_path(value: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("invalid embedded Loom skill path `{value}`"),
+    )
+}
+
+fn prune_embedded_skill_dir(
+    root: &Path,
+    dir: &Path,
+    expected: &BTreeSet<PathBuf>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path
+            .strip_prefix(root)
+            .map_err(std::io::Error::other)?
+            .to_path_buf();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() || meta.is_file() {
+            if !expected.contains(&rel_path) {
+                remove_path_if_exists(&path)?;
+            }
+            continue;
+        }
+        if meta.is_dir() {
+            prune_embedded_skill_dir(root, &path, expected)?;
+            if std::fs::read_dir(&path)?.next().is_none() {
+                std::fs::remove_dir(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_workspace_skill_targets(
@@ -7625,6 +7703,9 @@ mod tests {
 
         let skill = ensure_default_loom_skill(&root).expect("default loom skill");
         let skill_md = std::fs::read_to_string(skill.join("SKILL.md")).expect("skill md");
+        let runtime_reference =
+            std::fs::read_to_string(skill.join("references").join("runtime-awareness.md"))
+                .expect("runtime awareness reference");
 
         assert_eq!(
             skill,
@@ -7634,6 +7715,12 @@ mod tests {
         );
         assert!(skill_md.contains("name: loom"));
         assert!(skill_md.contains("Loom Runtime Skill"));
+        assert!(runtime_reference.contains("AGENTS.md"));
+
+        let stale = skill.join("references").join("obsolete.md");
+        std::fs::write(&stale, "old").expect("stale reference");
+        ensure_default_loom_skill(&root).expect("resync default loom skill");
+        assert!(!stale.exists());
 
         std::fs::remove_dir_all(root).ok();
     }

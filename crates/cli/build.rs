@@ -3,46 +3,100 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn main() {
-    let guide_dir = find_content_dir("LOOM_GUIDE_DIR", "loom-guide", "guides");
-    let skill_dir = find_content_dir("LOOM_SKILL_DIR", "loom-skill", "SKILL.md");
+use loom_platform::process::Command;
 
+const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
+const SKILLS_REPO_URL: &str = "https://github.com/wyw-ai/loom-skills.git";
+
+fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    let clone_root = out_dir.join("official-runtime-content");
+
+    let guide_dir = resolve_content_source(
+        &["LOOM_GUIDE_DIR"],
+        "loom-guide",
+        "guides",
+        "LOOM_GUIDE_REPO",
+        GUIDE_REPO_URL,
+        &clone_root,
+    );
+    let skills_dir = resolve_content_source(
+        &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
+        "loom-skills",
+        "skills/loom/SKILL.md",
+        "LOOM_SKILLS_REPO",
+        SKILLS_REPO_URL,
+        &clone_root,
+    );
+
     generate_guide_snapshot(&guide_dir, &out_dir);
-    copy_skill_snapshot(&skill_dir, &out_dir);
+    generate_skill_snapshot(&skills_dir, &out_dir);
+
+    cleanup_temp_source(&guide_dir, &out_dir);
+    cleanup_temp_source(&skills_dir, &out_dir);
 }
 
-fn find_content_dir(env_name: &str, repo_name: &str, required_rel: &str) -> PathBuf {
-    println!("cargo:rerun-if-env-changed={env_name}");
+#[derive(Debug)]
+struct ContentSource {
+    path: PathBuf,
+    cloned: bool,
+}
 
-    if let Some(raw) = env::var_os(env_name).filter(|value| !value.is_empty()) {
-        let path = PathBuf::from(raw);
-        if path.join(required_rel).exists() {
-            println!("cargo:rerun-if-changed={}", path.display());
-            return path;
+fn resolve_content_source(
+    env_names: &[&str],
+    repo_name: &str,
+    required_rel: &str,
+    repo_env_name: &str,
+    default_repo_url: &str,
+    clone_root: &Path,
+) -> ContentSource {
+    for env_name in env_names {
+        println!("cargo:rerun-if-env-changed={env_name}");
+    }
+    println!("cargo:rerun-if-env-changed={repo_env_name}");
+
+    for env_name in env_names {
+        if let Some(raw) = env::var_os(env_name).filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(raw);
+            if path.join(required_rel).exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+                return ContentSource {
+                    path,
+                    cloned: false,
+                };
+            }
+            panic!(
+                "{env_name} points at {}, but {} is missing",
+                path.display(),
+                required_rel
+            );
         }
-        panic!(
-            "{env_name} points at {}, but {} is missing",
-            path.display(),
-            required_rel
-        );
     }
 
     for candidate in content_candidates(repo_name) {
         if candidate.join(required_rel).exists() {
             println!("cargo:rerun-if-changed={}", candidate.display());
-            return candidate;
+            return ContentSource {
+                path: candidate,
+                cloned: false,
+            };
         }
     }
 
-    let candidates = content_candidates(repo_name)
-        .into_iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    panic!(
-        "missing official {repo_name} content; set {env_name} or clone {repo_name} next to the loom repo. Checked: {candidates}"
-    );
+    let repo_url = env::var(repo_env_name).unwrap_or_else(|_| default_repo_url.to_string());
+    let target = clone_root.join(repo_name);
+    clone_repo(&repo_url, &target);
+    if !target.join(required_rel).exists() {
+        panic!(
+            "cloned {repo_url} into {}, but {} is missing",
+            target.display(),
+            required_rel
+        );
+    }
+    ContentSource {
+        path: target,
+        cloned: true,
+    }
 }
 
 fn content_candidates(repo_name: &str) -> Vec<PathBuf> {
@@ -62,8 +116,55 @@ fn content_candidates(repo_name: &str) -> Vec<PathBuf> {
     candidates
 }
 
-fn generate_guide_snapshot(guide_dir: &Path, out_dir: &Path) {
-    let guides_dir = guide_dir.join("guides");
+fn clone_repo(repo_url: &str, target: &Path) {
+    if target.exists() {
+        fs::remove_dir_all(target)
+            .unwrap_or_else(|err| panic!("remove stale clone {} failed: {err}", target.display()));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|err| panic!("create clone dir {} failed: {err}", parent.display()));
+    }
+
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", repo_url])
+        .arg(target)
+        .status()
+        .unwrap_or_else(|err| panic!("run git clone for {repo_url} failed: {err}"));
+    if !status.success() {
+        panic!("git clone {repo_url} {} failed: {status}", target.display());
+    }
+}
+
+fn cleanup_temp_source(source: &ContentSource, out_dir: &Path) {
+    if !source.cloned {
+        return;
+    }
+
+    let canonical_out = fs::canonicalize(out_dir)
+        .unwrap_or_else(|err| panic!("canonicalize OUT_DIR {} failed: {err}", out_dir.display()));
+    let canonical_source = fs::canonicalize(&source.path).unwrap_or_else(|err| {
+        panic!(
+            "canonicalize temp content {} failed: {err}",
+            source.path.display()
+        )
+    });
+    if !canonical_source.starts_with(&canonical_out) {
+        panic!(
+            "refusing to remove temp content outside OUT_DIR: {}",
+            source.path.display()
+        );
+    }
+    fs::remove_dir_all(&source.path).unwrap_or_else(|err| {
+        panic!(
+            "remove temp content {} failed: {err}",
+            source.path.display()
+        )
+    });
+}
+
+fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
+    let guides_dir = guide_source.path.join("guides");
     println!("cargo:rerun-if-changed={}", guides_dir.display());
 
     let mut entries = fs::read_dir(&guides_dir)
@@ -100,13 +201,66 @@ fn generate_guide_snapshot(guide_dir: &Path, out_dir: &Path) {
         .expect("write generated guide snapshot");
 }
 
-fn copy_skill_snapshot(skill_dir: &Path, out_dir: &Path) {
+fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
+    let skill_dir = skills_source.path.join("skills").join("loom");
     let skill_md = skill_dir.join("SKILL.md");
     println!("cargo:rerun-if-changed={}", skill_md.display());
-    let target_dir = out_dir.join("loom-skill");
-    fs::create_dir_all(&target_dir).expect("create generated loom-skill dir");
-    fs::copy(&skill_md, target_dir.join("SKILL.md"))
-        .unwrap_or_else(|err| panic!("copy {} failed: {err}", skill_md.display()));
+    if !skill_md.is_file() {
+        panic!("default Loom skill missing {}", skill_md.display());
+    }
+
+    let mut files = collect_files(&skill_dir);
+    files.sort();
+    if files.is_empty() {
+        panic!(
+            "no default Loom skill files found under {}",
+            skill_dir.display()
+        );
+    }
+
+    let mut generated = String::new();
+    generated.push_str("const EMBEDDED_LOOM_SKILL_FILES: &[EmbeddedSkillFile] = &[\n");
+    for path in files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let rel = path
+            .strip_prefix(&skill_dir)
+            .unwrap_or_else(|err| panic!("strip skill prefix {} failed: {err}", path.display()))
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {} failed: {err}", path.display()));
+        writeln!(
+            generated,
+            "    EmbeddedSkillFile {{ path: {rel:?}, content: {content:?} }},"
+        )
+        .expect("write generated skill snapshot");
+    }
+    generated.push_str("];\n");
+
+    fs::write(out_dir.join("loom_skill_embedded.rs"), generated)
+        .expect("write generated skill snapshot");
+}
+
+fn collect_files(dir: &Path) -> Vec<PathBuf> {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let mut files = Vec::new();
+    collect_files_inner(dir, &mut files);
+    files
+}
+
+fn collect_files_inner(dir: &Path, files: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("read {} failed: {err}", dir.display()))
+        .map(|entry| entry.expect("read skill entry").path())
+        .collect::<Vec<_>>();
+    for path in entries {
+        if path.is_dir() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            collect_files_inner(&path, files);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
 }
 
 fn markdown_title(content: &str) -> Option<String> {

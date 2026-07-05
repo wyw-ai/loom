@@ -1303,7 +1303,7 @@ const SCOPE_SKILLS_LINKS: &[&str] = &[
     ".opencode/skills",
 ];
 const DEFAULT_LOOM_SKILL_ID: &str = "loom";
-const DEFAULT_LOOM_SKILL_MD: &str = include_str!("../../assets/loom-skill/SKILL.md");
+const DEFAULT_LOOM_SKILL_MD: &str = include_str!(concat!(env!("OUT_DIR"), "/loom-skill/SKILL.md"));
 const WORKSPACE_PROJECTION_MANIFEST: &str = "workspace.json";
 
 fn ensure_workspace_skill_dirs(workspace: &Path, skills_target: &Path) -> std::io::Result<()> {

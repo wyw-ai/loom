@@ -86,6 +86,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
+      - name: Checkout official Loom runtime content
+        run: |
+          git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
+          git clone --depth 1 https://github.com/wyw-ai/loom-skill.git ../loom-skill
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -118,6 +123,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
+      - name: Checkout official Loom runtime content
+        run: |
+          git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
+          git clone --depth 1 https://github.com/wyw-ai/loom-skill.git ../loom-skill
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -146,6 +156,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+
+      - name: Checkout official Loom runtime content
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
+          git clone --depth 1 https://github.com/wyw-ai/loom-skill.git ../loom-skill
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

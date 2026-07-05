@@ -58,6 +58,10 @@ Loom 打包时内置该仓库的一份快照。用户或 agent 可以运行 `loo
 从 GitHub 拉取更新版本。运行时查询 guide 时，应该优先使用本地更新缓存；如果
 没有缓存或更新失败，则回退到内置快照。
 
+`loom-guide` 的内容不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
+仓库内容生成编译期快照。构建机可以通过 `LOOM_GUIDE_DIR` 指向该仓库；未设置时，
+默认查找 Loom 仓库平级的 `../loom-guide`。
+
 ### `loom-skill` 是官方运行指路 Skill
 
 Loom 默认给每个 agent 投影一个官方 `loom` skill。该 skill 的源仓库是：
@@ -70,6 +74,10 @@ Loom 打包时内置该仓库的一份快照，并在 agent turn 启动前把它
 `data_root` 的内置 skill 区，再投影到当前 workspace 的 provider-native skill
 目录。这样 agent 不需要依赖 system prompt，也能知道遇到 Loom 路由、任务、私信、
 artifact、reminder 等场景时应该先读哪个 guide topic 或执行哪类命令。
+
+`loom-skill` 的内容同样不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
+仓库内容生成编译期快照。构建机可以通过 `LOOM_SKILL_DIR` 指向该仓库；未设置时，
+默认查找 Loom 仓库平级的 `../loom-skill`。
 
 ### Skill 负责指路，Guide 负责解释
 

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "topics": [
+    {
+      "id": "runtime-awareness",
+      "title": "Runtime Awareness",
+      "path": "guides/runtime-awareness.md",
+      "summary": "Prompt, AGENTS.md, skill, guide, and environment boundaries for Loom-aware agents."
+    },
+    {
+      "id": "messaging-routing",
+      "title": "Messaging And Routing",
+      "path": "guides/messaging-routing.md",
+      "summary": "How to publish visible replies, wake actors, send private messages, and address scopes."
+    },
+    {
+      "id": "tasks-and-coordination",
+      "title": "Tasks And Coordination",
+      "path": "guides/tasks-and-coordination.md",
+      "summary": "Task ownership, rebasing, assignments, reminders, hidden state, and workflow progress."
+    },
+    {
+      "id": "provider-integration",
+      "title": "Provider Integration",
+      "path": "guides/provider-integration.md",
+      "summary": "Provider prompt defaults, skill projection, session reuse, and native instruction files."
+    }
+  ]
+}

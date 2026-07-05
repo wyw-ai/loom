@@ -9,35 +9,14 @@ use crate::{config, render};
 
 const GUIDE_REPO: &str = "git@github.com:wyw-ai/loom-guide.git";
 
-const EMBEDDED_TOPICS: &[EmbeddedTopic] = &[
-    EmbeddedTopic {
-        id: "runtime-awareness",
-        title: "Runtime Awareness",
-        content: include_str!("../../assets/loom-guide/guides/runtime-awareness.md"),
-    },
-    EmbeddedTopic {
-        id: "messaging-routing",
-        title: "Messaging And Routing",
-        content: include_str!("../../assets/loom-guide/guides/messaging-routing.md"),
-    },
-    EmbeddedTopic {
-        id: "tasks-and-coordination",
-        title: "Tasks And Coordination",
-        content: include_str!("../../assets/loom-guide/guides/tasks-and-coordination.md"),
-    },
-    EmbeddedTopic {
-        id: "provider-integration",
-        title: "Provider Integration",
-        content: include_str!("../../assets/loom-guide/guides/provider-integration.md"),
-    },
-];
-
 #[derive(Debug, Clone)]
 struct EmbeddedTopic {
     id: &'static str,
     title: &'static str,
     content: &'static str,
 }
+
+include!(concat!(env!("OUT_DIR"), "/loom_guide_embedded.rs"));
 
 #[derive(Debug, Clone)]
 struct Topic {

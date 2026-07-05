@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "copilot-glm",
+  "displayName": "Copilot + GLM (BYOK)",
+  "extends": "copilot",
+  "models": {
+    "choices": [
+      { "id": "glm-5.2", "label": "GLM-5.2" },
+      { "id": "glm-4.6", "label": "GLM-4.6" },
+      { "id": "glm-4.5", "label": "GLM-4.5" },
+      { "id": "glm-4.5-air", "label": "GLM-4.5 Air" },
+      { "id": "glm-4-air", "label": "GLM-4 Air" }
+    ],
+    "default": "glm-5.2"
+  },
+  "modes": {
+    "print": {
+      "env": {
+        "merge": {
+          "COPILOT_PROVIDER_TYPE": "openai",
+          "COPILOT_PROVIDER_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
+          "COPILOT_PROVIDER_API_KEY": "YOUR-GLM-API-KEY",
+          "COPILOT_MODEL": "glm-4.6"
+        }
+      }
+    }
+  }
+}

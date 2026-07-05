@@ -1969,7 +1969,8 @@ pub struct AgentTransport {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// How instructions are injected (copied from ProviderModeSpec). "prompt" or "agents_md".
+    /// Deprecated compatibility mirror from ProviderModeSpec. Current Loom
+    /// runtime awareness is projected through workspace AGENTS.md plus skills.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2108,14 +2109,14 @@ pub struct ProviderModeSpec {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// How instructions are injected: "prompt" (default, injected into prompt text) or
-    /// "agents_md" (written to workspace AGENTS.md, auto-loaded by provider).
+    /// Deprecated compatibility field. Current default providers no longer use
+    /// this to split Loom runtime guidance between prompt and AGENTS.md.
     #[serde(default = "default_instructions_via", rename = "instructionsVia")]
     pub instructions_via: String,
 }
 
 pub fn default_instructions_via() -> String {
-    "prompt".into()
+    "agents_md".into()
 }
 
 fn default_provider_transport() -> String {
@@ -2720,9 +2721,8 @@ pub enum PromptVia {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
-    /// Static instructions for this agent actor. Loom injects these as a
-    /// system-side prompt part so providers with a native system prompt can
-    /// keep this content stable across turns.
+    /// Static instructions for this agent actor. Loom projects these into the
+    /// workspace AGENTS.md Loom block with other stable actor/channel context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Provider-catalog based runtime selection. The host resolves this into a

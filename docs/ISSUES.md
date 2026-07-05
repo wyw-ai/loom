@@ -3,6 +3,11 @@
 > 本文档追踪 Loom 项目中已发现的问题、Bug 与待改进项。
 > 关联 Obsidian 笔记：[[Loom 文档索引 (Loom Index)]]
 
+> 注：2026-07-06 后，Copilot instructions 注入策略已被
+> `docs/protocol/agent-runtime-awareness.md` 中的方案取代：Loom 不再通过默认
+> system prompt 注入 runtime guidance，而是使用 workspace `AGENTS.md`、默认
+> `loom` skill 和 `loom guide`。
+
 ## 活跃问题
 
 ### #1 Copilot CLI 首次运行 `--resume` 参数错误 ✅ 已修复 (2026-06-14)

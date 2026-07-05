@@ -81,7 +81,8 @@ pub struct ProviderRuntimePlan {
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// How instructions are injected. "prompt" or "agents_md".
+    /// Deprecated compatibility field. Runtime guidance is now projected
+    /// through workspace AGENTS.md plus skills.
     #[serde(default)]
     pub instructions_via: String,
 }
@@ -668,18 +669,10 @@ fn is_builtin_prompt_part_placeholder(key: &str) -> bool {
 
 fn preset_parts(preset: &str) -> Result<Vec<&'static str>, String> {
     match preset {
-        "loom_system" => Ok(vec![
-            "actor_context",
-            "agent_instructions",
-            "bootstrap_memory",
-            "scope_bootstrap",
-        ]),
+        "loom_system" => Ok(vec!["bootstrap_memory"]),
         "loom_turn" => Ok(vec!["turn_memory", "runtime_context", "user_message"]),
         "loom_full" => Ok(vec![
-            "actor_context",
-            "agent_instructions",
             "bootstrap_memory",
-            "scope_bootstrap",
             "turn_memory",
             "runtime_context",
             "user_message",
@@ -2317,10 +2310,8 @@ fn claude_manifest() -> ProviderManifest {
         lit("--session-id"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2335,10 +2326,8 @@ fn claude_manifest() -> ProviderManifest {
         lit("--resume"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
@@ -2459,10 +2448,8 @@ fn qoder_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--reasoning-effort"), lit("{reasoningEffort}")],
         ),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2477,12 +2464,10 @@ fn qoder_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--reasoning-effort"), lit("{reasoningEffort}")],
         ),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("--resume"),
         lit("{session.id}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -2569,7 +2554,7 @@ fn copilot_manifest() -> ProviderManifest {
             mode.instructions_via = "agents_md".into();
             mode.env.insert(
                 "COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(),
-                "{loom_agent_home}".into(),
+                "{agent.workspace}".into(),
             );
             // Deliver prompt via stdin to avoid Windows command-line length
             // limits.  Copilot reads from stdin when no -p flag is present.
@@ -2931,7 +2916,7 @@ mod tests {
     }
 
     #[test]
-    fn base_prompt_keeps_dynamic_turn_context_out_of_system_output() {
+    fn base_prompt_keeps_runtime_turn_context_out_of_system_output() {
         let parts = vec![
             prompt_part("actor_context", "actor context"),
             prompt_part("bootstrap_memory", "bootstrap memory"),
@@ -2944,8 +2929,9 @@ mod tests {
             render_prompt_outputs(Some(&base_prompt()), &parts, "full prompt").expect("outputs");
 
         let system = outputs.get("system").expect("system");
-        assert!(system.contains("actor context"));
-        assert!(system.contains("scope bootstrap"));
+        assert!(!system.contains("actor context"));
+        assert!(system.contains("bootstrap memory"));
+        assert!(!system.contains("scope bootstrap"));
         assert!(!system.contains("turn memory"));
         assert!(!system.contains("runtime context"));
         assert!(!system.contains("user message"));
@@ -2969,7 +2955,7 @@ mod tests {
 
         assert_eq!(
             outputs.get("full").map(String::as_str),
-            Some("actor context\n\nruntime context\n\nuser message")
+            Some("runtime context\n\nuser message")
         );
         assert!(!outputs.contains_key("system"));
         assert!(!outputs.contains_key("user"));
@@ -3766,7 +3752,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_claude_uses_system_and_user_prompt_outputs() {
+    fn builtin_claude_uses_full_prompt_without_system_append() {
         let dir = temp_dir("path");
         make_executable(&dir.join("claude"));
         let registry = ProviderRegistry::load(&temp_dir("config")).expect("registry");
@@ -3789,9 +3775,10 @@ mod tests {
             },
         )
         .expect("transport");
-        assert!(transport.args.contains(&"--append-system-prompt".into()));
-        assert!(transport.args.contains(&"{prompt.system}".into()));
-        assert!(transport.args.contains(&"{prompt.user}".into()));
+        assert!(!transport.args.contains(&"--append-system-prompt".into()));
+        assert!(!transport.args.contains(&"{prompt.system}".into()));
+        assert!(!transport.args.contains(&"{prompt.user}".into()));
+        assert!(transport.args.contains(&"{prompt.full}".into()));
         assert!(transport.args.contains(&"{agent.configDir}".into()));
         assert!(transport.args.contains(&"{agent.skillWorkspace}".into()));
         assert!(!transport.args.contains(&"{loom.configDir}".into()));

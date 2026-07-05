@@ -1731,13 +1731,7 @@ fn render_prompt_assembly_outputs(
         .unwrap_or_else(|| {
             join_prompt_preview_parts(
                 &part_map,
-                &[
-                    "actor_context",
-                    "agent_instructions",
-                    "bootstrap_memory",
-                    "scope_bootstrap",
-                    "profile_prompt_files",
-                ],
+                &["bootstrap_memory", "profile_prompt_files"],
                 "\n\n",
                 warnings,
             )
@@ -1802,16 +1796,10 @@ fn prompt_output_preview_include(spec: &Value, warnings: &mut Vec<String>) -> Ve
             .collect();
     }
     match spec.get("preset").and_then(Value::as_str) {
-        Some("loom_system") => [
-            "actor_context",
-            "agent_instructions",
-            "bootstrap_memory",
-            "scope_bootstrap",
-            "profile_prompt_files",
-        ]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect(),
+        Some("loom_system") => ["bootstrap_memory", "profile_prompt_files"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
         Some("loom_turn") => [
             "turn_memory",
             "runtime_context",
@@ -1822,10 +1810,7 @@ fn prompt_output_preview_include(spec: &Value, warnings: &mut Vec<String>) -> Ve
         .map(ToString::to_string)
         .collect(),
         Some("loom_full") => [
-            "actor_context",
-            "agent_instructions",
             "bootstrap_memory",
-            "scope_bootstrap",
             "profile_prompt_files",
             "turn_memory",
             "runtime_context",

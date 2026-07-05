@@ -107,13 +107,11 @@
             "{reasoningEffort}"
           ],
           "when": "reasoningEffort"
-        },
-        "-p",
-        "{prompt.user}"
+        }
       ],
       "command": "{bin}",
       "env": {
-        "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "{loom_agent_home}"
+        "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "{agent.workspace}"
       },
       "stdin": "{prompt.full}",
       "session": {
@@ -143,9 +141,7 @@
               "{reasoningEffort}"
             ],
             "when": "reasoningEffort"
-          },
-          "-p",
-          "{prompt.user}"
+          }
         ],
         "scope": "actor_scope"
       },

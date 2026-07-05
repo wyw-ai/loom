@@ -1909,12 +1909,7 @@ impl AgentTrigger {
     fn meta_value(&self, key: &str) -> Option<&Value> {
         match self {
             AgentTrigger::Message(message) => message.metadata.get(key),
-            AgentTrigger::Event(event) => event
-                .payload
-                .get("_meta")
-                .and_then(Value::as_object)
-                .and_then(|meta| meta.get(key))
-                .or_else(|| event._meta.as_ref().and_then(|meta| meta.get(key))),
+            AgentTrigger::Event(event) => event_meta_value(event, key),
         }
     }
 
@@ -2002,6 +1997,22 @@ fn normalize_reply_target(raw: &str) -> Option<String> {
     }
 }
 
+fn event_reply_target(event: &Event) -> Option<String> {
+    event_meta_value(event, "loomReplyTarget")
+        .or_else(|| event_meta_value(event, "replyTarget"))
+        .and_then(Value::as_str)
+        .and_then(normalize_reply_target)
+}
+
+fn event_meta_value<'a>(event: &'a Event, key: &str) -> Option<&'a Value> {
+    event
+        .payload
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get(key))
+        .or_else(|| event._meta.as_ref().and_then(|meta| meta.get(key)))
+}
+
 /// When the triggering message was sent privately (to a restricted same-scope
 /// audience via `--private-to`), returns the actor ids the woken agent should
 /// reply to so its reply stays inside that same private group: the author who
@@ -2073,12 +2084,24 @@ fn collect_private_to_ids(value: &Value, out: &mut Vec<String>) {
 fn turn_key_for_trigger(trigger: &AgentTrigger) -> String {
     match trigger {
         AgentTrigger::Message(message) => turn_key_for_message(message),
-        AgentTrigger::Event(event) => format!(
-            "scope:{}:{}",
-            scope_kind_name(event.scope.kind),
-            event.scope.id
-        ),
+        AgentTrigger::Event(event) => turn_key_for_event(event),
     }
+}
+
+fn turn_key_for_event(event: &Event) -> String {
+    if let Some(target) = event_reply_target(event) {
+        if let Some((channel_id, root_message_id)) = thread_target_parts(&target) {
+            return format!("thread-root:{channel_id}:{root_message_id}");
+        }
+        if target.starts_with("dm:") {
+            return target;
+        }
+    }
+    format!(
+        "scope:{}:{}",
+        scope_kind_name(event.scope.kind),
+        event.scope.id
+    )
 }
 
 fn turn_key_for_message(message: &Message) -> String {
@@ -8618,6 +8641,77 @@ mod tests {
     }
 
     #[test]
+    fn turn_key_for_event_uses_thread_reply_target() {
+        let root = sample_message(
+            "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        let mut event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+        );
+        event._meta = Some(Meta::from([(
+            "loomReplyTarget".into(),
+            json!("#chan_demo:msg_root"),
+        )]));
+
+        assert_eq!(turn_key_for_event(&event), "thread-root:chan_demo:msg_root");
+        assert_eq!(turn_key_for_event(&event), turn_key_for_message(&root));
+
+        event._meta = Some(Meta::from([(
+            "loomReplyTarget".into(),
+            json!("#chan_demo:msg_other"),
+        )]));
+        assert_eq!(
+            turn_key_for_event(&event),
+            "thread-root:chan_demo:msg_other"
+        );
+    }
+
+    #[test]
+    fn turn_key_for_event_uses_payload_reply_target() {
+        let mut event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+        );
+        event.payload = json!({
+            "_meta": {
+                "replyTarget": "#chan_demo:msg_payload"
+            }
+        });
+
+        assert_eq!(
+            turn_key_for_event(&event),
+            "thread-root:chan_demo:msg_payload"
+        );
+    }
+
+    #[test]
+    fn turn_key_for_event_falls_back_to_scope_without_thread_target() {
+        let event = sample_event(
+            "evt_reminder",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+        );
+
+        assert_eq!(turn_key_for_event(&event), "scope:channel:chan_demo");
+    }
+
+    #[test]
     fn runtime_failure_for_channel_root_uses_channel_target_without_threading() {
         let mut active = sample_active_turn("actor_human");
         active.scope = ScopeRef {
@@ -10512,6 +10606,7 @@ mod tests {
             scope: active_scope.clone(),
             trigger_source_id: human_one.id.clone(),
             trigger_is_message: false,
+            assignment_id: None,
             reply_target: None,
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10534,6 +10629,7 @@ mod tests {
             scope: active_scope.clone(),
             trigger_source_id: human_two.id.clone(),
             trigger_is_message: false,
+            assignment_id: None,
             reply_target: None,
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10556,6 +10652,7 @@ mod tests {
             scope: active_scope.clone(),
             trigger_source_id: service.id.clone(),
             trigger_is_message: false,
+            assignment_id: None,
             reply_target: None,
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10607,6 +10704,7 @@ mod tests {
                 scope: scope.clone(),
                 trigger_source_id: trigger_id.into(),
                 trigger_is_message: false,
+                assignment_id: None,
                 reply_target: None,
                 prompt_stats: empty_prompt_stats(),
                 prompt_breakdown: empty_prompt_breakdown(),

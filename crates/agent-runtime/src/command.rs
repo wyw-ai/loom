@@ -4088,6 +4088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn failed_command_summary_prefers_runtime_error_over_raw_json() {
         let error_line = serde_json::json!({
             "statusCode": 429,
@@ -4175,6 +4176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn spawn_and_collect_releases_slot_before_finished_dispatch() {
         let mut cfg = cfg();
         cfg.command = "sh".into();
@@ -4395,6 +4397,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn codex_stream_success_without_assistant_output_reports_failure() {
         let mut cfg = cfg();
         cfg.command = "/bin/sh".into();
@@ -4434,6 +4437,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn child_exit_does_not_wait_for_detached_stdout_holder() {
         let mut cfg = cfg();
         cfg.command = "/bin/sh".into();

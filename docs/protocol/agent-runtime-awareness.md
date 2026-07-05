@@ -60,24 +60,39 @@ Loom 打包时内置该仓库的一份快照。用户或 agent 可以运行 `loo
 
 `loom-guide` 的内容不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
 仓库内容生成编译期快照。构建机可以通过 `LOOM_GUIDE_DIR` 指向该仓库；未设置时，
-默认查找 Loom 仓库平级的 `../loom-guide`。
+默认查找 Loom 仓库平级的 `../loom-guide`；如果本地路径不存在，则从官方 GitHub
+仓库临时 clone 到构建输出目录，生成内置快照后删除临时 clone。需要覆盖远程地址时，
+可以设置 `LOOM_GUIDE_REPO`。
 
-### `loom-skill` 是官方运行指路 Skill
+### `loom-skills` 是官方 Skill 集合
 
 Loom 默认给每个 agent 投影一个官方 `loom` skill。该 skill 的源仓库是：
 
 ```text
-git@github.com:wyw-ai/loom-skill.git
+git@github.com:wyw-ai/loom-skills.git
 ```
 
-Loom 打包时内置该仓库的一份快照，并在 agent turn 启动前把它写入本机
+该仓库可以维护多个 skill。Loom 当前默认内置和投影的是其中的 `skills/loom`
+目录：
+
+```text
+skills/loom/SKILL.md
+skills/loom/references/*.md
+```
+
+`SKILL.md` 负责描述何时使用 Loom skill，并按场景指向 `references` 下的文档。
+`references` 保存 Loom 常识、消息路由、任务协作、状态和 artifact 等场景说明。
+
+Loom 打包时内置 `skills/loom` 的一份快照，并在 agent turn 启动前把它写入本机
 `data_root` 的内置 skill 区，再投影到当前 workspace 的 provider-native skill
 目录。这样 agent 不需要依赖 system prompt，也能知道遇到 Loom 路由、任务、私信、
-artifact、reminder 等场景时应该先读哪个 guide topic 或执行哪类命令。
+artifact、reminder 等场景时应该先读哪个 reference 或 guide topic。
 
-`loom-skill` 的内容同样不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
-仓库内容生成编译期快照。构建机可以通过 `LOOM_SKILL_DIR` 指向该仓库；未设置时，
-默认查找 Loom 仓库平级的 `../loom-skill`。
+`loom-skills` 的内容同样不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
+仓库内容生成编译期快照。构建机可以通过 `LOOM_SKILLS_DIR` 指向该仓库；未设置时，
+默认查找 Loom 仓库平级的 `../loom-skills`；如果本地路径不存在，则从官方 GitHub
+仓库临时 clone 到构建输出目录，生成内置快照后删除临时 clone。需要覆盖远程地址时，
+可以设置 `LOOM_SKILLS_REPO`。
 
 ### Skill 负责指路，Guide 负责解释
 
@@ -196,12 +211,17 @@ instruction 管理。是否把它投影进 Loom marker 内部，由 actor/profil
 内容来源是：
 
 ```text
-git@github.com:wyw-ai/loom-skill.git
+git@github.com:wyw-ai/loom-skills.git
 ```
 
 默认 skill id 是 `loom`。每个 agent turn 构造 workspace 前，Loom 应确保该 skill
 存在并投影到当前 workspace；channel/member scope skills 和 actor bundle skills
 可以和它并存，但不应替代默认 `loom` skill。
+
+Loom 只内置并同步 `loom-skills` 仓库中的 `skills/loom` 目录。运行时写入
+`data_root/builtin/skills/loom` 时，应同步完整目录树，包括 `SKILL.md` 和
+`references` 下的文档；如果内置快照删除了旧文件，运行时也应清理
+`data_root/builtin/skills/loom` 中对应的旧文件，避免 agent 读到过期 reference。
 
 skill 应专注于场景路由：
 
@@ -287,7 +307,8 @@ instruction path 指向同一份 workspace bootstrap 内容。这是 provider ad
 
 1. 将本文作为 agent 感知 Loom 运行规则的协议来源。
 2. 引入外部 `loom-guide` 的打包和更新机制。
-3. 引入外部 `loom-skill` 的打包快照，并默认投影到每个 agent workspace。
+3. 引入外部 `loom-skills` 的 `skills/loom` 打包快照，并默认投影到每个 agent
+   workspace。
 4. 把生成的 Loom `AGENTS.md` block 缩短为最小启动契约。
 5. 修改 `AGENTS.md` 生成逻辑：已有 marker block 时，只有生成内容不同才替换
    marker 内部。
@@ -315,6 +336,6 @@ instruction path 指向同一份 workspace bootstrap 内容。这是 provider ad
 - `loom guide update` 可以从 `git@github.com:wyw-ai/loom-guide.git` 刷新
   本地缓存。
 - 每个 agent workspace 都能发现默认 `loom` skill。
-- 默认 `loom` skill 的内容来自 `git@github.com:wyw-ai/loom-skill.git` 的打包
-  快照。
+- 默认 `loom` skill 的内容来自 `git@github.com:wyw-ai/loom-skills.git` 的
+  `skills/loom` 打包快照。
 - 官方 Loom skill 负责把 agent 指向 guide topic，而不是复制 guide 全文。

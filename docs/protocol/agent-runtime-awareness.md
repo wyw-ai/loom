@@ -51,7 +51,7 @@ prompt 干净，也避免和 agent 自己的 instruction 互相竞争。
 详细用法放在独立的 guide 仓库中：
 
 ```text
-git@github.com:wyw-ai/loom-guide.git
+https://github.com/wyw-ai/loom-guide.git
 ```
 
 Loom 打包时内置该仓库的一份快照。用户或 agent 可以运行 `loom guide update`
@@ -69,7 +69,7 @@ Loom 打包时内置该仓库的一份快照。用户或 agent 可以运行 `loo
 Loom 默认给每个 agent 投影一个官方 `loom` skill。该 skill 的源仓库是：
 
 ```text
-git@github.com:wyw-ai/loom-skills.git
+https://github.com/wyw-ai/loom-skills.git
 ```
 
 该仓库可以维护多个 skill。Loom 当前默认内置和投影的是其中的 `skills/loom`
@@ -211,7 +211,7 @@ instruction 管理。是否把它投影进 Loom marker 内部，由 actor/profil
 内容来源是：
 
 ```text
-git@github.com:wyw-ai/loom-skills.git
+https://github.com/wyw-ai/loom-skills.git
 ```
 
 默认 skill id 是 `loom`。每个 agent turn 构造 workspace 前，Loom 应确保该 skill
@@ -251,7 +251,7 @@ JSON。
 
 打包和更新规则：
 
-1. Loom 从 `git@github.com:wyw-ai/loom-guide.git` 打包一份内置快照。
+1. Loom 从 `https://github.com/wyw-ai/loom-guide.git` 打包一份内置快照。
 2. `loom guide update` 把最新 guide 拉取到本地缓存。
 3. 运行时读取 guide 时，优先使用本地缓存。
 4. 本地缓存不存在或不可用时，回退到内置快照。
@@ -333,9 +333,10 @@ instruction path 指向同一份 workspace bootstrap 内容。这是 provider ad
   reply target、task 状态或 assignment 状态。
 - provider prompt 不包含 Loom 通用使用手册。
 - `loom guide` 可以在离线状态下使用内置快照。
-- `loom guide update` 可以从 `git@github.com:wyw-ai/loom-guide.git` 刷新
-  本地缓存。
+- `loom guide update` 可以从 `https://github.com/wyw-ai/loom-guide.git` 刷新
+  本地缓存；运行时可用 `LOOM_GUIDE_REPO` 环境变量覆盖仓库地址（例如私有镜像
+  或带凭证的 URL）。
 - 每个 agent workspace 都能发现默认 `loom` skill。
-- 默认 `loom` skill 的内容来自 `git@github.com:wyw-ai/loom-skills.git` 的
+- 默认 `loom` skill 的内容来自 `https://github.com/wyw-ai/loom-skills.git` 的
   `skills/loom` 打包快照。
 - 官方 Loom skill 负责把 agent 指向 guide topic，而不是复制 guide 全文。

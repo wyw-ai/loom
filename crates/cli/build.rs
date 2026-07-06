@@ -165,7 +165,12 @@ fn cleanup_temp_source(source: &ContentSource, out_dir: &Path) {
 
 fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
     let guides_dir = guide_source.path.join("guides");
-    println!("cargo:rerun-if-changed={}", guides_dir.display());
+    // Temp clones are deleted after snapshot generation; registering their
+    // paths would make Cargo treat the build script as always dirty and
+    // re-clone on every build.
+    if !guide_source.cloned {
+        println!("cargo:rerun-if-changed={}", guides_dir.display());
+    }
 
     let mut entries = fs::read_dir(&guides_dir)
         .unwrap_or_else(|err| panic!("read {} failed: {err}", guides_dir.display()))
@@ -181,7 +186,9 @@ fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
     let mut generated = String::new();
     generated.push_str("const EMBEDDED_TOPICS: &[EmbeddedTopic] = &[\n");
     for path in entries {
-        println!("cargo:rerun-if-changed={}", path.display());
+        if !guide_source.cloned {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
         let id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -204,12 +211,14 @@ fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
 fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
     let skill_dir = skills_source.path.join("skills").join("loom");
     let skill_md = skill_dir.join("SKILL.md");
-    println!("cargo:rerun-if-changed={}", skill_md.display());
+    if !skills_source.cloned {
+        println!("cargo:rerun-if-changed={}", skill_md.display());
+    }
     if !skill_md.is_file() {
         panic!("default Loom skill missing {}", skill_md.display());
     }
 
-    let mut files = collect_files(&skill_dir);
+    let mut files = collect_files(&skill_dir, !skills_source.cloned);
     files.sort();
     if files.is_empty() {
         panic!(
@@ -221,7 +230,9 @@ fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
     let mut generated = String::new();
     generated.push_str("const EMBEDDED_LOOM_SKILL_FILES: &[EmbeddedSkillFile] = &[\n");
     for path in files {
-        println!("cargo:rerun-if-changed={}", path.display());
+        if !skills_source.cloned {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
         let rel = path
             .strip_prefix(&skill_dir)
             .unwrap_or_else(|err| panic!("strip skill prefix {} failed: {err}", path.display()))
@@ -241,22 +252,26 @@ fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
         .expect("write generated skill snapshot");
 }
 
-fn collect_files(dir: &Path) -> Vec<PathBuf> {
-    println!("cargo:rerun-if-changed={}", dir.display());
+fn collect_files(dir: &Path, emit_rerun: bool) -> Vec<PathBuf> {
+    if emit_rerun {
+        println!("cargo:rerun-if-changed={}", dir.display());
+    }
     let mut files = Vec::new();
-    collect_files_inner(dir, &mut files);
+    collect_files_inner(dir, emit_rerun, &mut files);
     files
 }
 
-fn collect_files_inner(dir: &Path, files: &mut Vec<PathBuf>) {
+fn collect_files_inner(dir: &Path, emit_rerun: bool, files: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("read {} failed: {err}", dir.display()))
         .map(|entry| entry.expect("read skill entry").path())
         .collect::<Vec<_>>();
     for path in entries {
         if path.is_dir() {
-            println!("cargo:rerun-if-changed={}", path.display());
-            collect_files_inner(&path, files);
+            if emit_rerun {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+            collect_files_inner(&path, emit_rerun, files);
         } else if path.is_file() {
             files.push(path);
         }

@@ -26,6 +26,7 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 ## Runtime And Providers
 
 - [protocol/agent-runtime-awareness.md](./protocol/agent-runtime-awareness.md) - current protocol for Loom runtime awareness through workspace `AGENTS.md`, the default `loom` skill, `loom guide`, and prompt/system-prompt boundaries.
+- [agent-turn-input-analysis.md](./agent-turn-input-analysis.md) - analysis of what agents actually receive per turn (GUI message → server delivery → worker queue → prompt), how bursts of messages are queued and replayed, design flaws measured against Loom's principles, and a turn-input contract proposal.
 - [protocol/provider-extension-design.md](./protocol/provider-extension-design.md) - historical provider manifest design. Runtime-guidance and system-prompt boundaries in this document are superseded by `agent-runtime-awareness.md`.
 - [command-transport-v0.md](./command-transport-v0.md) - command transport schema, session bookkeeping, first-run capture, resume arguments, output mapping, and worked examples.
 - [interactive-command-agent-transport-design.md](./interactive-command-agent-transport-design.md) - interactive command transport architecture, schema, session lifecycle, prompt composition, completion detection, output pipeline, and rollout.

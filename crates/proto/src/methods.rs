@@ -2762,6 +2762,12 @@ pub struct AgentSpec {
     /// `/delivery` or `/discovery`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TriggerSpec>,
+    /// Optional wake / turn-intake policy: burst coalescing, dispatch
+    /// debounce, and reply-reminder frequency. Absent fields fall back to
+    /// runtime defaults (coalesce on, no debounce, full reminder on the
+    /// first scope turn then a one-line pointer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeSpec>,
     /// Optional per-agent prompt assembly. This is the agent-owned rule that
     /// turns Loom prompt parts and controlled profile/workspace files into the
     /// named outputs providers consume through `{prompt.system}`,
@@ -2822,6 +2828,42 @@ pub enum TriggerPrefixApplyOn {
     FirstTurn,
     #[default]
     EveryTurn,
+}
+
+/// Wake / turn-intake policy. See `AgentSpec.wake`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeSpec {
+    /// Merge triggers that queued up behind a busy scope into a single turn
+    /// instead of replaying them one full turn per message. Only plain
+    /// messages with the same reply target and visibility are merged;
+    /// task/assignment triggers always run alone. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesce: Option<bool>,
+    /// Milliseconds to wait after a scope becomes free before composing the
+    /// prompt, so a burst of quick messages lands in one turn instead of
+    /// several. Default: 0 (dispatch immediately).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<u64>,
+    /// How often the response-delivery reminder is appended to the turn
+    /// input. The full rules always live in the workspace `AGENTS.md`;
+    /// this only controls the per-turn repetition. Default: `first-turn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_reminder: Option<ReplyReminderMode>,
+}
+
+/// Reply-reminder frequency. See `WakeSpec.reply_reminder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplyReminderMode {
+    /// Append the full reminder block to every turn input.
+    EveryTurn,
+    /// Full reminder on the first turn of a scope (per worker run), then a
+    /// one-line pointer to AGENTS.md on later turns.
+    #[default]
+    FirstTurn,
+    /// Never append reminder text; rely on `AGENTS.md` / skills only.
+    Off,
 }
 
 /// Per-actor prompt template (design §5). All three lists are joined with

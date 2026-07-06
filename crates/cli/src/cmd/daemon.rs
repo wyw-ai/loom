@@ -656,6 +656,7 @@ fn agent_spec_from_command(
         memory: None,
         announcement: None,
         trigger: None,
+        wake: None,
         prompt_assembly,
         prompt_template: None,
     })
@@ -2871,6 +2872,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         }];
@@ -2951,6 +2953,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         };
@@ -3178,6 +3181,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         };

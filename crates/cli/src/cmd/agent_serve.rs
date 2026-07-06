@@ -26,9 +26,9 @@ use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
     AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
     BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
-    InboxListResult, MessageListResult, MessageSendResult, PromptTemplateSpec, RunAppendResult,
-    RunCloseResult, RunOpenResult, TaskAssignmentContextResult, TaskAssignmentUpdateResult,
-    ThreadListResult, TriggerPrefixApplyOn,
+    InboxListResult, MessageListResult, MessageSendResult, PromptTemplateSpec, ReplyReminderMode,
+    RunAppendResult, RunCloseResult, RunOpenResult, TaskAssignmentContextResult,
+    TaskAssignmentUpdateResult, ThreadListResult, TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -2071,13 +2071,6 @@ fn normalize_reply_target(raw: &str) -> Option<String> {
     }
 }
 
-fn event_reply_target(event: &Event) -> Option<String> {
-    event_meta_value(event, "loomReplyTarget")
-        .or_else(|| event_meta_value(event, "replyTarget"))
-        .and_then(Value::as_str)
-        .and_then(normalize_reply_target)
-}
-
 fn event_meta_value<'a>(event: &'a Event, key: &str) -> Option<&'a Value> {
     event
         .payload
@@ -2155,67 +2148,21 @@ fn collect_private_to_ids(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Serialization key for a trigger.
+///
+/// One key per execution scope. The adapter keeps exactly one provider
+/// session and one in-flight slot per scope, and `active_turns` is keyed by
+/// scope id, so the dispatch gate must use the same granularity. The previous
+/// per-thread-root "family" keys were finer than the execution scope: two
+/// channel-root messages produced two keys over the same channel scope, let
+/// both dispatch concurrently, and then overwrote each other's active turn
+/// and raced the per-scope provider session ("session already in flight").
 fn turn_key_for_trigger(trigger: &AgentTrigger) -> String {
-    match trigger {
-        AgentTrigger::Message(message) => turn_key_for_message(message),
-        AgentTrigger::Event(event) => turn_key_for_event(event),
-    }
+    turn_key_for_scope(trigger.scope())
 }
 
-fn turn_key_for_event(event: &Event) -> String {
-    if let Some(target) = event_reply_target(event) {
-        if let Some((channel_id, root_message_id)) = thread_target_parts(&target) {
-            return format!("thread-root:{channel_id}:{root_message_id}");
-        }
-        if target.starts_with("dm:") {
-            return target;
-        }
-    }
-    format!(
-        "scope:{}:{}",
-        scope_kind_name(event.scope.kind),
-        event.scope.id
-    )
-}
-
-fn turn_key_for_message(message: &Message) -> String {
-    if message.target.starts_with("dm:") {
-        return message.target.clone();
-    }
-    if let Some((channel_id, root_message_id)) = thread_target_parts(&message.target) {
-        return format!("thread-root:{channel_id}:{root_message_id}");
-    }
-    if let Some(root_message_id) = message.thread_root_message_id.as_deref() {
-        return format!(
-            "thread-root:{}:{root_message_id}",
-            channel_id_from_target(&message.target).unwrap_or_else(|| message.scope.id.clone())
-        );
-    }
-    match message.scope.kind {
-        ScopeKind::Channel => format!("thread-root:{}:{}", message.scope.id, message.id),
-        ScopeKind::Thread => format!("scope:thread:{}", message.scope.id),
-    }
-}
-
-fn thread_target_parts(target: &str) -> Option<(String, String)> {
-    let raw = target.strip_prefix('#')?;
-    let (channel_id, root_message_id) = raw.split_once(':')?;
-    if channel_id.is_empty() || root_message_id.is_empty() {
-        return None;
-    }
-    Some((channel_id.to_string(), root_message_id.to_string()))
-}
-
-fn channel_id_from_target(target: &str) -> Option<String> {
-    target
-        .strip_prefix('#')
-        .map(|raw| {
-            raw.split_once(':')
-                .map(|(channel, _)| channel)
-                .unwrap_or(raw)
-        })
-        .filter(|channel| !channel.is_empty())
-        .map(ToString::to_string)
+fn turn_key_for_scope(scope: &ScopeRef) -> String {
+    format!("scope:{}:{}", scope_kind_name(scope.kind), scope.id)
 }
 
 fn scope_belongs_to_channel(
@@ -2246,15 +2193,15 @@ struct WorkerState {
     /// In-flight turn per scope. Adapter events are scoped only by scope id, so
     /// translation still uses scope as the active-turn lookup key.
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
-    /// Root/thread-family serialization gate. A turn key is present here from
-    /// the moment a turn is reserved until it finishes with no queued successor.
-    /// This preserves the mainline atomic begin/finish behavior while grouping
-    /// a channel root and its derived task/thread prompts into one FIFO.
+    /// Per-scope serialization gate. A turn key (see [`turn_key_for_scope`])
+    /// is present here from the moment a turn is reserved until it finishes
+    /// with no queued successor. Keys are scope-granular so the gate matches
+    /// the adapter's one-session-per-scope execution model exactly.
     busy_turn_keys: Mutex<HashSet<String>>,
-    /// Per-root/thread-family queues of triggers received while that
-    /// conversation is busy. Human triggers are kept ahead of service callbacks
-    /// within the same family so stale automation cannot starve an explicit
-    /// user request.
+    /// Per-scope queues of triggers received while that scope is busy. Human
+    /// triggers are kept ahead of service callbacks within the same scope so
+    /// stale automation cannot starve an explicit user request. Consecutive
+    /// compatible messages are coalesced into a single turn on dispatch.
     pending_triggers: Mutex<HashMap<String, VecDeque<AgentTrigger>>>,
     /// Per-turn streaming text buffer. Token/chunk streams are buffered until
     /// the adapter reports a message boundary; complete assistant messages are
@@ -2294,6 +2241,10 @@ struct ActiveTurn {
     turn_key: String,
     scope: ScopeRef,
     trigger_source_id: String,
+    /// Every trigger source merged into this turn, primary included. All of
+    /// them are acked when the turn finishes. Length is 1 unless wake
+    /// coalescing merged a burst into a single turn.
+    trigger_source_ids: Vec<String>,
     trigger_is_message: bool,
     assignment_id: Option<String>,
     reply_target: Option<String>,
@@ -2507,11 +2458,19 @@ impl WorkerState {
     }
 
     /// Drop the active turn for `scope_id` and pop the next queued trigger for
-    /// that same root/thread-family key (if any). Test-only; production uses
-    /// `finish_and_next`.
+    /// that same scope key (if any). Test-only; production uses
+    /// `finish_and_next_batch`.
     #[cfg(test)]
     fn clear_turn(&self, scope_id: &str) -> Option<AgentTrigger> {
         self.finish_and_next(scope_id)
+    }
+
+    /// Single-trigger variant kept for tests that assert FIFO order.
+    #[cfg(test)]
+    fn finish_and_next(&self, scope_id: &str) -> Option<AgentTrigger> {
+        let mut batch = self.finish_and_next_batch(scope_id, false);
+        debug_assert!(batch.len() <= 1);
+        batch.pop()
     }
 
     #[cfg(test)]
@@ -2574,18 +2533,26 @@ impl WorkerState {
     }
 
     /// Finish the active turn for `scope_id`: drop its metadata, then atomically
-    /// either hand back the next queued trigger for the same turn key (the key
-    /// stays reserved so the successor dispatches without re-racing the gate) or,
-    /// if the queue is empty, release the key. Locks `busy_turn_keys` before
+    /// either hand back the next queued trigger batch for the same turn key (the
+    /// key stays reserved so the successor dispatches without re-racing the gate)
+    /// or, if the queue is empty, release the key. Locks `busy_turn_keys` before
     /// `pending`, matching [`Self::begin_or_enqueue`], so the empty-check and the
     /// release are atomic with a concurrent begin-or-enqueue.
-    fn finish_and_next(&self, scope_id: &str) -> Option<AgentTrigger> {
-        let turn_key = self
+    ///
+    /// With `coalesce` enabled, consecutive compatible plain messages (same
+    /// reply target, same visibility, no task/assignment payload) are drained
+    /// into one batch so a burst becomes a single turn instead of one full
+    /// provider turn per message.
+    fn finish_and_next_batch(&self, scope_id: &str, coalesce: bool) -> Vec<AgentTrigger> {
+        let Some(turn_key) = self
             .active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(scope_id)
-            .map(|turn| turn.turn_key)?;
+            .map(|turn| turn.turn_key)
+        else {
+            return Vec::new();
+        };
         let mut busy = self
             .busy_turn_keys
             .lock()
@@ -2594,17 +2561,65 @@ impl WorkerState {
             .pending_triggers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(queue) = pending.get_mut(&turn_key) {
-            let next = queue.pop_front();
-            if queue.is_empty() {
-                pending.remove(&turn_key);
+        let batch = Self::pop_batch_locked(&mut pending, &turn_key, coalesce, &self.actor_id);
+        if batch.is_empty() {
+            busy.remove(&turn_key);
+        }
+        batch
+    }
+
+    /// Pop the head trigger for `turn_key` plus, when `coalesce` is set, any
+    /// directly following triggers that can merge into the same turn.
+    fn pop_batch_locked(
+        pending: &mut HashMap<String, VecDeque<AgentTrigger>>,
+        turn_key: &str,
+        coalesce: bool,
+        self_actor_id: &str,
+    ) -> Vec<AgentTrigger> {
+        let mut batch = Vec::new();
+        if let Some(queue) = pending.get_mut(turn_key) {
+            if let Some(first) = queue.pop_front() {
+                batch.push(first);
+                if coalesce {
+                    while batch.len() < WAKE_COALESCE_MAX {
+                        let Some(next) = queue.front() else { break };
+                        let last = batch.last().expect("batch has head");
+                        if !triggers_coalesce(last, next, self_actor_id) {
+                            break;
+                        }
+                        batch.push(queue.pop_front().expect("front checked"));
+                    }
+                }
             }
-            if next.is_some() {
-                return next;
+            if queue.is_empty() {
+                pending.remove(turn_key);
             }
         }
-        busy.remove(&turn_key);
-        None
+        batch
+    }
+
+    /// Extend an already-reserved batch with any coalescible triggers that
+    /// queued up behind it (e.g. during a debounce window). The turn key must
+    /// currently be held by the caller.
+    fn drain_coalescible_into(&self, turn_key: &str, batch: &mut Vec<AgentTrigger>) {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = pending.get_mut(turn_key) else {
+            return;
+        };
+        while batch.len() < WAKE_COALESCE_MAX {
+            let Some(next) = queue.front() else { break };
+            let Some(last) = batch.last() else { break };
+            if !triggers_coalesce(last, next, &self.actor_id) {
+                break;
+            }
+            batch.push(queue.pop_front().expect("front checked"));
+        }
+        if queue.is_empty() {
+            pending.remove(turn_key);
+        }
     }
 
     /// Cancel all active turns and queued triggers whose scope belongs to
@@ -2677,7 +2692,13 @@ impl WorkerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|turn| turn.trigger_source_id == source_id)
+            .any(|turn| {
+                turn.trigger_source_id == source_id
+                    || turn
+                        .trigger_source_ids
+                        .iter()
+                        .any(|id| id == source_id)
+            })
     }
 
     fn push_text(&self, turn_id: &str, chunk: &str) {
@@ -2815,6 +2836,63 @@ impl WorkerState {
 fn is_priority_trigger(trigger: &AgentTrigger) -> bool {
     trigger.actor_id().starts_with("actor_human_")
         || matches!(trigger.scope().kind, ScopeKind::Channel)
+}
+
+/// Upper bound for how many queued triggers may merge into one turn. Keeps a
+/// pathological backlog from producing an unbounded turn input.
+const WAKE_COALESCE_MAX: usize = 10;
+
+fn wake_coalesce_enabled(spec: &AgentSpec) -> bool {
+    spec.wake
+        .as_ref()
+        .and_then(|wake| wake.coalesce)
+        .unwrap_or(true)
+}
+
+fn wake_debounce(spec: &AgentSpec) -> Option<Duration> {
+    let ms = spec.wake.as_ref().and_then(|wake| wake.debounce_ms)?;
+    (ms > 0).then(|| Duration::from_millis(ms.min(10_000)))
+}
+
+/// Whether a trigger may share a turn with other triggers at all. Only plain
+/// conversational messages qualify: task/assignment payloads carry their own
+/// context blocks and lifecycle side effects, prefix-carrying wakes select
+/// skills, and events are never messages.
+fn trigger_is_coalescible(trigger: &AgentTrigger) -> bool {
+    let AgentTrigger::Message(message) = trigger else {
+        return false;
+    };
+    if message.metadata.contains_key("taskId")
+        || message.metadata.contains_key("assignmentId")
+        || message.metadata.contains_key("kind")
+        || trigger_prompt_prefix_from_trigger(trigger).is_some()
+    {
+        return false;
+    }
+    true
+}
+
+/// Whether two queued triggers can merge into the same turn: both plain
+/// messages, answered at the same reply target, with identical private
+/// visibility. Keeping the reply target equal means one merged turn still
+/// maps to exactly one conversation anchor (thread / DM / channel root).
+fn triggers_coalesce(a: &AgentTrigger, b: &AgentTrigger, self_actor_id: &str) -> bool {
+    if !trigger_is_coalescible(a) || !trigger_is_coalescible(b) {
+        return false;
+    }
+    let (AgentTrigger::Message(message_a), AgentTrigger::Message(message_b)) = (a, b) else {
+        return false;
+    };
+    if reply_target_for_message(message_a) != reply_target_for_message(message_b) {
+        return false;
+    }
+    let private_a: BTreeSet<String> = trigger_private_reply_actor_ids(message_a, self_actor_id)
+        .into_iter()
+        .collect();
+    let private_b: BTreeSet<String> = trigger_private_reply_actor_ids(message_b, self_actor_id)
+        .into_iter()
+        .collect();
+    private_a == private_b
 }
 
 fn model_state_path(profile_dir: &Path) -> PathBuf {
@@ -4047,12 +4125,17 @@ fn pending_inbox_max_age() -> chrono::Duration {
     chrono::Duration::seconds(secs)
 }
 
-async fn record_delivery_seen(
-    client: &Arc<Client>,
-    state: &Arc<WorkerState>,
-    trigger: &AgentTrigger,
-) -> Result<()> {
-    record_delivery_seen_by_id(client, &state.actor_id, trigger.id()).await
+/// Every trigger source merged into `active`, primary first, deduped. Older
+/// turns recorded only `trigger_source_id`; batches also fill
+/// `trigger_source_ids`.
+fn turn_source_ids(active: &ActiveTurn) -> Vec<&str> {
+    let mut ids: Vec<&str> = vec![active.trigger_source_id.as_str()];
+    for id in &active.trigger_source_ids {
+        if !ids.contains(&id.as_str()) {
+            ids.push(id.as_str());
+        }
+    }
+    ids
 }
 
 async fn record_delivery_seen_by_id(
@@ -4320,10 +4403,11 @@ async fn handle_trigger(
     trigger: AgentTrigger,
 ) -> Result<TriggerOutcome> {
     let trigger = trigger.clone();
-    // Root/thread-family FIFO: the same actor can handle independent
-    // conversations concurrently, but a channel root turn and its derived
-    // thread remain ordered. `begin_or_enqueue` reserves the key atomically
-    // before async dispatch work so bursts cannot race the gate.
+    // Per-scope FIFO: the same actor can handle independent scopes
+    // concurrently, but everything inside one scope stays serialized because
+    // the adapter keeps a single provider session per scope.
+    // `begin_or_enqueue` reserves the key atomically before async dispatch
+    // work so bursts cannot race the gate.
     let turn_key = turn_key_for_trigger(&trigger);
     if !state.begin_or_enqueue(&turn_key, trigger.clone()) {
         return Ok(TriggerOutcome::Queued);
@@ -4333,53 +4417,94 @@ async fn handle_trigger(
         .map(|_| TriggerOutcome::Dispatched)
 }
 
-/// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
-/// both the initial trigger and the Finished handler when it pops the next
-/// queued trigger. On `send_prompt` failure we iteratively drain the queue
-/// (rather than spawn-recursing) so a single bad prompt can't strand the rest
-/// and the future stays Send for `tokio::spawn`.
+/// Entry point for a freshly reserved trigger. Applies the optional debounce
+/// window, folds any coalescible triggers that queued up meanwhile into the
+/// same turn, then dispatches the batch.
 async fn dispatch_trigger(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     adapter: &Arc<dyn Adapter>,
-    mut trigger: AgentTrigger,
-) -> Result<AgentTrigger> {
+    trigger: AgentTrigger,
+) -> Result<()> {
+    let turn_key = turn_key_for_trigger(&trigger);
+    let mut batch = vec![trigger];
+    if wake_coalesce_enabled(&state.spec) {
+        if let Some(debounce) = wake_debounce(&state.spec) {
+            if batch[0].is_message() && trigger_is_coalescible(&batch[0]) {
+                tokio::time::sleep(debounce).await;
+            }
+        }
+        state.drain_coalescible_into(&turn_key, &mut batch);
+    }
+    dispatch_trigger_batch(client, state, adapter, batch).await
+}
+
+/// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
+/// both the initial trigger and the Finished handler when it pops the next
+/// queued batch. On `send_prompt` failure we iteratively drain the queue
+/// (rather than spawn-recursing) so a single bad prompt can't strand the rest
+/// and the future stays Send for `tokio::spawn`.
+///
+/// `batch` holds one or more triggers merged into a single turn. All batch
+/// members share the same scope, reply target, and visibility (see
+/// [`triggers_coalesce`]); the newest message acts as the primary trigger for
+/// reply threading and telemetry.
+async fn dispatch_trigger_batch(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    mut batch: Vec<AgentTrigger>,
+) -> Result<()> {
     loop {
-        let turn_key = turn_key_for_trigger(&trigger);
-        subscribe_scope(client, state, trigger.scope()).await;
+        let Some(primary) = batch.last().cloned() else {
+            return Ok(());
+        };
+        let turn_key = turn_key_for_trigger(&primary);
+        let source_ids: Vec<String> = batch
+            .iter()
+            .map(|trigger| trigger.id().to_string())
+            .collect();
+        subscribe_scope(client, state, primary.scope()).await;
+        let mut run_metadata = json!({
+            "triggerSourceId": primary.id(),
+            "triggerIsMessage": primary.is_message(),
+        });
+        if batch.len() > 1 {
+            run_metadata["coalescedSourceIds"] = json!(source_ids);
+        }
         let run_res: RunOpenResult = client
             .call(
                 method::RUN_OPEN,
                 json!({
                     "actorId": state.actor_id,
-                    "scope": trigger.scope(),
-                    "startReason": trigger.id(),
+                    "scope": primary.scope(),
+                    "startReason": primary.id(),
                     "agentConfigVersionId": state.agent_config_version_id.clone(),
-                    "metadata": {
-                        "triggerSourceId": trigger.id(),
-                        "triggerIsMessage": trigger.is_message(),
-                    },
+                    "metadata": run_metadata,
                 }),
             )
             .await?;
-        let turn_input = render_trigger_prompt(client, state, &trigger).await;
-        let prompt = compose_envelope_prompt(client, state, &trigger, &turn_input).await;
+        let first_turn = state.take_seed_slot(&primary.scope().id);
+        let turn_input = render_trigger_prompt(client, state, &batch, first_turn).await;
+        let prompt =
+            compose_envelope_prompt(client, state, &batch, &turn_input, first_turn).await;
         let no_reply_file =
-            no_reply_file_for_turn(client, state, trigger.scope(), &run_res.run.id).await;
-        let reply_target = reply_target_for_trigger(client, &state.actor_id, &trigger).await;
+            no_reply_file_for_turn(client, state, primary.scope(), &run_res.run.id).await;
+        let reply_target = reply_target_for_trigger(client, &state.actor_id, &primary).await;
         let active = ActiveTurn {
             id: run_res.run.id.clone(),
             run_id: run_res.run.id.clone(),
             turn_key: turn_key.clone(),
-            scope: trigger.scope().clone(),
-            trigger_source_id: trigger.id().to_string(),
-            trigger_is_message: trigger.is_message(),
-            assignment_id: assignment_id_for_start(&trigger).map(str::to_owned),
+            scope: primary.scope().clone(),
+            trigger_source_id: primary.id().to_string(),
+            trigger_source_ids: source_ids.clone(),
+            trigger_is_message: primary.is_message(),
+            assignment_id: assignment_id_for_start(&primary).map(str::to_owned),
             reply_target,
             prompt_stats: prompt.stats.clone(),
             prompt_breakdown: prompt.breakdown.clone(),
-            trigger_actor: trigger.actor_id().to_string(),
-            trigger_private_to: match &trigger {
+            trigger_actor: primary.actor_id().to_string(),
+            trigger_private_to: match &primary {
                 AgentTrigger::Message(message) => {
                     trigger_private_reply_actor_ids(message, &state.actor_id)
                 }
@@ -4390,23 +4515,23 @@ async fn dispatch_trigger(
             cancel_requested: false,
         };
         state.set_turn(active.clone());
-        mark_assignment_running_if_needed(client, state, &trigger).await;
+        mark_assignment_running_if_needed(client, state, &primary).await;
         if run_started_ack_enabled() {
-            append_run_started_ack(client, state, &active, &trigger).await;
+            append_run_started_ack(client, state, &active, &primary).await;
         }
 
         let adapter_prompt = build_adapter_prompt(
             client,
             state,
-            trigger.scope(),
+            primary.scope(),
             &prompt,
             Some(&active),
-            Some(&trigger),
+            Some(&primary),
         )
         .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
-            Ok(()) => return Ok(trigger),
+            Ok(()) => return Ok(()),
             Err(e) => {
                 publish_failed_turn_notice(
                     client,
@@ -4418,27 +4543,30 @@ async fn dispatch_trigger(
                 )
                 .await;
                 let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
-                if let Err(ack_err) = record_delivery_seen(client, state, &trigger).await {
-                    tracing::warn!(
-                        actor = %state.actor_id,
-                        event = %trigger.id(),
-                        %ack_err,
-                        "failed to record delivery ack for failed trigger dispatch"
-                    );
-                }
-                let scope_id = trigger.scope().id.clone();
-                match state.finish_and_next(&scope_id) {
-                    Some(next) => {
+                for source_id in &source_ids {
+                    if let Err(ack_err) =
+                        record_delivery_seen_by_id(client, &state.actor_id, source_id).await
+                    {
                         tracing::warn!(
                             actor = %state.actor_id,
-                            %e,
-                            "send_prompt failed; trying next queued trigger"
+                            event = %source_id,
+                            %ack_err,
+                            "failed to record delivery ack for failed trigger dispatch"
                         );
-                        trigger = next;
-                        continue;
                     }
-                    None => return Err(anyhow!("adapter send_prompt failed: {e}")),
                 }
+                let scope_id = primary.scope().id.clone();
+                let next =
+                    state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
+                if next.is_empty() {
+                    return Err(anyhow!("adapter send_prompt failed: {e}"));
+                }
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    %e,
+                    "send_prompt failed; trying next queued trigger"
+                );
+                batch = next;
             }
         }
     }
@@ -5092,16 +5220,32 @@ struct TriggerPromptText {
 async fn render_trigger_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    trigger: &AgentTrigger,
+    batch: &[AgentTrigger],
+    first_turn: bool,
 ) -> TriggerPromptText {
-    let actor_names = actor_display_map_for_prompt(client, state, trigger.scope()).await;
-    let latest_message = render_trigger_prompt_with_names(
-        &state.actor_id,
-        &state.spec.actor.display_name,
-        trigger,
-        &actor_names,
-    );
-    let assignment_context = assignment_context_for_prompt(client, trigger)
+    let Some(primary) = batch.last() else {
+        return TriggerPromptText::default();
+    };
+    let actor_names = actor_display_map_for_prompt(client, state, primary.scope()).await;
+    let reminder = reminder_render_for_turn(&state.spec, first_turn);
+    let latest_message = if batch.len() > 1 {
+        render_batch_prompt_with_names(
+            &state.actor_id,
+            &state.spec.actor.display_name,
+            batch,
+            &actor_names,
+            reminder,
+        )
+    } else {
+        render_trigger_prompt_with_names(
+            &state.actor_id,
+            &state.spec.actor.display_name,
+            primary,
+            &actor_names,
+            reminder,
+        )
+    };
+    let assignment_context = assignment_context_for_prompt(client, primary)
         .await
         .unwrap_or_default();
     let turn_input = join_prompt_sections([latest_message.clone(), assignment_context.clone()]);
@@ -5115,9 +5259,9 @@ async fn render_trigger_prompt(
 async fn recent_conversation_context(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    trigger: &AgentTrigger,
+    batch: &[AgentTrigger],
 ) -> String {
-    let Some(message) = trigger_message(trigger) else {
+    let Some(message) = batch.last().and_then(trigger_message) else {
         return String::new();
     };
     let target = reply_target_for_message(message);
@@ -5146,8 +5290,11 @@ async fn recent_conversation_context(
     if messages.is_empty() {
         return String::new();
     }
+    // Every batched trigger already appears verbatim in the turn input;
+    // repeating them in the recap would just duplicate context.
+    let exclude_ids: Vec<&str> = batch.iter().map(|trigger| trigger.id()).collect();
     let actor_names = actor_display_map_for_prompt(client, state, &message.scope).await;
-    format_recent_conversation_context(&messages, message, &actor_names)
+    format_recent_conversation_context(&messages, &exclude_ids, &actor_names)
 }
 
 async fn agents_md_context_for_scope(
@@ -5294,12 +5441,12 @@ fn actor_kind_prompt_label(kind: ActorKind) -> &'static str {
 
 fn format_recent_conversation_context(
     messages: &[Message],
-    trigger: &Message,
+    exclude_ids: &[&str],
     actor_names: &HashMap<String, String>,
 ) -> String {
     let lines = messages
         .iter()
-        .filter(|message| message.id != trigger.id)
+        .filter(|message| !exclude_ids.contains(&message.id.as_str()))
         .filter(|message| message.created_at <= Utc::now())
         .filter(|message| {
             message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
@@ -5386,15 +5533,84 @@ fn local_actor_display_map(state: &WorkerState) -> HashMap<String, String> {
     )])
 }
 
-fn render_trigger_prompt_with_names(
+/// How much response-delivery guidance a turn input repeats. The full rules
+/// always live in the workspace `AGENTS.md`; this only controls per-turn
+/// repetition (see `WakeSpec.reply_reminder`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReminderRender {
+    Full,
+    Pointer,
+    Skip,
+}
+
+fn reminder_render_for_turn(spec: &AgentSpec, first_turn: bool) -> ReminderRender {
+    let mode = spec
+        .wake
+        .as_ref()
+        .and_then(|wake| wake.reply_reminder)
+        .unwrap_or_default();
+    match mode {
+        ReplyReminderMode::EveryTurn => ReminderRender::Full,
+        ReplyReminderMode::FirstTurn => {
+            if first_turn {
+                ReminderRender::Full
+            } else {
+                ReminderRender::Pointer
+            }
+        }
+        ReplyReminderMode::Off => ReminderRender::Skip,
+    }
+}
+
+const RESPONSE_DELIVERY_REMINDER: &str = "\n\nResponse delivery reminder:\n\
+If this message asks you to answer, speak, choose, vote, submit a result, or take your turn, make that\n\
+answer visible by executing a Loom CLI message command before ending the turn. For a public reply use\n\
+`loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; for a private prompt reply use\n\
+`loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`. Do not put the answer only in\n\
+your assistant final text: that text is private trace and is not delivered to the thread. If no visible\n\
+reply is needed, end with `loom --json run ignore --reason \"...\"`.\n\
+Closeout checklist: if another actor must act, wake them with `message ask` or `--private-to`; if task\n\
+or assignment work is finished, update/complete that lifecycle; if a workflow is waiting on future\n\
+replies, schedule a reminder; before conflicting shared output, re-read latest and use `--if-latest`.\n";
+
+const RESPONSE_DELIVERY_POINTER: &str = "\n\nReply contract: deliver any visible reply with `loom --json message send` \
+(or end with `loom --json run ignore`); full rules in AGENTS.md.\n";
+
+fn push_reminder(out: &mut String, reminder: ReminderRender) {
+    match reminder {
+        ReminderRender::Full => out.push_str(RESPONSE_DELIVERY_REMINDER),
+        ReminderRender::Pointer => out.push_str(RESPONSE_DELIVERY_POINTER),
+        ReminderRender::Skip => {}
+    }
+}
+
+fn message_intent_label(intent: MessageIntent) -> &'static str {
+    match intent {
+        MessageIntent::Chat => "chat",
+        MessageIntent::Ask => "ask",
+        MessageIntent::RequestAction => "request_action",
+        MessageIntent::AssignTask => "assign_task",
+        MessageIntent::StatusUpdate => "status_update",
+        MessageIntent::Review => "review",
+        MessageIntent::Notify => "notify",
+    }
+}
+
+/// Delivery classification + rendered visible line, shared by the single and
+/// batch prompt renderers.
+struct TriggerRouting {
+    delivery: &'static str,
+    target_labels: Vec<String>,
+    visible: String,
+}
+
+fn trigger_routing(
     local_actor_id: &str,
-    local_display_name: &str,
     trigger: &AgentTrigger,
     actor_names: &HashMap<String, String>,
-) -> String {
+) -> TriggerRouting {
     let text = annotate_actor_mentions(&render_prompt(trigger), actor_names);
     let from = actor_label(trigger.actor_id(), actor_names);
-    let me = actor_label_with_fallback(local_actor_id, local_display_name, actor_names);
     let delivery_targets = trigger_target_ids(trigger);
     let target_labels = delivery_targets
         .iter()
@@ -5420,6 +5636,23 @@ fn render_trigger_prompt_with_names(
     } else {
         format!("route -> {}: {text}", target_labels.join(", "))
     };
+    TriggerRouting {
+        delivery,
+        target_labels,
+        visible,
+    }
+}
+
+fn render_trigger_prompt_with_names(
+    local_actor_id: &str,
+    local_display_name: &str,
+    trigger: &AgentTrigger,
+    actor_names: &HashMap<String, String>,
+    reminder: ReminderRender,
+) -> String {
+    let from = actor_label(trigger.actor_id(), actor_names);
+    let me = actor_label_with_fallback(local_actor_id, local_display_name, actor_names);
+    let routing = trigger_routing(local_actor_id, trigger, actor_names);
     let scope = trigger.scope();
     let scope_kind = scope_kind_name(scope.kind);
     let source_label = if trigger.is_message() {
@@ -5437,10 +5670,16 @@ fn render_trigger_prompt_with_names(
          Delivery: {delivery}\n",
         scope_id = scope.id,
         source_id = trigger.id(),
+        delivery = routing.delivery,
     );
-    if !target_labels.is_empty() {
+    if let Some(message) = trigger_message(trigger) {
+        out.push_str("Intent: ");
+        out.push_str(message_intent_label(message.intent));
+        out.push('\n');
+    }
+    if !routing.target_labels.is_empty() {
         out.push_str("Route target(s): ");
-        out.push_str(&target_labels.join(", "));
+        out.push_str(&routing.target_labels.join(", "));
         out.push('\n');
     }
     if let Some(message) = trigger_message(trigger) {
@@ -5454,19 +5693,62 @@ fn render_trigger_prompt_with_names(
         out.push_str(&task_context);
     }
     out.push_str("Visible message:\n");
-    out.push_str(&visible);
-    out.push_str(
-        "\n\nResponse delivery reminder:\n\
-         If this message asks you to answer, speak, choose, vote, submit a result, or take your turn, make that\n\
-         answer visible by executing a Loom CLI message command before ending the turn. For a public reply use\n\
-         `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; for a private prompt reply use\n\
-         `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`. Do not put the answer only in\n\
-         your assistant final text: that text is private trace and is not delivered to the thread. If no visible\n\
-         reply is needed, end with `loom --json run ignore --reason \"...\"`.\n\
-         Closeout checklist: if another actor must act, wake them with `message ask` or `--private-to`; if task\n\
-         or assignment work is finished, update/complete that lifecycle; if a workflow is waiting on future\n\
-         replies, schedule a reminder; before conflicting shared output, re-read latest and use `--if-latest`.\n",
+    out.push_str(&routing.visible);
+    push_reminder(&mut out, reminder);
+    out
+}
+
+/// Render a coalesced batch of message triggers as one turn input. Shared
+/// facts (actor, scope, visibility) render once; each message keeps its own
+/// sender / id / delivery / intent line so the model can address every point
+/// (or recognize that a later message supersedes an earlier one).
+fn render_batch_prompt_with_names(
+    local_actor_id: &str,
+    local_display_name: &str,
+    batch: &[AgentTrigger],
+    actor_names: &HashMap<String, String>,
+    reminder: ReminderRender,
+) -> String {
+    let Some(primary) = batch.last() else {
+        return String::new();
+    };
+    let me = actor_label_with_fallback(local_actor_id, local_display_name, actor_names);
+    let scope = primary.scope();
+    let scope_kind = scope_kind_name(scope.kind);
+    let mut out = format!(
+        "=== Latest Loom messages ({count}, oldest first) ===\n\
+         Your actor: {me}\n\
+         Scope: {scope_kind}:{scope_id}\n\
+         These messages arrived in quick succession or while you were busy. Read all of them, then respond\n\
+         once: address every point that still needs an answer and skip anything a later message supersedes.\n",
+        count = batch.len(),
+        scope_id = scope.id,
     );
+    if let Some(message) = trigger_message(primary) {
+        if let Some(visibility) = message_visibility_label(message, actor_names) {
+            out.push_str("Visibility: ");
+            out.push_str(&visibility);
+            out.push('\n');
+        }
+    }
+    for (index, trigger) in batch.iter().enumerate() {
+        let from = actor_label(trigger.actor_id(), actor_names);
+        let routing = trigger_routing(local_actor_id, trigger, actor_names);
+        out.push_str(&format!(
+            "\n[{n}] From: {from} | Message id: {id} | Delivery: {delivery}",
+            n = index + 1,
+            id = trigger.id(),
+            delivery = routing.delivery,
+        ));
+        if let Some(message) = trigger_message(trigger) {
+            out.push_str(" | Intent: ");
+            out.push_str(message_intent_label(message.intent));
+        }
+        out.push('\n');
+        out.push_str(&routing.visible);
+        out.push('\n');
+    }
+    push_reminder(&mut out, reminder);
     out
 }
 
@@ -5827,15 +6109,21 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
 /// configure legacy profile fields / memory fall back to the pre-envelope shape.
+///
+/// `batch` is the trigger batch for this turn; the last entry is the primary
+/// trigger used for scope resolution, template vars, and prefixes.
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
-    trigger: &AgentTrigger,
+    batch: &[AgentTrigger],
     trigger_prompt: &TriggerPromptText,
+    first_turn: bool,
 ) -> PromptTelemetry {
+    let Some(trigger) = batch.last() else {
+        return prompt_telemetry(String::new(), &[]);
+    };
     let scope = trigger.scope();
-    let first_turn = state.take_seed_slot(&scope.id);
-    let conversation_context = recent_conversation_context(client, state, trigger).await;
+    let conversation_context = recent_conversation_context(client, state, batch).await;
     let runtime_context =
         join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
     let profile_prompt_files = load_profile_prompt_files_section(&state.profile_dir);
@@ -6615,26 +6903,28 @@ async fn translate_one(
                     "run.close RPC failed; clearing slot anyway so the queue can drain"
                 );
             }
-            if let Err(e) =
-                record_delivery_seen_by_id(client, actor_id, &active.trigger_source_id).await
-            {
-                tracing::warn!(
-                    actor = %actor_id,
-                    event = %active.trigger_source_id,
-                    %e,
-                    "failed to record delivery ack after adapter finished"
-                );
+            for source_id in turn_source_ids(&active) {
+                if let Err(e) = record_delivery_seen_by_id(client, actor_id, source_id).await {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        event = %source_id,
+                        %e,
+                        "failed to record delivery ack after adapter finished"
+                    );
+                }
             }
             // Drop the active slot for this scope and pick up the next queued
-            // trigger (if any). `finish_and_next` releases the scope atomically
-            // when the queue is empty, or hands back the successor while keeping
-            // the scope reserved so it dispatches without re-racing the gate.
+            // batch (if any). `finish_and_next_batch` releases the scope
+            // atomically when the queue is empty, or hands back the successor
+            // batch while keeping the scope reserved so it dispatches without
+            // re-racing the gate.
             let scope_id = scope
                 .map(|s| s.id)
                 .unwrap_or_else(|| active.scope.id.clone());
-            let next_trigger = state.finish_and_next(&scope_id);
-            if let Some(next) = next_trigger {
-                match dispatch_trigger(client, state, adapter, next).await {
+            let next_batch =
+                state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
+            if !next_batch.is_empty() {
+                match dispatch_trigger_batch(client, state, adapter, next_batch).await {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::error!("[{actor_id}] failed to dispatch queued trigger: {e}")
@@ -7342,6 +7632,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         }
@@ -7477,6 +7768,7 @@ mod tests {
                 id: "chan_failure".into(),
             },
             trigger_source_id: "msg_failure".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_failure".into()),
@@ -8023,6 +8315,7 @@ mod tests {
             turn_key: "thread-root:chan_demo:msg_trigger".into(),
             scope: scope.clone(),
             trigger_source_id: "msg_trigger".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_demo".into()),
@@ -8258,9 +8551,19 @@ mod tests {
     }
 
     #[test]
-    fn turn_key_groups_channel_root_with_derived_thread() {
+    fn turn_key_matches_execution_scope() {
         let root = sample_message(
             "msg_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+        let sibling_root = sample_message(
+            "msg_other",
             ScopeRef {
                 kind: ScopeKind::Channel,
                 id: "chan_demo".into(),
@@ -8280,19 +8583,25 @@ mod tests {
             Some("msg_root"),
         );
 
+        // Two root messages in the same channel share the channel scope and
+        // therefore the same key: the adapter has only one session per scope,
+        // so they must never dispatch concurrently.
+        let root_key = turn_key_for_trigger(&AgentTrigger::Message(root));
+        assert_eq!(root_key, "scope:channel:chan_demo");
         assert_eq!(
-            turn_key_for_message(&root),
-            "thread-root:chan_demo:msg_root"
+            turn_key_for_trigger(&AgentTrigger::Message(sibling_root)),
+            root_key
         );
+        // Thread turns execute in their own scope/session and stay parallel.
         assert_eq!(
-            turn_key_for_message(&reply),
-            "thread-root:chan_demo:msg_root"
+            turn_key_for_trigger(&AgentTrigger::Message(reply)),
+            "scope:thread:thread_demo"
         );
     }
 
     #[test]
-    fn turn_key_for_event_uses_thread_reply_target() {
-        let root = sample_message(
+    fn turn_key_for_event_matches_message_key_in_same_scope() {
+        let message = sample_message(
             "msg_root",
             ScopeRef {
                 kind: ScopeKind::Channel,
@@ -8309,56 +8618,43 @@ mod tests {
                 id: "chan_demo".into(),
             },
         );
+        // Reply-target metadata routes the eventual reply, but must not
+        // change the serialization key: the event still executes in the
+        // channel scope session.
         event._meta = Some(Meta::from([(
             "loomReplyTarget".into(),
             json!("#chan_demo:msg_root"),
         )]));
 
-        assert_eq!(turn_key_for_event(&event), "thread-root:chan_demo:msg_root");
-        assert_eq!(turn_key_for_event(&event), turn_key_for_message(&root));
-
-        event._meta = Some(Meta::from([(
-            "loomReplyTarget".into(),
-            json!("#chan_demo:msg_other"),
-        )]));
         assert_eq!(
-            turn_key_for_event(&event),
-            "thread-root:chan_demo:msg_other"
+            turn_key_for_trigger(&AgentTrigger::Event(event)),
+            "scope:channel:chan_demo"
+        );
+        assert_eq!(
+            turn_key_for_trigger(&AgentTrigger::Message(message)),
+            "scope:channel:chan_demo"
         );
     }
 
     #[test]
-    fn turn_key_for_event_uses_payload_reply_target() {
-        let mut event = sample_event(
-            "evt_reminder",
+    fn turn_key_for_dm_message_follows_direct_channel_scope() {
+        let dm = sample_message(
+            "msg_dm",
             ScopeRef {
                 kind: ScopeKind::Channel,
-                id: "chan_demo".into(),
+                id: "chan_dm_pair".into(),
             },
+            "dm:@actor_agent_demo",
+            None,
+            None,
         );
-        event.payload = json!({
-            "_meta": {
-                "replyTarget": "#chan_demo:msg_payload"
-            }
-        });
-
+        // DMs key by their per-pair direct channel scope, so conversations
+        // with different peers dispatch in parallel while one peer's burst
+        // stays serialized.
         assert_eq!(
-            turn_key_for_event(&event),
-            "thread-root:chan_demo:msg_payload"
+            turn_key_for_trigger(&AgentTrigger::Message(dm)),
+            "scope:channel:chan_dm_pair"
         );
-    }
-
-    #[test]
-    fn turn_key_for_event_falls_back_to_scope_without_thread_target() {
-        let event = sample_event(
-            "evt_reminder",
-            ScopeRef {
-                kind: ScopeKind::Channel,
-                id: "chan_demo".into(),
-            },
-        );
-
-        assert_eq!(turn_key_for_event(&event), "scope:channel:chan_demo");
     }
 
     #[test]
@@ -8642,6 +8938,7 @@ mod tests {
                 id: "thread_demo".into(),
             },
             trigger_source_id: "msg_trigger".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_demo:msg_root".into()),
@@ -8695,6 +8992,7 @@ mod tests {
                 id: "thread_demo".into(),
             },
             trigger_source_id: "msg_trigger".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_demo:msg_root".into()),
@@ -8742,8 +9040,11 @@ mod tests {
         let mut names = HashMap::new();
         names.insert("actor_agent_echo".into(), "Echo".into());
 
-        let context =
-            format_recent_conversation_context(&[trigger.clone(), reply], &trigger, &names);
+        let context = format_recent_conversation_context(
+            &[trigger.clone(), reply],
+            &[trigger.id.as_str()],
+            &names,
+        );
 
         assert!(context.contains("Recent Loom conversation"));
         assert!(context.contains("Echo (@actor_agent_echo): 1"));
@@ -8783,8 +9084,11 @@ mod tests {
         names.insert("actor_agent_coordinator".into(), "Coordinator".into());
         names.insert("actor_agent_recipient".into(), "Recipient".into());
 
-        let context =
-            format_recent_conversation_context(&[trigger.clone(), private_reply], &trigger, &names);
+        let context = format_recent_conversation_context(
+            &[trigger.clone(), private_reply],
+            &[trigger.id.as_str()],
+            &names,
+        );
 
         assert!(context.contains(
             "Coordinator (@actor_agent_coordinator) [private to Recipient (@actor_agent_recipient)]: 私密说明：审批码 alpha"
@@ -8825,6 +9129,7 @@ mod tests {
             "Recipient",
             &AgentTrigger::Message(message),
             &actor_names,
+            ReminderRender::Full,
         );
 
         assert!(prompt.contains("Visibility: private to Recipient (@actor_agent_recipient)"));
@@ -9055,6 +9360,7 @@ mod tests {
             "G仔",
             &AgentTrigger::Event(trigger),
             &actor_names,
+            ReminderRender::Full,
         );
 
         assert!(prompt.contains("Your actor: G仔 (@actor_agent_g_1234)"));
@@ -9095,6 +9401,7 @@ mod tests {
             "Echo",
             &AgentTrigger::Message(message),
             &actor_names,
+            ReminderRender::Full,
         );
 
         assert!(prompt.contains("Delivery: thread/task attention to you"));
@@ -9707,6 +10014,7 @@ mod tests {
             turn_key: "thread-root:chan_demo:msg_1".into(),
             scope: scope.clone(),
             trigger_source_id: "msg_1".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_demo".into()),
@@ -10000,6 +10308,7 @@ mod tests {
             turn_key: "thread-root:chan_triage:msg_root".into(),
             scope: active_scope.clone(),
             trigger_source_id: "msg_root".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_triage".into()),
@@ -10084,6 +10393,7 @@ mod tests {
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
             trigger_source_id: "msg_busy".into(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: true,
             assignment_id: None,
             reply_target: Some("#chan_demo:msg_busy".into()),
@@ -10162,6 +10472,7 @@ mod tests {
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
             trigger_source_id: human_one.id.clone(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: false,
             assignment_id: None,
             reply_target: None,
@@ -10185,6 +10496,7 @@ mod tests {
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
             trigger_source_id: human_two.id.clone(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: false,
             assignment_id: None,
             reply_target: None,
@@ -10208,6 +10520,7 @@ mod tests {
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
             trigger_source_id: service.id.clone(),
+            trigger_source_ids: Vec::new(),
             trigger_is_message: false,
             assignment_id: None,
             reply_target: None,
@@ -10260,6 +10573,7 @@ mod tests {
                 turn_key: turn_key.into(),
                 scope: scope.clone(),
                 trigger_source_id: trigger_id.into(),
+                trigger_source_ids: Vec::new(),
                 trigger_is_message: false,
                 assignment_id: None,
                 reply_target: None,
@@ -10310,6 +10624,360 @@ mod tests {
         // Released turn key can be acquired again.
         assert!(state.begin_or_enqueue(turn_key, mk("evt_f")));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn finish_and_next_batch_coalesces_consecutive_compatible_messages() {
+        let root = temp_path("wake-coalesce-batch");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_burst".into(),
+        };
+        let mk = |id: &str| {
+            let mut message = sample_message(
+                id,
+                scope.clone(),
+                "#chan_demo:msg_root",
+                Some("msg_root"),
+                Some("msg_root"),
+            );
+            message.author_actor_id = "actor_human_burst".into();
+            AgentTrigger::Message(message)
+        };
+        let turn_key = turn_key_for_scope(&scope);
+
+        assert!(state.begin_or_enqueue(&turn_key, mk("msg_1")));
+        state.set_turn(ActiveTurn {
+            id: "turn_1".into(),
+            run_id: "run_1".into(),
+            turn_key: turn_key.clone(),
+            scope: scope.clone(),
+            trigger_source_id: "msg_1".into(),
+            trigger_source_ids: vec!["msg_1".into()],
+            trigger_is_message: true,
+            assignment_id: None,
+            reply_target: Some("#chan_demo:msg_root".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_burst".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
+        // A burst arrives while busy, followed by a non-coalescible event.
+        assert!(!state.begin_or_enqueue(&turn_key, mk("msg_2")));
+        assert!(!state.begin_or_enqueue(&turn_key, mk("msg_3")));
+        assert!(!state.begin_or_enqueue(&turn_key, mk("msg_4")));
+        assert!(!state.begin_or_enqueue(
+            &turn_key,
+            AgentTrigger::Event(sample_event("evt_callback", scope.clone()))
+        ));
+
+        // Finishing drains the whole compatible run into one batch, stopping
+        // at the event.
+        let batch = state.finish_and_next_batch(&scope.id, true);
+        assert_eq!(
+            batch.iter().map(|t| t.id().to_string()).collect::<Vec<_>>(),
+            vec!["msg_2", "msg_3", "msg_4"]
+        );
+        state.set_turn(ActiveTurn {
+            id: "turn_2".into(),
+            run_id: "run_2".into(),
+            turn_key: turn_key.clone(),
+            scope: scope.clone(),
+            trigger_source_id: "msg_4".into(),
+            trigger_source_ids: vec!["msg_2".into(), "msg_3".into(), "msg_4".into()],
+            trigger_is_message: true,
+            assignment_id: None,
+            reply_target: Some("#chan_demo:msg_root".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human_burst".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
+        // Batched sources are visible for inbox dedupe.
+        assert!(state.has_active_trigger("msg_3"));
+
+        // The event dispatches alone, then the key releases.
+        let batch = state.finish_and_next_batch(&scope.id, true);
+        assert_eq!(
+            batch.iter().map(|t| t.id().to_string()).collect::<Vec<_>>(),
+            vec!["evt_callback"]
+        );
+        state.set_turn(ActiveTurn {
+            id: "turn_3".into(),
+            run_id: "run_3".into(),
+            turn_key: turn_key.clone(),
+            scope: scope.clone(),
+            trigger_source_id: "evt_callback".into(),
+            trigger_source_ids: vec!["evt_callback".into()],
+            trigger_is_message: false,
+            assignment_id: None,
+            reply_target: None,
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_agent_dm".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
+        assert!(state.finish_and_next_batch(&scope.id, true).is_empty());
+        assert!(state.begin_or_enqueue(&turn_key, mk("msg_5")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn triggers_coalesce_requires_same_target_and_visibility() {
+        let thread_scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let plain = |id: &str| {
+            AgentTrigger::Message(sample_message(
+                id,
+                thread_scope.clone(),
+                "#chan_demo:msg_root",
+                Some("msg_root"),
+                Some("msg_root"),
+            ))
+        };
+
+        // Same thread, both plain: merge.
+        assert!(triggers_coalesce(&plain("msg_a"), &plain("msg_b"), "actor_self"));
+
+        // Channel roots answer at per-root thread targets: never merged.
+        let channel_scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_demo".into(),
+        };
+        let root_a = AgentTrigger::Message(sample_message(
+            "msg_root_a",
+            channel_scope.clone(),
+            "#chan_demo",
+            None,
+            None,
+        ));
+        let root_b = AgentTrigger::Message(sample_message(
+            "msg_root_b",
+            channel_scope,
+            "#chan_demo",
+            None,
+            None,
+        ));
+        assert!(!triggers_coalesce(&root_a, &root_b, "actor_self"));
+
+        // Private and public messages never share a turn.
+        let mut private = sample_message(
+            "msg_private",
+            thread_scope.clone(),
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        private.metadata.insert("private".into(), json!(true));
+        private
+            .metadata
+            .insert("privateTo".into(), json!(["actor_other"]));
+        assert!(!triggers_coalesce(
+            &plain("msg_a"),
+            &AgentTrigger::Message(private),
+            "actor_self"
+        ));
+
+        // Task / assignment payloads always run alone.
+        let mut assignment = sample_message(
+            "msg_assign",
+            thread_scope.clone(),
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        assignment
+            .metadata
+            .insert("assignmentId".into(), json!("asgn_1"));
+        assert!(!triggers_coalesce(
+            &plain("msg_a"),
+            &AgentTrigger::Message(assignment),
+            "actor_self"
+        ));
+    }
+
+    #[test]
+    fn reply_reminder_defaults_to_full_on_first_turn_then_pointer() {
+        let spec = sample_spec(None);
+        assert_eq!(reminder_render_for_turn(&spec, true), ReminderRender::Full);
+        assert_eq!(
+            reminder_render_for_turn(&spec, false),
+            ReminderRender::Pointer
+        );
+
+        let mut every = sample_spec(None);
+        every.wake = Some(proto::methods::WakeSpec {
+            reply_reminder: Some(ReplyReminderMode::EveryTurn),
+            ..Default::default()
+        });
+        assert_eq!(reminder_render_for_turn(&every, false), ReminderRender::Full);
+
+        let mut off = sample_spec(None);
+        off.wake = Some(proto::methods::WakeSpec {
+            reply_reminder: Some(ReplyReminderMode::Off),
+            ..Default::default()
+        });
+        assert_eq!(reminder_render_for_turn(&off, true), ReminderRender::Skip);
+    }
+
+    #[test]
+    fn latest_prompt_reminder_modes_render_expected_text() {
+        let actor_names = HashMap::new();
+        let message = sample_message(
+            "msg_mode",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        let trigger = AgentTrigger::Message(message);
+
+        let full = render_trigger_prompt_with_names(
+            "actor_self",
+            "Self",
+            &trigger,
+            &actor_names,
+            ReminderRender::Full,
+        );
+        assert!(full.contains("Response delivery reminder:"));
+
+        let pointer = render_trigger_prompt_with_names(
+            "actor_self",
+            "Self",
+            &trigger,
+            &actor_names,
+            ReminderRender::Pointer,
+        );
+        assert!(!pointer.contains("Response delivery reminder:"));
+        assert!(pointer.contains("Reply contract:"));
+        assert!(pointer.contains("AGENTS.md"));
+
+        let skip = render_trigger_prompt_with_names(
+            "actor_self",
+            "Self",
+            &trigger,
+            &actor_names,
+            ReminderRender::Skip,
+        );
+        assert!(!skip.contains("Response delivery reminder:"));
+        assert!(!skip.contains("Reply contract:"));
+    }
+
+    #[test]
+    fn latest_prompt_includes_message_intent() {
+        let actor_names = HashMap::new();
+        let mut message = sample_message(
+            "msg_intent",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.intent = MessageIntent::RequestAction;
+
+        let prompt = render_trigger_prompt_with_names(
+            "actor_self",
+            "Self",
+            &AgentTrigger::Message(message),
+            &actor_names,
+            ReminderRender::Full,
+        );
+        assert!(prompt.contains("Intent: request_action"));
+
+        // Events carry no message intent line.
+        let event_prompt = render_trigger_prompt_with_names(
+            "actor_self",
+            "Self",
+            &AgentTrigger::Event(sample_event(
+                "evt_x",
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: "thread_demo".into(),
+                },
+            )),
+            &actor_names,
+            ReminderRender::Full,
+        );
+        assert!(!event_prompt.contains("Intent: "));
+    }
+
+    #[test]
+    fn batch_prompt_lists_messages_oldest_first_with_one_reminder() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_a".into(), "Ada".into());
+        actor_names.insert("actor_human_b".into(), "Ben".into());
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let mut first = sample_message(
+            "msg_first",
+            scope.clone(),
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        first.author_actor_id = "actor_human_a".into();
+        first.body = "先看这个".into();
+        let mut second = sample_message(
+            "msg_second",
+            scope.clone(),
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        second.author_actor_id = "actor_human_b".into();
+        second.body = "补充一点".into();
+        second.intent = MessageIntent::Ask;
+        let batch = vec![
+            AgentTrigger::Message(first),
+            AgentTrigger::Message(second),
+        ];
+
+        let prompt = render_batch_prompt_with_names(
+            "actor_self",
+            "Self",
+            &batch,
+            &actor_names,
+            ReminderRender::Full,
+        );
+
+        assert!(prompt.contains("=== Latest Loom messages (2, oldest first) ==="));
+        assert!(prompt.contains("Your actor: Self (@actor_self)"));
+        let first_pos = prompt.find("[1] From: Ada (@actor_human_a)").expect("first");
+        let second_pos = prompt.find("[2] From: Ben (@actor_human_b)").expect("second");
+        assert!(first_pos < second_pos);
+        assert!(prompt.contains("Message id: msg_first"));
+        assert!(prompt.contains("Message id: msg_second"));
+        assert!(prompt.contains("Intent: ask"));
+        assert!(prompt.contains("先看这个"));
+        assert!(prompt.contains("补充一点"));
+        assert_eq!(prompt.matches("Response delivery reminder:").count(), 1);
     }
 
     #[test]

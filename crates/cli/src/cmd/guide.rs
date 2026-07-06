@@ -7,7 +7,14 @@ use serde::Serialize;
 
 use crate::{config, render};
 
-const GUIDE_REPO: &str = "git@github.com:wyw-ai/loom-guide.git";
+const GUIDE_REPO: &str = "https://github.com/wyw-ai/loom-guide.git";
+
+fn guide_repo_url() -> String {
+    std::env::var("LOOM_GUIDE_REPO")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| GUIDE_REPO.to_string())
+}
 
 #[derive(Debug, Clone)]
 struct EmbeddedTopic {
@@ -51,7 +58,7 @@ struct SearchHit<'a> {
 
 #[derive(Debug, Serialize)]
 struct UpdateOutput {
-    repo: &'static str,
+    repo: String,
     path: String,
     command: String,
     success: bool,
@@ -152,6 +159,7 @@ pub fn search(query: &str) -> Result<()> {
 }
 
 pub fn update() -> Result<()> {
+    let repo_url = guide_repo_url();
     let cache = guide_cache_dir();
     let parent = cache
         .parent()
@@ -169,15 +177,15 @@ pub fn update() -> Result<()> {
             cache.display()
         );
     } else {
-        command.arg("clone").arg(GUIDE_REPO).arg(&cache);
-        command_text = format!("git clone {GUIDE_REPO} {}", cache.display());
+        command.arg("clone").arg(&repo_url).arg(&cache);
+        command_text = format!("git clone {repo_url} {}", cache.display());
     }
 
     let output = command
         .output()
         .with_context(|| format!("run `{command_text}`"))?;
     let result = UpdateOutput {
-        repo: GUIDE_REPO,
+        repo: repo_url,
         path: cache.display().to_string(),
         command: command_text,
         success: output.status.success(),

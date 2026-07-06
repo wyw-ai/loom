@@ -1722,13 +1722,11 @@ fn emit_provider_runtime_event(
             });
             OutputLineEvents::default()
         }
-        ProviderRuntimeEvent::Finished { success, summary } => {
-            OutputLineEvents {
-                emitted_text: false,
-                emitted_finish: true,
-                finished: Some(DeferredFinished { success, summary }),
-            }
-        }
+        ProviderRuntimeEvent::Finished { success, summary } => OutputLineEvents {
+            emitted_text: false,
+            emitted_finish: true,
+            finished: Some(DeferredFinished { success, summary }),
+        },
         ProviderRuntimeEvent::Session { .. } => OutputLineEvents::default(),
     }
 }

@@ -11,6 +11,7 @@
 __pycache__/
 /docs/*
 !/docs/README.md
+!/docs/agent-turn-input-analysis.md
 !/docs/gui-actor-provider-management-design.md
 !/docs/loom-refactor-plan.md
 !/docs/loop-engineering.md

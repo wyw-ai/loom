@@ -5462,7 +5462,10 @@ fn render_trigger_prompt_with_names(
          `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; for a private prompt reply use\n\
          `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`. Do not put the answer only in\n\
          your assistant final text: that text is private trace and is not delivered to the thread. If no visible\n\
-         reply is needed, end with `loom --json run ignore --reason \"...\"`.\n",
+         reply is needed, end with `loom --json run ignore --reason \"...\"`.\n\
+         Closeout checklist: if another actor must act, wake them with `message ask` or `--private-to`; if task\n\
+         or assignment work is finished, update/complete that lifecycle; if a workflow is waiting on future\n\
+         replies, schedule a reminder; before conflicting shared output, re-read latest and use `--if-latest`.\n",
     );
     out
 }

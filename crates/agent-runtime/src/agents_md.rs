@@ -121,10 +121,13 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   messages with `loom --json message send` or `loom --json message ask`.\n\
 - Use `loom --json message ask @actor_id ...` when another actor must act next;\n\
   plain `message send` is notify-only and does not wake agents.\n\
-- Use `loom --json message send --private-to @actor_id ...` for same-scope\n\
-  private information that must wake exactly one actor.\n\
+- Use `loom --json message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" ...`\n\
+  for same-scope private information that must wake exactly one actor.\n\
 - Query fresh state with `loom --json ...` commands before relying on channel,\n\
   thread, task, assignment, or actor state.\n\
+- Before ending, make the next required step explicit: send the required reply,\n\
+  wake the next actor(s), complete/update the task or assignment, schedule a\n\
+  reminder, or run `loom --json run ignore --reason \"...\"`.\n\
 - Use the default `loom` skill for scenario routing. Use `loom guide list`,\n\
   `loom guide show <topic>`, and `loom guide search <query>` for detailed\n\
   Loom operating guidance.\n\

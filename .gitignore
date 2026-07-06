@@ -38,3 +38,6 @@ data
 /crates/gui/target/
 /logs/
 /tmp/
+# In-repo checkouts of official runtime content (CI checks these out here)
+/loom-guide/
+/loom-skills/

@@ -86,10 +86,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Checkout official Loom runtime content
-        run: |
-          git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
-          git clone --depth 1 https://github.com/wyw-ai/loom-skills.git ../loom-skills
+      - name: Checkout official Loom guide content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-guide
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-guide
+
+      - name: Checkout official Loom skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-skills
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-skills
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -123,10 +132,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Checkout official Loom runtime content
-        run: |
-          git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
-          git clone --depth 1 https://github.com/wyw-ai/loom-skills.git ../loom-skills
+      - name: Checkout official Loom guide content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-guide
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-guide
+
+      - name: Checkout official Loom skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-skills
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-skills
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -157,11 +175,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Checkout official Loom runtime content
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/wyw-ai/loom-guide.git ../loom-guide
-          git clone --depth 1 https://github.com/wyw-ai/loom-skills.git ../loom-skills
+      - name: Checkout official Loom guide content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-guide
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-guide
+
+      - name: Checkout official Loom skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-skills
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-skills
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

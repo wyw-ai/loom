@@ -447,9 +447,8 @@ agent-runtime 有 4 个预先存在的 Windows 环境失败（测试依赖 `/bin
    taskId/assignmentId/kind 元数据、无 triggerPromptPrefix）、同 reply
    target、同 privateTo 集合；上限 `WAKE_COALESCE_MAX = 10`。
    `ActiveTurn.trigger_source_ids` 记录整批来源，Finished/失败路径逐条 ack
-   delivery；`run.open` metadata 带 `coalescedSourceIds`。批量渲染
-   `render_batch_prompt_with_names`（`=== Latest Loom messages (N, oldest
-   first) ===`，逐条 From/Message id/Delivery/Intent，共享一段 reminder）。
+delivery；`run.open` metadata 带 `coalescedSourceIds`。批量渲染
+   已在后续 P2 中迁移为 Turn Input Contract v1（见下）。
 3. **spec 策略（proto）**：`AgentSpec.wake: Option<WakeSpec>` —
    `coalesce`（默认 true）、`debounceMs`（默认 0，上限 10s，仅对可合并消息
    生效）、`replyReminder`（`every-turn | first-turn | off`，默认
@@ -458,9 +457,9 @@ agent-runtime 有 4 个预先存在的 Windows 环境失败（测试依赖 `/bin
    `reminder_render_for_turn(spec, first_turn)` 决定；默认首回合（per scope
    per worker 进程）注入完整 `Response delivery reminder`，后续回合只保留
    单行 `Reply contract: ...`（指向 AGENTS.md）。
-5. **intent 显式化（6.5）**：消息触发的 prompt 头新增
+5. **intent 显式化（6.5）**：消息触发的 prompt 头先新增
    `Intent: chat|ask|request_action|assign_task|status_update|review|notify`
-   行（单条与批量渲染均含）。
+   行；后续 P2 已把该字段移入结构化 `wake[].intent`。
 
 新增测试（crates/cli/src/cmd/agent_serve.rs tests 模块）：
 `turn_key_matches_execution_scope`、
@@ -473,19 +472,58 @@ agent-runtime 有 4 个预先存在的 Windows 环境失败（测试依赖 `/bin
 `latest_prompt_includes_message_intent`、
 `batch_prompt_lists_messages_oldest_first_with_one_reminder`。
 
-后续待做（P2/P3，未开始）：
+### P2 + P3 已落地（2026-07-07）
 
-- **P2 / 6.1 Turn Input Contract v1**：结构化 turn header（围栏 JSON：
-  turn/wake[]/unreadGap）、消息正文进转义围栏块防伪造 `=== ... ===` 头、
-  取消正文 mention 改写（映射进 header）；需要新协议文档定稿。
-- **P2 / 6.3 delivery cursor**：resume session 的回合用"自上次 ack 以来的
-  新投递"替代固定最近 20 条回放；声明 unread gap；频道根消息触发时显式提示
-  频道主干上下文需 CLI 查询。
-- **P3 / 6.7**：`onHumanMessageWhileBusy: queue|cancel_and_requeue|inject`。
-- **P3 / 6.8**：prompt 重复注入率遥测 + 回放段 token 预算上限。
-- 收尾项：GUI Agent 编辑器暴露 `wake` 字段；`examples/agents` 文档补充
-  `wake` 示例；`docs/protocol/agent-coordination-workflow.md` 中依赖
-  "每条消息一个 turn"假设的措辞复查。
+新增协议文档：`docs/protocol/turn-input-contract-v1.md`（已加入 `.gitignore`
+白名单）。新增/修改文件：`crates/proto/src/methods.rs`、
+`crates/cli/src/cmd/agent_serve.rs`、`crates/cli/src/cmd/daemon.rs`、
+`crates/gui/src/ipc.rs`、`apps/gui-web/src/App.tsx`、
+`apps/gui-web/src/components/settings/AgentComponents.tsx`、
+`apps/gui-web/src/ipc/{bridge.ts,types.ts}`、`apps/gui-web/src/lib/{types.ts,agent-utils.ts,wake-utils.ts}`、
+`examples/agents/{README.md,codex.json}`。
+
+已实现内容：
+
+1. **Turn Input Contract v1（6.1）**：默认 turn input 迁移为
+   `=== Loom turn input v1 ===` + fenced JSON header。Header 包含
+   `version`、`turn`、`wake[]`、`unreadGap`、`actorNames`；`wake[]` 保存
+   `intent`、`deliveryPolicy`、`deliveredBecause`、sender、scope、route target、
+   visibility、mentions 与 `bodyRef`。正文放入动态长度 fenced
+   `loom-message` / `loom-event` block；正文中的 `=== ... ===` 与 Markdown fence
+   不能逃逸；正文 `@actor_id` 不再改写，显示名映射只在 header。
+2. **delivery cursor（6.3）**：`compose_envelope_prompt` 不再在 resume turn
+   固定注入最近 20 条。首次 scope turn 可做有限 bootstrap；后续 turn 使用
+   pending durable inbox delivery 作为"自上次 ack 以来的新投递"上下文，超出
+   `contextTokenBudget` 时写入 `unreadGap`。频道根消息触发时 header hint 明确提示
+   `loom message read --target '#<channel>'` 查询频道主干。
+3. **busy 策略（6.7）**：`WakeSpec.onHumanMessageWhileBusy:
+   queue|cancel_and_requeue|inject`。默认 `queue`；`cancel_and_requeue` 会取消当前
+   provider turn，把 active trigger batch 重新放回队首并与新人类消息合并；当前
+   adapters 不支持 `inject`，该模式降级为 queue 并记录 warning。
+4. **预算与观测（6.8）**：`WakeSpec.contextTokenBudget` 控制 bootstrap /
+   pending delivery 上下文预算；`prompt_breakdown` 顶层新增
+   `duplicate_byte_count` 与 `duplicate_ratio`，按同 scope 上一 turn prompt 的
+   重复行字节数估算重复注入率。
+5. **收尾项**：GUI Agent 设置页暴露 wake 字段（coalesce、debounce、reply reminder、
+   busy human 策略、context token budget）；daemon / Tauri IPC 透传 `wake`；
+   `examples/agents` 补充 wake 示例。
+
+新增测试（crates/cli/src/cmd/agent_serve.rs tests 模块）：
+`turn_input_contract_fences_raw_body_without_mention_rewrite`、
+`channel_root_context_hint_points_to_message_read`、
+`duplicate_prompt_bytes_counts_repeated_lines`、
+`cancel_and_requeue_puts_active_batch_before_new_human_message`，并将
+`latest_prompt_*` / `batch_prompt_*` 断言迁移为解析 v1 JSON header。
+
+验证：`cargo test -p loom-cli --lib`（395/395）、`cargo test -p loom-server -p proto`
+（123/123 + 19/19）、`cargo check --workspace`、`pnpm lint`
+（`apps/gui-web` TypeScript）均通过。仅剩 `agent-runtime` 既有 dead-code warning，
+与本次改动无关。
+
+剩余复查项：
+
+- `docs/protocol/agent-coordination-workflow.md` 中依赖"每条消息一个 turn"假设的措辞
+  仍需单独复查。
 
 ---
 
@@ -503,8 +541,8 @@ agent-runtime 有 4 个预先存在的 Windows 环境失败（测试依赖 `/bin
 | 排队/优先级/串行门 | 同上 `begin_or_enqueue`（~2558）、`enqueue_locked`（~2526）、`is_priority_trigger`（~2815） |
 | turn 完成 → 弹下一条 | 同上 `AdapterEvent::Finished` 分支（~6535）、`finish_and_next`（~2582） |
 | turn 派发 | 同上 `dispatch_trigger`（~4341） |
-| Latest message 头 + reminder | 同上 `render_trigger_prompt_with_names`（~5389） |
-| 最近 20 条回放 | 同上 `recent_conversation_context`（~5115）、`format_recent_conversation_context`（~5295） |
+| Turn input v1 header + fenced body + reminder | 同上 `render_turn_input_contract_with_names`、`render_trigger_body_block` |
+| delivery cursor / bootstrap / unread gap | 同上 `delivery_cursor_context`、`pending_delivery_context`、`bootstrap_conversation_context` |
 | envelope 组装 | 同上 `compose_envelope_prompt`（~5830）；`crates/agent-runtime/src/envelope.rs` |
 | assignment 上下文 | 同上 `assignment_context_for_prompt`（~5578） |
 | AGENTS.md 生成 | `crates/agent-runtime/src/agents_md.rs` `loom_block`（~85） |

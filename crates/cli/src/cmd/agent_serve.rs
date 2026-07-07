@@ -6189,8 +6189,9 @@ fn reminder_render_for_turn(spec: &AgentSpec, first_turn: bool) -> ReminderRende
 const RESPONSE_DELIVERY_POINTER: &str =
     "\n\nReply contract: follow AGENTS.md#loom-operating-rules. Deliver requested replies \
 with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current workflow; \
-use bare `#channel` only for intentional channel-level updates outside the active thread. If another actor or group must continue, including public \
-phase/broadcast prompts to discuss, review, approve, vote, or continue, use `message ask` \
+use bare `#channel` only for intentional channel-level updates outside the active thread. \
+In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
+When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
 with exact actor ids or an appropriate group; plain `message send` is only for no-action \
 announcements and may be rejected for action requests inside agent runs. Use same-scope \
 `message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\"` for hidden or sensitive prompts/follow-ups. \
@@ -6308,8 +6309,8 @@ fn push_public_wake_back_instruction(
     out.push_str("\n\nPublic wake-back route for this turn:\n");
     out.push_str(
         "The current public wake came from another agent. If it is a completed answer to your \
-earlier request, process it and route the next required actor; do not wake the submitter again \
-unless you need clarification.\n",
+earlier request and you own or were delegated coordination, process it and route the next \
+required actor; do not wake the submitter again unless you need clarification.\n",
     );
     out.push_str(
         "If you are answering, confirming, choosing, voting, submitting a result, or completing \
@@ -12407,8 +12408,9 @@ mod tests {
         assert!(!full.contains("Response delivery reminder:"));
         assert!(full.contains("Reply contract:"));
         assert!(full.contains("AGENTS.md#loom-operating-rules"));
-        assert!(full.contains("If another actor or group must continue"));
-        assert!(full.contains("public phase/broadcast prompts"));
+        assert!(full.contains("wake the requester/coordinator with your result"));
+        assert!(full.contains("unless you own or were delegated the next handoff"));
+        assert!(full.contains("When you own the handoff"));
         assert!(full.contains("plain `message send` is only for no-action announcements"));
         assert!(full.contains("loom --json run ignore --reason"));
 
@@ -12425,8 +12427,9 @@ mod tests {
         assert!(!pointer.contains("Response delivery reminder:"));
         assert!(pointer.contains("Reply contract:"));
         assert!(pointer.contains("AGENTS.md#loom-operating-rules"));
-        assert!(pointer.contains("If another actor or group must continue"));
-        assert!(pointer.contains("public phase/broadcast prompts"));
+        assert!(pointer.contains("wake the requester/coordinator with your result"));
+        assert!(pointer.contains("unless you own or were delegated the next handoff"));
+        assert!(pointer.contains("When you own the handoff"));
         assert!(pointer.contains("plain `message send` is only for no-action announcements"));
         assert!(pointer.contains("loom --json run ignore --reason"));
 

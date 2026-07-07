@@ -197,23 +197,20 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   when the answer is only one word.\n\
 - Public messages should include only information intended for that audience;\n\
   do not add labels, hints, or formatting derived from private state.\n\
-- In ordered workflows, when the latest message completes a step or names the\n\
-  next participant, wake the next required actor immediately; stale waiting or\n\
-  acknowledgement messages do not override that handoff.\n\
-- If the next actor depends on dynamic eligibility, permissions, lifecycle,\n\
-  membership, or other state that can change during the workflow, participants\n\
-  should wake the requester/coordinator with their completion instead of\n\
-  directly routing to another participant. The coordinator should read the\n\
-  latest state and route the next eligible actor.\n\
+- In ordered workflows, do not take over sequencing unless you own it or were\n\
+  explicitly delegated. Participants should wake the requester/coordinator with\n\
+  their completion. For dynamic eligibility, permissions, lifecycle,\n\
+  membership, or other mutable state, the coordinator should read current state\n\
+  and route the next eligible actor.\n\
 - If you are the requester/coordinator receiving a completed public answer,\n\
   process it and wake the next required actor; do not ask the submitter again\n\
   unless you need clarification.\n\
 - In multi-party decisions, rebuild the latest effective decision for each\n\
   required participant before declaring agreement; crossed or stale replies do\n\
   not count as consensus.\n\
-- If a private wake asks for a public contribution, publish the contribution\n\
-  publicly with `message ask` to the coordinator or next actor, and keep private\n\
-  facts out of the public text.\n\
+- If a private wake asks for a public contribution, publish it with\n\
+  `message ask` to the requester/coordinator unless you own or were delegated\n\
+  the next handoff; keep private facts out of the public text.\n\
 - If a wake is only informational, has `notify` / `notify_only` delivery, or\n\
   explicitly asks for no reply, do not send a receipt; run\n\
   `loom --json run ignore --reason \"no action needed\"`.\n\

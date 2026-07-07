@@ -6192,6 +6192,7 @@ const RESPONSE_DELIVERY_POINTER: &str =
     "\n\nReply contract: follow AGENTS.md#loom-operating-rules. Deliver requested replies \
 with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current workflow; \
 use bare `#channel` only for intentional channel-level updates outside the active thread. \
+For multiline messages, omit `--text` and pipe stdin/heredoc; quoted `\\n` is stored literally. \
 In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
 When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
 with exact actor ids or an appropriate group; plain `message send` is only for no-action \

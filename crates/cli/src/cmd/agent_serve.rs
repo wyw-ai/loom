@@ -34,7 +34,7 @@ use proto::methods::{
 use proto::types::trace::TraceKind;
 use proto::types::{
     ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta, Run,
-    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus,
+    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
 };
 use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
@@ -2296,6 +2296,7 @@ struct ActiveTurn {
     run_id: String,
     turn_key: String,
     scope: ScopeRef,
+    opened_at: Timestamp,
     trigger_source_id: String,
     /// Every trigger source merged into this turn, primary included. All of
     /// them are acked when the turn finishes. Length is 1 unless wake
@@ -4846,6 +4847,7 @@ async fn dispatch_trigger_batch(
             run_id: run_res.run.id.clone(),
             turn_key: turn_key.clone(),
             scope: primary.scope().clone(),
+            opened_at: run_res.run.opened_at,
             trigger_source_id: primary.id().to_string(),
             trigger_source_ids: source_ids.clone(),
             trigger_batch: batch.clone(),
@@ -7881,20 +7883,47 @@ async fn translate_one(
             } else {
                 let _ = state.take_text(&active.id);
             }
-            if !success {
+            let mut effective_success = success;
+            let mut effective_summary = summary;
+            if effective_success
+                && turn_requires_visible_outcome(&active)
+                && !active.cancel_requested
+                && !turn_no_reply_requested(&active)
+            {
+                match turn_has_actor_message_output(client, &active, actor_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        effective_success = false;
+                        effective_summary = missing_required_output_summary(&active);
+                    }
+                    Err(e) => {
+                        publish_runtime_warning_once(
+                            client,
+                            state,
+                            &active,
+                            actor_id,
+                            "output-check",
+                            "failed to verify whether the run produced a Loom output",
+                            &e,
+                        )
+                        .await;
+                    }
+                }
+            }
+            if !effective_success {
                 publish_failed_turn_notice(
                     client,
                     state,
                     &active,
                     actor_id,
-                    &summary,
+                    &effective_summary,
                     usage.as_ref(),
                 )
                 .await;
-                mark_assignment_failed_if_needed(client, state, &active, &summary).await;
+                mark_assignment_failed_if_needed(client, state, &active, &effective_summary).await;
             }
-            if !success {
-                if let Some(text) = failed_turn_text(&summary) {
+            if !effective_success {
+                if let Some(text) = failed_turn_text(&effective_summary) {
                     append_trace_or_report(
                         client,
                         state,
@@ -7930,7 +7959,7 @@ async fn translate_one(
             }
             let run_status = if active.cancel_requested {
                 RunStatus::Canceled
-            } else if success {
+            } else if effective_success {
                 RunStatus::Completed
             } else {
                 RunStatus::Failed
@@ -8361,6 +8390,83 @@ fn turn_no_reply_requested(active: &ActiveTurn) -> bool {
             .no_reply_file
             .as_ref()
             .is_some_and(|path| path.is_file())
+}
+
+fn turn_requires_visible_outcome(active: &ActiveTurn) -> bool {
+    if active.assignment_id.is_some() {
+        return false;
+    }
+    active
+        .trigger_batch
+        .iter()
+        .any(trigger_requires_visible_outcome)
+}
+
+fn trigger_requires_visible_outcome(trigger: &AgentTrigger) -> bool {
+    match trigger {
+        AgentTrigger::Message(message) => message_requires_visible_outcome(message),
+        AgentTrigger::Event(_) => true,
+    }
+}
+
+fn message_requires_visible_outcome(message: &Message) -> bool {
+    if message.delivery_policy == DeliveryPolicy::Silent {
+        return false;
+    }
+    message.delivery_policy == DeliveryPolicy::WakeAgent
+        || matches!(
+            message.intent,
+            MessageIntent::Ask
+                | MessageIntent::RequestAction
+                | MessageIntent::AssignTask
+                | MessageIntent::Review
+        )
+}
+
+fn missing_required_output_summary(active: &ActiveTurn) -> String {
+    format!(
+        "provider finished run `{}` successfully, but the turn required a Loom output and produced no message, action request, or explicit `loom run ignore` marker",
+        active.run_id
+    )
+}
+
+async fn turn_has_actor_message_output(
+    client: &Arc<Client>,
+    active: &ActiveTurn,
+    actor_id: &str,
+) -> Result<bool> {
+    let target = if let Some(target) = active.reply_target.as_deref() {
+        target.to_string()
+    } else {
+        message_target_for_scope(client, &active.scope).await?
+    };
+    let result: MessageListResult = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({
+                "target": target,
+                "limit": 200,
+            }),
+        )
+        .await
+        .with_context(|| format!("message.list target={target}"))?;
+    Ok(turn_has_actor_message_output_in_list(
+        active,
+        actor_id,
+        &result.messages,
+    ))
+}
+
+fn turn_has_actor_message_output_in_list(
+    active: &ActiveTurn,
+    actor_id: &str,
+    messages: &[Message],
+) -> bool {
+    messages.iter().any(|message| {
+        message.author_actor_id == actor_id
+            && message.created_at >= active.opened_at
+            && !is_runtime_failure_message(message)
+    })
 }
 
 async fn append_trace(
@@ -8980,6 +9086,7 @@ mod tests {
                 kind: ScopeKind::Channel,
                 id: "chan_failure".into(),
             },
+            opened_at: Utc::now(),
             trigger_source_id: "msg_failure".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -9531,6 +9638,7 @@ mod tests {
             run_id: "run_demo".into(),
             turn_key: "thread-root:chan_demo:msg_trigger".into(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_trigger".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -10219,6 +10327,7 @@ mod tests {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
             },
+            opened_at: Utc::now(),
             trigger_source_id: "msg_trigger".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -10275,6 +10384,7 @@ mod tests {
                 kind: ScopeKind::Thread,
                 id: "thread_demo".into(),
             },
+            opened_at: Utc::now(),
             trigger_source_id: "msg_trigger".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -10296,6 +10406,95 @@ mod tests {
             None
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn action_wakes_require_visible_outcome_unless_no_action() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let mut ask = sample_message("msg_ask", scope.clone(), "#chan_demo:msg_root", None, None);
+        ask.intent = MessageIntent::Ask;
+        ask.delivery_policy = DeliveryPolicy::WakeAgent;
+        let mut notify = sample_message(
+            "msg_notify",
+            scope.clone(),
+            "#chan_demo:msg_root",
+            None,
+            None,
+        );
+        notify.intent = MessageIntent::Notify;
+        notify.delivery_policy = DeliveryPolicy::NotifyOnly;
+
+        let mut active = sample_active_turn("actor_agent_requester");
+        active.trigger_batch = vec![AgentTrigger::Message(ask)];
+        assert!(turn_requires_visible_outcome(&active));
+
+        active.trigger_batch = vec![AgentTrigger::Message(notify)];
+        assert!(!turn_requires_visible_outcome(&active));
+
+        active.assignment_id = Some("assign_1".into());
+        active.trigger_batch = vec![AgentTrigger::Event(sample_event("evt_1", scope))];
+        assert!(!turn_requires_visible_outcome(&active));
+    }
+
+    #[test]
+    fn output_check_counts_only_actor_messages_after_run_open() {
+        let mut active = sample_active_turn("actor_agent_requester");
+        let opened_at = Utc::now();
+        active.opened_at = opened_at;
+        let mut before = sample_message(
+            "msg_before",
+            active.scope.clone(),
+            "#chan_failure",
+            None,
+            None,
+        );
+        before.author_actor_id = "actor_demo".into();
+        before.created_at = opened_at - chrono::Duration::seconds(1);
+        let mut other_actor = sample_message(
+            "msg_other",
+            active.scope.clone(),
+            "#chan_failure",
+            None,
+            None,
+        );
+        other_actor.author_actor_id = "actor_other".into();
+        other_actor.created_at = opened_at + chrono::Duration::seconds(1);
+        let mut runtime_failure = sample_message(
+            "msg_failure_notice",
+            active.scope.clone(),
+            "#chan_failure",
+            None,
+            None,
+        );
+        runtime_failure.author_actor_id = "actor_demo".into();
+        runtime_failure.created_at = opened_at + chrono::Duration::seconds(2);
+        runtime_failure
+            .metadata
+            .insert("runtimeFailure".into(), json!(true));
+
+        assert!(!turn_has_actor_message_output_in_list(
+            &active,
+            "actor_demo",
+            &[before, other_actor, runtime_failure]
+        ));
+
+        let mut after = sample_message(
+            "msg_after",
+            active.scope.clone(),
+            "#chan_failure",
+            None,
+            None,
+        );
+        after.author_actor_id = "actor_demo".into();
+        after.created_at = opened_at + chrono::Duration::seconds(3);
+        assert!(turn_has_actor_message_output_in_list(
+            &active,
+            "actor_demo",
+            &[after]
+        ));
     }
 
     #[test]
@@ -11327,6 +11526,7 @@ mod tests {
             run_id: "run_1".into(),
             turn_key: "thread-root:chan_demo:msg_1".into(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_1".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -11623,6 +11823,7 @@ mod tests {
             run_id: "run_channel".into(),
             turn_key: "thread-root:chan_triage:msg_root".into(),
             scope: active_scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_root".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -11710,6 +11911,7 @@ mod tests {
             run_id: "run_busy".into(),
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_busy".into(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -11791,6 +11993,7 @@ mod tests {
             run_id: "run_human_one".into(),
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: human_one.id.clone(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -11817,6 +12020,7 @@ mod tests {
             run_id: "run_human_two".into(),
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: human_two.id.clone(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -11843,6 +12047,7 @@ mod tests {
             run_id: "run_service".into(),
             turn_key: "thread-root:chan_demo:msg_busy".into(),
             scope: active_scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: service.id.clone(),
             trigger_source_ids: Vec::new(),
             trigger_batch: Vec::new(),
@@ -11898,6 +12103,7 @@ mod tests {
                 run_id: format!("run_{trigger_id}"),
                 turn_key: turn_key.into(),
                 scope: scope.clone(),
+                opened_at: Utc::now(),
                 trigger_source_id: trigger_id.into(),
                 trigger_source_ids: Vec::new(),
                 trigger_batch: Vec::new(),
@@ -11988,6 +12194,7 @@ mod tests {
             run_id: "run_wake".into(),
             turn_key: turn_key.clone(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_wake".into(),
             trigger_source_ids: vec!["msg_wake".into(), "msg_folded".into()],
             trigger_batch: vec![active_trigger],
@@ -12123,6 +12330,7 @@ mod tests {
             run_id: "run_active".into(),
             turn_key: turn_key.clone(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_active".into(),
             trigger_source_ids: vec!["msg_active".into()],
             trigger_batch: vec![active_trigger],
@@ -12188,6 +12396,7 @@ mod tests {
             run_id: "run_1".into(),
             turn_key: turn_key.clone(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_1".into(),
             trigger_source_ids: vec!["msg_1".into()],
             trigger_batch: Vec::new(),
@@ -12224,6 +12433,7 @@ mod tests {
             run_id: "run_2".into(),
             turn_key: turn_key.clone(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "msg_4".into(),
             trigger_source_ids: vec!["msg_2".into(), "msg_3".into(), "msg_4".into()],
             trigger_batch: Vec::new(),
@@ -12253,6 +12463,7 @@ mod tests {
             run_id: "run_3".into(),
             turn_key: turn_key.clone(),
             scope: scope.clone(),
+            opened_at: Utc::now(),
             trigger_source_id: "evt_callback".into(),
             trigger_source_ids: vec!["evt_callback".into()],
             trigger_batch: Vec::new(),

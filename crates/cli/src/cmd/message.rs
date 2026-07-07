@@ -45,6 +45,8 @@ pub async fn send(
     let is_private = !private_to.is_empty();
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
+    let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
+    let explicit_silent_policy = matches!(delivery_policy, Some(DeliveryPolicy::Silent));
     if is_private {
         intent.get_or_insert(MessageIntent::RequestAction);
         delivery_policy.get_or_insert(DeliveryPolicy::WakeAgent);
@@ -88,21 +90,28 @@ pub async fn send(
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
-    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
-    if let Some(warning) = channel_fragmentation_warning(&target, !private_to.is_empty()) {
-        eprintln!("{warning}");
-    }
     let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
     let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
     if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
-        eprintln!(
-            "loom: warning: this message is notify_only and will wake nobody, but its \
-             text looks like a call for others to act (discuss/vote/answer/your turn). \
-             If you expect a response, send it with `loom message ask @actor_id ...` \
-             (or `--private-to @actor_id` for a hidden prompt). A notify_only \
-             call-for-action wakes no one and is the #1 cause of stalled multi-actor flows."
-        );
+        let warning = notify_only_call_for_action_warning();
+        if should_reject_notify_only_call_for_action(
+            agent_turn_is_active(),
+            explicit_notify_intent,
+            explicit_silent_policy,
+        ) {
+            bail!(
+                "{warning} This is blocked inside an agent run. Use `loom message ask @actor_id ...` \
+                 or `loom message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" ...` \
+                 for hidden same-scope work. If this is intentionally a no-action notification, \
+                 rerun with `--intent notify`."
+            );
+        }
+        eprintln!("{warning}");
     }
+    if let Some(warning) = channel_fragmentation_warning(&target, !private_to.is_empty()) {
+        eprintln!("{warning}");
+    }
+    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -127,10 +136,10 @@ pub async fn ask(
         bail!("message body is empty");
     }
     let params = build_ask_params(target.clone(), recipients, body, if_latest, attachment_ids)?;
-    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
     if let Some(warning) = channel_fragmentation_warning(&target, false) {
         eprintln!("{warning}");
     }
+    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -174,6 +183,28 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "开始投票",
     ];
     CUES.iter().any(|cue| lower.contains(cue))
+}
+
+fn notify_only_call_for_action_warning() -> &'static str {
+    "loom: warning: this message is notify_only and will wake nobody, but its text looks \
+     like a call for others to act (discuss/vote/answer/your turn). If you expect a \
+     response, send it with `loom message ask @actor_id ...` (or `--private-to @actor_id` \
+     for a hidden prompt). A notify_only call-for-action wakes no one and is the #1 cause \
+     of stalled multi-actor flows."
+}
+
+fn agent_turn_is_active() -> bool {
+    std::env::var("LOOM_RUN_ID")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn should_reject_notify_only_call_for_action(
+    agent_turn_active: bool,
+    explicit_notify_intent: bool,
+    explicit_silent_policy: bool,
+) -> bool {
+    agent_turn_active && !explicit_notify_intent && !explicit_silent_policy
 }
 
 /// Best-effort, non-blocking nudge: warn when a non-private message is being
@@ -495,6 +526,22 @@ mod tests {
             "天亮了，昨晚是平安夜，无人死亡。"
         ));
         assert!(!looks_like_call_for_action("Game over. Villagers win."));
+    }
+
+    #[test]
+    fn agent_turn_rejects_notify_only_call_for_action_unless_explicitly_notify() {
+        assert!(should_reject_notify_only_call_for_action(
+            true, false, false
+        ));
+        assert!(!should_reject_notify_only_call_for_action(
+            false, false, false
+        ));
+        assert!(!should_reject_notify_only_call_for_action(
+            true, true, false
+        ));
+        assert!(!should_reject_notify_only_call_for_action(
+            true, false, true
+        ));
     }
 
     #[test]

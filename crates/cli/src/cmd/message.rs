@@ -47,6 +47,7 @@ pub async fn send(
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
     let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
     let explicit_silent_policy = matches!(delivery_policy, Some(DeliveryPolicy::Silent));
+    let infer_default_agent_reply = agent_turn_is_active() && !explicit_notify_intent;
     if is_private {
         intent.get_or_insert(MessageIntent::RequestAction);
         delivery_policy.get_or_insert(DeliveryPolicy::WakeAgent);
@@ -86,7 +87,12 @@ pub async fn send(
         &body,
         delivery_policy,
         trigger_actor.as_deref(),
+        infer_default_agent_reply,
     );
+    if inferred_reply.is_some() && delivery_policy.is_none() {
+        delivery_policy = Some(DeliveryPolicy::WakeAgent);
+        params["deliveryPolicy"] = serde_json::to_value(DeliveryPolicy::WakeAgent)?;
+    }
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
@@ -477,10 +483,8 @@ fn inferred_reply_audience<'a>(
     body: &str,
     delivery_policy: Option<DeliveryPolicy>,
     trigger_actor: Option<&'a str>,
+    infer_default_agent_reply: bool,
 ) -> Option<&'a str> {
-    if delivery_policy != Some(DeliveryPolicy::WakeAgent) {
-        return None;
-    }
     if !target.trim().starts_with('#') || !target.contains(':') {
         return None;
     }
@@ -492,6 +496,13 @@ fn inferred_reply_audience<'a>(
         .filter(|value| !value.is_empty())
         .filter(|value| *value != actor_id)
         .filter(|value| value.starts_with("actor_"))?;
+    let should_wake = delivery_policy == Some(DeliveryPolicy::WakeAgent)
+        || (delivery_policy.is_none()
+            && infer_default_agent_reply
+            && trigger_actor.starts_with("actor_agent_"));
+    if !should_wake {
+        return None;
+    }
     Some(trigger_actor)
 }
 
@@ -503,12 +514,19 @@ fn apply_inferred_reply_audience(
     body: &str,
     delivery_policy: Option<DeliveryPolicy>,
     trigger_actor: Option<&str>,
+    infer_default_agent_reply: bool,
 ) -> Option<String> {
     if is_private {
         return None;
     }
-    let reply_actor_id =
-        inferred_reply_audience(target, actor_id, body, delivery_policy, trigger_actor)?;
+    let reply_actor_id = inferred_reply_audience(
+        target,
+        actor_id,
+        body,
+        delivery_policy,
+        trigger_actor,
+        infer_default_agent_reply,
+    )?;
     params["audience"] = json!([{ "kind": "actor", "id": reply_actor_id }]);
     Some(reply_actor_id.to_string())
 }
@@ -579,6 +597,7 @@ mod tests {
                 "偏小，继续猜。",
                 Some(DeliveryPolicy::WakeAgent),
                 Some("actor_agent_guesser"),
+                false,
             ),
             Some("actor_agent_guesser")
         );
@@ -593,6 +612,7 @@ mod tests {
                 "@actor_agent_guesser 偏小，继续猜。",
                 Some(DeliveryPolicy::WakeAgent),
                 Some("actor_agent_guesser"),
+                false,
             ),
             None
         );
@@ -620,6 +640,7 @@ mod tests {
             "【私信·身份】你的身份是狼人。",
             Some(DeliveryPolicy::WakeAgent),
             Some("actor_human_local"),
+            false,
         );
 
         assert_eq!(params["audience"][0]["id"], "actor_agent_player");
@@ -643,9 +664,63 @@ mod tests {
             "继续。",
             Some(DeliveryPolicy::WakeAgent),
             Some("actor_agent_player"),
+            false,
         );
 
         assert_eq!(params["audience"][0]["id"], "actor_agent_player");
+    }
+
+    #[test]
+    fn agent_thread_reply_without_explicit_policy_infers_agent_requester() {
+        let mut params = json!({
+            "target": "#chan_1:msg_root",
+            "body": "到",
+        });
+
+        let inferred = apply_inferred_reply_audience(
+            &mut params,
+            false,
+            "#chan_1:msg_root",
+            "actor_agent_player",
+            "到",
+            None,
+            Some("actor_agent_dm"),
+            true,
+        );
+
+        if inferred.is_some() {
+            params["deliveryPolicy"] = serde_json::to_value(DeliveryPolicy::WakeAgent).unwrap();
+        }
+
+        assert_eq!(inferred.as_deref(), Some("actor_agent_dm"));
+        assert_eq!(params["audience"][0]["id"], "actor_agent_dm");
+        assert_eq!(params["deliveryPolicy"], "wake_agent");
+    }
+
+    #[test]
+    fn default_reply_inference_does_not_wake_humans_or_explicit_notify() {
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_worker",
+                "done",
+                None,
+                Some("actor_human_owner"),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_worker",
+                "done",
+                None,
+                Some("actor_agent_owner"),
+                false,
+            ),
+            None
+        );
     }
 
     #[test]

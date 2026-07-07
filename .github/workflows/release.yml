@@ -103,7 +103,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -112,7 +112,7 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build Linux release binaries
-        run: make linux-x86-release LINUX_BUILDER=cross
+        run: make linux-x86-gnu-release linux-x86-release LINUX_BUILDER=cross
 
       - name: Archive Linux dist
         run: tar -czf linux-dist.tar.gz -C dist release
